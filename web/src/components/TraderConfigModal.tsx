@@ -373,8 +373,7 @@ export function TraderConfigModal({
             </div>
           </div>
 
-          {/* Strategy Selection (only for AI mode) */}
-          {formData.decision_mode === 'ai' && (
+          {/* Strategy Selection (required for both AI and copy_trade mode) */}
           <div className="bg-[#0B0E11] border border-[#2B3139] rounded-lg p-5">
             <h3 className="text-lg font-semibold text-[#EAECEF] mb-5 flex items-center gap-2">
               <span className="text-[#F0B90B]">2</span> 选择交易策略
@@ -383,7 +382,7 @@ export function TraderConfigModal({
             <div className="space-y-4">
               <div>
                 <label className="text-sm text-[#EAECEF] block mb-2">
-                  使用策略
+                  使用策略 <span className="text-red-500">*</span>
                 </label>
                 <select
                   value={formData.strategy_id}
@@ -392,7 +391,7 @@ export function TraderConfigModal({
                   }
                   className="w-full px-3 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF] focus:border-[#F0B90B] focus:outline-none"
                 >
-                  <option value="">-- 不使用策略（手动配置）--</option>
+                  <option value="">-- 请选择策略 --</option>
                   {strategies.map((strategy) => (
                     <option key={strategy.id} value={strategy.id}>
                       {strategy.name}
@@ -404,6 +403,11 @@ export function TraderConfigModal({
                 {strategies.length === 0 && (
                   <p className="text-xs text-[#848E9C] mt-2">
                     暂无策略，请先在策略工作室创建策略
+                  </p>
+                )}
+                {formData.decision_mode === 'copy_trade' && (
+                  <p className="text-xs text-[#848E9C] mt-2">
+                    💡 跟单模式下策略不会执行，但需要配置以便随时切换回 AI 模式
                   </p>
                 )}
               </div>
@@ -438,7 +442,6 @@ export function TraderConfigModal({
               )}
             </div>
           </div>
-          )}
 
           {/* Decision Mode Selection */}
           <div className="bg-[#0B0E11] border border-[#2B3139] rounded-lg p-5">
@@ -784,7 +787,8 @@ export function TraderConfigModal({
                 isSaving ||
                 !formData.trader_name ||
                 !formData.ai_model ||
-                !formData.exchange_id
+                !formData.exchange_id ||
+                !formData.strategy_id
               }
               className="px-8 py-3 bg-gradient-to-r from-[#F0B90B] to-[#E1A706] text-black rounded-lg hover:from-[#E1A706] hover:to-[#D4951E] transition-all duration-200 disabled:bg-[#848E9C] disabled:cursor-not-allowed font-medium shadow-lg"
             >
