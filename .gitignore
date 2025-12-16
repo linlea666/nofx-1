@@ -33,7 +33,7 @@ config.json
 configbak.json
 
 # 数据目录（数据库、日志等）
-data/
+/data/
 *.db
 
 # 决策日志
@@ -78,8 +78,8 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
-lib64/
+/lib/
+/lib64/
 parts/
 sdist/
 var/
