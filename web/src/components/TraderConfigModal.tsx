@@ -144,6 +144,8 @@ export function TraderConfigModal({
         ...prev,
         ...traderData,
         strategy_id: traderData.strategy_id || '',
+        // Keep decision_mode from traderData if exists, otherwise keep prev value
+        decision_mode: traderData.decision_mode || prev.decision_mode || 'ai',
       }))
     } else if (!isEditMode) {
       setFormData({
@@ -205,6 +207,9 @@ export function TraderConfigModal({
 
     setIsSaving(true)
     try {
+      // Debug: log decision_mode before save
+      console.log('🔧 [DEBUG] Saving trader with decision_mode:', formData.decision_mode)
+      
       const saveData: CreateTraderRequest = {
         name: formData.trader_name,
         ai_model_id: formData.ai_model,
@@ -213,7 +218,7 @@ export function TraderConfigModal({
         is_cross_margin: formData.is_cross_margin,
         show_in_competition: formData.show_in_competition,
         scan_interval_minutes: formData.scan_interval_minutes,
-        decision_mode: formData.decision_mode,
+        decision_mode: formData.decision_mode || 'ai', // Ensure non-empty
       }
 
       // 只在编辑模式时包含initial_balance

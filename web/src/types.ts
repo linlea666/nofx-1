@@ -257,6 +257,7 @@ export interface TraderConfigData {
   scan_interval_minutes: number
   initial_balance: number
   is_running: boolean
+  decision_mode?: DecisionMode  // "ai" or "copy_trade"
   // 以下为旧版字段（向后兼容）
   btc_eth_leverage?: number
   altcoin_leverage?: number
