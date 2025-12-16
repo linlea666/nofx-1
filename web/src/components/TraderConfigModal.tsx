@@ -77,7 +77,7 @@ export function TraderConfigModal({
     copy_ratio: 1.0,
     copy_sync_leverage: true,
   })
-  const [copyTradeConfig, setCopyTradeConfig] = useState<CopyTradeConfig | null>(null)
+  const [, setCopyTradeConfig] = useState<CopyTradeConfig | null>(null)
   const [isSaving, setIsSaving] = useState(false)
   const [strategies, setStrategies] = useState<Strategy[]>([])
   const [isFetchingBalance, setIsFetchingBalance] = useState(false)
