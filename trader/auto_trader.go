@@ -34,13 +34,13 @@ type AutoTraderConfig struct {
 	BybitSecretKey string
 
 	// OKX API configuration
-	OKXAPIKey    string
-	OKXSecretKey string
+	OKXAPIKey     string
+	OKXSecretKey  string
 	OKXPassphrase string
 
 	// Bitget API configuration
-	BitgetAPIKey    string
-	BitgetSecretKey string
+	BitgetAPIKey     string
+	BitgetSecretKey  string
 	BitgetPassphrase string
 
 	// Hyperliquid configuration
@@ -396,9 +396,11 @@ func (at *AutoTrader) runCycle() error {
 	// Check decision mode - skip AI cycle if in copy_trade mode
 	isCopyTradeMode := false
 	if at.store != nil {
-		mode, _ := at.store.CopyTrade().GetDecisionMode(at.id)
+		mode, err := at.store.CopyTrade().GetDecisionMode(at.id)
+		logger.Infof("🔍 [%s] Checking decision mode: mode=%s, err=%v", at.name, mode, err)
 		if mode == "copy_trade" {
 			isCopyTradeMode = true
+			logger.Infof("📋 [%s] Copy trade mode detected, skipping AI decision cycle", at.name)
 		}
 	}
 
@@ -408,6 +410,7 @@ func (at *AutoTrader) runCycle() error {
 		ctx, err := at.buildTradingContext()
 		if err == nil {
 			at.saveEquitySnapshot(ctx)
+			logger.Infof("💾 [%s] Saved equity snapshot in copy_trade mode", at.name)
 		}
 		// Skip AI decision - copy trade engine handles decisions
 		return nil
@@ -1692,8 +1695,8 @@ func (at *AutoTrader) recordAndConfirmOrder(orderResult map[string]interface{}, 
 	}
 
 	// Poll order status to get actual fill price, quantity and fee
-	var actualPrice = price       // fallback to market price
-	var actualQty = quantity      // fallback to requested quantity
+	var actualPrice = price  // fallback to market price
+	var actualQty = quantity // fallback to requested quantity
 	var fee float64
 
 	// Wait for order to be filled and get actual fill data
@@ -1779,10 +1782,10 @@ func (at *AutoTrader) recordPositionChange(orderID, symbol, side, action string,
 		// Update position record
 		err = at.store.Position().ClosePosition(
 			openPos.ID,
-			price,       // exitPrice
-			orderID,     // exitOrderID
+			price,   // exitPrice
+			orderID, // exitOrderID
 			realizedPnL,
-			fee,         // fee from exchange API
+			fee, // fee from exchange API
 			"ai_decision",
 		)
 		if err != nil {
@@ -1876,4 +1879,3 @@ func (at *AutoTrader) enforceMaxPositions(currentPositionCount int) error {
 	}
 	return nil
 }
-
