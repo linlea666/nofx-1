@@ -1048,10 +1048,18 @@ func (s *Server) handleStartTrader(c *gin.Context) {
 	if decisionMode == "copy_trade" {
 		// Start in copy trade mode
 		logger.Infof("🎯 [%s] Starting in copy trade mode...", trader.GetName())
+
+		// Enable copy trade config before starting
+		if err := s.store.CopyTrade().SetEnabled(traderID, true); err != nil {
+			logger.Warnf("⚠️ Failed to enable copy trade config: %v", err)
+		}
+
 		go func() {
 			executor := &CopyTradeExecutorAdapter{trader: trader}
 			if err := copytrade.StartCopyTradingForTrader(traderID, executor, s.store); err != nil {
-				logger.Infof("❌ Trader %s copy trade runtime error: %v", trader.GetName(), err)
+				logger.Errorf("❌ Trader %s copy trade runtime error: %v", trader.GetName(), err)
+				// Disable copy trade on error
+				s.store.CopyTrade().SetEnabled(traderID, false)
 			}
 		}()
 	} else {
@@ -1097,6 +1105,18 @@ func (s *Server) handleStopTrader(c *gin.Context) {
 	if isRunning, ok := status["is_running"].(bool); ok && !isRunning {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Trader is already stopped"})
 		return
+	}
+
+	// Check decision mode to determine stop type
+	decisionMode, _ := s.store.CopyTrade().GetDecisionMode(traderID)
+
+	if decisionMode == "copy_trade" {
+		// Stop copy trade engine
+		if err := copytrade.StopCopyTradingForTrader(traderID); err != nil {
+			logger.Warnf("⚠️ Failed to stop copy trade engine: %v", err)
+		}
+		// Disable copy trade config
+		s.store.CopyTrade().SetEnabled(traderID, false)
 	}
 
 	// Stop trader
