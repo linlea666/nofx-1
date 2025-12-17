@@ -288,11 +288,18 @@ func (e *Engine) processSignal(signal *TradeSignal) {
 	}
 }
 
-// shouldFollowSignal 🎯 核心：判断是否应该跟随该信号（只跟新开仓原则）
+// shouldFollowSignal 🎯 核心规则：只跟新开仓（本地仓位对比法）
+// ============================================================
+// 判断逻辑：
+//   - 本地有仓位 → 跟随（加仓/减仓/平仓）
+//   - 本地无仓位 + 领航员开仓 → 跟随（新开仓）
+//   - 本地无仓位 + 领航员加仓/减仓/平仓 → 跳过（历史仓位操作）
+//
+// ============================================================
 func (e *Engine) shouldFollowSignal(signal *TradeSignal) (follow bool, reason string) {
 	fill := signal.Fill
 
-	// 获取本地仓位（从交易所/数据库，不是内存）
+	// 获取本地仓位（实时从交易所获取）
 	localPositions := e.getFollowerPositions()
 	key := PositionKey(fill.Symbol, fill.PositionSide)
 	localPosition := localPositions[key]
@@ -300,22 +307,25 @@ func (e *Engine) shouldFollowSignal(signal *TradeSignal) (follow bool, reason st
 
 	switch fill.Action {
 	case ActionOpen:
+		// 开仓信号：无论本地有没有仓位都跟随
 		if !hasLocalPosition {
-			return true, "新开仓信号，本地无持仓"
+			return true, "新开仓，本地无持仓 → 跟随开仓"
 		}
-		return true, "加仓信号，跟随已有仓位"
+		return true, "开仓信号，本地已有仓位 → 跟随加仓"
 
 	case ActionAdd:
+		// 加仓信号：本地有仓位才跟随
 		if !hasLocalPosition {
 			return false, "忽略：领航员历史仓位加仓，我们未跟随该仓位"
 		}
-		return true, "加仓信号，跟随已有仓位"
+		return true, "加仓信号，本地有仓位 → 跟随加仓"
 
 	case ActionReduce, ActionClose:
+		// 减仓/平仓信号：本地有仓位才跟随
 		if !hasLocalPosition {
 			return false, "忽略：领航员历史仓位操作，我们未跟随该仓位"
 		}
-		return true, "平仓/减仓信号，跟随已有仓位"
+		return true, "减仓/平仓信号，本地有仓位 → 跟随操作"
 
 	default:
 		return false, fmt.Sprintf("未知操作类型: %s", fill.Action)
@@ -323,6 +333,9 @@ func (e *Engine) shouldFollowSignal(signal *TradeSignal) (follow bool, reason st
 }
 
 // determineAction 判断实际动作类型（减仓 vs 平仓）
+// 核心逻辑：通过领航员当前持仓状态判断
+//   - 领航员仓位清零 → 平仓（全平我们的仓位）
+//   - 领航员仓位还有 → 减仓（按比例减我们的仓位）
 func (e *Engine) determineAction(signal *TradeSignal) ActionType {
 	fill := signal.Fill
 
@@ -331,19 +344,23 @@ func (e *Engine) determineAction(signal *TradeSignal) ActionType {
 		return fill.Action
 	}
 
-	// 减仓/平仓：通过领航员实时持仓判断
+	// ============================================================
+	// 减仓 vs 平仓判断：通过领航员实时持仓状态
+	// 这和"只跟新开仓"原则一致：都是通过持仓状态对比来决策
+	// ============================================================
+
 	if signal.LeaderPosition == nil {
-		logger.Infof("📊 [%s] %s 判断为平仓 | 原因: 领航员持仓数据为空", e.traderID, fill.Symbol)
-		return ActionClose // 领航员仓位清零 = 平仓
+		logger.Infof("📊 [%s] %s → 平仓 | 原因: 领航员持仓数据为空（可能已清仓）", e.traderID, fill.Symbol)
+		return ActionClose
 	}
 
 	if signal.LeaderPosition.Size == 0 {
-		logger.Infof("📊 [%s] %s 判断为平仓 | 原因: 领航员仓位已清零", e.traderID, fill.Symbol)
-		return ActionClose // 领航员仓位清零 = 平仓
+		logger.Infof("📊 [%s] %s → 平仓 | 原因: 领航员仓位已清零", e.traderID, fill.Symbol)
+		return ActionClose
 	}
 
-	logger.Infof("📊 [%s] %s 判断为减仓 | 领航员剩余仓位=%.4f (非清零)", e.traderID, fill.Symbol, signal.LeaderPosition.Size)
-	return ActionReduce // 领航员仓位仍有 = 减仓
+	logger.Infof("📊 [%s] %s → 减仓 | 领航员剩余仓位=%.4f（非清零，按比例减仓）", e.traderID, fill.Symbol, signal.LeaderPosition.Size)
+	return ActionReduce
 }
 
 // ============================================================================
@@ -417,24 +434,30 @@ func (e *Engine) calculateCopySize(signal *TradeSignal) (float64, []Warning) {
 }
 
 // calculateReduceRatio 计算减仓比例
+// 公式: 减仓比例 = 本次减仓量 / 减仓前总仓位
+// 例如: 领航员从 0.03 ETH 减到 0.02 ETH，减仓量=0.01，比例=0.01/0.03=33%
 func (e *Engine) calculateReduceRatio(signal *TradeSignal) float64 {
-	reduceSize := signal.Fill.Size
+	reduceSize := signal.Fill.Size // 本次减仓数量
 
+	// 获取领航员当前剩余仓位
 	leaderCurrentSize := float64(0)
 	if signal.LeaderPosition != nil {
 		leaderCurrentSize = signal.LeaderPosition.Size
 	}
+
+	// 推算减仓前的仓位 = 当前仓位 + 本次减仓量
 	leaderPreviousSize := leaderCurrentSize + reduceSize
 
+	// 边界检查
 	if leaderPreviousSize <= 0 {
-		logger.Infof("📊 [%s] %s 减仓比例计算 | 减仓量=%.4f 当前仓位=%.4f 减仓前=%.4f → 比例=100%% (全量)",
+		logger.Infof("📊 [%s] %s 减仓比例 | 减仓量=%.4f 当前=%.4f 减仓前=%.4f → 100%% (异常，视为全平)",
 			e.traderID, signal.Fill.Symbol, reduceSize, leaderCurrentSize, leaderPreviousSize)
-		return 1.0 // 全部平仓
+		return 1.0
 	}
 
 	ratio := reduceSize / leaderPreviousSize
 
-	logger.Infof("📊 [%s] %s 减仓比例计算 | 减仓量=%.4f 当前仓位=%.4f 减仓前=%.4f → 比例=%.2f%%",
+	logger.Infof("📊 [%s] %s 减仓比例 | 减仓量=%.4f 当前=%.4f 减仓前=%.4f → %.1f%%",
 		e.traderID, signal.Fill.Symbol, reduceSize, leaderCurrentSize, leaderPreviousSize, ratio*100)
 
 	return ratio
@@ -453,30 +476,43 @@ func (e *Engine) buildDecision(signal *TradeSignal, action ActionType, copySize 
 		Reasoning: fmt.Sprintf("Copy trading: %s following %s leader %s", action, e.config.ProviderType, e.config.LeaderID),
 	}
 
-	// 开仓/加仓参数
+	// ============================================================
+	// 开仓/加仓：设置仓位大小和杠杆
+	// ============================================================
 	if action == ActionOpen || action == ActionAdd {
 		dec.PositionSizeUSD = copySize
-
-		// 获取领航员杠杆
 		dec.Leverage = e.getLeaderLeverage(signal)
-		logger.Infof("📊 [%s] 跟单杠杆: %dx (SyncLeverage=%v)", e.traderID, dec.Leverage, e.config.SyncLeverage)
-
 		dec.Confidence = 90
+		logger.Infof("📊 [%s] %s | 金额=%.2f 杠杆=%dx", e.traderID, action, copySize, dec.Leverage)
 	}
 
-	// 减仓参数
+	// ============================================================
+	// 减仓：计算比例，按比例部分平仓
+	// ============================================================
 	if action == ActionReduce {
 		ratio := e.calculateReduceRatio(signal)
-		dec.CloseRatio = ratio // 设置减仓比例，执行层将按此比例部分平仓
-		dec.Reasoning = fmt.Sprintf("Copy trading: reduce %.0f%% following %s leader %s",
-			ratio*100, e.config.ProviderType, e.config.LeaderID)
-		logger.Infof("📊 [%s] 减仓比例: %.0f%% (非全量平仓)", e.traderID, ratio*100)
+
+		// 边界保护：减仓超过 95% 时，直接全量平仓
+		// 避免因精度问题导致 CloseRatio=1.0 时执行层误判
+		if ratio >= 0.95 {
+			logger.Infof("📊 [%s] 减仓比例 %.1f%% ≥ 95%%，转为全量平仓", e.traderID, ratio*100)
+			dec.CloseRatio = 0 // 0 = 全量平仓
+			dec.Reasoning = fmt.Sprintf("Copy trading: close (reduce %.0f%% → full close) following %s leader %s",
+				ratio*100, e.config.ProviderType, e.config.LeaderID)
+		} else {
+			dec.CloseRatio = ratio
+			dec.Reasoning = fmt.Sprintf("Copy trading: reduce %.0f%% following %s leader %s",
+				ratio*100, e.config.ProviderType, e.config.LeaderID)
+			logger.Infof("📊 [%s] 部分平仓 %.1f%%", e.traderID, ratio*100)
+		}
 	}
 
-	// 平仓参数 - CloseRatio 保持 0 表示全量平仓
+	// ============================================================
+	// 平仓：全量平仓
+	// ============================================================
 	if action == ActionClose {
 		dec.CloseRatio = 0 // 0 = 全量平仓
-		logger.Infof("📊 [%s] 全量平仓信号", e.traderID)
+		logger.Infof("📊 [%s] 全量平仓", e.traderID)
 	}
 
 	return dec
