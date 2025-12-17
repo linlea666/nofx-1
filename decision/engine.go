@@ -136,6 +136,9 @@ type Decision struct {
 	StopLoss        float64 `json:"stop_loss,omitempty"`
 	TakeProfit      float64 `json:"take_profit,omitempty"`
 
+	// Closing position parameters (for partial close/reduce)
+	CloseRatio float64 `json:"close_ratio,omitempty"` // 0 = close all, 0.5 = close 50%, etc.
+
 	// Common parameters
 	Confidence int     `json:"confidence,omitempty"` // Confidence level (0-100)
 	RiskUSD    float64 `json:"risk_usd,omitempty"`   // Maximum USD risk

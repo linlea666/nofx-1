@@ -444,10 +444,17 @@ func (e *Engine) buildDecision(signal *TradeSignal, action ActionType, copySize 
 
 	// 减仓参数
 	if action == ActionReduce {
-		// 可以在 Decision 中添加 ReduceRatio 字段
 		ratio := e.calculateReduceRatio(signal)
+		dec.CloseRatio = ratio // 设置减仓比例，执行层将按此比例部分平仓
 		dec.Reasoning = fmt.Sprintf("Copy trading: reduce %.0f%% following %s leader %s",
 			ratio*100, e.config.ProviderType, e.config.LeaderID)
+		logger.Infof("📊 [%s] 减仓比例: %.0f%% (非全量平仓)", e.traderID, ratio*100)
+	}
+
+	// 平仓参数 - CloseRatio 保持 0 表示全量平仓
+	if action == ActionClose {
+		dec.CloseRatio = 0 // 0 = 全量平仓
+		logger.Infof("📊 [%s] 全量平仓信号", e.traderID)
 	}
 
 	return dec

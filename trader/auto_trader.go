@@ -1087,7 +1087,7 @@ func (at *AutoTrader) executeCloseLongWithRecord(decision *decision.Decision, ac
 
 	// Get entry price and quantity from exchange API (most accurate)
 	var entryPrice float64
-	var quantity float64
+	var totalQuantity float64
 	positions, err := at.trader.GetPositions()
 	if err == nil {
 		for _, pos := range positions {
@@ -1096,15 +1096,23 @@ func (at *AutoTrader) executeCloseLongWithRecord(decision *decision.Decision, ac
 					entryPrice = ep
 				}
 				if amt, ok := pos["positionAmt"].(float64); ok && amt > 0 {
-					quantity = amt
+					totalQuantity = amt
 				}
 				break
 			}
 		}
 	}
 
+	// Calculate close quantity based on CloseRatio
+	// CloseRatio = 0 means close all, CloseRatio = 0.5 means close 50%, etc.
+	closeQuantity := float64(0) // 0 = close all
+	if decision.CloseRatio > 0 && decision.CloseRatio < 1 && totalQuantity > 0 {
+		closeQuantity = totalQuantity * decision.CloseRatio
+		logger.Infof("  📊 Partial close: %.0f%% of %.4f = %.4f", decision.CloseRatio*100, totalQuantity, closeQuantity)
+	}
+
 	// Close position
-	order, err := at.trader.CloseLong(decision.Symbol, 0) // 0 = close all
+	order, err := at.trader.CloseLong(decision.Symbol, closeQuantity)
 	if err != nil {
 		return err
 	}
@@ -1114,10 +1122,20 @@ func (at *AutoTrader) executeCloseLongWithRecord(decision *decision.Decision, ac
 		actionRecord.OrderID = orderID
 	}
 
-	// Record order to database and poll for confirmation
-	at.recordAndConfirmOrder(order, decision.Symbol, "close_long", quantity, marketData.CurrentPrice, 0, entryPrice)
+	// Determine actual closed quantity for recording
+	recordQuantity := totalQuantity
+	if closeQuantity > 0 {
+		recordQuantity = closeQuantity
+	}
 
-	logger.Infof("  ✓ Position closed successfully")
+	// Record order to database and poll for confirmation
+	at.recordAndConfirmOrder(order, decision.Symbol, "close_long", recordQuantity, marketData.CurrentPrice, 0, entryPrice)
+
+	if closeQuantity > 0 {
+		logger.Infof("  ✓ Position partially closed: %.4f (%.0f%%)", closeQuantity, decision.CloseRatio*100)
+	} else {
+		logger.Infof("  ✓ Position closed successfully")
+	}
 	return nil
 }
 
@@ -1134,7 +1152,7 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *decision.Decision, a
 
 	// Get entry price and quantity from exchange API (most accurate)
 	var entryPrice float64
-	var quantity float64
+	var totalQuantity float64
 	positions, err := at.trader.GetPositions()
 	if err == nil {
 		for _, pos := range positions {
@@ -1143,15 +1161,23 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *decision.Decision, a
 					entryPrice = ep
 				}
 				if amt, ok := pos["positionAmt"].(float64); ok {
-					quantity = -amt // positionAmt is negative for short
+					totalQuantity = -amt // positionAmt is negative for short
 				}
 				break
 			}
 		}
 	}
 
+	// Calculate close quantity based on CloseRatio
+	// CloseRatio = 0 means close all, CloseRatio = 0.5 means close 50%, etc.
+	closeQuantity := float64(0) // 0 = close all
+	if decision.CloseRatio > 0 && decision.CloseRatio < 1 && totalQuantity > 0 {
+		closeQuantity = totalQuantity * decision.CloseRatio
+		logger.Infof("  📊 Partial close: %.0f%% of %.4f = %.4f", decision.CloseRatio*100, totalQuantity, closeQuantity)
+	}
+
 	// Close position
-	order, err := at.trader.CloseShort(decision.Symbol, 0) // 0 = close all
+	order, err := at.trader.CloseShort(decision.Symbol, closeQuantity)
 	if err != nil {
 		return err
 	}
@@ -1161,10 +1187,20 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *decision.Decision, a
 		actionRecord.OrderID = orderID
 	}
 
-	// Record order to database and poll for confirmation
-	at.recordAndConfirmOrder(order, decision.Symbol, "close_short", quantity, marketData.CurrentPrice, 0, entryPrice)
+	// Determine actual closed quantity for recording
+	recordQuantity := totalQuantity
+	if closeQuantity > 0 {
+		recordQuantity = closeQuantity
+	}
 
-	logger.Infof("  ✓ Position closed successfully")
+	// Record order to database and poll for confirmation
+	at.recordAndConfirmOrder(order, decision.Symbol, "close_short", recordQuantity, marketData.CurrentPrice, 0, entryPrice)
+
+	if closeQuantity > 0 {
+		logger.Infof("  ✓ Position partially closed: %.4f (%.0f%%)", closeQuantity, decision.CloseRatio*100)
+	} else {
+		logger.Infof("  ✓ Position closed successfully")
+	}
 	return nil
 }
 
