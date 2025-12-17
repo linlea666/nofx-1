@@ -1860,12 +1860,24 @@ func (s *Server) handleTraderList(c *gin.Context) {
 
 	result := make([]map[string]interface{}, 0, len(traders))
 	for _, trader := range traders {
+		// Get decision mode first
+		decisionMode, _ := s.store.CopyTrade().GetDecisionMode(trader.ID)
+		if decisionMode == "" {
+			decisionMode = "ai"
+		}
+
 		// Get real-time running status
 		isRunning := trader.IsRunning
-		if at, err := s.traderManager.GetTrader(trader.ID); err == nil {
-			status := at.GetStatus()
-			if running, ok := status["is_running"].(bool); ok {
-				isRunning = running
+		if decisionMode == "copy_trade" {
+			// For copy trade mode, check copy trading engine status
+			isRunning = copytrade.IsCopyTradingRunning(trader.ID)
+		} else {
+			// For AI mode, check AutoTrader status
+			if at, err := s.traderManager.GetTrader(trader.ID); err == nil {
+				status := at.GetStatus()
+				if running, ok := status["is_running"].(bool); ok {
+					isRunning = running
+				}
 			}
 		}
 
@@ -1875,12 +1887,6 @@ func (s *Server) handleTraderList(c *gin.Context) {
 			if strategy, err := s.store.Strategy().Get(userID, trader.StrategyID); err == nil {
 				strategyName = strategy.Name
 			}
-		}
-
-		// Get decision mode
-		decisionMode, _ := s.store.CopyTrade().GetDecisionMode(trader.ID)
-		if decisionMode == "" {
-			decisionMode = "ai"
 		}
 
 		// Return complete AIModelID (e.g. "admin_deepseek"), don't truncate
@@ -1919,23 +1925,29 @@ func (s *Server) handleGetTraderConfig(c *gin.Context) {
 	}
 	traderConfig := fullCfg.Trader
 
+	// Get decision mode first
+	decisionMode, _ := s.store.CopyTrade().GetDecisionMode(traderID)
+	if decisionMode == "" {
+		decisionMode = "ai"
+	}
+
 	// Get real-time running status
 	isRunning := traderConfig.IsRunning
-	if at, err := s.traderManager.GetTrader(traderID); err == nil {
-		status := at.GetStatus()
-		if running, ok := status["is_running"].(bool); ok {
-			isRunning = running
+	if decisionMode == "copy_trade" {
+		// For copy trade mode, check copy trading engine status
+		isRunning = copytrade.IsCopyTradingRunning(traderID)
+	} else {
+		// For AI mode, check AutoTrader status
+		if at, err := s.traderManager.GetTrader(traderID); err == nil {
+			status := at.GetStatus()
+			if running, ok := status["is_running"].(bool); ok {
+				isRunning = running
+			}
 		}
 	}
 
 	// Return complete model ID without conversion, consistent with frontend model list
 	aiModelID := traderConfig.AIModelID
-
-	// Get decision mode
-	decisionMode, _ := s.store.CopyTrade().GetDecisionMode(traderID)
-	if decisionMode == "" {
-		decisionMode = "ai"
-	}
 
 	// Get copy trade config if in copy trade mode
 	var copyConfig map[string]interface{}
