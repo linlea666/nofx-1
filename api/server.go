@@ -41,6 +41,28 @@ func (a *CopyTradeExecutorAdapter) GetPositions() ([]map[string]interface{}, err
 	return a.trader.GetPositions()
 }
 
+// isTraderRunning checks if a trader is running (unified for both AI and copy trade modes)
+// This is the single source of truth for trader running status
+func (s *Server) isTraderRunning(traderID string) bool {
+	// Check decision mode
+	decisionMode, _ := s.store.CopyTrade().GetDecisionMode(traderID)
+
+	if decisionMode == "copy_trade" {
+		// For copy trade mode, check copy trading engine status
+		return copytrade.IsCopyTradingRunning(traderID)
+	}
+
+	// For AI mode, check AutoTrader status
+	if at, err := s.traderManager.GetTrader(traderID); err == nil {
+		status := at.GetStatus()
+		if running, ok := status["is_running"].(bool); ok {
+			return running
+		}
+	}
+
+	return false
+}
+
 // Server HTTP API server
 type Server struct {
 	router          *gin.Engine
@@ -955,13 +977,18 @@ func (s *Server) handleDeleteTrader(c *gin.Context) {
 		return
 	}
 
-	// If trader is running, stop it first
-	if trader, err := s.traderManager.GetTrader(traderID); err == nil {
-		status := trader.GetStatus()
-		if isRunning, ok := status["is_running"].(bool); ok && isRunning {
-			trader.Stop()
-			logger.Infof("⏹  Stopped running trader: %s", traderID)
+	// If trader is running, stop it first (unified check)
+	if s.isTraderRunning(traderID) {
+		// Check decision mode to determine stop type
+		decisionMode, _ := s.store.CopyTrade().GetDecisionMode(traderID)
+		if decisionMode == "copy_trade" {
+			copytrade.StopCopyTradingForTrader(traderID)
+			s.store.CopyTrade().SetEnabled(traderID, false)
 		}
+		if trader, err := s.traderManager.GetTrader(traderID); err == nil {
+			trader.Stop()
+		}
+		logger.Infof("⏹  Stopped running trader: %s", traderID)
 	}
 
 	// Remove trader from memory
@@ -983,15 +1010,14 @@ func (s *Server) handleStartTrader(c *gin.Context) {
 		return
 	}
 
-	// Check if trader exists in memory and if it's running
-	existingTrader, _ := s.traderManager.GetTrader(traderID)
-	if existingTrader != nil {
-		status := existingTrader.GetStatus()
-		if isRunning, ok := status["is_running"].(bool); ok && isRunning {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Trader is already running"})
-			return
-		}
-		// Trader exists but is stopped - remove from memory to reload fresh config
+	// Check if trader is already running (unified check for both AI and copy trade modes)
+	if s.isTraderRunning(traderID) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Trader is already running"})
+		return
+	}
+
+	// Remove from memory to reload fresh config
+	if _, err := s.traderManager.GetTrader(traderID); err == nil {
 		logger.Infof("🔄 Removing stopped trader %s from memory to reload config...", traderID)
 		s.traderManager.RemoveTrader(traderID)
 	}
@@ -1094,15 +1120,8 @@ func (s *Server) handleStopTrader(c *gin.Context) {
 		return
 	}
 
-	trader, err := s.traderManager.GetTrader(traderID)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Trader does not exist"})
-		return
-	}
-
-	// Check if trader is running
-	status := trader.GetStatus()
-	if isRunning, ok := status["is_running"].(bool); ok && !isRunning {
+	// Check if trader is running (unified check for both AI and copy trade modes)
+	if !s.isTraderRunning(traderID) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Trader is already stopped"})
 		return
 	}
@@ -1119,16 +1138,17 @@ func (s *Server) handleStopTrader(c *gin.Context) {
 		s.store.CopyTrade().SetEnabled(traderID, false)
 	}
 
-	// Stop trader
-	trader.Stop()
+	// Stop AutoTrader (also stop for copy trade mode in case it was partially started)
+	if trader, err := s.traderManager.GetTrader(traderID); err == nil {
+		trader.Stop()
+	}
 
 	// Update running status in database
-	err = s.store.Trader().UpdateStatus(userID, traderID, false)
-	if err != nil {
+	if err := s.store.Trader().UpdateStatus(userID, traderID, false); err != nil {
 		logger.Infof("⚠️  Failed to update trader status: %v", err)
 	}
 
-	logger.Infof("⏹  Trader %s stopped", trader.GetName())
+	logger.Infof("⏹  Trader %s stopped", traderID)
 	c.JSON(http.StatusOK, gin.H{"message": "Trader stopped"})
 }
 
@@ -1860,26 +1880,14 @@ func (s *Server) handleTraderList(c *gin.Context) {
 
 	result := make([]map[string]interface{}, 0, len(traders))
 	for _, trader := range traders {
-		// Get decision mode first
+		// Get decision mode
 		decisionMode, _ := s.store.CopyTrade().GetDecisionMode(trader.ID)
 		if decisionMode == "" {
 			decisionMode = "ai"
 		}
 
-		// Get real-time running status
-		isRunning := trader.IsRunning
-		if decisionMode == "copy_trade" {
-			// For copy trade mode, check copy trading engine status
-			isRunning = copytrade.IsCopyTradingRunning(trader.ID)
-		} else {
-			// For AI mode, check AutoTrader status
-			if at, err := s.traderManager.GetTrader(trader.ID); err == nil {
-				status := at.GetStatus()
-				if running, ok := status["is_running"].(bool); ok {
-					isRunning = running
-				}
-			}
-		}
+		// Get real-time running status (unified check)
+		isRunning := s.isTraderRunning(trader.ID)
 
 		// Get strategy name if strategy_id is set
 		var strategyName string
@@ -1925,26 +1933,14 @@ func (s *Server) handleGetTraderConfig(c *gin.Context) {
 	}
 	traderConfig := fullCfg.Trader
 
-	// Get decision mode first
+	// Get decision mode
 	decisionMode, _ := s.store.CopyTrade().GetDecisionMode(traderID)
 	if decisionMode == "" {
 		decisionMode = "ai"
 	}
 
-	// Get real-time running status
-	isRunning := traderConfig.IsRunning
-	if decisionMode == "copy_trade" {
-		// For copy trade mode, check copy trading engine status
-		isRunning = copytrade.IsCopyTradingRunning(traderID)
-	} else {
-		// For AI mode, check AutoTrader status
-		if at, err := s.traderManager.GetTrader(traderID); err == nil {
-			status := at.GetStatus()
-			if running, ok := status["is_running"].(bool); ok {
-				isRunning = running
-			}
-		}
-	}
+	// Get real-time running status (unified check)
+	isRunning := s.isTraderRunning(traderID)
 
 	// Return complete model ID without conversion, consistent with frontend model list
 	aiModelID := traderConfig.AIModelID
