@@ -850,16 +850,26 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 		return fmt.Errorf("failed to get positions: %w", err)
 	}
 
-	// [CODE ENFORCED] Check max positions limit
-	if err := at.enforceMaxPositions(len(positions)); err != nil {
-		return err
+	// 检查是否为加仓操作（跟单加仓时 Reasoning 包含 "add"）
+	isAddPosition := strings.Contains(strings.ToLower(decision.Reasoning), "add")
+
+	// [CODE ENFORCED] Check max positions limit (新开仓时检查，加仓时跳过)
+	if !isAddPosition {
+		if err := at.enforceMaxPositions(len(positions)); err != nil {
+			return err
+		}
 	}
 
 	// Check if there's already a position in the same symbol and direction
-	for _, pos := range positions {
-		if pos["symbol"] == decision.Symbol && pos["side"] == "long" {
-			return fmt.Errorf("❌ %s already has long position, close it first", decision.Symbol)
+	// 加仓操作时跳过此检查
+	if !isAddPosition {
+		for _, pos := range positions {
+			if pos["symbol"] == decision.Symbol && pos["side"] == "long" {
+				return fmt.Errorf("❌ %s already has long position, close it first", decision.Symbol)
+			}
 		}
+	} else {
+		logger.Infof("  📊 加仓操作，跳过重复仓位检查")
 	}
 
 	// Get current price
@@ -967,16 +977,26 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 		return fmt.Errorf("failed to get positions: %w", err)
 	}
 
-	// [CODE ENFORCED] Check max positions limit
-	if err := at.enforceMaxPositions(len(positions)); err != nil {
-		return err
+	// 检查是否为加仓操作（跟单加仓时 Reasoning 包含 "add"）
+	isAddPosition := strings.Contains(strings.ToLower(decision.Reasoning), "add")
+
+	// [CODE ENFORCED] Check max positions limit (新开仓时检查，加仓时跳过)
+	if !isAddPosition {
+		if err := at.enforceMaxPositions(len(positions)); err != nil {
+			return err
+		}
 	}
 
 	// Check if there's already a position in the same symbol and direction
-	for _, pos := range positions {
-		if pos["symbol"] == decision.Symbol && pos["side"] == "short" {
-			return fmt.Errorf("❌ %s already has short position, close it first", decision.Symbol)
+	// 加仓操作时跳过此检查
+	if !isAddPosition {
+		for _, pos := range positions {
+			if pos["symbol"] == decision.Symbol && pos["side"] == "short" {
+				return fmt.Errorf("❌ %s already has short position, close it first", decision.Symbol)
+			}
 		}
+	} else {
+		logger.Infof("  📊 加仓操作，跳过重复仓位检查")
 	}
 
 	// Get current price

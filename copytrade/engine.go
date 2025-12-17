@@ -471,9 +471,10 @@ func (e *Engine) buildDecision(signal *TradeSignal, action ActionType, copySize 
 	fill := signal.Fill
 
 	dec := decision.Decision{
-		Symbol:    fill.Symbol,
-		Action:    e.mapAction(action, fill.PositionSide),
-		Reasoning: fmt.Sprintf("Copy trading: %s following %s leader %s", action, e.config.ProviderType, e.config.LeaderID),
+		Symbol:     fill.Symbol,
+		Action:     e.mapAction(action, fill.PositionSide),
+		Reasoning:  fmt.Sprintf("Copy trading: %s following %s leader %s", action, e.config.ProviderType, e.config.LeaderID),
+		EntryPrice: fill.Price, // 记录领航员成交价格，用于前端显示
 	}
 
 	// ============================================================
@@ -483,7 +484,7 @@ func (e *Engine) buildDecision(signal *TradeSignal, action ActionType, copySize 
 		dec.PositionSizeUSD = copySize
 		dec.Leverage = e.getLeaderLeverage(signal)
 		dec.Confidence = 90
-		logger.Infof("📊 [%s] %s | 金额=%.2f 杠杆=%dx", e.traderID, action, copySize, dec.Leverage)
+		logger.Infof("📊 [%s] %s | 金额=%.2f 杠杆=%dx 入场价=%.4f", e.traderID, action, copySize, dec.Leverage, fill.Price)
 	}
 
 	// ============================================================

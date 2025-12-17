@@ -143,6 +143,9 @@ type Decision struct {
 	Confidence int     `json:"confidence,omitempty"` // Confidence level (0-100)
 	RiskUSD    float64 `json:"risk_usd,omitempty"`   // Maximum USD risk
 	Reasoning  string  `json:"reasoning"`
+
+	// 价格信息（用于跟单记录入场价）
+	EntryPrice float64 `json:"entry_price,omitempty"` // 入场价格（跟单时记录领航员成交价）
 }
 
 // FullDecision AI's complete decision (including chain of thought)

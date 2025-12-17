@@ -170,6 +170,7 @@ func (ti *TraderIntegration) executeFullDecision(fullDec *decision.FullDecision)
 			Action:    dec.Action,
 			Symbol:    dec.Symbol,
 			Leverage:  dec.Leverage,
+			Price:     dec.EntryPrice, // 使用领航员成交价格作为入场价
 			Reasoning: dec.Reasoning,
 			Timestamp: time.Now(),
 		}
