@@ -20,13 +20,14 @@ type DecisionExecutor interface {
 
 // TraderIntegration 跟单与交易执行的集成
 type TraderIntegration struct {
-	traderID string
-	executor DecisionExecutor
-	engine   *Engine
-	store    *store.Store
-	ctx      context.Context
-	cancel   context.CancelFunc
-	running  bool
+	traderID    string
+	executor    DecisionExecutor
+	engine      *Engine
+	store       *store.Store
+	ctx         context.Context
+	cancel      context.CancelFunc
+	running     bool
+	cycleNumber int // 跟单周期计数器
 }
 
 // NewTraderIntegration 创建交易集成
@@ -148,28 +149,140 @@ func (ti *TraderIntegration) consumeDecisions() {
 
 // executeFullDecision 执行完整决策
 func (ti *TraderIntegration) executeFullDecision(fullDec *decision.FullDecision) {
-	for _, dec := range fullDec.Decisions {
+	ti.cycleNumber++
+
+	// 构建决策记录
+	decisionActions := make([]store.DecisionAction, 0, len(fullDec.Decisions))
+	executionLogs := make([]string, 0)
+
+	for i := range fullDec.Decisions {
+		dec := &fullDec.Decisions[i]
+
 		// 记录决策日志
-		ti.logDecision(fullDec, &dec)
+		ti.logDecision(fullDec, dec)
 
 		// 执行交易
 		startTime := time.Now()
-		err := ti.executor.ExecuteDecision(&dec)
+		err := ti.executor.ExecuteDecision(dec)
+
+		// 构建决策动作记录
+		action := store.DecisionAction{
+			Action:    dec.Action,
+			Symbol:    dec.Symbol,
+			Leverage:  dec.Leverage,
+			Reasoning: dec.Reasoning,
+			Timestamp: time.Now(),
+		}
 
 		if err != nil {
 			logger.Errorf("❌ [%s] 跟单执行失败 | %s %s | error=%v",
 				ti.traderID, dec.Action, dec.Symbol, err)
-
-			// 保存错误日志
-			ti.saveSignalLog(&dec, "failed", err.Error())
+			executionLogs = append(executionLogs, fmt.Sprintf("❌ %s %s 失败: %v", dec.Action, dec.Symbol, err))
+			ti.saveSignalLog(dec, "failed", err.Error())
 		} else {
+			duration := time.Since(startTime).Milliseconds()
 			logger.Infof("✅ [%s] 跟单执行成功 | %s %s | 耗时=%dms",
-				ti.traderID, dec.Action, dec.Symbol, time.Since(startTime).Milliseconds())
+				ti.traderID, dec.Action, dec.Symbol, duration)
+			executionLogs = append(executionLogs, fmt.Sprintf("✅ %s %s 成功 (耗时 %dms)", dec.Action, dec.Symbol, duration))
+			ti.saveSignalLog(dec, "executed", "")
+		}
 
-			// 保存成功日志
-			ti.saveSignalLog(&dec, "executed", "")
+		decisionActions = append(decisionActions, action)
+	}
+
+	// 保存到 decision_records 表，复用现有日志系统
+	ti.saveDecisionRecord(fullDec, decisionActions, executionLogs)
+}
+
+// saveDecisionRecord 保存跟单决策到 decision_records 表
+func (ti *TraderIntegration) saveDecisionRecord(fullDec *decision.FullDecision, actions []store.DecisionAction, executionLogs []string) {
+	// 构建跟单的思维链（类似 AI 的 CoT）
+	cotTrace := ti.buildCopyTradeCoT(fullDec)
+
+	// 获取当前账户状态
+	accountState := store.AccountSnapshot{}
+	if info, err := ti.executor.GetAccountInfo(); err == nil {
+		if equity, ok := info["total_equity"].(float64); ok {
+			accountState.TotalBalance = equity
+		}
+		if available, ok := info["available_balance"].(float64); ok {
+			accountState.AvailableBalance = available
 		}
 	}
+
+	// 获取当前持仓
+	positions := make([]store.PositionSnapshot, 0)
+	if posData, err := ti.executor.GetPositions(); err == nil {
+		for _, p := range posData {
+			pos := store.PositionSnapshot{}
+			if s, ok := p["symbol"].(string); ok {
+				pos.Symbol = s
+			}
+			if s, ok := p["side"].(string); ok {
+				pos.Side = s
+			}
+			if v, ok := p["quantity"].(float64); ok {
+				pos.PositionAmt = v
+			}
+			if v, ok := p["entryPrice"].(float64); ok {
+				pos.EntryPrice = v
+			}
+			if v, ok := p["markPrice"].(float64); ok {
+				pos.MarkPrice = v
+			}
+			if v, ok := p["unrealizedPnl"].(float64); ok {
+				pos.UnrealizedProfit = v
+			}
+			positions = append(positions, pos)
+		}
+	}
+
+	record := &store.DecisionRecord{
+		TraderID:            ti.traderID,
+		CycleNumber:         ti.cycleNumber,
+		Timestamp:           time.Now(),
+		SystemPrompt:        "Copy Trading Mode",
+		InputPrompt:         fmt.Sprintf("跟单领航员: %s (%s)", ti.engine.config.LeaderID, ti.engine.config.ProviderType),
+		CoTTrace:            cotTrace,
+		DecisionJSON:        fmt.Sprintf(`{"mode":"copy_trade","leader":"%s"}`, ti.engine.config.LeaderID),
+		CandidateCoins:      []string{},
+		ExecutionLog:        executionLogs,
+		Success:             true,
+		Decisions:           actions,
+		AccountState:        accountState,
+		Positions:           positions,
+		AIRequestDurationMs: 0, // 跟单没有 AI 请求
+	}
+
+	if err := ti.store.Decision().LogDecision(record); err != nil {
+		logger.Warnf("⚠️ [%s] 保存跟单决策记录失败: %v", ti.traderID, err)
+	} else {
+		logger.Infof("📝 [%s] 跟单决策记录已保存: cycle=%d", ti.traderID, ti.cycleNumber)
+	}
+}
+
+// buildCopyTradeCoT 构建跟单的思维链描述
+func (ti *TraderIntegration) buildCopyTradeCoT(fullDec *decision.FullDecision) string {
+	var cot string
+	cot += "## 📋 跟单决策分析\n\n"
+	cot += fmt.Sprintf("**领航员**: %s\n", ti.engine.config.LeaderID)
+	cot += fmt.Sprintf("**数据源**: %s\n", ti.engine.config.ProviderType)
+	cot += fmt.Sprintf("**跟单比例**: %.0f%%\n\n", ti.engine.config.CopyRatio*100)
+
+	for _, dec := range fullDec.Decisions {
+		cot += fmt.Sprintf("### %s %s\n", dec.Action, dec.Symbol)
+		cot += fmt.Sprintf("- **操作**: %s\n", dec.Action)
+		cot += fmt.Sprintf("- **币种**: %s\n", dec.Symbol)
+		if dec.PositionSizeUSD > 0 {
+			cot += fmt.Sprintf("- **金额**: $%.2f\n", dec.PositionSizeUSD)
+		}
+		if dec.Leverage > 0 {
+			cot += fmt.Sprintf("- **杠杆**: %dx\n", dec.Leverage)
+		}
+		cot += fmt.Sprintf("- **原因**: %s\n\n", dec.Reasoning)
+	}
+
+	return cot
 }
 
 // logDecision 记录决策日志（兼容现有 AI 决策日志格式）

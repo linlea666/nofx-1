@@ -435,11 +435,9 @@ func (e *Engine) buildDecision(signal *TradeSignal, action ActionType, copySize 
 	if action == ActionOpen || action == ActionAdd {
 		dec.PositionSizeUSD = copySize
 
-		if e.config.SyncLeverage && signal.LeaderPosition != nil {
-			dec.Leverage = signal.LeaderPosition.Leverage
-		} else {
-			dec.Leverage = 5 // 默认杠杆
-		}
+		// 获取领航员杠杆
+		dec.Leverage = e.getLeaderLeverage(signal)
+		logger.Infof("📊 [%s] 跟单杠杆: %dx (SyncLeverage=%v)", e.traderID, dec.Leverage, e.config.SyncLeverage)
 
 		dec.Confidence = 90
 	}
@@ -453,6 +451,36 @@ func (e *Engine) buildDecision(signal *TradeSignal, action ActionType, copySize 
 	}
 
 	return dec
+}
+
+// getLeaderLeverage 获取领航员杠杆
+// 优先级：1.信号中的持仓杠杆 2.实时获取 3.默认值
+func (e *Engine) getLeaderLeverage(signal *TradeSignal) int {
+	// 1. 如果不同步杠杆，返回默认值
+	if !e.config.SyncLeverage {
+		return 10 // 默认 10x
+	}
+
+	// 2. 如果信号中有持仓信息，使用该杠杆
+	if signal.LeaderPosition != nil && signal.LeaderPosition.Leverage > 0 {
+		return signal.LeaderPosition.Leverage
+	}
+
+	// 3. 实时获取领航员当前持仓的杠杆
+	if e.provider != nil {
+		state, err := e.provider.GetAccountState(e.config.LeaderID)
+		if err == nil && state.Positions != nil {
+			key := PositionKey(signal.Fill.Symbol, signal.Fill.PositionSide)
+			if pos, ok := state.Positions[key]; ok && pos.Leverage > 0 {
+				logger.Infof("🔍 [%s] 实时获取领航员 %s 杠杆: %dx", e.traderID, signal.Fill.Symbol, pos.Leverage)
+				return pos.Leverage
+			}
+		}
+	}
+
+	// 4. 默认值
+	logger.Warnf("⚠️ [%s] 无法获取领航员杠杆，使用默认值 10x", e.traderID)
+	return 10
 }
 
 func (e *Engine) mapAction(action ActionType, side SideType) string {

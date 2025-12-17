@@ -1131,6 +1131,12 @@ function TraderDetailsPage({
                       </th>
                       <th
                         className="px-1 pb-3 font-semibold text-gray-400 whitespace-nowrap text-right"
+                        title={t('margin', language)}
+                      >
+                        {language === 'zh' ? '保证金' : 'Margin'}
+                      </th>
+                      <th
+                        className="px-1 pb-3 font-semibold text-gray-400 whitespace-nowrap text-right"
                         title={t('unrealizedPnL', language)}
                       >
                         {language === 'zh' ? '未实现盈亏' : 'uPnL'}
@@ -1237,6 +1243,12 @@ function TraderDetailsPage({
                           style={{ color: '#F0B90B' }}
                         >
                           {pos.leverage}x
+                        </td>
+                        <td
+                          className="px-1 py-3 font-mono whitespace-nowrap text-right"
+                          style={{ color: '#EAECEF' }}
+                        >
+                          {pos.margin_used?.toFixed(2) || '0.00'}
                         </td>
                         <td className="px-1 py-3 font-mono whitespace-nowrap text-right">
                           <span
