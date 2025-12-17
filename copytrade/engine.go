@@ -27,9 +27,9 @@ type Engine struct {
 	seenTTL   time.Duration
 
 	// 状态缓存
-	leaderState     *AccountState
-	leaderStateMu   sync.RWMutex
-	lastStateSync   time.Time
+	leaderState       *AccountState
+	leaderStateMu     sync.RWMutex
+	lastStateSync     time.Time
 	stateSyncInterval time.Duration
 
 	// 决策输出
@@ -230,6 +230,18 @@ func (e *Engine) buildSignal(fill *Fill) *TradeSignal {
 func (e *Engine) processSignal(signal *TradeSignal) {
 	fill := signal.Fill
 
+	// 🔄 对于 Close 类型操作，强制同步领航员状态以获取准确的剩余仓位
+	// 这确保了减仓 vs 平仓的判断准确性
+	if fill.Action == ActionClose {
+		if err := e.syncLeaderState(); err != nil {
+			logger.Warnf("⚠️ [%s] Close 操作前状态同步失败: %v", e.traderID, err)
+		} else {
+			// 重新构建 signal 以使用最新状态
+			signal = e.buildSignal(fill)
+			logger.Debugf("🔄 [%s] Close 操作已刷新领航员状态", e.traderID)
+		}
+	}
+
 	// 1. 🎯 核心规则：只跟新开仓（本地仓位对比法）
 	follow, reason := e.shouldFollowSignal(signal)
 	if !follow {
@@ -320,9 +332,17 @@ func (e *Engine) determineAction(signal *TradeSignal) ActionType {
 	}
 
 	// 减仓/平仓：通过领航员实时持仓判断
-	if signal.LeaderPosition == nil || signal.LeaderPosition.Size == 0 {
+	if signal.LeaderPosition == nil {
+		logger.Infof("📊 [%s] %s 判断为平仓 | 原因: 领航员持仓数据为空", e.traderID, fill.Symbol)
 		return ActionClose // 领航员仓位清零 = 平仓
 	}
+
+	if signal.LeaderPosition.Size == 0 {
+		logger.Infof("📊 [%s] %s 判断为平仓 | 原因: 领航员仓位已清零", e.traderID, fill.Symbol)
+		return ActionClose // 领航员仓位清零 = 平仓
+	}
+
+	logger.Infof("📊 [%s] %s 判断为减仓 | 领航员剩余仓位=%.4f (非清零)", e.traderID, fill.Symbol, signal.LeaderPosition.Size)
 	return ActionReduce // 领航员仓位仍有 = 减仓
 }
 
@@ -371,25 +391,25 @@ func (e *Engine) calculateCopySize(signal *TradeSignal) (float64, []Warning) {
 	// 预警检查（不阻止交易）
 	if e.config.MinTradeWarn > 0 && copySize < e.config.MinTradeWarn {
 		warnings = append(warnings, Warning{
-			Timestamp:    time.Now(),
-			Symbol:       fill.Symbol,
-			Type:         "low_value",
-			Message:      fmt.Sprintf("跟单金额较小 (%.2f < %.2f)，仍执行", copySize, e.config.MinTradeWarn),
-			SignalValue:  leaderTradeValue,
-			CopyValue:    copySize,
-			Executed:     true,
+			Timestamp:   time.Now(),
+			Symbol:      fill.Symbol,
+			Type:        "low_value",
+			Message:     fmt.Sprintf("跟单金额较小 (%.2f < %.2f)，仍执行", copySize, e.config.MinTradeWarn),
+			SignalValue: leaderTradeValue,
+			CopyValue:   copySize,
+			Executed:    true,
 		})
 	}
 
 	if e.config.MaxTradeWarn > 0 && copySize > e.config.MaxTradeWarn {
 		warnings = append(warnings, Warning{
-			Timestamp:    time.Now(),
-			Symbol:       fill.Symbol,
-			Type:         "high_value",
-			Message:      fmt.Sprintf("跟单金额较大 (%.2f > %.2f)，仍执行", copySize, e.config.MaxTradeWarn),
-			SignalValue:  leaderTradeValue,
-			CopyValue:    copySize,
-			Executed:     true,
+			Timestamp:   time.Now(),
+			Symbol:      fill.Symbol,
+			Type:        "high_value",
+			Message:     fmt.Sprintf("跟单金额较大 (%.2f > %.2f)，仍执行", copySize, e.config.MaxTradeWarn),
+			SignalValue: leaderTradeValue,
+			CopyValue:   copySize,
+			Executed:    true,
 		})
 	}
 
@@ -407,13 +427,15 @@ func (e *Engine) calculateReduceRatio(signal *TradeSignal) float64 {
 	leaderPreviousSize := leaderCurrentSize + reduceSize
 
 	if leaderPreviousSize <= 0 {
+		logger.Infof("📊 [%s] %s 减仓比例计算 | 减仓量=%.4f 当前仓位=%.4f 减仓前=%.4f → 比例=100%% (全量)",
+			e.traderID, signal.Fill.Symbol, reduceSize, leaderCurrentSize, leaderPreviousSize)
 		return 1.0 // 全部平仓
 	}
 
 	ratio := reduceSize / leaderPreviousSize
 
-	logger.Debugf("📊 [%s] 减仓计算 | 减仓量=%.4f 减仓前=%.4f → 比例=%.2f%%",
-		e.traderID, reduceSize, leaderPreviousSize, ratio*100)
+	logger.Infof("📊 [%s] %s 减仓比例计算 | 减仓量=%.4f 当前仓位=%.4f 减仓前=%.4f → 比例=%.2f%%",
+		e.traderID, signal.Fill.Symbol, reduceSize, leaderCurrentSize, leaderPreviousSize, ratio*100)
 
 	return ratio
 }
@@ -667,4 +689,3 @@ func (e *Engine) logWarning(w Warning) {
 
 	logger.Warnf("⚠️ [%s] 预警:%s | %s | %s", e.traderID, w.Type, w.Symbol, w.Message)
 }
-
