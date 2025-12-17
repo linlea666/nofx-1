@@ -1181,7 +1181,15 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *decision.Decision, a
 					entryPrice = ep
 				}
 				if amt, ok := pos["positionAmt"].(float64); ok {
-					totalQuantity = -amt // positionAmt is negative for short
+					// positionAmt format varies by exchange:
+					// - Binance/Bybit: negative for short positions
+					// - Hyperliquid/OKX/Bitget: already positive (normalized)
+					// Use absolute value to handle both cases
+					if amt < 0 {
+						totalQuantity = -amt
+					} else {
+						totalQuantity = amt
+					}
 				}
 				break
 			}
