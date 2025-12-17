@@ -9,7 +9,9 @@ import (
 	"nofx/auth"
 	"nofx/backtest"
 	"nofx/config"
+	"nofx/copytrade"
 	"nofx/crypto"
+	"nofx/decision"
 	"nofx/logger"
 	"nofx/manager"
 	"nofx/store"
@@ -21,6 +23,23 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
+
+// CopyTradeExecutorAdapter wraps AutoTrader to implement copytrade.DecisionExecutor
+type CopyTradeExecutorAdapter struct {
+	trader *trader.AutoTrader
+}
+
+func (a *CopyTradeExecutorAdapter) ExecuteDecision(d *decision.Decision) error {
+	return a.trader.ExecuteDecision(d)
+}
+
+func (a *CopyTradeExecutorAdapter) GetAccountInfo() (map[string]interface{}, error) {
+	return a.trader.GetAccountInfo()
+}
+
+func (a *CopyTradeExecutorAdapter) GetPositions() ([]map[string]interface{}, error) {
+	return a.trader.GetPositions()
+}
 
 // Server HTTP API server
 type Server struct {
@@ -1023,13 +1042,27 @@ func (s *Server) handleStartTrader(c *gin.Context) {
 		return
 	}
 
-	// Start trader
-	go func() {
-		logger.Infof("▶️  Starting trader %s (%s)", traderID, trader.GetName())
-		if err := trader.Run(); err != nil {
-			logger.Infof("❌ Trader %s runtime error: %v", trader.GetName(), err)
-		}
-	}()
+	// Check decision mode to determine startup type
+	decisionMode, _ := s.store.CopyTrade().GetDecisionMode(traderID)
+
+	if decisionMode == "copy_trade" {
+		// Start in copy trade mode
+		logger.Infof("🎯 [%s] Starting in copy trade mode...", trader.GetName())
+		go func() {
+			executor := &CopyTradeExecutorAdapter{trader: trader}
+			if err := copytrade.StartCopyTradingForTrader(traderID, executor, s.store); err != nil {
+				logger.Infof("❌ Trader %s copy trade runtime error: %v", trader.GetName(), err)
+			}
+		}()
+	} else {
+		// Start in AI mode (default)
+		logger.Infof("🤖 [%s] Starting in AI mode...", trader.GetName())
+		go func() {
+			if err := trader.Run(); err != nil {
+				logger.Infof("❌ Trader %s runtime error: %v", trader.GetName(), err)
+			}
+		}()
+	}
 
 	// Update running status in database
 	err = s.store.Trader().UpdateStatus(userID, traderID, true)
