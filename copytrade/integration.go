@@ -20,13 +20,13 @@ type DecisionExecutor interface {
 
 // TraderIntegration 跟单与交易执行的集成
 type TraderIntegration struct {
-	traderID   string
-	executor   DecisionExecutor
-	engine     *Engine
-	store      *store.Store
-	ctx        context.Context
-	cancel     context.CancelFunc
-	running    bool
+	traderID string
+	executor DecisionExecutor
+	engine   *Engine
+	store    *store.Store
+	ctx      context.Context
+	cancel   context.CancelFunc
+	running  bool
 }
 
 // NewTraderIntegration 创建交易集成
@@ -337,4 +337,3 @@ func StopAllCopyTrading() {
 	}
 	integrations = make(map[string]*TraderIntegration)
 }
-
