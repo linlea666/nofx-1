@@ -8,12 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"nofx/logger"
 	"math"
 	"math/big"
 	"net/http"
 	"net/url"
 	"nofx/hook"
+	"nofx/logger"
 	"sort"
 	"strconv"
 	"strings"
@@ -623,6 +623,14 @@ func (t *AsterTrader) OpenLong(symbol string, quantity float64, leverage int) (m
 	logger.Infof("  📏 Precision handling: price %.8f -> %s (precision=%d), quantity %.8f -> %s (precision=%d)",
 		limitPrice, priceStr, prec.PricePrecision, quantity, qtyStr, prec.QuantityPrecision)
 
+	// Check if quantity is too small after precision formatting
+	if formattedQty <= 0 {
+		minQty := math.Pow10(-prec.QuantityPrecision)
+		minValue := minQty * price
+		return nil, fmt.Errorf("quantity too small: %.8f -> 0 after precision formatting (min: %.4f %s ≈ %.2f USDT)",
+			quantity, minQty, symbol, minValue)
+	}
+
 	params := map[string]interface{}{
 		"symbol":       symbol,
 		"positionSide": "BOTH",
@@ -695,6 +703,14 @@ func (t *AsterTrader) OpenShort(symbol string, quantity float64, leverage int) (
 
 	logger.Infof("  📏 Precision handling: price %.8f -> %s (precision=%d), quantity %.8f -> %s (precision=%d)",
 		limitPrice, priceStr, prec.PricePrecision, quantity, qtyStr, prec.QuantityPrecision)
+
+	// Check if quantity is too small after precision formatting
+	if formattedQty <= 0 {
+		minQty := math.Pow10(-prec.QuantityPrecision)
+		minValue := minQty * price
+		return nil, fmt.Errorf("quantity too small: %.8f -> 0 after precision formatting (min: %.4f %s ≈ %.2f USDT)",
+			quantity, minQty, symbol, minValue)
+	}
 
 	params := map[string]interface{}{
 		"symbol":       symbol,
@@ -770,6 +786,14 @@ func (t *AsterTrader) CloseLong(symbol string, quantity float64) (map[string]int
 
 	logger.Infof("  📏 Precision handling: price %.8f -> %s (precision=%d), quantity %.8f -> %s (precision=%d)",
 		limitPrice, priceStr, prec.PricePrecision, quantity, qtyStr, prec.QuantityPrecision)
+
+	// Check if quantity is too small after precision formatting
+	if formattedQty <= 0 {
+		minQty := math.Pow10(-prec.QuantityPrecision)
+		minValue := minQty * price
+		return nil, fmt.Errorf("quantity too small: %.8f -> 0 after precision formatting (min: %.4f %s ≈ %.2f USDT)",
+			quantity, minQty, symbol, minValue)
+	}
 
 	params := map[string]interface{}{
 		"symbol":       symbol,
@@ -853,6 +877,14 @@ func (t *AsterTrader) CloseShort(symbol string, quantity float64) (map[string]in
 
 	logger.Infof("  📏 Precision handling: price %.8f -> %s (precision=%d), quantity %.8f -> %s (precision=%d)",
 		limitPrice, priceStr, prec.PricePrecision, quantity, qtyStr, prec.QuantityPrecision)
+
+	// Check if quantity is too small after precision formatting
+	if formattedQty <= 0 {
+		minQty := math.Pow10(-prec.QuantityPrecision)
+		minValue := minQty * price
+		return nil, fmt.Errorf("quantity too small: %.8f -> 0 after precision formatting (min: %.4f %s ≈ %.2f USDT)",
+			quantity, minQty, symbol, minValue)
+	}
 
 	params := map[string]interface{}{
 		"symbol":       symbol,
@@ -1262,14 +1294,14 @@ func (t *AsterTrader) GetOrderStatus(symbol string, orderID string) (map[string]
 
 	// Standardize return fields
 	response := map[string]interface{}{
-		"orderId":     result["orderId"],
-		"symbol":      result["symbol"],
-		"status":      result["status"],
-		"side":        result["side"],
-		"type":        result["type"],
-		"time":        result["time"],
-		"updateTime":  result["updateTime"],
-		"commission":  0.0, // Aster may require separate query
+		"orderId":    result["orderId"],
+		"symbol":     result["symbol"],
+		"status":     result["status"],
+		"side":       result["side"],
+		"type":       result["type"],
+		"time":       result["time"],
+		"updateTime": result["updateTime"],
+		"commission": 0.0, // Aster may require separate query
 	}
 
 	// Parse numeric fields

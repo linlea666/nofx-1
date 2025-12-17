@@ -405,13 +405,17 @@ func (e *Engine) calculateCopySize(signal *TradeSignal) (float64, []Warning) {
 		leaderTradeValue, leaderEquity, leaderTradeRatio*100,
 		followerEquity, e.config.CopyRatio*100, copySize)
 
-	// 预警检查（不阻止交易）
-	if e.config.MinTradeWarn > 0 && copySize < e.config.MinTradeWarn {
+	// 最小金额检查：如果低于阈值，自动提升到阈值（解决小账户精度问题）
+	if e.config.MinTradeWarn > 0 && copySize > 0 && copySize < e.config.MinTradeWarn {
+		originalSize := copySize
+		copySize = e.config.MinTradeWarn // 自动提升到最小阈值
+		logger.Infof("📊 [%s] 跟单金额 %.2f < 阈值 %.2f，自动提升到 %.2f USDT",
+			e.traderID, originalSize, e.config.MinTradeWarn, copySize)
 		warnings = append(warnings, Warning{
 			Timestamp:   time.Now(),
 			Symbol:      fill.Symbol,
-			Type:        "low_value",
-			Message:     fmt.Sprintf("跟单金额较小 (%.2f < %.2f)，仍执行", copySize, e.config.MinTradeWarn),
+			Type:        "size_boosted",
+			Message:     fmt.Sprintf("跟单金额 %.2f 低于阈值，已提升到 %.2f USDT", originalSize, copySize),
 			SignalValue: leaderTradeValue,
 			CopyValue:   copySize,
 			Executed:    true,
