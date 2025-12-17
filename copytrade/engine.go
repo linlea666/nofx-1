@@ -406,16 +406,21 @@ func (e *Engine) calculateCopySize(signal *TradeSignal) (float64, []Warning) {
 		followerEquity, e.config.CopyRatio*100, copySize)
 
 	// 最小金额检查：如果低于阈值，自动提升到阈值（解决小账户精度问题）
-	if e.config.MinTradeWarn > 0 && copySize > 0 && copySize < e.config.MinTradeWarn {
+	// 使用配置的阈值，如果未配置则使用默认值 5 USDT
+	minTradeThreshold := e.config.MinTradeWarn
+	if minTradeThreshold <= 0 {
+		minTradeThreshold = 5.0 // 默认最小 5 USDT，确保能通过交易所精度要求
+	}
+	if copySize > 0 && copySize < minTradeThreshold {
 		originalSize := copySize
-		copySize = e.config.MinTradeWarn // 自动提升到最小阈值
+		copySize = minTradeThreshold // 自动提升到最小阈值
 		logger.Infof("📊 [%s] 跟单金额 %.2f < 阈值 %.2f，自动提升到 %.2f USDT",
-			e.traderID, originalSize, e.config.MinTradeWarn, copySize)
+			e.traderID, originalSize, minTradeThreshold, copySize)
 		warnings = append(warnings, Warning{
 			Timestamp:   time.Now(),
 			Symbol:      fill.Symbol,
 			Type:        "size_boosted",
-			Message:     fmt.Sprintf("跟单金额 %.2f 低于阈值，已提升到 %.2f USDT", originalSize, copySize),
+			Message:     fmt.Sprintf("跟单金额 %.2f 低于阈值，已提升到 %.2f USDT", originalSize, minTradeThreshold),
 			SignalValue: leaderTradeValue,
 			CopyValue:   copySize,
 			Executed:    true,
