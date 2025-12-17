@@ -298,8 +298,8 @@ func (e *Engine) processSignal(signal *TradeSignal) {
 // OKX 特殊处理：
 //   - OKX API 不提供 startPosition，无法直接区分开仓/加仓
 //   - 通过比较领航员当前持仓量与本次交易量来推断：
-//     - 当前持仓 ≈ 本次交易量 → 新开仓
-//     - 当前持仓 > 本次交易量 * 1.2 → 历史仓位加仓
+//   - 当前持仓 ≈ 本次交易量 → 新开仓
+//   - 当前持仓 > 本次交易量 * 1.2 → 历史仓位加仓
 //
 // ============================================================
 func (e *Engine) shouldFollowSignal(signal *TradeSignal) (follow bool, reason string) {
