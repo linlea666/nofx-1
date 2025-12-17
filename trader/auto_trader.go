@@ -853,17 +853,17 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 	// 检查是否为跟单操作（Reasoning 包含 "Copy trading"）
 	isCopyTrade := strings.Contains(decision.Reasoning, "Copy trading")
 	// 检查是否为加仓操作（跟单加仓时 Reasoning 包含 "add"）
-	isAddPosition := strings.Contains(strings.ToLower(decision.Reasoning), "add")
+	isAddPosition := isCopyTrade && strings.Contains(strings.ToLower(decision.Reasoning), "add")
 
-	// [CODE ENFORCED] Check max positions limit (新开仓时检查，加仓时跳过)
-	if !isAddPosition {
+	// [CODE ENFORCED] Check max positions limit (跟单模式跳过，领航员已通过风控)
+	if !isCopyTrade {
 		if err := at.enforceMaxPositions(len(positions)); err != nil {
 			return err
 		}
 	}
 
 	// Check if there's already a position in the same symbol and direction
-	// 加仓操作时跳过此检查
+	// 跟单加仓时跳过此检查
 	if !isAddPosition {
 		for _, pos := range positions {
 			if pos["symbol"] == decision.Symbol && pos["side"] == "long" {
@@ -871,7 +871,7 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 			}
 		}
 	} else {
-		logger.Infof("  📊 加仓操作，跳过重复仓位检查")
+		logger.Infof("  📊 跟单加仓，跳过重复仓位检查")
 	}
 
 	// Get current price
@@ -986,17 +986,17 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 	// 检查是否为跟单操作（Reasoning 包含 "Copy trading"）
 	isCopyTrade := strings.Contains(decision.Reasoning, "Copy trading")
 	// 检查是否为加仓操作（跟单加仓时 Reasoning 包含 "add"）
-	isAddPosition := strings.Contains(strings.ToLower(decision.Reasoning), "add")
+	isAddPosition := isCopyTrade && strings.Contains(strings.ToLower(decision.Reasoning), "add")
 
-	// [CODE ENFORCED] Check max positions limit (新开仓时检查，加仓时跳过)
-	if !isAddPosition {
+	// [CODE ENFORCED] Check max positions limit (跟单模式跳过，领航员已通过风控)
+	if !isCopyTrade {
 		if err := at.enforceMaxPositions(len(positions)); err != nil {
 			return err
 		}
 	}
 
 	// Check if there's already a position in the same symbol and direction
-	// 加仓操作时跳过此检查
+	// 跟单加仓时跳过此检查
 	if !isAddPosition {
 		for _, pos := range positions {
 			if pos["symbol"] == decision.Symbol && pos["side"] == "short" {
@@ -1004,7 +1004,7 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 			}
 		}
 	} else {
-		logger.Infof("  📊 加仓操作，跳过重复仓位检查")
+		logger.Infof("  📊 跟单加仓，跳过重复仓位检查")
 	}
 
 	// Get current price
