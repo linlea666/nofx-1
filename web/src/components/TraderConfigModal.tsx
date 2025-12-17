@@ -110,7 +110,7 @@ export function TraderConfigModal({
     }
   }, [isOpen])
 
-  // 加载跟单配置
+  // 加载跟单配置（仅加载跟单参数，不覆盖 decision_mode）
   useEffect(() => {
     const fetchCopyTradeConfig = async () => {
       if (!isEditMode || !traderData?.trader_id) return
@@ -119,9 +119,9 @@ export function TraderConfigModal({
         if (result.success && result.data?.config) {
           const cfg = result.data.config
           setCopyTradeConfig(cfg)
+          // 只加载跟单参数，decision_mode 由 traderData 决定
           setFormData(prev => ({
             ...prev,
-            decision_mode: cfg.enabled ? 'copy_trade' : 'ai',
             copy_provider_type: cfg.provider_type as CopyTradeProvider,
             copy_leader_id: cfg.leader_id,
             copy_ratio: cfg.copy_ratio,
@@ -129,7 +129,7 @@ export function TraderConfigModal({
           }))
         }
       } catch (error) {
-        // 没有跟单配置，保持默认 AI 模式
+        // 没有跟单配置，保持当前状态
         console.log('No copy trade config found')
       }
     }
