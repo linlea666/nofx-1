@@ -1,6 +1,7 @@
 package trader
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -352,6 +353,21 @@ func (at *AutoTrader) Run() error {
 	at.monitorWg.Add(1)
 	defer at.monitorWg.Done()
 
+	// Check if copy_trade mode - start copy trading engine instead of AI loop
+	isCopyTradeMode := false
+	if at.store != nil {
+		mode, err := at.store.CopyTrade().GetDecisionMode(at.id)
+		if err == nil && mode == "copy_trade" {
+			isCopyTradeMode = true
+			logger.Infof("🎯 [%s] Copy trade mode detected, starting copy trading engine...", at.name)
+		}
+	}
+
+	if isCopyTradeMode {
+		// Start copy trading engine
+		return at.runCopyTradeMode()
+	}
+
 	// Start drawdown monitoring
 	at.startDrawdownMonitor()
 
@@ -389,32 +405,131 @@ func (at *AutoTrader) Stop() {
 	logger.Info("⏹ Automatic trading system stopped")
 }
 
+// runCopyTradeMode runs the copy trading mode
+func (at *AutoTrader) runCopyTradeMode() error {
+	logger.Infof("🎯 [%s] Starting copy trade mode...", at.name)
+
+	// Load copy trade config from database
+	copyConfig, err := at.store.CopyTrade().GetByTraderID(at.id)
+	if err != nil {
+		return fmt.Errorf("failed to get copy trade config: %w", err)
+	}
+
+	if !copyConfig.Enabled {
+		return fmt.Errorf("copy trade is not enabled for trader %s", at.id)
+	}
+
+	// Import copytrade package dynamically to avoid import cycle
+	// We use the integration function from copytrade package
+	logger.Infof("🚀 [%s] Copy trade engine starting | provider=%s leader=%s ratio=%.0f%%",
+		at.name, copyConfig.ProviderType, copyConfig.LeaderID, copyConfig.CopyRatio*100)
+
+	// Create copy trade engine config
+	engineConfig := &copyTradeConfig{
+		ProviderType:   copyConfig.ProviderType,
+		LeaderID:       copyConfig.LeaderID,
+		CopyRatio:      copyConfig.CopyRatio,
+		SyncLeverage:   copyConfig.SyncLeverage,
+		SyncMarginMode: copyConfig.SyncMarginMode,
+		MinTradeWarn:   copyConfig.MinTradeWarn,
+		MaxTradeWarn:   copyConfig.MaxTradeWarn,
+	}
+
+	// Create and start copy trade engine
+	engine, err := at.createCopyTradeEngine(engineConfig)
+	if err != nil {
+		return fmt.Errorf("failed to create copy trade engine: %w", err)
+	}
+
+	// Start engine
+	ctx := context.Background()
+	if err := engine.Start(ctx); err != nil {
+		return fmt.Errorf("failed to start copy trade engine: %w", err)
+	}
+	defer engine.Stop()
+
+	logger.Infof("✅ [%s] Copy trade engine started successfully", at.name)
+
+	// Start drawdown monitoring
+	at.startDrawdownMonitor()
+
+	// Ticker for equity snapshots
+	snapshotTicker := time.NewTicker(at.config.ScanInterval)
+	defer snapshotTicker.Stop()
+
+	// Get decision channel
+	decisionCh := engine.GetDecisionChannel()
+
+	// Main loop: consume decisions and save snapshots
+	for at.isRunning {
+		select {
+		case <-at.stopMonitorCh:
+			logger.Infof("[%s] ⏹ Stop signal received, stopping copy trade engine", at.name)
+			return nil
+
+		case fullDec, ok := <-decisionCh:
+			if !ok {
+				logger.Warnf("[%s] ⚠️ Decision channel closed", at.name)
+				return nil
+			}
+			// Execute each decision
+			for _, dec := range fullDec.Decisions {
+				logger.Infof("⚡ [%s] Executing copy trade decision: %s %s | size=%.2f",
+					at.name, dec.Action, dec.Symbol, dec.PositionSizeUSD)
+
+				startTime := time.Now()
+				if err := at.ExecuteDecision(&dec); err != nil {
+					logger.Errorf("❌ [%s] Copy trade execution failed | %s %s | error=%v",
+						at.name, dec.Action, dec.Symbol, err)
+				} else {
+					logger.Infof("✅ [%s] Copy trade execution success | %s %s | duration=%dms",
+						at.name, dec.Action, dec.Symbol, time.Since(startTime).Milliseconds())
+				}
+			}
+
+		case <-snapshotTicker.C:
+			// Save equity snapshot periodically
+			tradingCtx, err := at.buildTradingContext()
+			if err == nil {
+				at.saveEquitySnapshot(tradingCtx)
+			}
+		}
+	}
+
+	return nil
+}
+
+// copyTradeConfig is a local struct to hold copy trade configuration
+type copyTradeConfig struct {
+	ProviderType   string
+	LeaderID       string
+	CopyRatio      float64
+	SyncLeverage   bool
+	SyncMarginMode bool
+	MinTradeWarn   float64
+	MaxTradeWarn   float64
+}
+
+// copyTradeEngine interface to avoid import cycle
+type copyTradeEngine interface {
+	Start(ctx context.Context) error
+	Stop()
+	GetDecisionChannel() <-chan *decision.FullDecision
+}
+
+// createCopyTradeEngine creates a copy trade engine
+// This is implemented to call the copytrade package
+func (at *AutoTrader) createCopyTradeEngine(cfg *copyTradeConfig) (copyTradeEngine, error) {
+	// Import copytrade package
+	return newCopyTradeEngineAdapter(at, cfg)
+}
+
 // runCycle runs one trading cycle (using AI full decision-making)
 func (at *AutoTrader) runCycle() error {
 	at.callCount++
 
-	// Check decision mode - skip AI cycle if in copy_trade mode
-	isCopyTradeMode := false
-	if at.store != nil {
-		mode, err := at.store.CopyTrade().GetDecisionMode(at.id)
-		logger.Infof("🔍 [%s] Checking decision mode: mode=%s, err=%v", at.name, mode, err)
-		if mode == "copy_trade" {
-			isCopyTradeMode = true
-			logger.Infof("📋 [%s] Copy trade mode detected, skipping AI decision cycle", at.name)
-		}
-	}
-
-	// In copy_trade mode, only save equity snapshot, skip AI decision
-	if isCopyTradeMode {
-		// Still build context for equity snapshot
-		ctx, err := at.buildTradingContext()
-		if err == nil {
-			at.saveEquitySnapshot(ctx)
-			logger.Infof("💾 [%s] Saved equity snapshot in copy_trade mode", at.name)
-		}
-		// Skip AI decision - copy trade engine handles decisions
-		return nil
-	}
+	// In AI mode, just run the normal AI decision cycle
+	// (copy_trade mode is handled in Run() before this is called)
 
 	logger.Info("\n" + strings.Repeat("=", 70) + "\n")
 	logger.Infof("⏰ %s - AI decision cycle #%d", time.Now().Format("2006-01-02 15:04:05"), at.callCount)

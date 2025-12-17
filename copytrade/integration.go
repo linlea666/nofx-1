@@ -8,13 +8,20 @@ import (
 	"nofx/decision"
 	"nofx/logger"
 	"nofx/store"
-	"nofx/trader"
 )
+
+// DecisionExecutor 决策执行器接口
+// 用于避免循环导入，由 trader.AutoTrader 实现
+type DecisionExecutor interface {
+	ExecuteDecision(dec *decision.Decision) error
+	GetAccountInfo() (map[string]interface{}, error)
+	GetPositions() ([]map[string]interface{}, error)
+}
 
 // TraderIntegration 跟单与交易执行的集成
 type TraderIntegration struct {
 	traderID   string
-	autoTrader *trader.AutoTrader
+	executor   DecisionExecutor
 	engine     *Engine
 	store      *store.Store
 	ctx        context.Context
@@ -25,16 +32,16 @@ type TraderIntegration struct {
 // NewTraderIntegration 创建交易集成
 func NewTraderIntegration(
 	traderID string,
-	autoTrader *trader.AutoTrader,
+	executor DecisionExecutor,
 	st *store.Store,
 ) *TraderIntegration {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &TraderIntegration{
-		traderID:   traderID,
-		autoTrader: autoTrader,
-		store:      st,
-		ctx:        ctx,
-		cancel:     cancel,
+		traderID: traderID,
+		executor: executor,
+		store:    st,
+		ctx:      ctx,
+		cancel:   cancel,
 	}
 }
 
@@ -147,7 +154,7 @@ func (ti *TraderIntegration) executeFullDecision(fullDec *decision.FullDecision)
 
 		// 执行交易
 		startTime := time.Now()
-		err := ti.autoTrader.ExecuteDecision(&dec)
+		err := ti.executor.ExecuteDecision(&dec)
 
 		if err != nil {
 			logger.Errorf("❌ [%s] 跟单执行失败 | %s %s | error=%v",
@@ -202,7 +209,7 @@ func (ti *TraderIntegration) saveSignalLog(dec *decision.Decision, status, error
 // getBalanceFunc 返回获取余额的函数
 func (ti *TraderIntegration) getBalanceFunc() func() float64 {
 	return func() float64 {
-		info, err := ti.autoTrader.GetAccountInfo()
+		info, err := ti.executor.GetAccountInfo()
 		if err != nil {
 			logger.Warnf("⚠️ [%s] 获取账户余额失败: %v", ti.traderID, err)
 			return 0
@@ -222,7 +229,7 @@ func (ti *TraderIntegration) getPositionsFunc() func() map[string]*Position {
 		positions := make(map[string]*Position)
 
 		// 获取交易所持仓 (返回 []map[string]interface{})
-		exchangePositions, err := ti.autoTrader.GetPositions()
+		exchangePositions, err := ti.executor.GetPositions()
 		if err != nil {
 			logger.Warnf("⚠️ [%s] 获取持仓失败: %v", ti.traderID, err)
 			return positions
@@ -251,12 +258,12 @@ func (ti *TraderIntegration) getPositionsFunc() func() map[string]*Position {
 			positions[key] = &Position{
 				Symbol:        symbol,
 				Side:          side,
-				Size:          abs(quantity),
+				Size:          absFloat(quantity),
 				EntryPrice:    entryPrice,
 				MarkPrice:     markPrice,
 				Leverage:      leverage,
 				UnrealizedPnL: unrealizedPnl,
-				PositionValue: abs(quantity) * markPrice,
+				PositionValue: absFloat(quantity) * markPrice,
 			}
 		}
 
@@ -264,7 +271,7 @@ func (ti *TraderIntegration) getPositionsFunc() func() map[string]*Position {
 	}
 }
 
-func abs(x float64) float64 {
+func absFloat(x float64) float64 {
 	if x < 0 {
 		return -x
 	}
@@ -284,10 +291,10 @@ var (
 // 这是外部调用的主入口
 func StartCopyTradingForTrader(
 	traderID string,
-	autoTrader *trader.AutoTrader,
+	executor DecisionExecutor,
 	st *store.Store,
 ) error {
-	integration := NewTraderIntegration(traderID, autoTrader, st)
+	integration := NewTraderIntegration(traderID, executor, st)
 	integrations[traderID] = integration
 	return integration.StartCopyTrading()
 }
