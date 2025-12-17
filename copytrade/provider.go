@@ -196,6 +196,17 @@ func parseHLDirection(side, dir, startPosition string) (tradeSide string, posSid
 		return "sell", SideShort, ActionAdd
 	case "Close Short":
 		return "buy", SideShort, ActionClose // 具体是 reduce 还是 close 由 engine 判断
+
+	// 🔄 反向开仓处理（Hyperliquid 特有）
+	// 反向开仓 = 平掉原仓位 + 开新方向仓位（一次交易完成）
+	// 处理策略：将新方向视为新开仓，如果我们没有原仓位则直接跟随新方向
+	case "Long > Short":
+		// 从多翻空：新方向是 Short，当作新开仓处理
+		return "sell", SideShort, ActionOpen
+	case "Short > Long":
+		// 从空翻多：新方向是 Long，当作新开仓处理
+		return "buy", SideLong, ActionOpen
+
 	default:
 		// 兜底
 		if side == "B" {
