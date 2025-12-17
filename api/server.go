@@ -396,8 +396,8 @@ type CreateTraderRequest struct {
 	UseCoinPool          bool   `json:"use_coin_pool"`
 	UseOITop             bool   `json:"use_oi_top"`
 	// Copy trading configuration
-	DecisionMode string          `json:"decision_mode"` // "ai" or "copy_trade"
-	CopyConfig   *CopyConfigReq  `json:"copy_config"`   // Copy trade config (required when decision_mode is "copy_trade")
+	DecisionMode string         `json:"decision_mode"` // "ai" or "copy_trade"
+	CopyConfig   *CopyConfigReq `json:"copy_config"`   // Copy trade config (required when decision_mode is "copy_trade")
 }
 
 // CopyConfigReq Copy trading configuration request
@@ -1878,6 +1878,29 @@ func (s *Server) handleGetTraderConfig(c *gin.Context) {
 	// Return complete model ID without conversion, consistent with frontend model list
 	aiModelID := traderConfig.AIModelID
 
+	// Get decision mode
+	decisionMode, _ := s.store.CopyTrade().GetDecisionMode(traderID)
+	if decisionMode == "" {
+		decisionMode = "ai"
+	}
+
+	// Get copy trade config if in copy trade mode
+	var copyConfig map[string]interface{}
+	if decisionMode == "copy_trade" {
+		if cfg, err := s.store.CopyTrade().GetByTraderID(traderID); err == nil && cfg != nil {
+			copyConfig = map[string]interface{}{
+				"enabled":          cfg.Enabled,
+				"provider_type":    cfg.ProviderType,
+				"leader_id":        cfg.LeaderID,
+				"copy_ratio":       cfg.CopyRatio,
+				"sync_leverage":    cfg.SyncLeverage,
+				"sync_margin_mode": cfg.SyncMarginMode,
+				"min_trade_warn":   cfg.MinTradeWarn,
+				"max_trade_warn":   cfg.MaxTradeWarn,
+			}
+		}
+	}
+
 	result := map[string]interface{}{
 		"trader_id":             traderConfig.ID,
 		"trader_name":           traderConfig.Name,
@@ -1895,6 +1918,8 @@ func (s *Server) handleGetTraderConfig(c *gin.Context) {
 		"use_coin_pool":         traderConfig.UseCoinPool,
 		"use_oi_top":            traderConfig.UseOITop,
 		"is_running":            isRunning,
+		"decision_mode":         decisionMode,
+		"copy_config":           copyConfig,
 	}
 
 	c.JSON(http.StatusOK, result)

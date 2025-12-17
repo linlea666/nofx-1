@@ -71,7 +71,7 @@ export function TraderConfigModal({
     is_cross_margin: true,
     show_in_competition: true,
     scan_interval_minutes: 3,
-    decision_mode: 'ai',
+    decision_mode: 'copy_trade', // 默认跟单模式
     copy_provider_type: 'hyperliquid',
     copy_leader_id: '',
     copy_ratio: 1.0,
@@ -145,7 +145,7 @@ export function TraderConfigModal({
         ...traderData,
         strategy_id: traderData.strategy_id || '',
         // Keep decision_mode from traderData if exists, otherwise keep prev value
-        decision_mode: traderData.decision_mode || prev.decision_mode || 'ai',
+        decision_mode: traderData.decision_mode || prev.decision_mode || 'copy_trade',
       }))
     } else if (!isEditMode) {
       setFormData({
@@ -156,7 +156,7 @@ export function TraderConfigModal({
         is_cross_margin: true,
         show_in_competition: true,
         scan_interval_minutes: 3,
-        decision_mode: 'ai',
+        decision_mode: 'copy_trade', // 默认跟单模式
         copy_provider_type: 'hyperliquid',
         copy_leader_id: '',
         copy_ratio: 1.0,
@@ -218,7 +218,7 @@ export function TraderConfigModal({
         is_cross_margin: formData.is_cross_margin,
         show_in_competition: formData.show_in_competition,
         scan_interval_minutes: formData.scan_interval_minutes,
-        decision_mode: formData.decision_mode || 'ai', // Ensure non-empty
+        decision_mode: formData.decision_mode || 'copy_trade', // 默认跟单模式
       }
 
       // 只在编辑模式时包含initial_balance
@@ -455,25 +455,7 @@ export function TraderConfigModal({
             </h3>
             <div className="space-y-4">
               <div className="grid grid-cols-2 gap-4">
-                <button
-                  type="button"
-                  onClick={() => handleInputChange('decision_mode', 'ai')}
-                  className={`p-4 rounded-lg border-2 transition-all ${
-                    formData.decision_mode === 'ai'
-                      ? 'border-[#F0B90B] bg-[#F0B90B]/10'
-                      : 'border-[#2B3139] hover:border-[#404750]'
-                  }`}
-                >
-                  <div className="flex items-center gap-3 mb-2">
-                    <Bot className={`w-6 h-6 ${formData.decision_mode === 'ai' ? 'text-[#F0B90B]' : 'text-[#848E9C]'}`} />
-                    <span className={`font-medium ${formData.decision_mode === 'ai' ? 'text-[#EAECEF]' : 'text-[#848E9C]'}`}>
-                      AI 决策
-                    </span>
-                  </div>
-                  <p className="text-xs text-[#848E9C] text-left">
-                    由 AI 模型根据策略自主分析市场并做出交易决策
-                  </p>
-                </button>
+                {/* 跟单交易 - 默认选项，放在前面 */}
                 <button
                   type="button"
                   onClick={() => handleInputChange('decision_mode', 'copy_trade')}
@@ -491,6 +473,26 @@ export function TraderConfigModal({
                   </div>
                   <p className="text-xs text-[#848E9C] text-left">
                     跟随真人领航员的交易操作，按比例同步开仓/平仓
+                  </p>
+                </button>
+                {/* AI 决策 - 可选 */}
+                <button
+                  type="button"
+                  onClick={() => handleInputChange('decision_mode', 'ai')}
+                  className={`p-4 rounded-lg border-2 transition-all ${
+                    formData.decision_mode === 'ai'
+                      ? 'border-[#F0B90B] bg-[#F0B90B]/10'
+                      : 'border-[#2B3139] hover:border-[#404750]'
+                  }`}
+                >
+                  <div className="flex items-center gap-3 mb-2">
+                    <Bot className={`w-6 h-6 ${formData.decision_mode === 'ai' ? 'text-[#F0B90B]' : 'text-[#848E9C]'}`} />
+                    <span className={`font-medium ${formData.decision_mode === 'ai' ? 'text-[#EAECEF]' : 'text-[#848E9C]'}`}>
+                      AI 决策
+                    </span>
+                  </div>
+                  <p className="text-xs text-[#848E9C] text-left">
+                    由 AI 模型根据策略自主分析市场并做出交易决策
                   </p>
                 </button>
               </div>
