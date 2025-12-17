@@ -850,6 +850,8 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 		return fmt.Errorf("failed to get positions: %w", err)
 	}
 
+	// 检查是否为跟单操作（Reasoning 包含 "Copy trading"）
+	isCopyTrade := strings.Contains(decision.Reasoning, "Copy trading")
 	// 检查是否为加仓操作（跟单加仓时 Reasoning 包含 "add"）
 	isAddPosition := strings.Contains(strings.ToLower(decision.Reasoning), "add")
 
@@ -920,9 +922,13 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 		decision.PositionSizeUSD = actualPositionSize
 	}
 
-	// [CODE ENFORCED] Minimum position size check
-	if err := at.enforceMinPositionSize(decision.PositionSizeUSD); err != nil {
-		return err
+	// [CODE ENFORCED] Minimum position size check (跟单模式跳过，领航员已通过风控)
+	if !isCopyTrade {
+		if err := at.enforceMinPositionSize(decision.PositionSizeUSD); err != nil {
+			return err
+		}
+	} else {
+		logger.Infof("  📊 跟单模式，跳过最小仓位检查")
 	}
 
 	// Calculate quantity with adjusted position size
@@ -977,6 +983,8 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 		return fmt.Errorf("failed to get positions: %w", err)
 	}
 
+	// 检查是否为跟单操作（Reasoning 包含 "Copy trading"）
+	isCopyTrade := strings.Contains(decision.Reasoning, "Copy trading")
 	// 检查是否为加仓操作（跟单加仓时 Reasoning 包含 "add"）
 	isAddPosition := strings.Contains(strings.ToLower(decision.Reasoning), "add")
 
@@ -1047,9 +1055,13 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 		decision.PositionSizeUSD = actualPositionSize
 	}
 
-	// [CODE ENFORCED] Minimum position size check
-	if err := at.enforceMinPositionSize(decision.PositionSizeUSD); err != nil {
-		return err
+	// [CODE ENFORCED] Minimum position size check (跟单模式跳过，领航员已通过风控)
+	if !isCopyTrade {
+		if err := at.enforceMinPositionSize(decision.PositionSizeUSD); err != nil {
+			return err
+		}
+	} else {
+		logger.Infof("  📊 跟单模式，跳过最小仓位检查")
 	}
 
 	// Calculate quantity with adjusted position size
