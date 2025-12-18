@@ -532,7 +532,7 @@ func (p *HLWebSocketProvider) addFillToCache(fill Fill) {
 }
 
 // parseHLDir 解析 Hyperliquid 的 dir 字段
-// dir: "Open Long" | "Close Long" | "Open Short" | "Close Short"
+// dir: "Open Long" | "Close Long" | "Open Short" | "Close Short" | "Long > Short" | "Short > Long"
 func parseHLDir(dir string) (ActionType, SideType) {
 	switch dir {
 	case "Open Long":
@@ -543,6 +543,19 @@ func parseHLDir(dir string) (ActionType, SideType) {
 		return ActionOpen, SideShort
 	case "Close Short":
 		return ActionClose, SideShort
+
+	// 🔄 反向开仓处理（Hyperliquid 特有）
+	// 反向开仓 = 平掉原仓位 + 开新方向仓位（一次交易完成）
+	// 处理策略：将新方向视为新开仓
+	case "Long > Short":
+		// 从多翻空：新方向是 Short，当作新开仓处理
+		logger.Infof("📡 [HL-WS] 检测到反向开仓: %s → 转换为 Open Short", dir)
+		return ActionOpen, SideShort
+	case "Short > Long":
+		// 从空翻多：新方向是 Long，当作新开仓处理
+		logger.Infof("📡 [HL-WS] 检测到反向开仓: %s → 转换为 Open Long", dir)
+		return ActionOpen, SideLong
+
 	default:
 		// 尝试从旧格式解析
 		if len(dir) > 0 {
@@ -552,6 +565,7 @@ func parseHLDir(dir string) (ActionType, SideType) {
 				return ActionOpen, SideShort
 			}
 		}
+		logger.Warnf("⚠️ [HL-WS] 未知的 dir 类型: %s，默认按 Open Long 处理", dir)
 		return ActionOpen, SideLong
 	}
 }
