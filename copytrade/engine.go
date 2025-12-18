@@ -363,9 +363,21 @@ func (e *Engine) shouldFollowSignal(signal *TradeSignal) (follow bool, reason st
 func (e *Engine) determineAction(signal *TradeSignal) ActionType {
 	fill := signal.Fill
 
-	// 开仓/加仓直接返回
+	// 开仓/加仓：需要检查本地是否有仓位来判断是新开仓还是加仓
 	if fill.Action == ActionOpen || fill.Action == ActionAdd {
-		return fill.Action
+		// 检查本地是否已有仓位
+		localPositions := e.getFollowerPositions()
+		key := PositionKey(fill.Symbol, fill.PositionSide)
+		localPosition := localPositions[key]
+		hasLocalPosition := localPosition != nil && localPosition.Size > 0
+
+		if hasLocalPosition {
+			// 本地已有仓位 → 加仓
+			logger.Infof("📊 [%s] %s → 加仓 | 本地已有仓位 %.4f", e.traderID, fill.Symbol, localPosition.Size)
+			return ActionAdd
+		}
+		// 本地无仓位 → 新开仓
+		return ActionOpen
 	}
 
 	// ============================================================
