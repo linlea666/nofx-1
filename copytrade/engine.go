@@ -416,19 +416,19 @@ func (e *Engine) shouldFollowSignal(signal *TradeSignal) (follow bool, reason st
 		}
 
 		// 本地无仓位时，需要判断领航员是"新开仓"还是"历史仓位加仓"
-		// 🔍 OKX 特殊处理：通过领航员当前持仓量推断
-		if e.config.ProviderType == ProviderOKX && signal.LeaderPosition != nil {
+		// 🔍 通过领航员当前持仓量推断（适用于所有 Provider）
+		if signal.LeaderPosition != nil {
 			leaderCurrentSize := signal.LeaderPosition.Size
 			thisTradeSize := fill.Size
 
 			// 如果领航员当前持仓明显大于本次交易量，说明是历史仓位加仓
 			// 阈值 1.2：允许一定误差（滑点、部分成交等）
 			if leaderCurrentSize > thisTradeSize*1.2 {
-				logger.Infof("📊 [%s] OKX 历史仓位检测 | %s %s | 领航员当前持仓=%.4f > 本次交易=%.4f*1.2 → 判定为历史仓位加仓",
+				logger.Infof("📊 [%s] 历史仓位检测 | %s %s | 领航员当前持仓=%.4f > 本次交易=%.4f*1.2 → 判定为历史仓位加仓",
 					e.traderID, fill.Symbol, fill.PositionSide, leaderCurrentSize, thisTradeSize)
-				return false, fmt.Sprintf("忽略：OKX领航员历史仓位加仓（当前持仓%.4f > 本次交易%.4f），我们未跟随该仓位", leaderCurrentSize, thisTradeSize)
+				return false, fmt.Sprintf("忽略：领航员历史仓位加仓（当前持仓%.4f > 本次交易%.4f），我们未跟随该仓位", leaderCurrentSize, thisTradeSize)
 			}
-			logger.Infof("📊 [%s] OKX 新开仓确认 | %s %s | 领航员当前持仓=%.4f ≈ 本次交易=%.4f → 确认为新开仓",
+			logger.Infof("📊 [%s] 新开仓确认 | %s %s | 领航员当前持仓=%.4f ≈ 本次交易=%.4f → 确认为新开仓",
 				e.traderID, fill.Symbol, fill.PositionSide, leaderCurrentSize, thisTradeSize)
 		}
 
