@@ -367,16 +367,25 @@ func (e *Engine) determineAction(signal *TradeSignal) ActionType {
 	if fill.Action == ActionOpen || fill.Action == ActionAdd {
 		// 检查本地是否已有仓位
 		localPositions := e.getFollowerPositions()
+
+		// 🔍 调试日志：显示本地所有持仓
+		logger.Infof("📊 [%s] 本地持仓检查 | 信号: %s %s | 查找 key=%s",
+			e.traderID, fill.Symbol, fill.PositionSide, PositionKey(fill.Symbol, fill.PositionSide))
+		for k, v := range localPositions {
+			logger.Infof("   - 持仓: %s | 方向=%s 数量=%.4f", k, v.Side, v.Size)
+		}
+
 		key := PositionKey(fill.Symbol, fill.PositionSide)
 		localPosition := localPositions[key]
 		hasLocalPosition := localPosition != nil && localPosition.Size > 0
 
 		if hasLocalPosition {
 			// 本地已有仓位 → 加仓
-			logger.Infof("📊 [%s] %s → 加仓 | 本地已有仓位 %.4f", e.traderID, fill.Symbol, localPosition.Size)
+			logger.Infof("📊 [%s] %s %s → 加仓 | 本地已有仓位 %.4f", e.traderID, fill.Symbol, fill.PositionSide, localPosition.Size)
 			return ActionAdd
 		}
 		// 本地无仓位 → 新开仓
+		logger.Infof("📊 [%s] %s %s → 新开仓 | 本地无此方向持仓", e.traderID, fill.Symbol, fill.PositionSide)
 		return ActionOpen
 	}
 

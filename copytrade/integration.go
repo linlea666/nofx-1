@@ -350,14 +350,25 @@ func (ti *TraderIntegration) getPositionsFunc() func() map[string]*Position {
 		}
 
 		// 转换为跟单模块的持仓格式
+		// 兼容不同 trader 的字段名格式
 		for _, pos := range exchangePositions {
 			symbol, _ := pos["symbol"].(string)
 			sideStr, _ := pos["side"].(string)
-			quantity, _ := pos["quantity"].(float64)
-			entryPrice, _ := pos["entry_price"].(float64)
-			markPrice, _ := pos["mark_price"].(float64)
-			leverage, _ := pos["leverage"].(int)
-			unrealizedPnl, _ := pos["unrealized_pnl"].(float64)
+
+			// 数量字段: 优先 positionAmt (OKX), 回退 quantity (Binance)
+			quantity := getFloatField(pos, "positionAmt", "quantity")
+
+			// 入场价: 优先 entryPrice (OKX), 回退 entry_price (Binance)
+			entryPrice := getFloatField(pos, "entryPrice", "entry_price")
+
+			// 标记价: 优先 markPrice (OKX), 回退 mark_price (Binance)
+			markPrice := getFloatField(pos, "markPrice", "mark_price")
+
+			// 杠杆: float64 或 int
+			leverage := getIntOrFloatField(pos, "leverage")
+
+			// 未实现盈亏: 优先 unRealizedProfit (OKX), 回退 unrealized_pnl (Binance)
+			unrealizedPnl := getFloatField(pos, "unRealizedProfit", "unrealized_pnl")
 
 			if quantity == 0 {
 				continue
@@ -369,6 +380,11 @@ func (ti *TraderIntegration) getPositionsFunc() func() map[string]*Position {
 			}
 
 			key := PositionKey(symbol, side)
+
+			// 调试日志：显示每个持仓的详细信息
+			logger.Debugf("📊 [%s] 持仓解析: %s | side=%s → %s | 数量=%.4f 杠杆=%d",
+				ti.traderID, symbol, sideStr, side, quantity, leverage)
+
 			positions[key] = &Position{
 				Symbol:        symbol,
 				Side:          side,
@@ -390,6 +406,42 @@ func absFloat(x float64) float64 {
 		return -x
 	}
 	return x
+}
+
+// getFloatField 从 map 中获取 float64 字段，支持多个字段名回退
+func getFloatField(m map[string]interface{}, keys ...string) float64 {
+	for _, key := range keys {
+		if val, ok := m[key]; ok {
+			switch v := val.(type) {
+			case float64:
+				return v
+			case float32:
+				return float64(v)
+			case int:
+				return float64(v)
+			case int64:
+				return float64(v)
+			}
+		}
+	}
+	return 0
+}
+
+// getIntOrFloatField 从 map 中获取 int 字段，支持 float64 类型转换
+func getIntOrFloatField(m map[string]interface{}, key string) int {
+	if val, ok := m[key]; ok {
+		switch v := val.(type) {
+		case int:
+			return v
+		case int64:
+			return int(v)
+		case float64:
+			return int(v)
+		case float32:
+			return int(v)
+		}
+	}
+	return 0
 }
 
 // ============================================================================
