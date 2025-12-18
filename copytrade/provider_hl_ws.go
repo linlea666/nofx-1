@@ -324,6 +324,7 @@ func (p *HLWebSocketProvider) handleUserFills(data json.RawMessage) {
 
 // refreshAccountState 通过 REST 获取最新账户状态（混合模式）
 // 在收到交易信号时调用，确保获取到准确的领航员权益和持仓信息
+// 同时触发 onStateUpdate 回调，让 Engine 也更新 leaderState 缓存
 func (p *HLWebSocketProvider) refreshAccountState() {
 	if p.restProvider == nil || p.leaderID == "" {
 		return
@@ -335,13 +336,19 @@ func (p *HLWebSocketProvider) refreshAccountState() {
 		return
 	}
 
-	// 更新缓存
+	// 更新本地缓存
 	p.stateMu.Lock()
 	p.latestState = state
 	p.stateMu.Unlock()
 
 	logger.Infof("📡 [HL-WS] REST 获取账户状态成功 | 权益=%.2f 持仓数=%d",
 		state.TotalEquity, len(state.Positions))
+
+	// 触发回调，让 Engine 的 leaderState 也同步更新
+	// 这样加仓/减仓/平仓判断可以使用最新的持仓数据
+	if p.onStateUpdate != nil {
+		p.onStateUpdate(state)
+	}
 }
 
 func (p *HLWebSocketProvider) handleClearinghouseState(data json.RawMessage) {
