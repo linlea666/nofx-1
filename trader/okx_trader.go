@@ -1102,6 +1102,12 @@ func (t *OKXTrader) FormatQuantity(symbol string, quantity float64) (string, err
 func (t *OKXTrader) formatSize(sz float64, inst *OKXInstrument) string {
 	// Determine precision based on lotSz
 	if inst.LotSz >= 1 {
+		// 整数张合约要求：当 sz 在 (0, 1) 区间时，向上取整到 1（最小单位）
+		// 这确保减仓操作能执行，避免 "Parameter sz error"
+		if sz > 0 && sz < 1 {
+			logger.Infof("  ⚠️ 合约数 %.2f 不足 1 张，向上取整到 1（最小单位）", sz)
+			return "1"
+		}
 		return fmt.Sprintf("%.0f", sz)
 	}
 
@@ -1116,8 +1122,15 @@ func (t *OKXTrader) formatSize(sz float64, inst *OKXInstrument) string {
 	lotSzStr = strings.TrimRight(lotSzStr, "0")
 	precision := len(lotSzStr) - dotIndex - 1
 
-	format := fmt.Sprintf("%%.%df", precision)
-	return fmt.Sprintf(format, sz)
+	// 小数精度时：如果 sz > 0 但格式化后可能为 "0"，也需要处理
+	formatted := fmt.Sprintf(fmt.Sprintf("%%.%df", precision), sz)
+	if formatted == "0" && sz > 0 {
+		// 向上取整到最小单位 lotSz
+		logger.Infof("  ⚠️ 合约数 %.6f 不足最小单位 %.6f，向上取整", sz, inst.LotSz)
+		return fmt.Sprintf(fmt.Sprintf("%%.%df", precision), inst.LotSz)
+	}
+
+	return formatted
 }
 
 // GetOrderStatus gets order status
