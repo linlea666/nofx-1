@@ -491,7 +491,7 @@ func (t *OKXTrader) SetMarginMode(symbol string, isCrossMargin bool) error {
 	return nil
 }
 
-// SetLeverage sets leverage
+// SetLeverage sets leverage for both directions (used for general cases)
 func (t *OKXTrader) SetLeverage(symbol string, leverage int) error {
 	instId := t.convertSymbol(symbol)
 
@@ -518,13 +518,39 @@ func (t *OKXTrader) SetLeverage(symbol string, leverage int) error {
 	return nil
 }
 
+// setLeverageForSide sets leverage for a specific direction only
+// This prevents overwriting leverage of existing positions in the opposite direction
+func (t *OKXTrader) setLeverageForSide(symbol string, leverage int, posSide string) error {
+	instId := t.convertSymbol(symbol)
+
+	body := map[string]interface{}{
+		"instId":  instId,
+		"lever":   strconv.Itoa(leverage),
+		"mgnMode": "cross",
+		"posSide": posSide,
+	}
+
+	_, err := t.doRequest("POST", okxLeveragePath, body)
+	if err != nil {
+		// Ignore if already at target leverage
+		if strings.Contains(err.Error(), "same") {
+			logger.Infof("  ✓ %s %s leverage already at %dx", symbol, posSide, leverage)
+			return nil
+		}
+		return fmt.Errorf("failed to set %s %s leverage: %w", symbol, posSide, err)
+	}
+
+	logger.Infof("  ✓ %s %s leverage set to %dx", symbol, posSide, leverage)
+	return nil
+}
+
 // OpenLong opens long position
 func (t *OKXTrader) OpenLong(symbol string, quantity float64, leverage int) (map[string]interface{}, error) {
 	// Cancel old orders
 	t.CancelAllOrders(symbol)
 
-	// Set leverage
-	if err := t.SetLeverage(symbol, leverage); err != nil {
+	// Set leverage for long direction only (don't affect existing short positions)
+	if err := t.setLeverageForSide(symbol, leverage, "long"); err != nil {
 		logger.Infof("  ⚠️ Failed to set leverage: %v", err)
 	}
 
@@ -600,8 +626,8 @@ func (t *OKXTrader) OpenShort(symbol string, quantity float64, leverage int) (ma
 	// Cancel old orders
 	t.CancelAllOrders(symbol)
 
-	// Set leverage
-	if err := t.SetLeverage(symbol, leverage); err != nil {
+	// Set leverage for short direction only (don't affect existing long positions)
+	if err := t.setLeverageForSide(symbol, leverage, "short"); err != nil {
 		logger.Infof("  ⚠️ Failed to set leverage: %v", err)
 	}
 
