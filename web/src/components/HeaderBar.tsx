@@ -16,6 +16,7 @@ type Page =
   | 'faq'
   | 'login'
   | 'register'
+  | 'data-dashboard'
 
 interface HeaderBarProps {
   onLoginClick?: () => void
@@ -344,6 +345,46 @@ export default function HeaderBar({
                   )}
 
                   Backtest
+                </button>
+
+                <button
+                  onClick={() => {
+                    if (onPageChange) {
+                      onPageChange('data-dashboard')
+                    }
+                    navigate('/data-dashboard')
+                  }}
+                  className="text-sm font-bold transition-all duration-300 relative focus:outline-2 focus:outline-yellow-500"
+                  style={{
+                    color:
+                      currentPage === 'data-dashboard'
+                        ? 'var(--brand-yellow)'
+                        : 'var(--brand-light-gray)',
+                    padding: '8px 16px',
+                    borderRadius: '8px',
+                    position: 'relative',
+                  }}
+                  onMouseEnter={(e) => {
+                    if (currentPage !== 'data-dashboard') {
+                      e.currentTarget.style.color = 'var(--brand-yellow)'
+                    }
+                  }}
+                  onMouseLeave={(e) => {
+                    if (currentPage !== 'data-dashboard') {
+                      e.currentTarget.style.color = 'var(--brand-light-gray)'
+                    }
+                  }}
+                >
+                  {currentPage === 'data-dashboard' && (
+                    <span
+                      className="absolute inset-0 rounded-lg"
+                      style={{
+                        background: 'rgba(240, 185, 11, 0.15)',
+                        zIndex: -1,
+                      }}
+                    />
+                  )}
+                  📊 数据大屏
                 </button>
 
                 <button

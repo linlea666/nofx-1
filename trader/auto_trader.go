@@ -1743,9 +1743,11 @@ func (at *AutoTrader) recordAndConfirmOrder(orderResult map[string]interface{}, 
 		orderID = fmt.Sprintf("%v", v)
 	}
 
-	if orderID == "" || orderID == "0" {
-		logger.Infof("  ⚠️ Order ID is empty, skipping record")
-		return
+	// 修复：某些交易所（如 Hyperliquid）不返回 orderId，生成唯一 ID 确保交易记录不丢失
+	if orderID == "" || orderID == "0" || orderID == "<nil>" {
+		// 生成唯一 ID: 交易所_币种_动作_时间戳
+		orderID = fmt.Sprintf("%s_%s_%s_%d", at.exchange, symbol, action, time.Now().UnixNano())
+		logger.Infof("  📝 Order ID is empty, using auto-generated: %s", orderID)
 	}
 
 	// Determine positionSide

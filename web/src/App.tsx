@@ -11,6 +11,7 @@ import { LandingPage } from './pages/LandingPage'
 import { FAQPage } from './pages/FAQPage'
 import { StrategyStudioPage } from './pages/StrategyStudioPage'
 import { DebateArenaPage } from './pages/DebateArenaPage'
+import { DashboardPage } from './pages/DashboardPage'
 import HeaderBar from './components/HeaderBar'
 import { LanguageProvider, useLanguage } from './contexts/LanguageContext'
 import { AuthProvider, useAuth } from './contexts/AuthContext'
@@ -43,6 +44,7 @@ type Page =
   | 'faq'
   | 'login'
   | 'register'
+  | 'data-dashboard'
 
 // 获取友好的AI模型名称
 function getModelDisplayName(modelId: string): string {
@@ -98,6 +100,7 @@ function App() {
     if (path === '/backtest' || hash === 'backtest') return 'backtest'
     if (path === '/strategy' || hash === 'strategy') return 'strategy'
     if (path === '/debate' || hash === 'debate') return 'debate'
+    if (path === '/data-dashboard' || hash === 'data-dashboard') return 'data-dashboard'
     if (path === '/dashboard' || hash === 'trader' || hash === 'details')
       return 'trader'
     return 'competition' // 默认为竞赛页面
@@ -530,6 +533,8 @@ function App() {
           <StrategyStudioPage />
         ) : currentPage === 'debate' ? (
           <DebateArenaPage />
+        ) : currentPage === 'data-dashboard' ? (
+          <DashboardPage />
         ) : (
           <TraderDetailsPage
             selectedTrader={selectedTrader}
