@@ -135,6 +135,7 @@ type Decision struct {
 	PositionSizeUSD float64 `json:"position_size_usd,omitempty"`
 	StopLoss        float64 `json:"stop_loss,omitempty"`
 	TakeProfit      float64 `json:"take_profit,omitempty"`
+	MarginMode      string  `json:"margin_mode,omitempty"` // "cross" | "isolated"，跟单时同步领航员的保证金模式
 
 	// Closing position parameters (for partial close/reduce)
 	CloseRatio float64 `json:"close_ratio,omitempty"` // 0 = close all, 0.5 = close 50%, etc.

@@ -477,6 +477,8 @@ func (t *OKXTrader) SetMarginMode(symbol string, isCrossMargin bool) error {
 		// Ignore error if already in target mode
 		if strings.Contains(err.Error(), "already") {
 			logger.Infof("  ✓ %s margin mode is already %s", symbol, mgnMode)
+			// 即使已经是目标模式，也更新缓存
+			t.isCrossMargin = isCrossMargin
 			return nil
 		}
 		// Cannot change when there are positions
@@ -487,8 +489,18 @@ func (t *OKXTrader) SetMarginMode(symbol string, isCrossMargin bool) error {
 		return err
 	}
 
+	// 更新缓存的 margin mode，供后续 setLeverageForSide 和开仓使用
+	t.isCrossMargin = isCrossMargin
 	logger.Infof("  ✓ %s margin mode set to %s", symbol, mgnMode)
 	return nil
+}
+
+// getMgnMode 获取当前保证金模式字符串
+func (t *OKXTrader) getMgnMode() string {
+	if t.isCrossMargin {
+		return "cross"
+	}
+	return "isolated"
 }
 
 // SetLeverage sets leverage for both directions (used for general cases)
@@ -500,7 +512,7 @@ func (t *OKXTrader) SetLeverage(symbol string, leverage int) error {
 		body := map[string]interface{}{
 			"instId":  instId,
 			"lever":   strconv.Itoa(leverage),
-			"mgnMode": "cross",
+			"mgnMode": t.getMgnMode(), // 使用当前设置的保证金模式
 			"posSide": posSide,
 		}
 
@@ -526,7 +538,7 @@ func (t *OKXTrader) setLeverageForSide(symbol string, leverage int, posSide stri
 	body := map[string]interface{}{
 		"instId":  instId,
 		"lever":   strconv.Itoa(leverage),
-		"mgnMode": "cross",
+		"mgnMode": t.getMgnMode(), // 使用当前设置的保证金模式
 		"posSide": posSide,
 	}
 
@@ -578,7 +590,7 @@ func (t *OKXTrader) OpenLong(symbol string, quantity float64, leverage int) (map
 
 	body := map[string]interface{}{
 		"instId":  instId,
-		"tdMode":  "cross",
+		"tdMode":  t.getMgnMode(), // 使用当前设置的保证金模式
 		"side":    "buy",
 		"posSide": "long",
 		"ordType": "market",
@@ -655,7 +667,7 @@ func (t *OKXTrader) OpenShort(symbol string, quantity float64, leverage int) (ma
 
 	body := map[string]interface{}{
 		"instId":  instId,
-		"tdMode":  "cross",
+		"tdMode":  t.getMgnMode(), // 使用当前设置的保证金模式
 		"side":    "sell",
 		"posSide": "short",
 		"ordType": "market",
@@ -735,7 +747,7 @@ func (t *OKXTrader) CloseLong(symbol string, quantity float64) (map[string]inter
 
 	body := map[string]interface{}{
 		"instId":  instId,
-		"tdMode":  "cross",
+		"tdMode":  t.getMgnMode(), // 使用当前设置的保证金模式
 		"side":    "sell",
 		"posSide": "long",
 		"ordType": "market",
@@ -825,7 +837,7 @@ func (t *OKXTrader) CloseShort(symbol string, quantity float64) (map[string]inte
 
 	body := map[string]interface{}{
 		"instId":  instId,
-		"tdMode":  "cross",
+		"tdMode":  t.getMgnMode(), // 使用当前设置的保证金模式
 		"side":    "buy",
 		"posSide": "short",
 		"ordType": "market",
@@ -926,7 +938,7 @@ func (t *OKXTrader) SetStopLoss(symbol string, positionSide string, quantity, st
 
 	body := map[string]interface{}{
 		"instId":      instId,
-		"tdMode":      "cross",
+		"tdMode":      t.getMgnMode(), // 使用当前设置的保证金模式
 		"side":        side,
 		"posSide":     posSide,
 		"ordType":     "conditional",
@@ -969,7 +981,7 @@ func (t *OKXTrader) SetTakeProfit(symbol string, positionSide string, quantity, 
 
 	body := map[string]interface{}{
 		"instId":      instId,
-		"tdMode":      "cross",
+		"tdMode":      t.getMgnMode(), // 使用当前设置的保证金模式
 		"side":        side,
 		"posSide":     posSide,
 		"ordType":     "conditional",

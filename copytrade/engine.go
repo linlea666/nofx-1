@@ -537,8 +537,9 @@ func (e *Engine) buildDecision(signal *TradeSignal, action ActionType, copySize 
 	if action == ActionOpen || action == ActionAdd {
 		dec.PositionSizeUSD = copySize
 		dec.Leverage = e.getLeaderLeverage(signal)
+		dec.MarginMode = e.getLeaderMarginMode(signal)
 		dec.Confidence = 90
-		logger.Infof("📊 [%s] %s | 金额=%.2f 杠杆=%dx 入场价=%.4f", e.traderID, action, copySize, dec.Leverage, fill.Price)
+		logger.Infof("📊 [%s] %s | 金额=%.2f 杠杆=%dx 模式=%s 入场价=%.4f", e.traderID, action, copySize, dec.Leverage, dec.MarginMode, fill.Price)
 	}
 
 	// ============================================================
@@ -601,6 +602,37 @@ func (e *Engine) getLeaderLeverage(signal *TradeSignal) int {
 	// 4. 默认值
 	logger.Warnf("⚠️ [%s] 无法获取领航员杠杆，使用默认值 10x", e.traderID)
 	return 10
+}
+
+// getLeaderMarginMode 获取领航员保证金模式
+// 优先级：1.信号中的持仓模式 2.实时获取 3.默认值(cross)
+func (e *Engine) getLeaderMarginMode(signal *TradeSignal) string {
+	// 1. 如果不同步保证金模式，返回默认值
+	if !e.config.SyncMarginMode {
+		return "cross" // 默认全仓
+	}
+
+	// 2. 如果信号中有持仓信息，使用该模式
+	if signal.LeaderPosition != nil && signal.LeaderPosition.MarginMode != "" {
+		logger.Infof("🔍 [%s] 使用领航员 %s 保证金模式: %s", e.traderID, signal.Fill.Symbol, signal.LeaderPosition.MarginMode)
+		return signal.LeaderPosition.MarginMode
+	}
+
+	// 3. 实时获取领航员当前持仓的保证金模式
+	if e.provider != nil {
+		state, err := e.provider.GetAccountState(e.config.LeaderID)
+		if err == nil && state.Positions != nil {
+			key := PositionKey(signal.Fill.Symbol, signal.Fill.PositionSide)
+			if pos, ok := state.Positions[key]; ok && pos.MarginMode != "" {
+				logger.Infof("🔍 [%s] 实时获取领航员 %s 保证金模式: %s", e.traderID, signal.Fill.Symbol, pos.MarginMode)
+				return pos.MarginMode
+			}
+		}
+	}
+
+	// 4. 默认值
+	logger.Warnf("⚠️ [%s] 无法获取领航员保证金模式，使用默认值 cross", e.traderID)
+	return "cross"
 }
 
 func (e *Engine) mapAction(action ActionType, side SideType) string {

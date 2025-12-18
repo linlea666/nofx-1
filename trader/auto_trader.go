@@ -936,8 +936,13 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 	actionRecord.Quantity = quantity
 	actionRecord.Price = marketData.CurrentPrice
 
-	// Set margin mode
-	if err := at.trader.SetMarginMode(decision.Symbol, at.config.IsCrossMargin); err != nil {
+	// Set margin mode: 跟单模式下使用 decision 中的模式，否则使用配置
+	isCrossMargin := at.config.IsCrossMargin
+	if decision.MarginMode != "" {
+		isCrossMargin = decision.MarginMode == "cross"
+		logger.Infof("  📊 使用跟单指定的保证金模式: %s", decision.MarginMode)
+	}
+	if err := at.trader.SetMarginMode(decision.Symbol, isCrossMargin); err != nil {
 		logger.Infof("  ⚠️ Failed to set margin mode: %v", err)
 		// Continue execution, doesn't affect trading
 	}
@@ -1069,8 +1074,13 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 	actionRecord.Quantity = quantity
 	actionRecord.Price = marketData.CurrentPrice
 
-	// Set margin mode
-	if err := at.trader.SetMarginMode(decision.Symbol, at.config.IsCrossMargin); err != nil {
+	// Set margin mode: 跟单模式下使用 decision 中的模式，否则使用配置
+	isCrossMargin := at.config.IsCrossMargin
+	if decision.MarginMode != "" {
+		isCrossMargin = decision.MarginMode == "cross"
+		logger.Infof("  📊 使用跟单指定的保证金模式: %s", decision.MarginMode)
+	}
+	if err := at.trader.SetMarginMode(decision.Symbol, isCrossMargin); err != nil {
 		logger.Infof("  ⚠️ Failed to set margin mode: %v", err)
 		// Continue execution, doesn't affect trading
 	}
