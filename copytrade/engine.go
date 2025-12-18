@@ -17,6 +17,10 @@ type Engine struct {
 	config   *CopyConfig
 	provider LeaderProvider
 
+	// 流式 Provider（如果支持）
+	streamingProvider StreamingProvider
+	isStreamingMode   bool
+
 	// 跟随者账户信息（由外部注入）
 	getFollowerBalance   func() float64
 	getFollowerPositions func() map[string]*Position
@@ -51,6 +55,13 @@ type Engine struct {
 // EngineOption 引擎配置选项
 type EngineOption func(*Engine)
 
+// WithStreamingMode 启用流式模式（WebSocket 事件驱动）
+func WithStreamingMode() EngineOption {
+	return func(e *Engine) {
+		e.isStreamingMode = true
+	}
+}
+
 // NewEngine 创建跟单引擎
 func NewEngine(
 	traderID string,
@@ -59,15 +70,9 @@ func NewEngine(
 	getPositions func() map[string]*Position,
 	opts ...EngineOption,
 ) (*Engine, error) {
-	provider, err := NewProvider(config.ProviderType)
-	if err != nil {
-		return nil, err
-	}
-
 	e := &Engine{
 		traderID:             traderID,
 		config:               config,
-		provider:             provider,
 		getFollowerBalance:   getBalance,
 		getFollowerPositions: getPositions,
 		seenFills:            make(map[string]time.Time),
@@ -78,9 +83,34 @@ func NewEngine(
 		stats:                &EngineStats{StartTime: time.Now()},
 	}
 
+	// 应用选项
 	for _, opt := range opts {
 		opt(e)
 	}
+
+	// 根据配置选择 Provider 类型
+	if e.isStreamingMode {
+		// 尝试创建流式 Provider（目前只有 Hyperliquid 支持）
+		streamingProvider, err := NewStreamingProvider(config.ProviderType)
+		if err != nil {
+			// 不支持流式模式，回退到轮询模式
+			logger.Warnf("⚠️ [%s] %s 不支持流式模式，回退到轮询模式", traderID, config.ProviderType)
+			e.isStreamingMode = false
+		} else {
+			e.streamingProvider = streamingProvider
+			e.provider = streamingProvider // StreamingProvider 也实现了 LeaderProvider
+			logger.Infof("✅ [%s] 使用流式模式 (WebSocket)", traderID)
+			return e, nil
+		}
+	}
+
+	// 轮询模式（默认，或流式模式不可用时回退）
+	provider, err := NewProvider(config.ProviderType)
+	if err != nil {
+		return nil, err
+	}
+	e.provider = provider
+	logger.Infof("✅ [%s] 使用轮询模式 (REST)", traderID)
 
 	return e, nil
 }
@@ -105,9 +135,71 @@ func (e *Engine) Start(ctx context.Context) error {
 	e.running = true
 	e.mu.Unlock()
 
-	logger.Infof("🚀 [%s] 跟单引擎启动 | provider=%s leader=%s ratio=%.0f%%",
-		e.traderID, e.config.ProviderType, e.config.LeaderID, e.config.CopyRatio*100)
+	mode := "轮询"
+	if e.isStreamingMode {
+		mode = "流式(WebSocket)"
+	}
+	logger.Infof("🚀 [%s] 跟单引擎启动 | provider=%s leader=%s ratio=%.0f%% mode=%s",
+		e.traderID, e.config.ProviderType, e.config.LeaderID, e.config.CopyRatio*100, mode)
 
+	// 流式模式：WebSocket 事件驱动
+	if e.isStreamingMode && e.streamingProvider != nil {
+		return e.startStreamingMode(ctx)
+	}
+
+	// 轮询模式：REST 定时轮询（OKX 或回退模式）
+	return e.startPollingMode(ctx)
+}
+
+// startStreamingMode 启动流式模式（WebSocket 事件驱动）
+func (e *Engine) startStreamingMode(ctx context.Context) error {
+	// 设置 Fill 回调：收到成交时立即处理
+	e.streamingProvider.SetOnFill(func(fill Fill) {
+		// 去重检查
+		if e.isSeen(fill.ID) {
+			return
+		}
+		e.markSeen(fill.ID)
+
+		e.stats.SignalsReceived++
+		e.stats.LastSignalTime = time.Now()
+
+		// 构造信号并处理
+		signal := e.buildSignal(&fill)
+		logger.Infof("📡 [%s] 收到信号(WS) | %s %s %s | 价格=%.4f 数量=%.4f 价值=%.2f",
+			e.traderID, fill.Symbol, fill.Action, fill.PositionSide,
+			fill.Price, fill.Size, fill.Value)
+
+		e.processSignal(signal)
+	})
+
+	// 设置状态更新回调：持仓变化时更新缓存
+	e.streamingProvider.SetOnStateUpdate(func(state *AccountState) {
+		e.leaderStateMu.Lock()
+		e.leaderState = state
+		e.lastStateSync = time.Now()
+		e.leaderStateMu.Unlock()
+	})
+
+	// 连接并订阅
+	if err := e.streamingProvider.Connect(e.config.LeaderID); err != nil {
+		return fmt.Errorf("streaming provider connect failed: %w", err)
+	}
+
+	// 初始同步领航员状态
+	if err := e.syncLeaderState(); err != nil {
+		logger.Warnf("⚠️ [%s] 初始状态同步失败: %v", e.traderID, err)
+	}
+
+	// 获取历史成交作为去重基线
+	e.initSeenFills()
+
+	logger.Infof("✅ [%s] 流式模式已启动，等待 WebSocket 推送...", e.traderID)
+	return nil
+}
+
+// startPollingMode 启动轮询模式（REST 定时轮询）
+func (e *Engine) startPollingMode(ctx context.Context) error {
 	// 初始同步领航员状态
 	if err := e.syncLeaderState(); err != nil {
 		logger.Warnf("⚠️ [%s] 初始状态同步失败: %v", e.traderID, err)
@@ -129,6 +221,11 @@ func (e *Engine) Stop() {
 
 	if !e.running {
 		return
+	}
+
+	// 关闭流式 Provider
+	if e.streamingProvider != nil {
+		e.streamingProvider.Close()
 	}
 
 	close(e.stopCh)

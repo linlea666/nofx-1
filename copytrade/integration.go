@@ -73,12 +73,18 @@ func (ti *TraderIntegration) StartCopyTrading() error {
 		MaxTradeWarn:   copyConfig.MaxTradeWarn,
 	}
 
-	// 创建引擎
+	// 创建引擎（Hyperliquid 使用流式模式，OKX 使用轮询模式）
+	var engineOpts []EngineOption
+	if engineConfig.ProviderType == ProviderHyperliquid {
+		engineOpts = append(engineOpts, WithStreamingMode())
+	}
+
 	engine, err := NewEngine(
 		ti.traderID,
 		engineConfig,
 		ti.getBalanceFunc(),
 		ti.getPositionsFunc(),
+		engineOpts...,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create copy trade engine: %w", err)

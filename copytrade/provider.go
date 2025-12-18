@@ -29,7 +29,28 @@ type LeaderProvider interface {
 	Type() ProviderType
 }
 
-// NewProvider 创建 Provider
+// StreamingProvider 流式数据提供者接口（支持 WebSocket 推送）
+// 继承 LeaderProvider，额外支持事件驱动模式
+type StreamingProvider interface {
+	LeaderProvider
+
+	// SetOnFill 设置成交回调（收到领航员成交时触发）
+	SetOnFill(callback func(Fill))
+
+	// SetOnStateUpdate 设置状态更新回调（持仓变化时触发）
+	SetOnStateUpdate(callback func(*AccountState))
+
+	// Connect 连接并开始订阅指定领航员
+	Connect(leaderID string) error
+
+	// Close 关闭连接
+	Close() error
+
+	// IsStreaming 是否为流式 Provider
+	IsStreaming() bool
+}
+
+// NewProvider 创建 Provider（REST 轮询模式）
 func NewProvider(providerType ProviderType) (LeaderProvider, error) {
 	switch providerType {
 	case ProviderHyperliquid:
@@ -38,6 +59,17 @@ func NewProvider(providerType ProviderType) (LeaderProvider, error) {
 		return NewOKXProvider(), nil
 	default:
 		return nil, fmt.Errorf("unsupported provider type: %s", providerType)
+	}
+}
+
+// NewStreamingProvider 创建流式 Provider（WebSocket 事件驱动模式）
+// 目前只有 Hyperliquid 支持
+func NewStreamingProvider(providerType ProviderType) (StreamingProvider, error) {
+	switch providerType {
+	case ProviderHyperliquid:
+		return NewHLWebSocketProvider(), nil
+	default:
+		return nil, fmt.Errorf("provider %s does not support streaming mode", providerType)
 	}
 }
 
