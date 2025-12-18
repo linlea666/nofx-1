@@ -321,8 +321,9 @@ func (t *OKXTrader) GetPositions() ([]map[string]interface{}, error) {
 		Lever   string `json:"lever"`
 		LiqPx   string `json:"liqPx"`
 		Margin  string `json:"margin"`
-		CTime   string `json:"cTime"` // Position created time (ms)
-		UTime   string `json:"uTime"` // Position last update time (ms)
+		MgnMode string `json:"mgnMode"` // "cross" | "isolated" 保证金模式
+		CTime   string `json:"cTime"`   // Position created time (ms)
+		UTime   string `json:"uTime"`   // Position last update time (ms)
 	}
 
 	if err := json.Unmarshal(data, &positions); err != nil {
@@ -377,8 +378,9 @@ func (t *OKXTrader) GetPositions() ([]map[string]interface{}, error) {
 			"leverage":         leverage,
 			"liquidationPrice": liqPrice,
 			"side":             side,
-			"createdTime":      cTime, // Position open time (ms)
-			"updatedTime":      uTime, // Position last update time (ms)
+			"mgnMode":          pos.MgnMode, // 保证金模式：cross/isolated
+			"createdTime":      cTime,       // Position open time (ms)
+			"updatedTime":      uTime,       // Position last update time (ms)
 		}
 		result = append(result, posMap)
 	}
@@ -720,21 +722,28 @@ func (t *OKXTrader) CloseLong(symbol string, quantity float64) (map[string]inter
 		return nil, fmt.Errorf("failed to get instrument info: %w", err)
 	}
 
-	// If quantity is 0, get current position (positionAmt is in base asset, e.g. BTC)
-	if quantity == 0 {
-		positions, err := t.GetPositions()
-		if err != nil {
-			return nil, err
-		}
-		for _, pos := range positions {
-			if pos["symbol"] == symbol && pos["side"] == "long" {
-				quantity = pos["positionAmt"].(float64) // This is in base asset (BTC)
-				break
+	// 从持仓数据中获取实际的 margin mode（平仓必须使用与仓位相同的模式）
+	tdMode := t.getMgnMode() // 默认使用缓存的模式
+	positions, err := t.GetPositions()
+	if err != nil {
+		return nil, err
+	}
+	for _, pos := range positions {
+		if pos["symbol"] == symbol && pos["side"] == "long" {
+			// If quantity is 0, use full position
+			if quantity == 0 {
+				quantity = pos["positionAmt"].(float64)
 			}
+			// 使用仓位实际的 margin mode
+			if mgnMode, ok := pos["mgnMode"].(string); ok && mgnMode != "" {
+				tdMode = mgnMode
+				logger.Infof("📊 使用仓位实际的保证金模式: %s", tdMode)
+			}
+			break
 		}
-		if quantity == 0 {
-			return nil, fmt.Errorf("long position not found for %s", symbol)
-		}
+	}
+	if quantity == 0 {
+		return nil, fmt.Errorf("long position not found for %s", symbol)
 	}
 
 	// Convert quantity (base asset) to contract count
@@ -747,7 +756,7 @@ func (t *OKXTrader) CloseLong(symbol string, quantity float64) (map[string]inter
 
 	body := map[string]interface{}{
 		"instId":  instId,
-		"tdMode":  t.getMgnMode(), // 使用当前设置的保证金模式
+		"tdMode":  tdMode, // 使用仓位实际的保证金模式
 		"side":    "sell",
 		"posSide": "long",
 		"ordType": "market",
@@ -801,25 +810,32 @@ func (t *OKXTrader) CloseShort(symbol string, quantity float64) (map[string]inte
 		return nil, fmt.Errorf("failed to get instrument info: %w", err)
 	}
 
-	// If quantity is 0, get current position (positionAmt is in base asset, e.g. BTC)
-	if quantity == 0 {
-		positions, err := t.GetPositions()
-		if err != nil {
-			return nil, err
-		}
-		logger.Infof("🔍 OKX CloseShort searching positions: symbol=%s, current position count=%d", symbol, len(positions))
-		for _, pos := range positions {
-			logger.Infof("🔍 OKX position: symbol=%v, side=%v, positionAmt=%v",
-				pos["symbol"], pos["side"], pos["positionAmt"])
-			if pos["symbol"] == symbol && pos["side"] == "short" {
-				quantity = pos["positionAmt"].(float64) // This is in base asset (BTC)
+	// 从持仓数据中获取实际的 margin mode（平仓必须使用与仓位相同的模式）
+	tdMode := t.getMgnMode() // 默认使用缓存的模式
+	positions, err := t.GetPositions()
+	if err != nil {
+		return nil, err
+	}
+	logger.Infof("🔍 OKX CloseShort searching positions: symbol=%s, current position count=%d", symbol, len(positions))
+	for _, pos := range positions {
+		logger.Infof("🔍 OKX position: symbol=%v, side=%v, positionAmt=%v, mgnMode=%v",
+			pos["symbol"], pos["side"], pos["positionAmt"], pos["mgnMode"])
+		if pos["symbol"] == symbol && pos["side"] == "short" {
+			// If quantity is 0, use full position
+			if quantity == 0 {
+				quantity = pos["positionAmt"].(float64)
 				logger.Infof("🔍 OKX found short position: quantity=%f (base asset)", quantity)
-				break
 			}
+			// 使用仓位实际的 margin mode
+			if mgnMode, ok := pos["mgnMode"].(string); ok && mgnMode != "" {
+				tdMode = mgnMode
+				logger.Infof("📊 使用仓位实际的保证金模式: %s", tdMode)
+			}
+			break
 		}
-		if quantity == 0 {
-			return nil, fmt.Errorf("short position not found for %s", symbol)
-		}
+	}
+	if quantity == 0 {
+		return nil, fmt.Errorf("short position not found for %s", symbol)
 	}
 
 	// Ensure quantity is positive (OKX sz parameter must be positive)
@@ -837,7 +853,7 @@ func (t *OKXTrader) CloseShort(symbol string, quantity float64) (map[string]inte
 
 	body := map[string]interface{}{
 		"instId":  instId,
-		"tdMode":  t.getMgnMode(), // 使用当前设置的保证金模式
+		"tdMode":  tdMode, // 使用仓位实际的保证金模式
 		"side":    "buy",
 		"posSide": "short",
 		"ordType": "market",
