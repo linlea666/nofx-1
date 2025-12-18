@@ -202,12 +202,21 @@ func (ti *TraderIntegration) saveDecisionRecord(fullDec *decision.FullDecision, 
 
 	// 获取当前账户状态
 	accountState := store.AccountSnapshot{}
+	var totalEquity, availableBalance, unrealizedPnL float64
 	if info, err := ti.executor.GetAccountInfo(); err == nil {
 		if equity, ok := info["total_equity"].(float64); ok {
 			accountState.TotalBalance = equity
+			totalEquity = equity
 		}
 		if available, ok := info["available_balance"].(float64); ok {
 			accountState.AvailableBalance = available
+			availableBalance = available
+		}
+		// 尝试两种字段名，兼容不同返回格式
+		if pnl, ok := info["unrealized_profit"].(float64); ok {
+			unrealizedPnL = pnl
+		} else if pnl, ok := info["unrealized_pnl"].(float64); ok {
+			unrealizedPnL = pnl
 		}
 	}
 
@@ -259,6 +268,38 @@ func (ti *TraderIntegration) saveDecisionRecord(fullDec *decision.FullDecision, 
 		logger.Warnf("⚠️ [%s] 保存跟单决策记录失败: %v", ti.traderID, err)
 	} else {
 		logger.Infof("📝 [%s] 跟单决策记录已保存: cycle=%d", ti.traderID, ti.cycleNumber)
+	}
+
+	// 保存权益快照（用于前端绘制净值曲线）
+	ti.saveEquitySnapshot(totalEquity, availableBalance, unrealizedPnL, len(positions))
+}
+
+// saveEquitySnapshot 保存权益快照（复用 store.Equity() 接口）
+func (ti *TraderIntegration) saveEquitySnapshot(totalEquity, availableBalance, unrealizedPnL float64, positionCount int) {
+	if ti.store == nil || totalEquity <= 0 {
+		return
+	}
+
+	// 计算保证金使用率
+	marginUsedPct := 0.0
+	if totalEquity > 0 {
+		marginUsedPct = ((totalEquity - availableBalance) / totalEquity) * 100
+	}
+
+	snapshot := &store.EquitySnapshot{
+		TraderID:      ti.traderID,
+		Timestamp:     time.Now().UTC(),
+		TotalEquity:   totalEquity,
+		Balance:       totalEquity - unrealizedPnL, // 钱包余额 = 总权益 - 未实现盈亏
+		UnrealizedPnL: unrealizedPnL,
+		PositionCount: positionCount,
+		MarginUsedPct: marginUsedPct,
+	}
+
+	if err := ti.store.Equity().Save(snapshot); err != nil {
+		logger.Warnf("⚠️ [%s] 保存权益快照失败: %v", ti.traderID, err)
+	} else {
+		logger.Debugf("💾 [%s] 权益快照已保存: equity=%.2f", ti.traderID, totalEquity)
 	}
 }
 
