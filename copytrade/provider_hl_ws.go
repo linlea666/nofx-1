@@ -29,11 +29,14 @@ type HLWebSocketProvider struct {
 	conn     *websocket.Conn
 	connMu   sync.Mutex
 
+	// REST Provider（用于按需获取账户状态，解决 WS 时序问题）
+	restProvider *HyperliquidProvider
+
 	// 回调函数
 	onFill        func(Fill)
 	onStateUpdate func(*AccountState)
 
-	// 状态缓存（由 WebSocket 推送持续更新）
+	// 状态缓存（由 REST 获取或 WebSocket 推送更新）
 	latestState *AccountState
 	stateMu     sync.RWMutex
 
@@ -51,9 +54,10 @@ type HLWebSocketProvider struct {
 // NewHLWebSocketProvider 创建 Hyperliquid WebSocket Provider
 func NewHLWebSocketProvider() *HLWebSocketProvider {
 	return &HLWebSocketProvider{
-		recentFills: make([]Fill, 0),
-		fillsTTL:    5 * time.Minute, // Fill 缓存 5 分钟
-		stopCh:      make(chan struct{}),
+		restProvider: NewHyperliquidProvider(), // 复用 REST Provider 获取账户状态
+		recentFills:  make([]Fill, 0),
+		fillsTTL:     5 * time.Minute, // Fill 缓存 5 分钟
+		stopCh:       make(chan struct{}),
 	}
 }
 
@@ -281,9 +285,9 @@ func (p *HLWebSocketProvider) handleMessage(message []byte) {
 
 func (p *HLWebSocketProvider) handleUserFills(data json.RawMessage) {
 	var fillsMsg struct {
-		IsSnapshot bool      `json:"isSnapshot"`
-		User       string    `json:"user"`
-		Fills      []WsFill  `json:"fills"`
+		IsSnapshot bool     `json:"isSnapshot"`
+		User       string   `json:"user"`
+		Fills      []WsFill `json:"fills"`
 	}
 
 	if err := json.Unmarshal(data, &fillsMsg); err != nil {
@@ -295,6 +299,11 @@ func (p *HLWebSocketProvider) handleUserFills(data json.RawMessage) {
 	if fillsMsg.IsSnapshot {
 		logger.Debugf("📡 [HL-WS] 收到快照，包含 %d 条历史成交", len(fillsMsg.Fills))
 		return
+	}
+
+	// 如果有新成交，先通过 REST 获取最新账户状态（解决 WS 时序问题）
+	if len(fillsMsg.Fills) > 0 {
+		p.refreshAccountState()
 	}
 
 	// 处理新成交
@@ -311,6 +320,28 @@ func (p *HLWebSocketProvider) handleUserFills(data json.RawMessage) {
 			p.onFill(fill)
 		}
 	}
+}
+
+// refreshAccountState 通过 REST 获取最新账户状态（混合模式）
+// 在收到交易信号时调用，确保获取到准确的领航员权益和持仓信息
+func (p *HLWebSocketProvider) refreshAccountState() {
+	if p.restProvider == nil || p.leaderID == "" {
+		return
+	}
+
+	state, err := p.restProvider.GetAccountState(p.leaderID)
+	if err != nil {
+		logger.Warnf("⚠️ [HL-WS] REST 获取账户状态失败: %v", err)
+		return
+	}
+
+	// 更新缓存
+	p.stateMu.Lock()
+	p.latestState = state
+	p.stateMu.Unlock()
+
+	logger.Infof("📡 [HL-WS] REST 获取账户状态成功 | 权益=%.2f 持仓数=%d",
+		state.TotalEquity, len(state.Positions))
 }
 
 func (p *HLWebSocketProvider) handleClearinghouseState(data json.RawMessage) {
