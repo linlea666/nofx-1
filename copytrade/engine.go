@@ -310,12 +310,35 @@ func (e *Engine) buildSignal(fill *Fill) *TradeSignal {
 	if e.leaderState != nil {
 		signal.LeaderEquity = e.leaderState.TotalEquity
 
-		// 附加该币种的持仓信息 (遍历查找，兼容全仓/逐仓不同 Key)
+		// 附加该币种的持仓信息
+		// OKX 特殊处理：同一币种同一方向可能有多个仓位（全仓+逐仓）
+		// 由于成交记录不包含 mgnMode，需要智能匹配
+		var candidates []*Position
 		for _, pos := range e.leaderState.Positions {
 			if pos.Symbol == fill.Symbol && pos.Side == fill.PositionSide {
-				signal.LeaderPosition = pos
-				break
+				candidates = append(candidates, pos)
 			}
+		}
+
+		if len(candidates) == 1 {
+			// 只有一个仓位，直接使用
+			signal.LeaderPosition = candidates[0]
+		} else if len(candidates) > 1 {
+			// 多个仓位（全仓+逐仓同时存在）
+			// 策略：选择仓位价值最接近本次交易价值的（假设是最近操作的）
+			// 或者选择仓位数量最接近本次交易数量的
+			bestMatch := candidates[0]
+			bestDiff := absFloat(candidates[0].Size - fill.Size)
+			for _, pos := range candidates[1:] {
+				diff := absFloat(pos.Size - fill.Size)
+				if diff < bestDiff {
+					bestDiff = diff
+					bestMatch = pos
+				}
+			}
+			signal.LeaderPosition = bestMatch
+			logger.Infof("📊 [%s] 多仓位匹配 | %s %s | 选择 mgnMode=%s (size=%.4f, 交易=%.4f)",
+				e.traderID, fill.Symbol, fill.PositionSide, bestMatch.MarginMode, bestMatch.Size, fill.Size)
 		}
 	}
 
@@ -329,15 +352,17 @@ func (e *Engine) buildSignal(fill *Fill) *TradeSignal {
 func (e *Engine) processSignal(signal *TradeSignal) {
 	fill := signal.Fill
 
-	// 🔄 对于 Close 类型操作，强制同步领航员状态以获取准确的剩余仓位
-	// 这确保了减仓 vs 平仓的判断准确性
-	if fill.Action == ActionClose {
+	// 🔄 强制同步领航员状态
+	// - Open/Add: 获取最新持仓信息（OKX 需要区分全仓/逐仓）
+	// - Close: 获取准确的剩余仓位（判断减仓 vs 平仓）
+	needSync := fill.Action == ActionClose || fill.Action == ActionOpen || fill.Action == ActionAdd
+	if needSync {
 		if err := e.syncLeaderState(); err != nil {
-			logger.Warnf("⚠️ [%s] Close 操作前状态同步失败: %v", e.traderID, err)
+			logger.Warnf("⚠️ [%s] %s 操作前状态同步失败: %v", e.traderID, fill.Action, err)
 		} else {
 			// 重新构建 signal 以使用最新状态
 			signal = e.buildSignal(fill)
-			logger.Debugf("🔄 [%s] Close 操作已刷新领航员状态", e.traderID)
+			logger.Debugf("🔄 [%s] %s 操作已刷新领航员状态", e.traderID, fill.Action)
 		}
 	}
 
