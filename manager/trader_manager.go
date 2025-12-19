@@ -228,12 +228,12 @@ func (tm *TraderManager) AutoStartRunningTraders(st *store.Store) {
 				}(id, t)
 			} else {
 				// Start in AI mode (default)
-				go func(traderID string, at *trader.AutoTrader) {
+			go func(traderID string, at *trader.AutoTrader) {
 					logger.Infof("▶️  Auto-restoring %s (AI mode)...", at.GetName())
-					if err := at.Run(); err != nil {
-						logger.Infof("❌ %s runtime error: %v", at.GetName(), err)
-					}
-				}(id, t)
+				if err := at.Run(); err != nil {
+					logger.Infof("❌ %s runtime error: %v", at.GetName(), err)
+				}
+			}(id, t)
 			}
 			startedCount++
 		}
@@ -820,12 +820,12 @@ func (tm *TraderManager) addTraderFromStore(traderCfg *store.Trader, aiModelCfg 
 			// Start in AI mode (default)
 			go func(autoTrader *trader.AutoTrader, traderName, traderID, userID string) {
 				if err := autoTrader.Run(); err != nil {
-					logger.Warnf("⚠️ Trader '%s' stopped with error: %v", traderName, err)
-					if st != nil {
-						_ = st.Trader().UpdateStatus(userID, traderID, false)
-					}
+				logger.Warnf("⚠️ Trader '%s' stopped with error: %v", traderName, err)
+				if st != nil {
+					_ = st.Trader().UpdateStatus(userID, traderID, false)
 				}
-			}(at, traderCfg.Name, traderCfg.ID, traderCfg.UserID)
+			}
+		}(at, traderCfg.Name, traderCfg.ID, traderCfg.UserID)
 			logger.Infof("✅ Trader '%s' auto-started in AI mode", traderCfg.Name)
 		}
 	}
