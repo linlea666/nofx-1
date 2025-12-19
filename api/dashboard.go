@@ -2,7 +2,9 @@ package api
 
 import (
 	"database/sql"
+	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -125,6 +127,41 @@ type PnLTrendPoint struct {
 	PnL    float64 `json:"pnl"`     // 当日盈亏
 	CumPnL float64 `json:"cum_pnl"` // 累计盈亏
 	Trades int     `json:"trades"`  // 交易数
+}
+
+// SystemMonitor 系统监控统计
+type SystemMonitor struct {
+	// 跟单统计 (今日)
+	TodaySignals    int     `json:"today_signals"`     // 今日信号总数
+	TodayExecuted   int     `json:"today_executed"`    // 执行成功
+	TodaySkipped    int     `json:"today_skipped"`     // 跳过
+	TodayFailed     int     `json:"today_failed"`      // 失败
+	ExecutionRate   float64 `json:"execution_rate"`    // 执行率 %
+	
+	// API 错误统计 (最近24小时)
+	RateLimitErrors int     `json:"rate_limit_errors"` // 频率限制 (429)
+	NetworkErrors   int     `json:"network_errors"`    // 网络错误
+	AuthErrors      int     `json:"auth_errors"`       // 认证错误
+	OtherErrors     int     `json:"other_errors"`      // 其他错误
+	
+	// 系统健康
+	HealthScore     int     `json:"health_score"`      // 健康度 0-100
+	
+	// 风险预警
+	Alerts          []RiskAlert `json:"alerts"`        // 风险预警列表
+	
+	UpdatedAt       string  `json:"updated_at"`
+}
+
+// RiskAlert 风险预警
+type RiskAlert struct {
+	Level      string  `json:"level"`       // critical | warning | info
+	Type       string  `json:"type"`        // consecutive_loss | max_drawdown | api_error | low_win_rate
+	TraderID   string  `json:"trader_id"`
+	TraderName string  `json:"trader_name"`
+	Message    string  `json:"message"`
+	Value      float64 `json:"value"`       // 相关数值
+	Timestamp  string  `json:"timestamp"`
 }
 
 // ========== 辅助函数 ==========
@@ -435,6 +472,251 @@ func (s *Server) getAllTradersDashboardStats() ([]TraderDashboardStats, error) {
 	return result, nil
 }
 
+// getSystemMonitor 获取系统监控数据
+func (s *Server) getSystemMonitor() (*SystemMonitor, error) {
+	monitor := &SystemMonitor{
+		UpdatedAt: time.Now().Format("2006-01-02 15:04:05"),
+		Alerts:    []RiskAlert{},
+	}
+	
+	db := s.store.DB()
+	todayStart := getTimeRangeStart("today")
+	todayStr := todayStart.Format("2006-01-02 15:04:05")
+	
+	// ========== 跟单信号统计 (今日) ==========
+	// 总信号数
+	db.QueryRow(`
+		SELECT COUNT(*) FROM copy_trade_signal_logs WHERE created_at >= ?
+	`, todayStr).Scan(&monitor.TodaySignals)
+	
+	// 执行成功
+	db.QueryRow(`
+		SELECT COUNT(*) FROM copy_trade_signal_logs 
+		WHERE created_at >= ? AND status = 'executed'
+	`, todayStr).Scan(&monitor.TodayExecuted)
+	
+	// 跳过
+	db.QueryRow(`
+		SELECT COUNT(*) FROM copy_trade_signal_logs 
+		WHERE created_at >= ? AND status = 'skipped'
+	`, todayStr).Scan(&monitor.TodaySkipped)
+	
+	// 失败
+	db.QueryRow(`
+		SELECT COUNT(*) FROM copy_trade_signal_logs 
+		WHERE created_at >= ? AND status = 'failed'
+	`, todayStr).Scan(&monitor.TodayFailed)
+	
+	// 执行率
+	if monitor.TodaySignals > 0 {
+		monitor.ExecutionRate = float64(monitor.TodayExecuted) / float64(monitor.TodaySignals) * 100
+	}
+	
+	// ========== API 错误统计 (最近24小时) ==========
+	last24h := time.Now().Add(-24 * time.Hour).Format("2006-01-02 15:04:05")
+	
+	// 从 copy_trade_signal_logs 和 decision_records 提取错误
+	rows, err := db.Query(`
+		SELECT error_message FROM copy_trade_signal_logs 
+		WHERE created_at >= ? AND error_message != '' AND error_message IS NOT NULL
+		UNION ALL
+		SELECT error_message FROM decision_records 
+		WHERE timestamp >= ? AND error_message != '' AND error_message IS NOT NULL
+	`, last24h, last24h)
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var errMsg string
+			if rows.Scan(&errMsg) == nil && errMsg != "" {
+				// 分类错误
+				errLower := strings.ToLower(errMsg)
+				switch {
+				case strings.Contains(errLower, "429") || strings.Contains(errLower, "rate") || strings.Contains(errLower, "limit"):
+					monitor.RateLimitErrors++
+				case strings.Contains(errLower, "timeout") || strings.Contains(errLower, "network") || strings.Contains(errLower, "connection"):
+					monitor.NetworkErrors++
+				case strings.Contains(errLower, "auth") || strings.Contains(errLower, "401") || strings.Contains(errLower, "403") || strings.Contains(errLower, "key"):
+					monitor.AuthErrors++
+				default:
+					monitor.OtherErrors++
+				}
+			}
+		}
+	}
+	
+	// ========== 计算健康度 ==========
+	monitor.HealthScore = 100
+	totalErrors := monitor.RateLimitErrors + monitor.NetworkErrors + monitor.AuthErrors + monitor.OtherErrors
+	if totalErrors > 0 {
+		monitor.HealthScore -= min(totalErrors*5, 30) // 每个错误扣5分，最多扣30分
+	}
+	if monitor.ExecutionRate < 80 && monitor.TodaySignals > 5 {
+		monitor.HealthScore -= 20 // 执行率低于80%扣20分
+	}
+	if monitor.HealthScore < 0 {
+		monitor.HealthScore = 0
+	}
+	
+	// ========== 风险预警计算 ==========
+	monitor.Alerts = s.calculateRiskAlerts()
+	
+	// 根据预警调整健康度
+	for _, alert := range monitor.Alerts {
+		if alert.Level == "critical" {
+			monitor.HealthScore -= 15
+		} else if alert.Level == "warning" {
+			monitor.HealthScore -= 5
+		}
+	}
+	if monitor.HealthScore < 0 {
+		monitor.HealthScore = 0
+	}
+	
+	return monitor, nil
+}
+
+// calculateRiskAlerts 计算风险预警
+func (s *Server) calculateRiskAlerts() []RiskAlert {
+	var alerts []RiskAlert
+	db := s.store.DB()
+	
+	// 获取所有交易员
+	rows, err := db.Query(`SELECT DISTINCT id FROM traders`)
+	if err != nil {
+		return alerts
+	}
+	defer rows.Close()
+	
+	var traderIDs []string
+	for rows.Next() {
+		var id string
+		if rows.Scan(&id) == nil {
+			traderIDs = append(traderIDs, id)
+		}
+	}
+	
+	for _, traderID := range traderIDs {
+		// 获取交易员名称
+		var traderName string
+		var name, aiModel, exchange sql.NullString
+		db.QueryRow(`SELECT name, ai_model, exchange FROM traders WHERE id = ?`, traderID).Scan(&name, &aiModel, &exchange)
+		if name.String != "" {
+			traderName = name.String
+		} else if aiModel.String != "" {
+			traderName = aiModel.String
+		} else if len(traderID) >= 8 {
+			traderName = traderID[:8]
+		} else {
+			traderName = traderID
+		}
+		
+		// 1. 检查连续亏损 (最近5笔交易)
+		recentPnLs := []float64{}
+		pnlRows, err := db.Query(`
+			SELECT realized_pnl FROM trader_positions 
+			WHERE trader_id = ? AND status = 'CLOSED'
+			ORDER BY exit_time DESC LIMIT 5
+		`, traderID)
+		if err == nil {
+			for pnlRows.Next() {
+				var pnl float64
+				if pnlRows.Scan(&pnl) == nil {
+					recentPnLs = append(recentPnLs, pnl)
+				}
+			}
+			pnlRows.Close()
+		}
+		
+		// 计算连续亏损次数
+		consecutiveLosses := 0
+		for _, pnl := range recentPnLs {
+			if pnl < 0 {
+				consecutiveLosses++
+			} else {
+				break
+			}
+		}
+		
+		if consecutiveLosses >= 3 {
+			level := "warning"
+			if consecutiveLosses >= 5 {
+				level = "critical"
+			}
+			alerts = append(alerts, RiskAlert{
+				Level:      level,
+				Type:       "consecutive_loss",
+				TraderID:   traderID,
+				TraderName: traderName,
+				Message:    fmt.Sprintf("连续亏损 %d 笔交易", consecutiveLosses),
+				Value:      float64(consecutiveLosses),
+				Timestamp:  time.Now().Format("2006-01-02 15:04:05"),
+			})
+		}
+		
+		// 2. 检查胜率过低 (至少10笔交易)
+		var totalTrades, winTrades int
+		db.QueryRow(`
+			SELECT COUNT(*), COALESCE(SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END), 0)
+			FROM trader_positions WHERE trader_id = ? AND status = 'CLOSED'
+		`, traderID).Scan(&totalTrades, &winTrades)
+		
+		if totalTrades >= 10 {
+			winRate := float64(winTrades) / float64(totalTrades) * 100
+			if winRate < 30 {
+				alerts = append(alerts, RiskAlert{
+					Level:      "warning",
+					Type:       "low_win_rate",
+					TraderID:   traderID,
+					TraderName: traderName,
+					Message:    fmt.Sprintf("胜率过低: %.1f%% (%d/%d)", winRate, winTrades, totalTrades),
+					Value:      winRate,
+					Timestamp:  time.Now().Format("2006-01-02 15:04:05"),
+				})
+			}
+		}
+		
+		// 3. 检查最大回撤
+		maxDrawdown := s.calculateMaxDrawdown(traderID)
+		if maxDrawdown > 20 {
+			level := "warning"
+			if maxDrawdown > 40 {
+				level = "critical"
+			}
+			alerts = append(alerts, RiskAlert{
+				Level:      level,
+				Type:       "max_drawdown",
+				TraderID:   traderID,
+				TraderName: traderName,
+				Message:    fmt.Sprintf("最大回撤: %.1f%%", maxDrawdown),
+				Value:      maxDrawdown,
+				Timestamp:  time.Now().Format("2006-01-02 15:04:05"),
+			})
+		}
+	}
+	
+	// 4. 检查 API 错误频繁
+	var recentErrors int
+	last1h := time.Now().Add(-1 * time.Hour).Format("2006-01-02 15:04:05")
+	db.QueryRow(`
+		SELECT COUNT(*) FROM copy_trade_signal_logs 
+		WHERE created_at >= ? AND status = 'failed'
+	`, last1h).Scan(&recentErrors)
+	
+	if recentErrors >= 5 {
+		alerts = append(alerts, RiskAlert{
+			Level:      "warning",
+			Type:       "api_error",
+			TraderID:   "",
+			TraderName: "系统",
+			Message:    fmt.Sprintf("最近1小时内 %d 次跟单失败", recentErrors),
+			Value:      float64(recentErrors),
+			Timestamp:  time.Now().Format("2006-01-02 15:04:05"),
+		})
+	}
+	
+	return alerts
+}
+
 // getPnLTrend 获取盈亏趋势（按天）
 func (s *Server) getPnLTrend(traderID string, days int) ([]PnLTrendPoint, error) {
 	db := s.store.DB()
@@ -577,6 +859,18 @@ func (s *Server) handleDashboardTrend(c *gin.Context) {
 	c.JSON(http.StatusOK, trend)
 }
 
+// handleDashboardMonitor 处理系统监控请求
+func (s *Server) handleDashboardMonitor(c *gin.Context) {
+	monitor, err := s.getSystemMonitor()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "获取监控数据失败",
+		})
+		return
+	}
+	c.JSON(http.StatusOK, monitor)
+}
+
 // ========== 路由注册 ==========
 
 // RegisterDashboardRoutes 注册大屏路由（在 setupRoutes 中调用）
@@ -587,6 +881,7 @@ func (s *Server) RegisterDashboardRoutes(api *gin.RouterGroup) {
 		dashboard.GET("/traders", s.handleDashboardTraders)
 		dashboard.GET("/trader/:id", s.handleDashboardTrader)
 		dashboard.GET("/trend", s.handleDashboardTrend)
+		dashboard.GET("/monitor", s.handleDashboardMonitor)
 	}
 	
 	logger.Infof("📊 Dashboard API 路由已注册:")
@@ -594,5 +889,6 @@ func (s *Server) RegisterDashboardRoutes(api *gin.RouterGroup) {
 	logger.Infof("  • GET /api/dashboard/traders   - 所有交易员统计")
 	logger.Infof("  • GET /api/dashboard/trader/:id - 单个交易员统计")
 	logger.Infof("  • GET /api/dashboard/trend     - 盈亏趋势数据")
+	logger.Infof("  • GET /api/dashboard/monitor   - 系统监控与风险预警")
 }
 

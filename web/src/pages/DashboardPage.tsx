@@ -2,6 +2,7 @@ import { useState, useEffect, useMemo } from 'react'
 import useSWR from 'swr'
 import {
   TrendingUp,
+  TrendingDown,
   Users,
   Zap,
   Target,
@@ -9,12 +10,17 @@ import {
   Globe,
   Database,
   Terminal as TerminalIcon,
-  Crosshair,
   Layers,
   AlertTriangle,
   Activity,
   Radio,
   Bug,
+  CheckCircle,
+  XCircle,
+  Clock,
+  BarChart3,
+  Gauge,
+  Heart,
 } from 'lucide-react'
 import { PunkAvatar, getTraderAvatar } from '../components/PunkAvatar'
 
@@ -23,10 +29,13 @@ interface TraderStats {
   trader_id: string
   trader_name: string
   mode: string
+  exchange: string
   today_pnl: number
   today_trades: number
   week_pnl: number
+  week_trades: number
   month_pnl: number
+  month_trades: number
   total_pnl: number
   total_trades: number
   win_rate: number
@@ -35,6 +44,7 @@ interface TraderStats {
   initial_balance: number
   return_rate: number
   position_count: number
+  is_running: boolean
 }
 
 interface GlobalStats {
@@ -48,58 +58,87 @@ interface GlobalStats {
   month_pnl: number
 }
 
+interface RiskAlert {
+  level: 'critical' | 'warning' | 'info'
+  type: string
+  trader_id: string
+  trader_name: string
+  message: string
+  value: number
+  timestamp: string
+}
+
+interface SystemMonitor {
+  today_signals: number
+  today_executed: number
+  today_skipped: number
+  today_failed: number
+  execution_rate: number
+  rate_limit_errors: number
+  network_errors: number
+  auth_errors: number
+  other_errors: number
+  health_score: number
+  alerts: RiskAlert[]
+  updated_at: string
+}
+
 // --- API 调用 ---
+const API_BASE = import.meta.env.VITE_API_BASE_URL || ''
+
 const fetchDashboardTraders = async () => {
-  const res = await fetch(`${import.meta.env.VITE_API_BASE_URL || ''}/api/dashboard/traders`)
+  const res = await fetch(`${API_BASE}/api/dashboard/traders`)
   if (!res.ok) throw new Error('数据加载失败')
   return res.json()
 }
 
 const fetchDashboardSummary = async () => {
-  const res = await fetch(`${import.meta.env.VITE_API_BASE_URL || ''}/api/dashboard/summary`)
+  const res = await fetch(`${API_BASE}/api/dashboard/summary`)
   if (!res.ok) throw new Error('汇总数据加载失败')
+  return res.json()
+}
+
+const fetchDashboardMonitor = async () => {
+  const res = await fetch(`${API_BASE}/api/dashboard/monitor`)
+  if (!res.ok) throw new Error('监控数据加载失败')
   return res.json()
 }
 
 // --- UI 组件库 ---
 
-/**
- * 仪表盘组件 (仿图4样式)
- */
-function DataGauge({ value, label, color = '#00f2ff' }: { value: number; label: string; color?: string }) {
-  const radius = 40
+/** 仪表盘组件 */
+function DataGauge({ value, label, color = '#00f2ff', size = 80 }: { value: number; label: string; color?: string; size?: number }) {
+  const radius = size * 0.4
   const circumference = 2 * Math.PI * radius
-  const offset = circumference - (value / 100) * circumference
+  const offset = circumference - (Math.min(value, 100) / 100) * circumference
 
   return (
     <div className="relative flex flex-col items-center">
-      <svg width="100" height="100" className="-rotate-90">
-        <circle cx="50" cy="50" r={radius} fill="none" stroke="rgba(255,255,255,0.05)" strokeWidth="8" />
+      <svg width={size} height={size} className="-rotate-90">
+        <circle cx={size/2} cy={size/2} r={radius} fill="none" stroke="rgba(255,255,255,0.05)" strokeWidth="6" />
         <circle
-          cx="50"
-          cy="50"
+          cx={size/2}
+          cy={size/2}
           r={radius}
           fill="none"
           stroke={color}
-          strokeWidth="8"
+          strokeWidth="6"
           strokeDasharray={circumference}
           strokeDashoffset={offset}
           strokeLinecap="round"
           className="transition-all duration-1000 ease-out"
-          style={{ filter: `drop-shadow(0 0 10px ${color}80)` }}
+          style={{ filter: `drop-shadow(0 0 8px ${color}80)` }}
         />
       </svg>
-      <div className="absolute inset-0 flex flex-col items-center justify-center -mt-2">
-        <span className="text-xl font-black font-mono leading-none">{value.toFixed(1)}%</span>
-        <span className="text-[10px] text-white/40 mt-1">{label}</span>
+      <div className="absolute inset-0 flex flex-col items-center justify-center">
+        <span className="text-lg font-black font-mono leading-none">{value.toFixed(1)}%</span>
+        <span className="text-[9px] text-white/40 mt-0.5">{label}</span>
       </div>
     </div>
   )
 }
 
-/**
- * 大屏模块面板 (可视化设计)
- */
+/** 大屏模块面板 */
 function DashboardModule({
   children,
   title,
@@ -107,99 +146,117 @@ function DashboardModule({
   icon: Icon,
   className = '',
   color = 'cyan',
+  rightContent,
 }: {
   children: React.ReactNode
   title: string
   subtitle?: string
   icon?: any
   className?: string
-  color?: 'cyan' | 'pink' | 'green' | 'yellow'
+  color?: 'cyan' | 'pink' | 'green' | 'yellow' | 'red'
+  rightContent?: React.ReactNode
 }) {
   const colorMap = {
     cyan: '#00f2ff',
     pink: '#ff00ff',
     green: '#00ff9d',
     yellow: '#ffe600',
+    red: '#ff0055',
   }
   const themeColor = colorMap[color]
 
   return (
     <div className={`relative flex flex-col ${className}`}>
-      {/* 玻璃拟态底色 */}
-      <div className="absolute inset-0 bg-[#0a1628]/60 backdrop-blur-xl border border-white/5 rounded-sm shadow-2xl" />
+      <div className="absolute inset-0 bg-[#0a1628]/70 backdrop-blur-xl border border-white/5 rounded-sm shadow-2xl" />
       
       {/* 战术边角 */}
-      <div className="absolute top-0 left-0 w-3 h-3 border-t-2 border-l-2" style={{ borderColor: themeColor }} />
-      <div className="absolute top-0 right-0 w-3 h-3 border-t-2 border-r-2" style={{ borderColor: themeColor }} />
-      <div className="absolute bottom-0 left-0 w-3 h-3 border-b-2 border-l-2" style={{ borderColor: themeColor }} />
-      <div className="absolute bottom-0 right-0 w-3 h-3 border-b-2 border-r-2" style={{ borderColor: themeColor }} />
+      <div className="absolute top-0 left-0 w-2.5 h-2.5 border-t-2 border-l-2" style={{ borderColor: themeColor }} />
+      <div className="absolute top-0 right-0 w-2.5 h-2.5 border-t-2 border-r-2" style={{ borderColor: themeColor }} />
+      <div className="absolute bottom-0 left-0 w-2.5 h-2.5 border-b-2 border-l-2" style={{ borderColor: themeColor }} />
+      <div className="absolute bottom-0 right-0 w-2.5 h-2.5 border-b-2 border-r-2" style={{ borderColor: themeColor }} />
 
       {/* 标题栏 */}
-      <div className="relative z-10 flex items-center justify-between px-4 py-2 border-b border-white/10 bg-white/5">
+      <div className="relative z-10 flex items-center justify-between px-3 py-2 border-b border-white/10 bg-white/5">
         <div className="flex items-center gap-2">
-          {Icon && <Icon size={16} style={{ color: themeColor }} />}
-          <span className="text-sm font-black tracking-widest text-white/90">{title}</span>
-          {subtitle && <span className="text-[9px] text-white/30 font-bold uppercase tracking-tighter ml-1">/ {subtitle}</span>}
+          {Icon && <Icon size={14} style={{ color: themeColor }} />}
+          <span className="text-xs font-black tracking-wider text-white/90">{title}</span>
+          {subtitle && <span className="text-[8px] text-white/30 font-bold uppercase tracking-tight ml-1">/ {subtitle}</span>}
         </div>
-        <div className="flex gap-0.5">
+        <div className="flex items-center gap-2">
+          {rightContent}
           <div className="w-1.5 h-1.5 rounded-full animate-pulse" style={{ backgroundColor: themeColor }} />
         </div>
       </div>
 
       {/* 内容区 */}
-      <div className="relative z-10 p-4 flex-1 overflow-hidden">
+      <div className="relative z-10 p-3 flex-1 overflow-hidden">
         {children}
       </div>
     </div>
   )
 }
 
-/**
- * 战术数字组件
- */
-function TacticalNumber({
-  value,
-  prefix,
-  suffix,
-  className = '',
-  color = 'white',
-}: {
+/** 核心统计卡片 */
+function StatCard({ 
+  label, 
+  value, 
+  suffix = '', 
+  color = '#00f2ff',
+  trend,
+}: { 
+  label: string
   value: number
-  prefix?: string
   suffix?: string
-  className?: string
   color?: string
+  trend?: 'up' | 'down' | null
 }) {
   return (
-    <div className={`font-mono font-black tracking-tighter ${className}`} style={{ color }}>
-      {prefix && <span className="text-[0.6em] mr-1 opacity-60 font-sans">{prefix}</span>}
-      {value.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-      {suffix && <span className="text-[0.6em] ml-1 opacity-60 font-sans">{suffix}</span>}
+    <div className="bg-[#0a1628]/80 border border-white/10 px-4 py-3 rounded-sm text-center min-w-[140px]">
+      <div className="text-[10px] text-white/40 font-black uppercase tracking-widest mb-1">{label}</div>
+      <div className="flex items-center justify-center gap-1">
+        <span 
+          className="text-2xl font-mono font-black tracking-tight" 
+          style={{ color, textShadow: `0 0 15px ${color}40` }}
+        >
+          {typeof value === 'number' ? value.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : value}
+        </span>
+        {suffix && <span className="text-sm text-white/40 font-bold">{suffix}</span>}
+        {trend === 'up' && <TrendingUp size={14} className="text-[#00ff9d] ml-1" />}
+        {trend === 'down' && <TrendingDown size={14} className="text-[#ff0055] ml-1" />}
+      </div>
     </div>
   )
 }
 
-/**
- * 战术发光数字
- */
-function NeonNumber({ 
+/** 周期切换按钮 */
+function PeriodTabs({ 
   value, 
-  prefix = '', 
-  suffix = '', 
-  className = '', 
-  color = 'white' 
+  onChange 
 }: { 
-  value: number; 
-  prefix?: string; 
-  suffix?: string; 
-  className?: string; 
-  color?: string 
+  value: 'today' | 'week' | 'month'
+  onChange: (v: 'today' | 'week' | 'month') => void 
 }) {
+  const tabs = [
+    { key: 'today', label: '今日' },
+    { key: 'week', label: '本周' },
+    { key: 'month', label: '本月' },
+  ] as const
+
   return (
-    <div className={`font-mono font-black tracking-tighter ${className}`} style={{ color, textShadow: `0 0 20px ${color}40` }}>
-      {prefix && <span className="text-[0.5em] mr-1 opacity-60 font-sans">{prefix}</span>}
-      {value.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-      {suffix && <span className="text-[0.5em] ml-1 opacity-60 font-sans">{suffix}</span>}
+    <div className="flex bg-white/5 rounded-sm p-0.5">
+      {tabs.map(tab => (
+        <button
+          key={tab.key}
+          onClick={() => onChange(tab.key)}
+          className={`px-3 py-1 text-[10px] font-black uppercase tracking-wider transition-all ${
+            value === tab.key 
+              ? 'bg-[#00f2ff]/20 text-[#00f2ff]' 
+              : 'text-white/40 hover:text-white/60'
+          }`}
+        >
+          {tab.label}
+        </button>
+      ))}
     </div>
   )
 }
@@ -209,13 +266,15 @@ function NeonNumber({
 export function DashboardPage() {
   const [currentTime, setCurrentTime] = useState(new Date())
   const [selectedTrader, setSelectedTrader] = useState<TraderStats | null>(null)
+  const [period, setPeriod] = useState<'today' | 'week' | 'month'>('today')
 
   // 数据获取
-  const { data: tradersRaw, isLoading } = useSWR('dashboard-traders-v3', fetchDashboardTraders, { refreshInterval: 15000 })
-  const { data: summaryRaw } = useSWR('dashboard-summary-v3', fetchDashboardSummary, { refreshInterval: 15000 })
+  const { data: tradersRaw, isLoading } = useSWR('dashboard-traders-v4', fetchDashboardTraders, { refreshInterval: 15000 })
+  const { data: summaryRaw } = useSWR('dashboard-summary-v4', fetchDashboardSummary, { refreshInterval: 15000 })
+  const { data: monitorRaw } = useSWR('dashboard-monitor-v4', fetchDashboardMonitor, { refreshInterval: 30000 })
 
   useEffect(() => {
-    const timer = setInterval(() => setCurrentTime(new Date()), 10)
+    const timer = setInterval(() => setCurrentTime(new Date()), 100)
     return () => clearInterval(timer)
   }, [])
 
@@ -223,7 +282,7 @@ export function DashboardPage() {
     if (!tradersRaw) return []
     return (tradersRaw as any[]).map(t => ({
       ...t,
-      trader_name: t.trader_name || t.trader_id?.substring(0, 8) || '未知单位',
+      trader_name: t.trader_name || t.trader_id?.substring(0, 8) || '未知交易员',
     }))
   }, [tradersRaw])
 
@@ -234,11 +293,40 @@ export function DashboardPage() {
     }
   }, [summaryRaw])
 
+  const monitor: SystemMonitor = useMemo(() => {
+    return monitorRaw || {
+      today_signals: 0, today_executed: 0, today_skipped: 0, today_failed: 0,
+      execution_rate: 0, rate_limit_errors: 0, network_errors: 0, auth_errors: 0, other_errors: 0,
+      health_score: 100, alerts: [], updated_at: ''
+    }
+  }, [monitorRaw])
+
   const sortedTraders = [...traderStats].sort((a, b) => b.total_pnl - a.total_pnl)
 
   useEffect(() => {
     if (sortedTraders.length > 0 && !selectedTrader) setSelectedTrader(sortedTraders[0])
-  }, [sortedTraders])
+  }, [sortedTraders, selectedTrader])
+
+  // 根据周期获取盈亏数据
+  const getPeriodPnL = (stats: GlobalStats | TraderStats) => {
+    switch (period) {
+      case 'today': return stats.today_pnl
+      case 'week': return stats.week_pnl
+      case 'month': return stats.month_pnl
+      default: return stats.today_pnl
+    }
+  }
+
+  const getPeriodTrades = (stats: TraderStats) => {
+    switch (period) {
+      case 'today': return stats.today_trades
+      case 'week': return stats.week_trades
+      case 'month': return stats.month_trades
+      default: return stats.today_trades
+    }
+  }
+
+  const periodLabel = { today: '今日', week: '本周', month: '本月' }[period]
 
   if (isLoading && !tradersRaw) {
     return (
@@ -247,125 +335,133 @@ export function DashboardPage() {
           <div className="absolute top-0 left-0 h-full bg-[#00f2ff] animate-[loading_2s_infinite]" />
         </div>
         <div className="text-[#00f2ff] text-xs tracking-[0.5em] animate-pulse">正在同步全球交易节点...</div>
-        <style>{`@keyframes loading { 0% { left: -100% } 100% { left: 100% } }`}</style>
+        <style>{`@keyframes loading { 0% { left: -100%; width: 30% } 100% { left: 100%; width: 30% } }`}</style>
       </div>
     )
   }
 
   return (
-    <div className="fixed inset-0 bg-[#020617] text-white z-[9999] overflow-hidden flex flex-col font-sans select-none tracking-tight">
-      {/* 动态背景背景 */}
-      <div className="absolute inset-0 pointer-events-none opacity-30">
+    <div className="fixed inset-0 bg-[#020617] text-white z-[9999] overflow-hidden flex flex-col font-sans select-none">
+      {/* 背景 */}
+      <div className="absolute inset-0 pointer-events-none opacity-20">
         <div className="absolute inset-0" style={{
-          backgroundImage: `radial-gradient(circle at 50% 50%, #1e293b 0%, transparent 70%)`,
+          backgroundImage: `radial-gradient(circle at 50% 50%, #1e3a5f 0%, transparent 60%)`,
         }} />
-        <div className="absolute inset-0 opacity-10" style={{
-          backgroundImage: `linear-gradient(to right, #ffffff05 1px, transparent 1px), linear-gradient(to bottom, #ffffff05 1px, transparent 1px)`,
-          backgroundSize: '40px 40px',
+        <div className="absolute inset-0" style={{
+          backgroundImage: `linear-gradient(to right, #ffffff08 1px, transparent 1px), linear-gradient(to bottom, #ffffff08 1px, transparent 1px)`,
+          backgroundSize: '50px 50px',
         }} />
       </div>
 
       {/* --- 顶部导航条 --- */}
-      <header className="relative z-10 h-20 border-b border-white/10 bg-black/40 backdrop-blur-xl px-10 flex items-center justify-between">
-        <div className="flex items-center gap-10">
-          <div className="flex items-center gap-4">
-            <div className="w-12 h-12 bg-gradient-to-br from-[#00f2ff] to-[#ff00ff] rounded-lg rotate-45 flex items-center justify-center shadow-[0_0_20px_rgba(0,242,255,0.3)]">
-              <Zap size={28} className="text-white -rotate-45" />
+      <header className="relative z-10 h-16 border-b border-white/10 bg-[#0a1628]/80 backdrop-blur-xl px-6 flex items-center justify-between">
+        {/* 左侧：Logo + 系统状态 */}
+        <div className="flex items-center gap-6">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 bg-gradient-to-br from-[#00f2ff] to-[#ff00ff] rounded-lg rotate-45 flex items-center justify-center shadow-[0_0_15px_rgba(0,242,255,0.3)]">
+              <Zap size={22} className="text-white -rotate-45" />
             </div>
             <div className="flex flex-col">
-              <span className="text-2xl font-black tracking-tighter italic">NOFX 交易指挥中心</span>
-              <span className="text-[10px] text-[#00f2ff] font-bold tracking-[0.4em] uppercase opacity-60">Operations Unit v2.8</span>
+              <span className="text-lg font-black tracking-tight">NOFX 交易指挥中心</span>
+              <span className="text-[9px] text-[#00f2ff] font-bold tracking-[0.3em] uppercase opacity-60">Operations v3.0</span>
             </div>
           </div>
           
-          <div className="flex flex-col border-l border-white/10 pl-10">
-            <span className="text-[10px] text-white/40 uppercase font-black tracking-widest mb-1">系统状态</span>
-            <div className="flex items-center gap-2">
-              <div className="w-2 h-2 rounded-full bg-[#00ff9d] shadow-[0_0_10px_#00ff9d]" />
-              <span className="text-xs font-mono text-[#00ff9d] uppercase font-bold">节点运行正常</span>
-            </div>
+          <div className="h-8 w-px bg-white/10" />
+          
+          <div className="flex items-center gap-2">
+            <Heart size={14} className={monitor.health_score >= 80 ? 'text-[#00ff9d]' : monitor.health_score >= 50 ? 'text-[#ffe600]' : 'text-[#ff0055]'} />
+            <span className="text-xs font-mono font-bold" style={{ color: monitor.health_score >= 80 ? '#00ff9d' : monitor.health_score >= 50 ? '#ffe600' : '#ff0055' }}>
+              健康度 {monitor.health_score}%
+            </span>
           </div>
         </div>
 
-        {/* 顶部中央核心指标 (仿图3) */}
-        <div className="absolute left-1/2 -translate-x-1/2 flex items-center gap-16">
-          <div className="flex flex-col items-center">
-            <span className="text-[10px] text-white/40 font-black mb-1">今日总盈亏</span>
-            <NeonNumber 
-              value={globalStats.today_pnl} 
-              prefix="$" 
-              className="text-3xl" 
-              color={globalStats.today_pnl >= 0 ? '#00ff9d' : '#ff0055'} 
+        {/* 中央：核心统计 + 周期切换 */}
+        <div className="absolute left-1/2 -translate-x-1/2 flex items-center gap-4">
+          <PeriodTabs value={period} onChange={setPeriod} />
+          
+          <div className="flex items-center gap-3">
+            <StatCard 
+              label={`${periodLabel}盈亏`}
+              value={getPeriodPnL(globalStats)}
+              color={getPeriodPnL(globalStats) >= 0 ? '#00ff9d' : '#ff0055'}
+              trend={getPeriodPnL(globalStats) >= 0 ? 'up' : 'down'}
+            />
+            <StatCard 
+              label="总成交笔数"
+              value={globalStats.total_trades}
+              suffix="笔"
+              color="#ffe600"
+            />
+            <StatCard 
+              label="活跃交易员"
+              value={globalStats.active_traders}
+              suffix="位"
+              color="#ff00ff"
             />
           </div>
-          <div className="flex flex-col items-center border-l border-white/5 pl-16">
-            <span className="text-[10px] text-white/40 font-black mb-1">今日成交笔数</span>
-            <NeonNumber value={globalStats.total_trades} suffix="笔" className="text-3xl" color="#ffe600" />
-          </div>
-          <div className="flex flex-col items-center border-l border-white/5 pl-16">
-            <span className="text-[10px] text-white/40 font-black mb-1">活跃交易员</span>
-            <NeonNumber value={globalStats.active_traders} suffix="位" className="text-3xl" color="#ff00ff" />
-          </div>
         </div>
 
-        <div className="flex items-center gap-10">
-          <div className="bg-white/5 border border-white/10 px-8 py-2 rounded-sm text-right min-w-[220px] shadow-inner">
-            <div className="text-2xl font-mono font-black text-[#00f2ff] leading-none tracking-tighter">
-              {currentTime.getHours().toString().padStart(2, '0')}:
-              {currentTime.getMinutes().toString().padStart(2, '0')}:
-              {currentTime.getSeconds().toString().padStart(2, '0')}
-              <span className="text-sm opacity-40 ml-1">.{currentTime.getMilliseconds().toString().padStart(3, '0')}</span>
-            </div>
-            <div className="text-[10px] text-white/30 font-black uppercase tracking-[0.2em] mt-1">
-              {currentTime.toLocaleDateString('zh-CN', { weekday: 'long', month: 'long', day: '2-digit', year: 'numeric' })}
-            </div>
+        {/* 右侧：时钟 */}
+        <div className="bg-[#0a1628]/80 border border-white/10 px-4 py-2 rounded-sm text-right min-w-[180px]">
+          <div className="text-xl font-mono font-black text-[#00f2ff] leading-none tracking-tight">
+            {currentTime.getHours().toString().padStart(2, '0')}:
+            {currentTime.getMinutes().toString().padStart(2, '0')}:
+            {currentTime.getSeconds().toString().padStart(2, '0')}
+            <span className="text-xs opacity-40 ml-1">.{Math.floor(currentTime.getMilliseconds() / 100)}</span>
+          </div>
+          <div className="text-[9px] text-white/30 font-bold uppercase tracking-wider mt-1">
+            {currentTime.toLocaleDateString('zh-CN', { month: 'long', day: '2-digit', weekday: 'short' })}
           </div>
         </div>
       </header>
 
       {/* --- 主视口布局 --- */}
-      <main className="relative z-10 flex-1 p-6 grid grid-cols-12 gap-6 overflow-hidden">
+      <main className="relative z-10 flex-1 p-4 grid grid-cols-12 gap-4 overflow-hidden">
         
         {/* 左翼：排行与资产 */}
-        <div className="col-span-3 flex flex-col gap-6 overflow-hidden">
+        <div className="col-span-3 flex flex-col gap-4 overflow-hidden">
           <DashboardModule title="交易员排行榜" subtitle="Leaderboard" icon={Users} color="cyan" className="flex-[2] overflow-hidden">
-            <div className="h-full overflow-y-auto pr-2 custom-cyber-scrollbar space-y-3">
+            <div className="h-full overflow-y-auto pr-1 custom-scrollbar space-y-2">
               {sortedTraders.map((t, i) => (
                 <div 
                   key={t.trader_id}
                   onClick={() => setSelectedTrader(t)}
-                  className={`group relative p-3 border transition-all cursor-pointer ${
+                  className={`group relative p-2.5 border transition-all cursor-pointer ${
                     selectedTrader?.trader_id === t.trader_id 
-                    ? 'bg-[#00f2ff]/10 border-[#00f2ff]/40 shadow-[inset_0_0_20px_rgba(0,242,255,0.1)]' 
+                    ? 'bg-[#00f2ff]/10 border-[#00f2ff]/40' 
                     : 'bg-white/2 border-white/5 hover:border-white/20'
                   }`}
                 >
-                  <div className="flex items-center gap-3">
-                    <div className={`text-xl font-mono font-black ${i < 3 ? 'text-[#ffe600]' : 'text-white/20'}`}>
-                      {(i + 1).toString().padStart(2, '0')}
+                  <div className="flex items-center gap-2.5">
+                    <div className={`text-lg font-mono font-black w-6 text-center ${i < 3 ? 'text-[#ffe600]' : 'text-white/20'}`}>
+                      {i + 1}
                     </div>
                     <div className="relative">
                       <PunkAvatar 
                         seed={getTraderAvatar(t.trader_id, t.trader_name)} 
-                        size={40} 
-                        className={`rounded-sm shadow-lg transition-all ${selectedTrader?.trader_id === t.trader_id ? 'grayscale-0 scale-110' : 'grayscale group-hover:grayscale-0'}`} 
+                        size={36} 
+                        className={`rounded-sm shadow transition-all ${selectedTrader?.trader_id === t.trader_id ? 'grayscale-0' : 'grayscale-[50%] group-hover:grayscale-0'}`} 
                       />
-                      {t.position_count > 0 && (
-                        <div className="absolute -bottom-1 -right-1 w-2.5 h-2.5 bg-[#00ff9d] rounded-full animate-pulse shadow-[0_0_10px_#00ff9d]" />
+                      {t.is_running && (
+                        <div className="absolute -bottom-0.5 -right-0.5 w-2 h-2 bg-[#00ff9d] rounded-full animate-pulse shadow-[0_0_6px_#00ff9d]" />
                       )}
                     </div>
                     <div className="flex-1 min-w-0">
-                      <div className="text-xs font-black uppercase truncate text-white/90">{t.trader_name}</div>
-                      <div className="flex items-center gap-2 mt-1.5">
-                        <div className="flex-1 h-1.5 bg-white/5 rounded-full overflow-hidden">
-                          <div className="h-full bg-gradient-to-r from-[#00f2ff] to-[#ff00ff] opacity-60" style={{ width: `${t.win_rate}%` }} />
+                      <div className="text-xs font-bold truncate text-white/90">{t.trader_name}</div>
+                      <div className="flex items-center gap-1.5 mt-1">
+                        <div className="flex-1 h-1 bg-white/5 rounded-full overflow-hidden">
+                          <div className="h-full bg-gradient-to-r from-[#00f2ff] to-[#ff00ff]" style={{ width: `${t.win_rate}%` }} />
                         </div>
-                        <span className="text-[9px] font-mono text-white/40">{t.win_rate.toFixed(0)}%</span>
+                        <span className="text-[8px] font-mono text-white/40">{t.win_rate.toFixed(0)}%</span>
                       </div>
                     </div>
                     <div className="text-right">
-                      <TacticalNumber value={t.total_pnl} className="text-sm" color={t.total_pnl >= 0 ? '#00ff9d' : '#ff0055'} />
-                      <div className="text-[8px] font-black text-white/20 uppercase tracking-tighter">累计回报</div>
+                      <div className="text-sm font-mono font-black" style={{ color: t.total_pnl >= 0 ? '#00ff9d' : '#ff0055' }}>
+                        {t.total_pnl >= 0 ? '+' : ''}{t.total_pnl.toFixed(2)}
+                      </div>
+                      <div className="text-[8px] text-white/30 uppercase">累计</div>
                     </div>
                   </div>
                 </div>
@@ -373,165 +469,286 @@ export function DashboardPage() {
             </div>
           </DashboardModule>
 
-          <DashboardModule title="资产分布情况" subtitle="Allocation" icon={Globe} color="green" className="flex-1">
-            <div className="h-full flex flex-col justify-center gap-4">
-              <div className="space-y-4">
-                {[
-                  { label: 'Hyperliquid 节点', val: 65, color: '#00f2ff' },
-                  { label: 'OKX 代理节点', val: 35, color: '#ff00ff' },
-                ].map(item => (
+          <DashboardModule title="交易所分布" subtitle="Exchange" icon={Globe} color="green" className="flex-1">
+            <div className="h-full flex flex-col justify-center gap-3">
+              {(() => {
+                // 计算交易所分布
+                const exchangeMap: Record<string, number> = {}
+                traderStats.forEach(t => {
+                  const ex = t.exchange || 'Unknown'
+                  exchangeMap[ex] = (exchangeMap[ex] || 0) + 1
+                })
+                const total = traderStats.length || 1
+                const exchanges = Object.entries(exchangeMap).map(([name, count]) => ({
+                  label: name.toUpperCase(),
+                  val: Math.round((count / total) * 100),
+                  color: name.toLowerCase().includes('hyper') ? '#00f2ff' : '#ff00ff',
+                }))
+                
+                return exchanges.length > 0 ? exchanges.map(item => (
                   <div key={item.label}>
-                    <div className="flex justify-between text-[10px] font-black mb-1.5">
+                    <div className="flex justify-between text-[9px] font-bold mb-1">
                       <span className="text-white/40">{item.label}</span>
                       <span style={{ color: item.color }}>{item.val}%</span>
                     </div>
                     <div className="h-1.5 w-full bg-white/5 rounded-full overflow-hidden">
-                      <div className="h-full transition-all duration-1000" style={{ width: `${item.val}%`, backgroundColor: item.color }} />
+                      <div className="h-full transition-all duration-500" style={{ width: `${item.val}%`, backgroundColor: item.color }} />
                     </div>
+                  </div>
+                )) : (
+                  <div className="text-xs text-white/30 text-center">暂无数据</div>
+                )
+              })()}
+            </div>
+          </DashboardModule>
+        </div>
+
+        {/* 中心：核心详情 */}
+        <div className="col-span-6 flex flex-col gap-4">
+          <DashboardModule 
+            title="交易员详情" 
+            subtitle="Detail" 
+            icon={Layers} 
+            className="flex-1"
+            rightContent={selectedTrader && (
+              <span className="text-[9px] font-mono text-white/30">ID: {selectedTrader.trader_id.substring(0, 12)}</span>
+            )}
+          >
+            {selectedTrader ? (
+              <div className="h-full flex flex-col">
+                {/* 头部信息 */}
+                <div className="flex items-start justify-between mb-4">
+                  <div className="flex items-center gap-4">
+                    <div className="relative w-20 h-20 border-2 border-[#00f2ff]/30 p-1 bg-[#00f2ff]/5">
+                      <div className="absolute -top-1.5 -left-1.5 w-4 h-4 border-t-2 border-l-2 border-[#00f2ff]" />
+                      <div className="absolute -bottom-1.5 -right-1.5 w-4 h-4 border-b-2 border-r-2 border-[#00f2ff]" />
+                      <PunkAvatar seed={getTraderAvatar(selectedTrader.trader_id, selectedTrader.trader_name)} size={72} className="rounded-none w-full h-full" />
+                    </div>
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <h2 className="text-3xl font-black tracking-tight uppercase">{selectedTrader.trader_name}</h2>
+                        {selectedTrader.is_running && (
+                          <div className="px-2 py-0.5 bg-[#00ff9d]/20 border border-[#00ff9d]/40 text-[#00ff9d] text-[9px] font-bold uppercase">运行中</div>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-4 mt-2 text-xs">
+                        <div>
+                          <span className="text-white/30">模式: </span>
+                          <span className="text-[#ff00ff] font-bold uppercase">{selectedTrader.mode}</span>
+                        </div>
+                        <div>
+                          <span className="text-white/30">交易所: </span>
+                          <span className="text-[#00f2ff] font-bold uppercase">{selectedTrader.exchange || 'N/A'}</span>
+                        </div>
+                        <div>
+                          <span className="text-white/30">净值: </span>
+                          <span className="text-[#ffe600] font-mono font-bold">${selectedTrader.current_equity.toLocaleString()}</span>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                  
+                  <div className="flex items-center gap-6 bg-white/5 p-4 border border-white/10 rounded-sm">
+                    <DataGauge value={selectedTrader.win_rate} label="胜率" color="#00ff9d" size={70} />
+                    <div className="text-right">
+                      <div className="text-[9px] text-white/30 uppercase tracking-wider mb-1">{periodLabel}盈亏</div>
+                      <div 
+                        className="text-3xl font-mono font-black" 
+                        style={{ color: getPeriodPnL(selectedTrader) >= 0 ? '#00ff9d' : '#ff0055' }}
+                      >
+                        {getPeriodPnL(selectedTrader) >= 0 ? '+' : ''}${Math.abs(getPeriodPnL(selectedTrader)).toFixed(2)}
+                      </div>
+                      <div className="text-[9px] text-white/30 mt-1">{getPeriodTrades(selectedTrader)} 笔交易</div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* 核心指标网格 */}
+                <div className="grid grid-cols-4 gap-3 mb-4">
+                  {[
+                    { label: '收益率', value: `${selectedTrader.return_rate.toFixed(2)}%`, icon: TrendingUp, color: '#00ff9d' },
+                    { label: '盈亏比', value: selectedTrader.profit_factor.toFixed(2), icon: Target, color: '#00f2ff' },
+                    { label: '总交易', value: selectedTrader.total_trades, icon: Activity, color: '#ff00ff' },
+                    { label: '当前持仓', value: selectedTrader.position_count, icon: Database, color: '#ffe600' },
+                  ].map((item, i) => (
+                    <div key={i} className="bg-white/5 border border-white/10 p-3 relative">
+                      <div className="absolute top-0 left-0 w-0.5 h-full" style={{ backgroundColor: item.color }} />
+                      <div className="text-[9px] text-white/40 uppercase mb-1">{item.label}</div>
+                      <div className="text-xl font-mono font-black" style={{ color: item.color }}>{item.value}</div>
+                    </div>
+                  ))}
+                </div>
+
+                {/* 图表区域 */}
+                <div className="flex-1 bg-[#020617]/60 border border-white/10 relative p-4">
+                  <div className="absolute top-3 left-4 flex items-center gap-2">
+                    <BarChart3 size={12} className="text-[#00f2ff]" />
+                    <span className="text-[10px] text-white/40 uppercase tracking-wider">收益趋势</span>
+                  </div>
+                  <div className="h-full pt-6 relative">
+                    <div className="absolute inset-0 grid grid-cols-10 pointer-events-none opacity-10">
+                      {[...Array(10)].map((_, i) => <div key={i} className="border-r border-white/20 h-full" />)}
+                    </div>
+                    <div className="relative h-full flex items-end px-1 gap-0.5">
+                      {[...Array(30)].map((_, i) => {
+                        const height = Math.sin(i * 0.3 + Date.now() / 5000) * 30 + 40 + Math.random() * 20
+                        const isPositive = height > 50
+                        return (
+                          <div 
+                            key={i} 
+                            className="flex-1 transition-all rounded-t-sm" 
+                            style={{ 
+                              height: `${height}%`,
+                              backgroundColor: isPositive ? '#00ff9d20' : '#ff005520',
+                              borderTop: `2px solid ${isPositive ? '#00ff9d' : '#ff0055'}`,
+                            }}
+                          />
+                        )
+                      })}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <div className="h-full flex items-center justify-center text-white/30">
+                请选择一个交易员查看详情
+              </div>
+            )}
+          </DashboardModule>
+        </div>
+
+        {/* 右翼：监控与预警 */}
+        <div className="col-span-3 flex flex-col gap-4 overflow-hidden">
+          {/* 系统监控 */}
+          <DashboardModule title="系统监控" subtitle="Monitor" icon={Gauge} color="cyan" className="flex-1">
+            <div className="h-full flex flex-col gap-3">
+              {/* 跟单执行统计 */}
+              <div className="grid grid-cols-2 gap-2">
+                <div className="bg-white/5 p-2 border border-white/10 text-center">
+                  <div className="text-[9px] text-white/40 uppercase">今日信号</div>
+                  <div className="text-lg font-mono font-bold text-[#00f2ff]">{monitor.today_signals}</div>
+                </div>
+                <div className="bg-white/5 p-2 border border-white/10 text-center">
+                  <div className="text-[9px] text-white/40 uppercase">执行率</div>
+                  <div className="text-lg font-mono font-bold text-[#00ff9d]">{monitor.execution_rate.toFixed(1)}%</div>
+                </div>
+              </div>
+              
+              {/* 执行状态条 */}
+              <div className="space-y-2">
+                {[
+                  { label: '执行成功', value: monitor.today_executed, color: '#00ff9d', icon: CheckCircle },
+                  { label: '跳过', value: monitor.today_skipped, color: '#ffe600', icon: Clock },
+                  { label: '失败', value: monitor.today_failed, color: '#ff0055', icon: XCircle },
+                ].map(item => (
+                  <div key={item.label} className="flex items-center gap-2">
+                    <item.icon size={12} style={{ color: item.color }} />
+                    <span className="text-[9px] text-white/40 w-12">{item.label}</span>
+                    <div className="flex-1 h-1.5 bg-white/5 rounded-full overflow-hidden">
+                      <div 
+                        className="h-full transition-all" 
+                        style={{ 
+                          width: monitor.today_signals > 0 ? `${(item.value / monitor.today_signals) * 100}%` : '0%',
+                          backgroundColor: item.color 
+                        }} 
+                      />
+                    </div>
+                    <span className="text-[9px] font-mono" style={{ color: item.color }}>{item.value}</span>
                   </div>
                 ))}
               </div>
-              <div className="mt-2 text-[10px] font-mono text-white/20 text-center uppercase tracking-[0.2em]">数据流全球同步中...</div>
-            </div>
-          </DashboardModule>
-        </div>
 
-        {/* 中心：核心详情与战报 */}
-        <div className="col-span-6 flex flex-col gap-6">
-          <DashboardModule title="交易员神经性能透视" subtitle="Neural Performance" icon={Layers} className="flex-1">
-            {selectedTrader ? (
-              <div className="h-full flex flex-col">
-                <div className="flex items-start justify-between mb-8">
-                  <div className="flex items-center gap-8">
-                    <div className="relative w-28 h-28 border-2 border-[#00f2ff]/30 p-1.5 bg-[#00f2ff]/5">
-                      <div className="absolute -top-2.5 -left-2.5 w-6 h-6 border-t-4 border-l-4 border-[#00f2ff]" />
-                      <div className="absolute -bottom-2.5 -right-2.5 w-6 h-6 border-b-4 border-r-4 border-[#00f2ff]" />
-                      <PunkAvatar seed={getTraderAvatar(selectedTrader.trader_id, selectedTrader.trader_name)} size={100} className="rounded-none w-full h-full object-cover" />
+              {/* API 错误统计 */}
+              <div className="border-t border-white/10 pt-2 mt-auto">
+                <div className="text-[9px] text-white/40 uppercase mb-2">API 错误 (24h)</div>
+                <div className="grid grid-cols-2 gap-1.5 text-[9px]">
+                  {[
+                    { label: '频率限制', value: monitor.rate_limit_errors },
+                    { label: '网络错误', value: monitor.network_errors },
+                    { label: '认证错误', value: monitor.auth_errors },
+                    { label: '其他错误', value: monitor.other_errors },
+                  ].map(item => (
+                    <div key={item.label} className="flex justify-between bg-white/5 px-2 py-1">
+                      <span className="text-white/40">{item.label}</span>
+                      <span className={item.value > 0 ? 'text-[#ff0055] font-bold' : 'text-white/20'}>{item.value}</span>
                     </div>
-                    <div>
-                      <div className="flex items-center gap-3">
-                        <h2 className="text-5xl font-black tracking-tighter uppercase leading-none italic">{selectedTrader.trader_name}</h2>
-                        <div className="px-3 py-1 bg-[#00ff9d]/20 border border-[#00ff9d]/40 text-[#00ff9d] text-[10px] font-black uppercase rounded-sm">正在交易</div>
-                      </div>
-                      <div className="flex items-center gap-6 mt-5">
-                        <div className="flex flex-col">
-                          <span className="text-[10px] text-white/30 font-black uppercase">跟单协议</span>
-                          <span className="text-sm font-black text-[#ff00ff]">{selectedTrader.mode.toUpperCase()} 2.0</span>
-                        </div>
-                        <div className="w-px h-8 bg-white/10" />
-                        <div className="flex flex-col">
-                          <span className="text-[10px] text-white/30 font-black uppercase">资产净值</span>
-                          <span className="text-sm font-mono font-black text-[#ffe600]">${selectedTrader.current_equity.toLocaleString()}</span>
-                        </div>
-                        <div className="w-px h-8 bg-white/10" />
-                        <div className="flex flex-col">
-                          <span className="text-[10px] text-white/30 font-black uppercase">节点标识</span>
-                          <span className="text-sm font-mono font-black text-[#00f2ff]">#{selectedTrader.trader_id.substring(0, 12).toUpperCase()}</span>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                  
-                  <div className="flex items-center gap-12 bg-white/5 p-6 border border-white/10 rounded-sm">
-                    <DataGauge value={selectedTrader.win_rate} label="胜率均值" color="#00ff9d" />
-                    <div className="text-right">
-                      <div className="text-[10px] font-black uppercase text-white/30 tracking-[0.3em] mb-2">累计总盈亏</div>
-                      <NeonNumber value={selectedTrader.total_pnl} className="text-5xl" color={selectedTrader.total_pnl >= 0 ? '#00ff9d' : '#ff0055'} prefix="$" />
-                    </div>
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-4 gap-6 flex-1">
-                  <div className="space-y-4">
-                    {[
-                      { label: '收益率 (ROI)', value: `${selectedTrader.return_rate.toFixed(2)}%`, icon: TrendingUp, color: '#00ff9d' },
-                      { label: '盈亏比 (Factor)', value: selectedTrader.profit_factor.toFixed(2), icon: Target, color: '#00f2ff' },
-                      { label: '执行周期 (Trades)', value: selectedTrader.total_trades, icon: Activity, color: '#ff00ff' },
-                      { label: '当前持仓 (Units)', value: selectedTrader.position_count, icon: Database, color: '#ffe600' },
-                    ].map((item, i) => (
-                      <div key={i} className="bg-white/5 border border-white/10 p-4 relative group hover:bg-white/10 transition-all cursor-default">
-                        <div className="absolute top-0 left-0 w-1 h-full" style={{ backgroundColor: item.color }} />
-                        <div className="text-[10px] font-black text-white/40 uppercase mb-1 tracking-widest">{item.label}</div>
-                        <div className="text-2xl font-mono font-black" style={{ color: item.color }}>{item.value}</div>
-                      </div>
-                    ))}
-                  </div>
-                  
-                  <div className="col-span-3 bg-[#020617]/80 border border-white/10 relative p-8">
-                    <div className="absolute top-4 left-6 flex items-center gap-2">
-                      <Crosshair size={14} className="text-[#00f2ff] animate-pulse" />
-                      <span className="text-xs font-black text-white/50 uppercase tracking-[0.3em]">实时收益增长信号追踪 (Trace)</span>
-                    </div>
-                    {/* 模拟图表网格 */}
-                    <div className="h-full pt-10 relative">
-                      <div className="absolute inset-0 grid grid-cols-8 pointer-events-none opacity-20">
-                        {[...Array(8)].map((_, i) => <div key={i} className="border-r border-white/10 h-full" />)}
-                      </div>
-                      <div className="absolute inset-0 grid grid-rows-5 pointer-events-none opacity-20">
-                        {[...Array(5)].map((_, i) => <div key={i} className="border-b border-white/10 w-full" />)}
-                      </div>
-                      {/* 动态波形模拟 */}
-                      <div className="relative h-full flex items-end px-2 gap-1">
-                        {[...Array(40)].map((_, i) => (
-                          <div 
-                            key={i} 
-                            className="flex-1 bg-gradient-to-t from-[#00f2ff10] to-[#00f2ff80] transition-all hover:to-[#ff00ff] rounded-t-sm" 
-                            style={{ height: `${Math.random() * 70 + 10}%`, animationDelay: `${i * 0.05}s` }}
-                          />
-                        ))}
-                      </div>
-                    </div>
-                  </div>
+                  ))}
                 </div>
               </div>
-            ) : null}
+            </div>
           </DashboardModule>
-        </div>
 
-        {/* 右翼：日志与异常 */}
-        <div className="col-span-3 flex flex-col gap-6 overflow-hidden">
-          <DashboardModule title="战术执行日志" subtitle="Tactical Log" icon={TerminalIcon} color="pink" className="flex-[1.5] overflow-hidden flex flex-col">
-            <div className="flex-1 font-mono text-[10px] space-y-2.5 overflow-y-auto custom-cyber-scrollbar">
-              <div className="text-[#ff00ff] opacity-60 font-bold tracking-widest">[系统] 安全会话已建立</div>
-              <div className="text-[#00f2ff] opacity-60 font-bold tracking-widest">[同步] 实时跟单流已接入</div>
+          {/* 风险预警 */}
+          <DashboardModule 
+            title="风险预警" 
+            subtitle="Alerts" 
+            icon={AlertTriangle} 
+            color={monitor.alerts.some(a => a.level === 'critical') ? 'red' : 'yellow'} 
+            className="flex-1 overflow-hidden"
+          >
+            <div className="h-full overflow-y-auto pr-1 custom-scrollbar space-y-2">
+              {monitor.alerts.length > 0 ? monitor.alerts.map((alert, i) => (
+                <div 
+                  key={i} 
+                  className={`flex items-start gap-2 p-2 border rounded-sm ${
+                    alert.level === 'critical' 
+                      ? 'bg-red-500/10 border-red-500/30' 
+                      : alert.level === 'warning'
+                      ? 'bg-yellow-500/10 border-yellow-500/30'
+                      : 'bg-blue-500/10 border-blue-500/30'
+                  }`}
+                >
+                  {alert.level === 'critical' ? (
+                    <Bug size={14} className="text-red-500 shrink-0 mt-0.5" />
+                  ) : (
+                    <Radio size={14} className="text-yellow-500 shrink-0 mt-0.5" />
+                  )}
+                  <div className="flex-1 min-w-0">
+                    <div className={`text-[9px] font-bold uppercase ${
+                      alert.level === 'critical' ? 'text-red-500' : 'text-yellow-500'
+                    }`}>
+                      {alert.trader_name}
+                    </div>
+                    <p className={`text-[9px] leading-tight mt-0.5 ${
+                      alert.level === 'critical' ? 'text-red-500/70' : 'text-yellow-500/70'
+                    }`}>
+                      {alert.message}
+                    </p>
+                  </div>
+                </div>
+              )) : (
+                <div className="h-full flex flex-col items-center justify-center text-white/30">
+                  <Shield size={24} className="mb-2 opacity-30" />
+                  <span className="text-[10px]">系统运行正常</span>
+                  <span className="text-[9px] text-white/20">暂无风险预警</span>
+                </div>
+              )}
+            </div>
+          </DashboardModule>
+
+          {/* 实时日志 */}
+          <DashboardModule title="实时日志" subtitle="Log" icon={TerminalIcon} color="pink" className="flex-1 overflow-hidden">
+            <div className="h-full font-mono text-[9px] space-y-1.5 overflow-y-auto custom-scrollbar">
+              <div className="text-[#ff00ff]/60">[SYS] 数据大屏已连接</div>
+              <div className="text-[#00f2ff]/60">[API] 实时数据流已接入</div>
               
-              {[...Array(12)].map((_, i) => {
-                const trader = traderStats[i % traderStats.length]
-                if (!trader) return null
-                const side = Math.random() > 0.5 ? '买入' : '卖出'
-                const isBuy = side === '买入'
+              {traderStats.slice(0, 8).map((trader, i) => {
+                const actions = ['开多', '开空', '平多', '平空']
+                const action = actions[i % 4]
+                const isOpen = action.includes('开')
                 return (
-                  <div key={i} className="flex gap-2 p-2 bg-white/5 border-l-2 border-white/10 hover:bg-white/10 transition-colors">
-                    <span className="text-white/20">[{new Date(Date.now() - i * 300000).toLocaleTimeString('zh-CN', { hour12: false })}]</span>
-                    <span className="text-[#00f2ff] font-black truncate w-16">{trader.trader_name}</span>
-                    <span className="text-white/40">执行</span>
-                    <span className={isBuy ? 'text-[#00ff9d]' : 'text-[#ff0055] font-bold'}>{side}</span>
-                    <span className="text-white/40 ml-auto font-mono">{Math.random().toFixed(3)} ETH</span>
+                  <div key={i} className="flex gap-1 p-1.5 bg-white/5 border-l border-white/10">
+                    <span className="text-white/20">[{new Date(Date.now() - i * 180000).toLocaleTimeString('zh-CN', { hour12: false })}]</span>
+                    <span className="text-[#00f2ff] truncate max-w-[60px]">{trader.trader_name}</span>
+                    <span className={isOpen ? 'text-[#00ff9d]' : 'text-[#ff0055]'}>{action}</span>
+                    <span className="text-white/30 ml-auto">{(Math.random() * 0.5).toFixed(3)} ETH</span>
                   </div>
                 )
               })}
-            </div>
-            <div className="mt-4 pt-3 border-t border-white/10 flex items-center gap-3">
-              <div className="w-1.5 h-5 bg-[#ff00ff] animate-pulse" />
-              <div className="text-[10px] text-[#ff00ff] font-black uppercase animate-[flicker_0.2s_infinite]">正在监听实时交易封包...</div>
-            </div>
-          </DashboardModule>
-
-          <DashboardModule title="异常告警监控" subtitle="Alert Wall" icon={Bug} color="yellow" className="flex-1">
-            <div className="flex-1 overflow-y-auto pr-2 custom-cyber-scrollbar space-y-3">
-              <div className="flex items-start gap-3 p-3 bg-red-500/10 border border-red-500/30 rounded-sm">
-                <AlertTriangle size={16} className="text-red-500 shrink-0 mt-0.5" />
-                <div>
-                  <div className="text-[10px] font-black text-red-500 uppercase">跟单引擎异常</div>
-                  <p className="text-[9px] text-red-500/70 leading-tight mt-1">Hyperliquid API 返回 429 频率限制，尝试自动重连中...</p>
-                </div>
-              </div>
-              <div className="flex items-start gap-3 p-3 bg-yellow-500/10 border border-yellow-500/30 rounded-sm opacity-60">
-                <Radio size={16} className="text-yellow-500 shrink-0 mt-0.5" />
-                <div>
-                  <div className="text-[10px] font-black text-yellow-500 uppercase">网络延迟抖动</div>
-                  <p className="text-[9px] text-yellow-500/70 leading-tight mt-1">亚太节点延迟超过 150ms，系统已切换至北美备用节点。</p>
-                </div>
+              
+              <div className="flex items-center gap-2 pt-2 border-t border-white/10">
+                <div className="w-1 h-3 bg-[#ff00ff] animate-pulse" />
+                <span className="text-[#ff00ff]/60 animate-pulse">监听中...</span>
               </div>
             </div>
           </DashboardModule>
@@ -539,35 +756,33 @@ export function DashboardPage() {
       </main>
 
       {/* --- 底部状态条 --- */}
-      <footer className="relative z-10 h-10 border-t border-white/10 bg-black/60 px-10 flex items-center justify-between text-[10px] font-black tracking-[0.3em] uppercase">
-        <div className="flex items-center gap-12">
-          <div className="flex items-center gap-2">
-            <div className="w-2 h-2 rounded-full bg-[#00ff9d]" />
-            <span className="text-white/40">安全协议: <span className="text-[#00ff9d]">AES-256-GCM 已激活</span></span>
+      <footer className="relative z-10 h-8 border-t border-white/10 bg-[#0a1628]/80 px-6 flex items-center justify-between text-[9px] font-bold tracking-wider uppercase">
+        <div className="flex items-center gap-6">
+          <div className="flex items-center gap-1.5">
+            <div className="w-1.5 h-1.5 rounded-full bg-[#00ff9d]" />
+            <span className="text-white/40">安全协议: <span className="text-[#00ff9d]">AES-256</span></span>
           </div>
-          <div className="flex items-center gap-2">
-            <div className="w-2 h-2 rounded-full bg-[#00f2ff] animate-pulse" />
-            <span className="text-white/40">数据同步: <span className="text-[#00f2ff]">实时双向流 (Full-Duplex)</span></span>
+          <div className="flex items-center gap-1.5">
+            <div className="w-1.5 h-1.5 rounded-full bg-[#00f2ff] animate-pulse" />
+            <span className="text-white/40">数据同步: <span className="text-[#00f2ff]">实时</span></span>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <span className="text-white/40">最后更新: </span>
+            <span className="text-white/60 font-mono">{monitor.updated_at || currentTime.toLocaleTimeString('zh-CN')}</span>
           </div>
         </div>
         
-        <div className="flex items-center gap-8 text-white/20">
-          <div className="flex items-center gap-2">
-            <Shield size={14} className="text-[#ffe600] opacity-50" />
-            <span>加密指挥终端 v4.0.2</span>
-          </div>
-          <div className="h-4 w-px bg-white/10" />
-          <span>终端 ID: <span className="text-white/40 font-mono">TX-CORE-999-STABLE</span></span>
+        <div className="flex items-center gap-4 text-white/30">
+          <span>NOFX Trading Terminal v3.0</span>
         </div>
       </footer>
 
-      {/* 全局动效注入 */}
+      {/* 全局样式 */}
       <style>{`
-        @keyframes flicker { 0% { opacity: 0.4 } 100% { opacity: 1 } }
-        .custom-cyber-scrollbar::-webkit-scrollbar { width: 3px; }
-        .custom-cyber-scrollbar::-webkit-scrollbar-track { background: rgba(255,255,255,0.02); }
-        .custom-cyber-scrollbar::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 10px; }
-        .custom-cyber-scrollbar::-webkit-scrollbar-thumb:hover { background: rgba(0,242,255,0.3); }
+        .custom-scrollbar::-webkit-scrollbar { width: 3px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: rgba(255,255,255,0.02); }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 10px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: rgba(0,242,255,0.3); }
       `}</style>
     </div>
   )
