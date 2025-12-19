@@ -707,7 +707,8 @@ func (e *Engine) buildDecision(signal *TradeSignal, action ActionType, copySize 
 }
 
 // getLeaderLeverage 获取领航员杠杆
-// 优先级：1.信号中的持仓杠杆 2.实时获取 3.默认值
+// 优先级：1.信号中的持仓杠杆 2.变化追踪的仓位 3.缓存的持仓 4.默认值(10x)
+// 优化：使用缓存数据，避免重复 API 调用
 func (e *Engine) getLeaderLeverage(signal *TradeSignal) int {
 	// 1. 如果不同步杠杆，返回默认值
 	if !e.config.SyncLeverage {
@@ -719,26 +720,35 @@ func (e *Engine) getLeaderLeverage(signal *TradeSignal) int {
 		return signal.LeaderPosition.Leverage
 	}
 
-	// 3. 实时获取领航员当前持仓的杠杆 (遍历查找，兼容全仓/逐仓)
-	if e.provider != nil {
-		state, err := e.provider.GetAccountState(e.config.LeaderID)
-		if err == nil && state.Positions != nil {
-			for _, pos := range state.Positions {
-				if pos.Symbol == signal.Fill.Symbol && pos.Side == signal.Fill.PositionSide && pos.Leverage > 0 {
-					logger.Infof("🔍 [%s] 实时获取领航员 %s 杠杆: %dx", e.traderID, signal.Fill.Symbol, pos.Leverage)
-					return pos.Leverage
-				}
+	// 3. 从变化追踪的仓位获取（最近操作的仓位）
+	baseKey := signal.Fill.Symbol + "_" + string(signal.Fill.PositionSide)
+	e.leaderStateMu.RLock()
+	if changedPos, ok := e.changedPositions[baseKey]; ok && changedPos.Leverage > 0 {
+		e.leaderStateMu.RUnlock()
+		logger.Infof("🔍 [%s] 从变化追踪获取领航员 %s 杠杆: %dx", e.traderID, signal.Fill.Symbol, changedPos.Leverage)
+		return changedPos.Leverage
+	}
+
+	// 4. 从缓存的领航员状态获取（避免重复 API 调用）
+	if e.leaderState != nil && e.leaderState.Positions != nil {
+		for _, pos := range e.leaderState.Positions {
+			if pos.Symbol == signal.Fill.Symbol && pos.Side == signal.Fill.PositionSide && pos.Leverage > 0 {
+				e.leaderStateMu.RUnlock()
+				logger.Infof("🔍 [%s] 从缓存获取领航员 %s 杠杆: %dx", e.traderID, signal.Fill.Symbol, pos.Leverage)
+				return pos.Leverage
 			}
 		}
 	}
+	e.leaderStateMu.RUnlock()
 
-	// 4. 默认值
+	// 5. 默认值
 	logger.Warnf("⚠️ [%s] 无法获取领航员杠杆，使用默认值 10x", e.traderID)
 	return 10
 }
 
 // getLeaderMarginMode 获取领航员保证金模式
-// 优先级：1.信号中的持仓模式 2.实时获取 3.默认值(cross)
+// 优先级：1.信号中的持仓模式 2.变化追踪的仓位 3.缓存的持仓 4.默认值(cross)
+// 优化：使用缓存数据，避免重复 API 调用
 func (e *Engine) getLeaderMarginMode(signal *TradeSignal) string {
 	// 1. 如果不同步保证金模式，返回默认值
 	if !e.config.SyncMarginMode {
@@ -751,20 +761,28 @@ func (e *Engine) getLeaderMarginMode(signal *TradeSignal) string {
 		return signal.LeaderPosition.MarginMode
 	}
 
-	// 3. 实时获取领航员当前持仓的保证金模式 (遍历查找，兼容全仓/逐仓)
-	if e.provider != nil {
-		state, err := e.provider.GetAccountState(e.config.LeaderID)
-		if err == nil && state.Positions != nil {
-			for _, pos := range state.Positions {
-				if pos.Symbol == signal.Fill.Symbol && pos.Side == signal.Fill.PositionSide && pos.MarginMode != "" {
-					logger.Infof("🔍 [%s] 实时获取领航员 %s 保证金模式: %s", e.traderID, signal.Fill.Symbol, pos.MarginMode)
-					return pos.MarginMode
-				}
+	// 3. 从变化追踪的仓位获取（最近操作的仓位，最精确）
+	baseKey := signal.Fill.Symbol + "_" + string(signal.Fill.PositionSide)
+	e.leaderStateMu.RLock()
+	if changedPos, ok := e.changedPositions[baseKey]; ok && changedPos.MarginMode != "" {
+		e.leaderStateMu.RUnlock()
+		logger.Infof("🔍 [%s] 从变化追踪获取领航员 %s 保证金模式: %s", e.traderID, signal.Fill.Symbol, changedPos.MarginMode)
+		return changedPos.MarginMode
+	}
+
+	// 4. 从缓存的领航员状态获取（避免重复 API 调用）
+	if e.leaderState != nil && e.leaderState.Positions != nil {
+		for _, pos := range e.leaderState.Positions {
+			if pos.Symbol == signal.Fill.Symbol && pos.Side == signal.Fill.PositionSide && pos.MarginMode != "" {
+				e.leaderStateMu.RUnlock()
+				logger.Infof("🔍 [%s] 从缓存获取领航员 %s 保证金模式: %s", e.traderID, signal.Fill.Symbol, pos.MarginMode)
+				return pos.MarginMode
 			}
 		}
 	}
+	e.leaderStateMu.RUnlock()
 
-	// 4. 默认值
+	// 5. 默认值
 	logger.Warnf("⚠️ [%s] 无法获取领航员保证金模式，使用默认值 cross", e.traderID)
 	return "cross"
 }
