@@ -57,6 +57,10 @@ type OKXTrader struct {
 	positionsCacheTime  time.Time
 	positionsCacheMutex sync.RWMutex
 
+	// Symbol margin mode cache (记录每个 symbol 的保证金模式，在 SetMarginMode 时更新)
+	symbolMgnModes      map[string]string // symbol -> "cross" | "isolated"
+	symbolMgnModesMutex sync.RWMutex
+
 	// Instrument info cache
 	instrumentsCache      map[string]*OKXInstrument
 	instrumentsCacheTime  time.Time
@@ -115,6 +119,7 @@ func NewOKXTrader(apiKey, secretKey, passphrase string) *OKXTrader {
 		httpClient:       httpClient,
 		cacheDuration:    15 * time.Second,
 		instrumentsCache: make(map[string]*OKXInstrument),
+		symbolMgnModes:   make(map[string]string), // 按 symbol 缓存保证金模式
 	}
 
 	// Set dual position mode
@@ -369,11 +374,19 @@ func (t *OKXTrader) GetPositions() ([]map[string]interface{}, error) {
 		cTime, _ := strconv.ParseInt(pos.CTime, 10, 64)
 		uTime, _ := strconv.ParseInt(pos.UTime, 10, 64)
 
-		// 保证金模式：如果 API 返回空，默认为 cross（OKX 默认全仓）
+		// 保证金模式：优先使用 API 返回值，其次使用缓存，最后默认 cross
 		mgnMode := pos.MgnMode
 		if mgnMode == "" {
-			mgnMode = "cross"
-			logger.Debugf("  ⚠️ OKX position %s %s mgnMode is empty, defaulting to cross", symbol, side)
+			// 尝试从 SetMarginMode 时的缓存获取
+			t.symbolMgnModesMutex.RLock()
+			if cached, ok := t.symbolMgnModes[symbol]; ok {
+				mgnMode = cached
+				logger.Debugf("  📝 OKX position %s %s mgnMode 使用缓存值: %s", symbol, side, mgnMode)
+			} else {
+				mgnMode = "cross" // 默认全仓
+				logger.Debugf("  ⚠️ OKX position %s %s mgnMode 为空，使用默认值: cross", symbol, side)
+			}
+			t.symbolMgnModesMutex.RUnlock()
 		}
 
 		posMap := map[string]interface{}{
@@ -481,6 +494,12 @@ func (t *OKXTrader) SetMarginMode(symbol string, isCrossMargin bool) error {
 	// 先更新缓存（关键！确保后续 OpenLong/OpenShort 使用正确的 tdMode）
 	// OKX 开仓时 tdMode 参数会直接指定模式，不依赖账户全局设置
 	t.isCrossMargin = isCrossMargin
+
+	// 更新按 symbol 的 mgnMode 缓存（关键！用于 GetPositions 填充 mgnMode）
+	t.symbolMgnModesMutex.Lock()
+	t.symbolMgnModes[symbol] = mgnMode
+	t.symbolMgnModesMutex.Unlock()
+	logger.Debugf("  📝 缓存 %s 保证金模式: %s", symbol, mgnMode)
 
 	body := map[string]interface{}{
 		"instId":  instId,
