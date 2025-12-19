@@ -1002,8 +1002,8 @@ func (e *Engine) syncLeaderState() error {
 }
 
 // detectPositionChanges 对比新旧持仓，找出变化的仓位
-// 核心改进：使用 posId 作为唯一标识（OKX 独有），100% 准确区分不同仓位
-// 同时保留 baseKey (symbol_side) 兼容旧逻辑和非 OKX 场景
+// 核心逻辑：使用 posId 作为唯一标识（OKX 独有），100% 准确区分不同仓位
+// 非 OKX 场景（无 posId）使用原始 key
 func (e *Engine) detectPositionChanges(oldState, newState *AccountState) {
 	if e.changedPositions == nil {
 		e.changedPositions = make(map[string]*Position)
@@ -1020,30 +1020,21 @@ func (e *Engine) detectPositionChanges(oldState, newState *AccountState) {
 	}
 
 	// 遍历新持仓，对比变化
-	// 注意：newState.Positions 的 key 已经是 posId（如果有）或 mgnMode key
 	for key, newPos := range newState.Positions {
 		oldPos := oldPositions[key]
 
-		// 三种 key（优先级从高到低）：
-		// 1. posId: OKX 仓位唯一标识（最精确，100% 准确）
-		// 2. fullKey: symbol_side_mgnMode（区分全仓/逐仓）
-		// 3. baseKey: symbol_side（兼容旧逻辑）
-		baseKey := newPos.Symbol + "_" + string(newPos.Side)
+		// 使用 posId 作为 key（如果有），否则用原始 key
+		trackKey := key
+		if newPos.PosID != "" {
+			trackKey = newPos.PosID
+		}
 
 		if oldPos == nil {
-			// 新增仓位：存储所有 key 以便匹配
-			if newPos.PosID != "" {
-				e.changedPositions[newPos.PosID] = newPos // posId key（最精确）
-			}
-			e.changedPositions[baseKey] = newPos // baseKey（兼容）
+			e.changedPositions[trackKey] = newPos
 			logger.Debugf("📊 [%s] 持仓变化检测 | 新增: %s %s mgnMode=%s posId=%s size=%.4f",
 				e.traderID, newPos.Symbol, newPos.Side, newPos.MarginMode, newPos.PosID, newPos.Size)
 		} else if absFloat(newPos.Size-oldPos.Size) > 0.0001 {
-			// 仓位数量变化
-			if newPos.PosID != "" {
-				e.changedPositions[newPos.PosID] = newPos
-			}
-			e.changedPositions[baseKey] = newPos
+			e.changedPositions[trackKey] = newPos
 			logger.Debugf("📊 [%s] 持仓变化检测 | 变化: %s %s mgnMode=%s posId=%s size: %.4f → %.4f delta=%.4f",
 				e.traderID, newPos.Symbol, newPos.Side, newPos.MarginMode, newPos.PosID, oldPos.Size, newPos.Size, newPos.Size-oldPos.Size)
 		}
@@ -1052,12 +1043,11 @@ func (e *Engine) detectPositionChanges(oldState, newState *AccountState) {
 	// 检测平仓（旧有新无）
 	for key, oldPos := range oldPositions {
 		if _, exists := newState.Positions[key]; !exists {
-			baseKey := oldPos.Symbol + "_" + string(oldPos.Side)
-			// 仓位消失，记录最后的状态
+			trackKey := key
 			if oldPos.PosID != "" {
-				e.changedPositions[oldPos.PosID] = oldPos
+				trackKey = oldPos.PosID
 			}
-			e.changedPositions[baseKey] = oldPos
+			e.changedPositions[trackKey] = oldPos
 			logger.Debugf("📊 [%s] 持仓变化检测 | 清仓: %s %s mgnMode=%s posId=%s",
 				e.traderID, oldPos.Symbol, oldPos.Side, oldPos.MarginMode, oldPos.PosID)
 		}
