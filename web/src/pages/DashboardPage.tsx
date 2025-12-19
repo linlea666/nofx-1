@@ -51,10 +51,17 @@ interface GlobalStats {
   month_pnl: number
 }
 
-// 获取公开交易员数据
-const fetchPublicTraders = async () => {
-  const res = await fetch(`${import.meta.env.VITE_API_BASE_URL || ''}/api/traders`)
-  if (!res.ok) throw new Error('Failed to fetch traders')
+// 获取大屏交易员统计数据
+const fetchDashboardTraders = async () => {
+  const res = await fetch(`${import.meta.env.VITE_API_BASE_URL || ''}/api/dashboard/traders`)
+  if (!res.ok) throw new Error('Failed to fetch dashboard traders')
+  return res.json()
+}
+
+// 获取全局汇总数据
+const fetchDashboardSummary = async () => {
+  const res = await fetch(`${import.meta.env.VITE_API_BASE_URL || ''}/api/dashboard/summary`)
+  if (!res.ok) throw new Error('Failed to fetch dashboard summary')
   return res.json()
 }
 
@@ -867,8 +874,14 @@ export function DashboardPage() {
   const [selectedTrader, setSelectedTrader] = useState<TraderStats | null>(null)
   const [currentTime, setCurrentTime] = useState(new Date())
 
-  // 获取公开交易员数据
-  const { data: publicTraders, isLoading } = useSWR('public-traders', fetchPublicTraders, {
+  // 获取大屏交易员数据 (使用新的 Dashboard API)
+  const { data: dashboardTraders, isLoading, error } = useSWR('dashboard-traders', fetchDashboardTraders, {
+    refreshInterval: 30000,
+    onError: (err) => console.error('Dashboard API error:', err),
+  })
+
+  // 获取全局汇总数据
+  const { data: summaryData } = useSWR('dashboard-summary', fetchDashboardSummary, {
     refreshInterval: 30000,
   })
 
@@ -878,29 +891,42 @@ export function DashboardPage() {
     return () => clearInterval(timer)
   }, [])
 
-  // 统计数据
+  // 交易员统计数据 (直接使用后端返回的数据)
   const traderStats: TraderStats[] = useMemo(() => {
-    if (!publicTraders) return []
-    return publicTraders.map((t: any) => ({
-      trader_id: t.id,
-      trader_name: t.name || t.id.substring(0, 8),
-      mode: t.decision_mode || 'ai',
-      today_pnl: (t.pnl || 0) * 0.1,
-      week_pnl: (t.pnl || 0) * 0.3,
-      month_pnl: (t.pnl || 0) * 0.7,
-      total_pnl: t.pnl || 0,
-      total_trades: t.total_trades || Math.floor(Math.random() * 100) + 10,
-      win_rate: t.win_rate || Math.random() * 30 + 40,
-      profit_factor: t.profit_factor || Math.random() * 1.5 + 0.5,
-      current_equity: t.equity || 1000,
-      initial_balance: t.initial_balance || 1000,
-      return_rate: t.pnl_pct || 0,
+    if (!dashboardTraders || !Array.isArray(dashboardTraders)) return []
+    return dashboardTraders.map((t: any) => ({
+      trader_id: t.trader_id || '',
+      trader_name: t.trader_name || t.trader_id?.substring(0, 8) || '未知',
+      mode: t.mode || 'ai',
+      today_pnl: t.today_pnl || 0,
+      week_pnl: t.week_pnl || 0,
+      month_pnl: t.month_pnl || 0,
+      total_pnl: t.total_pnl || 0,
+      total_trades: t.total_trades || 0,
+      win_rate: t.win_rate || 0,
+      profit_factor: t.profit_factor || 0,
+      current_equity: t.current_equity || 0,
+      initial_balance: t.initial_balance || 0,
+      return_rate: t.return_rate || 0,
       position_count: t.position_count || 0,
     }))
-  }, [publicTraders])
+  }, [dashboardTraders])
 
-  // 全局统计
+  // 全局统计 (优先使用后端汇总数据)
   const globalStats: GlobalStats = useMemo(() => {
+    if (summaryData) {
+      return {
+        total_pnl: summaryData.total_pnl || 0,
+        total_trades: summaryData.total_trades || 0,
+        avg_win_rate: summaryData.avg_win_rate || 0,
+        active_traders: summaryData.active_traders || 0,
+        total_equity: summaryData.total_equity || 0,
+        today_pnl: summaryData.today_pnl || 0,
+        week_pnl: summaryData.week_pnl || 0,
+        month_pnl: summaryData.month_pnl || 0,
+      }
+    }
+    // 回退：从交易员数据计算
     return {
       total_pnl: traderStats.reduce((sum, t) => sum + t.total_pnl, 0),
       total_trades: traderStats.reduce((sum, t) => sum + t.total_trades, 0),
@@ -913,13 +939,46 @@ export function DashboardPage() {
       week_pnl: traderStats.reduce((sum, t) => sum + t.week_pnl, 0),
       month_pnl: traderStats.reduce((sum, t) => sum + t.month_pnl, 0),
     }
-  }, [traderStats])
+  }, [summaryData, traderStats])
 
   const timeRangeLabels: Record<TimeRange, string> = {
     today: '今日',
     week: '本周',
     month: '本月',
     all: '全部',
+  }
+
+  // 加载状态
+  if (isLoading && !dashboardTraders) {
+    return (
+      <div className="min-h-screen bg-[#030712] flex items-center justify-center">
+        <div className="text-center">
+          <div className="w-16 h-16 border-4 border-[#00d4ff]/30 border-t-[#00d4ff] rounded-full animate-spin mx-auto mb-4" />
+          <p className="text-gray-400">正在加载数据...</p>
+        </div>
+      </div>
+    )
+  }
+
+  // 错误状态
+  if (error) {
+    return (
+      <div className="min-h-screen bg-[#030712] flex items-center justify-center">
+        <div className="text-center">
+          <div className="w-16 h-16 rounded-full bg-[#F6465D]/20 flex items-center justify-center mx-auto mb-4">
+            <span className="text-3xl">⚠️</span>
+          </div>
+          <p className="text-gray-400 mb-2">加载数据失败</p>
+          <p className="text-gray-600 text-sm">{error.message}</p>
+          <button 
+            onClick={() => window.location.reload()}
+            className="mt-4 px-4 py-2 bg-[#00d4ff]/20 text-[#00d4ff] rounded-lg hover:bg-[#00d4ff]/30 transition-colors"
+          >
+            重新加载
+          </button>
+        </div>
+      </div>
+    )
   }
 
   return (
