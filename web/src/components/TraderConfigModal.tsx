@@ -41,6 +41,7 @@ interface FormState {
   copy_leader_id: string
   copy_ratio: number
   copy_sync_leverage: boolean
+  copy_sync_margin_mode: boolean  // 同步保证金模式（OKX 区分全仓/逐仓）
 }
 
 interface TraderConfigModalProps {
@@ -76,6 +77,7 @@ export function TraderConfigModal({
     copy_leader_id: '',
     copy_ratio: 1.0,
     copy_sync_leverage: true,
+    copy_sync_margin_mode: true,  // 默认同步保证金模式
   })
   const [, setCopyTradeConfig] = useState<CopyTradeConfig | null>(null)
   const [isSaving, setIsSaving] = useState(false)
@@ -126,6 +128,7 @@ export function TraderConfigModal({
             copy_leader_id: cfg.leader_id,
             copy_ratio: cfg.copy_ratio,
             copy_sync_leverage: cfg.sync_leverage,
+            copy_sync_margin_mode: cfg.sync_margin_mode ?? true,  // 默认 true
           }))
         }
       } catch (error) {
@@ -161,6 +164,7 @@ export function TraderConfigModal({
         copy_leader_id: '',
         copy_ratio: 1.0,
         copy_sync_leverage: true,
+        copy_sync_margin_mode: true,  // 默认同步保证金模式
       })
     }
   }, [traderData, isEditMode, availableModels, availableExchanges])
@@ -233,6 +237,7 @@ export function TraderConfigModal({
           leader_id: formData.copy_leader_id,
           copy_ratio: formData.copy_ratio,
           sync_leverage: formData.copy_sync_leverage,
+          sync_margin_mode: formData.copy_sync_margin_mode,  // 同步保证金模式
         }
       }
 
@@ -594,6 +599,25 @@ export function TraderConfigModal({
                     >
                       <div className={`w-5 h-5 rounded-full bg-white shadow transition-transform ${
                         formData.copy_sync_leverage ? 'translate-x-6' : 'translate-x-0.5'
+                      }`} />
+                    </button>
+                  </div>
+
+                  {/* Sync Margin Mode (OKX) */}
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <label className="text-sm text-[#EAECEF]">同步保证金模式</label>
+                      <p className="text-xs text-[#848E9C]">跟随领航员的全仓/逐仓模式（OKX 专用）</p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => handleInputChange('copy_sync_margin_mode', !formData.copy_sync_margin_mode)}
+                      className={`w-12 h-6 rounded-full transition-colors ${
+                        formData.copy_sync_margin_mode ? 'bg-[#F0B90B]' : 'bg-[#2B3139]'
+                      }`}
+                    >
+                      <div className={`w-5 h-5 rounded-full bg-white shadow transition-transform ${
+                        formData.copy_sync_margin_mode ? 'translate-x-6' : 'translate-x-0.5'
                       }`} />
                     </button>
                   </div>

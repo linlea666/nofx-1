@@ -189,6 +189,7 @@ export interface CopyConfigRequest {
   leader_id: string
   copy_ratio: number
   sync_leverage: boolean
+  sync_margin_mode?: boolean  // 同步保证金模式（OKX 区分全仓/逐仓）
 }
 
 export interface UpdateModelConfigRequest {
