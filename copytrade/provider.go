@@ -348,13 +348,15 @@ func (p *OKXProvider) GetAccountState(uniqueName string) (*AccountState, error) 
 		}
 	}
 
-	// 解析持仓
+	// 解析持仓 (OKX: 同一币种同一方向，全仓和逐仓是独立仓位)
 	for _, pd := range posResp.Data {
 		for _, pos := range pd.PosData {
 			symbol := normalizeOKXSymbol(pos.InstId)
 			side := SideType(pos.PosSide)
+			mgnMode := pos.MgnMode // "cross" | "isolated"
 
-			key := PositionKey(symbol, side)
+			// 使用带保证金模式的 Key (区分全仓/逐仓)
+			key := PositionKeyWithMode(symbol, side, mgnMode)
 			state.Positions[key] = &Position{
 				Symbol:        symbol,
 				Side:          side,
@@ -362,7 +364,7 @@ func (p *OKXProvider) GetAccountState(uniqueName string) (*AccountState, error) 
 				EntryPrice:    parseFloat(pos.AvgPx),
 				MarkPrice:     parseFloat(pos.MarkPx),
 				Leverage:      parseInt(pos.Lever),
-				MarginMode:    pos.MgnMode,
+				MarginMode:    mgnMode,
 				UnrealizedPnL: parseFloat(pos.Upl),
 				PositionValue: parseFloat(pos.NotionalUsd),
 			}

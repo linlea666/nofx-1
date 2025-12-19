@@ -417,6 +417,9 @@ func (ti *TraderIntegration) getPositionsFunc() func() map[string]*Position {
 			// 未实现盈亏: 优先 unRealizedProfit (OKX), 回退 unrealized_pnl (Binance)
 			unrealizedPnl := getFloatField(pos, "unRealizedProfit", "unrealized_pnl")
 
+			// 保证金模式: OKX 特有，用于区分全仓/逐仓
+			marginMode := getStringField(pos, "marginMode", "mgnMode")
+
 			if quantity == 0 {
 				continue
 			}
@@ -426,11 +429,12 @@ func (ti *TraderIntegration) getPositionsFunc() func() map[string]*Position {
 				side = SideShort
 			}
 
-			key := PositionKey(symbol, side)
+			// OKX: 使用带保证金模式的 Key（区分全仓/逐仓）
+			key := PositionKeyWithMode(symbol, side, marginMode)
 
 			// 调试日志：显示每个持仓的详细信息
-			logger.Debugf("📊 [%s] 持仓解析: %s | side=%s → %s | 数量=%.4f 杠杆=%d",
-				ti.traderID, symbol, sideStr, side, quantity, leverage)
+			logger.Debugf("📊 [%s] 持仓解析: %s | side=%s → %s | mgnMode=%s | 数量=%.4f 杠杆=%d",
+				ti.traderID, symbol, sideStr, side, marginMode, quantity, leverage)
 
 			positions[key] = &Position{
 				Symbol:        symbol,
@@ -439,6 +443,7 @@ func (ti *TraderIntegration) getPositionsFunc() func() map[string]*Position {
 				EntryPrice:    entryPrice,
 				MarkPrice:     markPrice,
 				Leverage:      leverage,
+				MarginMode:    marginMode,
 				UnrealizedPnL: unrealizedPnl,
 				PositionValue: absFloat(quantity) * markPrice,
 			}
@@ -472,6 +477,18 @@ func getFloatField(m map[string]interface{}, keys ...string) float64 {
 		}
 	}
 	return 0
+}
+
+// getStringField 从 map 中获取 string 字段，支持多个字段名回退
+func getStringField(m map[string]interface{}, keys ...string) string {
+	for _, key := range keys {
+		if val, ok := m[key]; ok {
+			if s, ok := val.(string); ok {
+				return s
+			}
+		}
+	}
+	return ""
 }
 
 // getIntOrFloatField 从 map 中获取 int 字段，支持 float64 类型转换

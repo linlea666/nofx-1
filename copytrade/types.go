@@ -117,9 +117,20 @@ type EngineStats struct {
 	StartTime          time.Time `json:"start_time"`
 }
 
-// PositionKey 生成仓位的唯一键
+// PositionKey 生成仓位的唯一键 (不含保证金模式，向后兼容)
 func PositionKey(symbol string, side SideType) string {
 	return symbol + "_" + string(side)
+}
+
+// PositionKeyWithMode 生成含保证金模式的仓位键 (OKX 全仓/逐仓区分)
+// 用于 OKX 交易所，同一币种同一方向的全仓和逐仓是独立仓位
+func PositionKeyWithMode(symbol string, side SideType, mgnMode string) string {
+	if mgnMode == "" || mgnMode == "cross" {
+		// 默认/全仓：使用基础 key (向后兼容)
+		return symbol + "_" + string(side)
+	}
+	// 逐仓：加上模式后缀
+	return symbol + "_" + string(side) + "_" + mgnMode
 }
 
 // OppositeSide 返回相反方向

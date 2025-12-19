@@ -310,10 +310,12 @@ func (e *Engine) buildSignal(fill *Fill) *TradeSignal {
 	if e.leaderState != nil {
 		signal.LeaderEquity = e.leaderState.TotalEquity
 
-		// 附加该币种的持仓信息
-		key := PositionKey(fill.Symbol, fill.PositionSide)
-		if pos, ok := e.leaderState.Positions[key]; ok {
-			signal.LeaderPosition = pos
+		// 附加该币种的持仓信息 (遍历查找，兼容全仓/逐仓不同 Key)
+		for _, pos := range e.leaderState.Positions {
+			if pos.Symbol == fill.Symbol && pos.Side == fill.PositionSide {
+				signal.LeaderPosition = pos
+				break
+			}
 		}
 	}
 
@@ -404,7 +406,15 @@ func (e *Engine) shouldFollowSignal(signal *TradeSignal) (follow bool, reason st
 
 	// 获取本地仓位（实时从交易所获取）
 	localPositions := e.getFollowerPositions()
-	key := PositionKey(fill.Symbol, fill.PositionSide)
+
+	// 获取领航员的保证金模式（用于 OKX 区分全仓/逐仓）
+	leaderMgnMode := ""
+	if signal.LeaderPosition != nil {
+		leaderMgnMode = signal.LeaderPosition.MarginMode
+	}
+
+	// 使用带保证金模式的 Key
+	key := PositionKeyWithMode(fill.Symbol, fill.PositionSide, leaderMgnMode)
 	localPosition := localPositions[key]
 	hasLocalPosition := localPosition != nil && localPosition.Size > 0
 
@@ -465,24 +475,32 @@ func (e *Engine) determineAction(signal *TradeSignal) ActionType {
 		// 检查本地是否已有仓位
 		localPositions := e.getFollowerPositions()
 
-		// 🔍 调试日志：显示本地所有持仓
-		logger.Infof("📊 [%s] 本地持仓检查 | 信号: %s %s | 查找 key=%s",
-			e.traderID, fill.Symbol, fill.PositionSide, PositionKey(fill.Symbol, fill.PositionSide))
-		for k, v := range localPositions {
-			logger.Infof("   - 持仓: %s | 方向=%s 数量=%.4f", k, v.Side, v.Size)
+		// 获取领航员的保证金模式（用于 OKX 区分全仓/逐仓）
+		leaderMgnMode := ""
+		if signal.LeaderPosition != nil {
+			leaderMgnMode = signal.LeaderPosition.MarginMode
 		}
 
-		key := PositionKey(fill.Symbol, fill.PositionSide)
+		// 使用带保证金模式的 Key（OKX: 区分全仓/逐仓独立仓位）
+		key := PositionKeyWithMode(fill.Symbol, fill.PositionSide, leaderMgnMode)
+
+		// 🔍 调试日志：显示本地所有持仓
+		logger.Infof("📊 [%s] 本地持仓检查 | 信号: %s %s mgnMode=%s | 查找 key=%s",
+			e.traderID, fill.Symbol, fill.PositionSide, leaderMgnMode, key)
+		for k, v := range localPositions {
+			logger.Infof("   - 持仓: %s | 方向=%s 模式=%s 数量=%.4f", k, v.Side, v.MarginMode, v.Size)
+		}
+
 		localPosition := localPositions[key]
 		hasLocalPosition := localPosition != nil && localPosition.Size > 0
 
 		if hasLocalPosition {
 			// 本地已有仓位 → 加仓
-			logger.Infof("📊 [%s] %s %s → 加仓 | 本地已有仓位 %.4f", e.traderID, fill.Symbol, fill.PositionSide, localPosition.Size)
+			logger.Infof("📊 [%s] %s %s %s → 加仓 | 本地已有仓位 %.4f", e.traderID, fill.Symbol, fill.PositionSide, leaderMgnMode, localPosition.Size)
 			return ActionAdd
 		}
 		// 本地无仓位 → 新开仓
-		logger.Infof("📊 [%s] %s %s → 新开仓 | 本地无此方向持仓", e.traderID, fill.Symbol, fill.PositionSide)
+		logger.Infof("📊 [%s] %s %s %s → 新开仓 | 本地无此方向+模式持仓", e.traderID, fill.Symbol, fill.PositionSide, leaderMgnMode)
 		return ActionOpen
 	}
 
@@ -684,14 +702,15 @@ func (e *Engine) getLeaderLeverage(signal *TradeSignal) int {
 		return signal.LeaderPosition.Leverage
 	}
 
-	// 3. 实时获取领航员当前持仓的杠杆
+	// 3. 实时获取领航员当前持仓的杠杆 (遍历查找，兼容全仓/逐仓)
 	if e.provider != nil {
 		state, err := e.provider.GetAccountState(e.config.LeaderID)
 		if err == nil && state.Positions != nil {
-			key := PositionKey(signal.Fill.Symbol, signal.Fill.PositionSide)
-			if pos, ok := state.Positions[key]; ok && pos.Leverage > 0 {
-				logger.Infof("🔍 [%s] 实时获取领航员 %s 杠杆: %dx", e.traderID, signal.Fill.Symbol, pos.Leverage)
-				return pos.Leverage
+			for _, pos := range state.Positions {
+				if pos.Symbol == signal.Fill.Symbol && pos.Side == signal.Fill.PositionSide && pos.Leverage > 0 {
+					logger.Infof("🔍 [%s] 实时获取领航员 %s 杠杆: %dx", e.traderID, signal.Fill.Symbol, pos.Leverage)
+					return pos.Leverage
+				}
 			}
 		}
 	}
@@ -715,14 +734,15 @@ func (e *Engine) getLeaderMarginMode(signal *TradeSignal) string {
 		return signal.LeaderPosition.MarginMode
 	}
 
-	// 3. 实时获取领航员当前持仓的保证金模式
+	// 3. 实时获取领航员当前持仓的保证金模式 (遍历查找，兼容全仓/逐仓)
 	if e.provider != nil {
 		state, err := e.provider.GetAccountState(e.config.LeaderID)
 		if err == nil && state.Positions != nil {
-			key := PositionKey(signal.Fill.Symbol, signal.Fill.PositionSide)
-			if pos, ok := state.Positions[key]; ok && pos.MarginMode != "" {
-				logger.Infof("🔍 [%s] 实时获取领航员 %s 保证金模式: %s", e.traderID, signal.Fill.Symbol, pos.MarginMode)
-				return pos.MarginMode
+			for _, pos := range state.Positions {
+				if pos.Symbol == signal.Fill.Symbol && pos.Side == signal.Fill.PositionSide && pos.MarginMode != "" {
+					logger.Infof("🔍 [%s] 实时获取领航员 %s 保证金模式: %s", e.traderID, signal.Fill.Symbol, pos.MarginMode)
+					return pos.MarginMode
+				}
 			}
 		}
 	}
