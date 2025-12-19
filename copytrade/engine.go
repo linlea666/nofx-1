@@ -430,8 +430,9 @@ func (e *Engine) shouldFollowSignal(signal *TradeSignal) (follow bool, reason st
 	localPositions := e.getFollowerPositions()
 
 	// 获取领航员的保证金模式（用于 OKX 区分全仓/逐仓）
+	// 关键：只有在 SyncMarginMode=true 时才区分模式，否则统一用默认 key
 	leaderMgnMode := ""
-	if signal.LeaderPosition != nil {
+	if e.config.SyncMarginMode && signal.LeaderPosition != nil {
 		leaderMgnMode = signal.LeaderPosition.MarginMode
 	}
 
@@ -498,8 +499,9 @@ func (e *Engine) determineAction(signal *TradeSignal) ActionType {
 		localPositions := e.getFollowerPositions()
 
 		// 获取领航员的保证金模式（用于 OKX 区分全仓/逐仓）
+		// 关键：只有在 SyncMarginMode=true 时才区分模式，否则统一用默认 key
 		leaderMgnMode := ""
-		if signal.LeaderPosition != nil {
+		if e.config.SyncMarginMode && signal.LeaderPosition != nil {
 			leaderMgnMode = signal.LeaderPosition.MarginMode
 		}
 
