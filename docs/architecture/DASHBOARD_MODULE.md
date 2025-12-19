@@ -15,7 +15,16 @@
 
 1. **复用优先**：最大化复用现有数据结构和 API
 2. **无侵入性**：不破坏现有系统架构
-3. **增量开发**：在现有基础上扩展，不重构核心逻辑
+3. **独立文件**：后端使用单文件方案，便于维护和删除
+
+### 1.3 实现状态 ✅
+
+| 模块 | 状态 | 文件 |
+|------|------|------|
+| 后端 API | ✅ 已完成 | `api/dashboard.go` |
+| 前端页面 | ✅ 已完成 | `web/src/pages/DashboardPage.tsx` |
+| 路由注册 | ✅ 已完成 | `api/server.go` |
+| 数据记录修复 | ✅ 已完成 | `trader/auto_trader.go` |
 
 ---
 
@@ -43,19 +52,9 @@ GetRecentTrades(traderID, n)   // 最近交易记录
 GetHistorySummary(traderID)    // 综合历史摘要
 ```
 
-### 2.3 现有 API 端点
-
-```
-GET /api/statistics?trader_id=xxx      # 单个交易员统计
-GET /api/equity-history?trader_id=xxx  # 权益历史
-GET /api/equity-history-batch          # 批量权益历史
-GET /api/traders                       # 公开交易员列表
-GET /api/competition                   # 竞赛数据
-```
-
 ---
 
-## 3. 跟单模式兼容性检查 ⚠️
+## 3. 跟单模式兼容性 ✅
 
 ### 3.1 数据记录链路
 
@@ -73,292 +72,265 @@ recordAndConfirmOrder() → recordPositionChange()
 store.Position().Create() / ClosePosition()  ← 记录到 trader_positions
 ```
 
-### 3.2 跟单模式已兼容的记录 ✅
+### 3.2 已修复的问题 ✅
 
-| 记录类型 | 存储位置 | 函数 | 状态 |
-|---------|---------|------|------|
-| 决策日志 | `decision_records` | `saveDecisionRecord()` | ✅ 兼容 |
-| 权益快照 | `trader_equity_snapshots` | `saveEquitySnapshot()` | ✅ 兼容 |
-| 信号日志 | `copy_trade_signal_logs` | `SaveSignalLog()` | ✅ 兼容 |
-| 交易记录 | `trader_positions` | `recordPositionChange()` | ⚠️ 部分兼容 |
+#### 问题：Hyperliquid 订单 ID 为空导致交易记录缺失
 
-### 3.3 已发现的问题 🔴
-
-#### 问题 1：Hyperliquid 订单 ID 为空导致交易记录缺失
-
+**原代码**：
 ```go
-// auto_trader.go:1746-1748
 if orderID == "" || orderID == "0" {
     logger.Infof("  ⚠️ Order ID is empty, skipping record")
     return  // ← 交易记录未保存！
 }
 ```
 
-**影响**：
-- Hyperliquid 交易所的开仓/平仓记录可能未保存到 `trader_positions`
-- 统计数据（盈亏、胜率）不完整
-
-**建议修复**：
+**修复后**（`trader/auto_trader.go`）：
 ```go
-// 即使 orderID 为空，也生成一个唯一 ID 继续记录
-if orderID == "" || orderID == "0" {
-    orderID = fmt.Sprintf("auto_%d", time.Now().UnixNano())
-    logger.Infof("  ⚠️ Order ID is empty, using auto-generated: %s", orderID)
+if orderID == "" || orderID == "0" || orderID == "<nil>" {
+    // Hyperliquid 不返回订单 ID，生成唯一 ID 确保记录被保存
+    orderID = fmt.Sprintf("%s_%s_%s_%d", at.exchange, symbol, action, time.Now().UnixNano())
+    logger.Infof("  📝 Order ID is empty, using auto-generated: %s", orderID)
 }
+// 继续记录，不再 return
 ```
 
-#### 问题 2：前端决策日志格式兼容性
-
-从截图可见，跟单模式的前端显示已兼容：
-- ✅ 币种和方向显示正确（DOGE SHORT）
-- ✅ 入场价、杠杆显示正确
-- ✅ AI思维链分析显示跟单信息（领航员 ID、数据源、跟单比例）
-
-**结论**：前端显示格式已适配跟单模式。
+**效果**：所有交易记录都能正确保存到 `trader_positions`，大屏统计数据完整。
 
 ---
 
-## 4. 大屏功能设计
+## 4. 后端 API 实现 ✅
 
-### 4.1 数据维度
+### 4.1 文件结构
 
-#### 4.1.1 时间维度
+采用**单文件独立方案**，所有 Dashboard 相关代码集中在 `api/dashboard.go`：
 
-| 维度 | 计算方式 |
-|------|---------|
-| 今日 | `WHERE DATE(exit_time) = DATE('now')` |
-| 本周 | `WHERE exit_time >= date('now', 'weekday 0', '-7 days')` |
-| 本月 | `WHERE strftime('%Y-%m', exit_time) = strftime('%Y-%m', 'now')` |
-| 全部 | 无时间过滤 |
+```
+api/dashboard.go
+├── 数据结构定义 (DashboardSummary, TraderDashboardStats, PnLTrendPoint)
+├── 辅助函数 (getTimeRangeStart)
+├── 数据查询函数 (直接 SQL)
+├── API Handler
+└── 路由注册 (RegisterDashboardRoutes)
+```
 
-#### 4.1.2 交易员维度
+### 4.2 API 端点
 
-- 单个交易员统计
-- 全局汇总（所有交易员）
+| 端点 | 方法 | 描述 | 认证 |
+|------|------|------|------|
+| `/api/dashboard/summary` | GET | 全局汇总统计 | 无需 |
+| `/api/dashboard/traders` | GET | 所有交易员统计列表 | 无需 |
+| `/api/dashboard/trader/:id` | GET | 单个交易员详细统计 | 无需 |
+| `/api/dashboard/trend` | GET | 盈亏趋势数据 | 无需 |
 
-### 4.2 统计指标
+### 4.3 数据结构
+
+```go
+// DashboardSummary 全局汇总
+type DashboardSummary struct {
+    TotalPnL      float64 `json:"total_pnl"`       // 总盈亏
+    TotalTrades   int     `json:"total_trades"`    // 总交易数
+    AvgWinRate    float64 `json:"avg_win_rate"`    // 平均胜率
+    ActiveTraders int     `json:"active_traders"`  // 活跃交易员数
+    TotalEquity   float64 `json:"total_equity"`    // 总净值
+    TotalFees     float64 `json:"total_fees"`      // 总手续费
+    TodayPnL      float64 `json:"today_pnl"`       // 今日盈亏
+    WeekPnL       float64 `json:"week_pnl"`        // 本周盈亏
+    MonthPnL      float64 `json:"month_pnl"`       // 本月盈亏
+    UpdatedAt     string  `json:"updated_at"`      // 更新时间
+}
+
+// TraderDashboardStats 交易员大屏统计
+type TraderDashboardStats struct {
+    TraderID       string  `json:"trader_id"`
+    TraderName     string  `json:"trader_name"`
+    Mode           string  `json:"mode"`            // ai | copy_trade
+    Exchange       string  `json:"exchange"`        // 交易所
+    IsRunning      bool    `json:"is_running"`      // 是否运行中
+    
+    // 分时段统计
+    TodayPnL       float64 `json:"today_pnl"`
+    TodayTrades    int     `json:"today_trades"`
+    WeekPnL        float64 `json:"week_pnl"`
+    WeekTrades     int     `json:"week_trades"`
+    MonthPnL       float64 `json:"month_pnl"`
+    MonthTrades    int     `json:"month_trades"`
+    TotalPnL       float64 `json:"total_pnl"`
+    
+    // 核心指标
+    TotalTrades    int     `json:"total_trades"`
+    WinRate        float64 `json:"win_rate"`
+    WinTrades      int     `json:"win_trades"`
+    LossTrades     int     `json:"loss_trades"`
+    ProfitFactor   float64 `json:"profit_factor"`   // 盈亏比
+    MaxDrawdown    float64 `json:"max_drawdown"`    // 最大回撤 %
+    TotalFees      float64 `json:"total_fees"`      // 总手续费
+    
+    // 当前状态
+    CurrentEquity  float64 `json:"current_equity"`
+    InitialBalance float64 `json:"initial_balance"`
+    ReturnRate     float64 `json:"return_rate"`     // 收益率 %
+    PositionCount  int     `json:"position_count"`  // 当前持仓数
+}
+
+// PnLTrendPoint 盈亏趋势数据点
+type PnLTrendPoint struct {
+    Date   string  `json:"date"`    // 日期
+    PnL    float64 `json:"pnl"`     // 当日盈亏
+    CumPnL float64 `json:"cum_pnl"` // 累计盈亏
+    Trades int     `json:"trades"`  // 交易数
+}
+```
+
+### 4.4 路由注册
+
+在 `api/server.go` 的 `setupRoutes()` 中：
+
+```go
+// Dashboard 数据大屏 API (无需认证)
+s.RegisterDashboardRoutes(api)
+```
+
+---
+
+## 5. 前端实现 ✅
+
+### 5.1 文件结构
+
+```
+web/src/pages/DashboardPage.tsx    // 主页面（包含所有组件）
+```
+
+### 5.2 主要组件
+
+| 组件 | 功能 |
+|------|------|
+| `ParticleBackground` | 粒子动画背景 |
+| `NeonCard` | 霓虹发光边框卡片 |
+| `CircleProgress` | 圆环进度图（胜率等） |
+| `MiniBarChart` | 迷你柱状图 |
+| `MiniLineChart` | 迷你折线图 |
+| `BigStatCard` | 顶部大数字统计卡片 |
+| `TraderLeaderboard` | 交易员排行榜 |
+| `TraderDetailPanel` | 交易员详情面板 |
+| `RealtimePanel` | 实时数据面板 |
+| `GlobalPnLChart` | 全局盈亏图表 |
+| `AnimatedNumber` | 数字动画效果 |
+
+### 5.3 数据获取
+
+```tsx
+// 获取大屏交易员统计数据
+const { data: dashboardTraders, isLoading, error } = useSWR(
+  'dashboard-traders', 
+  fetchDashboardTraders, 
+  { refreshInterval: 30000 }
+)
+
+// 获取全局汇总数据
+const { data: summaryData } = useSWR(
+  'dashboard-summary', 
+  fetchDashboardSummary, 
+  { refreshInterval: 30000 }
+)
+```
+
+### 5.4 路由配置
+
+```tsx
+// App.tsx
+{ path: '/data-dashboard', element: <DashboardPage /> }
+
+// HeaderBar.tsx
+导航按钮: "数据大屏" → /data-dashboard
+```
+
+### 5.5 UI 特性
+
+- 🎨 深蓝科技风格主题
+- ✨ 粒子背景动画
+- 💫 霓虹发光边框效果
+- 📊 圆环进度图显示胜率
+- 📈 迷你柱状图和折线图
+- 🏆 前三名金银铜发光效果
+- 🖥️ 三栏布局（排行榜/详情/实时数据）
+- 🔄 30秒自动刷新
+- ⚡ 加载状态和错误处理
+
+---
+
+## 6. 统计指标
 
 | 指标 | 计算方式 | 数据源 |
 |------|---------|--------|
 | 总盈亏 | `SUM(realized_pnl)` | `trader_positions` |
 | 总手续费 | `SUM(fee)` | `trader_positions` |
-| 净盈亏 | `总盈亏 - 总手续费` | 计算 |
 | 交易次数 | `COUNT(*)` | `trader_positions` |
 | 胜率 | `盈利交易数 / 总交易数 * 100` | `trader_positions` |
-| 盈亏比 | `平均盈利 / 平均亏损` | `trader_positions` |
-| 最大回撤 | 峰值到谷值的最大跌幅 | `trader_equity_snapshots` |
-| 当前净值 | 最新权益 | `trader_equity_snapshots` |
+| 盈亏比 | `总盈利 / 总亏损` | `trader_positions` |
+| 最大回撤 | `(峰值 - 谷值) / 峰值 * 100` | 累计 PnL 计算 |
+| 当前净值 | 最新权益快照 | `trader_equity_snapshots` |
 | 收益率 | `(当前净值 - 初始资金) / 初始资金 * 100` | 计算 |
+| 活跃交易员 | 有持仓的交易员数 | `trader_positions (status='OPEN')` |
 
-### 4.3 功能模块
+---
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                        📊 交易数据大屏                            │
-├──────────────────────────────────────────────────────────────────┤
-│  [全局统计卡片]                                                   │
-│  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐    │
-│  │ 总盈亏   │ │ 总交易   │ │ 平均胜率 │ │ 活跃交易员│ │ 总净值   │    │
-│  │ +$1,234 │ │ 156 笔  │ │ 62.5%  │ │ 8 位    │ │ $10,500│    │
-│  └─────────┘ └─────────┘ └─────────┘ └─────────┘ └─────────┘    │
-├──────────────────────────────────────────────────────────────────┤
-│  [时间筛选] ◯ 今日  ◯ 本周  ● 本月  ◯ 全部                        │
-├──────────────────────────────────────────────────────────────────┤
-│  [交易员排行榜]                         [盈亏趋势图]              │
-│  ┌────────────────────────┐           ┌────────────────────┐    │
-│  │ 1. 飞飞    +$456 62%  │           │     📈              │    │
-│  │ 2. 东东    +$234 58%  │           │   /    \            │    │
-│  │ 3. xxx    -$50  45%  │           │  /      \_/\        │    │
-│  │ ...                   │           │ /            \__    │    │
-│  └────────────────────────┘           └────────────────────┘    │
-├──────────────────────────────────────────────────────────────────┤
-│  [交易员详情] (点击排行榜展开)                                     │
-│  ┌──────────────────────────────────────────────────────────┐   │
-│  │ 交易员: 飞飞                                              │   │
-│  │ 今日盈亏: +$123  |  本周: +$456  |  本月: +$890           │   │
-│  │ 胜率: 62%  |  盈亏比: 1.8  |  最大回撤: 5.2%              │   │
-│  │ 最近交易: BTCUSDT LONG +$45, ETHUSDT SHORT -$12, ...     │   │
-│  └──────────────────────────────────────────────────────────┘   │
-└──────────────────────────────────────────────────────────────────┘
+## 7. 时间维度计算
+
+```go
+func getTimeRangeStart(timeRange string) time.Time {
+    now := time.Now()
+    switch timeRange {
+    case "today":
+        // 今天 00:00:00
+        return time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+    case "week":
+        // 本周一 00:00:00
+        weekday := int(now.Weekday())
+        if weekday == 0 { weekday = 7 }
+        return time.Date(now.Year(), now.Month(), now.Day()-weekday+1, 0, 0, 0, 0, now.Location())
+    case "month":
+        // 本月1号 00:00:00
+        return time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
+    default:
+        return time.Time{} // 全部
+    }
+}
 ```
 
 ---
 
-## 5. 技术方案
+## 8. 部署说明
 
-### 5.1 后端 API 设计
+### 8.1 后端
 
-#### 5.1.1 新增 API 端点
+```bash
+# 拉取代码
+git pull
 
-```go
-// 大屏统计 API
-GET /api/dashboard/summary              // 全局汇总统计
-GET /api/dashboard/traders              // 交易员列表 + 统计
-GET /api/dashboard/trader/:id           // 单个交易员详细统计
-GET /api/dashboard/leaderboard          // 排行榜
-GET /api/dashboard/trend                // 盈亏趋势图数据
+# 编译
+go build -o nofx
+
+# 重启服务
+./nofx
 ```
 
-#### 5.1.2 数据结构
+### 8.2 前端
 
-```go
-// DashboardSummary 全局汇总
-type DashboardSummary struct {
-    TotalPnL        float64 `json:"total_pnl"`         // 总盈亏
-    TotalTrades     int     `json:"total_trades"`      // 总交易数
-    AvgWinRate      float64 `json:"avg_win_rate"`      // 平均胜率
-    ActiveTraders   int     `json:"active_traders"`    // 活跃交易员数
-    TotalEquity     float64 `json:"total_equity"`      // 总净值
-    TotalFees       float64 `json:"total_fees"`        // 总手续费
-    UpdatedAt       string  `json:"updated_at"`        // 更新时间
-}
-
-// TraderDashboardStats 交易员统计
-type TraderDashboardStats struct {
-    TraderID        string  `json:"trader_id"`
-    TraderName      string  `json:"trader_name"`
-    Mode            string  `json:"mode"`              // ai | copy_trade
-    
-    // 分时段统计
-    TodayPnL        float64 `json:"today_pnl"`
-    WeekPnL         float64 `json:"week_pnl"`
-    MonthPnL        float64 `json:"month_pnl"`
-    TotalPnL        float64 `json:"total_pnl"`
-    
-    // 核心指标
-    TotalTrades     int     `json:"total_trades"`
-    WinRate         float64 `json:"win_rate"`
-    ProfitFactor    float64 `json:"profit_factor"`     // 盈亏比
-    MaxDrawdown     float64 `json:"max_drawdown"`
-    
-    // 当前状态
-    CurrentEquity   float64 `json:"current_equity"`
-    InitialBalance  float64 `json:"initial_balance"`
-    ReturnRate      float64 `json:"return_rate"`       // 收益率 %
-    PositionCount   int     `json:"position_count"`    // 当前持仓数
-    
-    // 最近交易
-    RecentTrades    []RecentTrade `json:"recent_trades"`
-}
-
-// PnLTrendPoint 盈亏趋势数据点
-type PnLTrendPoint struct {
-    Date     string  `json:"date"`      // 日期
-    PnL      float64 `json:"pnl"`       // 当日盈亏
-    CumPnL   float64 `json:"cum_pnl"`   // 累计盈亏
-    Equity   float64 `json:"equity"`    // 净值
-}
+```bash
+cd web
+npm install
+npm run build
 ```
 
-### 5.2 复用策略
+### 8.3 访问地址
 
-#### 5.2.1 复用现有 Store 函数
-
-```go
-// 在 store/position.go 中新增按时间段查询
-func (s *PositionStore) GetPnLByDateRange(traderID string, start, end time.Time) (float64, int, error) {
-    var totalPnL float64
-    var count int
-    err := s.db.QueryRow(`
-        SELECT COALESCE(SUM(realized_pnl), 0), COUNT(*)
-        FROM trader_positions
-        WHERE trader_id = ? AND status = 'CLOSED'
-        AND exit_time >= ? AND exit_time < ?
-    `, traderID, start.Format(time.RFC3339), end.Format(time.RFC3339)).Scan(&totalPnL, &count)
-    return totalPnL, count, err
-}
-
-// 全局统计（所有交易员）
-func (s *PositionStore) GetGlobalStats() (*GlobalStats, error) {
-    // 复用现有的 GetFullStats 逻辑，但不按 trader_id 过滤
-}
-```
-
-#### 5.2.2 复用现有 API
-
-```go
-// 在 api/dashboard_handler.go 中
-func (h *DashboardHandler) handleTraderStats(c *gin.Context) {
-    traderID := c.Param("id")
-    
-    // 复用现有函数
-    fullStats, _ := h.store.Position().GetFullStats(traderID)
-    recentTrades, _ := h.store.Position().GetRecentTrades(traderID, 5)
-    equityHistory, _ := h.store.Equity().GetLatest(traderID, 30)
-    
-    // 新增：按时间段统计
-    todayPnL, todayTrades, _ := h.store.Position().GetPnLByDateRange(traderID, todayStart, todayEnd)
-    // ...
-}
-```
-
-### 5.3 前端设计
-
-#### 5.3.1 新增页面
-
-```
-web/src/pages/Dashboard.tsx     // 大屏页面
-web/src/components/dashboard/   // 大屏组件
-  ├── SummaryCards.tsx          // 顶部统计卡片
-  ├── TraderLeaderboard.tsx     // 交易员排行榜
-  ├── PnLTrendChart.tsx         // 盈亏趋势图
-  ├── TraderDetailPanel.tsx     // 交易员详情面板
-  └── TimeRangeSelector.tsx     // 时间筛选器
-```
-
-#### 5.3.2 路由配置
-
-```tsx
-// App.tsx
-<Route path="/dashboard" element={<Dashboard />} />
-```
+- 数据大屏：`https://your-domain/data-dashboard`
 
 ---
 
-## 6. 实施计划
+## 9. 附录
 
-### Phase 1: 数据层完善 (Day 1-2)
-
-1. **修复 Hyperliquid 交易记录缺失问题**
-   - 修改 `recordAndConfirmOrder()`，即使 orderID 为空也生成唯一 ID 继续记录
-   
-2. **新增按时间段统计函数**
-   - `GetPnLByDateRange()` - 按日期范围统计盈亏
-   - `GetGlobalStats()` - 全局统计
-   - `GetDailyPnLTrend()` - 每日盈亏趋势
-
-### Phase 2: API 层开发 (Day 3-4)
-
-1. **新建 `api/dashboard_handler.go`**
-   - `/api/dashboard/summary` - 全局汇总
-   - `/api/dashboard/traders` - 交易员列表统计
-   - `/api/dashboard/leaderboard` - 排行榜
-   - `/api/dashboard/trend` - 趋势数据
-
-2. **注册路由**
-   - 无需认证（公开数据）
-
-### Phase 3: 前端开发 (Day 5-7)
-
-1. **创建大屏页面组件**
-2. **集成图表库**（复用现有的 recharts）
-3. **响应式布局适配**
-
----
-
-## 7. 风险评估
-
-| 风险 | 影响 | 缓解措施 |
-|------|------|---------|
-| Hyperliquid 交易记录缺失 | 统计不准确 | Phase 1 优先修复 |
-| 数据量大导致查询慢 | 大屏加载慢 | 添加缓存 + 分页 |
-| 跟单模式数据格式差异 | 统计逻辑不一致 | 统一使用 trader_positions |
-
----
-
-## 8. 附录
-
-### 8.1 现有数据记录流程图
+### 9.1 数据流程图
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -377,7 +349,7 @@ web/src/components/dashboard/   // 大屏组件
 │    ExecuteExternalDecision()                                    │
 │                 │                                                │
 │                 ↓                                                │
-│    recordAndConfirmOrder()                                      │
+│    recordAndConfirmOrder()  ← 已修复：空 orderID 自动生成       │
 │                 │                                                │
 │                 ↓                                                │
 │    recordPositionChange()                                       │
@@ -394,52 +366,59 @@ web/src/components/dashboard/   // 大屏组件
 │    └───────────┴───────────┘                                   │
 │                 │                                                │
 │                 ↓                                                │
-│         📊 数据大屏统计                                          │
+│    ┌─────────────────────────────┐                             │
+│    │    api/dashboard.go         │                             │
+│    │    直接 SQL 查询统计        │                             │
+│    └─────────────────────────────┘                             │
+│                 │                                                │
+│                 ↓                                                │
+│         📊 数据大屏展示                                          │
 │                                                                  │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 8.2 SQL 查询示例
+### 9.2 SQL 查询示例
 
 ```sql
--- 今日盈亏统计
+-- 全局统计
 SELECT 
-    trader_id,
-    SUM(realized_pnl) as today_pnl,
-    SUM(fee) as today_fee,
-    COUNT(*) as today_trades,
-    SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) as wins
-FROM trader_positions
-WHERE status = 'CLOSED'
-AND DATE(exit_time) = DATE('now')
-GROUP BY trader_id;
-
--- 全局汇总
-SELECT 
-    SUM(realized_pnl) as total_pnl,
-    SUM(fee) as total_fee,
-    COUNT(*) as total_trades,
-    COUNT(DISTINCT trader_id) as trader_count,
-    AVG(CASE WHEN realized_pnl > 0 THEN 1.0 ELSE 0.0 END) * 100 as avg_win_rate
+    COALESCE(SUM(realized_pnl), 0) as total_pnl,
+    COALESCE(SUM(fee), 0) as total_fees,
+    COUNT(*) as total_trades
 FROM trader_positions
 WHERE status = 'CLOSED';
+
+-- 今日盈亏
+SELECT COALESCE(SUM(realized_pnl), 0) 
+FROM trader_positions
+WHERE status = 'CLOSED' AND exit_time >= '2025-12-19 00:00:00';
+
+-- 交易员分时段统计
+SELECT 
+    COALESCE(SUM(realized_pnl), 0) as pnl,
+    COALESCE(SUM(fee), 0) as fees,
+    COUNT(*) as trades,
+    COALESCE(SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END), 0) as wins,
+    COALESCE(SUM(CASE WHEN realized_pnl < 0 THEN 1 ELSE 0 END), 0) as losses
+FROM trader_positions
+WHERE trader_id = ? AND status = 'CLOSED' AND exit_time >= ?;
 
 -- 每日盈亏趋势
 SELECT 
     DATE(exit_time) as date,
-    SUM(realized_pnl) as daily_pnl,
-    SUM(SUM(realized_pnl)) OVER (ORDER BY DATE(exit_time)) as cum_pnl
+    COALESCE(SUM(realized_pnl), 0) as daily_pnl,
+    COUNT(*) as trades
 FROM trader_positions
 WHERE status = 'CLOSED'
 GROUP BY DATE(exit_time)
-ORDER BY date;
+ORDER BY date ASC;
 ```
 
 ---
 
-## 9. 更新日志
+## 10. 更新日志
 
 | 日期 | 版本 | 更新内容 |
 |------|------|---------|
 | 2025-12-19 | v1.0 | 初始设计文档 |
-
+| 2025-12-19 | v2.0 | 完成实现，更新文档：<br>- 后端 API 实现 (`api/dashboard.go`)<br>- 前端页面实现 (`DashboardPage.tsx`)<br>- 修复 Hyperliquid 交易记录缺失<br>- 采用单文件独立方案 |
