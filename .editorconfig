@@ -1,0 +1,36 @@
+# EditorConfig - 统一代码格式，避免 Tab/Space 混乱
+# https://editorconfig.org
+
+root = true
+
+# 所有文件的默认设置
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+# Go 文件 - 使用 Tab 缩进（Go 官方规范）
+[*.go]
+indent_style = tab
+indent_size = 4
+
+# TypeScript/JavaScript/React 文件 - 使用 2 空格
+[*.{ts,tsx,js,jsx}]
+indent_style = space
+indent_size = 2
+
+# JSON/YAML/Markdown 文件
+[*.{json,yaml,yml,md}]
+indent_style = space
+indent_size = 2
+
+# HTML/CSS 文件
+[*.{html,css,scss}]
+indent_style = space
+indent_size = 2
+
+# Makefile 必须使用 Tab
+[Makefile]
+indent_style = tab
+
