@@ -506,33 +506,44 @@ func (e *Engine) processSignal(signal *TradeSignal) {
 
 // shouldFollowSignal 🎯 核心规则：只跟新开仓（本地仓位对比法）
 // ============================================================
-// 判断逻辑：
-//   - 本地有仓位 → 跟随（加仓/减仓/平仓）
-//   - 本地无仓位 + 领航员开仓 → 跟随（新开仓）
-//   - 本地无仓位 + 领航员加仓/减仓/平仓 → 跳过（历史仓位操作）
+// 判断逻辑（优先级从高到低）：
+//   1. 数据库有映射 → 跟随（我们已跟随该仓位）
+//   2. 本地有仓位 → 跟随（加仓/减仓/平仓）
+//   3. 本地无仓位 + 领航员开仓 → 跟随（新开仓）
+//   4. 本地无仓位 + 领航员历史仓位操作 → 跳过
 //
 // OKX 特殊处理：
-//   - OKX API 不提供 startPosition，无法直接区分开仓/加仓
-//   - 通过比较领航员当前持仓量与本次交易量来推断：
-//   - 当前持仓 ≈ 本次交易量 → 新开仓
-//   - 当前持仓 > 本次交易量 * 1.2 → 历史仓位加仓
-//
+//   - 使用 posId 查询数据库映射，精确判断是否已跟随
+//   - 无 posId 时回退到持仓量比较推断
 // ============================================================
 func (e *Engine) shouldFollowSignal(signal *TradeSignal) (follow bool, reason string) {
 	fill := signal.Fill
+
+	// ====== 优先查数据库映射（精确判断是否已跟随该仓位） ======
+	if signal.LeaderPosID != "" && e.store != nil {
+		mapping, err := e.store.CopyTrade().GetActiveMapping(e.traderID, signal.LeaderPosID)
+		if err != nil {
+			logger.Warnf("⚠️ [%s] 查询仓位映射失败: %v", e.traderID, err)
+		} else if mapping != nil {
+			// 数据库有映射 → 说明我们已跟随该仓位，继续跟随
+			logger.Infof("📊 [%s] 数据库映射存在 | posId=%s → 已跟随该仓位，继续跟随",
+				e.traderID, signal.LeaderPosID)
+			return true, fmt.Sprintf("数据库映射存在(posId=%s)，继续跟随", signal.LeaderPosID)
+		}
+	}
+
+	// ====== 回退逻辑：无 posId 或无数据库时，使用原有逻辑 ======
 
 	// 获取本地仓位（实时从交易所获取）
 	localPositions := e.getFollowerPositions()
 
 	// 获取领航员的保证金模式（用于 OKX 区分全仓/逐仓）
-	// 关键：只有在 SyncMarginMode=true 时才区分模式，否则统一用默认 key
 	leaderMgnMode := ""
 	if e.config.SyncMarginMode && signal.LeaderPosition != nil {
 		leaderMgnMode = signal.LeaderPosition.MarginMode
 	}
 
-	// 查找本地仓位：localPositions 的 key 可能是 posId 或 mgnMode key
-	// 需要遍历查找 symbol+side+mgnMode 匹配的仓位
+	// 查找本地仓位
 	localPosition := e.findLocalPosition(localPositions, fill.Symbol, fill.PositionSide, leaderMgnMode)
 	hasLocalPosition := localPosition != nil && localPosition.Size > 0
 
@@ -543,14 +554,12 @@ func (e *Engine) shouldFollowSignal(signal *TradeSignal) (follow bool, reason st
 			return true, "开仓信号，本地已有仓位 → 跟随加仓"
 		}
 
-		// 本地无仓位时，需要判断领航员是"新开仓"还是"历史仓位加仓"
-		// 🔍 通过领航员当前持仓量推断（适用于所有 Provider）
+		// 本地无仓位 + 数据库无映射 → 需要判断领航员是"新开仓"还是"历史仓位加仓"
 		if signal.LeaderPosition != nil {
 			leaderCurrentSize := signal.LeaderPosition.Size
 			thisTradeSize := fill.Size
 
 			// 如果领航员当前持仓明显大于本次交易量，说明是历史仓位加仓
-			// 阈值 1.2：允许一定误差（滑点、部分成交等）
 			if leaderCurrentSize > thisTradeSize*1.2 {
 				logger.Infof("📊 [%s] 历史仓位检测 | %s %s | 领航员当前持仓=%.4f > 本次交易=%.4f*1.2 → 判定为历史仓位加仓",
 					e.traderID, fill.Symbol, fill.PositionSide, leaderCurrentSize, thisTradeSize)
@@ -563,14 +572,14 @@ func (e *Engine) shouldFollowSignal(signal *TradeSignal) (follow bool, reason st
 		return true, "新开仓，本地无持仓 → 跟随开仓"
 
 	case ActionAdd:
-		// 加仓信号：本地有仓位才跟随
+		// 加仓信号：本地有仓位才跟随（数据库映射已在上面处理）
 		if !hasLocalPosition {
 			return false, "忽略：领航员历史仓位加仓，我们未跟随该仓位"
 		}
 		return true, "加仓信号，本地有仓位 → 跟随加仓"
 
 	case ActionReduce, ActionClose:
-		// 减仓/平仓信号：本地有仓位才跟随
+		// 减仓/平仓信号：本地有仓位才跟随（数据库映射已在上面处理）
 		if !hasLocalPosition {
 			return false, "忽略：领航员历史仓位操作，我们未跟随该仓位"
 		}
@@ -912,7 +921,7 @@ func (e *Engine) mapAction(action ActionType, side SideType) string {
 	case action == ActionOpen && side == SideShort:
 		return "open_short"
 	case action == ActionAdd && side == SideLong:
-		return "open_long"
+		return "open_long" // 加仓用 open，在 updatePositionMapping 中通过数据库区分
 	case action == ActionAdd && side == SideShort:
 		return "open_short"
 	case action == ActionClose && side == SideLong:
@@ -920,9 +929,9 @@ func (e *Engine) mapAction(action ActionType, side SideType) string {
 	case action == ActionClose && side == SideShort:
 		return "close_short"
 	case action == ActionReduce && side == SideLong:
-		return "close_long" // 减仓也用 close，执行层处理数量
+		return "reduce_long" // 减仓用 reduce，与平仓区分
 	case action == ActionReduce && side == SideShort:
-		return "close_short"
+		return "reduce_short"
 	default:
 		return "hold"
 	}

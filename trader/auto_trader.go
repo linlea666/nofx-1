@@ -805,6 +805,14 @@ func (at *AutoTrader) executeDecisionWithRecord(decision *decision.Decision, act
 		return at.executeCloseLongWithRecord(decision, actionRecord)
 	case "close_short":
 		return at.executeCloseShortWithRecord(decision, actionRecord)
+	case "reduce_long":
+		// 减仓：复用平仓逻辑（通过 CloseRatio 控制减仓比例）
+		logger.Infof("  📉 Reduce long: %s (ratio=%.2f)", decision.Symbol, decision.CloseRatio)
+		return at.executeCloseLongWithRecord(decision, actionRecord)
+	case "reduce_short":
+		// 减仓：复用平仓逻辑（通过 CloseRatio 控制减仓比例）
+		logger.Infof("  📉 Reduce short: %s (ratio=%.2f)", decision.Symbol, decision.CloseRatio)
+		return at.executeCloseShortWithRecord(decision, actionRecord)
 	case "hold", "wait":
 		// No execution needed, just record
 		return nil
