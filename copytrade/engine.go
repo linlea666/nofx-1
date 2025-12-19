@@ -315,20 +315,52 @@ func (e *Engine) buildSignal(fill *Fill) *TradeSignal {
 		signal.LeaderEquity = e.leaderState.TotalEquity
 
 		// 附加该币种的持仓信息
-		// 优先级：1.变化追踪的仓位 2.当前持仓查找
+		// 策略：遍历所有变化的仓位，找到最匹配的（size 最接近 fill.Size）
 		baseKey := fill.Symbol + "_" + string(fill.PositionSide)
 		
-		// 1. 优先使用变化追踪的仓位（最精确）
-		if changedPos, ok := e.changedPositions[baseKey]; ok {
-			signal.LeaderPosition = changedPos
-			logger.Debugf("📊 [%s] 使用变化追踪的仓位 | %s %s mgnMode=%s", 
-				e.traderID, fill.Symbol, fill.PositionSide, changedPos.MarginMode)
+		// 收集所有匹配的变化仓位（可能有全仓和逐仓两个）
+		var candidates []*Position
+		for key, pos := range e.changedPositions {
+			// 检查是否是同 symbol+side 的仓位
+			if pos.Symbol == fill.Symbol && pos.Side == fill.PositionSide {
+				candidates = append(candidates, pos)
+				logger.Debugf("📊 [%s] buildSignal 候选仓位 | key=%s mgnMode=%s size=%.4f",
+					e.traderID, key, pos.MarginMode, pos.Size)
+			}
+		}
+		
+		if len(candidates) == 1 {
+			// 只有一个变化仓位，直接使用
+			signal.LeaderPosition = candidates[0]
+			logger.Debugf("📊 [%s] 使用唯一变化仓位 | %s %s mgnMode=%s", 
+				e.traderID, fill.Symbol, fill.PositionSide, candidates[0].MarginMode)
+		} else if len(candidates) > 1 {
+			// 多个变化仓位（全仓和逐仓都变了），选择 size 最接近 fill.Size 的
+			var bestMatch *Position
+			minDiff := float64(999999)
+			for _, pos := range candidates {
+				diff := absFloat(pos.Size - fill.Size)
+				if diff < minDiff {
+					minDiff = diff
+					bestMatch = pos
+				}
+			}
+			if bestMatch != nil {
+				signal.LeaderPosition = bestMatch
+				logger.Debugf("📊 [%s] 从%d个候选中选择最佳匹配 | %s %s mgnMode=%s size=%.4f (fill.Size=%.4f)", 
+					e.traderID, len(candidates), fill.Symbol, fill.PositionSide, 
+					bestMatch.MarginMode, bestMatch.Size, fill.Size)
+			}
 		} else {
-			// 2. 回退：从当前持仓中查找（兼容单仓位场景）
-			for _, pos := range e.leaderState.Positions {
-				if pos.Symbol == fill.Symbol && pos.Side == fill.PositionSide {
-					signal.LeaderPosition = pos
-					break
+			// 没有变化追踪，回退：从当前持仓中查找（兼容单仓位场景）
+			if changedPos, ok := e.changedPositions[baseKey]; ok {
+				signal.LeaderPosition = changedPos
+			} else {
+				for _, pos := range e.leaderState.Positions {
+					if pos.Symbol == fill.Symbol && pos.Side == fill.PositionSide {
+						signal.LeaderPosition = pos
+						break
+					}
 				}
 			}
 		}
@@ -917,6 +949,7 @@ func (e *Engine) syncLeaderState() error {
 
 // detectPositionChanges 对比新旧持仓，找出变化的仓位
 // 核心逻辑：通过持仓数量变化来确定哪个仓位（全仓/逐仓）发生了操作
+// 关键改进：同时用 baseKey 和 fullKey 记录，解决同 symbol+side 不同 mgnMode 的覆盖问题
 func (e *Engine) detectPositionChanges(oldState, newState *AccountState) {
 	if e.changedPositions == nil {
 		e.changedPositions = make(map[string]*Position)
@@ -936,19 +969,23 @@ func (e *Engine) detectPositionChanges(oldState, newState *AccountState) {
 	for key, newPos := range newState.Positions {
 		oldPos := oldPositions[key]
 		
-		// 基础 key（不含 mgnMode）用于快速查找
+		// baseKey: symbol_side（用于快速查找，不区分模式）
+		// fullKey: symbol_side_mgnMode（用于精确查找，区分全仓/逐仓）
 		baseKey := newPos.Symbol + "_" + string(newPos.Side)
+		fullKey := PositionKeyWithMode(newPos.Symbol, newPos.Side, newPos.MarginMode)
 		
 		if oldPos == nil {
-			// 新增仓位
-			e.changedPositions[baseKey] = newPos
-			logger.Debugf("📊 [%s] 持仓变化检测 | 新增: %s %s %s size=%.4f", 
-				e.traderID, newPos.Symbol, newPos.Side, newPos.MarginMode, newPos.Size)
+			// 新增仓位 - 同时记录两个 key
+			e.changedPositions[fullKey] = newPos
+			e.changedPositions[baseKey] = newPos // 兼容旧逻辑
+			logger.Debugf("📊 [%s] 持仓变化检测 | 新增: %s %s %s size=%.4f (key=%s)", 
+				e.traderID, newPos.Symbol, newPos.Side, newPos.MarginMode, newPos.Size, fullKey)
 		} else if absFloat(newPos.Size-oldPos.Size) > 0.0001 {
-			// 仓位数量变化
-			e.changedPositions[baseKey] = newPos
-			logger.Debugf("📊 [%s] 持仓变化检测 | 变化: %s %s %s size: %.4f → %.4f", 
-				e.traderID, newPos.Symbol, newPos.Side, newPos.MarginMode, oldPos.Size, newPos.Size)
+			// 仓位数量变化 - 同时记录两个 key
+			e.changedPositions[fullKey] = newPos
+			e.changedPositions[baseKey] = newPos // 兼容旧逻辑
+			logger.Debugf("📊 [%s] 持仓变化检测 | 变化: %s %s %s size: %.4f → %.4f (key=%s)", 
+				e.traderID, newPos.Symbol, newPos.Side, newPos.MarginMode, oldPos.Size, newPos.Size, fullKey)
 		}
 	}
 	
@@ -956,10 +993,12 @@ func (e *Engine) detectPositionChanges(oldState, newState *AccountState) {
 	for key, oldPos := range oldPositions {
 		if _, exists := newState.Positions[key]; !exists {
 			baseKey := oldPos.Symbol + "_" + string(oldPos.Side)
+			fullKey := PositionKeyWithMode(oldPos.Symbol, oldPos.Side, oldPos.MarginMode)
 			// 仓位消失，记录最后的模式
+			e.changedPositions[fullKey] = oldPos
 			e.changedPositions[baseKey] = oldPos
-			logger.Debugf("📊 [%s] 持仓变化检测 | 清仓: %s %s %s", 
-				e.traderID, oldPos.Symbol, oldPos.Side, oldPos.MarginMode)
+			logger.Debugf("📊 [%s] 持仓变化检测 | 清仓: %s %s %s (key=%s)", 
+				e.traderID, oldPos.Symbol, oldPos.Side, oldPos.MarginMode, fullKey)
 		}
 	}
 }
