@@ -501,6 +501,11 @@ func (t *OKXTrader) SetMarginMode(symbol string, isCrossMargin bool) error {
 	t.symbolMgnModesMutex.Unlock()
 	logger.Debugf("  📝 缓存 %s 保证金模式: %s", symbol, mgnMode)
 
+	// 清除持仓缓存，确保下次查询时使用最新的 mgnMode
+	t.positionsCacheMutex.Lock()
+	t.cachedPositions = nil
+	t.positionsCacheMutex.Unlock()
+
 	body := map[string]interface{}{
 		"instId":  instId,
 		"mgnMode": mgnMode,
