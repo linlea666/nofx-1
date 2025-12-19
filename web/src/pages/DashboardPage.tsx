@@ -309,10 +309,17 @@ export function DashboardPage() {
   }, [summaryRaw])
 
   const monitor: SystemMonitor = useMemo(() => {
-    return monitorRaw || {
+    const defaults = {
       today_signals: 0, today_executed: 0, today_skipped: 0, today_failed: 0,
       execution_rate: 0, rate_limit_errors: 0, network_errors: 0, auth_errors: 0, other_errors: 0,
-      health_score: 100, alerts: [], updated_at: ''
+      health_score: 100, alerts: [] as RiskAlert[], updated_at: ''
+    }
+    if (!monitorRaw) return defaults
+    // 深度合并，确保 alerts 不为 null
+    return {
+      ...defaults,
+      ...monitorRaw,
+      alerts: monitorRaw.alerts || []
     }
   }, [monitorRaw])
 
