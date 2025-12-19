@@ -304,9 +304,11 @@ func (t *OKXTrader) GetPositions() ([]map[string]interface{}, error) {
 	// Check cache
 	t.positionsCacheMutex.RLock()
 	if t.cachedPositions != nil && time.Since(t.positionsCacheTime) < t.cacheDuration {
+		// 确保缓存数据中的 mgnMode 不为空（可能在缓存时 OKX API 返回了空值）
+		result := t.ensureMgnModeInPositions(t.cachedPositions)
 		t.positionsCacheMutex.RUnlock()
 		logger.Infof("✓ Using cached OKX positions")
-		return t.cachedPositions, nil
+		return result, nil
 	}
 	t.positionsCacheMutex.RUnlock()
 
@@ -329,6 +331,7 @@ func (t *OKXTrader) GetPositions() ([]map[string]interface{}, error) {
 		MgnMode string `json:"mgnMode"` // "cross" | "isolated" 保证金模式
 		CTime   string `json:"cTime"`   // Position created time (ms)
 		UTime   string `json:"uTime"`   // Position last update time (ms)
+		PosId   string `json:"posId"`   // 仓位唯一标识
 	}
 
 	if err := json.Unmarshal(data, &positions); err != nil {
@@ -377,17 +380,28 @@ func (t *OKXTrader) GetPositions() ([]map[string]interface{}, error) {
 		// 保证金模式：优先使用 API 返回值，其次使用缓存，最后默认 cross
 		mgnMode := pos.MgnMode
 		if mgnMode == "" {
-			// 尝试从 SetMarginMode 时的缓存获取
+			// 尝试从缓存获取（优先级：symbol_side_pending > symbol > 默认 cross）
 			t.symbolMgnModesMutex.RLock()
-			if cached, ok := t.symbolMgnModes[symbol]; ok {
+			pendingKey := symbol + "_" + side + "_pending"
+			if cached, ok := t.symbolMgnModes[pendingKey]; ok {
 				mgnMode = cached
-				logger.Debugf("  📝 OKX position %s %s mgnMode 使用缓存值: %s", symbol, side, mgnMode)
+				logger.Debugf("  📝 OKX position %s %s mgnMode 使用 pending 缓存: %s", symbol, side, mgnMode)
+			} else if cached, ok := t.symbolMgnModes[symbol]; ok {
+				mgnMode = cached
+				logger.Debugf("  📝 OKX position %s %s mgnMode 使用 symbol 缓存: %s", symbol, side, mgnMode)
 			} else {
 				mgnMode = "cross" // 默认全仓
 				logger.Debugf("  ⚠️ OKX position %s %s mgnMode 为空，使用默认值: cross", symbol, side)
 			}
 			t.symbolMgnModesMutex.RUnlock()
 		}
+
+		// 记录已确认的仓位 mgnMode（用 symbol_side_mgnMode 作为精确 key）
+		// 这样后续查询时可以精确获取每个仓位的 mgnMode
+		positionKey := symbol + "_" + side + "_" + mgnMode
+		t.symbolMgnModesMutex.Lock()
+		t.symbolMgnModes[positionKey] = mgnMode
+		t.symbolMgnModesMutex.Unlock()
 
 		posMap := map[string]interface{}{
 			"symbol":           symbol,
@@ -398,11 +412,12 @@ func (t *OKXTrader) GetPositions() ([]map[string]interface{}, error) {
 			"leverage":         leverage,
 			"liquidationPrice": liqPrice,
 			"side":             side,
-			"mgnMode":          mgnMode, // 保证金模式：cross/isolated
-			"createdTime":      cTime,   // Position open time (ms)
-			"updatedTime":      uTime,   // Position last update time (ms)
+			"mgnMode":          mgnMode,   // 保证金模式：cross/isolated
+			"createdTime":      cTime,     // Position open time (ms)
+			"updatedTime":      uTime,     // Position last update time (ms)
+			"posId":            pos.PosId, // 仓位唯一标识（OKX 独有）
 		}
-		logger.Debugf("  📊 OKX position: %s %s mgnMode=%s size=%.4f", symbol, side, mgnMode, posAmt)
+		logger.Debugf("  📊 OKX position: %s %s mgnMode=%s posId=%s size=%.4f", symbol, side, mgnMode, pos.PosId, posAmt)
 		result = append(result, posMap)
 	}
 
@@ -413,6 +428,60 @@ func (t *OKXTrader) GetPositions() ([]map[string]interface{}, error) {
 	t.positionsCacheMutex.Unlock()
 
 	return result, nil
+}
+
+// ensureMgnModeInPositions 确保持仓数据中的 mgnMode 不为空
+// 用于处理从缓存返回数据时，可能存在的空 mgnMode 情况
+func (t *OKXTrader) ensureMgnModeInPositions(positions []map[string]interface{}) []map[string]interface{} {
+	result := make([]map[string]interface{}, len(positions))
+	for i, pos := range positions {
+		// 复制 map（避免修改原缓存数据）
+		newPos := make(map[string]interface{})
+		for k, v := range pos {
+			newPos[k] = v
+		}
+
+		// 检查并修复空的 mgnMode
+		mgnMode, _ := newPos["mgnMode"].(string)
+		if mgnMode == "" {
+			symbol, _ := newPos["symbol"].(string)
+			side, _ := newPos["side"].(string)
+
+			// 尝试从缓存获取（优先级：已确认的 > pending > symbol > 默认 cross）
+			t.symbolMgnModesMutex.RLock()
+
+			// 1. 尝试已确认的仓位 mgnMode（symbol_side_cross 或 symbol_side_isolated）
+			crossKey := symbol + "_" + side + "_cross"
+			isolatedKey := symbol + "_" + side + "_isolated"
+			pendingKey := symbol + "_" + side + "_pending"
+
+			if _, ok := t.symbolMgnModes[isolatedKey]; ok {
+				mgnMode = "isolated"
+				logger.Debugf("  📝 修复缓存 %s %s mgnMode 使用已确认 key: isolated", symbol, side)
+			} else if _, ok := t.symbolMgnModes[crossKey]; ok {
+				mgnMode = "cross"
+				logger.Debugf("  📝 修复缓存 %s %s mgnMode 使用已确认 key: cross", symbol, side)
+			} else if cached, ok := t.symbolMgnModes[pendingKey]; ok {
+				// 2. 尝试 pending 缓存
+				mgnMode = cached
+				logger.Debugf("  📝 修复缓存 %s %s mgnMode 使用 pending: %s", symbol, side, mgnMode)
+			} else if cached, ok := t.symbolMgnModes[symbol]; ok {
+				// 3. 尝试 symbol 缓存
+				mgnMode = cached
+				logger.Debugf("  📝 修复缓存 %s %s mgnMode 使用 symbol: %s", symbol, side, mgnMode)
+			} else {
+				// 4. 默认 cross
+				mgnMode = "cross"
+				logger.Debugf("  ⚠️ 修复缓存 %s %s mgnMode 使用默认: cross", symbol, side)
+			}
+			t.symbolMgnModesMutex.RUnlock()
+
+			newPos["mgnMode"] = mgnMode
+		}
+
+		result[i] = newPos
+	}
+	return result
 }
 
 // getInstrument gets instrument info
@@ -495,11 +564,15 @@ func (t *OKXTrader) SetMarginMode(symbol string, isCrossMargin bool) error {
 	// OKX 开仓时 tdMode 参数会直接指定模式，不依赖账户全局设置
 	t.isCrossMargin = isCrossMargin
 
-	// 更新按 symbol 的 mgnMode 缓存（关键！用于 GetPositions 填充 mgnMode）
+	// 记录"待开仓"的 mgnMode（关键！用于开仓成功后填充仓位的 mgnMode）
+	// 使用 symbol 作为临时 key，开仓成功后会更新为 symbol_side_mgnMode
 	t.symbolMgnModesMutex.Lock()
 	t.symbolMgnModes[symbol] = mgnMode
+	// 同时记录 symbol_long 和 symbol_short 的 pending 模式（因为不知道具体开哪个方向）
+	t.symbolMgnModes[symbol+"_long_pending"] = mgnMode
+	t.symbolMgnModes[symbol+"_short_pending"] = mgnMode
 	t.symbolMgnModesMutex.Unlock()
-	logger.Debugf("  📝 缓存 %s 保证金模式: %s", symbol, mgnMode)
+	logger.Debugf("  📝 缓存 %s 待开仓保证金模式: %s", symbol, mgnMode)
 
 	// 清除持仓缓存，确保下次查询时使用最新的 mgnMode
 	t.positionsCacheMutex.Lock()

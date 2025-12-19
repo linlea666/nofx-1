@@ -420,6 +420,9 @@ func (ti *TraderIntegration) getPositionsFunc() func() map[string]*Position {
 			// 保证金模式: OKX 特有，用于区分全仓/逐仓
 			marginMode := getStringField(pos, "marginMode", "mgnMode")
 
+			// 仓位唯一标识: OKX 特有，用于精确匹配仓位
+			posId := getStringField(pos, "posId")
+
 			if quantity == 0 {
 				continue
 			}
@@ -429,12 +432,18 @@ func (ti *TraderIntegration) getPositionsFunc() func() map[string]*Position {
 				side = SideShort
 			}
 
-			// OKX: 使用带保证金模式的 Key（区分全仓/逐仓）
-			key := PositionKeyWithMode(symbol, side, marginMode)
+			// 关键改进：使用 posId 作为 key（如果有），否则回退到 mgnMode key
+			// posId 是 OKX 为每个仓位生成的唯一标识，100% 准确
+			var key string
+			if posId != "" {
+				key = posId // 使用 posId 作为 key（推荐）
+			} else {
+				key = PositionKeyWithMode(symbol, side, marginMode) // 回退兼容
+			}
 
 			// 调试日志：显示每个持仓的详细信息
-			logger.Debugf("📊 [%s] 持仓解析: %s | side=%s → %s | mgnMode=%s | 数量=%.4f 杠杆=%d",
-				ti.traderID, symbol, sideStr, side, marginMode, quantity, leverage)
+			logger.Debugf("📊 [%s] 持仓解析: %s | side=%s → %s | mgnMode=%s | posId=%s | 数量=%.4f 杠杆=%d",
+				ti.traderID, symbol, sideStr, side, marginMode, posId, quantity, leverage)
 
 			positions[key] = &Position{
 				Symbol:        symbol,
@@ -446,6 +455,7 @@ func (ti *TraderIntegration) getPositionsFunc() func() map[string]*Position {
 				MarginMode:    marginMode,
 				UnrealizedPnL: unrealizedPnl,
 				PositionValue: absFloat(quantity) * markPrice,
+				PosID:         posId,
 			}
 		}
 

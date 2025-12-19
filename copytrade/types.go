@@ -60,6 +60,7 @@ type Position struct {
 	MarginMode    string   // "cross" | "isolated"
 	UnrealizedPnL float64
 	PositionValue float64 // 仓位价值
+	PosID         string   // OKX 仓位唯一标识（用于精确匹配）
 }
 
 // AccountState 账户状态
@@ -79,6 +80,7 @@ type TradeSignal struct {
 	// 领航员账户快照（用于比例计算）
 	LeaderEquity   float64   // 领航员总权益
 	LeaderPosition *Position // 该币种的持仓（如有）
+	LeaderPosID    string    // 领航员仓位 ID（OKX 独有，用于精确匹配）
 }
 
 // CopyConfig 跟单配置

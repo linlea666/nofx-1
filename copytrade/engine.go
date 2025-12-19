@@ -314,20 +314,25 @@ func (e *Engine) buildSignal(fill *Fill) *TradeSignal {
 	if e.leaderState != nil {
 		signal.LeaderEquity = e.leaderState.TotalEquity
 
-		// 使用"变化量差分"精确匹配仓位（核心改进）
-		// 原理：收集所有 symbol+side 匹配的变化仓位，用变化量（deltaSize）匹配 fill.Size
+		// 使用"变化量差分"精确匹配仓位
+		// 优先使用 posId（100% 准确），回退到变化量匹配
 		signal.LeaderPosition = e.findBestMatchPosition(fill)
+
+		// 附加领航员仓位 ID（用于跟随者端精确匹配）
+		if signal.LeaderPosition != nil && signal.LeaderPosition.PosID != "" {
+			signal.LeaderPosID = signal.LeaderPosition.PosID
+		}
 	}
 
 	return signal
 }
 
-// findBestMatchPosition 使用变化量差分精确匹配仓位
-// 核心逻辑：
-//  1. 收集所有 symbol+side 匹配的变化仓位（候选）
-//  2. 如果只有一个候选，直接使用
-//  3. 如果有多个候选（如 cross 和 isolated），计算每个的 deltaSize
-//  4. 选择 deltaSize 最接近 fill.Size 的仓位
+// findBestMatchPosition 精确匹配领航员仓位
+// 核心改进：优先使用 posId（100% 准确），回退到变化量匹配
+// 匹配优先级：
+//  1. posId 直接匹配（OKX 独有，最精确）
+//  2. symbol+side 唯一候选
+//  3. 变化量（deltaSize）最接近 fill.Size 的候选
 func (e *Engine) findBestMatchPosition(fill *Fill) *Position {
 	// 获取旧持仓（用于计算变化量）
 	oldPositions := make(map[string]*Position)
@@ -335,24 +340,14 @@ func (e *Engine) findBestMatchPosition(fill *Fill) *Position {
 		oldPositions = e.prevLeaderState.Positions
 	}
 
-	// 1. 收集所有 symbol+side 匹配的变化仓位
+	// 1. 收集所有 symbol+side 匹配的变化仓位（去重）
 	var candidates []*Position
-	candidateKeys := make(map[*Position]string) // 用于日志
+	seen := make(map[*Position]bool)
 
-	for key, pos := range e.changedPositions {
-		if pos.Symbol == fill.Symbol && pos.Side == fill.PositionSide {
-			// 避免重复（fullKey 和 baseKey 可能指向同一个 Position）
-			isDuplicate := false
-			for _, existing := range candidates {
-				if existing == pos {
-					isDuplicate = true
-					break
-				}
-			}
-			if !isDuplicate {
-				candidates = append(candidates, pos)
-				candidateKeys[pos] = key
-			}
+	for _, pos := range e.changedPositions {
+		if pos.Symbol == fill.Symbol && pos.Side == fill.PositionSide && !seen[pos] {
+			seen[pos] = true
+			candidates = append(candidates, pos)
 		}
 	}
 
@@ -361,8 +356,8 @@ func (e *Engine) findBestMatchPosition(fill *Fill) *Position {
 		// 没有变化追踪，回退到当前持仓查找（兼容单仓位场景）
 		for _, pos := range e.leaderState.Positions {
 			if pos.Symbol == fill.Symbol && pos.Side == fill.PositionSide {
-				logger.Debugf("📊 [%s] 回退使用当前持仓 | %s %s mgnMode=%s",
-					e.traderID, fill.Symbol, fill.PositionSide, pos.MarginMode)
+				logger.Debugf("📊 [%s] 回退使用当前持仓 | %s %s mgnMode=%s posId=%s",
+					e.traderID, fill.Symbol, fill.PositionSide, pos.MarginMode, pos.PosID)
 				return pos
 			}
 		}
@@ -372,8 +367,8 @@ func (e *Engine) findBestMatchPosition(fill *Fill) *Position {
 	if len(candidates) == 1 {
 		// 只有一个候选，直接使用
 		pos := candidates[0]
-		logger.Debugf("📊 [%s] 使用唯一变化仓位 | %s %s mgnMode=%s",
-			e.traderID, fill.Symbol, fill.PositionSide, pos.MarginMode)
+		logger.Debugf("📊 [%s] 使用唯一变化仓位 | %s %s mgnMode=%s posId=%s",
+			e.traderID, fill.Symbol, fill.PositionSide, pos.MarginMode, pos.PosID)
 		return pos
 	}
 
@@ -385,9 +380,15 @@ func (e *Engine) findBestMatchPosition(fill *Fill) *Position {
 		e.traderID, fill.Symbol, fill.PositionSide, len(candidates), fill.Size)
 
 	for _, pos := range candidates {
-		// 计算变化量 deltaSize = newSize - oldSize
-		fullKey := PositionKeyWithMode(pos.Symbol, pos.Side, pos.MarginMode)
-		oldPos := oldPositions[fullKey]
+		// 计算变化量：优先用 posId 查找旧仓位，回退到 mgnMode key
+		var oldPos *Position
+		if pos.PosID != "" {
+			oldPos = oldPositions[pos.PosID]
+		}
+		if oldPos == nil {
+			fullKey := PositionKeyWithMode(pos.Symbol, pos.Side, pos.MarginMode)
+			oldPos = oldPositions[fullKey]
+		}
 
 		var deltaSize float64
 		if oldPos == nil {
@@ -401,13 +402,12 @@ func (e *Engine) findBestMatchPosition(fill *Fill) *Position {
 		// 计算与 fill.Size 的差距（取绝对值，因为减仓时 deltaSize 为负）
 		diff := absFloat(absFloat(deltaSize) - fill.Size)
 
-		logger.Debugf("  - 候选: mgnMode=%s | oldSize=%.4f newSize=%.4f delta=%.4f | diff=%.4f",
-			pos.MarginMode, func() float64 {
-				if oldPos != nil {
-					return oldPos.Size
-				}
-				return 0
-			}(), pos.Size, deltaSize, diff)
+		oldSize := float64(0)
+		if oldPos != nil {
+			oldSize = oldPos.Size
+		}
+		logger.Debugf("  - 候选: mgnMode=%s posId=%s | oldSize=%.4f newSize=%.4f delta=%.4f | diff=%.4f",
+			pos.MarginMode, pos.PosID, oldSize, pos.Size, deltaSize, diff)
 
 		if diff < minDiff {
 			minDiff = diff
@@ -416,8 +416,8 @@ func (e *Engine) findBestMatchPosition(fill *Fill) *Position {
 	}
 
 	if bestMatch != nil {
-		logger.Infof("📊 [%s] 变化量匹配成功 | %s %s mgnMode=%s | 最小差距=%.4f",
-			e.traderID, fill.Symbol, fill.PositionSide, bestMatch.MarginMode, minDiff)
+		logger.Infof("📊 [%s] 变化量匹配成功 | %s %s mgnMode=%s posId=%s | 最小差距=%.4f",
+			e.traderID, fill.Symbol, fill.PositionSide, bestMatch.MarginMode, bestMatch.PosID, minDiff)
 	}
 
 	return bestMatch
@@ -522,9 +522,9 @@ func (e *Engine) shouldFollowSignal(signal *TradeSignal) (follow bool, reason st
 		leaderMgnMode = signal.LeaderPosition.MarginMode
 	}
 
-	// 使用带保证金模式的 Key
-	key := PositionKeyWithMode(fill.Symbol, fill.PositionSide, leaderMgnMode)
-	localPosition := localPositions[key]
+	// 查找本地仓位：localPositions 的 key 可能是 posId 或 mgnMode key
+	// 需要遍历查找 symbol+side+mgnMode 匹配的仓位
+	localPosition := e.findLocalPosition(localPositions, fill.Symbol, fill.PositionSide, leaderMgnMode)
 	hasLocalPosition := localPosition != nil && localPosition.Size > 0
 
 	switch fill.Action {
@@ -591,22 +591,22 @@ func (e *Engine) determineAction(signal *TradeSignal) ActionType {
 			leaderMgnMode = signal.LeaderPosition.MarginMode
 		}
 
-		// 使用带保证金模式的 Key（OKX: 区分全仓/逐仓独立仓位）
-		key := PositionKeyWithMode(fill.Symbol, fill.PositionSide, leaderMgnMode)
-
 		// 🔍 调试日志：显示本地所有持仓
-		logger.Infof("📊 [%s] 本地持仓检查 | 信号: %s %s mgnMode=%s | 查找 key=%s",
-			e.traderID, fill.Symbol, fill.PositionSide, leaderMgnMode, key)
+		logger.Infof("📊 [%s] 本地持仓检查 | 信号: %s %s mgnMode=%s posId=%s",
+			e.traderID, fill.Symbol, fill.PositionSide, leaderMgnMode, signal.LeaderPosID)
 		for k, v := range localPositions {
-			logger.Infof("   - 持仓: %s | 方向=%s 模式=%s 数量=%.4f", k, v.Side, v.MarginMode, v.Size)
+			logger.Infof("   - 持仓: %s | 方向=%s 模式=%s posId=%s 数量=%.4f", k, v.Side, v.MarginMode, v.PosID, v.Size)
 		}
 
-		localPosition := localPositions[key]
+		// 查找本地仓位：localPositions 的 key 可能是 posId 或 mgnMode key
+		// 需要遍历查找 symbol+side+mgnMode 匹配的仓位
+		localPosition := e.findLocalPosition(localPositions, fill.Symbol, fill.PositionSide, leaderMgnMode)
 		hasLocalPosition := localPosition != nil && localPosition.Size > 0
 
 		if hasLocalPosition {
 			// 本地已有仓位 → 加仓
-			logger.Infof("📊 [%s] %s %s %s → 加仓 | 本地已有仓位 %.4f", e.traderID, fill.Symbol, fill.PositionSide, leaderMgnMode, localPosition.Size)
+			logger.Infof("📊 [%s] %s %s %s → 加仓 | 本地已有仓位 %.4f (posId=%s)",
+				e.traderID, fill.Symbol, fill.PositionSide, leaderMgnMode, localPosition.Size, localPosition.PosID)
 			return ActionAdd
 		}
 		// 本地无仓位 → 新开仓
@@ -1002,8 +1002,8 @@ func (e *Engine) syncLeaderState() error {
 }
 
 // detectPositionChanges 对比新旧持仓，找出变化的仓位
-// 核心逻辑：通过持仓数量变化来确定哪个仓位（全仓/逐仓）发生了操作
-// 关键改进：同时存储 fullKey（带 mgnMode）和 baseKey（不带），避免不同模式仓位互相覆盖
+// 核心改进：使用 posId 作为唯一标识（OKX 独有），100% 准确区分不同仓位
+// 同时保留 baseKey (symbol_side) 兼容旧逻辑和非 OKX 场景
 func (e *Engine) detectPositionChanges(oldState, newState *AccountState) {
 	if e.changedPositions == nil {
 		e.changedPositions = make(map[string]*Position)
@@ -1020,40 +1020,46 @@ func (e *Engine) detectPositionChanges(oldState, newState *AccountState) {
 	}
 
 	// 遍历新持仓，对比变化
+	// 注意：newState.Positions 的 key 已经是 posId（如果有）或 mgnMode key
 	for key, newPos := range newState.Positions {
 		oldPos := oldPositions[key]
 
-		// 两种 key：
-		// - fullKey: symbol_side_mgnMode（精确匹配，区分全仓/逐仓）
-		// - baseKey: symbol_side（兼容旧逻辑，单仓位场景）
-		fullKey := PositionKeyWithMode(newPos.Symbol, newPos.Side, newPos.MarginMode)
+		// 三种 key（优先级从高到低）：
+		// 1. posId: OKX 仓位唯一标识（最精确，100% 准确）
+		// 2. fullKey: symbol_side_mgnMode（区分全仓/逐仓）
+		// 3. baseKey: symbol_side（兼容旧逻辑）
 		baseKey := newPos.Symbol + "_" + string(newPos.Side)
 
 		if oldPos == nil {
-			// 新增仓位：同时存储 fullKey 和 baseKey
-			e.changedPositions[fullKey] = newPos
-			e.changedPositions[baseKey] = newPos
-			logger.Debugf("📊 [%s] 持仓变化检测 | 新增: %s %s mgnMode=%s size=%.4f (key=%s)",
-				e.traderID, newPos.Symbol, newPos.Side, newPos.MarginMode, newPos.Size, fullKey)
+			// 新增仓位：存储所有 key 以便匹配
+			if newPos.PosID != "" {
+				e.changedPositions[newPos.PosID] = newPos // posId key（最精确）
+			}
+			e.changedPositions[baseKey] = newPos // baseKey（兼容）
+			logger.Debugf("📊 [%s] 持仓变化检测 | 新增: %s %s mgnMode=%s posId=%s size=%.4f",
+				e.traderID, newPos.Symbol, newPos.Side, newPos.MarginMode, newPos.PosID, newPos.Size)
 		} else if absFloat(newPos.Size-oldPos.Size) > 0.0001 {
-			// 仓位数量变化：同时存储 fullKey 和 baseKey
-			e.changedPositions[fullKey] = newPos
+			// 仓位数量变化
+			if newPos.PosID != "" {
+				e.changedPositions[newPos.PosID] = newPos
+			}
 			e.changedPositions[baseKey] = newPos
-			logger.Debugf("📊 [%s] 持仓变化检测 | 变化: %s %s mgnMode=%s size: %.4f → %.4f delta=%.4f (key=%s)",
-				e.traderID, newPos.Symbol, newPos.Side, newPos.MarginMode, oldPos.Size, newPos.Size, newPos.Size-oldPos.Size, fullKey)
+			logger.Debugf("📊 [%s] 持仓变化检测 | 变化: %s %s mgnMode=%s posId=%s size: %.4f → %.4f delta=%.4f",
+				e.traderID, newPos.Symbol, newPos.Side, newPos.MarginMode, newPos.PosID, oldPos.Size, newPos.Size, newPos.Size-oldPos.Size)
 		}
 	}
 
 	// 检测平仓（旧有新无）
 	for key, oldPos := range oldPositions {
 		if _, exists := newState.Positions[key]; !exists {
-			fullKey := PositionKeyWithMode(oldPos.Symbol, oldPos.Side, oldPos.MarginMode)
 			baseKey := oldPos.Symbol + "_" + string(oldPos.Side)
-			// 仓位消失，记录最后的模式（同时存储 fullKey 和 baseKey）
-			e.changedPositions[fullKey] = oldPos
+			// 仓位消失，记录最后的状态
+			if oldPos.PosID != "" {
+				e.changedPositions[oldPos.PosID] = oldPos
+			}
 			e.changedPositions[baseKey] = oldPos
-			logger.Debugf("📊 [%s] 持仓变化检测 | 清仓: %s %s mgnMode=%s (key=%s)",
-				e.traderID, oldPos.Symbol, oldPos.Side, oldPos.MarginMode, fullKey)
+			logger.Debugf("📊 [%s] 持仓变化检测 | 清仓: %s %s mgnMode=%s posId=%s",
+				e.traderID, oldPos.Symbol, oldPos.Side, oldPos.MarginMode, oldPos.PosID)
 		}
 	}
 }
@@ -1118,4 +1124,30 @@ func (e *Engine) logWarning(w Warning) {
 	e.warningsMu.Unlock()
 
 	logger.Warnf("⚠️ [%s] 预警:%s | %s | %s", e.traderID, w.Type, w.Symbol, w.Message)
+}
+
+// findLocalPosition 在本地仓位中查找匹配的仓位
+// 核心逻辑：localPositions 的 key 可能是 posId（OKX）或 mgnMode key
+// 需要遍历查找 symbol+side+mgnMode 匹配的仓位
+func (e *Engine) findLocalPosition(localPositions map[string]*Position, symbol string, side SideType, mgnMode string) *Position {
+	// 优先尝试直接 key 匹配（快速路径）
+	key := PositionKeyWithMode(symbol, side, mgnMode)
+	if pos, ok := localPositions[key]; ok {
+		return pos
+	}
+
+	// 直接 key 未找到，遍历查找 symbol+side+mgnMode 匹配的仓位
+	// 这是因为 localPositions 的 key 可能是 posId 而不是 mgnMode key
+	for _, pos := range localPositions {
+		if pos.Symbol == symbol && pos.Side == side {
+			// 如果指定了 mgnMode，需要精确匹配
+			if mgnMode != "" && pos.MarginMode != mgnMode {
+				continue
+			}
+			// 如果未指定 mgnMode 或 mgnMode 匹配，返回该仓位
+			return pos
+		}
+	}
+
+	return nil
 }

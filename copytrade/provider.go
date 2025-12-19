@@ -348,15 +348,23 @@ func (p *OKXProvider) GetAccountState(uniqueName string) (*AccountState, error) 
 		}
 	}
 
-	// 解析持仓 (OKX: 同一币种同一方向，全仓和逐仓是独立仓位)
+	// 解析持仓 (OKX: 使用 posId 作为唯一标识，精确区分每个仓位)
 	for _, pd := range posResp.Data {
 		for _, pos := range pd.PosData {
 			symbol := normalizeOKXSymbol(pos.InstId)
 			side := SideType(pos.PosSide)
 			mgnMode := pos.MgnMode // "cross" | "isolated"
+			posId := pos.PosId     // 仓位唯一标识
 
-			// 使用带保证金模式的 Key (区分全仓/逐仓)
-			key := PositionKeyWithMode(symbol, side, mgnMode)
+			// 关键改进：使用 posId 作为 key（如果有），否则回退到 mgnMode key
+			// posId 是 OKX 为每个仓位生成的唯一标识，100% 准确
+			var key string
+			if posId != "" {
+				key = posId // 使用 posId 作为 key（推荐）
+			} else {
+				key = PositionKeyWithMode(symbol, side, mgnMode) // 回退兼容
+			}
+
 			state.Positions[key] = &Position{
 				Symbol:        symbol,
 				Side:          side,
@@ -367,6 +375,7 @@ func (p *OKXProvider) GetAccountState(uniqueName string) (*AccountState, error) 
 				MarginMode:    mgnMode,
 				UnrealizedPnL: parseFloat(pos.Upl),
 				PositionValue: parseFloat(pos.NotionalUsd),
+				PosID:         posId,
 			}
 		}
 	}
@@ -517,6 +526,7 @@ type OKXPosition struct {
 	Pos         string `json:"pos"`
 	PosSide     string `json:"posSide"`
 	Upl         string `json:"upl"`
+	PosId       string `json:"posId"` // 仓位唯一标识
 }
 
 // ============================================================================
