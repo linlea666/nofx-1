@@ -865,8 +865,8 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 
 	// [CODE ENFORCED] Check max positions limit (跟单模式跳过，领航员已通过风控)
 	if !isCopyTrade {
-	if err := at.enforceMaxPositions(len(positions)); err != nil {
-		return err
+		if err := at.enforceMaxPositions(len(positions)); err != nil {
+			return err
 		}
 	}
 
@@ -944,8 +944,8 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 
 	// [CODE ENFORCED] Minimum position size check (跟单模式跳过，领航员已通过风控)
 	if !isCopyTrade {
-	if err := at.enforceMinPositionSize(decision.PositionSizeUSD); err != nil {
-		return err
+		if err := at.enforceMinPositionSize(decision.PositionSizeUSD); err != nil {
+			return err
 		}
 	} else {
 		logger.Infof("  📊 跟单模式，跳过最小仓位检查")
@@ -1015,8 +1015,8 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 
 	// [CODE ENFORCED] Check max positions limit (跟单模式跳过，领航员已通过风控)
 	if !isCopyTrade {
-	if err := at.enforceMaxPositions(len(positions)); err != nil {
-		return err
+		if err := at.enforceMaxPositions(len(positions)); err != nil {
+			return err
 		}
 	}
 
@@ -1094,8 +1094,8 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 
 	// [CODE ENFORCED] Minimum position size check (跟单模式跳过，领航员已通过风控)
 	if !isCopyTrade {
-	if err := at.enforceMinPositionSize(decision.PositionSizeUSD); err != nil {
-		return err
+		if err := at.enforceMinPositionSize(decision.PositionSizeUSD); err != nil {
+			return err
 		}
 	} else {
 		logger.Infof("  📊 跟单模式，跳过最小仓位检查")
@@ -1208,7 +1208,7 @@ func (at *AutoTrader) executeCloseLongWithRecord(decision *decision.Decision, ac
 	if closeQuantity > 0 {
 		logger.Infof("  ✓ Position partially closed: %.4f (%.0f%%)", closeQuantity, decision.CloseRatio*100)
 	} else {
-	logger.Infof("  ✓ Position closed successfully")
+		logger.Infof("  ✓ Position closed successfully")
 	}
 	return nil
 }
@@ -1281,7 +1281,7 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *decision.Decision, a
 	if closeQuantity > 0 {
 		logger.Infof("  ✓ Position partially closed: %.4f (%.0f%%)", closeQuantity, decision.CloseRatio*100)
 	} else {
-	logger.Infof("  ✓ Position closed successfully")
+		logger.Infof("  ✓ Position closed successfully")
 	}
 	return nil
 }
