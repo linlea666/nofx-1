@@ -90,6 +90,9 @@ func (ti *TraderIntegration) StartCopyTrading() error {
 		return fmt.Errorf("failed to create copy trade engine: %w", err)
 	}
 
+	// 设置数据库存储（用于仓位映射）
+	engine.SetStore(ti.store)
+
 	ti.engine = engine
 
 	// 启动引擎
@@ -192,6 +195,9 @@ func (ti *TraderIntegration) executeFullDecision(fullDec *decision.FullDecision)
 				ti.traderID, dec.Action, dec.Symbol, duration)
 			executionLogs = append(executionLogs, fmt.Sprintf("✅ %s %s 成功 (耗时 %dms)", dec.Action, dec.Symbol, duration))
 			ti.saveSignalLog(dec, "executed", "")
+
+			// 执行成功后更新仓位映射
+			ti.updatePositionMapping(dec)
 		}
 
 		decisionActions = append(decisionActions, action)
@@ -360,6 +366,71 @@ func (ti *TraderIntegration) saveSignalLog(dec *decision.Decision, status, error
 
 	if err := ti.store.CopyTrade().SaveSignalLog(log); err != nil {
 		logger.Warnf("⚠️ [%s] 保存信号日志失败: %v", ti.traderID, err)
+	}
+}
+
+// updatePositionMapping 更新仓位映射（执行成功后调用）
+// 根据 action 类型执行不同操作：
+//   - open_long/open_short: 保存新映射
+//   - add: 增加加仓次数
+//   - reduce: 增加减仓次数
+//   - close_long/close_short: 关闭映射
+func (ti *TraderIntegration) updatePositionMapping(dec *decision.Decision) {
+	// 无 posId 时跳过（Hyperliquid 或其他场景）
+	if dec.LeaderPosID == "" {
+		return
+	}
+
+	copyTradeStore := ti.store.CopyTrade()
+
+	// 从 action 推断操作类型
+	switch dec.Action {
+	case "open_long", "open_short":
+		// 新开仓：保存映射
+		side := "long"
+		if dec.Action == "open_short" {
+			side = "short"
+		}
+
+		mapping := &store.CopyTradePositionMapping{
+			TraderID:    ti.traderID,
+			LeaderPosID: dec.LeaderPosID,
+			LeaderID:    ti.engine.config.LeaderID,
+			Symbol:      dec.Symbol,
+			Side:        side,
+			MarginMode:  dec.MarginMode,
+			OpenedAt:    time.Now(),
+			OpenPrice:   dec.EntryPrice,
+			OpenSizeUSD: dec.PositionSizeUSD,
+		}
+
+		if err := copyTradeStore.SavePositionMapping(mapping); err != nil {
+			logger.Warnf("⚠️ [%s] 保存仓位映射失败: %v", ti.traderID, err)
+		} else {
+			logger.Infof("📝 [%s] 仓位映射已保存 | posId=%s %s %s %s",
+				ti.traderID, dec.LeaderPosID, dec.Symbol, side, dec.MarginMode)
+		}
+
+	case "add_long", "add_short":
+		// 加仓：增加加仓次数
+		if err := copyTradeStore.IncrementAddCount(ti.traderID, dec.LeaderPosID); err != nil {
+			logger.Warnf("⚠️ [%s] 更新加仓次数失败: %v", ti.traderID, err)
+		}
+
+	case "reduce_long", "reduce_short":
+		// 减仓：增加减仓次数
+		if err := copyTradeStore.IncrementReduceCount(ti.traderID, dec.LeaderPosID); err != nil {
+			logger.Warnf("⚠️ [%s] 更新减仓次数失败: %v", ti.traderID, err)
+		}
+
+	case "close_long", "close_short":
+		// 平仓：关闭映射
+		if err := copyTradeStore.CloseMapping(ti.traderID, dec.LeaderPosID, dec.EntryPrice); err != nil {
+			logger.Warnf("⚠️ [%s] 关闭仓位映射失败: %v", ti.traderID, err)
+		} else {
+			logger.Infof("📝 [%s] 仓位映射已关闭 | posId=%s %s",
+				ti.traderID, dec.LeaderPosID, dec.Symbol)
+		}
 	}
 }
 

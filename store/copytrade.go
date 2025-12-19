@@ -323,6 +323,223 @@ func (s *CopyTradeStore) GetRecentSignalLogs(traderID string, limit int) ([]*Cop
 }
 
 // ============================================================================
+// 仓位映射（跟单仓位生命周期管理）
+// ============================================================================
+
+// CopyTradePositionMapping 仓位映射记录
+// 一条映射 = 一笔跟单仓位的完整生命周期（开仓 → 平仓）
+// 用于精确匹配领航员仓位与跟随者仓位，解决同币种多仓位（cross/isolated）的识别问题
+type CopyTradePositionMapping struct {
+	ID          int64  `json:"id"`
+	TraderID    string `json:"trader_id"`     // 跟随者 trader ID（多账户隔离）
+	LeaderPosID string `json:"leader_pos_id"` // 领航员仓位 ID = 本地标识（OKX posId）
+	LeaderID    string `json:"leader_id"`     // 领航员 ID
+	Symbol      string `json:"symbol"`        // LINKUSDT
+	Side        string `json:"side"`          // long | short
+	MarginMode  string `json:"margin_mode"`   // cross | isolated
+	Status      string `json:"status"`        // active | closed
+
+	// 开仓信息
+	OpenedAt    time.Time `json:"opened_at"`     // 跟单开仓时间
+	OpenPrice   float64   `json:"open_price"`    // 领航员开仓价格
+	OpenSizeUSD float64   `json:"open_size_usd"` // 跟单开仓金额
+
+	// 平仓信息（平仓时填充）
+	ClosedAt   *time.Time `json:"closed_at"`   // 平仓时间
+	ClosePrice float64    `json:"close_price"` // 平仓价格
+
+	// 累计统计（加仓/减仓时更新）
+	AddCount    int       `json:"add_count"`    // 累计加仓次数
+	ReduceCount int       `json:"reduce_count"` // 累计减仓次数
+	UpdatedAt   time.Time `json:"updated_at"`   // 最后更新时间
+}
+
+// initPositionMappingTable 初始化仓位映射表
+func (s *CopyTradeStore) initPositionMappingTable() error {
+	_, err := s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS copy_trade_position_mappings (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			trader_id TEXT NOT NULL,
+			leader_pos_id TEXT NOT NULL,
+			leader_id TEXT NOT NULL,
+			symbol TEXT NOT NULL,
+			side TEXT NOT NULL,
+			margin_mode TEXT NOT NULL,
+			status TEXT DEFAULT 'active',
+			
+			opened_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			open_price REAL DEFAULT 0,
+			open_size_usd REAL DEFAULT 0,
+			
+			closed_at DATETIME,
+			close_price REAL DEFAULT 0,
+			
+			add_count INTEGER DEFAULT 0,
+			reduce_count INTEGER DEFAULT 0,
+			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			
+			UNIQUE(trader_id, leader_pos_id)
+		)
+	`)
+	if err != nil {
+		return err
+	}
+
+	// 创建索引
+	s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_mapping_trader_status ON copy_trade_position_mappings(trader_id, status)`)
+	s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_mapping_trader_symbol ON copy_trade_position_mappings(trader_id, symbol, side, status)`)
+
+	return nil
+}
+
+// SavePositionMapping 保存仓位映射（开仓时调用）
+func (s *CopyTradeStore) SavePositionMapping(mapping *CopyTradePositionMapping) error {
+	_, err := s.db.Exec(`
+		INSERT INTO copy_trade_position_mappings 
+			(trader_id, leader_pos_id, leader_id, symbol, side, margin_mode, status,
+			 opened_at, open_price, open_size_usd, add_count, reduce_count, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, 0, 0, CURRENT_TIMESTAMP)
+		ON CONFLICT(trader_id, leader_pos_id) DO UPDATE SET
+			updated_at = CURRENT_TIMESTAMP
+	`, mapping.TraderID, mapping.LeaderPosID, mapping.LeaderID, mapping.Symbol,
+		mapping.Side, mapping.MarginMode, mapping.OpenedAt, mapping.OpenPrice, mapping.OpenSizeUSD)
+	return err
+}
+
+// GetActiveMapping 查询活跃的仓位映射（判断开仓/加仓时调用）
+func (s *CopyTradeStore) GetActiveMapping(traderID, leaderPosID string) (*CopyTradePositionMapping, error) {
+	var mapping CopyTradePositionMapping
+	var openedAt, updatedAt string
+	var closedAt sql.NullString
+
+	err := s.db.QueryRow(`
+		SELECT id, trader_id, leader_pos_id, leader_id, symbol, side, margin_mode, status,
+		       opened_at, open_price, open_size_usd, closed_at, close_price,
+		       add_count, reduce_count, updated_at
+		FROM copy_trade_position_mappings
+		WHERE trader_id = ? AND leader_pos_id = ? AND status = 'active'
+	`, traderID, leaderPosID).Scan(
+		&mapping.ID, &mapping.TraderID, &mapping.LeaderPosID, &mapping.LeaderID,
+		&mapping.Symbol, &mapping.Side, &mapping.MarginMode, &mapping.Status,
+		&openedAt, &mapping.OpenPrice, &mapping.OpenSizeUSD, &closedAt, &mapping.ClosePrice,
+		&mapping.AddCount, &mapping.ReduceCount, &updatedAt,
+	)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil // 无映射，返回 nil
+		}
+		return nil, err
+	}
+
+	mapping.OpenedAt, _ = time.Parse("2006-01-02 15:04:05", openedAt)
+	mapping.UpdatedAt, _ = time.Parse("2006-01-02 15:04:05", updatedAt)
+	if closedAt.Valid {
+		t, _ := time.Parse("2006-01-02 15:04:05", closedAt.String)
+		mapping.ClosedAt = &t
+	}
+
+	return &mapping, nil
+}
+
+// IncrementAddCount 增加加仓次数（加仓时调用）
+func (s *CopyTradeStore) IncrementAddCount(traderID, leaderPosID string) error {
+	_, err := s.db.Exec(`
+		UPDATE copy_trade_position_mappings 
+		SET add_count = add_count + 1, updated_at = CURRENT_TIMESTAMP
+		WHERE trader_id = ? AND leader_pos_id = ? AND status = 'active'
+	`, traderID, leaderPosID)
+	return err
+}
+
+// IncrementReduceCount 增加减仓次数（减仓时调用）
+func (s *CopyTradeStore) IncrementReduceCount(traderID, leaderPosID string) error {
+	_, err := s.db.Exec(`
+		UPDATE copy_trade_position_mappings 
+		SET reduce_count = reduce_count + 1, updated_at = CURRENT_TIMESTAMP
+		WHERE trader_id = ? AND leader_pos_id = ? AND status = 'active'
+	`, traderID, leaderPosID)
+	return err
+}
+
+// CloseMapping 关闭仓位映射（平仓时调用）
+func (s *CopyTradeStore) CloseMapping(traderID, leaderPosID string, closePrice float64) error {
+	_, err := s.db.Exec(`
+		UPDATE copy_trade_position_mappings 
+		SET status = 'closed', closed_at = CURRENT_TIMESTAMP, close_price = ?, updated_at = CURRENT_TIMESTAMP
+		WHERE trader_id = ? AND leader_pos_id = ? AND status = 'active'
+	`, closePrice, traderID, leaderPosID)
+	return err
+}
+
+// ListActiveMappings 列出某 trader 所有活跃映射（调试/展示）
+func (s *CopyTradeStore) ListActiveMappings(traderID string) ([]*CopyTradePositionMapping, error) {
+	return s.listMappings(traderID, "active", 0)
+}
+
+// ListAllMappings 列出某 trader 所有映射（含历史）
+func (s *CopyTradeStore) ListAllMappings(traderID string, limit int) ([]*CopyTradePositionMapping, error) {
+	return s.listMappings(traderID, "", limit)
+}
+
+// listMappings 内部方法：查询映射列表
+func (s *CopyTradeStore) listMappings(traderID, status string, limit int) ([]*CopyTradePositionMapping, error) {
+	query := `
+		SELECT id, trader_id, leader_pos_id, leader_id, symbol, side, margin_mode, status,
+		       opened_at, open_price, open_size_usd, closed_at, close_price,
+		       add_count, reduce_count, updated_at
+		FROM copy_trade_position_mappings
+		WHERE trader_id = ?
+	`
+	args := []interface{}{traderID}
+
+	if status != "" {
+		query += " AND status = ?"
+		args = append(args, status)
+	}
+
+	query += " ORDER BY opened_at DESC"
+
+	if limit > 0 {
+		query += " LIMIT ?"
+		args = append(args, limit)
+	}
+
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var mappings []*CopyTradePositionMapping
+	for rows.Next() {
+		var mapping CopyTradePositionMapping
+		var openedAt, updatedAt string
+		var closedAt sql.NullString
+
+		err := rows.Scan(
+			&mapping.ID, &mapping.TraderID, &mapping.LeaderPosID, &mapping.LeaderID,
+			&mapping.Symbol, &mapping.Side, &mapping.MarginMode, &mapping.Status,
+			&openedAt, &mapping.OpenPrice, &mapping.OpenSizeUSD, &closedAt, &mapping.ClosePrice,
+			&mapping.AddCount, &mapping.ReduceCount, &updatedAt,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		mapping.OpenedAt, _ = time.Parse("2006-01-02 15:04:05", openedAt)
+		mapping.UpdatedAt, _ = time.Parse("2006-01-02 15:04:05", updatedAt)
+		if closedAt.Valid {
+			t, _ := time.Parse("2006-01-02 15:04:05", closedAt.String)
+			mapping.ClosedAt = &t
+		}
+
+		mappings = append(mappings, &mapping)
+	}
+
+	return mappings, nil
+}
+
+// ============================================================================
 // 辅助函数
 // ============================================================================
 

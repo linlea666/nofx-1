@@ -147,6 +147,9 @@ type Decision struct {
 
 	// 价格信息（用于跟单记录入场价）
 	EntryPrice float64 `json:"entry_price,omitempty"` // 入场价格（跟单时记录领航员成交价）
+
+	// 跟单专用字段
+	LeaderPosID string `json:"leader_pos_id,omitempty"` // 领航员仓位 ID（用于映射追踪）
 }
 
 // FullDecision AI's complete decision (including chain of thought)

@@ -150,6 +150,9 @@ func (s *Store) initTables() error {
 	if err := s.CopyTrade().initSignalLogTable(); err != nil {
 		return fmt.Errorf("failed to initialize copy trade signal log table: %w", err)
 	}
+	if err := s.CopyTrade().initPositionMappingTable(); err != nil {
+		return fmt.Errorf("failed to initialize copy trade position mapping table: %w", err)
+	}
 	return nil
 }
 

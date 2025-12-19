@@ -9,6 +9,7 @@ import (
 
 	"nofx/decision"
 	"nofx/logger"
+	"nofx/store"
 )
 
 // Engine 跟单引擎
@@ -24,6 +25,9 @@ type Engine struct {
 	// 跟随者账户信息（由外部注入）
 	getFollowerBalance   func() float64
 	getFollowerPositions func() map[string]*Position
+
+	// 数据库存储（用于仓位映射）
+	store *store.Store
 
 	// 去重（使用时间戳过期）
 	seenFills map[string]time.Time
@@ -127,6 +131,11 @@ func (e *Engine) GetDecisionChannel() <-chan *decision.FullDecision {
 // GetStats 获取统计信息
 func (e *Engine) GetStats() *EngineStats {
 	return e.stats
+}
+
+// SetStore 设置数据库存储（用于仓位映射）
+func (e *Engine) SetStore(st *store.Store) {
+	e.store = st
 }
 
 // Start 启动引擎
@@ -572,53 +581,68 @@ func (e *Engine) shouldFollowSignal(signal *TradeSignal) (follow bool, reason st
 	}
 }
 
-// determineAction 判断实际动作类型（减仓 vs 平仓）
-// 核心逻辑：通过领航员当前持仓状态判断
-//   - 领航员仓位清零 → 平仓（全平我们的仓位）
-//   - 领航员仓位还有 → 减仓（按比例减我们的仓位）
+// determineAction 判断实际动作类型
+// 核心逻辑：
+//   - 开仓/加仓：通过数据库映射判断（posId 精确匹配）
+//   - 减仓/平仓：通过领航员持仓状态判断
 func (e *Engine) determineAction(signal *TradeSignal) ActionType {
 	fill := signal.Fill
 
-	// 开仓/加仓：需要检查本地是否有仓位来判断是新开仓还是加仓
+	// ============================================================
+	// 开仓/加仓判断：优先使用数据库映射（posId 精确匹配）
+	// ============================================================
 	if fill.Action == ActionOpen || fill.Action == ActionAdd {
-		// 检查本地是否已有仓位
-		localPositions := e.getFollowerPositions()
-
-		// 获取领航员的保证金模式（用于 OKX 区分全仓/逐仓）
-		// 关键：只有在 SyncMarginMode=true 时才区分模式，否则统一用默认 key
+		// 获取领航员的保证金模式
 		leaderMgnMode := ""
 		if e.config.SyncMarginMode && signal.LeaderPosition != nil {
 			leaderMgnMode = signal.LeaderPosition.MarginMode
 		}
 
-		// 🔍 调试日志：显示本地所有持仓
+		// 🔍 调试日志
 		logger.Infof("📊 [%s] 本地持仓检查 | 信号: %s %s mgnMode=%s posId=%s",
 			e.traderID, fill.Symbol, fill.PositionSide, leaderMgnMode, signal.LeaderPosID)
+
+		// ====== 优先使用数据库映射判断（精确匹配） ======
+		if signal.LeaderPosID != "" && e.store != nil {
+			mapping, err := e.store.CopyTrade().GetActiveMapping(e.traderID, signal.LeaderPosID)
+			if err != nil {
+				logger.Warnf("⚠️ [%s] 查询仓位映射失败: %v，回退到内存匹配", e.traderID, err)
+			} else if mapping != nil {
+				// 数据库有映射 → 加仓
+				logger.Infof("📊 [%s] %s %s %s → 加仓 | 数据库映射存在 (posId=%s)",
+					e.traderID, fill.Symbol, fill.PositionSide, leaderMgnMode, signal.LeaderPosID)
+				return ActionAdd
+			} else {
+				// 数据库无映射 → 新开仓
+				logger.Infof("📊 [%s] %s %s %s → 新开仓 | 数据库无映射 (posId=%s)",
+					e.traderID, fill.Symbol, fill.PositionSide, leaderMgnMode, signal.LeaderPosID)
+				return ActionOpen
+			}
+		}
+
+		// ====== 回退逻辑：无 posId 或无数据库时，使用内存匹配 ======
+		// 主要用于 Hyperliquid 或降级场景
+		localPositions := e.getFollowerPositions()
 		for k, v := range localPositions {
 			logger.Infof("   - 持仓: %s | 方向=%s 模式=%s posId=%s 数量=%.4f", k, v.Side, v.MarginMode, v.PosID, v.Size)
 		}
 
-		// 查找本地仓位：localPositions 的 key 可能是 posId 或 mgnMode key
-		// 需要遍历查找 symbol+side+mgnMode 匹配的仓位
 		localPosition := e.findLocalPosition(localPositions, fill.Symbol, fill.PositionSide, leaderMgnMode)
 		hasLocalPosition := localPosition != nil && localPosition.Size > 0
 
 		if hasLocalPosition {
-			// 本地已有仓位 → 加仓
-			logger.Infof("📊 [%s] %s %s %s → 加仓 | 本地已有仓位 %.4f (posId=%s)",
-				e.traderID, fill.Symbol, fill.PositionSide, leaderMgnMode, localPosition.Size, localPosition.PosID)
+			logger.Infof("📊 [%s] %s %s %s → 加仓 | 本地已有仓位 %.4f (内存匹配)",
+				e.traderID, fill.Symbol, fill.PositionSide, leaderMgnMode, localPosition.Size)
 			return ActionAdd
 		}
-		// 本地无仓位 → 新开仓
-		logger.Infof("📊 [%s] %s %s %s → 新开仓 | 本地无此方向+模式持仓", e.traderID, fill.Symbol, fill.PositionSide, leaderMgnMode)
+		logger.Infof("📊 [%s] %s %s %s → 新开仓 | 本地无此方向+模式持仓 (内存匹配)",
+			e.traderID, fill.Symbol, fill.PositionSide, leaderMgnMode)
 		return ActionOpen
 	}
 
 	// ============================================================
 	// 减仓 vs 平仓判断：通过领航员实时持仓状态
-	// 这和"只跟新开仓"原则一致：都是通过持仓状态对比来决策
 	// ============================================================
-
 	if signal.LeaderPosition == nil {
 		logger.Infof("📊 [%s] %s → 平仓 | 原因: 领航员持仓数据为空（可能已清仓）", e.traderID, fill.Symbol)
 		return ActionClose
@@ -750,10 +774,11 @@ func (e *Engine) buildDecision(signal *TradeSignal, action ActionType, copySize 
 	fill := signal.Fill
 
 	dec := decision.Decision{
-		Symbol:     fill.Symbol,
-		Action:     e.mapAction(action, fill.PositionSide),
-		Reasoning:  fmt.Sprintf("Copy trading: %s following %s leader %s", action, e.config.ProviderType, e.config.LeaderID),
-		EntryPrice: fill.Price, // 记录领航员成交价格，用于前端显示
+		Symbol:      fill.Symbol,
+		Action:      e.mapAction(action, fill.PositionSide),
+		Reasoning:   fmt.Sprintf("Copy trading: %s following %s leader %s", action, e.config.ProviderType, e.config.LeaderID),
+		EntryPrice:  fill.Price,         // 记录领航员成交价格，用于前端显示
+		LeaderPosID: signal.LeaderPosID, // 领航员仓位 ID，用于映射追踪
 	}
 
 	// ============================================================

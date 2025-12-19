@@ -143,3 +143,9 @@ func OppositeSide(side SideType) SideType {
 	return SideLong
 }
 
+// GenerateHLPosID 为 Hyperliquid 生成虚拟 posId
+// 因为 HL 同一币种只能有一个方向的仓位，用 leaderID+symbol+side 组合作为唯一标识
+func GenerateHLPosID(leaderID, symbol string, side SideType) string {
+	return "hl_" + leaderID + "_" + symbol + "_" + string(side)
+}
+
