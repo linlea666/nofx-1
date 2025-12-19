@@ -3,11 +3,72 @@ package api
 import (
 	"database/sql"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"nofx/logger"
 )
+
+// ========== 缓存结构 ==========
+
+// dashboardCache 大屏数据缓存
+type dashboardCache struct {
+	sync.RWMutex
+	summary        *DashboardSummary
+	summaryTime    time.Time
+	traders        []TraderDashboardStats
+	tradersTime    time.Time
+	cacheDuration  time.Duration
+}
+
+// 全局缓存实例
+var dbCache = &dashboardCache{
+	cacheDuration: 30 * time.Second, // 30秒缓存
+}
+
+// isCacheValid 检查缓存是否有效
+func (c *dashboardCache) isSummaryValid() bool {
+	c.RLock()
+	defer c.RUnlock()
+	return c.summary != nil && time.Since(c.summaryTime) < c.cacheDuration
+}
+
+func (c *dashboardCache) isTradersValid() bool {
+	c.RLock()
+	defer c.RUnlock()
+	return c.traders != nil && time.Since(c.tradersTime) < c.cacheDuration
+}
+
+// getSummary 获取缓存的汇总数据
+func (c *dashboardCache) getSummary() *DashboardSummary {
+	c.RLock()
+	defer c.RUnlock()
+	return c.summary
+}
+
+// setSummary 设置汇总缓存
+func (c *dashboardCache) setSummary(s *DashboardSummary) {
+	c.Lock()
+	defer c.Unlock()
+	c.summary = s
+	c.summaryTime = time.Now()
+}
+
+// getTraders 获取缓存的交易员数据
+func (c *dashboardCache) getTraders() []TraderDashboardStats {
+	c.RLock()
+	defer c.RUnlock()
+	return c.traders
+}
+
+// setTraders 设置交易员缓存
+func (c *dashboardCache) setTraders(t []TraderDashboardStats) {
+	c.Lock()
+	defer c.Unlock()
+	c.traders = t
+	c.tradersTime = time.Now()
+}
 
 // ========== 数据结构 ==========
 
@@ -183,13 +244,26 @@ func (s *Server) getTraderDashboardStats(traderID string) (*TraderDashboardStats
 	db := s.store.DB()
 	
 	// 获取交易员基本信息
-	var name, exchange, decisionMode sql.NullString
+	var name, exchange, decisionMode, aiModel sql.NullString
 	var initialBalance sql.NullFloat64
 	err := db.QueryRow(`
-		SELECT name, exchange, decision_mode, initial_balance FROM traders WHERE id = ?
-	`, traderID).Scan(&name, &exchange, &decisionMode, &initialBalance)
+		SELECT name, exchange, decision_mode, initial_balance, ai_model FROM traders WHERE id = ?
+	`, traderID).Scan(&name, &exchange, &decisionMode, &initialBalance, &aiModel)
 	if err == nil {
-		stats.TraderName = name.String
+		// 优先使用 name，如果为空则尝试构建友好名称
+		if name.String != "" {
+			stats.TraderName = name.String
+		} else {
+			// 尝试用 ai_model + exchange 构建名称，如 "DEEPSEEK + HYPERLIQUID"
+			if aiModel.String != "" && exchange.String != "" {
+				stats.TraderName = aiModel.String + " + " + exchange.String
+			} else if len(traderID) >= 8 {
+				// 最后使用 trader_id 前8位
+				stats.TraderName = traderID[:8]
+			} else {
+				stats.TraderName = traderID
+			}
+		}
 		stats.Exchange = exchange.String
 		stats.Mode = decisionMode.String
 		if stats.Mode == "" {
@@ -413,8 +487,16 @@ func (s *Server) getPnLTrend(traderID string, days int) ([]PnLTrendPoint, error)
 
 // ========== API Handler ==========
 
-// handleDashboardSummary 处理全局汇总请求
+// handleDashboardSummary 处理全局汇总请求（带缓存）
 func (s *Server) handleDashboardSummary(c *gin.Context) {
+	// 检查缓存
+	if dbCache.isSummaryValid() {
+		logger.Debugf("📊 Dashboard: 使用缓存的汇总数据")
+		c.JSON(http.StatusOK, dbCache.getSummary())
+		return
+	}
+	
+	// 缓存失效，重新查询
 	summary, err := s.getDashboardSummary()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -422,11 +504,24 @@ func (s *Server) handleDashboardSummary(c *gin.Context) {
 		})
 		return
 	}
+	
+	// 更新缓存
+	dbCache.setSummary(summary)
+	logger.Debugf("📊 Dashboard: 更新汇总数据缓存")
+	
 	c.JSON(http.StatusOK, summary)
 }
 
-// handleDashboardTraders 处理交易员列表统计请求
+// handleDashboardTraders 处理交易员列表统计请求（带缓存）
 func (s *Server) handleDashboardTraders(c *gin.Context) {
+	// 检查缓存
+	if dbCache.isTradersValid() {
+		logger.Debugf("📊 Dashboard: 使用缓存的交易员数据")
+		c.JSON(http.StatusOK, dbCache.getTraders())
+		return
+	}
+	
+	// 缓存失效，重新查询
 	traders, err := s.getAllTradersDashboardStats()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -434,6 +529,11 @@ func (s *Server) handleDashboardTraders(c *gin.Context) {
 		})
 		return
 	}
+	
+	// 更新缓存
+	dbCache.setTraders(traders)
+	logger.Debugf("📊 Dashboard: 更新交易员数据缓存，共 %d 位", len(traders))
+	
 	c.JSON(http.StatusOK, traders)
 }
 
