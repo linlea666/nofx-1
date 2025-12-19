@@ -446,10 +446,11 @@ type CreateTraderRequest struct {
 
 // CopyConfigReq Copy trading configuration request
 type CopyConfigReq struct {
-	ProviderType string  `json:"provider_type"` // "hyperliquid" or "okx"
-	LeaderID     string  `json:"leader_id"`     // Leader wallet address or uniqueName
-	CopyRatio    float64 `json:"copy_ratio"`    // Copy ratio (1.0 = 100%)
-	SyncLeverage bool    `json:"sync_leverage"` // Whether to sync leverage
+	ProviderType   string  `json:"provider_type"`    // "hyperliquid" or "okx"
+	LeaderID       string  `json:"leader_id"`        // Leader wallet address or uniqueName
+	CopyRatio      float64 `json:"copy_ratio"`       // Copy ratio (1.0 = 100%)
+	SyncLeverage   bool    `json:"sync_leverage"`    // Whether to sync leverage
+	SyncMarginMode *bool   `json:"sync_margin_mode"` // Whether to sync margin mode (OKX: cross/isolated)
 }
 
 type ModelConfig struct {
@@ -741,13 +742,20 @@ func (s *Server) handleCreateTrader(c *gin.Context) {
 
 	// If copy_trade mode, create copy trade config
 	if decisionMode == "copy_trade" && req.CopyConfig != nil {
+		// SyncMarginMode 默认为 true（同步领航员的全仓/逐仓模式）
+		syncMarginMode := true
+		if req.CopyConfig.SyncMarginMode != nil {
+			syncMarginMode = *req.CopyConfig.SyncMarginMode
+		}
+
 		copyConfig := &store.CopyTradeConfig{
-			TraderID:     traderID,
-			ProviderType: req.CopyConfig.ProviderType,
-			LeaderID:     req.CopyConfig.LeaderID,
-			CopyRatio:    req.CopyConfig.CopyRatio,
-			SyncLeverage: req.CopyConfig.SyncLeverage,
-			Enabled:      false, // Not enabled until explicitly started
+			TraderID:       traderID,
+			ProviderType:   req.CopyConfig.ProviderType,
+			LeaderID:       req.CopyConfig.LeaderID,
+			CopyRatio:      req.CopyConfig.CopyRatio,
+			SyncLeverage:   req.CopyConfig.SyncLeverage,
+			SyncMarginMode: syncMarginMode,
+			Enabled:        false, // Not enabled until explicitly started
 		}
 
 		// Validate required fields
@@ -923,12 +931,19 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 
 		// If copy_trade mode, update copy trade config
 		if decisionMode == "copy_trade" && req.CopyConfig != nil {
+			// SyncMarginMode 默认为 true（同步领航员的全仓/逐仓模式）
+			syncMarginMode := true
+			if req.CopyConfig.SyncMarginMode != nil {
+				syncMarginMode = *req.CopyConfig.SyncMarginMode
+			}
+
 			copyConfig := &store.CopyTradeConfig{
-				TraderID:     traderID,
-				ProviderType: req.CopyConfig.ProviderType,
-				LeaderID:     req.CopyConfig.LeaderID,
-				CopyRatio:    req.CopyConfig.CopyRatio,
-				SyncLeverage: req.CopyConfig.SyncLeverage,
+				TraderID:       traderID,
+				ProviderType:   req.CopyConfig.ProviderType,
+				LeaderID:       req.CopyConfig.LeaderID,
+				CopyRatio:      req.CopyConfig.CopyRatio,
+				SyncLeverage:   req.CopyConfig.SyncLeverage,
+				SyncMarginMode: syncMarginMode,
 			}
 
 			// Default copy ratio to 1.0 (100%)
