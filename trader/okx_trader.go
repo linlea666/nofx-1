@@ -369,6 +369,13 @@ func (t *OKXTrader) GetPositions() ([]map[string]interface{}, error) {
 		cTime, _ := strconv.ParseInt(pos.CTime, 10, 64)
 		uTime, _ := strconv.ParseInt(pos.UTime, 10, 64)
 
+		// 保证金模式：如果 API 返回空，默认为 cross（OKX 默认全仓）
+		mgnMode := pos.MgnMode
+		if mgnMode == "" {
+			mgnMode = "cross"
+			logger.Debugf("  ⚠️ OKX position %s %s mgnMode is empty, defaulting to cross", symbol, side)
+		}
+
 		posMap := map[string]interface{}{
 			"symbol":           symbol,
 			"positionAmt":      posAmt,
@@ -378,10 +385,11 @@ func (t *OKXTrader) GetPositions() ([]map[string]interface{}, error) {
 			"leverage":         leverage,
 			"liquidationPrice": liqPrice,
 			"side":             side,
-			"mgnMode":          pos.MgnMode, // 保证金模式：cross/isolated
-			"createdTime":      cTime,       // Position open time (ms)
-			"updatedTime":      uTime,       // Position last update time (ms)
+			"mgnMode":          mgnMode, // 保证金模式：cross/isolated
+			"createdTime":      cTime,   // Position open time (ms)
+			"updatedTime":      uTime,   // Position last update time (ms)
 		}
+		logger.Debugf("  📊 OKX position: %s %s mgnMode=%s size=%.4f", symbol, side, mgnMode, posAmt)
 		result = append(result, posMap)
 	}
 
