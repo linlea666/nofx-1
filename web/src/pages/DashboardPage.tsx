@@ -268,10 +268,25 @@ export function DashboardPage() {
   const [selectedTrader, setSelectedTrader] = useState<TraderStats | null>(null)
   const [period, setPeriod] = useState<'today' | 'week' | 'month'>('today')
 
-  // 数据获取
-  const { data: tradersRaw, isLoading } = useSWR('dashboard-traders-v4', fetchDashboardTraders, { refreshInterval: 15000 })
-  const { data: summaryRaw } = useSWR('dashboard-summary-v4', fetchDashboardSummary, { refreshInterval: 15000 })
-  const { data: monitorRaw } = useSWR('dashboard-monitor-v4', fetchDashboardMonitor, { refreshInterval: 30000 })
+  // 数据获取（添加 error 处理）
+  const { data: tradersRaw, isLoading, error: tradersError, mutate: refreshTraders } = useSWR(
+    'dashboard-traders-v4', 
+    fetchDashboardTraders, 
+    { refreshInterval: 15000, revalidateOnFocus: false }
+  )
+  const { data: summaryRaw, error: summaryError } = useSWR(
+    'dashboard-summary-v4', 
+    fetchDashboardSummary, 
+    { refreshInterval: 15000, revalidateOnFocus: false }
+  )
+  const { data: monitorRaw, error: monitorError } = useSWR(
+    'dashboard-monitor-v4', 
+    fetchDashboardMonitor, 
+    { refreshInterval: 30000, revalidateOnFocus: false }
+  )
+  
+  // 综合错误状态
+  const hasError = tradersError || summaryError || monitorError
 
   useEffect(() => {
     const timer = setInterval(() => setCurrentTime(new Date()), 100)
@@ -328,6 +343,7 @@ export function DashboardPage() {
 
   const periodLabel = { today: '今日', week: '本周', month: '本月' }[period]
 
+  // 加载中状态
   if (isLoading && !tradersRaw) {
     return (
       <div className="fixed inset-0 bg-[#020617] z-[9999] flex flex-col items-center justify-center font-mono">
@@ -336,6 +352,27 @@ export function DashboardPage() {
         </div>
         <div className="text-[#00f2ff] text-xs tracking-[0.5em] animate-pulse">正在同步全球交易节点...</div>
         <style>{`@keyframes loading { 0% { left: -100%; width: 30% } 100% { left: 100%; width: 30% } }`}</style>
+      </div>
+    )
+  }
+
+  // 错误状态（API 请求失败）
+  if (hasError && !tradersRaw) {
+    return (
+      <div className="fixed inset-0 bg-[#020617] z-[9999] flex flex-col items-center justify-center font-mono">
+        <div className="text-[#ff0055] mb-4">
+          <AlertTriangle size={48} />
+        </div>
+        <div className="text-[#ff0055] text-lg font-bold mb-2">数据加载失败</div>
+        <div className="text-white/40 text-sm mb-6 max-w-md text-center">
+          {tradersError?.message || summaryError?.message || monitorError?.message || '无法连接到服务器'}
+        </div>
+        <button
+          onClick={() => refreshTraders()}
+          className="px-6 py-2 bg-[#00f2ff]/20 border border-[#00f2ff]/40 text-[#00f2ff] hover:bg-[#00f2ff]/30 transition-colors rounded"
+        >
+          重新加载
+        </button>
       </div>
     )
   }
