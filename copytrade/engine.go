@@ -32,9 +32,13 @@ type Engine struct {
 
 	// 状态缓存
 	leaderState       *AccountState
+	prevLeaderState   *AccountState // 上一次状态（用于对比变化）
 	leaderStateMu     sync.RWMutex
 	lastStateSync     time.Time
 	stateSyncInterval time.Duration
+	
+	// 持仓变化追踪（用于 OKX 区分全仓/逐仓）
+	changedPositions map[string]*Position // symbol_side -> 最近变化的仓位
 
 	// 决策输出
 	decisionCh chan *decision.FullDecision
@@ -311,34 +315,22 @@ func (e *Engine) buildSignal(fill *Fill) *TradeSignal {
 		signal.LeaderEquity = e.leaderState.TotalEquity
 
 		// 附加该币种的持仓信息
-		// OKX 特殊处理：同一币种同一方向可能有多个仓位（全仓+逐仓）
-		// 由于成交记录不包含 mgnMode，需要智能匹配
-		var candidates []*Position
-		for _, pos := range e.leaderState.Positions {
-			if pos.Symbol == fill.Symbol && pos.Side == fill.PositionSide {
-				candidates = append(candidates, pos)
-			}
-		}
-
-		if len(candidates) == 1 {
-			// 只有一个仓位，直接使用
-			signal.LeaderPosition = candidates[0]
-		} else if len(candidates) > 1 {
-			// 多个仓位（全仓+逐仓同时存在）
-			// 策略：选择仓位价值最接近本次交易价值的（假设是最近操作的）
-			// 或者选择仓位数量最接近本次交易数量的
-			bestMatch := candidates[0]
-			bestDiff := absFloat(candidates[0].Size - fill.Size)
-			for _, pos := range candidates[1:] {
-				diff := absFloat(pos.Size - fill.Size)
-				if diff < bestDiff {
-					bestDiff = diff
-					bestMatch = pos
+		// 优先级：1.变化追踪的仓位 2.当前持仓查找
+		baseKey := fill.Symbol + "_" + string(fill.PositionSide)
+		
+		// 1. 优先使用变化追踪的仓位（最精确）
+		if changedPos, ok := e.changedPositions[baseKey]; ok {
+			signal.LeaderPosition = changedPos
+			logger.Debugf("📊 [%s] 使用变化追踪的仓位 | %s %s mgnMode=%s", 
+				e.traderID, fill.Symbol, fill.PositionSide, changedPos.MarginMode)
+		} else {
+			// 2. 回退：从当前持仓中查找（兼容单仓位场景）
+			for _, pos := range e.leaderState.Positions {
+				if pos.Symbol == fill.Symbol && pos.Side == fill.PositionSide {
+					signal.LeaderPosition = pos
+					break
 				}
 			}
-			signal.LeaderPosition = bestMatch
-			logger.Infof("📊 [%s] 多仓位匹配 | %s %s | 选择 mgnMode=%s (size=%.4f, 交易=%.4f)",
-				e.traderID, fill.Symbol, fill.PositionSide, bestMatch.MarginMode, bestMatch.Size, fill.Size)
 		}
 	}
 
@@ -883,6 +875,11 @@ func (e *Engine) syncLeaderState() error {
 	}
 
 	e.leaderStateMu.Lock()
+	// 对比新旧持仓，找出变化的仓位（用于 OKX 区分全仓/逐仓）
+	e.detectPositionChanges(e.leaderState, state)
+	
+	// 保存历史状态
+	e.prevLeaderState = e.leaderState
 	e.leaderState = state
 	e.lastStateSync = time.Now()
 	e.leaderStateMu.Unlock()
@@ -891,6 +888,55 @@ func (e *Engine) syncLeaderState() error {
 		e.traderID, state.TotalEquity, len(state.Positions))
 
 	return nil
+}
+
+// detectPositionChanges 对比新旧持仓，找出变化的仓位
+// 核心逻辑：通过持仓数量变化来确定哪个仓位（全仓/逐仓）发生了操作
+func (e *Engine) detectPositionChanges(oldState, newState *AccountState) {
+	if e.changedPositions == nil {
+		e.changedPositions = make(map[string]*Position)
+	}
+	
+	if newState == nil || newState.Positions == nil {
+		return
+	}
+	
+	// 获取旧持仓 map
+	oldPositions := make(map[string]*Position)
+	if oldState != nil && oldState.Positions != nil {
+		oldPositions = oldState.Positions
+	}
+	
+	// 遍历新持仓，对比变化
+	for key, newPos := range newState.Positions {
+		oldPos := oldPositions[key]
+		
+		// 基础 key（不含 mgnMode）用于快速查找
+		baseKey := newPos.Symbol + "_" + string(newPos.Side)
+		
+		if oldPos == nil {
+			// 新增仓位
+			e.changedPositions[baseKey] = newPos
+			logger.Debugf("📊 [%s] 持仓变化检测 | 新增: %s %s %s size=%.4f", 
+				e.traderID, newPos.Symbol, newPos.Side, newPos.MarginMode, newPos.Size)
+		} else if absFloat(newPos.Size-oldPos.Size) > 0.0001 {
+			// 仓位数量变化
+			e.changedPositions[baseKey] = newPos
+			logger.Debugf("📊 [%s] 持仓变化检测 | 变化: %s %s %s size: %.4f → %.4f", 
+				e.traderID, newPos.Symbol, newPos.Side, newPos.MarginMode, oldPos.Size, newPos.Size)
+		}
+	}
+	
+	// 检测平仓（旧有新无）
+	for key, oldPos := range oldPositions {
+		if _, exists := newState.Positions[key]; !exists {
+			baseKey := oldPos.Symbol + "_" + string(oldPos.Side)
+			// 仓位消失，记录最后的模式
+			e.changedPositions[baseKey] = oldPos
+			logger.Debugf("📊 [%s] 持仓变化检测 | 清仓: %s %s %s", 
+				e.traderID, oldPos.Symbol, oldPos.Side, oldPos.MarginMode)
+		}
+	}
 }
 
 func (e *Engine) initSeenFills() {
