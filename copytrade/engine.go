@@ -349,6 +349,11 @@ func (e *Engine) processSignal(signal *TradeSignal) {
 	// - Close: 获取准确的剩余仓位（判断减仓 vs 平仓）
 	needSync := fill.Action == ActionClose || fill.Action == ActionOpen || fill.Action == ActionAdd
 	if needSync {
+		// 清空变化追踪缓存，确保使用最新数据
+		e.leaderStateMu.Lock()
+		e.changedPositions = make(map[string]*Position)
+		e.leaderStateMu.Unlock()
+
 		if err := e.syncLeaderState(); err != nil {
 			logger.Warnf("⚠️ [%s] %s 操作前状态同步失败: %v", e.traderID, fill.Action, err)
 		} else {
