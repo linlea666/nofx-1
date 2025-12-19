@@ -523,8 +523,8 @@ func getIntOrFloatField(m map[string]interface{}, key string) int {
 // ============================================================================
 
 var (
-	integrations   = make(map[string]*TraderIntegration)
-	integrationsMu = &struct{}{}
+	// integrations 存储所有跟单集成实例（注：目前只在启动时使用，无并发问题）
+	integrations = make(map[string]*TraderIntegration)
 )
 
 // StartCopyTradingForTrader 为指定 trader 启动跟单

@@ -432,8 +432,8 @@ func (e *Engine) processSignal(signal *TradeSignal) {
 
 	// 🔄 强制同步领航员状态
 	// - Open/Add: 获取最新持仓信息（OKX 需要区分全仓/逐仓）
-	// - Close: 获取准确的剩余仓位（判断减仓 vs 平仓）
-	needSync := fill.Action == ActionClose || fill.Action == ActionOpen || fill.Action == ActionAdd
+	// - Close/Reduce: 获取准确的剩余仓位（判断减仓 vs 平仓，计算减仓比例）
+	needSync := fill.Action == ActionClose || fill.Action == ActionOpen || fill.Action == ActionAdd || fill.Action == ActionReduce
 	if needSync {
 		// 清空变化追踪缓存，确保使用最新数据
 		e.leaderStateMu.Lock()
@@ -801,7 +801,6 @@ func (e *Engine) buildDecision(signal *TradeSignal, action ActionType, copySize 
 
 // getLeaderLeverage 获取领航员杠杆
 // 优先级：1.信号中的持仓杠杆 2.变化追踪的仓位 3.缓存的持仓 4.默认值(10x)
-// 优化：使用缓存数据，避免重复 API 调用
 func (e *Engine) getLeaderLeverage(signal *TradeSignal) int {
 	// 1. 如果不同步杠杆，返回默认值
 	if !e.config.SyncLeverage {
@@ -813,35 +812,35 @@ func (e *Engine) getLeaderLeverage(signal *TradeSignal) int {
 		return signal.LeaderPosition.Leverage
 	}
 
-	// 3. 从变化追踪的仓位获取（最近操作的仓位）
-	baseKey := signal.Fill.Symbol + "_" + string(signal.Fill.PositionSide)
+	// 3. 从缓存查找（使用 defer 确保锁平衡）
 	e.leaderStateMu.RLock()
-	if changedPos, ok := e.changedPositions[baseKey]; ok && changedPos.Leverage > 0 {
-		e.leaderStateMu.RUnlock()
-		logger.Infof("🔍 [%s] 从变化追踪获取领航员 %s 杠杆: %dx", e.traderID, signal.Fill.Symbol, changedPos.Leverage)
-		return changedPos.Leverage
+	defer e.leaderStateMu.RUnlock()
+
+	// 从变化追踪的仓位获取
+	for _, pos := range e.changedPositions {
+		if pos.Symbol == signal.Fill.Symbol && pos.Side == signal.Fill.PositionSide && pos.Leverage > 0 {
+			logger.Infof("🔍 [%s] 从变化追踪获取领航员 %s 杠杆: %dx", e.traderID, signal.Fill.Symbol, pos.Leverage)
+			return pos.Leverage
+		}
 	}
 
-	// 4. 从缓存的领航员状态获取（避免重复 API 调用）
+	// 从缓存的领航员状态获取
 	if e.leaderState != nil && e.leaderState.Positions != nil {
 		for _, pos := range e.leaderState.Positions {
 			if pos.Symbol == signal.Fill.Symbol && pos.Side == signal.Fill.PositionSide && pos.Leverage > 0 {
-				e.leaderStateMu.RUnlock()
 				logger.Infof("🔍 [%s] 从缓存获取领航员 %s 杠杆: %dx", e.traderID, signal.Fill.Symbol, pos.Leverage)
 				return pos.Leverage
 			}
 		}
 	}
-	e.leaderStateMu.RUnlock()
 
-	// 5. 默认值
+	// 4. 默认值
 	logger.Warnf("⚠️ [%s] 无法获取领航员杠杆，使用默认值 10x", e.traderID)
 	return 10
 }
 
 // getLeaderMarginMode 获取领航员保证金模式
 // 优先级：1.信号中的持仓模式 2.变化追踪的仓位 3.缓存的持仓 4.默认值(cross)
-// 优化：使用缓存数据，避免重复 API 调用
 func (e *Engine) getLeaderMarginMode(signal *TradeSignal) string {
 	// 1. 如果不同步保证金模式，返回默认值
 	if !e.config.SyncMarginMode {
@@ -854,28 +853,29 @@ func (e *Engine) getLeaderMarginMode(signal *TradeSignal) string {
 		return signal.LeaderPosition.MarginMode
 	}
 
-	// 3. 从变化追踪的仓位获取（最近操作的仓位，最精确）
-	baseKey := signal.Fill.Symbol + "_" + string(signal.Fill.PositionSide)
+	// 3. 从缓存查找（使用 defer 确保锁平衡）
 	e.leaderStateMu.RLock()
-	if changedPos, ok := e.changedPositions[baseKey]; ok && changedPos.MarginMode != "" {
-		e.leaderStateMu.RUnlock()
-		logger.Infof("🔍 [%s] 从变化追踪获取领航员 %s 保证金模式: %s", e.traderID, signal.Fill.Symbol, changedPos.MarginMode)
-		return changedPos.MarginMode
+	defer e.leaderStateMu.RUnlock()
+
+	// 从变化追踪的仓位获取
+	for _, pos := range e.changedPositions {
+		if pos.Symbol == signal.Fill.Symbol && pos.Side == signal.Fill.PositionSide && pos.MarginMode != "" {
+			logger.Infof("🔍 [%s] 从变化追踪获取领航员 %s 保证金模式: %s", e.traderID, signal.Fill.Symbol, pos.MarginMode)
+			return pos.MarginMode
+		}
 	}
 
-	// 4. 从缓存的领航员状态获取（避免重复 API 调用）
+	// 从缓存的领航员状态获取
 	if e.leaderState != nil && e.leaderState.Positions != nil {
 		for _, pos := range e.leaderState.Positions {
 			if pos.Symbol == signal.Fill.Symbol && pos.Side == signal.Fill.PositionSide && pos.MarginMode != "" {
-				e.leaderStateMu.RUnlock()
 				logger.Infof("🔍 [%s] 从缓存获取领航员 %s 保证金模式: %s", e.traderID, signal.Fill.Symbol, pos.MarginMode)
 				return pos.MarginMode
 			}
 		}
 	}
-	e.leaderStateMu.RUnlock()
 
-	// 5. 默认值
+	// 4. 默认值
 	logger.Warnf("⚠️ [%s] 无法获取领航员保证金模式，使用默认值 cross", e.traderID)
 	return "cross"
 }
@@ -1005,9 +1005,8 @@ func (e *Engine) syncLeaderState() error {
 // 核心逻辑：使用 posId 作为唯一标识（OKX 独有），100% 准确区分不同仓位
 // 非 OKX 场景（无 posId）使用原始 key
 func (e *Engine) detectPositionChanges(oldState, newState *AccountState) {
-	if e.changedPositions == nil {
-		e.changedPositions = make(map[string]*Position)
-	}
+	// 每次检测前清空旧的变化记录，避免内存泄漏
+	e.changedPositions = make(map[string]*Position)
 
 	if newState == nil || newState.Positions == nil {
 		return
