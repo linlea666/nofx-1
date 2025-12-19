@@ -461,6 +461,7 @@ func (t *OKXTrader) getInstrument(symbol string) (*OKXInstrument, error) {
 }
 
 // SetMarginMode sets margin mode
+// OKX 特性：开仓时通过 tdMode 参数直接指定模式，所以这里主要是更新缓存
 func (t *OKXTrader) SetMarginMode(symbol string, isCrossMargin bool) error {
 	instId := t.convertSymbol(symbol)
 
@@ -468,6 +469,10 @@ func (t *OKXTrader) SetMarginMode(symbol string, isCrossMargin bool) error {
 	if isCrossMargin {
 		mgnMode = "cross"
 	}
+
+	// 先更新缓存（关键！确保后续 OpenLong/OpenShort 使用正确的 tdMode）
+	// OKX 开仓时 tdMode 参数会直接指定模式，不依赖账户全局设置
+	t.isCrossMargin = isCrossMargin
 
 	body := map[string]interface{}{
 		"instId":  instId,
@@ -479,8 +484,6 @@ func (t *OKXTrader) SetMarginMode(symbol string, isCrossMargin bool) error {
 		// Ignore error if already in target mode
 		if strings.Contains(err.Error(), "already") {
 			logger.Infof("  ✓ %s margin mode is already %s", symbol, mgnMode)
-			// 即使已经是目标模式，也更新缓存
-			t.isCrossMargin = isCrossMargin
 			return nil
 		}
 		// Cannot change when there are positions
@@ -488,11 +491,11 @@ func (t *OKXTrader) SetMarginMode(symbol string, isCrossMargin bool) error {
 			logger.Infof("  ⚠️ %s has positions, cannot change margin mode", symbol)
 			return nil
 		}
-		return err
+		// API 调用失败也不返回错误，因为开仓时 tdMode 会直接指定模式
+		logger.Infof("  ⚠️ SetMarginMode API failed: %v (will use tdMode=%s in order)", err, mgnMode)
+		return nil
 	}
 
-	// 更新缓存的 margin mode，供后续 setLeverageForSide 和开仓使用
-	t.isCrossMargin = isCrossMargin
 	logger.Infof("  ✓ %s margin mode set to %s", symbol, mgnMode)
 	return nil
 }
