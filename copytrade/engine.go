@@ -515,8 +515,8 @@ func (e *Engine) matchOpenAddSignal(signal *TradeSignal, leaderPosMap map[string
 	}
 }
 
-// matchCloseReduceSignal 匹配减仓/平仓信号（反向查找法）
-// 核心思想：从本地 active 映射出发，对比领航员持仓判断动作
+// matchCloseReduceSignal 匹配减仓/平仓信号（反向查找法 + posId 精确匹配）
+// 核心思想：从本地 active 映射出发，通过 size 变化精确确定是哪个 posId 被操作
 func (e *Engine) matchCloseReduceSignal(signal *TradeSignal, leaderPosMap map[string]*Position) *SignalMatchResult {
 	fill := signal.Fill
 
@@ -539,12 +539,12 @@ func (e *Engine) matchCloseReduceSignal(signal *TradeSignal, leaderPosMap map[st
 		}
 	}
 
-	// 2. 遍历映射，对比领航员持仓
+	// 2. 遍历映射，通过 posId + size 变化精确匹配
 	for _, mapping := range activeMappings {
 		leaderPos := leaderPosMap[mapping.LeaderPosID]
 
+		// 场景 1: posId 消失 = 全平（直接通过 posId 匹配）
 		if leaderPos == nil {
-			// ✅ 领航员已平仓（posId 不在持仓列表中）
 			logger.Infof("📊 [%s] 领航员已平仓 | posId=%s 不在持仓列表 → 全量平仓",
 				e.traderID, mapping.LeaderPosID)
 			return &SignalMatchResult{
@@ -557,38 +557,82 @@ func (e *Engine) matchCloseReduceSignal(signal *TradeSignal, leaderPosMap map[st
 			}
 		}
 
-		// 领航员还有仓位，判断是减仓还是其他
-		// 用 fill.Size vs leaderPos.Size 判断是否是全平
-		if fill.Size >= leaderPos.Size*0.95 {
-			logger.Infof("📊 [%s] 减仓量(%.4f) ≈ 当前持仓(%.4f) → 视为全平 | posId=%s",
-				e.traderID, fill.Size, leaderPos.Size, mapping.LeaderPosID)
+		// 场景 2: posId 还在，通过 size 变化判断是否是这个仓位被减仓
+		// lastKnownSize > currentSize = 这个仓位被减仓了
+		if mapping.LastKnownSize > 0 && mapping.LastKnownSize > leaderPos.Size {
+			sizeDiff := mapping.LastKnownSize - leaderPos.Size
+			logger.Infof("📊 [%s] posId=%s size变化 | 上次=%.4f 当前=%.4f 减少=%.4f",
+				e.traderID, mapping.LeaderPosID, mapping.LastKnownSize, leaderPos.Size, sizeDiff)
+
+			// 判断是全平还是减仓
+			if leaderPos.Size < mapping.LastKnownSize*0.05 {
+				// 剩余不足 5% = 视为全平
+				logger.Infof("📊 [%s] 剩余(%.4f) < 5%% → 视为全平 | posId=%s",
+					e.traderID, leaderPos.Size, mapping.LeaderPosID)
+				return &SignalMatchResult{
+					ShouldFollow:   true,
+					Reason:         fmt.Sprintf("近乎全平(posId=%s)", mapping.LeaderPosID),
+					Action:         ActionClose,
+					PosID:          mapping.LeaderPosID,
+					MarginMode:     mapping.MarginMode,
+					LeaderPosition: leaderPos,
+				}
+			}
+
+			// 部分减仓
+			logger.Infof("📊 [%s] 部分减仓 | posId=%s 领航员剩余=%.4f",
+				e.traderID, mapping.LeaderPosID, leaderPos.Size)
 			return &SignalMatchResult{
 				ShouldFollow:   true,
-				Reason:         fmt.Sprintf("减仓量≈持仓量(posId=%s)，视为全平", mapping.LeaderPosID),
-				Action:         ActionClose,
+				Reason:         fmt.Sprintf("部分减仓(posId=%s)", mapping.LeaderPosID),
+				Action:         ActionReduce,
 				PosID:          mapping.LeaderPosID,
 				MarginMode:     mapping.MarginMode,
 				LeaderPosition: leaderPos,
 			}
 		}
+	}
 
-		// 部分减仓
-		logger.Infof("📊 [%s] 部分减仓 | posId=%s 领航员剩余=%.4f",
-			e.traderID, mapping.LeaderPosID, leaderPos.Size)
-		return &SignalMatchResult{
-			ShouldFollow:   true,
-			Reason:         fmt.Sprintf("部分减仓(posId=%s)", mapping.LeaderPosID),
-			Action:         ActionReduce,
-			PosID:          mapping.LeaderPosID,
-			MarginMode:     mapping.MarginMode,
-			LeaderPosition: leaderPos,
+	// 兜底：如果只有一个映射且 lastKnownSize 为 0（旧数据），使用 fill.Size 判断
+	if len(activeMappings) == 1 {
+		mapping := activeMappings[0]
+		leaderPos := leaderPosMap[mapping.LeaderPosID]
+
+		if leaderPos != nil {
+			// 用 fill.Size vs leaderPos.Size 判断是否是全平
+			if fill.Size >= leaderPos.Size*0.95 {
+				logger.Infof("📊 [%s] 减仓量(%.4f) ≈ 当前持仓(%.4f) → 视为全平 | posId=%s (兜底)",
+					e.traderID, fill.Size, leaderPos.Size, mapping.LeaderPosID)
+				return &SignalMatchResult{
+					ShouldFollow:   true,
+					Reason:         fmt.Sprintf("减仓量≈持仓量(posId=%s)，视为全平", mapping.LeaderPosID),
+					Action:         ActionClose,
+					PosID:          mapping.LeaderPosID,
+					MarginMode:     mapping.MarginMode,
+					LeaderPosition: leaderPos,
+				}
+			}
+
+			// 部分减仓
+			logger.Infof("📊 [%s] 部分减仓 | posId=%s 领航员剩余=%.4f (兜底)",
+				e.traderID, mapping.LeaderPosID, leaderPos.Size)
+			return &SignalMatchResult{
+				ShouldFollow:   true,
+				Reason:         fmt.Sprintf("部分减仓(posId=%s)", mapping.LeaderPosID),
+				Action:         ActionReduce,
+				PosID:          mapping.LeaderPosID,
+				MarginMode:     mapping.MarginMode,
+				LeaderPosition: leaderPos,
+			}
 		}
 	}
 
-	// 所有映射都在领航员持仓中，但没有匹配的减仓信号（理论上不会到这里）
+	// 所有映射都在领航员持仓中，但没有 size 变化（可能是重复信号）
+	logger.Infof("📊 [%s] 未检测到 size 变化 | %s %s → 跳过",
+		e.traderID, fill.Symbol, fill.PositionSide)
 	return &SignalMatchResult{
 		ShouldFollow: false,
-		Reason:       "未找到匹配的减仓/平仓操作",
+		Reason:       "未检测到 size 变化，可能是重复信号",
 	}
 }
 
@@ -678,13 +722,20 @@ func (e *Engine) processSignal(signal *TradeSignal) {
 func (e *Engine) buildDecisionV2(signal *TradeSignal, match *SignalMatchResult, copySize float64) decision.Decision {
 	fill := signal.Fill
 
+	// 获取领航员当前持仓数量（用于 lastKnownSize 追踪）
+	leaderPosSize := float64(0)
+	if match.LeaderPosition != nil {
+		leaderPosSize = match.LeaderPosition.Size
+	}
+
 	dec := decision.Decision{
-		Symbol:      fill.Symbol,
-		Action:      e.mapAction(match.Action, fill.PositionSide),
-		Reasoning:   fmt.Sprintf("Copy trading: %s following %s leader %s", match.Action, e.config.ProviderType, e.config.LeaderID),
-		EntryPrice:  fill.Price,
-		LeaderPosID: match.PosID,
-		MarginMode:  match.MarginMode, // 直接使用匹配结果中的 marginMode
+		Symbol:        fill.Symbol,
+		Action:        e.mapAction(match.Action, fill.PositionSide),
+		Reasoning:     fmt.Sprintf("Copy trading: %s following %s leader %s", match.Action, e.config.ProviderType, e.config.LeaderID),
+		EntryPrice:    fill.Price,
+		LeaderPosID:   match.PosID,
+		LeaderPosSize: leaderPosSize, // 传递领航员当前持仓数量
+		MarginMode:    match.MarginMode, // 直接使用匹配结果中的 marginMode
 	}
 
 	// ============================================================

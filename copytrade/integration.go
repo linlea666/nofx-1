@@ -404,6 +404,12 @@ func (ti *TraderIntegration) updatePositionMapping(dec *decision.Decision) {
 				logger.Infof("📝 [%s] 加仓次数已更新 | posId=%s %s (第 %d 次加仓)",
 					ti.traderID, dec.LeaderPosID, dec.Symbol, existingMapping.AddCount+1)
 			}
+			// 更新 lastKnownSize（领航员当前持仓数量）
+			if dec.LeaderPosSize > 0 {
+				if err := copyTradeStore.UpdateLastKnownSize(ti.traderID, dec.LeaderPosID, dec.LeaderPosSize); err != nil {
+					logger.Warnf("⚠️ [%s] 更新 lastKnownSize 失败: %v", ti.traderID, err)
+				}
+			}
 		} else {
 			// 无映射 → 新开仓：保存映射
 			side := "long"
@@ -412,22 +418,23 @@ func (ti *TraderIntegration) updatePositionMapping(dec *decision.Decision) {
 			}
 
 			mapping := &store.CopyTradePositionMapping{
-				TraderID:    ti.traderID,
-				LeaderPosID: dec.LeaderPosID,
-				LeaderID:    ti.engine.config.LeaderID,
-				Symbol:      dec.Symbol,
-				Side:        side,
-				MarginMode:  dec.MarginMode,
-				OpenedAt:    time.Now(),
-				OpenPrice:   dec.EntryPrice,
-				OpenSizeUSD: dec.PositionSizeUSD,
+				TraderID:      ti.traderID,
+				LeaderPosID:   dec.LeaderPosID,
+				LeaderID:      ti.engine.config.LeaderID,
+				Symbol:        dec.Symbol,
+				Side:          side,
+				MarginMode:    dec.MarginMode,
+				OpenedAt:      time.Now(),
+				OpenPrice:     dec.EntryPrice,
+				OpenSizeUSD:   dec.PositionSizeUSD,
+				LastKnownSize: dec.LeaderPosSize, // 记录领航员当前持仓数量
 			}
 
 			if err := copyTradeStore.SavePositionMapping(mapping); err != nil {
 				logger.Warnf("⚠️ [%s] 保存仓位映射失败: %v", ti.traderID, err)
 			} else {
-				logger.Infof("📝 [%s] 仓位映射已保存 | posId=%s %s %s %s",
-					ti.traderID, dec.LeaderPosID, dec.Symbol, side, dec.MarginMode)
+				logger.Infof("📝 [%s] 仓位映射已保存 | posId=%s %s %s %s lastKnownSize=%.4f",
+					ti.traderID, dec.LeaderPosID, dec.Symbol, side, dec.MarginMode, dec.LeaderPosSize)
 			}
 		}
 
@@ -435,6 +442,12 @@ func (ti *TraderIntegration) updatePositionMapping(dec *decision.Decision) {
 		// 减仓：增加减仓次数
 		if err := copyTradeStore.IncrementReduceCount(ti.traderID, dec.LeaderPosID); err != nil {
 			logger.Warnf("⚠️ [%s] 更新减仓次数失败: %v", ti.traderID, err)
+		}
+		// 更新 lastKnownSize（领航员当前持仓数量）
+		if dec.LeaderPosSize > 0 {
+			if err := copyTradeStore.UpdateLastKnownSize(ti.traderID, dec.LeaderPosID, dec.LeaderPosSize); err != nil {
+				logger.Warnf("⚠️ [%s] 更新 lastKnownSize 失败: %v", ti.traderID, err)
+			}
 		}
 
 	case "close_long", "close_short":

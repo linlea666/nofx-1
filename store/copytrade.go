@@ -340,9 +340,10 @@ type CopyTradePositionMapping struct {
 	Status      string `json:"status"`        // active | closed
 
 	// 开仓信息
-	OpenedAt    time.Time `json:"opened_at"`     // 跟单开仓时间
-	OpenPrice   float64   `json:"open_price"`    // 领航员开仓价格
-	OpenSizeUSD float64   `json:"open_size_usd"` // 跟单开仓金额
+	OpenedAt      time.Time `json:"opened_at"`       // 跟单开仓时间
+	OpenPrice     float64   `json:"open_price"`      // 领航员开仓价格
+	OpenSizeUSD   float64   `json:"open_size_usd"`   // 跟单开仓金额
+	LastKnownSize float64   `json:"last_known_size"` // 领航员上次已知持仓数量（用于精确匹配 posId）
 
 	// 平仓信息（平仓时填充）
 	ClosedAt   *time.Time `json:"closed_at"`   // 平仓时间
@@ -389,6 +390,9 @@ func (s *CopyTradeStore) initPositionMappingTable() error {
 	s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_mapping_trader_status ON copy_trade_position_mappings(trader_id, status)`)
 	s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_mapping_trader_symbol ON copy_trade_position_mappings(trader_id, symbol, side, status)`)
 
+	// 添加 last_known_size 字段（如果不存在）
+	s.db.Exec(`ALTER TABLE copy_trade_position_mappings ADD COLUMN last_known_size REAL DEFAULT 0`)
+
 	return nil
 }
 
@@ -397,12 +401,13 @@ func (s *CopyTradeStore) SavePositionMapping(mapping *CopyTradePositionMapping) 
 	_, err := s.db.Exec(`
 		INSERT INTO copy_trade_position_mappings 
 			(trader_id, leader_pos_id, leader_id, symbol, side, margin_mode, status,
-			 opened_at, open_price, open_size_usd, add_count, reduce_count, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, 0, 0, CURRENT_TIMESTAMP)
+			 opened_at, open_price, open_size_usd, last_known_size, add_count, reduce_count, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, 0, 0, CURRENT_TIMESTAMP)
 		ON CONFLICT(trader_id, leader_pos_id) DO UPDATE SET
+			last_known_size = excluded.last_known_size,
 			updated_at = CURRENT_TIMESTAMP
 	`, mapping.TraderID, mapping.LeaderPosID, mapping.LeaderID, mapping.Symbol,
-		mapping.Side, mapping.MarginMode, mapping.OpenedAt, mapping.OpenPrice, mapping.OpenSizeUSD)
+		mapping.Side, mapping.MarginMode, mapping.OpenedAt, mapping.OpenPrice, mapping.OpenSizeUSD, mapping.LastKnownSize)
 	return err
 }
 
@@ -429,7 +434,7 @@ func (s *CopyTradeStore) getMappingByStatus(traderID, leaderPosID, status string
 
 	query := `
 		SELECT id, trader_id, leader_pos_id, leader_id, symbol, side, margin_mode, status,
-		       opened_at, open_price, open_size_usd, closed_at, close_price,
+		       opened_at, open_price, open_size_usd, last_known_size, closed_at, close_price,
 		       add_count, reduce_count, updated_at
 		FROM copy_trade_position_mappings
 		WHERE trader_id = ? AND leader_pos_id = ?
@@ -447,7 +452,7 @@ func (s *CopyTradeStore) getMappingByStatus(traderID, leaderPosID, status string
 	err := s.db.QueryRow(query, args...).Scan(
 		&mapping.ID, &mapping.TraderID, &mapping.LeaderPosID, &mapping.LeaderID,
 		&mapping.Symbol, &mapping.Side, &mapping.MarginMode, &mapping.Status,
-		&openedAt, &mapping.OpenPrice, &mapping.OpenSizeUSD, &closedAt, &mapping.ClosePrice,
+		&openedAt, &mapping.OpenPrice, &mapping.OpenSizeUSD, &mapping.LastKnownSize, &closedAt, &mapping.ClosePrice,
 		&mapping.AddCount, &mapping.ReduceCount, &updatedAt,
 	)
 	if err != nil {
@@ -500,6 +505,17 @@ func (s *CopyTradeStore) IncrementReduceCount(traderID, leaderPosID string) erro
 	return err
 }
 
+// UpdateLastKnownSize 更新领航员上次已知持仓数量（加仓/减仓后调用）
+// 用于精确匹配：通过 size 变化确定是哪个 posId 发生了操作
+func (s *CopyTradeStore) UpdateLastKnownSize(traderID, leaderPosID string, size float64) error {
+	_, err := s.db.Exec(`
+		UPDATE copy_trade_position_mappings 
+		SET last_known_size = ?, updated_at = CURRENT_TIMESTAMP
+		WHERE trader_id = ? AND leader_pos_id = ? AND status = 'active'
+	`, size, traderID, leaderPosID)
+	return err
+}
+
 // CloseMapping 关闭仓位映射（平仓时调用）
 func (s *CopyTradeStore) CloseMapping(traderID, leaderPosID string, closePrice float64) error {
 	_, err := s.db.Exec(`
@@ -520,7 +536,7 @@ func (s *CopyTradeStore) ListActiveMappings(traderID string) ([]*CopyTradePositi
 func (s *CopyTradeStore) FindActiveBySymbolSide(traderID, symbol, side string) ([]*CopyTradePositionMapping, error) {
 	query := `
 		SELECT id, trader_id, leader_pos_id, leader_id, symbol, side, margin_mode, status,
-		       opened_at, open_price, open_size_usd, closed_at, close_price,
+		       opened_at, open_price, open_size_usd, last_known_size, closed_at, close_price,
 		       add_count, reduce_count, updated_at
 		FROM copy_trade_position_mappings
 		WHERE trader_id = ? AND symbol = ? AND side = ? AND status = 'active'
@@ -542,7 +558,7 @@ func (s *CopyTradeStore) FindActiveBySymbolSide(traderID, symbol, side string) (
 		err := rows.Scan(
 			&mapping.ID, &mapping.TraderID, &mapping.LeaderPosID, &mapping.LeaderID,
 			&mapping.Symbol, &mapping.Side, &mapping.MarginMode, &mapping.Status,
-			&openedAt, &mapping.OpenPrice, &mapping.OpenSizeUSD, &closedAt, &mapping.ClosePrice,
+			&openedAt, &mapping.OpenPrice, &mapping.OpenSizeUSD, &mapping.LastKnownSize, &closedAt, &mapping.ClosePrice,
 			&mapping.AddCount, &mapping.ReduceCount, &updatedAt,
 		)
 		if err != nil {
@@ -571,7 +587,7 @@ func (s *CopyTradeStore) ListAllMappings(traderID string, limit int) ([]*CopyTra
 func (s *CopyTradeStore) listMappings(traderID, status string, limit int) ([]*CopyTradePositionMapping, error) {
 	query := `
 		SELECT id, trader_id, leader_pos_id, leader_id, symbol, side, margin_mode, status,
-		       opened_at, open_price, open_size_usd, closed_at, close_price,
+		       opened_at, open_price, open_size_usd, last_known_size, closed_at, close_price,
 		       add_count, reduce_count, updated_at
 		FROM copy_trade_position_mappings
 		WHERE trader_id = ?
@@ -605,7 +621,7 @@ func (s *CopyTradeStore) listMappings(traderID, status string, limit int) ([]*Co
 		err := rows.Scan(
 			&mapping.ID, &mapping.TraderID, &mapping.LeaderPosID, &mapping.LeaderID,
 			&mapping.Symbol, &mapping.Side, &mapping.MarginMode, &mapping.Status,
-			&openedAt, &mapping.OpenPrice, &mapping.OpenSizeUSD, &closedAt, &mapping.ClosePrice,
+			&openedAt, &mapping.OpenPrice, &mapping.OpenSizeUSD, &mapping.LastKnownSize, &closedAt, &mapping.ClosePrice,
 			&mapping.AddCount, &mapping.ReduceCount, &updatedAt,
 		)
 		if err != nil {
@@ -641,4 +657,3 @@ func CopyTradeConfigFromJSON(jsonStr string) (*CopyTradeConfig, error) {
 	err := json.Unmarshal([]byte(jsonStr), &config)
 	return &config, err
 }
-
