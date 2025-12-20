@@ -393,6 +393,7 @@ type SignalMatchResult struct {
 // 核心思想：
 //   - 开仓/加仓：从领航员持仓列表获取 posId，查数据库映射判断
 //   - 减仓/平仓：反向查找法 - 从本地 active 映射出发，对比领航员持仓
+//
 // ============================================================================
 func (e *Engine) matchSignalWithMapping(signal *TradeSignal) *SignalMatchResult {
 	fill := signal.Fill
@@ -442,7 +443,9 @@ func (e *Engine) buildLeaderPosMap() map[string]*Position {
 }
 
 // matchOpenAddSignal 匹配开仓/加仓信号
-// 核心思想：遍历所有 symbol+side 匹配的仓位，优先找新出现的 posId（新开仓）
+// 核心思想：
+//   1. 新开仓：找领航员持仓中没有本地映射的 posId
+//   2. 加仓：通过 lastKnownSize 变化判断是哪个仓位被加仓（size 增加的那个）
 func (e *Engine) matchOpenAddSignal(signal *TradeSignal, leaderPosMap map[string]*Position) *SignalMatchResult {
 	fill := signal.Fill
 
@@ -461,19 +464,17 @@ func (e *Engine) matchOpenAddSignal(signal *TradeSignal, leaderPosMap map[string
 		}
 	}
 
-	// 遍历所有匹配仓位，分类处理
-	var newPosition *Position      // 新出现的 posId（无映射或 closed）
-	var activePosition *Position   // 已跟随的 posId（active 映射）
-	var activeMapping *store.CopyTradePositionMapping
+	// ============================================================
+	// 第一轮：查找新开仓（无映射或 closed 状态的 posId）
+	// ============================================================
+	var newPosition *Position
 
 	for _, pos := range matchedPositions {
 		posID := pos.PosID
 		if posID == "" {
-			// Hyperliquid 等无 posId，生成虚拟 ID
 			posID = fmt.Sprintf("%s_%s", fill.Symbol, fill.PositionSide)
 		}
 
-		// 查数据库映射
 		mapping, err := e.store.CopyTrade().GetMapping(e.traderID, posID)
 		if err != nil {
 			logger.Warnf("⚠️ [%s] 查询映射失败: %v (posId=%s)", e.traderID, err, posID)
@@ -485,26 +486,20 @@ func (e *Engine) matchOpenAddSignal(signal *TradeSignal, leaderPosMap map[string
 			logger.Infof("📊 [%s] 发现新 posId | posId=%s mgnMode=%s → 新开仓候选",
 				e.traderID, posID, pos.MarginMode)
 			newPosition = pos
-			break // 优先处理新开仓
+			break
 		}
 
-		switch mapping.Status {
-		case "active":
-			// 已跟随的仓位 → 加仓候选
-			if activePosition == nil {
-				activePosition = pos
-				activeMapping = mapping
-			}
-		case "ignored":
-			// 历史仓位 → 跳过
-			logger.Infof("📊 [%s] 历史仓位 | posId=%s status=ignored → 跳过",
-				e.traderID, posID)
-		case "closed":
+		if mapping.Status == "closed" {
 			// 已关闭 = 可重新开仓
 			logger.Infof("📊 [%s] 仓位已关闭 | posId=%s → 新开仓候选",
 				e.traderID, posID)
 			newPosition = pos
-			break // 优先处理新开仓
+			break
+		}
+
+		if mapping.Status == "ignored" {
+			logger.Infof("📊 [%s] 历史仓位 | posId=%s status=ignored → 跳过",
+				e.traderID, posID)
 		}
 	}
 
@@ -526,21 +521,118 @@ func (e *Engine) matchOpenAddSignal(signal *TradeSignal, leaderPosMap map[string
 		}
 	}
 
-	// 其次处理加仓
-	if activePosition != nil && activeMapping != nil {
-		posID := activePosition.PosID
+	// ============================================================
+	// 第二轮：查找加仓（通过 lastKnownSize 变化判断）
+	// 关键：找 currentSize > lastKnownSize 的仓位，说明这个仓位被加仓了
+	// ============================================================
+	var addPosition *Position
+	var addMapping *store.CopyTradePositionMapping
+	var maxSizeIncrease float64
+
+	for _, pos := range matchedPositions {
+		posID := pos.PosID
 		if posID == "" {
 			posID = fmt.Sprintf("%s_%s", fill.Symbol, fill.PositionSide)
 		}
-		logger.Infof("📊 [%s] 已跟随仓位 | posId=%s status=active → 加仓",
+
+		mapping, err := e.store.CopyTrade().GetMapping(e.traderID, posID)
+		if err != nil || mapping == nil {
+			continue
+		}
+
+		if mapping.Status != "active" {
+			continue
+		}
+
+		// 查找领航员当前持仓
+		leaderPos, exists := leaderPosMap[posID]
+		if !exists {
+			continue
+		}
+
+		currentSize := leaderPos.Size
+		lastKnownSize := mapping.LastKnownSize
+
+		// 判断 size 是否增加（加仓）
+		if currentSize > lastKnownSize {
+			sizeIncrease := currentSize - lastKnownSize
+			logger.Infof("📊 [%s] posId=%s size 变化 | 上次=%.4f 当前=%.4f 增加=%.4f",
+				e.traderID, posID, lastKnownSize, currentSize, sizeIncrease)
+
+			// 取 size 增加最多的那个仓位（防止多个仓位同时变化时的误判）
+			if sizeIncrease > maxSizeIncrease {
+				maxSizeIncrease = sizeIncrease
+				addPosition = leaderPos
+				addMapping = mapping
+			}
+		}
+	}
+
+	// 找到了加仓目标
+	if addPosition != nil && addMapping != nil {
+		posID := addPosition.PosID
+		if posID == "" {
+			posID = fmt.Sprintf("%s_%s", fill.Symbol, fill.PositionSide)
+		}
+		logger.Infof("📊 [%s] 精确匹配加仓 | posId=%s mgnMode=%s size增加=%.4f → 跟随加仓",
+			e.traderID, posID, addMapping.MarginMode, maxSizeIncrease)
+		return &SignalMatchResult{
+			ShouldFollow:   true,
+			Reason:         fmt.Sprintf("已跟随仓位(posId=%s)，加仓", posID),
+			Action:         ActionAdd,
+			PosID:          posID,
+			MarginMode:     addMapping.MarginMode,
+			LeaderPosition: addPosition,
+		}
+	}
+
+	// ============================================================
+	// 第三轮：兜底 - 只有一个 active 仓位时，直接加仓
+	// ============================================================
+	var singleActivePos *Position
+	var singleActiveMapping *store.CopyTradePositionMapping
+	activeCount := 0
+
+	for _, pos := range matchedPositions {
+		posID := pos.PosID
+		if posID == "" {
+			posID = fmt.Sprintf("%s_%s", fill.Symbol, fill.PositionSide)
+		}
+
+		mapping, err := e.store.CopyTrade().GetMapping(e.traderID, posID)
+		if err != nil || mapping == nil || mapping.Status != "active" {
+			continue
+		}
+
+		activeCount++
+		singleActivePos = pos
+		singleActiveMapping = mapping
+	}
+
+	if activeCount == 1 && singleActivePos != nil {
+		posID := singleActivePos.PosID
+		if posID == "" {
+			posID = fmt.Sprintf("%s_%s", fill.Symbol, fill.PositionSide)
+		}
+		logger.Infof("📊 [%s] 唯一 active 仓位 | posId=%s status=active → 加仓",
 			e.traderID, posID)
 		return &SignalMatchResult{
 			ShouldFollow:   true,
 			Reason:         fmt.Sprintf("已跟随仓位(posId=%s)，加仓", posID),
 			Action:         ActionAdd,
 			PosID:          posID,
-			MarginMode:     activeMapping.MarginMode,
-			LeaderPosition: activePosition,
+			MarginMode:     singleActiveMapping.MarginMode,
+			LeaderPosition: singleActivePos,
+		}
+	}
+
+	// 多个 active 仓位但无法判断加仓目标
+	if activeCount > 1 {
+		logger.Warnf("⚠️ [%s] 多个 active 仓位 (%d个)，无法判断加仓目标，跳过",
+			e.traderID, activeCount)
+		return &SignalMatchResult{
+			ShouldFollow: false,
+			Reason:       fmt.Sprintf("多个 %s %s active 仓位，无法判断加仓目标", fill.Symbol, fill.PositionSide),
 		}
 	}
 
@@ -673,15 +765,6 @@ func (e *Engine) matchCloseReduceSignal(signal *TradeSignal, leaderPosMap map[st
 }
 
 // findLeaderPosition 在领航员持仓映射中查找指定 symbol+side 的仓位
-func (e *Engine) findLeaderPosition(symbol string, side SideType, leaderPosMap map[string]*Position) *Position {
-	for _, pos := range leaderPosMap {
-		if pos.Symbol == symbol && pos.Side == side {
-			return pos
-		}
-	}
-	return nil
-}
-
 // ============================================================================
 // 信号处理（核心逻辑 - 统一入口）
 // ============================================================================
@@ -770,7 +853,7 @@ func (e *Engine) buildDecisionV2(signal *TradeSignal, match *SignalMatchResult, 
 		Reasoning:     fmt.Sprintf("Copy trading: %s following %s leader %s", match.Action, e.config.ProviderType, e.config.LeaderID),
 		EntryPrice:    fill.Price,
 		LeaderPosID:   match.PosID,
-		LeaderPosSize: leaderPosSize, // 传递领航员当前持仓数量
+		LeaderPosSize: leaderPosSize,    // 传递领航员当前持仓数量
 		MarginMode:    match.MarginMode, // 直接使用匹配结果中的 marginMode
 	}
 
@@ -923,7 +1006,6 @@ func (e *Engine) calculateCopySize(signal *TradeSignal) (float64, []Warning) {
 	return copySize, warnings
 }
 
-
 // getLeaderLeverage 获取领航员杠杆
 // 优先级：1.信号中的持仓杠杆 2.缓存的持仓 3.默认值(10x)
 func (e *Engine) getLeaderLeverage(signal *TradeSignal) int {
@@ -1069,7 +1151,6 @@ func (e *Engine) syncLeaderState() error {
 	return nil
 }
 
-
 func (e *Engine) initSeenFills() {
 	since := time.Now().Add(-5 * time.Minute)
 	fills, err := e.provider.GetFills(e.config.LeaderID, since)
@@ -1131,4 +1212,3 @@ func (e *Engine) logWarning(w Warning) {
 
 	logger.Warnf("⚠️ [%s] 预警:%s | %s | %s", e.traderID, w.Type, w.Symbol, w.Message)
 }
-
