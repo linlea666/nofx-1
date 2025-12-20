@@ -36,13 +36,9 @@ type Engine struct {
 
 	// 状态缓存
 	leaderState       *AccountState
-	prevLeaderState   *AccountState // 上一次状态（用于对比变化）
 	leaderStateMu     sync.RWMutex
 	lastStateSync     time.Time
 	stateSyncInterval time.Duration
-
-	// 持仓变化追踪（用于 OKX 区分全仓/逐仓）
-	changedPositions map[string]*Position // symbol_side -> 最近变化的仓位
 
 	// 决策输出
 	decisionCh chan *decision.FullDecision
@@ -372,178 +368,302 @@ func (e *Engine) buildSignal(fill *Fill) *TradeSignal {
 
 	if e.leaderState != nil {
 		signal.LeaderEquity = e.leaderState.TotalEquity
-
-		// 使用"变化量差分"精确匹配仓位
-		// 优先使用 posId（100% 准确），回退到变化量匹配
-		signal.LeaderPosition = e.findBestMatchPosition(fill)
-
-		// 附加领航员仓位 ID（用于跟随者端精确匹配）
-		if signal.LeaderPosition != nil && signal.LeaderPosition.PosID != "" {
-			signal.LeaderPosID = signal.LeaderPosition.PosID
-		}
 	}
 
 	return signal
 }
 
-// findBestMatchPosition 精确匹配领航员仓位
-// 核心改进：优先使用 posId（100% 准确），回退到变化量匹配
-// 匹配优先级：
-//  1. posId 直接匹配（OKX 独有，最精确）
-//  2. symbol+side 唯一候选
-//  3. 变化量（deltaSize）最接近 fill.Size 的候选
-func (e *Engine) findBestMatchPosition(fill *Fill) *Position {
-	// 获取旧持仓（用于计算变化量）
-	oldPositions := make(map[string]*Position)
-	if e.prevLeaderState != nil && e.prevLeaderState.Positions != nil {
-		oldPositions = e.prevLeaderState.Positions
-	}
+// ============================================================================
+// 统一信号匹配（核心逻辑）
+// ============================================================================
 
-	// 1. 收集所有 symbol+side 匹配的变化仓位（去重）
-	var candidates []*Position
-	seen := make(map[*Position]bool)
+// SignalMatchResult 信号匹配结果
+type SignalMatchResult struct {
+	ShouldFollow   bool       // 是否跟随
+	Reason         string     // 原因
+	Action         ActionType // 实际动作类型
+	PosID          string     // 领航员仓位 ID
+	MarginMode     string     // 保证金模式
+	LeaderPosition *Position  // 领航员仓位（可能为 nil，表示已平仓）
+}
 
-	for _, pos := range e.changedPositions {
-		if pos.Symbol == fill.Symbol && pos.Side == fill.PositionSide && !seen[pos] {
-			seen[pos] = true
-			candidates = append(candidates, pos)
+// matchSignalWithMapping 统一信号匹配（核心方法）
+// ============================================================================
+// 统一处理所有信号类型：开仓/加仓/减仓/平仓
+// 核心思想：
+//   - 开仓/加仓：从领航员持仓列表获取 posId，查数据库映射判断
+//   - 减仓/平仓：反向查找法 - 从本地 active 映射出发，对比领航员持仓
+// ============================================================================
+func (e *Engine) matchSignalWithMapping(signal *TradeSignal) *SignalMatchResult {
+	fill := signal.Fill
+
+	if e.store == nil {
+		return &SignalMatchResult{
+			ShouldFollow: false,
+			Reason:       "数据库未初始化",
 		}
 	}
 
-	// 2. 根据候选数量决定匹配策略
-	if len(candidates) == 0 {
-		// 没有变化追踪，回退到当前持仓查找（兼容单仓位场景）
-		for _, pos := range e.leaderState.Positions {
-			if pos.Symbol == fill.Symbol && pos.Side == fill.PositionSide {
-				logger.Debugf("📊 [%s] 回退使用当前持仓 | %s %s mgnMode=%s posId=%s",
-					e.traderID, fill.Symbol, fill.PositionSide, pos.MarginMode, pos.PosID)
-				return pos
+	// 构建领航员持仓 posId -> Position 映射（一次构建，全程复用）
+	leaderPosMap := e.buildLeaderPosMap()
+
+	// ============================================================
+	// 场景 1: 开仓/加仓信号
+	// ============================================================
+	if fill.Action == ActionOpen || fill.Action == ActionAdd {
+		return e.matchOpenAddSignal(signal, leaderPosMap)
+	}
+
+	// ============================================================
+	// 场景 2: 减仓/平仓信号（反向查找法）
+	// ============================================================
+	return e.matchCloseReduceSignal(signal, leaderPosMap)
+}
+
+// buildLeaderPosMap 构建领航员持仓映射 (posId -> Position)
+func (e *Engine) buildLeaderPosMap() map[string]*Position {
+	e.leaderStateMu.RLock()
+	defer e.leaderStateMu.RUnlock()
+
+	posMap := make(map[string]*Position)
+	if e.leaderState == nil || e.leaderState.Positions == nil {
+		return posMap
+	}
+
+	for key, pos := range e.leaderState.Positions {
+		if pos.PosID != "" {
+			posMap[pos.PosID] = pos
+		} else {
+			// Hyperliquid 等无 posId 的交易所，用 symbol_side 作为 key
+			posMap[key] = pos
+		}
+	}
+	return posMap
+}
+
+// matchOpenAddSignal 匹配开仓/加仓信号
+func (e *Engine) matchOpenAddSignal(signal *TradeSignal, leaderPosMap map[string]*Position) *SignalMatchResult {
+	fill := signal.Fill
+
+	// 从领航员持仓中找匹配的仓位
+	leaderPos := e.findLeaderPosition(fill.Symbol, fill.PositionSide, leaderPosMap)
+	if leaderPos == nil {
+		return &SignalMatchResult{
+			ShouldFollow: false,
+			Reason:       fmt.Sprintf("领航员持仓中找不到 %s %s", fill.Symbol, fill.PositionSide),
+		}
+	}
+
+	posID := leaderPos.PosID
+	if posID == "" {
+		// Hyperliquid 等无 posId，生成虚拟 ID
+		posID = fmt.Sprintf("%s_%s", fill.Symbol, fill.PositionSide)
+	}
+
+	// 查数据库映射
+	mapping, err := e.store.CopyTrade().GetMapping(e.traderID, posID)
+	if err != nil {
+		logger.Errorf("❌ [%s] 查询映射失败: %v (posId=%s)", e.traderID, err, posID)
+		return &SignalMatchResult{
+			ShouldFollow: false,
+			Reason:       fmt.Sprintf("查询映射失败: %v", err),
+		}
+	}
+
+	// 根据映射状态判断
+	if mapping != nil {
+		switch mapping.Status {
+		case "active":
+			// 已跟随的仓位 → 加仓
+			logger.Infof("📊 [%s] 已跟随仓位 | posId=%s status=active → 加仓",
+				e.traderID, posID)
+			return &SignalMatchResult{
+				ShouldFollow:   true,
+				Reason:         fmt.Sprintf("已跟随仓位(posId=%s)，加仓", posID),
+				Action:         ActionAdd,
+				PosID:          posID,
+				MarginMode:     mapping.MarginMode,
+				LeaderPosition: leaderPos,
+			}
+
+		case "ignored":
+			// 历史仓位 → 不跟随
+			logger.Infof("📊 [%s] 历史仓位 | posId=%s status=ignored → 不跟随",
+				e.traderID, posID)
+			return &SignalMatchResult{
+				ShouldFollow: false,
+				Reason:       fmt.Sprintf("历史仓位(posId=%s)，不跟随", posID),
+			}
+
+		default:
+			// closed 或其他状态，视为可重新开仓
+			logger.Infof("📊 [%s] 仓位已关闭 | posId=%s status=%s → 视为新开仓",
+				e.traderID, posID, mapping.Status)
+		}
+	}
+
+	// 无映射或 closed = 新开仓
+	logger.Infof("📊 [%s] 新开仓 | posId=%s mgnMode=%s → 跟随开仓",
+		e.traderID, posID, leaderPos.MarginMode)
+	return &SignalMatchResult{
+		ShouldFollow:   true,
+		Reason:         fmt.Sprintf("新开仓(posId=%s)，跟随开仓", posID),
+		Action:         ActionOpen,
+		PosID:          posID,
+		MarginMode:     leaderPos.MarginMode,
+		LeaderPosition: leaderPos,
+	}
+}
+
+// matchCloseReduceSignal 匹配减仓/平仓信号（反向查找法）
+// 核心思想：从本地 active 映射出发，对比领航员持仓判断动作
+func (e *Engine) matchCloseReduceSignal(signal *TradeSignal, leaderPosMap map[string]*Position) *SignalMatchResult {
+	fill := signal.Fill
+
+	// 1. 查本地所有 active 映射
+	activeMappings, err := e.store.CopyTrade().FindActiveBySymbolSide(e.traderID, fill.Symbol, string(fill.PositionSide))
+	if err != nil {
+		logger.Errorf("❌ [%s] 查询活跃映射失败: %v", e.traderID, err)
+		return &SignalMatchResult{
+			ShouldFollow: false,
+			Reason:       fmt.Sprintf("查询活跃映射失败: %v", err),
+		}
+	}
+
+	if len(activeMappings) == 0 {
+		logger.Infof("📊 [%s] 无活跃映射 | %s %s → 不跟随",
+			e.traderID, fill.Symbol, fill.PositionSide)
+		return &SignalMatchResult{
+			ShouldFollow: false,
+			Reason:       fmt.Sprintf("无活跃映射(%s %s)，不跟随", fill.Symbol, fill.PositionSide),
+		}
+	}
+
+	// 2. 遍历映射，对比领航员持仓
+	for _, mapping := range activeMappings {
+		leaderPos := leaderPosMap[mapping.LeaderPosID]
+
+		if leaderPos == nil {
+			// ✅ 领航员已平仓（posId 不在持仓列表中）
+			logger.Infof("📊 [%s] 领航员已平仓 | posId=%s 不在持仓列表 → 全量平仓",
+				e.traderID, mapping.LeaderPosID)
+			return &SignalMatchResult{
+				ShouldFollow:   true,
+				Reason:         fmt.Sprintf("领航员已平仓(posId=%s)", mapping.LeaderPosID),
+				Action:         ActionClose,
+				PosID:          mapping.LeaderPosID,
+				MarginMode:     mapping.MarginMode,
+				LeaderPosition: nil, // nil 表示已平仓
 			}
 		}
-		return nil
-	}
 
-	if len(candidates) == 1 {
-		// 只有一个候选，直接使用
-		pos := candidates[0]
-		logger.Debugf("📊 [%s] 使用唯一变化仓位 | %s %s mgnMode=%s posId=%s",
-			e.traderID, fill.Symbol, fill.PositionSide, pos.MarginMode, pos.PosID)
-		return pos
-	}
-
-	// 3. 多个候选：用变化量（deltaSize）精确匹配
-	var bestMatch *Position
-	minDiff := float64(1e18)
-
-	logger.Debugf("📊 [%s] 多仓位匹配开始 | %s %s | 候选数=%d fill.Size=%.4f",
-		e.traderID, fill.Symbol, fill.PositionSide, len(candidates), fill.Size)
-
-	for _, pos := range candidates {
-		// 计算变化量：优先用 posId 查找旧仓位，回退到 mgnMode key
-		var oldPos *Position
-		if pos.PosID != "" {
-			oldPos = oldPositions[pos.PosID]
-		}
-		if oldPos == nil {
-			fullKey := PositionKeyWithMode(pos.Symbol, pos.Side, pos.MarginMode)
-			oldPos = oldPositions[fullKey]
+		// 领航员还有仓位，判断是减仓还是其他
+		// 用 fill.Size vs leaderPos.Size 判断是否是全平
+		if fill.Size >= leaderPos.Size*0.95 {
+			logger.Infof("📊 [%s] 减仓量(%.4f) ≈ 当前持仓(%.4f) → 视为全平 | posId=%s",
+				e.traderID, fill.Size, leaderPos.Size, mapping.LeaderPosID)
+			return &SignalMatchResult{
+				ShouldFollow:   true,
+				Reason:         fmt.Sprintf("减仓量≈持仓量(posId=%s)，视为全平", mapping.LeaderPosID),
+				Action:         ActionClose,
+				PosID:          mapping.LeaderPosID,
+				MarginMode:     mapping.MarginMode,
+				LeaderPosition: leaderPos,
+			}
 		}
 
-		var deltaSize float64
-		if oldPos == nil {
-			// 新开仓：变化量 = 当前持仓量
-			deltaSize = pos.Size
-		} else {
-			// 加仓/减仓：变化量 = 当前 - 旧值
-			deltaSize = pos.Size - oldPos.Size
-		}
-
-		// 计算与 fill.Size 的差距（取绝对值，因为减仓时 deltaSize 为负）
-		diff := absFloat(absFloat(deltaSize) - fill.Size)
-
-		oldSize := float64(0)
-		if oldPos != nil {
-			oldSize = oldPos.Size
-		}
-		logger.Debugf("  - 候选: mgnMode=%s posId=%s | oldSize=%.4f newSize=%.4f delta=%.4f | diff=%.4f",
-			pos.MarginMode, pos.PosID, oldSize, pos.Size, deltaSize, diff)
-
-		if diff < minDiff {
-			minDiff = diff
-			bestMatch = pos
+		// 部分减仓
+		logger.Infof("📊 [%s] 部分减仓 | posId=%s 领航员剩余=%.4f",
+			e.traderID, mapping.LeaderPosID, leaderPos.Size)
+		return &SignalMatchResult{
+			ShouldFollow:   true,
+			Reason:         fmt.Sprintf("部分减仓(posId=%s)", mapping.LeaderPosID),
+			Action:         ActionReduce,
+			PosID:          mapping.LeaderPosID,
+			MarginMode:     mapping.MarginMode,
+			LeaderPosition: leaderPos,
 		}
 	}
 
-	if bestMatch != nil {
-		logger.Infof("📊 [%s] 变化量匹配成功 | %s %s mgnMode=%s posId=%s | 最小差距=%.4f",
-			e.traderID, fill.Symbol, fill.PositionSide, bestMatch.MarginMode, bestMatch.PosID, minDiff)
+	// 所有映射都在领航员持仓中，但没有匹配的减仓信号（理论上不会到这里）
+	return &SignalMatchResult{
+		ShouldFollow: false,
+		Reason:       "未找到匹配的减仓/平仓操作",
 	}
+}
 
-	return bestMatch
+// findLeaderPosition 在领航员持仓映射中查找指定 symbol+side 的仓位
+func (e *Engine) findLeaderPosition(symbol string, side SideType, leaderPosMap map[string]*Position) *Position {
+	for _, pos := range leaderPosMap {
+		if pos.Symbol == symbol && pos.Side == side {
+			return pos
+		}
+	}
+	return nil
 }
 
 // ============================================================================
-// 信号处理（核心逻辑）
+// 信号处理（核心逻辑 - 统一入口）
 // ============================================================================
 
 func (e *Engine) processSignal(signal *TradeSignal) {
 	fill := signal.Fill
 
-	// 🔄 强制同步领航员状态
-	// - Open/Add: 获取最新持仓信息（OKX 需要区分全仓/逐仓）
-	// - Close/Reduce: 获取准确的剩余仓位（判断减仓 vs 平仓，计算减仓比例）
-	needSync := fill.Action == ActionClose || fill.Action == ActionOpen || fill.Action == ActionAdd || fill.Action == ActionReduce
-	if needSync {
-		// 清空变化追踪缓存，确保使用最新数据
-		e.leaderStateMu.Lock()
-		e.changedPositions = make(map[string]*Position)
-		e.leaderStateMu.Unlock()
-
-		if err := e.syncLeaderState(); err != nil {
-			logger.Warnf("⚠️ [%s] %s 操作前状态同步失败: %v", e.traderID, fill.Action, err)
-		} else {
-			// 重新构建 signal 以使用最新状态
-			signal = e.buildSignal(fill)
-			logger.Debugf("🔄 [%s] %s 操作已刷新领航员状态", e.traderID, fill.Action)
-		}
+	// ========================================
+	// Step 1: 统一数据准备（只拉取一次）
+	// ========================================
+	if err := e.syncLeaderState(); err != nil {
+		logger.Warnf("⚠️ [%s] 领航员状态同步失败: %v", e.traderID, err)
 	}
 
-	// 1. 🎯 核心规则：只跟新开仓（本地仓位对比法）
-	follow, reason := e.shouldFollowSignal(signal)
-	if !follow {
-		logger.Infof("🎯 [%s] ❌ 跳过 | %s | 原因: %s", e.traderID, fill.Symbol, reason)
+	// 重新构建 signal 以获取最新的 LeaderEquity
+	signal = e.buildSignal(fill)
+
+	// ========================================
+	// Step 2: 统一信号匹配（核心判断）
+	// ========================================
+	matchResult := e.matchSignalWithMapping(signal)
+
+	if !matchResult.ShouldFollow {
+		logger.Infof("🎯 [%s] ❌ 跳过 | %s | 原因: %s", e.traderID, fill.Symbol, matchResult.Reason)
 		e.stats.SignalsSkipped++
 		return
 	}
-	logger.Infof("🎯 [%s] ✅ 跟随 | %s | 原因: %s", e.traderID, fill.Symbol, reason)
+	logger.Infof("🎯 [%s] ✅ 跟随 | %s | 原因: %s", e.traderID, fill.Symbol, matchResult.Reason)
 	e.stats.SignalsFollowed++
 
-	// 2. 判断实际动作类型（减仓 vs 平仓）
-	actualAction := e.determineAction(signal)
+	// 回填匹配结果到 signal（供后续逻辑使用）
+	signal.LeaderPosID = matchResult.PosID
+	signal.LeaderPosition = matchResult.LeaderPosition
 
-	// 3. 计算跟单仓位（带预警，不限制）
+	// ========================================
+	// Step 3: 计算跟单仓位
+	// ========================================
 	copySize, warnings := e.calculateCopySize(signal)
 
-	// 4. 记录所有预警（不阻止交易）
+	// 记录所有预警（不阻止交易）
 	for _, w := range warnings {
 		e.logWarning(w)
 	}
 
-	// 5. 构造 Decision
-	dec := e.buildDecision(signal, actualAction, copySize)
+	// ========================================
+	// Step 4: 构造 Decision
+	// ========================================
+	dec := e.buildDecisionV2(signal, matchResult, copySize)
 
-	// 6. 包装为 FullDecision
+	// ========================================
+	// Step 5: 推送决策
+	// ========================================
 	fullDec := &decision.FullDecision{
 		SystemPrompt:        e.buildSystemPromptLog(),
 		UserPrompt:          e.buildUserPromptLog(signal),
-		CoTTrace:            e.buildCoTTrace(signal, actualAction, copySize, warnings),
+		CoTTrace:            e.buildCoTTrace(signal, matchResult.Action, copySize, warnings),
 		Decisions:           []decision.Decision{dec},
 		RawResponse:         fmt.Sprintf("Copy trade signal from %s:%s", e.config.ProviderType, e.config.LeaderID),
 		Timestamp:           time.Now(),
 		AIRequestDurationMs: 0,
 	}
 
-	// 7. 推送决策
 	select {
 	case e.decisionCh <- fullDec:
 		e.stats.DecisionsGenerated++
@@ -554,123 +674,85 @@ func (e *Engine) processSignal(signal *TradeSignal) {
 	}
 }
 
-// shouldFollowSignal 🎯 核心规则：统一 posId 方案
-// ============================================================
-// 判断逻辑（简单精确，100% 准确）：
-//  1. posId 状态为 active → 已跟随的仓位 → 继续跟随
-//  2. posId 状态为 ignored → 启动时的历史仓位 → 不跟随
-//  3. posId 无映射 → 新开仓 → 跟随
-// ============================================================
-func (e *Engine) shouldFollowSignal(signal *TradeSignal) (follow bool, reason string) {
+// buildDecisionV2 构建决策（使用统一匹配结果）
+func (e *Engine) buildDecisionV2(signal *TradeSignal, match *SignalMatchResult, copySize float64) decision.Decision {
 	fill := signal.Fill
 
-	// posId 方案：必须有 posId
-	if signal.LeaderPosID == "" {
-		logger.Errorf("❌ [%s] 信号缺少 posId | %s %s %s → 跳过",
-			e.traderID, fill.Symbol, fill.PositionSide, fill.Action)
-		return false, "信号缺少 posId，无法判断是否跟随"
+	dec := decision.Decision{
+		Symbol:      fill.Symbol,
+		Action:      e.mapAction(match.Action, fill.PositionSide),
+		Reasoning:   fmt.Sprintf("Copy trading: %s following %s leader %s", match.Action, e.config.ProviderType, e.config.LeaderID),
+		EntryPrice:  fill.Price,
+		LeaderPosID: match.PosID,
+		MarginMode:  match.MarginMode, // 直接使用匹配结果中的 marginMode
 	}
 
-	if e.store == nil {
-		logger.Errorf("❌ [%s] 数据库未初始化 | posId=%s → 跳过", e.traderID, signal.LeaderPosID)
-		return false, "数据库未初始化"
+	// ============================================================
+	// 开仓/加仓：设置仓位大小和杠杆
+	// ============================================================
+	if match.Action == ActionOpen || match.Action == ActionAdd {
+		dec.PositionSizeUSD = copySize
+		dec.Leverage = e.getLeaderLeverage(signal)
+		dec.Confidence = 90
+		logger.Infof("📊 [%s] %s | 金额=%.2f 杠杆=%dx 模式=%s 入场价=%.4f",
+			e.traderID, match.Action, copySize, dec.Leverage, dec.MarginMode, fill.Price)
 	}
 
-	// 查询数据库映射（包括 active 和 ignored 状态）
-	mapping, err := e.store.CopyTrade().GetMapping(e.traderID, signal.LeaderPosID)
-	if err != nil {
-		logger.Errorf("❌ [%s] 查询仓位映射失败: %v (posId=%s) → 跳过", e.traderID, err, signal.LeaderPosID)
-		return false, fmt.Sprintf("查询映射失败: %v", err)
-	}
+	// ============================================================
+	// 减仓：计算比例
+	// ============================================================
+	if match.Action == ActionReduce {
+		ratio := e.calculateReduceRatioV2(signal, match)
 
-	// 根据映射状态判断
-	if mapping != nil {
-		switch mapping.Status {
-		case "active":
-			// ✅ 已跟随的仓位 → 继续跟随
-			logger.Infof("📊 [%s] 已跟随仓位 | posId=%s status=active → 继续跟随",
-				e.traderID, signal.LeaderPosID)
-			return true, fmt.Sprintf("已跟随仓位(posId=%s)，继续跟随", signal.LeaderPosID)
-
-		case "ignored":
-			// ❌ 启动时的历史仓位 → 不跟随
-			logger.Infof("📊 [%s] 历史仓位 | posId=%s status=ignored → 不跟随",
-				e.traderID, signal.LeaderPosID)
-			return false, fmt.Sprintf("历史仓位(posId=%s)，不跟随", signal.LeaderPosID)
-
-		default:
-			// closed 或其他状态，视为可重新开仓
-			logger.Infof("📊 [%s] 仓位已关闭 | posId=%s status=%s → 视为新开仓",
-				e.traderID, signal.LeaderPosID, mapping.Status)
+		// 边界保护：减仓超过 95% 时，直接全量平仓
+		if ratio >= 0.95 {
+			logger.Infof("📊 [%s] 减仓比例 %.1f%% ≥ 95%%，转为全量平仓", e.traderID, ratio*100)
+			dec.CloseRatio = 0
+			dec.Reasoning = fmt.Sprintf("Copy trading: close (reduce %.0f%% → full close) following %s leader %s",
+				ratio*100, e.config.ProviderType, e.config.LeaderID)
+		} else {
+			dec.CloseRatio = ratio
+			dec.Reasoning = fmt.Sprintf("Copy trading: reduce %.0f%% following %s leader %s",
+				ratio*100, e.config.ProviderType, e.config.LeaderID)
+			logger.Infof("📊 [%s] 部分平仓 %.1f%% marginMode=%s", e.traderID, ratio*100, dec.MarginMode)
 		}
 	}
 
-	// ✅ 无映射或 closed 状态 = 新开仓 → 跟随
-	logger.Infof("📊 [%s] 新开仓 | posId=%s 无活跃映射 → 跟随开仓",
-		e.traderID, signal.LeaderPosID)
-	return true, fmt.Sprintf("新开仓(posId=%s)，跟随开仓", signal.LeaderPosID)
+	// ============================================================
+	// 平仓：全量平仓
+	// ============================================================
+	if match.Action == ActionClose {
+		dec.CloseRatio = 0 // 0 = 全量平仓
+		logger.Infof("📊 [%s] 全量平仓 marginMode=%s", e.traderID, dec.MarginMode)
+	}
+
+	return dec
 }
 
-// determineAction 判断实际动作类型（统一 posId 方案）
-// 核心逻辑：
-//   - 开仓/加仓：通过数据库映射判断（posId 精确匹配）
-//   - 减仓/平仓：通过领航员持仓状态判断
-func (e *Engine) determineAction(signal *TradeSignal) ActionType {
-	fill := signal.Fill
+// calculateReduceRatioV2 计算减仓比例（使用统一匹配结果）
+func (e *Engine) calculateReduceRatioV2(signal *TradeSignal, match *SignalMatchResult) float64 {
+	reduceSize := signal.Fill.Size
 
-	// ============================================================
-	// 开仓/加仓判断：统一使用 posId + 数据库映射
-	// ============================================================
-	if fill.Action == ActionOpen || fill.Action == ActionAdd {
-		leaderMgnMode := ""
-		if signal.LeaderPosition != nil {
-			leaderMgnMode = signal.LeaderPosition.MarginMode
-		}
-
-		logger.Infof("📊 [%s] determineAction | %s %s mgnMode=%s posId=%s",
-			e.traderID, fill.Symbol, fill.PositionSide, leaderMgnMode, signal.LeaderPosID)
-
-		// posId 方案：查数据库映射
-		if signal.LeaderPosID != "" && e.store != nil {
-			mapping, err := e.store.CopyTrade().GetActiveMapping(e.traderID, signal.LeaderPosID)
-			if err != nil {
-				logger.Errorf("❌ [%s] 查询仓位映射失败: %v (posId=%s)", e.traderID, err, signal.LeaderPosID)
-				// 出错时默认开仓（日志已记录错误）
-				return ActionOpen
-			}
-			if mapping != nil {
-				logger.Infof("📊 [%s] %s %s → 加仓 | posId=%s 映射存在",
-					e.traderID, fill.Symbol, fill.PositionSide, signal.LeaderPosID)
-				return ActionAdd
-			}
-			logger.Infof("📊 [%s] %s %s → 开仓 | posId=%s 无映射",
-				e.traderID, fill.Symbol, fill.PositionSide, signal.LeaderPosID)
-			return ActionOpen
-		}
-
-		// 无 posId（如 Hyperliquid）：默认开仓
-		logger.Infof("📊 [%s] %s %s → 开仓 | 无 posId，默认开仓", e.traderID, fill.Symbol, fill.PositionSide)
-		return ActionOpen
+	leaderCurrentSize := float64(0)
+	if match.LeaderPosition != nil {
+		leaderCurrentSize = match.LeaderPosition.Size
 	}
 
-	// ============================================================
-	// 减仓 vs 平仓判断
-	// ============================================================
-	if signal.LeaderPosition == nil || signal.LeaderPosition.Size == 0 {
-		logger.Infof("📊 [%s] %s → 平仓 | 领航员仓位已清零", e.traderID, fill.Symbol)
-		return ActionClose
+	// 推算减仓前的仓位 = 当前仓位 + 本次减仓量
+	leaderPreviousSize := leaderCurrentSize + reduceSize
+
+	if leaderPreviousSize <= 0 {
+		logger.Infof("📊 [%s] %s 减仓比例 | 减仓量=%.4f 当前=%.4f → 100%% (异常)",
+			e.traderID, signal.Fill.Symbol, reduceSize, leaderCurrentSize)
+		return 1.0
 	}
 
-	// 🆕 最简单准确的判断：如果减仓量 >= 当前持仓的 95%，视为全平
-	// 解决 OKX API 延迟导致获取到的持仓是旧值的问题 
-	if fill.Size >= signal.LeaderPosition.Size*0.95 {
-		logger.Infof("📊 [%s] %s → 平仓 | 减仓量(%.4f) ≈ 当前持仓(%.4f)，视为全平",
-			e.traderID, fill.Symbol, fill.Size, signal.LeaderPosition.Size)
-		return ActionClose
-	}
+	ratio := reduceSize / leaderPreviousSize
 
-	logger.Infof("📊 [%s] %s → 减仓 | 领航员剩余=%.4f", e.traderID, fill.Symbol, signal.LeaderPosition.Size)
-	return ActionReduce
+	logger.Infof("📊 [%s] %s 减仓比例 | 减仓量=%.4f 当前=%.4f 减仓前=%.4f → %.1f%%",
+		e.traderID, signal.Fill.Symbol, reduceSize, leaderCurrentSize, leaderPreviousSize, ratio*100)
+
+	return ratio
 }
 
 // ============================================================================
@@ -754,114 +836,9 @@ func (e *Engine) calculateCopySize(signal *TradeSignal) (float64, []Warning) {
 	return copySize, warnings
 }
 
-// calculateReduceRatio 计算减仓比例
-// 公式: 减仓比例 = 本次减仓量 / 减仓前总仓位
-// 例如: 领航员从 0.03 ETH 减到 0.02 ETH，减仓量=0.01，比例=0.01/0.03=33%
-func (e *Engine) calculateReduceRatio(signal *TradeSignal) float64 {
-	reduceSize := signal.Fill.Size // 本次减仓数量
-
-	// 获取领航员当前剩余仓位
-	leaderCurrentSize := float64(0)
-	if signal.LeaderPosition != nil {
-		leaderCurrentSize = signal.LeaderPosition.Size
-	}
-
-	// 推算减仓前的仓位 = 当前仓位 + 本次减仓量
-	leaderPreviousSize := leaderCurrentSize + reduceSize
-
-	// 边界检查
-	if leaderPreviousSize <= 0 {
-		logger.Infof("📊 [%s] %s 减仓比例 | 减仓量=%.4f 当前=%.4f 减仓前=%.4f → 100%% (异常，视为全平)",
-			e.traderID, signal.Fill.Symbol, reduceSize, leaderCurrentSize, leaderPreviousSize)
-		return 1.0
-	}
-
-	ratio := reduceSize / leaderPreviousSize
-
-	logger.Infof("📊 [%s] %s 减仓比例 | 减仓量=%.4f 当前=%.4f 减仓前=%.4f → %.1f%%",
-		e.traderID, signal.Fill.Symbol, reduceSize, leaderCurrentSize, leaderPreviousSize, ratio*100)
-
-	return ratio
-}
-
-// ============================================================================
-// Decision 构建
-// ============================================================================
-
-func (e *Engine) buildDecision(signal *TradeSignal, action ActionType, copySize float64) decision.Decision {
-	fill := signal.Fill
-
-	dec := decision.Decision{
-		Symbol:      fill.Symbol,
-		Action:      e.mapAction(action, fill.PositionSide),
-		Reasoning:   fmt.Sprintf("Copy trading: %s following %s leader %s", action, e.config.ProviderType, e.config.LeaderID),
-		EntryPrice:  fill.Price,         // 记录领航员成交价格，用于前端显示
-		LeaderPosID: signal.LeaderPosID, // 领航员仓位 ID，用于映射追踪
-	}
-
-	// ============================================================
-	// 开仓/加仓：设置仓位大小和杠杆
-	// ============================================================
-	if action == ActionOpen || action == ActionAdd {
-		dec.PositionSizeUSD = copySize
-		dec.Leverage = e.getLeaderLeverage(signal)
-		dec.MarginMode = e.getLeaderMarginMode(signal)
-		dec.Confidence = 90
-		logger.Infof("📊 [%s] %s | 金额=%.2f 杠杆=%dx 模式=%s 入场价=%.4f", e.traderID, action, copySize, dec.Leverage, dec.MarginMode, fill.Price)
-	}
-
-	// ============================================================
-	// 减仓/平仓：从数据库映射获取 MarginMode（精确匹配仓位）
-	// ============================================================
-	if action == ActionReduce || action == ActionClose {
-		// 从数据库映射获取 marginMode（posId 方案的核心）
-		if signal.LeaderPosID != "" && e.store != nil {
-			mapping, err := e.store.CopyTrade().GetActiveMapping(e.traderID, signal.LeaderPosID)
-			if err == nil && mapping != nil {
-				dec.MarginMode = mapping.MarginMode
-				logger.Infof("📊 [%s] 减仓/平仓使用数据库映射的 marginMode=%s (posId=%s)",
-					e.traderID, mapping.MarginMode, signal.LeaderPosID)
-			}
-		}
-		// 回退：如果数据库没有，使用领航员信号中的
-		if dec.MarginMode == "" {
-			dec.MarginMode = e.getLeaderMarginMode(signal)
-		}
-	}
-
-	// ============================================================
-	// 减仓：计算比例，按比例部分平仓
-	// ============================================================
-	if action == ActionReduce {
-		ratio := e.calculateReduceRatio(signal)
-
-		// 边界保护：减仓超过 95% 时，直接全量平仓
-		if ratio >= 0.95 {
-			logger.Infof("📊 [%s] 减仓比例 %.1f%% ≥ 95%%，转为全量平仓", e.traderID, ratio*100)
-			dec.CloseRatio = 0 // 0 = 全量平仓
-			dec.Reasoning = fmt.Sprintf("Copy trading: close (reduce %.0f%% → full close) following %s leader %s",
-				ratio*100, e.config.ProviderType, e.config.LeaderID)
-		} else {
-			dec.CloseRatio = ratio
-			dec.Reasoning = fmt.Sprintf("Copy trading: reduce %.0f%% following %s leader %s",
-				ratio*100, e.config.ProviderType, e.config.LeaderID)
-			logger.Infof("📊 [%s] 部分平仓 %.1f%% marginMode=%s", e.traderID, ratio*100, dec.MarginMode)
-		}
-	}
-
-	// ============================================================
-	// 平仓：全量平仓
-	// ============================================================
-	if action == ActionClose {
-		dec.CloseRatio = 0 // 0 = 全量平仓
-		logger.Infof("📊 [%s] 全量平仓 marginMode=%s", e.traderID, dec.MarginMode)
-	}
-
-	return dec
-}
 
 // getLeaderLeverage 获取领航员杠杆
-// 优先级：1.信号中的持仓杠杆 2.变化追踪的仓位 3.缓存的持仓 4.默认值(10x)
+// 优先级：1.信号中的持仓杠杆 2.缓存的持仓 3.默认值(10x)
 func (e *Engine) getLeaderLeverage(signal *TradeSignal) int {
 	// 1. 如果不同步杠杆，返回默认值
 	if !e.config.SyncLeverage {
@@ -873,72 +850,20 @@ func (e *Engine) getLeaderLeverage(signal *TradeSignal) int {
 		return signal.LeaderPosition.Leverage
 	}
 
-	// 3. 从缓存查找（使用 defer 确保锁平衡）
+	// 3. 从缓存的领航员状态获取
 	e.leaderStateMu.RLock()
 	defer e.leaderStateMu.RUnlock()
 
-	// 从变化追踪的仓位获取
-	for _, pos := range e.changedPositions {
-		if pos.Symbol == signal.Fill.Symbol && pos.Side == signal.Fill.PositionSide && pos.Leverage > 0 {
-			logger.Infof("🔍 [%s] 从变化追踪获取领航员 %s 杠杆: %dx", e.traderID, signal.Fill.Symbol, pos.Leverage)
-			return pos.Leverage
-		}
-	}
-
-	// 从缓存的领航员状态获取
 	if e.leaderState != nil && e.leaderState.Positions != nil {
 		for _, pos := range e.leaderState.Positions {
 			if pos.Symbol == signal.Fill.Symbol && pos.Side == signal.Fill.PositionSide && pos.Leverage > 0 {
-				logger.Infof("🔍 [%s] 从缓存获取领航员 %s 杠杆: %dx", e.traderID, signal.Fill.Symbol, pos.Leverage)
 				return pos.Leverage
 			}
 		}
 	}
 
 	// 4. 默认值
-	logger.Warnf("⚠️ [%s] 无法获取领航员杠杆，使用默认值 10x", e.traderID)
 	return 10
-}
-
-// getLeaderMarginMode 获取领航员保证金模式
-// 优先级：1.信号中的持仓模式 2.变化追踪的仓位 3.缓存的持仓 4.默认值(cross)
-func (e *Engine) getLeaderMarginMode(signal *TradeSignal) string {
-	// 1. 如果不同步保证金模式，返回默认值
-	if !e.config.SyncMarginMode {
-		return "cross" // 默认全仓
-	}
-
-	// 2. 如果信号中有持仓信息，使用该模式
-	if signal.LeaderPosition != nil && signal.LeaderPosition.MarginMode != "" {
-		logger.Infof("🔍 [%s] 使用领航员 %s 保证金模式: %s", e.traderID, signal.Fill.Symbol, signal.LeaderPosition.MarginMode)
-		return signal.LeaderPosition.MarginMode
-	}
-
-	// 3. 从缓存查找（使用 defer 确保锁平衡）
-	e.leaderStateMu.RLock()
-	defer e.leaderStateMu.RUnlock()
-
-	// 从变化追踪的仓位获取
-	for _, pos := range e.changedPositions {
-		if pos.Symbol == signal.Fill.Symbol && pos.Side == signal.Fill.PositionSide && pos.MarginMode != "" {
-			logger.Infof("🔍 [%s] 从变化追踪获取领航员 %s 保证金模式: %s", e.traderID, signal.Fill.Symbol, pos.MarginMode)
-			return pos.MarginMode
-		}
-	}
-
-	// 从缓存的领航员状态获取
-	if e.leaderState != nil && e.leaderState.Positions != nil {
-		for _, pos := range e.leaderState.Positions {
-			if pos.Symbol == signal.Fill.Symbol && pos.Side == signal.Fill.PositionSide && pos.MarginMode != "" {
-				logger.Infof("🔍 [%s] 从缓存获取领航员 %s 保证金模式: %s", e.traderID, signal.Fill.Symbol, pos.MarginMode)
-				return pos.MarginMode
-			}
-		}
-	}
-
-	// 4. 默认值
-	logger.Warnf("⚠️ [%s] 无法获取领航员保证金模式，使用默认值 cross", e.traderID)
-	return "cross"
 }
 
 func (e *Engine) mapAction(action ActionType, side SideType) string {
@@ -1047,11 +972,6 @@ func (e *Engine) syncLeaderState() error {
 	}
 
 	e.leaderStateMu.Lock()
-	// 对比新旧持仓，找出变化的仓位（用于 OKX 区分全仓/逐仓）
-	e.detectPositionChanges(e.leaderState, state)
-
-	// 保存历史状态
-	e.prevLeaderState = e.leaderState
 	e.leaderState = state
 	e.lastStateSync = time.Now()
 	e.leaderStateMu.Unlock()
@@ -1062,57 +982,6 @@ func (e *Engine) syncLeaderState() error {
 	return nil
 }
 
-// detectPositionChanges 对比新旧持仓，找出变化的仓位
-// 核心逻辑：使用 posId 作为唯一标识（OKX 独有），100% 准确区分不同仓位
-// 非 OKX 场景（无 posId）使用原始 key
-func (e *Engine) detectPositionChanges(oldState, newState *AccountState) {
-	// 每次检测前清空旧的变化记录，避免内存泄漏
-	e.changedPositions = make(map[string]*Position)
-
-	if newState == nil || newState.Positions == nil {
-		return
-	}
-
-	// 获取旧持仓 map
-	oldPositions := make(map[string]*Position)
-	if oldState != nil && oldState.Positions != nil {
-		oldPositions = oldState.Positions
-	}
-
-	// 遍历新持仓，对比变化
-	for key, newPos := range newState.Positions {
-		oldPos := oldPositions[key]
-
-		// 使用 posId 作为 key（如果有），否则用原始 key
-		trackKey := key
-		if newPos.PosID != "" {
-			trackKey = newPos.PosID
-		}
-
-		if oldPos == nil {
-			e.changedPositions[trackKey] = newPos
-			logger.Debugf("📊 [%s] 持仓变化检测 | 新增: %s %s mgnMode=%s posId=%s size=%.4f",
-				e.traderID, newPos.Symbol, newPos.Side, newPos.MarginMode, newPos.PosID, newPos.Size)
-		} else if absFloat(newPos.Size-oldPos.Size) > 0.0001 {
-			e.changedPositions[trackKey] = newPos
-			logger.Debugf("📊 [%s] 持仓变化检测 | 变化: %s %s mgnMode=%s posId=%s size: %.4f → %.4f delta=%.4f",
-				e.traderID, newPos.Symbol, newPos.Side, newPos.MarginMode, newPos.PosID, oldPos.Size, newPos.Size, newPos.Size-oldPos.Size)
-		}
-	}
-
-	// 检测平仓（旧有新无）
-	for key, oldPos := range oldPositions {
-		if _, exists := newState.Positions[key]; !exists {
-			trackKey := key
-			if oldPos.PosID != "" {
-				trackKey = oldPos.PosID
-			}
-			e.changedPositions[trackKey] = oldPos
-			logger.Debugf("📊 [%s] 持仓变化检测 | 清仓: %s %s mgnMode=%s posId=%s",
-				e.traderID, oldPos.Symbol, oldPos.Side, oldPos.MarginMode, oldPos.PosID)
-		}
-	}
-}
 
 func (e *Engine) initSeenFills() {
 	since := time.Now().Add(-5 * time.Minute)
@@ -1175,3 +1044,4 @@ func (e *Engine) logWarning(w Warning) {
 
 	logger.Warnf("⚠️ [%s] 预警:%s | %s | %s", e.traderID, w.Type, w.Symbol, w.Message)
 }
+
