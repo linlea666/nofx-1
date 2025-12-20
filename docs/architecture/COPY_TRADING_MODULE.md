@@ -141,97 +141,97 @@ NOFX 当前的交易决策完全由 AI 模型驱动。为扩展信号来源，�
 
 #### 2.2.2 判断新开仓 vs 加仓的方法
 
-**判断方案：本地仓位对比法（最简单、最准确）**
+**判断方案：posId + 数据库映射（100% 准确）**
+
+> **v2.0 更新**：采用 OKX 的 `posId` 作为仓位唯一标识，配合数据库映射实现 100% 准确的历史仓位判断。
+
+**核心原理：**
+1. **启动跟单时**：获取领航员当前所有持仓，将其 posId 标记为 `ignored` 状态
+2. **收到信号时**：查询数据库映射，根据状态判断是否跟随
+
+**数据库映射状态：**
+
+| 状态 | 含义 | 处理方式 |
+|------|------|----------|
+| `active` | 我们已跟随的仓位 | ✅ 继续跟随（加仓/减仓/平仓） |
+| `ignored` | 启动时的历史仓位 | ❌ 不跟随 |
+| `closed` | 已平仓的历史记录 | 视为无映射，可重新开仓 |
+| 无映射 | 新仓位 | ✅ 新开仓，跟随 |
 
 ```go
-// 判断逻辑伪代码
+// 判断逻辑（v2.0 简化版）
 func shouldFollowSignal(signal TradeSignal) (follow bool, reason string) {
-    localPosition := getLocalPosition(signal.Symbol, signal.PositionSide)
+    // 必须有 posId
+    if signal.LeaderPosID == "" {
+        return false, "信号缺少 posId"
+    }
     
-    if signal.Action == "open" {
-        if localPosition == nil || localPosition.Size == 0 {
-            // 本地无仓位 + 领航员开仓 = 新开仓（跟！）
-            return true, "新开仓信号，本地无持仓"
-        } else {
-            // 本地有仓位 + 领航员"开仓" = 其实是加仓（跟！因为是我们跟过的仓位）
-            return true, "加仓信号，跟随已有仓位"
+    // 查询数据库映射（包括 active 和 ignored 状态）
+    mapping := store.GetMapping(traderID, signal.LeaderPosID)
+    
+    if mapping != nil {
+        switch mapping.Status {
+        case "active":
+            // ✅ 已跟随的仓位 → 继续跟随
+            return true, "已跟随仓位，继续跟随"
+        case "ignored":
+            // ❌ 启动时的历史仓位 → 不跟随
+            return false, "历史仓位，不跟随"
         }
     }
     
-    if signal.Action == "add" || signal.Action == "reduce" || signal.Action == "close" {
-        if localPosition == nil || localPosition.Size == 0 {
-            // 本地无仓位 + 领航员加仓/减仓/平仓 = 历史仓位操作（不跟！）
-            return false, "忽略：领航员历史仓位操作，我们未跟随该仓位"
-        } else {
-            // 本地有仓位 = 是我们跟过的仓位（跟！）
-            return true, "跟随已有仓位的操作"
-        }
-    }
-    
-    return false, "未知操作类型"
+    // ✅ 无映射 = 新开仓 → 跟随
+    return true, "新开仓，跟随"
 }
 ```
 
-**判断流程图：**
+**判断流程图（v2.0）：**
 
 ```
               领航员发出交易信号
                       │
                       ▼
            ┌─────────────────────┐
-           │   查询本地仓位状态   │
-           │   (同币种同方向)     │
+           │  查询数据库映射      │
+           │  GetMapping(posId)   │
            └──────────┬──────────┘
                       │
-           ┌──────────┴──────────┐
-           │                      │
-           ▼                      ▼
-      本地有仓位               本地无仓位
-           │                      │
-           │                      ├─ 信号=开仓 ─┐
-           │                      │             │
-           │                      │             ▼
-           │                      │    ┌────────────────────┐
-           │                      │    │  🔍 历史仓位检测    │
-           │                      │    │  领航员当前持仓 vs  │
-           │                      │    │  本次交易量         │
-           │                      │    └─────────┬──────────┘
-           │                      │              │
-           │                      │    ┌─────────┴─────────┐
-           │                      │    │                    │
-           │                      │    ▼                    ▼
-           │                      │ 持仓>交易*1.2        持仓≈交易
-           │                      │    │                    │
-           │                      │    ▼                    ▼
-           │                      │ ❌ 跳过              ✅ 跟随
-           │                      │ (历史仓位加仓)       (新开仓)
-           │                      │
-           │                      └─ 信号=其他 ────────▶ ❌ 忽略（历史仓位）
-           │
-           └─────────── 任何信号 ─────────────────────▶ ✅ 跟随（已跟仓位）
+           ┌──────────┼──────────┐
+           │          │          │
+           ▼          ▼          ▼
+     status=active  status=ignored  无映射
+           │          │          │
+           ▼          ▼          ▼
+      ✅ 继续跟随   ❌ 不跟随    ✅ 新开仓
+      (已跟仓位)   (历史仓位)   (跟随)
 ```
 
-**🔍 历史仓位检测逻辑说明：**
-
-当本地无仓位 + 信号=开仓时，需要额外检测领航员是"新开仓"还是"历史仓位加仓"：
-
-| 场景 | 判断条件 | 结果 |
-|------|---------|------|
-| 新开仓 | 领航员当前持仓 ≈ 本次交易量 | ✅ 跟随 |
-| 历史仓位加仓 | 领航员当前持仓 > 本次交易量 × 1.2 | ❌ 跳过 |
+**启动时初始化历史仓位：**
 
 ```go
-// 历史仓位检测实现
-if signal.LeaderPosition != nil {
-    leaderCurrentSize := signal.LeaderPosition.Size
-    thisTradeSize := fill.Size
+// InitIgnoredPositions 在启动跟单时调用
+func (e *Engine) InitIgnoredPositions() error {
+    // 获取领航员当前所有持仓
+    state := provider.GetAccountState(leaderID)
     
-    // 阈值 1.2：允许滑点、部分成交等误差
-    if leaderCurrentSize > thisTradeSize*1.2 {
-        return false, "忽略：领航员历史仓位加仓"
+    // 将所有持仓的 posId 标记为 ignored
+    for _, pos := range state.Positions {
+        if pos.PosID != "" {
+            store.SaveIgnoredPosition(traderID, leaderID, pos.PosID, ...)
+        }
     }
+    return nil
 }
 ```
+
+**为什么 posId 方案更好？**
+
+| 对比项 | 旧方案（1.2x 阈值） | 新方案（posId 映射） |
+|--------|---------------------|---------------------|
+| 准确性 | 依赖阈值，有误判风险 | 100% 准确 |
+| 边界情况 | 多种误判场景 | 无 |
+| 逻辑复杂度 | 需要计算比例 | 只查数据库 |
+| 支持场景 | 仅 OKX/Hyperliquid | 所有有 posId 的交易所 |
 
 #### 2.2.3 判断减仓 vs 平仓的方法
 
@@ -3111,6 +3111,7 @@ func normalizeOKXSymbol(instId string) string {
 | v1.6 | 2025-12-16 | 补充边界情况处理：<br>1. 系统重启：复用现有 PositionSyncManager，从交易所获取真实仓位<br>2. 用户手动操作：尊重用户行为，后续忽略是合理的<br>3. 反向开仓乱序：新增反向窗口保护（防御性编程） |
 | v1.7 | 2025-12-16 | 优化去重逻辑：<br>1. 使用时间戳过期机制替代随机删除<br>2. 默认 1 小时过期<br>3. 定期清理过期记录，避免内存泄漏 |
 | v1.8 | 2025-12-18 | 完善历史仓位检测与 WebSocket 混合模式：<br>1. 更新流程图，增加"历史仓位检测"分支<br>2. 历史仓位检测扩展到所有 Provider（OKX + Hyperliquid）<br>3. 检测条件：领航员当前持仓 > 本次交易量 × 1.2 则跳过<br>4. Hyperliquid 新增 WebSocket 混合模式：收到 fill 后通过 REST 获取账户状态<br>5. 解决 WebSocket 模式下权益和杠杆获取问题 |
+| **v2.0** | **2025-12-20** | **🎯 posId 统一方案重大更新：**<br>1. **历史仓位处理**：启动跟单时记录领航员已有仓位为 `ignored` 状态<br>2. **100% 准确判断**：通过数据库映射状态（active/ignored/无映射）判断是否跟随<br>3. **去掉阈值检测**：不再依赖 1.2x 阈值，避免误判<br>4. **新增方法**：`InitIgnoredPositions()`、`GetMapping()`、`SaveIgnoredPosition()`<br>5. **简化流程**：查数据库 → 判断状态 → 决策，逻辑更清晰<br>6. **修改文件**：store/copytrade.go、copytrade/engine.go、copytrade/integration.go |
 
 ---
 
