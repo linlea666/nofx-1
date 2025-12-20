@@ -654,10 +654,18 @@ func (e *Engine) determineAction(signal *TradeSignal) ActionType {
 	}
 
 	// ============================================================
-	// 减仓 vs 平仓判断：通过领航员持仓状态
+	// 减仓 vs 平仓判断
 	// ============================================================
 	if signal.LeaderPosition == nil || signal.LeaderPosition.Size == 0 {
 		logger.Infof("📊 [%s] %s → 平仓 | 领航员仓位已清零", e.traderID, fill.Symbol)
+		return ActionClose
+	}
+
+	// 🆕 最简单准确的判断：如果减仓量 >= 当前持仓的95%，视为全平
+	// 解决 OKX API 延迟导致获取到的持仓是旧值的问题
+	if fill.Size >= signal.LeaderPosition.Size*0.95 {
+		logger.Infof("📊 [%s] %s → 平仓 | 减仓量(%.4f) ≈ 当前持仓(%.4f)，视为全平",
+			e.traderID, fill.Symbol, fill.Size, signal.LeaderPosition.Size)
 		return ActionClose
 	}
 
