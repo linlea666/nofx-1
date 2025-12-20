@@ -1201,6 +1201,17 @@ func (at *AutoTrader) executeCloseLongWithRecord(decision *decision.Decision, ac
 	if decision.CloseRatio > 0 && decision.CloseRatio < 1 && totalQuantity > 0 {
 		closeQuantity = totalQuantity * decision.CloseRatio
 		logger.Infof("  📊 Partial close: %.0f%% of %.4f = %.4f", decision.CloseRatio*100, totalQuantity, closeQuantity)
+
+		// 🆕 边界检查：仓位太小无法按比例减仓
+		// 当仓位很小时，由于最小下单量（1张合约）约束，减仓可能导致意外全平
+		// 例如：仓位 0.01 BNB（1张），减仓50% = 0.005，但向上取整到1张 → 全平
+		// 为避免这种情况，当仓位 < 阈值且不是接近全平时，跳过减仓
+		const minPositionForPartialClose = 0.02 // 约2张合约的阈值
+		if totalQuantity < minPositionForPartialClose && decision.CloseRatio < 0.9 {
+			logger.Warnf("  ⚠️ 仓位太小 (%.4f < %.4f)，无法按 %.0f%% 比例减仓，跳过本次操作",
+				totalQuantity, minPositionForPartialClose, decision.CloseRatio*100)
+			return nil
+		}
 	}
 
 	// Close position
@@ -1288,6 +1299,17 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *decision.Decision, a
 	if decision.CloseRatio > 0 && decision.CloseRatio < 1 && totalQuantity > 0 {
 		closeQuantity = totalQuantity * decision.CloseRatio
 		logger.Infof("  📊 Partial close: %.0f%% of %.4f = %.4f", decision.CloseRatio*100, totalQuantity, closeQuantity)
+
+		// 🆕 边界检查：仓位太小无法按比例减仓
+		// 当仓位很小时，由于最小下单量（1张合约）约束，减仓可能导致意外全平
+		// 例如：仓位 0.01 BNB（1张），减仓50% = 0.005，但向上取整到1张 → 全平
+		// 为避免这种情况，当仓位 < 阈值且不是接近全平时，跳过减仓
+		const minPositionForPartialClose = 0.02 // 约2张合约的阈值
+		if totalQuantity < minPositionForPartialClose && decision.CloseRatio < 0.9 {
+			logger.Warnf("  ⚠️ 仓位太小 (%.4f < %.4f)，无法按 %.0f%% 比例减仓，跳过本次操作",
+				totalQuantity, minPositionForPartialClose, decision.CloseRatio*100)
+			return nil
+		}
 	}
 
 	// Close position
