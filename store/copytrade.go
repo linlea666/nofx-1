@@ -408,17 +408,43 @@ func (s *CopyTradeStore) SavePositionMapping(mapping *CopyTradePositionMapping) 
 
 // GetActiveMapping 查询活跃的仓位映射（判断开仓/加仓时调用）
 func (s *CopyTradeStore) GetActiveMapping(traderID, leaderPosID string) (*CopyTradePositionMapping, error) {
+	return s.getMappingByStatus(traderID, leaderPosID, "active")
+}
+
+// GetMapping 查询任意状态的仓位映射（包括 active/ignored/closed）
+// 用于判断是否应该跟随信号：
+//   - active: 已跟随的仓位 → 继续跟随
+//   - ignored: 启动时的历史仓位 → 不跟随
+//   - closed: 已平仓 → 可以重新开仓
+//   - nil: 无映射 → 新开仓
+func (s *CopyTradeStore) GetMapping(traderID, leaderPosID string) (*CopyTradePositionMapping, error) {
+	return s.getMappingByStatus(traderID, leaderPosID, "")
+}
+
+// getMappingByStatus 内部方法：按状态查询映射
+func (s *CopyTradeStore) getMappingByStatus(traderID, leaderPosID, status string) (*CopyTradePositionMapping, error) {
 	var mapping CopyTradePositionMapping
 	var openedAt, updatedAt string
 	var closedAt sql.NullString
 
-	err := s.db.QueryRow(`
+	query := `
 		SELECT id, trader_id, leader_pos_id, leader_id, symbol, side, margin_mode, status,
 		       opened_at, open_price, open_size_usd, closed_at, close_price,
 		       add_count, reduce_count, updated_at
 		FROM copy_trade_position_mappings
-		WHERE trader_id = ? AND leader_pos_id = ? AND status = 'active'
-	`, traderID, leaderPosID).Scan(
+		WHERE trader_id = ? AND leader_pos_id = ?
+	`
+	args := []interface{}{traderID, leaderPosID}
+
+	if status != "" {
+		query += " AND status = ?"
+		args = append(args, status)
+	} else {
+		// 无状态筛选时，优先返回 active/ignored，忽略 closed
+		query += " AND status IN ('active', 'ignored') ORDER BY CASE status WHEN 'active' THEN 1 WHEN 'ignored' THEN 2 END LIMIT 1"
+	}
+
+	err := s.db.QueryRow(query, args...).Scan(
 		&mapping.ID, &mapping.TraderID, &mapping.LeaderPosID, &mapping.LeaderID,
 		&mapping.Symbol, &mapping.Side, &mapping.MarginMode, &mapping.Status,
 		&openedAt, &mapping.OpenPrice, &mapping.OpenSizeUSD, &closedAt, &mapping.ClosePrice,
@@ -439,6 +465,19 @@ func (s *CopyTradeStore) GetActiveMapping(traderID, leaderPosID string) (*CopyTr
 	}
 
 	return &mapping, nil
+}
+
+// SaveIgnoredPosition 保存历史仓位（启动跟单时调用）
+// 标记为 ignored 状态，后续这些仓位的操作都不跟随
+func (s *CopyTradeStore) SaveIgnoredPosition(traderID, leaderID, leaderPosID, symbol, side, marginMode string) error {
+	_, err := s.db.Exec(`
+		INSERT INTO copy_trade_position_mappings 
+			(trader_id, leader_pos_id, leader_id, symbol, side, margin_mode, status,
+			 opened_at, open_price, open_size_usd, add_count, reduce_count, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, 'ignored', CURRENT_TIMESTAMP, 0, 0, 0, 0, CURRENT_TIMESTAMP)
+		ON CONFLICT(trader_id, leader_pos_id) DO NOTHING
+	`, traderID, leaderPosID, leaderID, symbol, side, marginMode)
+	return err
 }
 
 // IncrementAddCount 增加加仓次数（加仓时调用）

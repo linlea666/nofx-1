@@ -93,6 +93,12 @@ func (ti *TraderIntegration) StartCopyTrading() error {
 	// 设置数据库存储（用于仓位映射）
 	engine.SetStore(ti.store)
 
+	// 🔑 初始化历史仓位：将领航员当前持仓标记为 ignored
+	// 这样后续这些仓位的操作都不会跟随，只跟新开仓
+	if err := engine.InitIgnoredPositions(); err != nil {
+		logger.Warnf("⚠️ [%s] 初始化历史仓位失败: %v（继续启动）", ti.traderID, err)
+	}
+
 	ti.engine = engine
 
 	// 启动引擎

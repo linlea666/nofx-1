@@ -138,6 +138,56 @@ func (e *Engine) SetStore(st *store.Store) {
 	e.store = st
 }
 
+// InitIgnoredPositions 初始化领航员历史仓位（启动跟单时调用）
+// 将领航员当前所有持仓标记为 ignored，后续这些仓位的操作都不跟随
+// 这样可以 100% 准确地区分"新开仓"和"历史仓位操作"
+func (e *Engine) InitIgnoredPositions() error {
+	if e.store == nil {
+		return fmt.Errorf("store not initialized")
+	}
+
+	// 获取领航员当前所有持仓
+	state, err := e.provider.GetAccountState(e.config.LeaderID)
+	if err != nil {
+		return fmt.Errorf("获取领航员持仓失败: %w", err)
+	}
+
+	if state == nil || len(state.Positions) == 0 {
+		logger.Infof("📊 [%s] 领航员当前无持仓，无需标记历史仓位", e.traderID)
+		return nil
+	}
+
+	// 将所有持仓标记为 ignored
+	ignoredCount := 0
+	for _, pos := range state.Positions {
+		// 必须有 posId 才能标记
+		if pos.PosID == "" {
+			logger.Warnf("⚠️ [%s] 持仓 %s %s 无 posId，跳过标记", e.traderID, pos.Symbol, pos.Side)
+			continue
+		}
+
+		err := e.store.CopyTrade().SaveIgnoredPosition(
+			e.traderID,
+			e.config.LeaderID,
+			pos.PosID,
+			pos.Symbol,
+			string(pos.Side),
+			pos.MarginMode,
+		)
+		if err != nil {
+			logger.Warnf("⚠️ [%s] 标记历史仓位失败 posId=%s: %v", e.traderID, pos.PosID, err)
+			continue
+		}
+
+		ignoredCount++
+		logger.Infof("📊 [%s] 标记历史仓位 | posId=%s %s %s %s",
+			e.traderID, pos.PosID, pos.Symbol, pos.Side, pos.MarginMode)
+	}
+
+	logger.Infof("✅ [%s] 历史仓位初始化完成 | 共标记 %d 个仓位为 ignored", e.traderID, ignoredCount)
+	return nil
+}
+
 // Start 启动引擎
 func (e *Engine) Start(ctx context.Context) error {
 	e.mu.Lock()
@@ -506,11 +556,10 @@ func (e *Engine) processSignal(signal *TradeSignal) {
 
 // shouldFollowSignal 🎯 核心规则：统一 posId 方案
 // ============================================================
-// 判断逻辑（简单精确）：
-//  1. 有 posId + 数据库有映射 → 继续跟随（加仓/减仓/平仓）
-//  2. 有 posId + 数据库无映射 + 开仓信号 + 新开仓验证 → 跟随
-//  3. 有 posId + 数据库无映射 + 非开仓信号 → 历史仓位操作，跳过
-//  4. 无 posId → 错误日志，跳过
+// 判断逻辑（简单精确，100% 准确）：
+//  1. posId 状态为 active → 已跟随的仓位 → 继续跟随
+//  2. posId 状态为 ignored → 启动时的历史仓位 → 不跟随
+//  3. posId 无映射 → 新开仓 → 跟随
 // ============================================================
 func (e *Engine) shouldFollowSignal(signal *TradeSignal) (follow bool, reason string) {
 	fill := signal.Fill
@@ -527,55 +576,39 @@ func (e *Engine) shouldFollowSignal(signal *TradeSignal) (follow bool, reason st
 		return false, "数据库未初始化"
 	}
 
-	// 查询数据库映射
-	mapping, err := e.store.CopyTrade().GetActiveMapping(e.traderID, signal.LeaderPosID)
+	// 查询数据库映射（包括 active 和 ignored 状态）
+	mapping, err := e.store.CopyTrade().GetMapping(e.traderID, signal.LeaderPosID)
 	if err != nil {
 		logger.Errorf("❌ [%s] 查询仓位映射失败: %v (posId=%s) → 跳过", e.traderID, err, signal.LeaderPosID)
 		return false, fmt.Sprintf("查询映射失败: %v", err)
 	}
 
+	// 根据映射状态判断
 	if mapping != nil {
-		// ✅ 有映射 = 我们已跟随该仓位 → 继续跟随
-		logger.Infof("📊 [%s] 数据库映射存在 | posId=%s → 继续跟随",
-			e.traderID, signal.LeaderPosID)
-		return true, fmt.Sprintf("数据库映射存在(posId=%s)，继续跟随", signal.LeaderPosID)
-	}
+		switch mapping.Status {
+		case "active":
+			// ✅ 已跟随的仓位 → 继续跟随
+			logger.Infof("📊 [%s] 已跟随仓位 | posId=%s status=active → 继续跟随",
+				e.traderID, signal.LeaderPosID)
+			return true, fmt.Sprintf("已跟随仓位(posId=%s)，继续跟随", signal.LeaderPosID)
 
-	// ============================================================
-	// 无映射：需要判断是"新开仓"还是"历史仓位操作"
-	// ============================================================
+		case "ignored":
+			// ❌ 启动时的历史仓位 → 不跟随
+			logger.Infof("📊 [%s] 历史仓位 | posId=%s status=ignored → 不跟随",
+				e.traderID, signal.LeaderPosID)
+			return false, fmt.Sprintf("历史仓位(posId=%s)，不跟随", signal.LeaderPosID)
 
-	// 非开仓信号（add/reduce/close）→ 明确是历史仓位操作
-	if fill.Action != ActionOpen {
-		logger.Infof("📊 [%s] 历史仓位 | posId=%s 无映射 + %s 信号 → 跳过",
-			e.traderID, signal.LeaderPosID, fill.Action)
-		return false, fmt.Sprintf("历史仓位操作(posId=%s 无映射)，跳过", signal.LeaderPosID)
-	}
-
-	// ActionOpen 信号：需要验证是否真的是新开仓
-	// 因为 OKX 无法区分新开仓和加仓，统一返回 ActionOpen
-	// 验证方法：如果领航员当前持仓 > 本次交易量，说明是历史仓位加仓
-	if signal.LeaderPosition != nil && signal.LeaderPosition.Size > 0 {
-		leaderCurrentSize := signal.LeaderPosition.Size
-		thisTradeSize := fill.Size
-
-		// 如果领航员当前持仓明显大于本次交易量（>1.5x），说明是历史仓位加仓
-		// 使用 1.5x 而不是 1.2x，给一些容差（价格波动可能导致数量略有差异）
-		if leaderCurrentSize > thisTradeSize*1.5 {
-			logger.Infof("📊 [%s] 历史仓位检测 | posId=%s | 当前持仓=%.4f > 本次交易=%.4f*1.5 → 判定为历史仓位加仓，跳过",
-				e.traderID, signal.LeaderPosID, leaderCurrentSize, thisTradeSize)
-			return false, fmt.Sprintf("历史仓位加仓(posId=%s, 当前%.4f > 本次%.4f)，跳过",
-				signal.LeaderPosID, leaderCurrentSize, thisTradeSize)
+		default:
+			// closed 或其他状态，视为可重新开仓
+			logger.Infof("📊 [%s] 仓位已关闭 | posId=%s status=%s → 视为新开仓",
+				e.traderID, signal.LeaderPosID, mapping.Status)
 		}
-
-		logger.Infof("📊 [%s] 新开仓确认 | posId=%s | 当前持仓=%.4f ≈ 本次交易=%.4f → 确认新开仓",
-			e.traderID, signal.LeaderPosID, leaderCurrentSize, thisTradeSize)
 	}
 
-	// ✅ 新开仓 → 跟随
-	logger.Infof("📊 [%s] 新开仓 | posId=%s 无映射 + open 信号 → 跟随开仓",
+	// ✅ 无映射或 closed 状态 = 新开仓 → 跟随
+	logger.Infof("📊 [%s] 新开仓 | posId=%s 无活跃映射 → 跟随开仓",
 		e.traderID, signal.LeaderPosID)
-	return true, "新开仓（posId 无映射），跟随开仓"
+	return true, fmt.Sprintf("新开仓(posId=%s)，跟随开仓", signal.LeaderPosID)
 }
 
 // determineAction 判断实际动作类型（统一 posId 方案）
