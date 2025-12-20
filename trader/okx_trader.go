@@ -830,28 +830,30 @@ func (t *OKXTrader) CloseLong(symbol string, quantity float64) (map[string]inter
 		return nil, fmt.Errorf("failed to get instrument info: %w", err)
 	}
 
-	// 从持仓数据中获取实际的 margin mode（平仓必须使用与仓位相同的模式）
-	tdMode := t.getMgnMode() // 默认使用缓存的模式
+	// 🔑 posId 方案：使用已设置的 marginMode 筛选仓位
+	tdMode := t.getMgnMode()
 	positions, err := t.GetPositions()
 	if err != nil {
 		return nil, err
 	}
+	logger.Infof("🔍 OKX CloseLong searching positions: symbol=%s, targetMgnMode=%s, count=%d", symbol, tdMode, len(positions))
 	for _, pos := range positions {
 		if pos["symbol"] == symbol && pos["side"] == "long" {
-			// If quantity is 0, use full position
+			posMgnMode, _ := pos["mgnMode"].(string)
+			// 精确匹配 marginMode（posId 方案核心）
+			if posMgnMode != tdMode {
+				logger.Infof("🔍 Skip long position: mgnMode=%s (want %s)", posMgnMode, tdMode)
+				continue
+			}
 			if quantity == 0 {
 				quantity = pos["positionAmt"].(float64)
 			}
-			// 使用仓位实际的 margin mode
-			if mgnMode, ok := pos["mgnMode"].(string); ok && mgnMode != "" {
-				tdMode = mgnMode
-				logger.Infof("📊 使用仓位实际的保证金模式: %s", tdMode)
-			}
+			logger.Infof("📊 Found matching long position: mgnMode=%s, quantity=%.4f", posMgnMode, quantity)
 			break
 		}
 	}
 	if quantity == 0 {
-		return nil, fmt.Errorf("long position not found for %s", symbol)
+		return nil, fmt.Errorf("long position not found for %s (mgnMode=%s)", symbol, tdMode)
 	}
 
 	// Convert quantity (base asset) to contract count
@@ -918,32 +920,30 @@ func (t *OKXTrader) CloseShort(symbol string, quantity float64) (map[string]inte
 		return nil, fmt.Errorf("failed to get instrument info: %w", err)
 	}
 
-	// 从持仓数据中获取实际的 margin mode（平仓必须使用与仓位相同的模式）
-	tdMode := t.getMgnMode() // 默认使用缓存的模式
+	// 🔑 posId 方案：使用已设置的 marginMode 筛选仓位
+	tdMode := t.getMgnMode()
 	positions, err := t.GetPositions()
 	if err != nil {
 		return nil, err
 	}
-	logger.Infof("🔍 OKX CloseShort searching positions: symbol=%s, current position count=%d", symbol, len(positions))
+	logger.Infof("🔍 OKX CloseShort searching positions: symbol=%s, targetMgnMode=%s, count=%d", symbol, tdMode, len(positions))
 	for _, pos := range positions {
-		logger.Infof("🔍 OKX position: symbol=%v, side=%v, positionAmt=%v, mgnMode=%v",
-			pos["symbol"], pos["side"], pos["positionAmt"], pos["mgnMode"])
 		if pos["symbol"] == symbol && pos["side"] == "short" {
-			// If quantity is 0, use full position
+			posMgnMode, _ := pos["mgnMode"].(string)
+			// 精确匹配 marginMode（posId 方案核心）
+			if posMgnMode != tdMode {
+				logger.Infof("🔍 Skip short position: mgnMode=%s (want %s)", posMgnMode, tdMode)
+				continue
+			}
 			if quantity == 0 {
 				quantity = pos["positionAmt"].(float64)
-				logger.Infof("🔍 OKX found short position: quantity=%f (base asset)", quantity)
 			}
-			// 使用仓位实际的 margin mode
-			if mgnMode, ok := pos["mgnMode"].(string); ok && mgnMode != "" {
-				tdMode = mgnMode
-				logger.Infof("📊 使用仓位实际的保证金模式: %s", tdMode)
-			}
+			logger.Infof("📊 Found matching short position: mgnMode=%s, quantity=%.4f", posMgnMode, quantity)
 			break
 		}
 	}
 	if quantity == 0 {
-		return nil, fmt.Errorf("short position not found for %s", symbol)
+		return nil, fmt.Errorf("short position not found for %s (mgnMode=%s)", symbol, tdMode)
 	}
 
 	// Ensure quantity is positive (OKX sz parameter must be positive)

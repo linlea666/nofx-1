@@ -504,94 +504,58 @@ func (e *Engine) processSignal(signal *TradeSignal) {
 	}
 }
 
-// shouldFollowSignal 🎯 核心规则：只跟新开仓（本地仓位对比法）
+// shouldFollowSignal 🎯 核心规则：统一 posId 方案
 // ============================================================
-// 判断逻辑（优先级从高到低）：
-//  1. 数据库有映射 → 跟随（我们已跟随该仓位）
-//  2. 本地有仓位 → 跟随（加仓/减仓/平仓）
-//  3. 本地无仓位 + 领航员开仓 → 跟随（新开仓）
-//  4. 本地无仓位 + 领航员历史仓位操作 → 跳过
-//
-// OKX 特殊处理：
-//   - 使用 posId 查询数据库映射，精确判断是否已跟随
-//   - 无 posId 时回退到持仓量比较推断
-//
+// 判断逻辑（简单精确）：
+//  1. 有 posId + 数据库有映射 → 继续跟随（加仓/减仓/平仓）
+//  2. 有 posId + 数据库无映射 + 开仓信号 → 新开仓，跟随
+//  3. 有 posId + 数据库无映射 + 非开仓信号 → 历史仓位操作，跳过
+//  4. 无 posId → 错误日志，跳过
 // ============================================================
 func (e *Engine) shouldFollowSignal(signal *TradeSignal) (follow bool, reason string) {
 	fill := signal.Fill
 
-	// ====== 优先查数据库映射（精确判断是否已跟随该仓位） ======
-	if signal.LeaderPosID != "" && e.store != nil {
-		mapping, err := e.store.CopyTrade().GetActiveMapping(e.traderID, signal.LeaderPosID)
-		if err != nil {
-			logger.Warnf("⚠️ [%s] 查询仓位映射失败: %v", e.traderID, err)
-		} else if mapping != nil {
-			// 数据库有映射 → 说明我们已跟随该仓位，继续跟随
-			logger.Infof("📊 [%s] 数据库映射存在 | posId=%s → 已跟随该仓位，继续跟随",
-				e.traderID, signal.LeaderPosID)
-			return true, fmt.Sprintf("数据库映射存在(posId=%s)，继续跟随", signal.LeaderPosID)
-		}
+	// posId 方案：必须有 posId
+	if signal.LeaderPosID == "" {
+		logger.Errorf("❌ [%s] 信号缺少 posId | %s %s %s → 跳过",
+			e.traderID, fill.Symbol, fill.PositionSide, fill.Action)
+		return false, "信号缺少 posId，无法判断是否跟随"
 	}
 
-	// ====== 回退逻辑：无 posId 或无数据库时，使用原有逻辑 ======
-
-	// 获取本地仓位（实时从交易所获取）
-	localPositions := e.getFollowerPositions()
-
-	// 获取领航员的保证金模式（用于 OKX 区分全仓/逐仓）
-	leaderMgnMode := ""
-	if e.config.SyncMarginMode && signal.LeaderPosition != nil {
-		leaderMgnMode = signal.LeaderPosition.MarginMode
+	if e.store == nil {
+		logger.Errorf("❌ [%s] 数据库未初始化 | posId=%s → 跳过", e.traderID, signal.LeaderPosID)
+		return false, "数据库未初始化"
 	}
 
-	// 查找本地仓位
-	localPosition := e.findLocalPosition(localPositions, fill.Symbol, fill.PositionSide, leaderMgnMode)
-	hasLocalPosition := localPosition != nil && localPosition.Size > 0
-
-	switch fill.Action {
-	case ActionOpen:
-		// 开仓信号
-		if hasLocalPosition {
-			return true, "开仓信号，本地已有仓位 → 跟随加仓"
-		}
-
-		// 本地无仓位 + 数据库无映射 → 需要判断领航员是"新开仓"还是"历史仓位加仓"
-		if signal.LeaderPosition != nil {
-			leaderCurrentSize := signal.LeaderPosition.Size
-			thisTradeSize := fill.Size
-
-			// 如果领航员当前持仓明显大于本次交易量，说明是历史仓位加仓
-			if leaderCurrentSize > thisTradeSize*1.2 {
-				logger.Infof("📊 [%s] 历史仓位检测 | %s %s | 领航员当前持仓=%.4f > 本次交易=%.4f*1.2 → 判定为历史仓位加仓",
-					e.traderID, fill.Symbol, fill.PositionSide, leaderCurrentSize, thisTradeSize)
-				return false, fmt.Sprintf("忽略：领航员历史仓位加仓（当前持仓%.4f > 本次交易%.4f），我们未跟随该仓位", leaderCurrentSize, thisTradeSize)
-			}
-			logger.Infof("📊 [%s] 新开仓确认 | %s %s | 领航员当前持仓=%.4f ≈ 本次交易=%.4f → 确认为新开仓",
-				e.traderID, fill.Symbol, fill.PositionSide, leaderCurrentSize, thisTradeSize)
-		}
-
-		return true, "新开仓，本地无持仓 → 跟随开仓"
-
-	case ActionAdd:
-		// 加仓信号：本地有仓位才跟随（数据库映射已在上面处理）
-		if !hasLocalPosition {
-			return false, "忽略：领航员历史仓位加仓，我们未跟随该仓位"
-		}
-		return true, "加仓信号，本地有仓位 → 跟随加仓"
-
-	case ActionReduce, ActionClose:
-		// 减仓/平仓信号：本地有仓位才跟随（数据库映射已在上面处理）
-		if !hasLocalPosition {
-			return false, "忽略：领航员历史仓位操作，我们未跟随该仓位"
-		}
-		return true, "减仓/平仓信号，本地有仓位 → 跟随操作"
-
-	default:
-		return false, fmt.Sprintf("未知操作类型: %s", fill.Action)
+	// 查询数据库映射
+	mapping, err := e.store.CopyTrade().GetActiveMapping(e.traderID, signal.LeaderPosID)
+	if err != nil {
+		logger.Errorf("❌ [%s] 查询仓位映射失败: %v (posId=%s) → 跳过", e.traderID, err, signal.LeaderPosID)
+		return false, fmt.Sprintf("查询映射失败: %v", err)
 	}
+
+	if mapping != nil {
+		// ✅ 有映射 = 我们已跟随该仓位 → 继续跟随
+		logger.Infof("📊 [%s] 数据库映射存在 | posId=%s → 继续跟随",
+			e.traderID, signal.LeaderPosID)
+		return true, fmt.Sprintf("数据库映射存在(posId=%s)，继续跟随", signal.LeaderPosID)
+	}
+
+	// 无映射：根据 Action 判断
+	if fill.Action == ActionOpen {
+		// ✅ 新开仓 → 跟随
+		logger.Infof("📊 [%s] 新开仓 | posId=%s 无映射 + open 信号 → 跟随开仓",
+			e.traderID, signal.LeaderPosID)
+		return true, "新开仓（posId 无映射），跟随开仓"
+	}
+
+	// ❌ 无映射 + 非开仓信号 = 历史仓位操作 → 跳过
+	logger.Infof("📊 [%s] 历史仓位 | posId=%s 无映射 + %s 信号 → 跳过",
+		e.traderID, signal.LeaderPosID, fill.Action)
+	return false, fmt.Sprintf("历史仓位操作(posId=%s 无映射)，跳过", signal.LeaderPosID)
 }
 
-// determineAction 判断实际动作类型
+// determineAction 判断实际动作类型（统一 posId 方案）
 // 核心逻辑：
 //   - 开仓/加仓：通过数据库映射判断（posId 精确匹配）
 //   - 减仓/平仓：通过领航员持仓状态判断
@@ -599,71 +563,49 @@ func (e *Engine) determineAction(signal *TradeSignal) ActionType {
 	fill := signal.Fill
 
 	// ============================================================
-	// 开仓/加仓判断：优先使用数据库映射（posId 精确匹配）
+	// 开仓/加仓判断：统一使用 posId + 数据库映射
 	// ============================================================
 	if fill.Action == ActionOpen || fill.Action == ActionAdd {
-		// 获取领航员的保证金模式
 		leaderMgnMode := ""
-		if e.config.SyncMarginMode && signal.LeaderPosition != nil {
+		if signal.LeaderPosition != nil {
 			leaderMgnMode = signal.LeaderPosition.MarginMode
 		}
 
-		// 🔍 调试日志
-		logger.Infof("📊 [%s] 本地持仓检查 | 信号: %s %s mgnMode=%s posId=%s",
+		logger.Infof("📊 [%s] determineAction | %s %s mgnMode=%s posId=%s",
 			e.traderID, fill.Symbol, fill.PositionSide, leaderMgnMode, signal.LeaderPosID)
 
-		// ====== 优先使用数据库映射判断（精确匹配） ======
+		// posId 方案：查数据库映射
 		if signal.LeaderPosID != "" && e.store != nil {
 			mapping, err := e.store.CopyTrade().GetActiveMapping(e.traderID, signal.LeaderPosID)
 			if err != nil {
-				logger.Warnf("⚠️ [%s] 查询仓位映射失败: %v，回退到内存匹配", e.traderID, err)
-			} else if mapping != nil {
-				// 数据库有映射 → 加仓
-				logger.Infof("📊 [%s] %s %s %s → 加仓 | 数据库映射存在 (posId=%s)",
-					e.traderID, fill.Symbol, fill.PositionSide, leaderMgnMode, signal.LeaderPosID)
-				return ActionAdd
-			} else {
-				// 数据库无映射 → 新开仓
-				logger.Infof("📊 [%s] %s %s %s → 新开仓 | 数据库无映射 (posId=%s)",
-					e.traderID, fill.Symbol, fill.PositionSide, leaderMgnMode, signal.LeaderPosID)
+				logger.Errorf("❌ [%s] 查询仓位映射失败: %v (posId=%s)", e.traderID, err, signal.LeaderPosID)
+				// 出错时默认开仓（日志已记录错误）
 				return ActionOpen
 			}
+			if mapping != nil {
+				logger.Infof("📊 [%s] %s %s → 加仓 | posId=%s 映射存在",
+					e.traderID, fill.Symbol, fill.PositionSide, signal.LeaderPosID)
+				return ActionAdd
+			}
+			logger.Infof("📊 [%s] %s %s → 开仓 | posId=%s 无映射",
+				e.traderID, fill.Symbol, fill.PositionSide, signal.LeaderPosID)
+			return ActionOpen
 		}
 
-		// ====== 回退逻辑：无 posId 或无数据库时，使用内存匹配 ======
-		// 主要用于 Hyperliquid 或降级场景
-		localPositions := e.getFollowerPositions()
-		for k, v := range localPositions {
-			logger.Infof("   - 持仓: %s | 方向=%s 模式=%s posId=%s 数量=%.4f", k, v.Side, v.MarginMode, v.PosID, v.Size)
-		}
-
-		localPosition := e.findLocalPosition(localPositions, fill.Symbol, fill.PositionSide, leaderMgnMode)
-		hasLocalPosition := localPosition != nil && localPosition.Size > 0
-
-		if hasLocalPosition {
-			logger.Infof("📊 [%s] %s %s %s → 加仓 | 本地已有仓位 %.4f (内存匹配)",
-				e.traderID, fill.Symbol, fill.PositionSide, leaderMgnMode, localPosition.Size)
-			return ActionAdd
-		}
-		logger.Infof("📊 [%s] %s %s %s → 新开仓 | 本地无此方向+模式持仓 (内存匹配)",
-			e.traderID, fill.Symbol, fill.PositionSide, leaderMgnMode)
+		// 无 posId（如 Hyperliquid）：默认开仓
+		logger.Infof("📊 [%s] %s %s → 开仓 | 无 posId，默认开仓", e.traderID, fill.Symbol, fill.PositionSide)
 		return ActionOpen
 	}
 
 	// ============================================================
-	// 减仓 vs 平仓判断：通过领航员实时持仓状态
+	// 减仓 vs 平仓判断：通过领航员持仓状态
 	// ============================================================
-	if signal.LeaderPosition == nil {
-		logger.Infof("📊 [%s] %s → 平仓 | 原因: 领航员持仓数据为空（可能已清仓）", e.traderID, fill.Symbol)
+	if signal.LeaderPosition == nil || signal.LeaderPosition.Size == 0 {
+		logger.Infof("📊 [%s] %s → 平仓 | 领航员仓位已清零", e.traderID, fill.Symbol)
 		return ActionClose
 	}
 
-	if signal.LeaderPosition.Size == 0 {
-		logger.Infof("📊 [%s] %s → 平仓 | 原因: 领航员仓位已清零", e.traderID, fill.Symbol)
-		return ActionClose
-	}
-
-	logger.Infof("📊 [%s] %s → 减仓 | 领航员剩余仓位=%.4f（非清零，按比例减仓）", e.traderID, fill.Symbol, signal.LeaderPosition.Size)
+	logger.Infof("📊 [%s] %s → 减仓 | 领航员剩余=%.4f", e.traderID, fill.Symbol, signal.LeaderPosition.Size)
 	return ActionReduce
 }
 
@@ -803,13 +745,31 @@ func (e *Engine) buildDecision(signal *TradeSignal, action ActionType, copySize 
 	}
 
 	// ============================================================
+	// 减仓/平仓：从数据库映射获取 MarginMode（精确匹配仓位）
+	// ============================================================
+	if action == ActionReduce || action == ActionClose {
+		// 从数据库映射获取 marginMode（posId 方案的核心）
+		if signal.LeaderPosID != "" && e.store != nil {
+			mapping, err := e.store.CopyTrade().GetActiveMapping(e.traderID, signal.LeaderPosID)
+			if err == nil && mapping != nil {
+				dec.MarginMode = mapping.MarginMode
+				logger.Infof("📊 [%s] 减仓/平仓使用数据库映射的 marginMode=%s (posId=%s)",
+					e.traderID, mapping.MarginMode, signal.LeaderPosID)
+			}
+		}
+		// 回退：如果数据库没有，使用领航员信号中的
+		if dec.MarginMode == "" {
+			dec.MarginMode = e.getLeaderMarginMode(signal)
+		}
+	}
+
+	// ============================================================
 	// 减仓：计算比例，按比例部分平仓
 	// ============================================================
 	if action == ActionReduce {
 		ratio := e.calculateReduceRatio(signal)
 
 		// 边界保护：减仓超过 95% 时，直接全量平仓
-		// 避免因精度问题导致 CloseRatio=1.0 时执行层误判
 		if ratio >= 0.95 {
 			logger.Infof("📊 [%s] 减仓比例 %.1f%% ≥ 95%%，转为全量平仓", e.traderID, ratio*100)
 			dec.CloseRatio = 0 // 0 = 全量平仓
@@ -819,7 +779,7 @@ func (e *Engine) buildDecision(signal *TradeSignal, action ActionType, copySize 
 			dec.CloseRatio = ratio
 			dec.Reasoning = fmt.Sprintf("Copy trading: reduce %.0f%% following %s leader %s",
 				ratio*100, e.config.ProviderType, e.config.LeaderID)
-			logger.Infof("📊 [%s] 部分平仓 %.1f%%", e.traderID, ratio*100)
+			logger.Infof("📊 [%s] 部分平仓 %.1f%% marginMode=%s", e.traderID, ratio*100, dec.MarginMode)
 		}
 	}
 
@@ -828,7 +788,7 @@ func (e *Engine) buildDecision(signal *TradeSignal, action ActionType, copySize 
 	// ============================================================
 	if action == ActionClose {
 		dec.CloseRatio = 0 // 0 = 全量平仓
-		logger.Infof("📊 [%s] 全量平仓", e.traderID)
+		logger.Infof("📊 [%s] 全量平仓 marginMode=%s", e.traderID, dec.MarginMode)
 	}
 
 	return dec
@@ -1148,30 +1108,4 @@ func (e *Engine) logWarning(w Warning) {
 	e.warningsMu.Unlock()
 
 	logger.Warnf("⚠️ [%s] 预警:%s | %s | %s", e.traderID, w.Type, w.Symbol, w.Message)
-}
-
-// findLocalPosition 在本地仓位中查找匹配的仓位
-// 核心逻辑：localPositions 的 key 可能是 posId（OKX）或 mgnMode key
-// 需要遍历查找 symbol+side+mgnMode 匹配的仓位
-func (e *Engine) findLocalPosition(localPositions map[string]*Position, symbol string, side SideType, mgnMode string) *Position {
-	// 优先尝试直接 key 匹配（快速路径）
-	key := PositionKeyWithMode(symbol, side, mgnMode)
-	if pos, ok := localPositions[key]; ok {
-		return pos
-	}
-
-	// 直接 key 未找到，遍历查找 symbol+side+mgnMode 匹配的仓位
-	// 这是因为 localPositions 的 key 可能是 posId 而不是 mgnMode key
-	for _, pos := range localPositions {
-		if pos.Symbol == symbol && pos.Side == side {
-			// 如果指定了 mgnMode，需要精确匹配
-			if mgnMode != "" && pos.MarginMode != mgnMode {
-				continue
-			}
-			// 如果未指定 mgnMode 或 mgnMode 匹配，返回该仓位
-			return pos
-		}
-	}
-
-	return nil
 }

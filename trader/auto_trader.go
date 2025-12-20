@@ -1159,26 +1159,44 @@ func (at *AutoTrader) executeCloseLongWithRecord(decision *decision.Decision, ac
 	}
 	actionRecord.Price = marketData.CurrentPrice
 
+	// 🔑 posId 方案：设置正确的 marginMode（复用 SetMarginMode）
+	if decision.MarginMode != "" {
+		isCross := decision.MarginMode == "cross"
+		if err := at.trader.SetMarginMode(decision.Symbol, isCross); err != nil {
+			logger.Warnf("  ⚠️ SetMarginMode failed: %v (继续执行)", err)
+		} else {
+			logger.Infof("  📊 Set marginMode=%s for close long", decision.MarginMode)
+		}
+	}
+
 	// Get entry price and quantity from exchange API (most accurate)
 	var entryPrice float64
 	var totalQuantity float64
 	positions, err := at.trader.GetPositions()
 	if err == nil {
 		for _, pos := range positions {
+			// 根据 marginMode 精确匹配仓位
 			if pos["symbol"] == decision.Symbol && pos["side"] == "long" {
+				// 如果指定了 marginMode，需要精确匹配
+				if decision.MarginMode != "" {
+					posMgnMode, _ := pos["mgnMode"].(string)
+					if posMgnMode != decision.MarginMode {
+						continue // 跳过不匹配的仓位
+					}
+				}
 				if ep, ok := pos["entryPrice"].(float64); ok {
 					entryPrice = ep
 				}
 				if amt, ok := pos["positionAmt"].(float64); ok && amt > 0 {
 					totalQuantity = amt
 				}
+				logger.Infof("  📊 Found long position: mgnMode=%v, quantity=%.4f", pos["mgnMode"], totalQuantity)
 				break
 			}
 		}
 	}
 
 	// Calculate close quantity based on CloseRatio
-	// CloseRatio = 0 means close all, CloseRatio = 0.5 means close 50%, etc.
 	closeQuantity := float64(0) // 0 = close all
 	if decision.CloseRatio > 0 && decision.CloseRatio < 1 && totalQuantity > 0 {
 		closeQuantity = totalQuantity * decision.CloseRatio
@@ -1224,34 +1242,48 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *decision.Decision, a
 	}
 	actionRecord.Price = marketData.CurrentPrice
 
+	// 🔑 posId 方案：设置正确的 marginMode（复用 SetMarginMode）
+	if decision.MarginMode != "" {
+		isCross := decision.MarginMode == "cross"
+		if err := at.trader.SetMarginMode(decision.Symbol, isCross); err != nil {
+			logger.Warnf("  ⚠️ SetMarginMode failed: %v (继续执行)", err)
+		} else {
+			logger.Infof("  📊 Set marginMode=%s for close short", decision.MarginMode)
+		}
+	}
+
 	// Get entry price and quantity from exchange API (most accurate)
 	var entryPrice float64
 	var totalQuantity float64
 	positions, err := at.trader.GetPositions()
 	if err == nil {
 		for _, pos := range positions {
+			// 根据 marginMode 精确匹配仓位
 			if pos["symbol"] == decision.Symbol && pos["side"] == "short" {
+				// 如果指定了 marginMode，需要精确匹配
+				if decision.MarginMode != "" {
+					posMgnMode, _ := pos["mgnMode"].(string)
+					if posMgnMode != decision.MarginMode {
+						continue // 跳过不匹配的仓位
+					}
+				}
 				if ep, ok := pos["entryPrice"].(float64); ok {
 					entryPrice = ep
 				}
 				if amt, ok := pos["positionAmt"].(float64); ok {
-					// positionAmt format varies by exchange:
-					// - Binance/Bybit: negative for short positions
-					// - Hyperliquid/OKX/Bitget: already positive (normalized)
-					// Use absolute value to handle both cases
 					if amt < 0 {
 						totalQuantity = -amt
 					} else {
 						totalQuantity = amt
 					}
 				}
+				logger.Infof("  📊 Found short position: mgnMode=%v, quantity=%.4f", pos["mgnMode"], totalQuantity)
 				break
 			}
 		}
 	}
 
 	// Calculate close quantity based on CloseRatio
-	// CloseRatio = 0 means close all, CloseRatio = 0.5 means close 50%, etc.
 	closeQuantity := float64(0) // 0 = close all
 	if decision.CloseRatio > 0 && decision.CloseRatio < 1 && totalQuantity > 0 {
 		closeQuantity = totalQuantity * decision.CloseRatio
