@@ -444,8 +444,8 @@ func (e *Engine) buildLeaderPosMap() map[string]*Position {
 
 // matchOpenAddSignal 匹配开仓/加仓信号
 // 核心思想：
-//   1. 新开仓：找领航员持仓中没有本地映射的 posId
-//   2. 加仓：通过 lastKnownSize 变化判断是哪个仓位被加仓（size 增加的那个）
+//  1. 新开仓：找领航员持仓中没有本地映射的 posId
+//  2. 加仓：通过 lastKnownSize 变化判断是哪个仓位被加仓（size 增加的那个）
 func (e *Engine) matchOpenAddSignal(signal *TradeSignal, leaderPosMap map[string]*Position) *SignalMatchResult {
 	fill := signal.Fill
 

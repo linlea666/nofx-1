@@ -1,10 +1,10 @@
 # NOFX 真人领航员跟单系统设计文档
 
-> **版本**: v1.1  
-> **状态**: 设计阶段  
+> **版本**: v2.1  
+> **状态**: 已实现  
 > **作者**: Core Engineering Team  
 > **创建日期**: 2025-12-16  
-> **更新日期**: 2025-12-16
+> **更新日期**: 2025-12-21
 
 ---
 
@@ -104,9 +104,48 @@ NOFX 当前的交易决策完全由 AI 模型驱动。为扩展信号来源，�
 
 > ⚠️ **注意**：OKX 没有反向开仓动作，只有上述四种基本动作。
 
-### 2.2 核心跟单规则：统一 posId 方案（v2.0）
+### 2.2 核心跟单规则：统一 posId + lastKnownSize 方案（v2.1）
 
-> **🎯 核心设计**：使用 OKX 的 `posId` 作为仓位唯一标识，统一处理所有跟单场景（开仓、加仓、减仓、平仓、同币种多仓位）。
+> **🎯 核心设计**：使用 OKX 的 `posId` 作为仓位唯一标识，通过 `lastKnownSize` 变化精确判断操作目标，统一处理所有跟单场景（开仓、加仓、减仓、平仓、同币种多仓位）。
+
+#### 2.2.0 核心架构：通知 + 持仓对比
+
+> **重要理解**：OKX 的 `trade-records` API 只作为"交易通知"，不依赖其返回的具体数据（因为缺少关键信息）。
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      信号处理核心架构                                    │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  trade-records API (通知)              position-current API (真实数据)   │
+│  ┌─────────────────────┐               ┌─────────────────────────────┐  │
+│  │ 提供：               │               │ 提供：                       │  │
+│  │ ✓ symbol            │               │ ✓ posId (仓位唯一标识)       │  │
+│  │ ✓ side/posSide      │      →        │ ✓ mgnMode (cross/isolated)  │  │
+│  │ ✓ size/value        │   触发获取    │ ✓ lever (杠杆)              │  │
+│  │ ✗ posId (无!)       │               │ ✓ size (当前持仓)           │  │
+│  │ ✗ mgnMode (无!)     │               │ ✓ 完整准确的仓位信息        │  │
+│  └─────────────────────┘               └─────────────────────────────┘  │
+│              ↓                                      ↓                    │
+│         交易发生通知                        精确的仓位信息               │
+│              ↓                                      ↓                    │
+│              └────────────→ 对比 lastKnownSize ←────┘                    │
+│                                      ↓                                   │
+│                           精确判断哪个仓位被操作                         │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**数据来源对比：**
+
+| 字段 | trade-records (通知) | position-current (持仓) | 实际使用来源 |
+|------|---------------------|------------------------|-------------|
+| posId | ❌ 没有 | ✅ 有 | **持仓 API** |
+| mgnMode | ❌ 没有 | ✅ 有 | **持仓 API** |
+| lever | ⚠️ 可能不准 | ✅ 准确 | **持仓 API** |
+| size | ✅ 有（交易量） | ✅ 有（当前持仓） | 通知用于触发，持仓用于判断 |
+| symbol | ✅ 有 | ✅ 有 | 通知 |
+| side/posSide | ✅ 有 | ✅ 有 | 通知 |
 
 #### 2.2.1 posId 是什么？
 
@@ -124,34 +163,84 @@ NOFX 当前的交易决策完全由 AI 模型驱动。为扩展信号来源，�
 - ✅ 仓位生命周期内保持不变
 - ✅ 平仓后 posId 失效，新开仓会分配新 posId
 
-#### 2.2.2 统一判断逻辑
+#### 2.2.2 lastKnownSize 是什么？
 
-**核心规则：所有跟单判断都通过 posId + 数据库映射状态来决定**
+`lastKnownSize` 是本地数据库记录的领航员某仓位的"上次已知大小"。用于精确判断哪个仓位发生了变化：
+
+```go
+type CopyTradePositionMapping struct {
+    TraderID      string    // 跟随者 ID
+    LeaderPosID   string    // 领航员仓位 ID (posId)
+    Symbol        string    // 交易对
+    Side          string    // long/short
+    MarginMode    string    // cross/isolated
+    Status        string    // active/ignored/closed
+    LastKnownSize float64   // ← 上次已知大小（关键字段）
+    AddCount      int       // 加仓次数
+    ReduceCount   int       // 减仓次数
+}
+```
+
+**更新时机：**
+- 开仓成功 → 保存初始 `lastKnownSize`
+- 加仓成功 → 更新为当前大小
+- 减仓成功 → 更新为当前大小
+- 平仓成功 → 标记 status=closed
+
+**为什么需要 lastKnownSize？**
+
+当领航员有两个同币种同方向仓位时：
+```
+posId=A: BNBUSDT long isolated 10x, lastKnownSize=2.0
+posId=B: BNBUSDT long cross 3x, lastKnownSize=4.0
+```
+
+收到加仓信号时，trade-records 只告诉我们 "BNBUSDT long buy"，不知道是加到哪个仓位。
+
+通过对比 `currentSize`（持仓 API）和 `lastKnownSize`（数据库）：
+- posId=A: currentSize=2.0, lastKnownSize=2.0 → 无变化
+- posId=B: currentSize=6.0, lastKnownSize=4.0 → **增加了！这个是加仓目标**
+
+#### 2.2.3 统一信号匹配逻辑（核心！）
+
+**核心规则：开仓/加仓和减仓/平仓使用不同的匹配策略**
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
-│                       统一 posId 跟单方案                                │
+│                    统一 posId + lastKnownSize 跟单方案                   │
 ├──────────────────────────────────────────────────────────────────────────┤
 │                                                                          │
 │  数据库映射表：copy_trade_position_mappings                              │
-│  ┌────────────┬────────────┬────────────┬────────────┬─────────────────┐│
-│  │ trader_id  │ leader_pos_id │ symbol  │ status     │ 说明            ││
-│  ├────────────┼────────────┼────────────┼────────────┼─────────────────┤│
-│  │ trader_001 │ 123456     │ SOLUSDT   │ active     │ 正在跟随的仓位  ││
-│  │ trader_001 │ 234567     │ SOLUSDT   │ ignored    │ 启动时的历史仓位││
-│  │ trader_001 │ 345678     │ ETHUSDT   │ closed     │ 已平仓的历史记录││
-│  └────────────┴────────────┴────────────┴────────────┴─────────────────┘│
+│  ┌────────────┬────────────┬────────────┬────────────┬───────────────┐  │
+│  │ trader_id  │ leader_pos_id │ symbol  │ status     │ lastKnownSize │  │
+│  ├────────────┼────────────┼────────────┼────────────┼───────────────┤  │
+│  │ trader_001 │ 123456     │ BNBUSDT   │ active     │ 2.0           │  │
+│  │ trader_001 │ 234567     │ BNBUSDT   │ active     │ 4.0           │  │
+│  │ trader_001 │ 345678     │ SOLUSDT   │ ignored    │ 10.0          │  │
+│  │ trader_001 │ 456789     │ ETHUSDT   │ closed     │ 0.0           │  │
+│  └────────────┴────────────┴────────────┴────────────┴───────────────┘  │
 │                                                                          │
-│  判断逻辑：                                                              │
-│  ┌────────────────┬────────────────┬──────────────────────────────────┐ │
-│  │   映射状态     │   操作类型     │           处理方式               │ │
-│  ├────────────────┼────────────────┼──────────────────────────────────┤ │
-│  │ 无映射         │ 开仓信号       │ ✅ 新开仓，创建 active 映射      │ │
-│  │ active         │ 开仓信号       │ ✅ 加仓，add_count++             │ │
-│  │ active         │ 平仓信号       │ ✅ 减仓/平仓，按领航员持仓判断   │ │
-│  │ ignored        │ 任何信号       │ ❌ 历史仓位，不跟随              │ │
-│  │ closed         │ 开仓信号       │ ✅ 重新开仓（新周期）            │ │
-│  └────────────────┴────────────────┴──────────────────────────────────┘ │
+│  🔵 开仓/加仓信号匹配（三轮匹配）：                                      │
+│  ┌─────────────────────────────────────────────────────────────────────┐│
+│  │ 第1轮：查找新开仓（无映射或 closed 的 posId）                       ││
+│  │        → 找到则返回 ActionOpen                                      ││
+│  │                                                                     ││
+│  │ 第2轮：通过 lastKnownSize 变化判断加仓                              ││
+│  │        → currentSize > lastKnownSize 的仓位 = 加仓目标              ││
+│  │        → 找到则返回 ActionAdd                                       ││
+│  │                                                                     ││
+│  │ 第3轮：兜底 - 只有一个 active 仓位时直接匹配                        ││
+│  │        → 多个 active 但无法判断时跳过并警告                         ││
+│  └─────────────────────────────────────────────────────────────────────┘│
+│                                                                          │
+│  🔴 减仓/平仓信号匹配（反向查找法）：                                    │
+│  ┌─────────────────────────────────────────────────────────────────────┐│
+│  │ 1. 查找所有 symbol+side 匹配的 active 映射                          ││
+│  │ 2. 对每个映射的 posId，检查领航员持仓：                             ││
+│  │    - posId 不在领航员持仓中 → 全部平仓 (ActionClose)                ││
+│  │    - posId 仍在但 currentSize < lastKnownSize → 部分减仓 (Reduce)   ││
+│  │ 3. 更新 lastKnownSize 或标记 closed                                 ││
+│  └─────────────────────────────────────────────────────────────────────┘│
 │                                                                          │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
@@ -159,37 +248,75 @@ NOFX 当前的交易决策完全由 AI 模型驱动。为扩展信号来源，�
 **完整判断流程图：**
 
 ```
-              领航员发出交易信号（携带 posId）
+                 收到 trade-records 交易通知
                           │
                           ▼
                ┌─────────────────────┐
-               │  查询数据库映射      │
-               │  GetMapping(posId)   │
+               │ 拉取领航员最新持仓   │
+               │ (position-current)  │
                └──────────┬──────────┘
                           │
-          ┌───────────────┼───────────────┐
-          │               │               │
-          ▼               ▼               ▼
-    status=active   status=ignored   无映射/closed
-          │               │               │
-          │               │               │
-    ┌─────┴─────┐         │         ┌─────┴─────┐
-    │           │         │         │           │
-    ▼           ▼         ▼         ▼           ▼
- 开仓信号    平仓信号    任何信号   开仓信号    其他信号
-    │           │         │         │           │
-    ▼           ▼         ▼         ▼           ▼
- ✅ 加仓    判断减/平   ❌ 不跟    ✅ 新开仓  ❌ 跳过
- add++      ↓                     创建映射   (异常)
-            │
-     ┌──────┴──────┐
-     │             │
-     ▼             ▼
- 领航员仓位=0  领航员仓位>0
-     │             │
-     ▼             ▼
- ✅ 平仓       ✅ 减仓
- status→closed reduce++
+          ┌───────────────┴───────────────┐
+          │                               │
+          ▼                               ▼
+    开仓/加仓信号                   减仓/平仓信号
+    (buy+long/sell+short)          (sell+long/buy+short)
+          │                               │
+          ▼                               ▼
+   ┌──────────────────┐           ┌──────────────────┐
+   │  matchOpenAdd    │           │ matchCloseReduce │
+   │  (三轮匹配)       │           │ (反向查找法)      │
+   └────────┬─────────┘           └────────┬─────────┘
+            │                               │
+    ┌───────┴───────┐               ┌───────┴───────┐
+    │               │               │               │
+    ▼               ▼               ▼               ▼
+ 第1轮:新posId   第2轮:size↑     posId不存在    size减少
+    │               │               │               │
+    ▼               ▼               ▼               ▼
+ ✅ ActionOpen  ✅ ActionAdd   ✅ ActionClose  ✅ ActionReduce
+ 创建映射       更新size         关闭映射       更新size
+```
+
+**代码实现（matchOpenAddSignal 核心逻辑）：**
+
+```go
+func (e *Engine) matchOpenAddSignal(signal *TradeSignal, leaderPosMap map[string]*Position) *SignalMatchResult {
+    fill := signal.Fill
+    
+    // 第1轮：查找新开仓（无映射或 closed 的 posId）
+    for _, pos := range matchedPositions {
+        mapping, _ := e.store.CopyTrade().GetMapping(e.traderID, pos.PosID)
+        if mapping == nil || mapping.Status == "closed" {
+            return &SignalMatchResult{
+                Action: ActionOpen,
+                PosID:  pos.PosID,
+                // ... 
+            }
+        }
+    }
+    
+    // 第2轮：通过 lastKnownSize 变化判断加仓
+    for _, pos := range matchedPositions {
+        mapping, _ := e.store.CopyTrade().GetMapping(e.traderID, pos.PosID)
+        if mapping != nil && mapping.Status == "active" {
+            if pos.Size > mapping.LastKnownSize {  // ← 关键判断
+                return &SignalMatchResult{
+                    Action: ActionAdd,
+                    PosID:  pos.PosID,
+                    // ...
+                }
+            }
+        }
+    }
+    
+    // 第3轮：兜底
+    if activeCount == 1 {
+        return &SignalMatchResult{Action: ActionAdd, ...}
+    }
+    
+    return &SignalMatchResult{ShouldFollow: false, Reason: "无法判断加仓目标"}
+}
 ```
 
 #### 2.2.3 各操作类型详解
@@ -3246,6 +3373,7 @@ func normalizeOKXSymbol(instId string) string {
 | v1.7 | 2025-12-16 | 优化去重逻辑：<br>1. 使用时间戳过期机制替代随机删除<br>2. 默认 1 小时过期<br>3. 定期清理过期记录，避免内存泄漏 |
 | v1.8 | 2025-12-18 | 完善历史仓位检测与 WebSocket 混合模式：<br>1. 更新流程图，增加"历史仓位检测"分支<br>2. 历史仓位检测扩展到所有 Provider（OKX + Hyperliquid）<br>3. 检测条件：领航员当前持仓 > 本次交易量 × 1.2 则跳过<br>4. Hyperliquid 新增 WebSocket 混合模式：收到 fill 后通过 REST 获取账户状态<br>5. 解决 WebSocket 模式下权益和杠杆获取问题 |
 | **v2.0** | **2025-12-20** | **🎯 posId 统一方案重大更新：**<br>1. **历史仓位处理**：启动跟单时记录领航员已有仓位为 `ignored` 状态<br>2. **100% 准确判断**：通过数据库映射状态（active/ignored/无映射）判断是否跟随<br>3. **去掉阈值检测**：不再依赖 1.2x 阈值，避免误判<br>4. **新增方法**：`InitIgnoredPositions()`、`GetMapping()`、`SaveIgnoredPosition()`<br>5. **简化流程**：查数据库 → 判断状态 → 决策，逻辑更清晰<br>6. **修改文件**：store/copytrade.go、copytrade/engine.go、copytrade/integration.go |
+| **v2.1** | **2025-12-21** | **🎯 lastKnownSize 精确匹配机制：**<br>1. **核心架构明确**：trade-records 只作为通知，所有关键数据从持仓 API 获取<br>2. **新增 lastKnownSize 字段**：记录每个仓位的上次已知大小，用于精确判断操作目标<br>3. **三轮匹配逻辑**：新开仓 → 精确加仓匹配（size变化）→ 兜底匹配<br>4. **反向查找法**：减仓/平仓通过本地映射反向查找领航员持仓<br>5. **解决同币种多仓位问题**：当有 BNB 逐仓10x 和 全仓3x 两个仓位时，能精确判断加仓目标<br>6. **删除冗余代码**：移除 `findLeaderPosition` 等不再使用的函数 |
 
 ---
 
