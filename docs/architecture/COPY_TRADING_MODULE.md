@@ -104,189 +104,323 @@ NOFX 当前的交易决策完全由 AI 模型驱动。为扩展信号来源，�
 
 > ⚠️ **注意**：OKX 没有反向开仓动作，只有上述四种基本动作。
 
-### 2.2 核心跟单规则
+### 2.2 核心跟单规则：统一 posId 方案（v2.0）
 
-#### 2.2.1 只跟新开仓原则
+> **🎯 核心设计**：使用 OKX 的 `posId` 作为仓位唯一标识，统一处理所有跟单场景（开仓、加仓、减仓、平仓、同币种多仓位）。
 
-**核心规则：只跟领航员的新开仓，以及该仓位后续的所有操作（加仓、减仓、平仓）。领航员的历史仓位的任何操作都不跟。**
+#### 2.2.1 posId 是什么？
+
+`posId` 是 OKX 为每个仓位分配的唯一标识符。即使同一币种、同一方向，不同保证金模式的仓位也有不同的 `posId`：
+
+| 仓位 | posId | symbol | side | marginMode |
+|------|-------|--------|------|------------|
+| SOL 全仓做空 | `123456` | SOLUSDT | short | cross |
+| SOL 逐仓做空 | `234567` | SOLUSDT | short | isolated |
+| ETH 全仓做多 | `345678` | ETHUSDT | long | cross |
+
+**关键特性：**
+- ✅ 全局唯一，不会重复
+- ✅ 精确区分同币种不同保证金模式的仓位
+- ✅ 仓位生命周期内保持不变
+- ✅ 平仓后 posId 失效，新开仓会分配新 posId
+
+#### 2.2.2 统一判断逻辑
+
+**核心规则：所有跟单判断都通过 posId + 数据库映射状态来决定**
 
 ```
-                    ┌─────────────────────────────────────────────────────┐
-                    │              只跟新开仓原则                          │
-                    └─────────────────────────────────────────────────────┘
-                                           │
-                    ┌──────────────────────┴──────────────────────┐
-                    │                                              │
-                    ▼                                              ▼
-        ┌───────────────────────┐                    ┌───────────────────────┐
-        │   领航员 新开仓        │                    │   领航员 历史仓位      │
-        │   (启动跟单后的仓位)   │                    │   (我们没跟过的仓位)   │
-        └───────────┬───────────┘                    └───────────┬───────────┘
-                    │                                             │
-                    ▼                                             ▼
-        ┌───────────────────────┐                    ┌───────────────────────┐
-        │   ✅ 跟随所有操作      │                    │   ❌ 忽略所有操作      │
-        │   • 开仓 → 跟          │                    │   • 加仓 → 不跟        │
-        │   • 加仓 → 跟          │                    │   • 减仓 → 不跟        │
-        │   • 减仓 → 跟          │                    │   • 平仓 → 不跟        │
-        │   • 平仓 → 跟          │                    │   (避免高位接盘)       │
-        └───────────────────────┘                    └───────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│                       统一 posId 跟单方案                                │
+├──────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  数据库映射表：copy_trade_position_mappings                              │
+│  ┌────────────┬────────────┬────────────┬────────────┬─────────────────┐│
+│  │ trader_id  │ leader_pos_id │ symbol  │ status     │ 说明            ││
+│  ├────────────┼────────────┼────────────┼────────────┼─────────────────┤│
+│  │ trader_001 │ 123456     │ SOLUSDT   │ active     │ 正在跟随的仓位  ││
+│  │ trader_001 │ 234567     │ SOLUSDT   │ ignored    │ 启动时的历史仓位││
+│  │ trader_001 │ 345678     │ ETHUSDT   │ closed     │ 已平仓的历史记录││
+│  └────────────┴────────────┴────────────┴────────────┴─────────────────┘│
+│                                                                          │
+│  判断逻辑：                                                              │
+│  ┌────────────────┬────────────────┬──────────────────────────────────┐ │
+│  │   映射状态     │   操作类型     │           处理方式               │ │
+│  ├────────────────┼────────────────┼──────────────────────────────────┤ │
+│  │ 无映射         │ 开仓信号       │ ✅ 新开仓，创建 active 映射      │ │
+│  │ active         │ 开仓信号       │ ✅ 加仓，add_count++             │ │
+│  │ active         │ 平仓信号       │ ✅ 减仓/平仓，按领航员持仓判断   │ │
+│  │ ignored        │ 任何信号       │ ❌ 历史仓位，不跟随              │ │
+│  │ closed         │ 开仓信号       │ ✅ 重新开仓（新周期）            │ │
+│  └────────────────┴────────────────┴──────────────────────────────────┘ │
+│                                                                          │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
-**为什么这样设计？**
+**完整判断流程图：**
 
-1. **开仓价一致**：保证我们和领航员的开仓价格一致
-2. **避免高位接盘**：不会在领航员历史仓位的高/低位被动入场
-3. **风险可控**：完整跟随一个仓位的全生命周期（开仓 → 加仓 → 减仓 → 平仓）
+```
+              领航员发出交易信号（携带 posId）
+                          │
+                          ▼
+               ┌─────────────────────┐
+               │  查询数据库映射      │
+               │  GetMapping(posId)   │
+               └──────────┬──────────┘
+                          │
+          ┌───────────────┼───────────────┐
+          │               │               │
+          ▼               ▼               ▼
+    status=active   status=ignored   无映射/closed
+          │               │               │
+          │               │               │
+    ┌─────┴─────┐         │         ┌─────┴─────┐
+    │           │         │         │           │
+    ▼           ▼         ▼         ▼           ▼
+ 开仓信号    平仓信号    任何信号   开仓信号    其他信号
+    │           │         │         │           │
+    ▼           ▼         ▼         ▼           ▼
+ ✅ 加仓    判断减/平   ❌ 不跟    ✅ 新开仓  ❌ 跳过
+ add++      ↓                     创建映射   (异常)
+            │
+     ┌──────┴──────┐
+     │             │
+     ▼             ▼
+ 领航员仓位=0  领航员仓位>0
+     │             │
+     ▼             ▼
+ ✅ 平仓       ✅ 减仓
+ status→closed reduce++
+```
 
-#### 2.2.2 判断新开仓 vs 加仓的方法
+#### 2.2.3 各操作类型详解
 
-**判断方案：posId + 数据库映射（100% 准确）**
+##### 1️⃣ 新开仓
 
-> **v2.0 更新**：采用 OKX 的 `posId` 作为仓位唯一标识，配合数据库映射实现 100% 准确的历史仓位判断。
-
-**核心原理：**
-1. **启动跟单时**：获取领航员当前所有持仓，将其 posId 标记为 `ignored` 状态
-2. **收到信号时**：查询数据库映射，根据状态判断是否跟随
-
-**数据库映射状态：**
-
-| 状态 | 含义 | 处理方式 |
-|------|------|----------|
-| `active` | 我们已跟随的仓位 | ✅ 继续跟随（加仓/减仓/平仓） |
-| `ignored` | 启动时的历史仓位 | ❌ 不跟随 |
-| `closed` | 已平仓的历史记录 | 视为无映射，可重新开仓 |
-| 无映射 | 新仓位 | ✅ 新开仓，跟随 |
+| 条件 | 处理 |
+|------|------|
+| posId 无映射 | ✅ 跟随开仓 |
+| posId 状态=closed | ✅ 跟随开仓（同一 posId 不会复用，但逻辑兼容） |
 
 ```go
-// 判断逻辑（v2.0 简化版）
-func shouldFollowSignal(signal TradeSignal) (follow bool, reason string) {
-    // 必须有 posId
-    if signal.LeaderPosID == "" {
-        return false, "信号缺少 posId"
-    }
-    
-    // 查询数据库映射（包括 active 和 ignored 状态）
-    mapping := store.GetMapping(traderID, signal.LeaderPosID)
-    
-    if mapping != nil {
-        switch mapping.Status {
-        case "active":
-            // ✅ 已跟随的仓位 → 继续跟随
-            return true, "已跟随仓位，继续跟随"
-        case "ignored":
-            // ❌ 启动时的历史仓位 → 不跟随
-            return false, "历史仓位，不跟随"
-        }
-    }
-    
-    // ✅ 无映射 = 新开仓 → 跟随
-    return true, "新开仓，跟随"
+// 新开仓处理
+if mapping == nil {
+    // 执行开仓
+    executeOpen(signal)
+    // 保存映射
+    store.SavePositionMapping(&CopyTradePositionMapping{
+        TraderID:    traderID,
+        LeaderPosID: signal.LeaderPosID,
+        Symbol:      signal.Fill.Symbol,
+        Side:        signal.Fill.PositionSide,
+        MarginMode:  signal.MarginMode,
+        Status:      "active",
+    })
 }
 ```
 
-**判断流程图（v2.0）：**
+##### 2️⃣ 加仓
 
-```
-              领航员发出交易信号
-                      │
-                      ▼
-           ┌─────────────────────┐
-           │  查询数据库映射      │
-           │  GetMapping(posId)   │
-           └──────────┬──────────┘
-                      │
-           ┌──────────┼──────────┐
-           │          │          │
-           ▼          ▼          ▼
-     status=active  status=ignored  无映射
-           │          │          │
-           ▼          ▼          ▼
-      ✅ 继续跟随   ❌ 不跟随    ✅ 新开仓
-      (已跟仓位)   (历史仓位)   (跟随)
-```
-
-**启动时初始化历史仓位：**
+| 条件 | 处理 |
+|------|------|
+| posId 状态=active + 开仓信号 | ✅ 跟随加仓 |
 
 ```go
-// InitIgnoredPositions 在启动跟单时调用
+// 加仓处理
+if mapping != nil && mapping.Status == "active" && signal.Fill.Action == "open" {
+    // 执行加仓
+    executeAdd(signal)
+    // 更新加仓次数
+    store.IncrementAddCount(traderID, signal.LeaderPosID)
+}
+```
+
+##### 3️⃣ 减仓
+
+| 条件 | 处理 |
+|------|------|
+| posId 状态=active + 平仓信号 + 领航员仍有持仓 | ✅ 按比例减仓 |
+
+```go
+// 减仓处理
+if mapping != nil && mapping.Status == "active" && 
+   signal.Fill.Action == "close" && signal.LeaderPosition.Size > 0 {
+    // 计算减仓比例
+    ratio := calculateReduceRatio(signal)
+    // 执行减仓
+    executeReduce(signal, ratio)
+    // 更新减仓次数
+    store.IncrementReduceCount(traderID, signal.LeaderPosID)
+}
+```
+
+##### 4️⃣ 平仓
+
+| 条件 | 处理 |
+|------|------|
+| posId 状态=active + 平仓信号 + 领航员持仓=0 | ✅ 全部平仓 |
+
+```go
+// 平仓处理
+if mapping != nil && mapping.Status == "active" && 
+   signal.Fill.Action == "close" && signal.LeaderPosition.Size == 0 {
+    // 执行平仓
+    executeClose(signal)
+    // 关闭映射
+    store.CloseMapping(traderID, signal.LeaderPosID, closePrice)
+}
+```
+
+##### 5️⃣ 历史仓位（不跟随）
+
+| 条件 | 处理 |
+|------|------|
+| posId 状态=ignored | ❌ 不跟随任何操作 |
+
+```go
+// 历史仓位处理
+if mapping != nil && mapping.Status == "ignored" {
+    logger.Infof("📊 历史仓位 | posId=%s status=ignored → 不跟随", signal.LeaderPosID)
+    return false, "历史仓位，不跟随"
+}
+```
+
+#### 2.2.4 同币种多仓位处理（重点！）
+
+**场景：领航员对同一币种同时持有全仓和逐仓仓位**
+
+```
+领航员持仓状态：
+┌─────────────────────────────────────────────────────────────────┐
+│  posId=123456 │ SOLUSDT │ short │ cross    │ 100 SOL │ active  │
+│  posId=234567 │ SOLUSDT │ short │ isolated │ 50 SOL  │ active  │
+└─────────────────────────────────────────────────────────────────┘
+
+旧方案问题：
+- 用 symbol+side 作为 key → 两个仓位会覆盖，只能追踪一个
+- 减仓时无法区分是哪个仓位
+
+posId 方案优势：
+- 每个仓位独立追踪
+- 减仓/平仓时精确匹配
+```
+
+**处理流程：**
+
+```
+领航员操作：减仓 posId=234567 (逐仓 SOL short)
+                    │
+                    ▼
+          查询映射 GetMapping("234567")
+                    │
+                    ▼
+          找到 active 映射，marginMode=isolated
+                    │
+                    ▼
+          设置 OKX 交易模式为 isolated
+                    │
+                    ▼
+          执行减仓（精确操作逐仓仓位）
+```
+
+**代码实现：**
+
+```go
+// 执行减仓/平仓时，使用映射中的 marginMode
+func executeReduceOrClose(signal *TradeSignal, mapping *CopyTradePositionMapping) {
+    // 设置正确的保证金模式
+    trader.SetMarginMode(signal.Symbol, mapping.MarginMode == "cross")
+    
+    // 执行操作（会操作对应模式的仓位）
+    if signal.LeaderPosition.Size == 0 {
+        trader.CloseLong(signal.Symbol, quantity)
+    } else {
+        trader.ReduceLong(signal.Symbol, ratio)
+    }
+}
+```
+
+#### 2.2.5 启动时初始化历史仓位
+
+**时机：启动跟单服务时，在开始监听信号之前**
+
+```go
+// InitIgnoredPositions 初始化领航员历史仓位
 func (e *Engine) InitIgnoredPositions() error {
     // 获取领航员当前所有持仓
-    state := provider.GetAccountState(leaderID)
+    state, err := e.provider.GetAccountState(e.config.LeaderID)
+    if err != nil {
+        return err
+    }
     
-    // 将所有持仓的 posId 标记为 ignored
+    // 将所有持仓标记为 ignored
     for _, pos := range state.Positions {
         if pos.PosID != "" {
-            store.SaveIgnoredPosition(traderID, leaderID, pos.PosID, ...)
+            e.store.CopyTrade().SaveIgnoredPosition(
+                e.traderID,
+                e.config.LeaderID,
+                pos.PosID,
+                pos.Symbol,
+                string(pos.Side),
+                pos.MarginMode,
+            )
+            logger.Infof("📊 标记历史仓位 | posId=%s %s %s %s",
+                pos.PosID, pos.Symbol, pos.Side, pos.MarginMode)
         }
     }
+    
     return nil
 }
 ```
 
-**为什么 posId 方案更好？**
+**为什么在启动时标记？**
 
-| 对比项 | 旧方案（1.2x 阈值） | 新方案（posId 映射） |
-|--------|---------------------|---------------------|
-| 准确性 | 依赖阈值，有误判风险 | 100% 准确 |
-| 边界情况 | 多种误判场景 | 无 |
-| 逻辑复杂度 | 需要计算比例 | 只查数据库 |
-| 支持场景 | 仅 OKX/Hyperliquid | 所有有 posId 的交易所 |
+1. **100% 准确**：启动时领航员的所有持仓都是"历史仓位"
+2. **一次性操作**：不需要每次收到信号都判断
+3. **无误判风险**：去掉了阈值检测（1.2x）的不确定性
 
-#### 2.2.3 判断减仓 vs 平仓的方法
-
-**判断方案：领航员仓位对比法（同样简单准确）**
-
-检测到减仓/平仓类交易动作（`Close Long/Short`）后，直接查看领航员的实时持仓：
-- **领航员该币种仓位 = 0** → 平仓（全部平掉）
-- **领航员该币种仓位 > 0** → 减仓（部分平掉）
-
-```go
-// 判断减仓 vs 平仓
-func determineCloseAction(signal TradeSignal, leaderState AccountState) string {
-    // 获取领航员该币种的当前持仓
-    leaderPosition := leaderState.Positions[signal.Symbol]
-    
-    if leaderPosition == nil || leaderPosition.Size == 0 {
-        // 领航员该币种仓位已清零 = 平仓
-        return "close"
-    } else {
-        // 领航员该币种仓位仍有 = 减仓
-        return "reduce"
-    }
-}
-```
-
-**判断流程图：**
+#### 2.2.6 映射生命周期
 
 ```
-       领航员发出 Close Long/Short 信号
-                      │
-                      ▼
-           ┌─────────────────────────┐
-           │  查询领航员实时持仓状态  │
-           │  (同币种同方向)          │
-           └───────────┬─────────────┘
-                       │
-           ┌───────────┴───────────┐
-           │                        │
-           ▼                        ▼
-    领航员仓位 = 0              领航员仓位 > 0
-           │                        │
-           ▼                        ▼
-      📉 平仓动作                📉 减仓动作
-    (我方也全部平仓)          (我方按比例减仓)
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        映射状态机                                        │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│   启动跟单                     新开仓成功                               │
+│      │                            │                                     │
+│      ▼                            ▼                                     │
+│  ┌───────┐                   ┌───────┐                                 │
+│  │ignored│                   │active │ ←─────────────────────┐         │
+│  └───────┘                   └───┬───┘                       │         │
+│      │                           │                           │         │
+│      │ 任何信号                  │ 加仓/减仓成功              │         │
+│      ▼                           ▼                           │         │
+│  ❌ 不跟随                   ┌───────┐                       │         │
+│                              │active │ (更新 add/reduce count)│         │
+│                              └───┬───┘                       │         │
+│                                  │                           │         │
+│                                  │ 平仓成功                  │         │
+│                                  ▼                           │         │
+│                              ┌───────┐     同一 posId 重新   │         │
+│                              │closed │ ──── 开仓（理论上不会）─┘         │
+│                              └───────┘                                  │
+│                                                                          │
+│   注：closed 状态永久保留，作为历史记录                                 │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-**为什么这样判断最准确？**
+#### 2.2.7 方案优势对比
 
-1. **API 不区分减仓/平仓**：Hyperliquid 的 `dir` 字段只显示 `Close Long/Short`，不区分是减仓还是平仓
-2. **实时持仓是真相**：检查领航员的实时持仓状态，能准确判断他是部分平还是全部平
-3. **跟单动作一致**：
-   - 领航员平仓 → 我们也平仓（全部）
-   - 领航员减仓 → 我们按比例减仓（部分）
+| 对比项 | 旧方案（symbol+side+阈值） | 新方案（posId 统一） |
+|--------|--------------------------|---------------------|
+| 新开仓判断 | 依赖 1.2x 阈值，有误判 | 查数据库，100% 准确 |
+| 加仓判断 | 依赖本地仓位对比 | 查数据库，100% 准确 |
+| 减仓/平仓 | 无法区分同币种多仓位 | posId 精确匹配 |
+| 同币种多仓位 | ❌ 不支持（会覆盖） | ✅ 独立追踪 |
+| 历史仓位 | 阈值判断，有漏判 | ignored 状态，100% 准确 |
+| 逻辑复杂度 | 多种判断逻辑 | 统一查数据库 |
+| 可维护性 | 分散在多处 | 集中管理 |
 
-#### 2.2.3 Hyperliquid 反向开仓处理
+#### 2.2.8 Hyperliquid 反向开仓处理
 
 **处理策略：将反向开仓拆分为"先平后开"两个独立事件**
 
@@ -329,7 +463,7 @@ func determineCloseAction(signal TradeSignal, leaderState AccountState) string {
 2. **逻辑统一**：平仓就是平仓，开仓就是开仓，不需要特殊分支
 3. **状态清晰**：每个事件独立处理，不依赖复杂的状态机
 
-#### 2.2.4 边界情况处理
+#### 2.2.9 边界情况处理
 
 ##### 边界 1：系统重启后仓位状态恢复
 
