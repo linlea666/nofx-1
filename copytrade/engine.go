@@ -442,76 +442,112 @@ func (e *Engine) buildLeaderPosMap() map[string]*Position {
 }
 
 // matchOpenAddSignal 匹配开仓/加仓信号
+// 核心思想：遍历所有 symbol+side 匹配的仓位，优先找新出现的 posId（新开仓）
 func (e *Engine) matchOpenAddSignal(signal *TradeSignal, leaderPosMap map[string]*Position) *SignalMatchResult {
 	fill := signal.Fill
 
-	// 从领航员持仓中找匹配的仓位
-	leaderPos := e.findLeaderPosition(fill.Symbol, fill.PositionSide, leaderPosMap)
-	if leaderPos == nil {
+	// 收集所有 symbol+side 匹配的仓位
+	var matchedPositions []*Position
+	for _, pos := range leaderPosMap {
+		if pos.Symbol == fill.Symbol && pos.Side == fill.PositionSide {
+			matchedPositions = append(matchedPositions, pos)
+		}
+	}
+
+	if len(matchedPositions) == 0 {
 		return &SignalMatchResult{
 			ShouldFollow: false,
 			Reason:       fmt.Sprintf("领航员持仓中找不到 %s %s", fill.Symbol, fill.PositionSide),
 		}
 	}
 
-	posID := leaderPos.PosID
-	if posID == "" {
-		// Hyperliquid 等无 posId，生成虚拟 ID
-		posID = fmt.Sprintf("%s_%s", fill.Symbol, fill.PositionSide)
-	}
+	// 遍历所有匹配仓位，分类处理
+	var newPosition *Position      // 新出现的 posId（无映射或 closed）
+	var activePosition *Position   // 已跟随的 posId（active 映射）
+	var activeMapping *store.CopyTradePositionMapping
 
-	// 查数据库映射
-	mapping, err := e.store.CopyTrade().GetMapping(e.traderID, posID)
-	if err != nil {
-		logger.Errorf("❌ [%s] 查询映射失败: %v (posId=%s)", e.traderID, err, posID)
-		return &SignalMatchResult{
-			ShouldFollow: false,
-			Reason:       fmt.Sprintf("查询映射失败: %v", err),
+	for _, pos := range matchedPositions {
+		posID := pos.PosID
+		if posID == "" {
+			// Hyperliquid 等无 posId，生成虚拟 ID
+			posID = fmt.Sprintf("%s_%s", fill.Symbol, fill.PositionSide)
 		}
-	}
 
-	// 根据映射状态判断
-	if mapping != nil {
+		// 查数据库映射
+		mapping, err := e.store.CopyTrade().GetMapping(e.traderID, posID)
+		if err != nil {
+			logger.Warnf("⚠️ [%s] 查询映射失败: %v (posId=%s)", e.traderID, err, posID)
+			continue
+		}
+
+		if mapping == nil {
+			// 无映射 = 新开仓（优先）
+			logger.Infof("📊 [%s] 发现新 posId | posId=%s mgnMode=%s → 新开仓候选",
+				e.traderID, posID, pos.MarginMode)
+			newPosition = pos
+			break // 优先处理新开仓
+		}
+
 		switch mapping.Status {
 		case "active":
-			// 已跟随的仓位 → 加仓
-			logger.Infof("📊 [%s] 已跟随仓位 | posId=%s status=active → 加仓",
-				e.traderID, posID)
-			return &SignalMatchResult{
-				ShouldFollow:   true,
-				Reason:         fmt.Sprintf("已跟随仓位(posId=%s)，加仓", posID),
-				Action:         ActionAdd,
-				PosID:          posID,
-				MarginMode:     mapping.MarginMode,
-				LeaderPosition: leaderPos,
+			// 已跟随的仓位 → 加仓候选
+			if activePosition == nil {
+				activePosition = pos
+				activeMapping = mapping
 			}
-
 		case "ignored":
-			// 历史仓位 → 不跟随
-			logger.Infof("📊 [%s] 历史仓位 | posId=%s status=ignored → 不跟随",
+			// 历史仓位 → 跳过
+			logger.Infof("📊 [%s] 历史仓位 | posId=%s status=ignored → 跳过",
 				e.traderID, posID)
-			return &SignalMatchResult{
-				ShouldFollow: false,
-				Reason:       fmt.Sprintf("历史仓位(posId=%s)，不跟随", posID),
-			}
-
-		default:
-			// closed 或其他状态，视为可重新开仓
-			logger.Infof("📊 [%s] 仓位已关闭 | posId=%s status=%s → 视为新开仓",
-				e.traderID, posID, mapping.Status)
+		case "closed":
+			// 已关闭 = 可重新开仓
+			logger.Infof("📊 [%s] 仓位已关闭 | posId=%s → 新开仓候选",
+				e.traderID, posID)
+			newPosition = pos
+			break // 优先处理新开仓
 		}
 	}
 
-	// 无映射或 closed = 新开仓
-	logger.Infof("📊 [%s] 新开仓 | posId=%s mgnMode=%s → 跟随开仓",
-		e.traderID, posID, leaderPos.MarginMode)
+	// 优先处理新开仓
+	if newPosition != nil {
+		posID := newPosition.PosID
+		if posID == "" {
+			posID = fmt.Sprintf("%s_%s", fill.Symbol, fill.PositionSide)
+		}
+		logger.Infof("📊 [%s] 新开仓 | posId=%s mgnMode=%s → 跟随开仓",
+			e.traderID, posID, newPosition.MarginMode)
+		return &SignalMatchResult{
+			ShouldFollow:   true,
+			Reason:         fmt.Sprintf("新开仓(posId=%s)，跟随开仓", posID),
+			Action:         ActionOpen,
+			PosID:          posID,
+			MarginMode:     newPosition.MarginMode,
+			LeaderPosition: newPosition,
+		}
+	}
+
+	// 其次处理加仓
+	if activePosition != nil && activeMapping != nil {
+		posID := activePosition.PosID
+		if posID == "" {
+			posID = fmt.Sprintf("%s_%s", fill.Symbol, fill.PositionSide)
+		}
+		logger.Infof("📊 [%s] 已跟随仓位 | posId=%s status=active → 加仓",
+			e.traderID, posID)
+		return &SignalMatchResult{
+			ShouldFollow:   true,
+			Reason:         fmt.Sprintf("已跟随仓位(posId=%s)，加仓", posID),
+			Action:         ActionAdd,
+			PosID:          posID,
+			MarginMode:     activeMapping.MarginMode,
+			LeaderPosition: activePosition,
+		}
+	}
+
+	// 所有仓位都是 ignored
 	return &SignalMatchResult{
-		ShouldFollow:   true,
-		Reason:         fmt.Sprintf("新开仓(posId=%s)，跟随开仓", posID),
-		Action:         ActionOpen,
-		PosID:          posID,
-		MarginMode:     leaderPos.MarginMode,
-		LeaderPosition: leaderPos,
+		ShouldFollow: false,
+		Reason:       fmt.Sprintf("所有 %s %s 仓位都是历史仓位，不跟随", fill.Symbol, fill.PositionSide),
 	}
 }
 
