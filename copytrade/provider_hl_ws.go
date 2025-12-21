@@ -7,8 +7,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"nofx/logger"
+
+	"github.com/gorilla/websocket"
 )
 
 // ============================================================================
@@ -591,4 +592,3 @@ func parseHLDir(dir string) (ActionType, SideType) {
 		return ActionOpen, SideLong
 	}
 }
-

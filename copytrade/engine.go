@@ -155,29 +155,32 @@ func (e *Engine) InitIgnoredPositions() error {
 
 	// 将所有持仓标记为 ignored
 	ignoredCount := 0
-	for _, pos := range state.Positions {
-		// 必须有 posId 才能标记
-		if pos.PosID == "" {
-			logger.Warnf("⚠️ [%s] 持仓 %s %s 无 posId，跳过标记", e.traderID, pos.Symbol, pos.Side)
-			continue
+	for key, pos := range state.Positions {
+		// 确定 posId：优先用原生的，否则用 map key（symbol_side 格式）作为虚拟 posId
+		posID := pos.PosID
+		if posID == "" {
+			// Hyperliquid 等无原生 posId 的交易所，用 symbol_side 作为虚拟 posId
+			// key 格式为 "BTCUSDT_long"、"ETHUSDT_short"
+			posID = key
+			logger.Debugf("📊 [%s] 持仓 %s %s 使用虚拟 posId: %s", e.traderID, pos.Symbol, pos.Side, posID)
 		}
 
 		err := e.store.CopyTrade().SaveIgnoredPosition(
 			e.traderID,
 			e.config.LeaderID,
-			pos.PosID,
+			posID,
 			pos.Symbol,
 			string(pos.Side),
 			pos.MarginMode,
 		)
 		if err != nil {
-			logger.Warnf("⚠️ [%s] 标记历史仓位失败 posId=%s: %v", e.traderID, pos.PosID, err)
+			logger.Warnf("⚠️ [%s] 标记历史仓位失败 posId=%s: %v", e.traderID, posID, err)
 			continue
 		}
 
 		ignoredCount++
 		logger.Infof("📊 [%s] 标记历史仓位 | posId=%s %s %s %s",
-			e.traderID, pos.PosID, pos.Symbol, pos.Side, pos.MarginMode)
+			e.traderID, posID, pos.Symbol, pos.Side, pos.MarginMode)
 	}
 
 	logger.Infof("✅ [%s] 历史仓位初始化完成 | 共标记 %d 个仓位为 ignored", e.traderID, ignoredCount)

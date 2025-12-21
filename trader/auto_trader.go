@@ -865,16 +865,16 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 
 	// [CODE ENFORCED] Check max positions limit (跟单模式跳过，领航员已通过风控)
 	if !isCopyTrade {
-		if err := at.enforceMaxPositions(len(positions)); err != nil {
-			return err
+	if err := at.enforceMaxPositions(len(positions)); err != nil {
+		return err
 		}
 	}
 
 	// Check if there's already a position in the same symbol and direction
 	// 跟单加仓时跳过此检查
 	if !isAddPosition {
-		for _, pos := range positions {
-			if pos["symbol"] == decision.Symbol && pos["side"] == "long" {
+	for _, pos := range positions {
+		if pos["symbol"] == decision.Symbol && pos["side"] == "long" {
 				// 跟单模式下，如果 mgnMode 不同（全仓 vs 逐仓），视为不同仓位，允许开仓
 				if isCopyTrade && decision.MarginMode != "" {
 					posMgnMode, _ := pos["mgnMode"].(string)
@@ -887,8 +887,8 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 						continue // 不同模式，不视为重复仓位
 					}
 				}
-				return fmt.Errorf("❌ %s already has long position, close it first", decision.Symbol)
-			}
+			return fmt.Errorf("❌ %s already has long position, close it first", decision.Symbol)
+		}
 		}
 	} else {
 		logger.Infof("  📊 跟单加仓，跳过重复仓位检查")
@@ -944,8 +944,8 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 
 	// [CODE ENFORCED] Minimum position size check (跟单模式跳过，领航员已通过风控)
 	if !isCopyTrade {
-		if err := at.enforceMinPositionSize(decision.PositionSizeUSD); err != nil {
-			return err
+	if err := at.enforceMinPositionSize(decision.PositionSizeUSD); err != nil {
+		return err
 		}
 	} else {
 		logger.Infof("  📊 跟单模式，跳过最小仓位检查")
@@ -1015,16 +1015,16 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 
 	// [CODE ENFORCED] Check max positions limit (跟单模式跳过，领航员已通过风控)
 	if !isCopyTrade {
-		if err := at.enforceMaxPositions(len(positions)); err != nil {
-			return err
+	if err := at.enforceMaxPositions(len(positions)); err != nil {
+		return err
 		}
 	}
 
 	// Check if there's already a position in the same symbol and direction
 	// 跟单加仓时跳过此检查
 	if !isAddPosition {
-		for _, pos := range positions {
-			if pos["symbol"] == decision.Symbol && pos["side"] == "short" {
+	for _, pos := range positions {
+		if pos["symbol"] == decision.Symbol && pos["side"] == "short" {
 				// 跟单模式下，如果 mgnMode 不同（全仓 vs 逐仓），视为不同仓位，允许开仓
 				if isCopyTrade && decision.MarginMode != "" {
 					posMgnMode, _ := pos["mgnMode"].(string)
@@ -1037,8 +1037,8 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 						continue // 不同模式，不视为重复仓位
 					}
 				}
-				return fmt.Errorf("❌ %s already has short position, close it first", decision.Symbol)
-			}
+			return fmt.Errorf("❌ %s already has short position, close it first", decision.Symbol)
+		}
 		}
 	} else {
 		logger.Infof("  📊 跟单加仓，跳过重复仓位检查")
@@ -1094,8 +1094,8 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 
 	// [CODE ENFORCED] Minimum position size check (跟单模式跳过，领航员已通过风控)
 	if !isCopyTrade {
-		if err := at.enforceMinPositionSize(decision.PositionSizeUSD); err != nil {
-			return err
+	if err := at.enforceMinPositionSize(decision.PositionSizeUSD); err != nil {
+		return err
 		}
 	} else {
 		logger.Infof("  📊 跟单模式，跳过最小仓位检查")
@@ -1237,7 +1237,7 @@ func (at *AutoTrader) executeCloseLongWithRecord(decision *decision.Decision, ac
 	if closeQuantity > 0 {
 		logger.Infof("  ✓ Position partially closed: %.4f (%.0f%%)", closeQuantity, decision.CloseRatio*100)
 	} else {
-		logger.Infof("  ✓ Position closed successfully")
+	logger.Infof("  ✓ Position closed successfully")
 	}
 	return nil
 }
@@ -1286,7 +1286,7 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *decision.Decision, a
 						totalQuantity = -amt
 					} else {
 						totalQuantity = amt
-					}
+				}
 				}
 				logger.Infof("  📊 Found short position: mgnMode=%v, quantity=%.4f", pos["mgnMode"], totalQuantity)
 				break
@@ -1335,7 +1335,7 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *decision.Decision, a
 	if closeQuantity > 0 {
 		logger.Infof("  ✓ Position partially closed: %.4f (%.0f%%)", closeQuantity, decision.CloseRatio*100)
 	} else {
-		logger.Infof("  ✓ Position closed successfully")
+	logger.Infof("  ✓ Position closed successfully")
 	}
 	return nil
 }

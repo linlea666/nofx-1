@@ -1003,10 +1003,10 @@ func (s *Server) handleDeleteTrader(c *gin.Context) {
 			copytrade.StopCopyTradingForTrader(traderID)
 			s.store.CopyTrade().SetEnabled(traderID, false)
 		}
-		if trader, err := s.traderManager.GetTrader(traderID); err == nil {
+	if trader, err := s.traderManager.GetTrader(traderID); err == nil {
 			trader.Stop()
 		}
-		logger.Infof("⏹  Stopped running trader: %s", traderID)
+			logger.Infof("⏹  Stopped running trader: %s", traderID)
 	}
 
 	// Remove trader from memory
@@ -1030,9 +1030,9 @@ func (s *Server) handleStartTrader(c *gin.Context) {
 
 	// Check if trader is already running (unified check for both AI and copy trade modes)
 	if s.isTraderRunning(traderID) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Trader is already running"})
-		return
-	}
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Trader is already running"})
+			return
+		}
 
 	// Remove from memory to reload fresh config
 	if _, err := s.traderManager.GetTrader(traderID); err == nil {
@@ -1098,7 +1098,7 @@ func (s *Server) handleStartTrader(c *gin.Context) {
 			logger.Warnf("⚠️ Failed to enable copy trade config: %v", err)
 		}
 
-		go func() {
+	go func() {
 			executor := &CopyTradeExecutorAdapter{trader: trader}
 			if err := copytrade.StartCopyTradingForTrader(traderID, executor, s.store); err != nil {
 				logger.Errorf("❌ Trader %s copy trade runtime error: %v", trader.GetName(), err)
@@ -1110,10 +1110,10 @@ func (s *Server) handleStartTrader(c *gin.Context) {
 		// Start in AI mode (default)
 		logger.Infof("🤖 [%s] Starting in AI mode...", trader.GetName())
 		go func() {
-			if err := trader.Run(); err != nil {
-				logger.Infof("❌ Trader %s runtime error: %v", trader.GetName(), err)
-			}
-		}()
+		if err := trader.Run(); err != nil {
+			logger.Infof("❌ Trader %s runtime error: %v", trader.GetName(), err)
+		}
+	}()
 	}
 
 	// Update running status in database
@@ -1158,7 +1158,7 @@ func (s *Server) handleStopTrader(c *gin.Context) {
 
 	// Stop AutoTrader (also stop for copy trade mode in case it was partially started)
 	if trader, err := s.traderManager.GetTrader(traderID); err == nil {
-		trader.Stop()
+	trader.Stop()
 	}
 
 	// Update running status in database
