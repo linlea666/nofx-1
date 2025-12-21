@@ -1187,7 +1187,52 @@ func (e *Engine) syncLeaderState() error {
 	logger.Debugf("👁️ [%s] 领航员状态同步 | 权益=%.2f 持仓数=%d",
 		e.traderID, state.TotalEquity, len(state.Positions))
 
+	// 🔑 检查 ignored 仓位是否已被领航员平仓
+	// 如果是，标记为 closed，这样后续重新开仓可以跟随
+	e.checkIgnoredPositionsClosed()
+
 	return nil
+}
+
+// checkIgnoredPositionsClosed 检查 ignored 仓位是否已被领航员平仓
+// 当历史仓位被领航员平仓后，将状态从 ignored 改为 closed
+// 这样如果领航员重新开仓（即使 posId 被复用），也能正确跟随
+func (e *Engine) checkIgnoredPositionsClosed() {
+	if e.store == nil {
+		return
+	}
+
+	// 获取所有 ignored 映射
+	ignoredMappings, err := e.store.CopyTrade().ListIgnoredMappings(e.traderID)
+	if err != nil {
+		logger.Warnf("⚠️ [%s] 获取 ignored 映射失败: %v", e.traderID, err)
+		return
+	}
+
+	if len(ignoredMappings) == 0 {
+		return
+	}
+
+	// 获取领航员当前持仓的 posId 集合
+	leaderPosMap := e.buildLeaderPosMap()
+	leaderPosIds := make(map[string]bool)
+	for posId := range leaderPosMap {
+		leaderPosIds[posId] = true
+	}
+
+	// 检查每个 ignored 映射
+	for _, mapping := range ignoredMappings {
+		if _, exists := leaderPosIds[mapping.LeaderPosID]; !exists {
+			// ignored 仓位不在领航员持仓中 → 说明已被平仓 → 改为 closed
+			if err := e.store.CopyTrade().MarkIgnoredAsClosed(e.traderID, mapping.LeaderPosID); err != nil {
+				logger.Warnf("⚠️ [%s] 更新 ignored→closed 失败: %v (posId=%s)",
+					e.traderID, err, mapping.LeaderPosID)
+			} else {
+				logger.Infof("📊 [%s] 历史仓位已平仓 | posId=%s %s %s → ignored→closed",
+					e.traderID, mapping.LeaderPosID, mapping.Symbol, mapping.Side)
+			}
+		}
+	}
 }
 
 func (e *Engine) initSeenFills() {

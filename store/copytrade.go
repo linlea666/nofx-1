@@ -537,6 +537,23 @@ func (s *CopyTradeStore) ListActiveMappings(traderID string) ([]*CopyTradePositi
 	return s.listMappings(traderID, "active", 0)
 }
 
+// ListIgnoredMappings 列出某 trader 所有 ignored 映射
+// 用于检测历史仓位是否已被领航员平仓
+func (s *CopyTradeStore) ListIgnoredMappings(traderID string) ([]*CopyTradePositionMapping, error) {
+	return s.listMappings(traderID, "ignored", 0)
+}
+
+// MarkIgnoredAsClosed 将 ignored 状态的映射标记为 closed
+// 当检测到领航员的历史仓位已被平仓时调用，这样后续重新开仓可以跟随
+func (s *CopyTradeStore) MarkIgnoredAsClosed(traderID, leaderPosID string) error {
+	_, err := s.db.Exec(`
+		UPDATE copy_trade_position_mappings 
+		SET status = 'closed', closed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+		WHERE trader_id = ? AND leader_pos_id = ? AND status = 'ignored'
+	`, traderID, leaderPosID)
+	return err
+}
+
 // FindActiveBySymbolSide 查找某 symbol+side 的所有活跃映射
 // 用于平仓/减仓时的反向查找：从本地映射出发，对比领航员持仓判断动作
 func (s *CopyTradeStore) FindActiveBySymbolSide(traderID, symbol, side string) ([]*CopyTradePositionMapping, error) {
