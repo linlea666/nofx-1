@@ -452,9 +452,12 @@ func (p *HLWebSocketProvider) convertWsFill(raw WsFill) Fill {
 	price, _ := strconv.ParseFloat(raw.Px, 64)
 	size, _ := strconv.ParseFloat(raw.Sz, 64)
 	closedPnl, _ := strconv.ParseFloat(raw.ClosedPnl, 64)
+	startPos, _ := strconv.ParseFloat(raw.StartPosition, 64)
 
-	// 解析方向和动作
-	action, side := parseHLDir(raw.Dir)
+	// 🔑 使用 startPosition 精确判断动作类型
+	// startPosition=0 + "Open Long/Short" = 新开仓
+	// startPosition>0 + "Open Long/Short" = 加仓
+	action, side := parseHLDirWithStartPos(raw.Dir, startPos)
 
 	return Fill{
 		ID:           raw.Hash,
@@ -554,7 +557,46 @@ func (p *HLWebSocketProvider) addFillToCache(fill Fill) {
 	p.recentFills = valid
 }
 
-// parseHLDir 解析 Hyperliquid 的 dir 字段
+// parseHLDirWithStartPos 使用 startPosition 精确判断动作类型
+// 🔑 核心逻辑：
+//   - "Open Long/Short" + startPosition=0 → ActionOpen（新开仓）
+//   - "Open Long/Short" + startPosition>0 → ActionAdd（加仓）
+//   - "Close Long/Short" + 仓位归零 → ActionClose（平仓）
+//   - "Close Long/Short" + 仓位未归零 → ActionReduce（减仓）
+func parseHLDirWithStartPos(dir string, startPos float64) (ActionType, SideType) {
+	switch dir {
+	case "Open Long":
+		if startPos == 0 {
+			return ActionOpen, SideLong
+		}
+		return ActionAdd, SideLong
+	case "Open Short":
+		if startPos == 0 {
+			return ActionOpen, SideShort
+		}
+		return ActionAdd, SideShort
+	case "Close Long":
+		// 注：Close 时 startPos 是平仓前的仓位大小，无法直接判断是否全平
+		// 全平/减仓的判断交给 matchCloseReduceSignal 通过 size 变化判断
+		return ActionClose, SideLong
+	case "Close Short":
+		return ActionClose, SideShort
+
+	// 🔄 反向开仓处理
+	case "Long > Short":
+		logger.Infof("📡 [HL-WS] 检测到反向开仓: %s → 转换为 Open Short", dir)
+		return ActionOpen, SideShort
+	case "Short > Long":
+		logger.Infof("📡 [HL-WS] 检测到反向开仓: %s → 转换为 Open Long", dir)
+		return ActionOpen, SideLong
+
+	default:
+		logger.Warnf("⚠️ [HL-WS] 未知 dir: %s，默认为 Open Long", dir)
+		return ActionOpen, SideLong
+	}
+}
+
+// parseHLDir 解析 Hyperliquid 的 dir 字段（旧版本，不使用 startPosition）
 // dir: "Open Long" | "Close Long" | "Open Short" | "Close Short" | "Long > Short" | "Short > Long"
 func parseHLDir(dir string) (ActionType, SideType) {
 	switch dir {
