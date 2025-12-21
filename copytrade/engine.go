@@ -325,36 +325,52 @@ func (e *Engine) poll() {
 		return
 	}
 
-	// 同步领航员状态
-	if time.Since(e.lastStateSync) > e.stateSyncInterval {
-		if err := e.syncLeaderState(); err != nil {
-			logger.Warnf("⚠️ [%s] 状态同步失败: %v", e.traderID, err)
-		}
-	}
-
 	// 按时间排序（确保反向开仓按顺序处理）
 	sort.Slice(fills, func(i, j int) bool {
 		return fills[i].Timestamp.Before(fills[j].Timestamp)
 	})
 
-	// 处理新成交
+	// 🔑 第一步：过滤出新成交（未处理的）
+	var newFills []Fill
 	for _, fill := range fills {
-		if e.isSeen(fill.ID) {
-			continue
+		if !e.isSeen(fill.ID) {
+			newFills = append(newFills, fill)
 		}
+	}
+
+	// 🔑 第二步：有新成交时，强制同步领航员持仓（确保用最新数据判断）
+	// 这解决了"平仓后重开仓被误判为历史仓位"的问题
+	if len(newFills) > 0 {
+		if err := e.syncLeaderState(); err != nil {
+			logger.Warnf("⚠️ [%s] 处理信号前同步状态失败: %v（使用缓存）", e.traderID, err)
+		} else {
+			logger.Debugf("📡 [%s] 收到 %d 条新成交，已同步领航员持仓", e.traderID, len(newFills))
+		}
+	} else {
+		// 无新成交时，保持原有的定时同步作为兜底（防止长时间无交易时数据过旧）
+		if time.Since(e.lastStateSync) > e.stateSyncInterval {
+			if err := e.syncLeaderState(); err != nil {
+				logger.Warnf("⚠️ [%s] 定时状态同步失败: %v", e.traderID, err)
+			}
+		}
+	}
+
+	// 🔑 第三步：处理所有新成交（共用同一份最新 leaderState）
+	for i := range newFills {
+		fill := &newFills[i]
 		e.markSeen(fill.ID)
 
 		e.stats.SignalsReceived++
 		e.stats.LastSignalTime = time.Now()
 
 		// 构造信号
-		signal := e.buildSignal(&fill)
+		signal := e.buildSignal(fill)
 
 		logger.Infof("📡 [%s] 收到信号 | %s %s %s | 价格=%.4f 数量=%.4f 价值=%.2f",
 			e.traderID, fill.Symbol, fill.Action, fill.PositionSide,
 			fill.Price, fill.Size, fill.Value)
 
-		// 处理信号
+		// 处理信号（此时 leaderState 是最新的）
 		e.processSignal(signal)
 	}
 }
