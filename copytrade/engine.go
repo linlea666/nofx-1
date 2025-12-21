@@ -980,12 +980,12 @@ func (e *Engine) calculateCopySize(signal *TradeSignal) (float64, []Warning) {
 		followerEquity, e.config.CopyRatio*100, copySize)
 
 	// 最小金额检查：如果低于阈值，自动提升到阈值（解决小账户精度问题）
-	// 使用配置的阈值，如果未配置则使用默认值 10 USDT
-	// 🆕 从 5 提升到 10 USDT，确保开仓后有足够仓位进行比例减仓
-	// （避免因最小下单量约束导致减仓时意外全平）
+	// 使用配置的阈值，如果未配置则使用默认值 12 USDT
+	// 🆕 从 10 提升到 12 USDT，预留精度损失余量（Hyperliquid 最小订单 $10）
+	// （避免因数量精度向下取整导致订单价值不足 $10）
 	minTradeThreshold := e.config.MinTradeWarn
 	if minTradeThreshold <= 0 {
-		minTradeThreshold = 10.0 // 默认最小 10 USDT，确保仓位足够进行比例操作
+		minTradeThreshold = 12.0 // 默认最小 12 USDT，预留精度损失余量
 	}
 	if copySize > 0 && copySize < minTradeThreshold {
 		originalSize := copySize
