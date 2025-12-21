@@ -303,6 +303,14 @@ func (t *HyperliquidTrader) GetPositions() ([]map[string]interface{}, error) {
 		posMap["leverage"] = float64(position.Leverage.Value)
 		posMap["liquidationPrice"] = liquidationPx
 
+		// 添加 mgnMode 字段，用于跟单减仓时的仓位匹配
+		// Hyperliquid 默认使用 cross 模式（根据杠杆类型判断）
+		if position.Leverage.Type == "cross" {
+			posMap["mgnMode"] = "cross"
+		} else {
+			posMap["mgnMode"] = "isolated"
+		}
+
 		result = append(result, posMap)
 	}
 

@@ -1,839 +1,664 @@
-[GIN] 2025/12/21 - 03:32:20 | 200 | 417.35µs | 133.18.161.81 | GET "/api/my-traders"
-2025/12/21 03:32:23 Combined stream WebSocket connected successfully
-12-21 03:32:27 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313): failed to get trader config: trader not found: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313
-12-21 03:32:27 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
-12-21 03:32:30 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user : 0 traders
-[GIN] 2025/12/21 - 03:32:30 | 200 | 604.838µs | 133.18.161.81 | GET "/api/equity-history?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:32:30 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:32:30 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-12-21 03:32:30 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:32:30 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-[GIN] 2025/12/21 - 03:32:30 | 200 | 1.242702ms | 133.18.161.81 | GET "/api/statistics?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-[GIN] 2025/12/21 - 03:32:30 | 200 | 1.740646ms | 133.18.161.81 | GET "/api/decisions/latest?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775&limit=5"
-12-21 03:32:30 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:32:30 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-[GIN] 2025/12/21 - 03:32:30 | 200 | 647.832µs | 133.18.161.81 | GET "/api/status?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-[GIN] 2025/12/21 - 03:32:30 | 200 | 350.939µs | 133.18.161.81 | GET "/api/my-traders"
-12-21 03:32:30 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:32:30 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-12-21 03:32:30 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
-[GIN] 2025/12/21 - 03:32:30 | 200 | 4.411086ms | 133.18.161.81 | GET "/api/positions?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:32:30 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:32:30 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-12-21 03:32:30 [INFO] api/server.go:2039 📊 Received account info request [多多干]
-12-21 03:32:30 [INFO] trader/okx_trader.go:243 🔄 Calling OKX API to get account balance...
-12-21 03:32:30 [INFO] trader/okx_trader.go:291 ✓ OKX balance: Total equity=499.43, Available=499.64, Unrealized PnL=0.00
-12-21 03:32:30 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
-12-21 03:32:30 [INFO] api/server.go:2049 ✓ Returning account info [多多干]: equity=499.43, available=499.64, pnl=0.02 (0.00%)
-[GIN] 2025/12/21 - 03:32:30 | 200 | 9.019786ms | 133.18.161.81 | GET "/api/account?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:32:37 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313): failed to get trader config: trader not found: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313
-12-21 03:32:37 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
-[GIN] 2025/12/21 - 03:32:41 | 200 | 459.605µs | 133.18.161.81 | GET "/api/my-traders"
-12-21 03:32:45 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:32:45 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-[GIN] 2025/12/21 - 03:32:45 | 200 | 639.175µs | 133.18.161.81 | GET "/api/status?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:32:45 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:32:45 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-12-21 03:32:45 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
-[GIN] 2025/12/21 - 03:32:45 | 200 | 4.35837ms | 133.18.161.81 | GET "/api/positions?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:32:46 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:32:46 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-12-21 03:32:46 [INFO] api/server.go:2039 📊 Received account info request [多多干]
-12-21 03:32:46 [INFO] trader/okx_trader.go:243 🔄 Calling OKX API to get account balance...
-12-21 03:32:46 [INFO] trader/okx_trader.go:291 ✓ OKX balance: Total equity=499.44, Available=499.64, Unrealized PnL=0.00
-12-21 03:32:46 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
-12-21 03:32:46 [INFO] api/server.go:2049 ✓ Returning account info [多多干]: equity=499.44, available=499.64, pnl=0.04 (0.01%)
-[GIN] 2025/12/21 - 03:32:46 | 200 | 8.581677ms | 133.18.161.81 | GET "/api/account?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:32:47 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313): failed to get trader config: trader not found: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313
-12-21 03:32:47 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
-12-21 03:32:49 [INFO] copytrade/engine.go:350 📡 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 收到信号 | BNBUSDT open long | 价格=852.9000 数量=2.0000 价值=17.06
-12-21 03:32:49 [INFO] copytrade/engine.go:485 📊 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 发现新 posId | posId=3138015978897563648 mgnMode=isolated → 新开仓候选
-12-21 03:32:49 [INFO] copytrade/engine.go:517 📊 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 新开仓 | posId=3138015978897563648 mgnMode=isolated → 跟随开仓
-12-21 03:32:49 [INFO] copytrade/engine.go:712 🎯 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] ✅ 跟随 | BNBUSDT | 原因: 新开仓(posId=3138015978897563648)，跟随开仓
-12-21 03:32:49 [INFO] trader/okx_trader.go:238 ✓ Using cached OKX account balance
-12-21 03:32:49 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
-12-21 03:32:49 [INFO] copytrade/engine.go:882 📊 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 比例计算 | BNBUSDT | 领航员: 交易=17.06 权益=4570.92 占比=0.37% | 跟随者: 权益=499.44 系数=100% → 跟单=1.86
-12-21 03:32:49 [INFO] copytrade/engine.go:898 📊 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 跟单金额 1.86 < 阈值 10.00，自动提升到 10.00 USDT
-12-21 03:32:49 [WARN] copytrade/engine.go:1132 ⚠️ [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 预警:size_boosted | BNBUSDT | 跟单金额 1.86 低于阈值，已提升到 10.00 USDT
-12-21 03:32:49 [INFO] copytrade/engine.go:784 📊 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] open | 金额=10.00 杠杆=10x 模式=isolated 入场价=852.9000
-12-21 03:32:49 [INFO] trader/okx_trader.go:238 ✓ Using cached OKX account balance
-12-21 03:32:49 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
-12-21 03:32:49 [INFO] copytrade/engine.go:750 ⚡ [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 决策生成 | open_long BNBUSDT | 金额=10.00
-12-21 03:32:49 [INFO] copytrade/integration.go:352 📝 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 跟单决策 | open_long BNBUSDT | reasoning=Copy trading: open following okx leader A98D73D93204D632
-12-21 03:32:49 [INFO] trader/auto_trader.go:827 [多多干] Executing external decision: open_long BNBUSDT
-12-21 03:32:49 [INFO] trader/auto_trader.go:853 📈 Open long: BNBUSDT
-12-21 03:32:49 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
-2025/12/21 03:32:49 🔌 Do not find hook: SET_HTTP_CLIENT
-2025/12/21 03:32:49 🔌 Do not find hook: SET_HTTP_CLIENT
-12-21 03:32:49 [INFO] trader/okx_trader.go:238 ✓ Using cached OKX account balance
-12-21 03:32:49 [INFO] trader/auto_trader.go:951 📊 跟单模式，跳过最小仓位检查
-12-21 03:32:49 [INFO] trader/auto_trader.go:963 📊 使用跟单指定的保证金模式: isolated
-12-21 03:32:49 [INFO] trader/okx_trader.go:600 ⚠️ SetMarginMode API failed: OKX API error: code=51000, msg=Parameter isoMode error (will use tdMode=isolated in order)
-12-21 03:32:49 [INFO] trader/okx_trader.go:665 ✓ BNBUSDT long leverage set to 10x
-12-21 03:32:49 [INFO] trader/okx_trader.go:692 📊 OKX OpenLong: quantity=0.011713, ctVal=0.010000, contracts=1.17
-12-21 03:32:49 [INFO] trader/okx_trader.go:736 ✓ OKX opened long position successfully: BNBUSDT size: 1
-12-21 03:32:49 [INFO] trader/okx_trader.go:737 Order ID: 3145955151251939328
-12-21 03:32:49 [INFO] trader/auto_trader.go:981 ✓ Position opened successfully, order ID: 3145955151251939328, quantity: 0.0117
-12-21 03:32:50 [INFO] trader/auto_trader.go:1872 ✅ Order filled: avgPrice=852.900000, qty=0.010000, fee=0.004265
-12-21 03:32:50 [INFO] trader/auto_trader.go:1882 📝 Recording position (ID: 3145955151251939328, action: open_long, price: 852.900000, qty: 0.010000, fee: 0.0043)
-12-21 03:32:50 [INFO] trader/auto_trader.go:1914 📊 Position recorded [8dd37a6e] BNBUSDT LONG @ 852.9000
-12-21 03:32:50 [INFO] trader/auto_trader.go:992 ⚠ Failed to set stop loss: failed to set stop loss: OKX API error: code=51250, msg=Order price is out of the available range
-12-21 03:32:50 [INFO] trader/auto_trader.go:995 ⚠ Failed to set take profit: failed to set take profit: OKX API error: code=51250, msg=Order price is out of the available range
-12-21 03:32:50 [INFO] trader/auto_trader.go:847 [多多干] External decision executed successfully: open_long BNBUSDT
-12-21 03:32:50 [INFO] copytrade/integration.go:200 ✅ [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 跟单执行成功 | open_long BNBUSDT | 耗时=662ms
-12-21 03:32:50 [INFO] copytrade/integration.go:436 📝 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 仓位映射已保存 | posId=3138015978897563648 BNBUSDT long isolated lastKnownSize=2.0000
-12-21 03:32:50 [INFO] trader/okx_trader.go:238 ✓ Using cached OKX account balance
-12-21 03:32:50 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
-12-21 03:32:50 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:32:50 [INFO] copytrade/integration.go:288 📝 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 跟单决策记录已保存: cycle=1
-[GIN] 2025/12/21 - 03:32:51 | 200 | 463.796µs | 133.18.161.81 | GET "/api/my-traders"
-12-21 03:32:57 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313): failed to get trader config: trader not found: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313
-12-21 03:32:57 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
-12-21 03:32:57 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
-12-21 03:32:59 [INFO] api/server.go:1632 🔍 Querying exchange configs for user cdf6b311-af93-4b6a-8976-ee8140262f2c
-12-21 03:32:59 [INFO] api/server.go:1647 ✅ Found 1 exchange configs
-[GIN] 2025/12/21 - 03:32:59 | 200 | 376.096µs | 133.18.161.81 | GET "/api/exchanges"
-12-21 03:33:00 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user : 0 traders
-[GIN] 2025/12/21 - 03:33:00 | 200 | 573.389µs | 133.18.161.81 | GET "/api/equity-history?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:33:00 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:33:00 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-[GIN] 2025/12/21 - 03:33:00 | 200 | 731.084µs | 133.18.161.81 | GET "/api/statistics?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:33:00 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:33:00 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-[GIN] 2025/12/21 - 03:33:00 | 200 | 875.463µs | 133.18.161.81 | GET "/api/decisions/latest?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775&limit=5"
-12-21 03:33:01 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:33:01 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-[GIN] 2025/12/21 - 03:33:01 | 200 | 646.219µs | 133.18.161.81 | GET "/api/status?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:33:01 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:33:01 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-12-21 03:33:01 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-[GIN] 2025/12/21 - 03:33:01 | 200 | 613.458µs | 133.18.161.81 | GET "/api/positions?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:33:01 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:33:01 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-12-21 03:33:01 [INFO] api/server.go:2039 📊 Received account info request [多多干]
-12-21 03:33:01 [INFO] trader/okx_trader.go:243 🔄 Calling OKX API to get account balance...
-12-21 03:33:01 [INFO] trader/okx_trader.go:291 ✓ OKX balance: Total equity=499.41, Available=498.78, Unrealized PnL=-0.00
-12-21 03:33:01 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:33:01 [INFO] api/server.go:2049 ✓ Returning account info [多多干]: equity=499.41, available=498.78, pnl=0.01 (0.00%)
-[GIN] 2025/12/21 - 03:33:01 | 200 | 4.200621ms | 133.18.161.81 | GET "/api/account?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-[GIN] 2025/12/21 - 03:33:01 | 200 | 449.5µs | 133.18.161.81 | GET "/api/my-traders"
-12-21 03:33:07 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
-12-21 03:33:07 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313): failed to get trader config: trader not found: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313
-12-21 03:33:07 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-[GIN] 2025/12/21 - 03:33:11 | 200 | 456.382µs | 133.18.161.81 | GET "/api/my-traders"
-12-21 03:33:13 [INFO] copytrade/engine.go:350 📡 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 收到信号 | BNBUSDT open long | 价格=852.9000 数量=2.0000 价值=17.06
-12-21 03:33:13 [INFO] copytrade/engine.go:485 📊 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 发现新 posId | posId=3142331871408447488 mgnMode=cross → 新开仓候选
-12-21 03:33:13 [INFO] copytrade/engine.go:517 📊 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 新开仓 | posId=3142331871408447488 mgnMode=cross → 跟随开仓
-12-21 03:33:13 [INFO] copytrade/engine.go:712 🎯 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] ✅ 跟随 | BNBUSDT | 原因: 新开仓(posId=3142331871408447488)，跟随开仓
-12-21 03:33:13 [INFO] trader/okx_trader.go:238 ✓ Using cached OKX account balance
-12-21 03:33:13 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
-12-21 03:33:13 [INFO] copytrade/engine.go:882 📊 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 比例计算 | BNBUSDT | 领航员: 交易=17.06 权益=4570.92 占比=0.37% | 跟随者: 权益=499.41 系数=100% → 跟单=1.86
-12-21 03:33:13 [INFO] copytrade/engine.go:898 📊 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 跟单金额 1.86 < 阈值 10.00，自动提升到 10.00 USDT
-12-21 03:33:13 [WARN] copytrade/engine.go:1132 ⚠️ [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 预警:size_boosted | BNBUSDT | 跟单金额 1.86 低于阈值，已提升到 10.00 USDT
-12-21 03:33:13 [INFO] copytrade/engine.go:784 📊 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] open | 金额=10.00 杠杆=3x 模式=cross 入场价=852.9000
-12-21 03:33:13 [INFO] trader/okx_trader.go:238 ✓ Using cached OKX account balance
-12-21 03:33:13 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:33:13 [INFO] copytrade/engine.go:750 ⚡ [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 决策生成 | open_long BNBUSDT | 金额=10.00
-12-21 03:33:13 [INFO] copytrade/integration.go:352 📝 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 跟单决策 | open_long BNBUSDT | reasoning=Copy trading: open following okx leader A98D73D93204D632
-12-21 03:33:13 [INFO] trader/auto_trader.go:827 [多多干] Executing external decision: open_long BNBUSDT
-12-21 03:33:13 [INFO] trader/auto_trader.go:853 📈 Open long: BNBUSDT
-12-21 03:33:13 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:33:13 [INFO] trader/auto_trader.go:885 📊 跟单模式：本地已有 BNBUSDT 仓位(模式=isolated)，目标是 cross 模式，允许新开仓
-2025/12/21 03:33:13 🔌 Do not find hook: SET_HTTP_CLIENT
-12-21 03:33:13 [INFO] trader/okx_trader.go:238 ✓ Using cached OKX account balance
-12-21 03:33:13 [INFO] trader/auto_trader.go:951 📊 跟单模式，跳过最小仓位检查
-12-21 03:33:13 [INFO] trader/auto_trader.go:963 📊 使用跟单指定的保证金模式: cross
-12-21 03:33:13 [INFO] trader/okx_trader.go:600 ⚠️ SetMarginMode API failed: OKX API error: code=51000, msg=Parameter isoMode error (will use tdMode=cross in order)
-12-21 03:33:13 [INFO] trader/okx_trader.go:665 ✓ BNBUSDT long leverage set to 3x
-12-21 03:33:13 [INFO] trader/okx_trader.go:692 📊 OKX OpenLong: quantity=0.011713, ctVal=0.010000, contracts=1.17
-12-21 03:33:13 [INFO] trader/okx_trader.go:736 ✓ OKX opened long position successfully: BNBUSDT size: 1
-12-21 03:33:13 [INFO] trader/okx_trader.go:737 Order ID: 3145955954276605952
-12-21 03:33:13 [INFO] trader/auto_trader.go:981 ✓ Position opened successfully, order ID: 3145955954276605952, quantity: 0.0117
-12-21 03:33:14 [INFO] trader/auto_trader.go:1872 ✅ Order filled: avgPrice=852.900000, qty=0.010000, fee=0.004265
-12-21 03:33:14 [INFO] trader/auto_trader.go:1882 📝 Recording position (ID: 3145955954276605952, action: open_long, price: 852.900000, qty: 0.010000, fee: 0.0043)
-12-21 03:33:14 [INFO] trader/auto_trader.go:1914 📊 Position recorded [8dd37a6e] BNBUSDT LONG @ 852.9000
-12-21 03:33:14 [INFO] trader/auto_trader.go:992 ⚠ Failed to set stop loss: failed to set stop loss: OKX API error: code=51250, msg=Order price is out of the available range
-12-21 03:33:14 [INFO] trader/auto_trader.go:995 ⚠ Failed to set take profit: failed to set take profit: OKX API error: code=51250, msg=Order price is out of the available range
-12-21 03:33:14 [INFO] trader/auto_trader.go:847 [多多干] External decision executed successfully: open_long BNBUSDT
-12-21 03:33:14 [INFO] copytrade/integration.go:200 ✅ [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 跟单执行成功 | open_long BNBUSDT | 耗时=594ms
-12-21 03:33:14 [INFO] copytrade/integration.go:436 📝 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 仓位映射已保存 | posId=3142331871408447488 BNBUSDT long cross lastKnownSize=2.0000
-12-21 03:33:14 [INFO] trader/okx_trader.go:238 ✓ Using cached OKX account balance
-12-21 03:33:14 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
-12-21 03:33:14 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:33:14 [INFO] copytrade/integration.go:288 📝 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 跟单决策记录已保存: cycle=2
-12-21 03:33:16 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:33:16 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-[GIN] 2025/12/21 - 03:33:16 | 200 | 667.956µs | 133.18.161.81 | GET "/api/status?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:33:16 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:33:16 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-12-21 03:33:16 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-[GIN] 2025/12/21 - 03:33:16 | 200 | 676.142µs | 133.18.161.81 | GET "/api/positions?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:33:16 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:33:16 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-12-21 03:33:16 [INFO] api/server.go:2039 📊 Received account info request [多多干]
-12-21 03:33:16 [INFO] trader/okx_trader.go:243 🔄 Calling OKX API to get account balance...
-12-21 03:33:16 [INFO] trader/okx_trader.go:291 ✓ OKX balance: Total equity=499.42, Available=495.93, Unrealized PnL=-0.00
-12-21 03:33:16 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:33:16 [INFO] api/server.go:2049 ✓ Returning account info [多多干]: equity=499.42, available=495.93, pnl=0.02 (0.00%)
-[GIN] 2025/12/21 - 03:33:16 | 200 | 4.451985ms | 133.18.161.81 | GET "/api/account?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:33:17 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313): failed to get trader config: trader not found: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313
-12-21 03:33:17 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
-12-21 03:33:17 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
-[GIN] 2025/12/21 - 03:33:21 | 200 | 436.387µs | 133.18.161.81 | GET "/api/my-traders"
-12-21 03:33:27 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313): failed to get trader config: trader not found: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313
-12-21 03:33:27 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:33:27 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
-12-21 03:33:28 [INFO] copytrade/engine.go:350 📡 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 收到信号 | BNBUSDT open long | 价格=852.9000 数量=2.0000 价值=17.06
-12-21 03:33:28 [INFO] copytrade/engine.go:535 📊 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 已跟随仓位 | posId=3142331871408447488 status=active → 加仓
-12-21 03:33:28 [INFO] copytrade/engine.go:712 🎯 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] ✅ 跟随 | BNBUSDT | 原因: 已跟随仓位(posId=3142331871408447488)，加仓
-12-21 03:33:28 [INFO] trader/okx_trader.go:238 ✓ Using cached OKX account balance
-12-21 03:33:28 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:33:28 [INFO] copytrade/engine.go:882 📊 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 比例计算 | BNBUSDT | 领航员: 交易=17.06 权益=4570.91 占比=0.37% | 跟随者: 权益=499.42 系数=100% → 跟单=1.86
-12-21 03:33:28 [INFO] copytrade/engine.go:898 📊 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 跟单金额 1.86 < 阈值 10.00，自动提升到 10.00 USDT
-12-21 03:33:28 [WARN] copytrade/engine.go:1132 ⚠️ [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 预警:size_boosted | BNBUSDT | 跟单金额 1.86 低于阈值，已提升到 10.00 USDT
-12-21 03:33:28 [INFO] copytrade/engine.go:784 📊 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] add | 金额=10.00 杠杆=3x 模式=cross 入场价=852.9000
-12-21 03:33:28 [INFO] trader/okx_trader.go:238 ✓ Using cached OKX account balance
-12-21 03:33:28 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:33:28 [INFO] copytrade/engine.go:750 ⚡ [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 决策生成 | open_long BNBUSDT | 金额=10.00
-12-21 03:33:28 [INFO] copytrade/integration.go:352 📝 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 跟单决策 | open_long BNBUSDT | reasoning=Copy trading: add following okx leader A98D73D93204D632
-12-21 03:33:28 [INFO] trader/auto_trader.go:827 [多多干] Executing external decision: open_long BNBUSDT
-12-21 03:33:28 [INFO] trader/auto_trader.go:853 📈 Open long: BNBUSDT
-12-21 03:33:28 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:33:28 [INFO] trader/auto_trader.go:894 📊 跟单加仓，跳过重复仓位检查
-2025/12/21 03:33:28 🔌 Do not find hook: SET_HTTP_CLIENT
-12-21 03:33:28 [INFO] trader/okx_trader.go:238 ✓ Using cached OKX account balance
-12-21 03:33:28 [INFO] trader/auto_trader.go:951 📊 跟单模式，跳过最小仓位检查
-12-21 03:33:28 [INFO] trader/auto_trader.go:963 📊 使用跟单指定的保证金模式: cross
-12-21 03:33:28 [INFO] trader/okx_trader.go:600 ⚠️ SetMarginMode API failed: OKX API error: code=51000, msg=Parameter isoMode error (will use tdMode=cross in order)
-12-21 03:33:28 [INFO] trader/okx_trader.go:665 ✓ BNBUSDT long leverage set to 3x
-12-21 03:33:28 [INFO] trader/okx_trader.go:692 📊 OKX OpenLong: quantity=0.011713, ctVal=0.010000, contracts=1.17
-12-21 03:33:28 [INFO] trader/okx_trader.go:736 ✓ OKX opened long position successfully: BNBUSDT size: 1
-12-21 03:33:28 [INFO] trader/okx_trader.go:737 Order ID: 3145956458733936640
-12-21 03:33:28 [INFO] trader/auto_trader.go:981 ✓ Position opened successfully, order ID: 3145956458733936640, quantity: 0.0117
-12-21 03:33:29 [INFO] trader/auto_trader.go:1872 ✅ Order filled: avgPrice=852.900000, qty=0.010000, fee=0.004265
-12-21 03:33:29 [INFO] trader/auto_trader.go:1882 📝 Recording position (ID: 3145956458733936640, action: open_long, price: 852.900000, qty: 0.010000, fee: 0.0043)
-12-21 03:33:29 [INFO] trader/auto_trader.go:1914 📊 Position recorded [8dd37a6e] BNBUSDT LONG @ 852.9000
-12-21 03:33:29 [INFO] trader/auto_trader.go:992 ⚠ Failed to set stop loss: failed to set stop loss: OKX API error: code=51250, msg=Order price is out of the available range
-12-21 03:33:29 [INFO] trader/auto_trader.go:995 ⚠ Failed to set take profit: failed to set take profit: OKX API error: code=51250, msg=Order price is out of the available range
-12-21 03:33:29 [INFO] trader/auto_trader.go:847 [多多干] External decision executed successfully: open_long BNBUSDT
-12-21 03:33:29 [INFO] copytrade/integration.go:200 ✅ [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 跟单执行成功 | open_long BNBUSDT | 耗时=630ms
-12-21 03:33:29 [INFO] copytrade/integration.go:404 📝 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 加仓次数已更新 | posId=3142331871408447488 BNBUSDT (第 1 次加仓)
-12-21 03:33:29 [INFO] trader/okx_trader.go:238 ✓ Using cached OKX account balance
-12-21 03:33:29 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
-12-21 03:33:29 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:33:29 [INFO] copytrade/integration.go:288 📝 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 跟单决策记录已保存: cycle=3
-12-21 03:33:30 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user : 0 traders
-[GIN] 2025/12/21 - 03:33:30 | 200 | 594.157µs | 133.18.161.81 | GET "/api/equity-history?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:33:30 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:33:30 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-[GIN] 2025/12/21 - 03:33:30 | 200 | 801.118µs | 133.18.161.81 | GET "/api/statistics?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:33:30 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:33:30 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-[GIN] 2025/12/21 - 03:33:30 | 200 | 882.594µs | 133.18.161.81 | GET "/api/decisions/latest?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775&limit=5"
-12-21 03:33:31 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:33:31 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-[GIN] 2025/12/21 - 03:33:31 | 200 | 603.826µs | 133.18.161.81 | GET "/api/status?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:33:31 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:33:31 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-12-21 03:33:31 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-[GIN] 2025/12/21 - 03:33:31 | 200 | 658.539µs | 133.18.161.81 | GET "/api/positions?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:33:31 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:33:31 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-12-21 03:33:31 [INFO] api/server.go:2039 📊 Received account info request [多多干]
-12-21 03:33:31 [INFO] trader/okx_trader.go:243 🔄 Calling OKX API to get account balance...
-12-21 03:33:31 [INFO] trader/okx_trader.go:291 ✓ OKX balance: Total equity=499.40, Available=493.09, Unrealized PnL=-0.00
-12-21 03:33:31 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:33:31 [INFO] api/server.go:2049 ✓ Returning account info [多多干]: equity=499.40, available=493.09, pnl=-0.00 (-0.00%)
-[GIN] 2025/12/21 - 03:33:31 | 200 | 4.932055ms | 133.18.161.81 | GET "/api/account?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-[GIN] 2025/12/21 - 03:33:31 | 200 | 402.447µs | 133.18.161.81 | GET "/api/my-traders"
-12-21 03:33:37 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313): failed to get trader config: trader not found: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313
-12-21 03:33:37 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
-12-21 03:33:37 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
-[GIN] 2025/12/21 - 03:33:42 | 200 | 447.259µs | 133.18.161.81 | GET "/api/my-traders"
-12-21 03:33:46 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:33:46 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-[GIN] 2025/12/21 - 03:33:46 | 200 | 629.728µs | 133.18.161.81 | GET "/api/status?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:33:46 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:33:46 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-12-21 03:33:46 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
-[GIN] 2025/12/21 - 03:33:46 | 200 | 4.443105ms | 133.18.161.81 | GET "/api/positions?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:33:46 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:33:46 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-12-21 03:33:46 [INFO] api/server.go:2039 📊 Received account info request [多多干]
-12-21 03:33:46 [INFO] trader/okx_trader.go:243 🔄 Calling OKX API to get account balance...
-12-21 03:33:46 [INFO] trader/okx_trader.go:291 ✓ OKX balance: Total equity=499.41, Available=493.09, Unrealized PnL=-0.00
-12-21 03:33:46 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:33:46 [INFO] api/server.go:2049 ✓ Returning account info [多多干]: equity=499.41, available=493.09, pnl=0.01 (0.00%)
-[GIN] 2025/12/21 - 03:33:46 | 200 | 6.30622ms | 133.18.161.81 | GET "/api/account?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:33:47 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313): failed to get trader config: trader not found: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313
-12-21 03:33:47 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:33:47 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
-[GIN] 2025/12/21 - 03:33:52 | 200 | 446.6µs | 133.18.161.81 | GET "/api/my-traders"
-12-21 03:33:57 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313): failed to get trader config: trader not found: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313
-12-21 03:33:57 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
-12-21 03:33:57 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
-12-21 03:33:59 [INFO] api/server.go:1632 🔍 Querying exchange configs for user cdf6b311-af93-4b6a-8976-ee8140262f2c
-12-21 03:33:59 [INFO] api/server.go:1647 ✅ Found 1 exchange configs
-[GIN] 2025/12/21 - 03:33:59 | 200 | 413.264µs | 133.18.161.81 | GET "/api/exchanges"
-12-21 03:34:01 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user : 0 traders
-[GIN] 2025/12/21 - 03:34:01 | 200 | 643.837µs | 133.18.161.81 | GET "/api/equity-history?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:34:01 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:34:01 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-[GIN] 2025/12/21 - 03:34:01 | 200 | 1.373451ms | 133.18.161.81 | GET "/api/statistics?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:34:01 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:34:01 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-[GIN] 2025/12/21 - 03:34:01 | 200 | 872.98µs | 133.18.161.81 | GET "/api/decisions/latest?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775&limit=5"
-12-21 03:34:01 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:34:01 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-[GIN] 2025/12/21 - 03:34:01 | 200 | 646.329µs | 133.18.161.81 | GET "/api/status?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:34:02 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:34:02 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-12-21 03:34:02 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
-[GIN] 2025/12/21 - 03:34:02 | 200 | 5.433175ms | 133.18.161.81 | GET "/api/positions?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:34:02 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:34:02 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-12-21 03:34:02 [INFO] api/server.go:2039 📊 Received account info request [多多干]
-12-21 03:34:02 [INFO] trader/okx_trader.go:243 🔄 Calling OKX API to get account balance...
-12-21 03:34:02 [INFO] trader/okx_trader.go:291 ✓ OKX balance: Total equity=499.41, Available=493.09, Unrealized PnL=-0.00
-12-21 03:34:02 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:34:02 [INFO] api/server.go:2049 ✓ Returning account info [多多干]: equity=499.41, available=493.09, pnl=0.01 (0.00%)
-[GIN] 2025/12/21 - 03:34:02 | 200 | 4.790176ms | 133.18.161.81 | GET "/api/account?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-[GIN] 2025/12/21 - 03:34:02 | 200 | 446.229µs | 133.18.161.81 | GET "/api/my-traders"
-12-21 03:34:07 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313): failed to get trader config: trader not found: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313
-12-21 03:34:07 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:34:07 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
-12-21 03:34:10 [INFO] copytrade/engine.go:350 📡 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 收到信号 | BTCUSDT open short | 价格=88215.1000 数量=0.0500 价值=44.11
-12-21 03:34:10 [INFO] copytrade/engine.go:485 📊 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 发现新 posId | posId=2918200939023196160 mgnMode=isolated → 新开仓候选
-12-21 03:34:10 [INFO] copytrade/engine.go:517 📊 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 新开仓 | posId=2918200939023196160 mgnMode=isolated → 跟随开仓
-12-21 03:34:10 [INFO] copytrade/engine.go:712 🎯 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] ✅ 跟随 | BTCUSDT | 原因: 新开仓(posId=2918200939023196160)，跟随开仓
-12-21 03:34:10 [INFO] trader/okx_trader.go:238 ✓ Using cached OKX account balance
-12-21 03:34:10 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:34:10 [INFO] copytrade/engine.go:882 📊 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 比例计算 | BTCUSDT | 领航员: 交易=44.11 权益=4570.87 占比=0.96% | 跟随者: 权益=499.41 系数=100% → 跟单=4.82
-12-21 03:34:10 [INFO] copytrade/engine.go:898 📊 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 跟单金额 4.82 < 阈值 10.00，自动提升到 10.00 USDT
-12-21 03:34:10 [WARN] copytrade/engine.go:1132 ⚠️ [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 预警:size_boosted | BTCUSDT | 跟单金额 4.82 低于阈值，已提升到 10.00 USDT
-12-21 03:34:10 [INFO] copytrade/engine.go:784 📊 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] open | 金额=10.00 杠杆=10x 模式=isolated 入场价=88215.1000
-12-21 03:34:10 [INFO] trader/okx_trader.go:238 ✓ Using cached OKX account balance
-12-21 03:34:10 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:34:10 [INFO] copytrade/engine.go:750 ⚡ [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 决策生成 | open_short BTCUSDT | 金额=10.00
-12-21 03:34:10 [INFO] copytrade/integration.go:352 📝 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 跟单决策 | open_short BTCUSDT | reasoning=Copy trading: open following okx leader A98D73D93204D632
-12-21 03:34:10 [INFO] trader/auto_trader.go:827 [多多干] Executing external decision: open_short BTCUSDT
-12-21 03:34:10 [INFO] trader/auto_trader.go:1003 📉 Open short: BTCUSDT
-12-21 03:34:10 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-2025/12/21 03:34:10 🔌 Do not find hook: SET_HTTP_CLIENT
-2025/12/21 03:34:10 🔌 Do not find hook: SET_HTTP_CLIENT
-12-21 03:34:10 [INFO] trader/okx_trader.go:238 ✓ Using cached OKX account balance
-12-21 03:34:10 [INFO] trader/auto_trader.go:1101 📊 跟单模式，跳过最小仓位检查
-12-21 03:34:10 [INFO] trader/auto_trader.go:1113 📊 使用跟单指定的保证金模式: isolated
-12-21 03:34:10 [INFO] trader/okx_trader.go:600 ⚠️ SetMarginMode API failed: OKX API error: code=51000, msg=Parameter type error (will use tdMode=isolated in order)
-12-21 03:34:10 [INFO] trader/okx_trader.go:665 ✓ BTCUSDT short leverage set to 10x
-12-21 03:34:10 [INFO] trader/okx_trader.go:769 📊 OKX OpenShort: quantity=0.000113, ctVal=0.010000, contracts=0.01
-12-21 03:34:10 [INFO] trader/okx_trader.go:813 ✓ OKX opened short position successfully: BTCUSDT size: 0.01
-12-21 03:34:10 [INFO] trader/okx_trader.go:814 Order ID: 3145957868959604736
-12-21 03:34:10 [INFO] trader/auto_trader.go:1131 ✓ Position opened successfully, order ID: 3145957868959604736, quantity: 0.0001
-12-21 03:34:11 [INFO] trader/auto_trader.go:1872 ✅ Order filled: avgPrice=88215.100000, qty=0.000100, fee=0.004411
-12-21 03:34:11 [INFO] trader/auto_trader.go:1882 📝 Recording position (ID: 3145957868959604736, action: open_short, price: 88215.100000, qty: 0.000100, fee: 0.0044)
-12-21 03:34:11 [INFO] trader/auto_trader.go:1914 📊 Position recorded [8dd37a6e] BTCUSDT SHORT @ 88215.1000
-12-21 03:34:11 [INFO] trader/auto_trader.go:1142 ⚠ Failed to set stop loss: failed to set stop loss: OKX API error: code=51250, msg=Order price is out of the available range
-12-21 03:34:11 [INFO] trader/auto_trader.go:1145 ⚠ Failed to set take profit: failed to set take profit: OKX API error: code=51250, msg=Order price is out of the available range
-12-21 03:34:11 [INFO] trader/auto_trader.go:847 [多多干] External decision executed successfully: open_short BTCUSDT
-12-21 03:34:11 [INFO] copytrade/integration.go:200 ✅ [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 跟单执行成功 | open_short BTCUSDT | 耗时=662ms
-12-21 03:34:11 [INFO] copytrade/integration.go:436 📝 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 仓位映射已保存 | posId=2918200939023196160 BTCUSDT short isolated lastKnownSize=0.0500
-12-21 03:34:11 [INFO] trader/okx_trader.go:238 ✓ Using cached OKX account balance
-12-21 03:34:11 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
-12-21 03:34:11 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:34:11 [INFO] copytrade/integration.go:288 📝 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 跟单决策记录已保存: cycle=4
-[GIN] 2025/12/21 - 03:34:12 | 200 | 485.721µs | 133.18.161.81 | GET "/api/my-traders"
-12-21 03:34:16 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:34:16 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-[GIN] 2025/12/21 - 03:34:16 | 200 | 650.129µs | 133.18.161.81 | GET "/api/status?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:34:17 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:34:17 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-12-21 03:34:17 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-[GIN] 2025/12/21 - 03:34:17 | 200 | 684.132µs | 133.18.161.81 | GET "/api/positions?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:34:17 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
-12-21 03:34:17 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
-12-21 03:34:17 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313): failed to get trader config: trader not found: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313
-12-21 03:34:17 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:34:17 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-12-21 03:34:17 [INFO] api/server.go:2039 📊 Received account info request [多多干]
-12-21 03:34:17 [INFO] trader/okx_trader.go:243 🔄 Calling OKX API to get account balance...
-12-21 03:34:17 [INFO] trader/okx_trader.go:291 ✓ OKX balance: Total equity=499.41, Available=492.20, Unrealized PnL=-0.00
-12-21 03:34:17 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:34:17 [INFO] api/server.go:2049 ✓ Returning account info [多多干]: equity=499.41, available=492.20, pnl=0.01 (0.00%)
-[GIN] 2025/12/21 - 03:34:17 | 200 | 4.293764ms | 133.18.161.81 | GET "/api/account?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-[GIN] 2025/12/21 - 03:34:23 | 200 | 411.852µs | 133.18.161.81 | GET "/api/my-traders"
-12-21 03:34:27 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313): failed to get trader config: trader not found: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313
-12-21 03:34:27 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:34:27 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
-12-21 03:34:31 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user : 0 traders
-[GIN] 2025/12/21 - 03:34:31 | 200 | 606.156µs | 133.18.161.81 | GET "/api/equity-history?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:34:31 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:34:31 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-[GIN] 2025/12/21 - 03:34:31 | 200 | 752.246µs | 133.18.161.81 | GET "/api/statistics?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:34:31 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:34:31 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-[GIN] 2025/12/21 - 03:34:31 | 200 | 857.882µs | 133.18.161.81 | GET "/api/decisions/latest?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775&limit=5"
-12-21 03:34:32 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:34:32 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-[GIN] 2025/12/21 - 03:34:32 | 200 | 601.31µs | 133.18.161.81 | GET "/api/status?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:34:32 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:34:32 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-12-21 03:34:32 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
-[GIN] 2025/12/21 - 03:34:32 | 200 | 4.307959ms | 133.18.161.81 | GET "/api/positions?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:34:32 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:34:32 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-12-21 03:34:32 [INFO] api/server.go:2039 📊 Received account info request [多多干]
-12-21 03:34:32 [INFO] trader/okx_trader.go:243 🔄 Calling OKX API to get account balance...
-12-21 03:34:32 [INFO] trader/okx_trader.go:291 ✓ OKX balance: Total equity=499.42, Available=492.20, Unrealized PnL=-0.00
-12-21 03:34:32 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:34:32 [INFO] api/server.go:2049 ✓ Returning account info [多多干]: equity=499.42, available=492.20, pnl=0.02 (0.00%)
-[GIN] 2025/12/21 - 03:34:32 | 200 | 4.368439ms | 133.18.161.81 | GET "/api/account?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-[GIN] 2025/12/21 - 03:34:33 | 200 | 446.04µs | 133.18.161.81 | GET "/api/my-traders"
-12-21 03:34:37 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313): failed to get trader config: trader not found: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313
-12-21 03:34:37 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
-12-21 03:34:37 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
-[GIN] 2025/12/21 - 03:34:43 | 200 | 447.706µs | 133.18.161.81 | GET "/api/my-traders"
-12-21 03:34:47 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:34:47 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-[GIN] 2025/12/21 - 03:34:47 | 200 | 667.241µs | 133.18.161.81 | GET "/api/status?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:34:47 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313): failed to get trader config: trader not found: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313
-12-21 03:34:47 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:34:47 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
-12-21 03:34:47 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:34:47 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-12-21 03:34:47 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
-[GIN] 2025/12/21 - 03:34:47 | 200 | 14.510018ms | 133.18.161.81 | GET "/api/positions?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:34:47 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:34:47 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-12-21 03:34:47 [INFO] api/server.go:2039 📊 Received account info request [多多干]
-12-21 03:34:47 [INFO] trader/okx_trader.go:243 🔄 Calling OKX API to get account balance...
-12-21 03:34:47 [INFO] trader/okx_trader.go:291 ✓ OKX balance: Total equity=499.42, Available=492.20, Unrealized PnL=-0.00
-12-21 03:34:47 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:34:47 [INFO] api/server.go:2049 ✓ Returning account info [多多干]: equity=499.42, available=492.20, pnl=0.02 (0.00%)
-[GIN] 2025/12/21 - 03:34:47 | 200 | 4.350878ms | 133.18.161.81 | GET "/api/account?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-[GIN] 2025/12/21 - 03:34:53 | 200 | 413.628µs | 133.18.161.81 | GET "/api/my-traders"
-12-21 03:34:57 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313): failed to get trader config: trader not found: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313
-12-21 03:34:57 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
-12-21 03:34:57 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
-12-21 03:34:59 [INFO] api/server.go:1632 🔍 Querying exchange configs for user cdf6b311-af93-4b6a-8976-ee8140262f2c
-12-21 03:34:59 [INFO] api/server.go:1647 ✅ Found 1 exchange configs
-[GIN] 2025/12/21 - 03:34:59 | 200 | 375.665µs | 133.18.161.81 | GET "/api/exchanges"
-12-21 03:35:01 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user : 0 traders
-[GIN] 2025/12/21 - 03:35:01 | 200 | 613.002µs | 133.18.161.81 | GET "/api/equity-history?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:35:01 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:35:01 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-[GIN] 2025/12/21 - 03:35:01 | 200 | 746.743µs | 133.18.161.81 | GET "/api/statistics?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:35:01 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:35:01 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-[GIN] 2025/12/21 - 03:35:01 | 200 | 875.939µs | 133.18.161.81 | GET "/api/decisions/latest?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775&limit=5"
-12-21 03:35:02 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:35:02 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-[GIN] 2025/12/21 - 03:35:02 | 200 | 620.036µs | 133.18.161.81 | GET "/api/status?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:35:02 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:35:02 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-12-21 03:35:02 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
-[GIN] 2025/12/21 - 03:35:02 | 200 | 5.604189ms | 133.18.161.81 | GET "/api/positions?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:35:02 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:35:02 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-12-21 03:35:02 [INFO] api/server.go:2039 📊 Received account info request [多多干]
-12-21 03:35:02 [INFO] trader/okx_trader.go:243 🔄 Calling OKX API to get account balance...
-12-21 03:35:02 [INFO] trader/okx_trader.go:291 ✓ OKX balance: Total equity=499.41, Available=492.20, Unrealized PnL=-0.00
-12-21 03:35:02 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:35:02 [INFO] api/server.go:2049 ✓ Returning account info [多多干]: equity=499.41, available=492.20, pnl=0.01 (0.00%)
-[GIN] 2025/12/21 - 03:35:02 | 200 | 3.814415ms | 133.18.161.81 | GET "/api/account?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-[GIN] 2025/12/21 - 03:35:04 | 200 | 417.183µs | 133.18.161.81 | GET "/api/my-traders"
-12-21 03:35:07 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313): failed to get trader config: trader not found: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313
-12-21 03:35:07 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:35:07 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
-[GIN] 2025/12/21 - 03:35:14 | 200 | 463.095µs | 133.18.161.81 | GET "/api/my-traders"
-12-21 03:35:17 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313): failed to get trader config: trader not found: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313
-12-21 03:35:17 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
-12-21 03:35:17 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
-12-21 03:35:17 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:35:17 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-[GIN] 2025/12/21 - 03:35:17 | 200 | 646.149µs | 133.18.161.81 | GET "/api/status?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:35:17 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:35:17 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-12-21 03:35:17 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
-[GIN] 2025/12/21 - 03:35:17 | 200 | 5.233527ms | 133.18.161.81 | GET "/api/positions?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:35:18 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:35:18 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-12-21 03:35:18 [INFO] api/server.go:2039 📊 Received account info request [多多干]
-12-21 03:35:18 [INFO] trader/okx_trader.go:243 🔄 Calling OKX API to get account balance...
-12-21 03:35:18 [INFO] trader/okx_trader.go:291 ✓ OKX balance: Total equity=499.41, Available=492.20, Unrealized PnL=-0.00
-12-21 03:35:18 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:35:18 [INFO] api/server.go:2049 ✓ Returning account info [多多干]: equity=499.41, available=492.20, pnl=0.01 (0.00%)
-[GIN] 2025/12/21 - 03:35:18 | 200 | 5.047851ms | 133.18.161.81 | GET "/api/account?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-[GIN] 2025/12/21 - 03:35:25 | 200 | 433.981µs | 133.18.161.81 | GET "/api/my-traders"
-12-21 03:35:27 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313): failed to get trader config: trader not found: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313
-12-21 03:35:27 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:35:27 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
-12-21 03:35:31 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user : 0 traders
-[GIN] 2025/12/21 - 03:35:31 | 200 | 599.555µs | 133.18.161.81 | GET "/api/equity-history?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:35:31 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:35:31 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-[GIN] 2025/12/21 - 03:35:31 | 200 | 773.604µs | 133.18.161.81 | GET "/api/statistics?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:35:31 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:35:31 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-[GIN] 2025/12/21 - 03:35:31 | 200 | 921.392µs | 133.18.161.81 | GET "/api/decisions/latest?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775&limit=5"
-12-21 03:35:32 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:35:32 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-[GIN] 2025/12/21 - 03:35:32 | 200 | 632.233µs | 133.18.161.81 | GET "/api/status?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:35:33 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:35:33 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-12-21 03:35:33 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
-[GIN] 2025/12/21 - 03:35:33 | 200 | 4.389572ms | 133.18.161.81 | GET "/api/positions?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:35:33 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:35:33 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-12-21 03:35:33 [INFO] api/server.go:2039 📊 Received account info request [多多干]
-12-21 03:35:33 [INFO] trader/okx_trader.go:243 🔄 Calling OKX API to get account balance...
-12-21 03:35:33 [INFO] trader/okx_trader.go:291 ✓ OKX balance: Total equity=499.41, Available=492.20, Unrealized PnL=-0.00
-12-21 03:35:33 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:35:33 [INFO] api/server.go:2049 ✓ Returning account info [多多干]: equity=499.41, available=492.20, pnl=0.01 (0.00%)
-[GIN] 2025/12/21 - 03:35:33 | 200 | 5.011287ms | 133.18.161.81 | GET "/api/account?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-[GIN] 2025/12/21 - 03:35:35 | 200 | 437.17µs | 133.18.161.81 | GET "/api/my-traders"
-12-21 03:35:37 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313): failed to get trader config: trader not found: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313
-12-21 03:35:37 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
-12-21 03:35:37 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
-12-21 03:35:37 [INFO] copytrade/engine.go:350 📡 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 收到信号 | BNBUSDT close long | 价格=852.8000 数量=2.0000 价值=17.06
-12-21 03:35:37 [INFO] copytrade/engine.go:600 📊 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] posId=3142331871408447488 size变化 | 上次=4.0000 当前=2.0000 减少=2.0000
-12-21 03:35:37 [INFO] copytrade/engine.go:619 📊 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 部分减仓 | posId=3142331871408447488 领航员剩余=2.0000
-12-21 03:35:37 [INFO] copytrade/engine.go:712 🎯 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] ✅ 跟随 | BNBUSDT | 原因: 部分减仓(posId=3142331871408447488)
-12-21 03:35:37 [INFO] trader/okx_trader.go:238 ✓ Using cached OKX account balance
-12-21 03:35:37 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:35:37 [INFO] copytrade/engine.go:882 📊 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 比例计算 | BNBUSDT | 领航员: 交易=17.06 权益=4570.85 占比=0.37% | 跟随者: 权益=499.41 系数=100% → 跟单=1.86
-12-21 03:35:37 [INFO] copytrade/engine.go:898 📊 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 跟单金额 1.86 < 阈值 10.00，自动提升到 10.00 USDT
-12-21 03:35:37 [WARN] copytrade/engine.go:1132 ⚠️ [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 预警:size_boosted | BNBUSDT | 跟单金额 1.86 低于阈值，已提升到 10.00 USDT
-12-21 03:35:37 [INFO] copytrade/engine.go:839 📊 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] BNBUSDT 减仓比例 | 减仓量=2.0000 当前=2.0000 减仓前=4.0000 → 50.0%
-12-21 03:35:37 [INFO] copytrade/engine.go:804 📊 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 部分平仓 50.0% marginMode=cross
-12-21 03:35:37 [INFO] trader/okx_trader.go:238 ✓ Using cached OKX account balance
-12-21 03:35:37 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:35:37 [INFO] copytrade/engine.go:750 ⚡ [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 决策生成 | reduce_long BNBUSDT | 金额=10.00
-12-21 03:35:37 [INFO] copytrade/integration.go:352 📝 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 跟单决策 | reduce_long BNBUSDT | reasoning=Copy trading: reduce 50% following okx leader A98D73D93204D632
-12-21 03:35:37 [INFO] trader/auto_trader.go:827 [多多干] Executing external decision: reduce_long BNBUSDT
-12-21 03:35:37 [INFO] trader/auto_trader.go:810 📉 Reduce long: BNBUSDT (ratio=0.50)
-12-21 03:35:37 [INFO] trader/auto_trader.go:1153 🔄 Close long: BNBUSDT
-2025/12/21 03:35:37 🔌 Do not find hook: SET_HTTP_CLIENT
-12-21 03:35:37 [INFO] trader/okx_trader.go:600 ⚠️ SetMarginMode API failed: OKX API error: code=51000, msg=Parameter isoMode error (will use tdMode=cross in order)
-12-21 03:35:37 [INFO] trader/auto_trader.go:1168 📊 Set marginMode=cross for close long
-12-21 03:35:37 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
-12-21 03:35:37 [INFO] trader/auto_trader.go:1193 📊 Found long position: mgnMode=cross, quantity=0.0200
-12-21 03:35:37 [INFO] trader/auto_trader.go:1203 📊 Partial close: 50% of 0.0200 = 0.0100
-12-21 03:35:37 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:35:37 [INFO] trader/okx_trader.go:839 🔍 OKX CloseLong searching positions: symbol=BNBUSDT, targetMgnMode=cross, count=3
-12-21 03:35:37 [INFO] trader/okx_trader.go:851 📊 Found matching long position: mgnMode=cross, quantity=0.0100
-12-21 03:35:37 [INFO] trader/okx_trader.go:864 🔻 OKX close long: symbol=BNBUSDT, quantity=0.010000, ctVal=0.010000, contracts=1.00, szStr=1
-12-21 03:35:37 [INFO] trader/okx_trader.go:901 ✓ OKX closed long position successfully: BNBUSDT
-12-21 03:35:38 [INFO] trader/auto_trader.go:1872 ✅ Order filled: avgPrice=852.800000, qty=0.010000, fee=0.004264
-12-21 03:35:38 [INFO] trader/auto_trader.go:1882 📝 Recording position (ID: 3145960785678606337, action: close_long, price: 852.800000, qty: 0.010000, fee: 0.0043)
-12-21 03:35:38 [INFO] trader/auto_trader.go:1945 📊 Position closed [8dd37a6e] BNBUSDT LONG @ 852.9000 → 852.8000, P&L: -0.00, Fee: 0.0043
-12-21 03:35:38 [INFO] trader/auto_trader.go:1238 ✓ Position partially closed: 0.0100 (50%)
-12-21 03:35:38 [INFO] trader/auto_trader.go:847 [多多干] External decision executed successfully: reduce_long BNBUSDT
-12-21 03:35:38 [INFO] copytrade/integration.go:200 ✅ [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 跟单执行成功 | reduce_long BNBUSDT | 耗时=592ms
-12-21 03:35:38 [INFO] trader/okx_trader.go:238 ✓ Using cached OKX account balance
-12-21 03:35:38 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:35:38 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:35:38 [INFO] copytrade/integration.go:288 📝 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 跟单决策记录已保存: cycle=5
-[GIN] 2025/12/21 - 03:35:45 | 200 | 436.734µs | 133.18.161.81 | GET "/api/my-traders"
-12-21 03:35:47 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313): failed to get trader config: trader not found: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313
-12-21 03:35:47 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:35:47 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
-12-21 03:35:48 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:35:48 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-[GIN] 2025/12/21 - 03:35:48 | 200 | 629.261µs | 133.18.161.81 | GET "/api/status?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:35:48 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:35:48 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-12-21 03:35:48 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-[GIN] 2025/12/21 - 03:35:48 | 200 | 670.487µs | 133.18.161.81 | GET "/api/positions?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:35:48 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:35:48 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-12-21 03:35:48 [INFO] api/server.go:2039 📊 Received account info request [多多干]
-12-21 03:35:48 [INFO] trader/okx_trader.go:243 🔄 Calling OKX API to get account balance...
-12-21 03:35:48 [INFO] trader/okx_trader.go:291 ✓ OKX balance: Total equity=499.41, Available=495.04, Unrealized PnL=-0.00
-12-21 03:35:48 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:35:48 [INFO] api/server.go:2049 ✓ Returning account info [多多干]: equity=499.41, available=495.04, pnl=0.01 (0.00%)
-[GIN] 2025/12/21 - 03:35:48 | 200 | 4.629828ms | 133.18.161.81 | GET "/api/account?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-[GIN] 2025/12/21 - 03:35:55 | 200 | 434.148µs | 133.18.161.81 | GET "/api/my-traders"
-12-21 03:35:57 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313): failed to get trader config: trader not found: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313
-12-21 03:35:57 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
-12-21 03:35:57 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
-12-21 03:35:59 [INFO] api/server.go:1632 🔍 Querying exchange configs for user cdf6b311-af93-4b6a-8976-ee8140262f2c
-12-21 03:35:59 [INFO] api/server.go:1647 ✅ Found 1 exchange configs
-[GIN] 2025/12/21 - 03:35:59 | 200 | 403.031µs | 133.18.161.81 | GET "/api/exchanges"
-12-21 03:36:01 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user : 0 traders
-[GIN] 2025/12/21 - 03:36:01 | 200 | 635.713µs | 133.18.161.81 | GET "/api/equity-history?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:36:01 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:36:01 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-[GIN] 2025/12/21 - 03:36:01 | 200 | 735.345µs | 133.18.161.81 | GET "/api/statistics?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:36:02 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:36:02 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-[GIN] 2025/12/21 - 03:36:02 | 200 | 931.817µs | 133.18.161.81 | GET "/api/decisions/latest?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775&limit=5"
-12-21 03:36:03 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:36:03 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-[GIN] 2025/12/21 - 03:36:03 | 200 | 717.276µs | 133.18.161.81 | GET "/api/status?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:36:03 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:36:03 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-12-21 03:36:03 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
-[GIN] 2025/12/21 - 03:36:03 | 200 | 4.712215ms | 133.18.161.81 | GET "/api/positions?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:36:04 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:36:04 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-12-21 03:36:04 [INFO] api/server.go:2039 📊 Received account info request [多多干]
-12-21 03:36:04 [INFO] trader/okx_trader.go:243 🔄 Calling OKX API to get account balance...
-12-21 03:36:04 [INFO] trader/okx_trader.go:291 ✓ OKX balance: Total equity=499.41, Available=495.04, Unrealized PnL=-0.00
-12-21 03:36:04 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:36:04 [INFO] api/server.go:2049 ✓ Returning account info [多多干]: equity=499.41, available=495.04, pnl=0.01 (0.00%)
-[GIN] 2025/12/21 - 03:36:04 | 200 | 3.519325ms | 133.18.161.81 | GET "/api/account?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-[GIN] 2025/12/21 - 03:36:05 | 200 | 427.627µs | 133.18.161.81 | GET "/api/my-traders"
-12-21 03:36:07 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313): failed to get trader config: trader not found: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313
-12-21 03:36:07 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:36:07 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
-12-21 03:36:08 [INFO] api/server.go:1632 🔍 Querying exchange configs for user cdf6b311-af93-4b6a-8976-ee8140262f2c
-12-21 03:36:08 [INFO] api/server.go:1647 ✅ Found 1 exchange configs
-[GIN] 2025/12/21 - 03:36:08 | 200 | 539.028µs | 133.18.161.81 | GET "/api/exchanges"
-[GIN] 2025/12/21 - 03:36:08 | 200 | 732.642µs | 133.18.161.81 | GET "/api/my-traders"
-[GIN] 2025/12/21 - 03:36:16 | 200 | 450.665µs | 133.18.161.81 | GET "/api/my-traders"
-12-21 03:36:17 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313): failed to get trader config: trader not found: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313
-12-21 03:36:17 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
-12-21 03:36:17 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
-12-21 03:36:18 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:36:18 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-[GIN] 2025/12/21 - 03:36:18 | 200 | 618.482µs | 133.18.161.81 | GET "/api/status?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:36:18 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:36:18 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-12-21 03:36:18 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
-[GIN] 2025/12/21 - 03:36:18 | 200 | 4.377358ms | 133.18.161.81 | GET "/api/positions?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:36:19 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:36:19 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-12-21 03:36:19 [INFO] api/server.go:2039 📊 Received account info request [多多干]
-12-21 03:36:19 [INFO] trader/okx_trader.go:243 🔄 Calling OKX API to get account balance...
-12-21 03:36:19 [INFO] trader/okx_trader.go:291 ✓ OKX balance: Total equity=499.41, Available=495.04, Unrealized PnL=-0.00
-12-21 03:36:19 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:36:19 [INFO] api/server.go:2049 ✓ Returning account info [多多干]: equity=499.41, available=495.04, pnl=0.01 (0.00%)
-[GIN] 2025/12/21 - 03:36:19 | 200 | 4.543494ms | 133.18.161.81 | GET "/api/account?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-[GIN] 2025/12/21 - 03:36:26 | 200 | 415.93µs | 133.18.161.81 | GET "/api/my-traders"
-12-21 03:36:27 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313): failed to get trader config: trader not found: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313
-12-21 03:36:27 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:36:27 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
-12-21 03:36:31 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user : 0 traders
-[GIN] 2025/12/21 - 03:36:31 | 200 | 614.994µs | 133.18.161.81 | GET "/api/equity-history?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:36:31 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:36:31 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-[GIN] 2025/12/21 - 03:36:31 | 200 | 739.287µs | 133.18.161.81 | GET "/api/statistics?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:36:32 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:36:32 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-[GIN] 2025/12/21 - 03:36:32 | 200 | 932.641µs | 133.18.161.81 | GET "/api/decisions/latest?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775&limit=5"
-12-21 03:36:33 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:36:33 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-[GIN] 2025/12/21 - 03:36:33 | 200 | 619.125µs | 133.18.161.81 | GET "/api/status?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:36:33 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:36:33 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-12-21 03:36:33 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
-[GIN] 2025/12/21 - 03:36:33 | 200 | 4.353588ms | 133.18.161.81 | GET "/api/positions?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:36:34 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:36:34 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-12-21 03:36:34 [INFO] api/server.go:2039 📊 Received account info request [多多干]
-12-21 03:36:34 [INFO] trader/okx_trader.go:243 🔄 Calling OKX API to get account balance...
-12-21 03:36:34 [INFO] trader/okx_trader.go:291 ✓ OKX balance: Total equity=499.41, Available=495.04, Unrealized PnL=-0.00
-12-21 03:36:34 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:36:34 [INFO] api/server.go:2049 ✓ Returning account info [多多干]: equity=499.41, available=495.04, pnl=0.01 (0.00%)
-[GIN] 2025/12/21 - 03:36:34 | 200 | 3.538172ms | 133.18.161.81 | GET "/api/account?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-[GIN] 2025/12/21 - 03:36:36 | 200 | 430.156µs | 133.18.161.81 | GET "/api/my-traders"
-12-21 03:36:37 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313): failed to get trader config: trader not found: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313
-12-21 03:36:37 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
-12-21 03:36:37 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
-[GIN] 2025/12/21 - 03:36:46 | 200 | 421.284µs | 133.18.161.81 | GET "/api/my-traders"
-12-21 03:36:47 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313): failed to get trader config: trader not found: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313
-12-21 03:36:47 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:36:47 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
-12-21 03:36:48 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:36:48 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-[GIN] 2025/12/21 - 03:36:48 | 200 | 635.615µs | 133.18.161.81 | GET "/api/status?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:36:49 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:36:49 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-12-21 03:36:49 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
-[GIN] 2025/12/21 - 03:36:49 | 200 | 4.018205ms | 133.18.161.81 | GET "/api/positions?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:36:50 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:36:50 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-12-21 03:36:50 [INFO] api/server.go:2039 📊 Received account info request [多多干]
-12-21 03:36:50 [INFO] trader/okx_trader.go:243 🔄 Calling OKX API to get account balance...
-12-21 03:36:50 [INFO] trader/okx_trader.go:291 ✓ OKX balance: Total equity=499.41, Available=495.04, Unrealized PnL=-0.00
-12-21 03:36:50 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:36:50 [INFO] api/server.go:2049 ✓ Returning account info [多多干]: equity=499.41, available=495.04, pnl=0.01 (0.00%)
-[GIN] 2025/12/21 - 03:36:50 | 200 | 4.633912ms | 133.18.161.81 | GET "/api/account?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-[GIN] 2025/12/21 - 03:36:57 | 200 | 413.446µs | 133.18.161.81 | GET "/api/my-traders"
-12-21 03:36:57 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313): failed to get trader config: trader not found: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313
-12-21 03:36:57 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
-12-21 03:36:57 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
-12-21 03:37:00 [INFO] api/server.go:1632 🔍 Querying exchange configs for user cdf6b311-af93-4b6a-8976-ee8140262f2c
-12-21 03:37:00 [INFO] api/server.go:1647 ✅ Found 1 exchange configs
-[GIN] 2025/12/21 - 03:37:00 | 200 | 393.766µs | 133.18.161.81 | GET "/api/exchanges"
-12-21 03:37:02 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user : 0 traders
-[GIN] 2025/12/21 - 03:37:02 | 200 | 603.416µs | 133.18.161.81 | GET "/api/equity-history?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:37:02 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:37:02 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-[GIN] 2025/12/21 - 03:37:02 | 200 | 784.987µs | 133.18.161.81 | GET "/api/statistics?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:37:02 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:37:02 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-[GIN] 2025/12/21 - 03:37:02 | 200 | 857.158µs | 133.18.161.81 | GET "/api/decisions/latest?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775&limit=5"
-12-21 03:37:04 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:37:04 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-[GIN] 2025/12/21 - 03:37:04 | 200 | 640.809µs | 133.18.161.81 | GET "/api/status?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:37:04 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:37:04 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-12-21 03:37:04 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
-[GIN] 2025/12/21 - 03:37:04 | 200 | 5.824084ms | 133.18.161.81 | GET "/api/positions?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:37:05 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:37:05 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-12-21 03:37:05 [INFO] api/server.go:2039 📊 Received account info request [多多干]
-12-21 03:37:05 [INFO] trader/okx_trader.go:243 🔄 Calling OKX API to get account balance...
-12-21 03:37:05 [INFO] trader/okx_trader.go:291 ✓ OKX balance: Total equity=499.39, Available=495.04, Unrealized PnL=-0.00
-12-21 03:37:05 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:37:05 [INFO] api/server.go:2049 ✓ Returning account info [多多干]: equity=499.39, available=495.04, pnl=-0.01 (-0.00%)
-[GIN] 2025/12/21 - 03:37:05 | 200 | 5.183575ms | 133.18.161.81 | GET "/api/account?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-[GIN] 2025/12/21 - 03:37:07 | 200 | 416.636µs | 133.18.161.81 | GET "/api/my-traders"
-12-21 03:37:07 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:37:07 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
-12-21 03:37:07 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313): failed to get trader config: trader not found: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313
-12-21 03:37:17 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313): failed to get trader config: trader not found: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313
-12-21 03:37:17 [INFO] trader/position_sync.go:738 ⚠️ Failed to get closed PnL records (ID: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775): failed to parse response: json: cannot unmarshal array into Go value of type struct { Code string "json:\"code\""; Msg string "json:\"msg\""; Data []struct { InstID string "json:\"instId\""; Direction string "json:\"direction\""; OpenAvgPx string "json:\"openAvgPx\""; CloseAvgPx string "json:\"closeAvgPx\""; CloseTotalPos string "json:\"closeTotalPos\""; RealizedPnl string "json:\"realizedPnl\""; Fee string "json:\"fee\""; FundingFee string "json:\"fundingFee\""; Lever string "json:\"lever\""; CTime string "json:\"cTime\""; UTime string "json:\"uTime\""; Type string "json:\"type\""; PosId string "json:\"posId\"" } "json:\"data\"" }
-12-21 03:37:17 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
-12-21 03:37:17 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
-[GIN] 2025/12/21 - 03:37:17 | 200 | 443.832µs | 133.18.161.81 | GET "/api/my-traders"
-12-21 03:37:19 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:37:19 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-[GIN] 2025/12/21 - 03:37:19 | 200 | 637.685µs | 133.18.161.81 | GET "/api/status?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:37:19 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:37:19 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-12-21 03:37:19 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
-[GIN] 2025/12/21 - 03:37:19 | 200 | 5.311478ms | 133.18.161.81 | GET "/api/positions?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:37:21 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:37:21 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-12-21 03:37:21 [INFO] api/server.go:2039 📊 Received account info request [多多干]
-12-21 03:37:21 [INFO] trader/okx_trader.go:243 🔄 Calling OKX API to get account balance...
-12-21 03:37:21 [INFO] trader/okx_trader.go:291 ✓ OKX balance: Total equity=499.42, Available=495.04, Unrealized PnL=-0.00
-12-21 03:37:21 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:37:21 [INFO] api/server.go:2049 ✓ Returning account info [多多干]: equity=499.42, available=495.04, pnl=0.02 (0.00%)
-[GIN] 2025/12/21 - 03:37:21 | 200 | 3.726399ms | 133.18.161.81 | GET "/api/account?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:37:27 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313): failed to get trader config: trader not found: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313
-12-21 03:37:27 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:37:27 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
-[GIN] 2025/12/21 - 03:37:27 | 200 | 418.5µs | 133.18.161.81 | GET "/api/my-traders"
-12-21 03:37:32 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user : 0 traders
-[GIN] 2025/12/21 - 03:37:32 | 200 | 611.072µs | 133.18.161.81 | GET "/api/equity-history?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:37:32 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:37:32 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-[GIN] 2025/12/21 - 03:37:32 | 200 | 821.746µs | 133.18.161.81 | GET "/api/statistics?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:37:32 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:37:32 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-[GIN] 2025/12/21 - 03:37:32 | 200 | 870.319µs | 133.18.161.81 | GET "/api/decisions/latest?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775&limit=5"
-12-21 03:37:34 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:37:34 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-[GIN] 2025/12/21 - 03:37:34 | 200 | 641.53µs | 133.18.161.81 | GET "/api/status?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:37:34 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:37:34 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-12-21 03:37:34 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
-[GIN] 2025/12/21 - 03:37:34 | 200 | 5.495327ms | 133.18.161.81 | GET "/api/positions?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:37:36 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:37:36 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-12-21 03:37:36 [INFO] api/server.go:2039 📊 Received account info request [多多干]
-12-21 03:37:36 [INFO] trader/okx_trader.go:243 🔄 Calling OKX API to get account balance...
-12-21 03:37:36 [INFO] trader/okx_trader.go:291 ✓ OKX balance: Total equity=499.42, Available=495.04, Unrealized PnL=-0.00
-12-21 03:37:36 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:37:36 [INFO] api/server.go:2049 ✓ Returning account info [多多干]: equity=499.42, available=495.04, pnl=0.01 (0.00%)
-[GIN] 2025/12/21 - 03:37:36 | 200 | 4.700437ms | 133.18.161.81 | GET "/api/account?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:37:37 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313): failed to get trader config: trader not found: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313
-12-21 03:37:37 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
-12-21 03:37:37 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
-[GIN] 2025/12/21 - 03:37:38 | 200 | 435.548µs | 133.18.161.81 | GET "/api/my-traders"
-12-21 03:37:47 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313): failed to get trader config: trader not found: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313
-12-21 03:37:47 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:37:47 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
-[GIN] 2025/12/21 - 03:37:48 | 200 | 420.924µs | 133.18.161.81 | GET "/api/my-traders"
-12-21 03:37:49 [INFO] copytrade/engine.go:350 📡 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 收到信号 | BNBUSDT open long | 价格=852.7000 数量=5.0000 价值=42.63
-12-21 03:37:49 [INFO] copytrade/engine.go:535 📊 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 已跟随仓位 | posId=3142331871408447488 status=active → 加仓
-12-21 03:37:49 [INFO] copytrade/engine.go:712 🎯 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] ✅ 跟随 | BNBUSDT | 原因: 已跟随仓位(posId=3142331871408447488)，加仓
-12-21 03:37:49 [INFO] trader/okx_trader.go:238 ✓ Using cached OKX account balance
-12-21 03:37:49 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:37:49 [INFO] copytrade/engine.go:882 📊 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 比例计算 | BNBUSDT | 领航员: 交易=42.63 权益=4570.85 占比=0.93% | 跟随者: 权益=499.42 系数=100% → 跟单=4.66
-12-21 03:37:49 [INFO] copytrade/engine.go:898 📊 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 跟单金额 4.66 < 阈值 10.00，自动提升到 10.00 USDT
-12-21 03:37:49 [WARN] copytrade/engine.go:1132 ⚠️ [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 预警:size_boosted | BNBUSDT | 跟单金额 4.66 低于阈值，已提升到 10.00 USDT
-12-21 03:37:49 [INFO] copytrade/engine.go:784 📊 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] add | 金额=10.00 杠杆=3x 模式=cross 入场价=852.7000
-12-21 03:37:49 [INFO] trader/okx_trader.go:238 ✓ Using cached OKX account balance
-12-21 03:37:49 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:37:49 [INFO] copytrade/engine.go:750 ⚡ [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 决策生成 | open_long BNBUSDT | 金额=10.00
-12-21 03:37:49 [INFO] copytrade/integration.go:352 📝 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 跟单决策 | open_long BNBUSDT | reasoning=Copy trading: add following okx leader A98D73D93204D632
-12-21 03:37:49 [INFO] trader/auto_trader.go:827 [多多干] Executing external decision: open_long BNBUSDT
-12-21 03:37:49 [INFO] trader/auto_trader.go:853 📈 Open long: BNBUSDT
-12-21 03:37:49 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:37:49 [INFO] trader/auto_trader.go:894 📊 跟单加仓，跳过重复仓位检查
-2025/12/21 03:37:49 🔌 Do not find hook: SET_HTTP_CLIENT
-12-21 03:37:49 [INFO] trader/okx_trader.go:238 ✓ Using cached OKX account balance
-12-21 03:37:49 [INFO] trader/auto_trader.go:951 📊 跟单模式，跳过最小仓位检查
-12-21 03:37:49 [INFO] trader/auto_trader.go:963 📊 使用跟单指定的保证金模式: cross
-12-21 03:37:49 [INFO] trader/okx_trader.go:600 ⚠️ SetMarginMode API failed: OKX API error: code=51000, msg=Parameter isoMode error (will use tdMode=cross in order)
-12-21 03:37:49 [INFO] trader/okx_trader.go:665 ✓ BNBUSDT long leverage set to 3x
-12-21 03:37:49 [INFO] trader/okx_trader.go:692 📊 OKX OpenLong: quantity=0.011713, ctVal=0.010000, contracts=1.17
-12-21 03:37:49 [INFO] trader/okx_trader.go:736 ✓ OKX opened long position successfully: BNBUSDT size: 1
-12-21 03:37:49 [INFO] trader/okx_trader.go:737 Order ID: 3145965215803154432
-12-21 03:37:49 [INFO] trader/auto_trader.go:981 ✓ Position opened successfully, order ID: 3145965215803154432, quantity: 0.0117
-12-21 03:37:49 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:37:49 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-[GIN] 2025/12/21 - 03:37:49 | 200 | 676.835µs | 133.18.161.81 | GET "/api/status?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:37:49 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:37:49 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-12-21 03:37:49 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
-[GIN] 2025/12/21 - 03:37:49 | 200 | 4.090596ms | 133.18.161.81 | GET "/api/positions?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:37:50 [INFO] trader/auto_trader.go:1872 ✅ Order filled: avgPrice=852.700000, qty=0.010000, fee=0.004263
-12-21 03:37:50 [INFO] trader/auto_trader.go:1882 📝 Recording position (ID: 3145965215803154432, action: open_long, price: 852.700000, qty: 0.010000, fee: 0.0043)
-12-21 03:37:50 [INFO] trader/auto_trader.go:1914 📊 Position recorded [8dd37a6e] BNBUSDT LONG @ 852.7000
-12-21 03:37:50 [INFO] trader/auto_trader.go:992 ⚠ Failed to set stop loss: failed to set stop loss: OKX API error: code=51250, msg=Order price is out of the available range
-12-21 03:37:50 [INFO] trader/auto_trader.go:995 ⚠ Failed to set take profit: failed to set take profit: OKX API error: code=51250, msg=Order price is out of the available range
-12-21 03:37:50 [INFO] trader/auto_trader.go:847 [多多干] External decision executed successfully: open_long BNBUSDT
-12-21 03:37:50 [INFO] copytrade/integration.go:200 ✅ [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 跟单执行成功 | open_long BNBUSDT | 耗时=607ms
-12-21 03:37:50 [INFO] copytrade/integration.go:404 📝 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 加仓次数已更新 | posId=3142331871408447488 BNBUSDT (第 2 次加仓)
-12-21 03:37:50 [INFO] trader/okx_trader.go:238 ✓ Using cached OKX account balance
-12-21 03:37:50 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:37:50 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:37:50 [INFO] copytrade/integration.go:288 📝 [8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775] 跟单决策记录已保存: cycle=6
-12-21 03:37:51 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:37:51 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-12-21 03:37:51 [INFO] api/server.go:2039 📊 Received account info request [多多干]
-12-21 03:37:51 [INFO] trader/okx_trader.go:243 🔄 Calling OKX API to get account balance...
-12-21 03:37:51 [INFO] trader/okx_trader.go:291 ✓ OKX balance: Total equity=499.41, Available=492.19, Unrealized PnL=-0.00
-12-21 03:37:51 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:37:51 [INFO] api/server.go:2049 ✓ Returning account info [多多干]: equity=499.40, available=492.19, pnl=0.00 (0.00%)
-[GIN] 2025/12/21 - 03:37:51 | 200 | 3.674351ms | 133.18.161.81 | GET "/api/account?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:37:57 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313): failed to get trader config: trader not found: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313
-12-21 03:37:57 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
-12-21 03:37:57 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
-[GIN] 2025/12/21 - 03:37:58 | 200 | 450.556µs | 133.18.161.81 | GET "/api/my-traders"
-12-21 03:38:00 [INFO] api/server.go:1632 🔍 Querying exchange configs for user cdf6b311-af93-4b6a-8976-ee8140262f2c
-12-21 03:38:00 [INFO] api/server.go:1647 ✅ Found 1 exchange configs
-[GIN] 2025/12/21 - 03:38:00 | 200 | 396.769µs | 133.18.161.81 | GET "/api/exchanges"
-12-21 03:38:02 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user : 0 traders
-[GIN] 2025/12/21 - 03:38:02 | 200 | 613.786µs | 133.18.161.81 | GET "/api/equity-history?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:38:02 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:38:02 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-[GIN] 2025/12/21 - 03:38:02 | 200 | 762.247µs | 133.18.161.81 | GET "/api/statistics?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:38:02 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:38:02 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-[GIN] 2025/12/21 - 03:38:02 | 200 | 906.559µs | 133.18.161.81 | GET "/api/decisions/latest?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775&limit=5"
-12-21 03:38:04 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:38:04 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-[GIN] 2025/12/21 - 03:38:04 | 200 | 658.099µs | 133.18.161.81 | GET "/api/status?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:38:04 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:38:04 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-12-21 03:38:04 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
-[GIN] 2025/12/21 - 03:38:04 | 200 | 4.532238ms | 133.18.161.81 | GET "/api/positions?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:38:06 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user cdf6b311-af93-4b6a-8976-ee8140262f2c: 1 traders
-12-21 03:38:06 [INFO] manager/trader_manager.go:523 ⚠️ Trader 多多干 already loaded, skipping
-12-21 03:38:06 [INFO] api/server.go:2039 📊 Received account info request [多多干]
-12-21 03:38:06 [INFO] trader/okx_trader.go:243 🔄 Calling OKX API to get account balance...
-12-21 03:38:06 [INFO] trader/okx_trader.go:291 ✓ OKX balance: Total equity=499.41, Available=492.19, Unrealized PnL=-0.01
-12-21 03:38:06 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:38:06 [INFO] api/server.go:2049 ✓ Returning account info [多多干]: equity=499.40, available=492.19, pnl=0.00 (0.00%)
-[GIN] 2025/12/21 - 03:38:06 | 200 | 4.931388ms | 133.18.161.81 | GET "/api/account?trader_id=8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766253775"
-12-21 03:38:07 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
-12-21 03:38:07 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
-12-21 03:38:07 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313): failed to get trader config: trader not found: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313
-[GIN] 2025/12/21 - 03:38:08 | 200 | 408.099µs | 133.18.161.81 | GET "/api/my-traders"
+12-21 11:03:57 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766284011): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
+12-21 11:03:57 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
+12-21 11:04:01 [INFO] copytrade/provider_hl_ws.go:344 📡 [HL-WS] REST 获取账户状态成功 | 权益=178.47 持仓数=2
+12-21 11:04:01 [INFO] copytrade/provider_hl_ws.go:318 📡 [HL-WS] 收到成交推送 | ETHUSDT open short | 价格=2970.0000 数量=0.0101
+12-21 11:04:01 [INFO] copytrade/engine.go:228 📡 [b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592] 收到信号(WS) | ETHUSDT open short | 价格=2970.0000 数量=0.0101 价值=30.00
+12-21 11:04:01 [INFO] copytrade/engine.go:486 📊 [b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592] 发现新 posId | posId=ETHUSDT_short mgnMode=cross → 新开仓候选
+12-21 11:04:01 [INFO] copytrade/engine.go:512 📊 [b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592] 新开仓 | posId=ETHUSDT_short mgnMode=cross → 跟随开仓
+12-21 11:04:01 [INFO] copytrade/engine.go:795 🎯 [b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592] ✅ 跟随 | ETHUSDT | 原因: 新开仓(posId=ETHUSDT_short)，跟随开仓
+12-21 11:04:01 [INFO] trader/hyperliquid_trader.go:135 🔄 Calling Hyperliquid API to get account balance...
+12-21 11:04:01 [INFO] trader/hyperliquid_trader.go:146 ✓ Found Spot balance: 0.01 USDC
+12-21 11:04:01 [INFO] trader/hyperliquid_trader.go:183 🔍 [DEBUG] Hyperliquid API CrossMarginSummary (cross margin) complete data:
+12-21 11:04:01 [INFO] trader/hyperliquid_trader.go:184 {
+"accountValue": "96.22366",
+"totalMarginUsed": "1.173573",
+"totalNtlPos": "10.56216",
+"totalRawUsd": "85.6615"
+}
+12-21 11:04:01 [INFO] trader/hyperliquid_trader.go:208 ✓ Using Withdrawable as available balance: 95.05
+12-21 11:04:01 [INFO] trader/hyperliquid_trader.go:231 ✓ Hyperliquid complete account:
+12-21 11:04:01 [INFO] trader/hyperliquid_trader.go:232 • Spot balance: 0.01 USDC (manual transfer to Perpetuals required for opening positions)
+12-21 11:04:01 [INFO] trader/hyperliquid_trader.go:233 • Perpetuals equity: 96.22 USDC (wallet 96.21 + unrealized 0.01)
+12-21 11:04:01 [INFO] trader/hyperliquid_trader.go:237 • Perpetuals available balance: 95.05 USDC (directly usable for opening positions)
+12-21 11:04:01 [INFO] trader/hyperliquid_trader.go:238 • Margin used: 1.17 USDC
+12-21 11:04:01 [INFO] trader/hyperliquid_trader.go:239 • Total assets (Perp+Spot): 96.22 USDC
+12-21 11:04:01 [INFO] trader/hyperliquid_trader.go:240 ⭐ Total assets: 96.22 USDC | Perp available: 95.05 USDC | Spot balance: 0.01 USDC
+12-21 11:04:02 [INFO] copytrade/engine.go:965 📊 [b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592] 比例计算 | ETHUSDT | 领航员: 交易=30.00 权益=178.47 占比=16.81% | 跟随者: 权益=96.23 系数=100% → 跟单=16.17
+12-21 11:04:02 [INFO] copytrade/engine.go:867 📊 [b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592] open | 金额=16.17 杠杆=25x 模式=cross 入场价=2970.0000
+12-21 11:04:02 [INFO] trader/hyperliquid_trader.go:135 🔄 Calling Hyperliquid API to get account balance...
+12-21 11:04:02 [INFO] trader/hyperliquid_trader.go:146 ✓ Found Spot balance: 0.01 USDC
+12-21 11:04:02 [INFO] trader/hyperliquid_trader.go:183 🔍 [DEBUG] Hyperliquid API CrossMarginSummary (cross margin) complete data:
+12-21 11:04:02 [INFO] trader/hyperliquid_trader.go:184 {
+"accountValue": "96.2227",
+"totalMarginUsed": "1.173466",
+"totalNtlPos": "10.5612",
+"totalRawUsd": "85.6615"
+}
+12-21 11:04:02 [INFO] trader/hyperliquid_trader.go:208 ✓ Using Withdrawable as available balance: 95.05
+12-21 11:04:02 [INFO] trader/hyperliquid_trader.go:231 ✓ Hyperliquid complete account:
+12-21 11:04:02 [INFO] trader/hyperliquid_trader.go:232 • Spot balance: 0.01 USDC (manual transfer to Perpetuals required for opening positions)
+12-21 11:04:02 [INFO] trader/hyperliquid_trader.go:233 • Perpetuals equity: 96.22 USDC (wallet 96.21 + unrealized 0.01)
+12-21 11:04:02 [INFO] trader/hyperliquid_trader.go:237 • Perpetuals available balance: 95.05 USDC (directly usable for opening positions)
+12-21 11:04:02 [INFO] trader/hyperliquid_trader.go:238 • Margin used: 1.17 USDC
+12-21 11:04:02 [INFO] trader/hyperliquid_trader.go:239 • Total assets (Perp+Spot): 96.22 USDC
+12-21 11:04:02 [INFO] trader/hyperliquid_trader.go:240 ⭐ Total assets: 96.22 USDC | Perp available: 95.05 USDC | Spot balance: 0.01 USDC
+12-21 11:04:02 [INFO] copytrade/engine.go:833 ⚡ [b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592] 决策生成 | open_short ETHUSDT | 金额=16.17
+12-21 11:04:02 [INFO] copytrade/integration.go:352 📝 [b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592] 跟单决策 | open_short ETHUSDT | reasoning=Copy trading: open following hyperliquid leader 0x4899Fc894a663e317C6F681D02F709fC5da8b535
+12-21 11:04:02 [INFO] trader/auto_trader.go:827 [哈哈哈] Executing external decision: open_short ETHUSDT
+12-21 11:04:02 [INFO] trader/auto_trader.go:1003 📉 Open short: ETHUSDT
+2025/12/21 11:04:02 🔌 Do not find hook: SET_HTTP_CLIENT
+2025/12/21 11:04:02 Do not find hook: SET_HTTP_CLIENT
+12-21 11:04:02 [INFO] trader/hyperliquid_trader.go:135 🔄 Calling Hyperliquid API to get account balance...
+12-21 11:04:02 [INFO] trader/hyperliquid_trader.go:146 ✓ Found Spot balance: 0.01 USDC
+12-21 11:04:02 [INFO] trader/hyperliquid_trader.go:183 🔍 [DEBUG] Hyperliquid API CrossMarginSummary (cross margin) complete data:
+12-21 11:04:02 [INFO] trader/hyperliquid_trader.go:184 {
+"accountValue": "96.2227",
+"totalMarginUsed": "1.173466",
+"totalNtlPos": "10.5612",
+"totalRawUsd": "85.6615"
+}
+12-21 11:04:02 [INFO] trader/hyperliquid_trader.go:208 ✓ Using Withdrawable as available balance: 95.05
+12-21 11:04:02 [INFO] trader/hyperliquid_trader.go:231 ✓ Hyperliquid complete account:
+12-21 11:04:02 [INFO] trader/hyperliquid_trader.go:232 • Spot balance: 0.01 USDC (manual transfer to Perpetuals required for opening positions)
+12-21 11:04:02 [INFO] trader/hyperliquid_trader.go:233 • Perpetuals equity: 96.22 USDC (wallet 96.21 + unrealized 0.01)
+12-21 11:04:02 [INFO] trader/hyperliquid_trader.go:237 • Perpetuals available balance: 95.05 USDC (directly usable for opening positions)
+12-21 11:04:02 [INFO] trader/hyperliquid_trader.go:238 • Margin used: 1.17 USDC
+12-21 11:04:02 [INFO] trader/hyperliquid_trader.go:239 • Total assets (Perp+Spot): 96.22 USDC
+12-21 11:04:02 [INFO] trader/hyperliquid_trader.go:240 ⭐ Total assets: 96.22 USDC | Perp available: 95.05 USDC | Spot balance: 0.01 USDC
+12-21 11:04:02 [INFO] trader/auto_trader.go:1101 📊 跟单模式，跳过最小仓位检查
+12-21 11:04:02 [INFO] trader/auto_trader.go:1113 📊 使用跟单指定的保证金模式: cross
+12-21 11:04:02 [INFO] trader/hyperliquid_trader.go:320 ✓ ETHUSDT will use cross margin mode
+12-21 11:04:02 [INFO] trader/hyperliquid_trader.go:671 ✓ Cancelled all pending orders for ETHUSDT
+🔍 DEBUG actionHash msgpack: 84a474797065ae7570646174654c65766572616765a5617373657401a7697343726f7373c3a86c6576657261676519
+[DEBUG] SignL1Action - ActionHash: 9469f28d29dfb5465f7116ddb2d5b26fef92bf760c2939ee4db21574beef5121
+12-21 11:04:03 [INFO] trader/hyperliquid_trader.go:336 ✓ ETHUSDT leverage switched to 25x
+12-21 11:04:03 [INFO] trader/hyperliquid_trader.go:456 📏 Quantity precision handling: 0.00545503 -> 0.00550000 (szDecimals=4)
+12-21 11:04:03 [INFO] trader/hyperliquid_trader.go:460 💰 Price precision handling: 2939.95350000 -> 2940.00000000 (5 significant figures)
+🔍 DEBUG actionHash msgpack: 83a474797065a56f72646572a66f72646572739186a16101a162c2a170a432393430a173a6302e30303535a172c2a17481a56c696d697481a3746966a3496f63a867726f7570696e67a26e61
+[DEBUG] SignL1Action - ActionHash: 15e9d454bf7b19b9b6b45c6aa074187cde3131023fb8f068dffad791b33bc28d
+12-21 11:04:04 [INFO] trader/hyperliquid_trader.go:481 ✓ Short position opened successfully: ETHUSDT quantity: 0.0055
+12-21 11:04:04 [INFO] trader/auto_trader.go:1131 ✓ Position opened successfully, order ID: 0, quantity: 0.0055
+12-21 11:04:04 [INFO] trader/auto_trader.go:1836 📝 Order ID is empty, using auto-generated: hyperliquid_ETHUSDT_open_short_1766286244465548546
+12-21 11:04:05 [INFO] trader/auto_trader.go:1872 ✅ Order filled: avgPrice=2965.000000, qty=0.005455, fee=0.000000
+12-21 11:04:05 [INFO] trader/auto_trader.go:1882 📝 Recording position (ID: hyperliquid_ETHUSDT_open_short_1766286244465548546, action: open_short, price: 2965.000000, qty: 0.005455, fee: 0.0000)
+12-21 11:04:05 [INFO] trader/auto_trader.go:1914 📊 Position recorded [b7c550f8] ETHUSDT SHORT @ 2965.0000
+🔍 DEBUG actionHash msgpack: 83a474797065a56f72646572a66f72646572739186a16101a162c3a170a130a173a6302e30303535a172c3a17481a77472696767657283a869734d61726b6574c3a9747269676765725078a130a47470736ca2736ca867726f7570696e67a26e61
+[DEBUG] SignL1Action - ActionHash: e02c4ff1f17f469dde2580030c2daf1d21903d2811b27c45e1eb1630f6178ca5
+12-21 11:04:05 [INFO] api/server.go:1632 🔍 Querying exchange configs for user e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34
+12-21 11:04:05 [INFO] api/server.go:1647 ✅ Found 1 exchange configs
+[GIN] 2025/12/21 - 11:04:05 | 200 | 534.89µs | 160.16.132.242 | GET "/api/exchanges"
+[GIN] 2025/12/21 - 11:04:05 | 200 | 723.14µs | 160.16.132.242 | GET "/api/my-traders"
+12-21 11:04:05 [INFO] trader/auto_trader.go:1142 ⚠ Failed to set stop loss: failed to set stop loss: Order has invalid price.
+🔍 DEBUG actionHash msgpack: 83a474797065a56f72646572a66f72646572739186a16101a162c3a170a130a173a6302e30303535a172c3a17481a77472696767657283a869734d61726b6574c3a9747269676765725078a130a47470736ca27470a867726f7570696e67a26e61
+[DEBUG] SignL1Action - ActionHash: 2a007d6886d5cc01515e8ccdbe77f63a979c5975bef33e0a40f084f16f38b0aa
+12-21 11:04:06 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34: 1 traders
+12-21 11:04:06 [INFO] manager/trader_manager.go:523 ⚠️ Trader 哈哈哈 already loaded, skipping
+[GIN] 2025/12/21 - 11:04:06 | 200 | 624.935µs | 160.16.132.242 | GET "/api/status?trader_id=b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592"
+12-21 11:04:06 [INFO] trader/auto_trader.go:1145 ⚠ Failed to set take profit: failed to set take profit: Order has invalid price.
+12-21 11:04:06 [INFO] trader/auto_trader.go:847 [哈哈哈] External decision executed successfully: open_short ETHUSDT
+12-21 11:04:06 [INFO] copytrade/integration.go:200 ✅ [b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592] 跟单执行成功 | open_short ETHUSDT | 耗时=4391ms
+12-21 11:04:06 [INFO] copytrade/integration.go:436 📝 [b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592] 仓位映射已保存 | posId=ETHUSDT_short ETHUSDT short cross lastKnownSize=0.0101
+12-21 11:04:06 [INFO] trader/hyperliquid_trader.go:135 🔄 Calling Hyperliquid API to get account balance...
+12-21 11:04:06 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34: 1 traders
+12-21 11:04:06 [INFO] manager/trader_manager.go:523 ⚠️ Trader 哈哈哈 already loaded, skipping
+12-21 11:04:06 [INFO] api/server.go:2039 📊 Received account info request [哈哈哈]
+12-21 11:04:06 [INFO] trader/hyperliquid_trader.go:135 🔄 Calling Hyperliquid API to get account balance...
+12-21 11:04:06 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34: 1 traders
+12-21 11:04:06 [INFO] manager/trader_manager.go:523 ⚠️ Trader 哈哈哈 already loaded, skipping
+12-21 11:04:06 [INFO] trader/hyperliquid_trader.go:146 ✓ Found Spot balance: 0.01 USDC
+[GIN] 2025/12/21 - 11:04:06 | 200 | 149.610826ms | 160.16.132.242 | GET "/api/positions?trader_id=b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592"
+12-21 11:04:07 [INFO] trader/hyperliquid_trader.go:183 🔍 [DEBUG] Hyperliquid API CrossMarginSummary (cross margin) complete data:
+12-21 11:04:07 [INFO] trader/hyperliquid_trader.go:184 {
+"accountValue": "96.215715",
+"totalMarginUsed": "1.826681",
+"totalNtlPos": "26.89242",
+"totalRawUsd": "101.986695"
+}
+12-21 11:04:07 [INFO] trader/hyperliquid_trader.go:208 ✓ Using Withdrawable as available balance: 93.41
+12-21 11:04:07 [INFO] trader/hyperliquid_trader.go:231 ✓ Hyperliquid complete account:
+12-21 11:04:07 [INFO] trader/hyperliquid_trader.go:232 • Spot balance: 0.01 USDC (manual transfer to Perpetuals required for opening positions)
+12-21 11:04:07 [INFO] trader/hyperliquid_trader.go:233 • Perpetuals equity: 96.22 USDC (wallet 96.20 + unrealized 0.01)
+12-21 11:04:07 [INFO] trader/hyperliquid_trader.go:237 • Perpetuals available balance: 93.41 USDC (directly usable for opening positions)
+12-21 11:04:07 [INFO] trader/hyperliquid_trader.go:238 • Margin used: 1.83 USDC
+12-21 11:04:07 [INFO] trader/hyperliquid_trader.go:239 • Total assets (Perp+Spot): 96.21 USDC
+12-21 11:04:07 [INFO] trader/hyperliquid_trader.go:240 ⭐ Total assets: 96.21 USDC | Perp available: 93.41 USDC | Spot balance: 0.01 USDC
+12-21 11:04:07 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
+12-21 11:04:07 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549): failed to get trader config: trader not found: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549
+12-21 11:04:07 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766284011): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
+12-21 11:04:07 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
+12-21 11:04:07 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313): failed to get trader config: trader not found: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313
+12-21 11:04:07 [INFO] trader/hyperliquid_trader.go:146 ✓ Found Spot balance: 0.01 USDC
+12-21 11:04:07 [INFO] trader/hyperliquid_trader.go:183 🔍 [DEBUG] Hyperliquid API CrossMarginSummary (cross margin) complete data:
+12-21 11:04:07 [INFO] trader/hyperliquid_trader.go:184 {
+"accountValue": "96.215715",
+"totalMarginUsed": "1.826681",
+"totalNtlPos": "26.89242",
+"totalRawUsd": "101.986695"
+}
+12-21 11:04:07 [INFO] trader/hyperliquid_trader.go:208 ✓ Using Withdrawable as available balance: 93.41
+12-21 11:04:07 [INFO] trader/hyperliquid_trader.go:231 ✓ Hyperliquid complete account:
+12-21 11:04:07 [INFO] trader/hyperliquid_trader.go:232 • Spot balance: 0.01 USDC (manual transfer to Perpetuals required for opening positions)
+12-21 11:04:07 [INFO] trader/hyperliquid_trader.go:233 • Perpetuals equity: 96.22 USDC (wallet 96.20 + unrealized 0.01)
+12-21 11:04:07 [INFO] trader/hyperliquid_trader.go:237 • Perpetuals available balance: 93.41 USDC (directly usable for opening positions)
+12-21 11:04:07 [INFO] trader/hyperliquid_trader.go:238 • Margin used: 1.83 USDC
+12-21 11:04:07 [INFO] trader/hyperliquid_trader.go:239 • Total assets (Perp+Spot): 96.21 USDC
+12-21 11:04:07 [INFO] trader/hyperliquid_trader.go:240 ⭐ Total assets: 96.21 USDC | Perp available: 93.41 USDC | Spot balance: 0.01 USDC
+12-21 11:04:07 [INFO] copytrade/integration.go:288 📝 [b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592] 跟单决策记录已保存: cycle=2
+12-21 11:04:07 [INFO] api/server.go:2049 ✓ Returning account info [哈哈哈]: equity=96.22, available=93.41, pnl=0.00 (0.00%)
+[GIN] 2025/12/21 - 11:04:07 | 200 | 373.004767ms | 160.16.132.242 | GET "/api/account?trader_id=b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592"
+12-21 11:04:10 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user : 0 traders
+[GIN] 2025/12/21 - 11:04:10 | 200 | 647.286µs | 160.16.132.242 | GET "/api/equity-history?trader_id=b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592"
+12-21 11:04:10 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34: 1 traders
+12-21 11:04:10 [INFO] manager/trader_manager.go:523 ⚠️ Trader 哈哈哈 already loaded, skipping
+[GIN] 2025/12/21 - 11:04:10 | 200 | 1.358638ms | 160.16.132.242 | GET "/api/decisions/latest?trader_id=b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592&limit=5"
+12-21 11:04:10 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34: 1 traders
+12-21 11:04:10 [INFO] manager/trader_manager.go:523 ⚠️ Trader 哈哈哈 already loaded, skipping
+[GIN] 2025/12/21 - 11:04:10 | 200 | 1.83298ms | 160.16.132.242 | GET "/api/statistics?trader_id=b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592"
+12-21 11:04:17 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549): failed to get trader config: trader not found: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549
+12-21 11:04:17 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766284011): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
+12-21 11:04:17 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
+12-21 11:04:17 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313): failed to get trader config: trader not found: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313
+12-21 11:04:17 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
+12-21 11:04:27 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313): failed to get trader config: trader not found: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313
+12-21 11:04:27 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
+12-21 11:04:27 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549): failed to get trader config: trader not found: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549
+12-21 11:04:27 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766284011): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
+12-21 11:04:27 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
+12-21 11:04:31 [INFO] api/server.go:1632 🔍 Querying exchange configs for user e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34
+12-21 11:04:31 [INFO] api/server.go:1647 ✅ Found 1 exchange configs
+[GIN] 2025/12/21 - 11:04:31 | 200 | 567.014µs | 160.16.132.242 | GET "/api/exchanges"
+[GIN] 2025/12/21 - 11:04:31 | 200 | 733.245µs | 160.16.132.242 | GET "/api/my-traders"
+12-21 11:04:33 [INFO] copytrade/provider_hl_ws.go:344 📡 [HL-WS] REST 获取账户状态成功 | 权益=178.46 持仓数=2
+12-21 11:04:33 [INFO] copytrade/provider_hl_ws.go:318 📡 [HL-WS] 收到成交推送 | ETHUSDT open short | 价格=2968.9000 数量=0.0101
+12-21 11:04:33 [INFO] copytrade/engine.go:228 📡 [b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592] 收到信号(WS) | ETHUSDT open short | 价格=2968.9000 数量=0.0101 价值=29.99
+12-21 11:04:33 [INFO] copytrade/engine.go:559 📊 [b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592] posId=ETHUSDT_short size 变化 | 上次=0.0101 当前=0.0202 增加=0.0101
+12-21 11:04:33 [INFO] copytrade/engine.go:577 📊 [b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592] 精确匹配加仓 | posId=ETHUSDT_short mgnMode=cross size增加=0.0101 → 跟随加仓
+12-21 11:04:33 [INFO] copytrade/engine.go:795 🎯 [b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592] ✅ 跟随 | ETHUSDT | 原因: 已跟随仓位(posId=ETHUSDT_short)，加仓
+12-21 11:04:33 [INFO] trader/hyperliquid_trader.go:135 🔄 Calling Hyperliquid API to get account balance...
+12-21 11:04:33 [INFO] trader/hyperliquid_trader.go:146 ✓ Found Spot balance: 0.01 USDC
+12-21 11:04:33 [INFO] trader/hyperliquid_trader.go:183 🔍 [DEBUG] Hyperliquid API CrossMarginSummary (cross margin) complete data:
+12-21 11:04:33 [INFO] trader/hyperliquid_trader.go:184 {
+"accountValue": "96.218055",
+"totalMarginUsed": "1.826442",
+"totalNtlPos": "26.88816",
+"totalRawUsd": "101.986695"
+}
+12-21 11:04:33 [INFO] trader/hyperliquid_trader.go:208 ✓ Using Withdrawable as available balance: 93.41
+12-21 11:04:33 [INFO] trader/hyperliquid_trader.go:231 ✓ Hyperliquid complete account:
+12-21 11:04:33 [INFO] trader/hyperliquid_trader.go:232 • Spot balance: 0.01 USDC (manual transfer to Perpetuals required for opening positions)
+12-21 11:04:33 [INFO] trader/hyperliquid_trader.go:233 • Perpetuals equity: 96.22 USDC (wallet 96.20 + unrealized 0.01)
+12-21 11:04:33 [INFO] trader/hyperliquid_trader.go:237 • Perpetuals available balance: 93.41 USDC (directly usable for opening positions)
+12-21 11:04:33 [INFO] trader/hyperliquid_trader.go:238 • Margin used: 1.83 USDC
+12-21 11:04:33 [INFO] trader/hyperliquid_trader.go:239 • Total assets (Perp+Spot): 96.21 USDC
+12-21 11:04:33 [INFO] trader/hyperliquid_trader.go:240 ⭐ Total assets: 96.21 USDC | Perp available: 93.41 USDC | Spot balance: 0.01 USDC
+12-21 11:04:33 [INFO] copytrade/engine.go:965 📊 [b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592] 比例计算 | ETHUSDT | 领航员: 交易=29.99 权益=178.46 占比=16.80% | 跟随者: 权益=96.22 系数=100% → 跟单=16.17
+12-21 11:04:33 [INFO] copytrade/engine.go:867 📊 [b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592] add | 金额=16.17 杠杆=25x 模式=cross 入场价=2968.9000
+12-21 11:04:33 [INFO] trader/hyperliquid_trader.go:135 🔄 Calling Hyperliquid API to get account balance...
+12-21 11:04:33 [INFO] trader/hyperliquid_trader.go:146 ✓ Found Spot balance: 0.01 USDC
+12-21 11:04:33 [INFO] trader/hyperliquid_trader.go:183 🔍 [DEBUG] Hyperliquid API CrossMarginSummary (cross margin) complete data:
+12-21 11:04:33 [INFO] trader/hyperliquid_trader.go:184 {
+"accountValue": "96.218055",
+"totalMarginUsed": "1.826442",
+"totalNtlPos": "26.88816",
+"totalRawUsd": "101.986695"
+}
+12-21 11:04:33 [INFO] trader/hyperliquid_trader.go:208 ✓ Using Withdrawable as available balance: 93.41
+12-21 11:04:33 [INFO] trader/hyperliquid_trader.go:231 ✓ Hyperliquid complete account:
+12-21 11:04:33 [INFO] trader/hyperliquid_trader.go:232 • Spot balance: 0.01 USDC (manual transfer to Perpetuals required for opening positions)
+12-21 11:04:33 [INFO] trader/hyperliquid_trader.go:233 • Perpetuals equity: 96.22 USDC (wallet 96.20 + unrealized 0.01)
+12-21 11:04:33 [INFO] trader/hyperliquid_trader.go:237 • Perpetuals available balance: 93.41 USDC (directly usable for opening positions)
+12-21 11:04:33 [INFO] trader/hyperliquid_trader.go:238 • Margin used: 1.83 USDC
+12-21 11:04:33 [INFO] trader/hyperliquid_trader.go:239 • Total assets (Perp+Spot): 96.21 USDC
+12-21 11:04:33 [INFO] trader/hyperliquid_trader.go:240 ⭐ Total assets: 96.21 USDC | Perp available: 93.41 USDC | Spot balance: 0.01 USDC
+12-21 11:04:34 [INFO] copytrade/engine.go:833 ⚡ [b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592] 决策生成 | open_short ETHUSDT | 金额=16.17
+12-21 11:04:34 [INFO] copytrade/integration.go:352 📝 [b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592] 跟单决策 | open_short ETHUSDT | reasoning=Copy trading: add following hyperliquid leader 0x4899Fc894a663e317C6F681D02F709fC5da8b535
+12-21 11:04:34 [INFO] trader/auto_trader.go:827 [哈哈哈] Executing external decision: open_short ETHUSDT
+12-21 11:04:34 [INFO] trader/auto_trader.go:1003 📉 Open short: ETHUSDT
+12-21 11:04:34 [INFO] trader/auto_trader.go:1044 📊 跟单加仓，跳过重复仓位检查
+2025/12/21 11:04:34 🔌 Do not find hook: SET_HTTP_CLIENT
+12-21 11:04:34 [INFO] trader/hyperliquid_trader.go:135 🔄 Calling Hyperliquid API to get account balance...
+12-21 11:04:34 [INFO] trader/hyperliquid_trader.go:146 ✓ Found Spot balance: 0.01 USDC
+12-21 11:04:34 [INFO] trader/hyperliquid_trader.go:183 🔍 [DEBUG] Hyperliquid API CrossMarginSummary (cross margin) complete data:
+12-21 11:04:34 [INFO] trader/hyperliquid_trader.go:184 {
+"accountValue": "96.218055",
+"totalMarginUsed": "1.826442",
+"totalNtlPos": "26.88816",
+"totalRawUsd": "101.986695"
+}
+12-21 11:04:34 [INFO] trader/hyperliquid_trader.go:208 ✓ Using Withdrawable as available balance: 93.41
+12-21 11:04:34 [INFO] trader/hyperliquid_trader.go:231 ✓ Hyperliquid complete account:
+12-21 11:04:34 [INFO] trader/hyperliquid_trader.go:232 • Spot balance: 0.01 USDC (manual transfer to Perpetuals required for opening positions)
+12-21 11:04:34 [INFO] trader/hyperliquid_trader.go:233 • Perpetuals equity: 96.22 USDC (wallet 96.20 + unrealized 0.01)
+12-21 11:04:34 [INFO] trader/hyperliquid_trader.go:237 • Perpetuals available balance: 93.41 USDC (directly usable for opening positions)
+12-21 11:04:34 [INFO] trader/hyperliquid_trader.go:238 • Margin used: 1.83 USDC
+12-21 11:04:34 [INFO] trader/hyperliquid_trader.go:239 • Total assets (Perp+Spot): 96.21 USDC
+12-21 11:04:34 [INFO] trader/hyperliquid_trader.go:240 ⭐ Total assets: 96.21 USDC | Perp available: 93.41 USDC | Spot balance: 0.01 USDC
+12-21 11:04:34 [INFO] trader/auto_trader.go:1101 📊 跟单模式，跳过最小仓位检查
+12-21 11:04:34 [INFO] trader/auto_trader.go:1113 📊 使用跟单指定的保证金模式: cross
+12-21 11:04:34 [INFO] trader/hyperliquid_trader.go:320 ✓ ETHUSDT will use cross margin mode
+12-21 11:04:34 [INFO] trader/hyperliquid_trader.go:671 ✓ Cancelled all pending orders for ETHUSDT
+🔍 DEBUG actionHash msgpack: 84a474797065ae7570646174654c65766572616765a5617373657401a7697343726f7373c3a86c6576657261676519
+[DEBUG] SignL1Action - ActionHash: c096e534b47a586588808d0ce9d82f1e9c6451b8c2a8a68cdc1c52f3890561ac
+12-21 11:04:34 [INFO] trader/hyperliquid_trader.go:336 ✓ ETHUSDT leverage switched to 25x
+12-21 11:04:34 [INFO] trader/hyperliquid_trader.go:456 📏 Quantity precision handling: 0.00545283 -> 0.00550000 (szDecimals=4)
+12-21 11:04:34 [INFO] trader/hyperliquid_trader.go:460 💰 Price precision handling: 2938.96350000 -> 2939.00000000 (5 significant figures)
+🔍 DEBUG actionHash msgpack: 83a474797065a56f72646572a66f72646572739186a16101a162c2a170a432393339a173a6302e30303535a172c2a17481a56c696d697481a3746966a3496f63a867726f7570696e67a26e61
+[DEBUG] SignL1Action - ActionHash: 3ae169326a2611c57ef1d46e6b6541fb016ab9c6181b76c4660551892e6e3d40
+12-21 11:04:35 [INFO] trader/hyperliquid_trader.go:481 ✓ Short position opened successfully: ETHUSDT quantity: 0.0055
+12-21 11:04:35 [INFO] trader/auto_trader.go:1131 ✓ Position opened successfully, order ID: 0, quantity: 0.0055
+12-21 11:04:35 [INFO] trader/auto_trader.go:1836 📝 Order ID is empty, using auto-generated: hyperliquid_ETHUSDT_open_short_1766286275706323654
+12-21 11:04:36 [INFO] trader/auto_trader.go:1872 ✅ Order filled: avgPrice=2965.000000, qty=0.005453, fee=0.000000
+12-21 11:04:36 [INFO] trader/auto_trader.go:1882 📝 Recording position (ID: hyperliquid_ETHUSDT_open_short_1766286275706323654, action: open_short, price: 2965.000000, qty: 0.005453, fee: 0.0000)
+12-21 11:04:36 [INFO] trader/auto_trader.go:1914 📊 Position recorded [b7c550f8] ETHUSDT SHORT @ 2965.0000
+🔍 DEBUG actionHash msgpack: 83a474797065a56f72646572a66f72646572739186a16101a162c3a170a130a173a6302e30303535a172c3a17481a77472696767657283a869734d61726b6574c3a9747269676765725078a130a47470736ca2736ca867726f7570696e67a26e61
+[DEBUG] SignL1Action - ActionHash: 6fa2403ed63a433e0a96a5e868ceb7d7fd40e8550cf1ab33a772ebe3eb855ae6
+12-21 11:04:37 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766284011): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
+12-21 11:04:37 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
+12-21 11:04:37 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313): failed to get trader config: trader not found: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313
+12-21 11:04:37 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
+12-21 11:04:37 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549): failed to get trader config: trader not found: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549
+12-21 11:04:37 [INFO] api/server.go:1632 🔍 Querying exchange configs for user e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34
+12-21 11:04:37 [INFO] api/server.go:1647 ✅ Found 1 exchange configs
+[GIN] 2025/12/21 - 11:04:37 | 200 | 424.433µs | 160.16.132.242 | GET "/api/exchanges"
+12-21 11:04:37 [INFO] trader/auto_trader.go:1142 ⚠ Failed to set stop loss: failed to set stop loss: Order has invalid price.
+🔍 DEBUG actionHash msgpack: 83a474797065a56f72646572a66f72646572739186a16101a162c3a170a130a173a6302e30303535a172c3a17481a77472696767657283a869734d61726b6574c3a9747269676765725078a130a47470736ca27470a867726f7570696e67a26e61
+[DEBUG] SignL1Action - ActionHash: cd779f9d0b804fad90ad913319a87916e40581ec7e96ce125da54acc44feee50
+12-21 11:04:37 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34: 1 traders
+12-21 11:04:37 [INFO] manager/trader_manager.go:523 ⚠️ Trader 哈哈哈 already loaded, skipping
+12-21 11:04:37 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34: 1 traders
+12-21 11:04:37 [INFO] manager/trader_manager.go:523 ⚠️ Trader 哈哈哈 already loaded, skipping
+[GIN] 2025/12/21 - 11:04:37 | 200 | 1.130301ms | 160.16.132.242 | GET "/api/status?trader_id=b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592"
+12-21 11:04:37 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34: 1 traders
+12-21 11:04:37 [INFO] manager/trader_manager.go:523 ⚠️ Trader 哈哈哈 already loaded, skipping
+12-21 11:04:37 [INFO] api/server.go:2039 📊 Received account info request [哈哈哈]
+12-21 11:04:37 [INFO] trader/hyperliquid_trader.go:135 🔄 Calling Hyperliquid API to get account balance...
+12-21 11:04:37 [INFO] trader/hyperliquid_trader.go:146 ✓ Found Spot balance: 0.01 USDC
+[GIN] 2025/12/21 - 11:04:37 | 200 | 142.285871ms | 160.16.132.242 | GET "/api/positions?trader_id=b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592"
+12-21 11:04:37 [INFO] trader/hyperliquid_trader.go:183 🔍 [DEBUG] Hyperliquid API CrossMarginSummary (cross margin) complete data:
+12-21 11:04:37 [INFO] trader/hyperliquid_trader.go:184 {
+"accountValue": "96.211502",
+"totalMarginUsed": "2.479424",
+"totalNtlPos": "43.21376",
+"totalRawUsd": "118.306942"
+}
+12-21 11:04:37 [INFO] trader/hyperliquid_trader.go:208 ✓ Using Withdrawable as available balance: 91.77
+12-21 11:04:37 [INFO] trader/hyperliquid_trader.go:231 ✓ Hyperliquid complete account:
+12-21 11:04:37 [INFO] trader/hyperliquid_trader.go:232 • Spot balance: 0.01 USDC (manual transfer to Perpetuals required for opening positions)
+12-21 11:04:37 [INFO] trader/hyperliquid_trader.go:233 • Perpetuals equity: 96.21 USDC (wallet 96.20 + unrealized 0.02)
+12-21 11:04:37 [INFO] trader/hyperliquid_trader.go:237 • Perpetuals available balance: 91.77 USDC (directly usable for opening positions)
+12-21 11:04:37 [INFO] trader/hyperliquid_trader.go:238 • Margin used: 2.48 USDC
+12-21 11:04:37 [INFO] trader/hyperliquid_trader.go:239 • Total assets (Perp+Spot): 96.20 USDC
+12-21 11:04:37 [INFO] trader/hyperliquid_trader.go:240 ⭐ Total assets: 96.20 USDC | Perp available: 91.77 USDC | Spot balance: 0.01 USDC
+12-21 11:04:37 [INFO] api/server.go:2049 ✓ Returning account info [哈哈哈]: equity=96.22, available=91.77, pnl=-0.00 (-0.00%)
+[GIN] 2025/12/21 - 11:04:37 | 200 | 269.382285ms | 160.16.132.242 | GET "/api/account?trader_id=b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592"
+12-21 11:04:38 [INFO] trader/auto_trader.go:1145 ⚠ Failed to set take profit: failed to set take profit: Order has invalid price.
+12-21 11:04:38 [INFO] trader/auto_trader.go:847 [哈哈哈] External decision executed successfully: open_short ETHUSDT
+12-21 11:04:38 [INFO] copytrade/integration.go:200 ✅ [b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592] 跟单执行成功 | open_short ETHUSDT | 耗时=4165ms
+12-21 11:04:38 [INFO] copytrade/integration.go:404 📝 [b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592] 加仓次数已更新 | posId=ETHUSDT_short ETHUSDT (第 1 次加仓)
+12-21 11:04:38 [INFO] trader/hyperliquid_trader.go:135 🔄 Calling Hyperliquid API to get account balance...
+12-21 11:04:38 [INFO] trader/hyperliquid_trader.go:146 ✓ Found Spot balance: 0.01 USDC
+12-21 11:04:38 [INFO] trader/hyperliquid_trader.go:183 🔍 [DEBUG] Hyperliquid API CrossMarginSummary (cross margin) complete data:
+12-21 11:04:38 [INFO] trader/hyperliquid_trader.go:184 {
+"accountValue": "96.211502",
+"totalMarginUsed": "2.479424",
+"totalNtlPos": "43.21376",
+"totalRawUsd": "118.306942"
+}
+12-21 11:04:38 [INFO] trader/hyperliquid_trader.go:208 ✓ Using Withdrawable as available balance: 91.77
+12-21 11:04:38 [INFO] trader/hyperliquid_trader.go:231 ✓ Hyperliquid complete account:
+12-21 11:04:38 [INFO] trader/hyperliquid_trader.go:232 • Spot balance: 0.01 USDC (manual transfer to Perpetuals required for opening positions)
+12-21 11:04:38 [INFO] trader/hyperliquid_trader.go:233 • Perpetuals equity: 96.21 USDC (wallet 96.20 + unrealized 0.02)
+12-21 11:04:38 [INFO] trader/hyperliquid_trader.go:237 • Perpetuals available balance: 91.77 USDC (directly usable for opening positions)
+12-21 11:04:38 [INFO] trader/hyperliquid_trader.go:238 • Margin used: 2.48 USDC
+12-21 11:04:38 [INFO] trader/hyperliquid_trader.go:239 • Total assets (Perp+Spot): 96.20 USDC
+12-21 11:04:38 [INFO] trader/hyperliquid_trader.go:240 ⭐ Total assets: 96.20 USDC | Perp available: 91.77 USDC | Spot balance: 0.01 USDC
+12-21 11:04:38 [INFO] copytrade/integration.go:288 📝 [b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592] 跟单决策记录已保存: cycle=3
+12-21 11:04:44 [INFO] api/server.go:1632 🔍 Querying exchange configs for user e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34
+12-21 11:04:44 [INFO] api/server.go:1647 ✅ Found 1 exchange configs
+[GIN] 2025/12/21 - 11:04:44 | 200 | 1.341226ms | 160.16.132.242 | GET "/api/exchanges"
+[GIN] 2025/12/21 - 11:04:44 | 200 | 701.398µs | 160.16.132.242 | GET "/api/my-traders"
+12-21 11:04:47 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313): failed to get trader config: trader not found: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313
+12-21 11:04:47 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
+12-21 11:04:47 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549): failed to get trader config: trader not found: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549
+12-21 11:04:47 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766284011): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
+12-21 11:04:47 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
+12-21 11:04:57 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
+12-21 11:04:57 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313): failed to get trader config: trader not found: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313
+12-21 11:04:57 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
+12-21 11:04:57 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549): failed to get trader config: trader not found: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549
+12-21 11:04:57 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766284011): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
+12-21 11:05:07 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549): failed to get trader config: trader not found: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549
+12-21 11:05:07 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766284011): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
+12-21 11:05:07 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
+12-21 11:05:07 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313): failed to get trader config: trader not found: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313
+12-21 11:05:07 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
+12-21 11:05:11 [INFO] api/server.go:1632 🔍 Querying exchange configs for user e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34
+12-21 11:05:11 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user : 0 traders
+12-21 11:05:11 [INFO] api/server.go:1647 ✅ Found 1 exchange configs
+[GIN] 2025/12/21 - 11:05:11 | 200 | 557.011µs | 160.16.132.242 | GET "/api/exchanges"
+[GIN] 2025/12/21 - 11:05:11 | 200 | 1.078972ms | 160.16.132.242 | GET "/api/equity-history?trader_id=b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592"
+[GIN] 2025/12/21 - 11:05:11 | 200 | 1.337752ms | 160.16.132.242 | GET "/api/my-traders"
+12-21 11:05:11 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34: 1 traders
+12-21 11:05:11 [INFO] manager/trader_manager.go:523 ⚠️ Trader 哈哈哈 already loaded, skipping
+[GIN] 2025/12/21 - 11:05:11 | 200 | 904.293µs | 160.16.132.242 | GET "/api/decisions/latest?trader_id=b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592&limit=5"
+12-21 11:05:11 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34: 1 traders
+12-21 11:05:11 [INFO] manager/trader_manager.go:523 ⚠️ Trader 哈哈哈 already loaded, skipping
+[GIN] 2025/12/21 - 11:05:11 | 200 | 1.379737ms | 160.16.132.242 | GET "/api/statistics?trader_id=b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592"
+12-21 11:05:17 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
+12-21 11:05:17 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549): failed to get trader config: trader not found: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549
+12-21 11:05:17 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766284011): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
+12-21 11:05:17 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
+12-21 11:05:17 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313): failed to get trader config: trader not found: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313
+12-21 11:05:17 [INFO] copytrade/provider_hl_ws.go:344 📡 [HL-WS] REST 获取账户状态成功 | 权益=178.43 持仓数=2
+12-21 11:05:17 [INFO] copytrade/provider_hl_ws.go:318 📡 [HL-WS] 收到成交推送 | BTCUSDT open long | 价格=88060.0000 数量=0.0003
+12-21 11:05:17 [INFO] copytrade/engine.go:228 📡 [b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592] 收到信号(WS) | BTCUSDT open long | 价格=88060.0000 数量=0.0003 价值=29.94
+12-21 11:05:17 [INFO] copytrade/engine.go:559 📊 [b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592] posId=BTCUSDT_long size 变化 | 上次=0.0002 当前=0.0006 增加=0.0003
+12-21 11:05:17 [INFO] copytrade/engine.go:577 📊 [b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592] 精确匹配加仓 | posId=BTCUSDT_long mgnMode=cross size增加=0.0003 → 跟随加仓
+12-21 11:05:17 [INFO] copytrade/engine.go:795 🎯 [b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592] ✅ 跟随 | BTCUSDT | 原因: 已跟随仓位(posId=BTCUSDT_long)，加仓
+12-21 11:05:17 [INFO] trader/hyperliquid_trader.go:135 🔄 Calling Hyperliquid API to get account balance...
+12-21 11:05:17 [INFO] trader/hyperliquid_trader.go:146 ✓ Found Spot balance: 0.01 USDC
+12-21 11:05:18 [INFO] trader/hyperliquid_trader.go:183 🔍 [DEBUG] Hyperliquid API CrossMarginSummary (cross margin) complete data:
+12-21 11:05:18 [INFO] trader/hyperliquid_trader.go:184 {
+"accountValue": "96.204702",
+"totalMarginUsed": "2.48033",
+"totalNtlPos": "43.22896",
+"totalRawUsd": "118.306942"
+}
+12-21 11:05:18 [INFO] trader/hyperliquid_trader.go:208 ✓ Using Withdrawable as available balance: 91.76
+12-21 11:05:18 [INFO] trader/hyperliquid_trader.go:231 ✓ Hyperliquid complete account:
+12-21 11:05:18 [INFO] trader/hyperliquid_trader.go:232 • Spot balance: 0.01 USDC (manual transfer to Perpetuals required for opening positions)
+12-21 11:05:18 [INFO] trader/hyperliquid_trader.go:233 • Perpetuals equity: 96.20 USDC (wallet 96.20 + unrealized 0.01)
+12-21 11:05:18 [INFO] trader/hyperliquid_trader.go:237 • Perpetuals available balance: 91.76 USDC (directly usable for opening positions)
+12-21 11:05:18 [INFO] trader/hyperliquid_trader.go:238 • Margin used: 2.48 USDC
+12-21 11:05:18 [INFO] trader/hyperliquid_trader.go:239 • Total assets (Perp+Spot): 96.20 USDC
+12-21 11:05:18 [INFO] trader/hyperliquid_trader.go:240 ⭐ Total assets: 96.20 USDC | Perp available: 91.76 USDC | Spot balance: 0.01 USDC
+12-21 11:05:18 [INFO] copytrade/engine.go:965 📊 [b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592] 比例计算 | BTCUSDT | 领航员: 交易=29.94 权益=178.43 占比=16.78% | 跟随者: 权益=96.21 系数=100% → 跟单=16.14
+12-21 11:05:18 [INFO] copytrade/engine.go:867 📊 [b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592] add | 金额=16.14 杠杆=9x 模式=cross 入场价=88060.0000
+12-21 11:05:18 [INFO] trader/hyperliquid_trader.go:135 🔄 Calling Hyperliquid API to get account balance...
+12-21 11:05:18 [INFO] trader/hyperliquid_trader.go:146 ✓ Found Spot balance: 0.01 USDC
+12-21 11:05:18 [INFO] trader/hyperliquid_trader.go:183 🔍 [DEBUG] Hyperliquid API CrossMarginSummary (cross margin) complete data:
+12-21 11:05:18 [INFO] trader/hyperliquid_trader.go:184 {
+"accountValue": "96.204702",
+"totalMarginUsed": "2.48033",
+"totalNtlPos": "43.22896",
+"totalRawUsd": "118.306942"
+}
+12-21 11:05:18 [INFO] trader/hyperliquid_trader.go:208 ✓ Using Withdrawable as available balance: 91.76
+12-21 11:05:18 [INFO] trader/hyperliquid_trader.go:231 ✓ Hyperliquid complete account:
+12-21 11:05:18 [INFO] trader/hyperliquid_trader.go:232 • Spot balance: 0.01 USDC (manual transfer to Perpetuals required for opening positions)
+12-21 11:05:18 [INFO] trader/hyperliquid_trader.go:233 • Perpetuals equity: 96.20 USDC (wallet 96.20 + unrealized 0.01)
+12-21 11:05:18 [INFO] trader/hyperliquid_trader.go:237 • Perpetuals available balance: 91.76 USDC (directly usable for opening positions)
+12-21 11:05:18 [INFO] trader/hyperliquid_trader.go:238 • Margin used: 2.48 USDC
+12-21 11:05:18 [INFO] trader/hyperliquid_trader.go:239 • Total assets (Perp+Spot): 96.20 USDC
+12-21 11:05:18 [INFO] trader/hyperliquid_trader.go:240 ⭐ Total assets: 96.20 USDC | Perp available: 91.76 USDC | Spot balance: 0.01 USDC
+12-21 11:05:18 [INFO] copytrade/engine.go:833 ⚡ [b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592] 决策生成 | open_long BTCUSDT | 金额=16.14
+12-21 11:05:18 [INFO] copytrade/integration.go:352 📝 [b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592] 跟单决策 | open_long BTCUSDT | reasoning=Copy trading: add following hyperliquid leader 0x4899Fc894a663e317C6F681D02F709fC5da8b535
+12-21 11:05:18 [INFO] trader/auto_trader.go:827 [哈哈哈] Executing external decision: open_long BTCUSDT
+12-21 11:05:18 [INFO] trader/auto_trader.go:853 📈 Open long: BTCUSDT
+12-21 11:05:18 [INFO] trader/auto_trader.go:894 📊 跟单加仓，跳过重复仓位检查
+2025/12/21 11:05:18 🔌 Do not find hook: SET_HTTP_CLIENT
+12-21 11:05:18 [INFO] trader/hyperliquid_trader.go:135 🔄 Calling Hyperliquid API to get account balance...
+12-21 11:05:18 [INFO] trader/hyperliquid_trader.go:146 ✓ Found Spot balance: 0.01 USDC
+12-21 11:05:18 [INFO] trader/hyperliquid_trader.go:183 🔍 [DEBUG] Hyperliquid API CrossMarginSummary (cross margin) complete data:
+12-21 11:05:18 [INFO] trader/hyperliquid_trader.go:184 {
+"accountValue": "96.204702",
+"totalMarginUsed": "2.48033",
+"totalNtlPos": "43.22896",
+"totalRawUsd": "118.306942"
+}
+12-21 11:05:18 [INFO] trader/hyperliquid_trader.go:208 ✓ Using Withdrawable as available balance: 91.76
+12-21 11:05:18 [INFO] trader/hyperliquid_trader.go:231 ✓ Hyperliquid complete account:
+12-21 11:05:18 [INFO] trader/hyperliquid_trader.go:232 • Spot balance: 0.01 USDC (manual transfer to Perpetuals required for opening positions)
+12-21 11:05:18 [INFO] trader/hyperliquid_trader.go:233 • Perpetuals equity: 96.20 USDC (wallet 96.20 + unrealized 0.01)
+12-21 11:05:18 [INFO] trader/hyperliquid_trader.go:237 • Perpetuals available balance: 91.76 USDC (directly usable for opening positions)
+12-21 11:05:18 [INFO] trader/hyperliquid_trader.go:238 • Margin used: 2.48 USDC
+12-21 11:05:18 [INFO] trader/hyperliquid_trader.go:239 • Total assets (Perp+Spot): 96.20 USDC
+12-21 11:05:18 [INFO] trader/hyperliquid_trader.go:240 ⭐ Total assets: 96.20 USDC | Perp available: 91.76 USDC | Spot balance: 0.01 USDC
+12-21 11:05:18 [INFO] trader/auto_trader.go:951 📊 跟单模式，跳过最小仓位检查
+12-21 11:05:18 [INFO] trader/auto_trader.go:963 📊 使用跟单指定的保证金模式: cross
+12-21 11:05:18 [INFO] trader/hyperliquid_trader.go:320 ✓ BTCUSDT will use cross margin mode
+12-21 11:05:18 [INFO] trader/hyperliquid_trader.go:671 ✓ Cancelled all pending orders for BTCUSDT
+🔍 DEBUG actionHash msgpack: 84a474797065ae7570646174654c65766572616765a5617373657400a7697343726f7373c3a86c6576657261676509
+[DEBUG] SignL1Action - ActionHash: 77cd8a7ac250406f48496b45e3c67901ae6725c8514afb004505dd2e170406ef
+12-21 11:05:19 [INFO] trader/hyperliquid_trader.go:336 ✓ BTCUSDT leverage switched to 9x
+12-21 11:05:19 [INFO] trader/hyperliquid_trader.go:398 📏 Quantity precision handling: 0.00018364 -> 0.00018000 (szDecimals=5)
+12-21 11:05:19 [INFO] trader/hyperliquid_trader.go:402 💰 Price precision handling: 88940.09500000 -> 88940.00000000 (5 significant figures)
+🔍 DEBUG actionHash msgpack: 83a474797065a56f72646572a66f72646572739186a16100a162c3a170a53838393430a173a7302e3030303138a172c2a17481a56c696d697481a3746966a3496f63a867726f7570696e67a26e61
+[DEBUG] SignL1Action - ActionHash: 5cb88103cd284114ad2c639c94e95d1ca5f6915db7be6d575eb0d4d2b64f0e36
+12-21 11:05:20 [INFO] trader/hyperliquid_trader.go:423 ✓ Long position opened successfully: BTCUSDT quantity: 0.0002
+12-21 11:05:20 [INFO] trader/auto_trader.go:981 ✓ Position opened successfully, order ID: 0, quantity: 0.0002
+12-21 11:05:20 [INFO] trader/auto_trader.go:1836 📝 Order ID is empty, using auto-generated: hyperliquid_BTCUSDT_open_long_1766286320186756055
+12-21 11:05:20 [INFO] trader/auto_trader.go:1872 ✅ Order filled: avgPrice=87910.000000, qty=0.000184, fee=0.000000
+12-21 11:05:20 [INFO] trader/auto_trader.go:1882 📝 Recording position (ID: hyperliquid_BTCUSDT_open_long_1766286320186756055, action: open_long, price: 87910.000000, qty: 0.000184, fee: 0.0000)
+12-21 11:05:20 [INFO] trader/auto_trader.go:1914 📊 Position recorded [b7c550f8] BTCUSDT LONG @ 87910.0000
+🔍 DEBUG actionHash msgpack: 83a474797065a56f72646572a66f72646572739186a16100a162c2a170a130a173a7302e3030303138a172c3a17481a77472696767657283a869734d61726b6574c3a9747269676765725078a130a47470736ca2736ca867726f7570696e67a26e61
+[DEBUG] SignL1Action - ActionHash: 431af02fef31bf0ffb5979d6bcc0249c243a5d0b638a97f8efda1751e65de493
+12-21 11:05:21 [INFO] trader/auto_trader.go:992 ⚠ Failed to set stop loss: failed to set stop loss: Order has invalid price.
+🔍 DEBUG actionHash msgpack: 83a474797065a56f72646572a66f72646572739186a16100a162c2a170a130a173a7302e3030303138a172c3a17481a77472696767657283a869734d61726b6574c3a9747269676765725078a130a47470736ca27470a867726f7570696e67a26e61
+[DEBUG] SignL1Action - ActionHash: f84243fb5d79353f1058285c426007b6c3c7841ba1142499f239c8a8b9126542
+12-21 11:05:22 [INFO] trader/auto_trader.go:995 ⚠ Failed to set take profit: failed to set take profit: Order has invalid price.
+12-21 11:05:22 [INFO] trader/auto_trader.go:847 [哈哈哈] External decision executed successfully: open_long BTCUSDT
+12-21 11:05:22 [INFO] copytrade/integration.go:200 ✅ [b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592] 跟单执行成功 | open_long BTCUSDT | 耗时=4060ms
+12-21 11:05:22 [INFO] copytrade/integration.go:404 📝 [b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592] 加仓次数已更新 | posId=BTCUSDT_long BTCUSDT (第 1 次加仓)
+12-21 11:05:22 [INFO] trader/hyperliquid_trader.go:135 🔄 Calling Hyperliquid API to get account balance...
+12-21 11:05:22 [INFO] trader/hyperliquid_trader.go:146 ✓ Found Spot balance: 0.01 USDC
+12-21 11:05:22 [INFO] trader/hyperliquid_trader.go:183 🔍 [DEBUG] Hyperliquid API CrossMarginSummary (cross margin) complete data:
+12-21 11:05:22 [INFO] trader/hyperliquid_trader.go:184 {
+"accountValue": "96.195295",
+"totalMarginUsed": "4.242077",
+"totalNtlPos": "59.0882",
+"totalRawUsd": "102.449295"
+}
+12-21 11:05:22 [INFO] trader/hyperliquid_trader.go:208 ✓ Using Withdrawable as available balance: 89.99
+12-21 11:05:22 [INFO] trader/hyperliquid_trader.go:231 ✓ Hyperliquid complete account:
+12-21 11:05:22 [INFO] trader/hyperliquid_trader.go:232 • Spot balance: 0.01 USDC (manual transfer to Perpetuals required for opening positions)
+12-21 11:05:22 [INFO] trader/hyperliquid_trader.go:233 • Perpetuals equity: 96.20 USDC (wallet 96.19 + unrealized 0.01)
+12-21 11:05:22 [INFO] trader/hyperliquid_trader.go:237 • Perpetuals available balance: 89.99 USDC (directly usable for opening positions)
+12-21 11:05:22 [INFO] trader/hyperliquid_trader.go:238 • Margin used: 4.24 USDC
+12-21 11:05:22 [INFO] trader/hyperliquid_trader.go:239 • Total assets (Perp+Spot): 96.19 USDC
+12-21 11:05:22 [INFO] trader/hyperliquid_trader.go:240 ⭐ Total assets: 96.19 USDC | Perp available: 89.99 USDC | Spot balance: 0.01 USDC
+12-21 11:05:22 [INFO] copytrade/integration.go:288 📝 [b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592] 跟单决策记录已保存: cycle=4
+12-21 11:05:25 [INFO] api/server.go:1632 🔍 Querying exchange configs for user e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34
+12-21 11:05:25 [INFO] api/server.go:1647 ✅ Found 1 exchange configs
+[GIN] 2025/12/21 - 11:05:25 | 200 | 696.203µs | 160.16.132.242 | GET "/api/exchanges"
+12-21 11:05:25 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34: 1 traders
+12-21 11:05:25 [INFO] manager/trader_manager.go:523 ⚠️ Trader 哈哈哈 already loaded, skipping
+12-21 11:05:25 [INFO] api/server.go:2039 📊 Received account info request [哈哈哈]
+12-21 11:05:25 [INFO] trader/hyperliquid_trader.go:135 🔄 Calling Hyperliquid API to get account balance...
+[GIN] 2025/12/21 - 11:05:25 | 200 | 2.473036ms | 160.16.132.242 | GET "/api/my-traders"
+12-21 11:05:25 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34: 1 traders
+12-21 11:05:25 [INFO] manager/trader_manager.go:523 ⚠️ Trader 哈哈哈 already loaded, skipping
+[GIN] 2025/12/21 - 11:05:25 | 200 | 2.7235ms | 160.16.132.242 | GET "/api/status?trader_id=b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592"
+12-21 11:05:25 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34: 1 traders
+12-21 11:05:25 [INFO] manager/trader_manager.go:523 ⚠️ Trader 哈哈哈 already loaded, skipping
+12-21 11:05:25 [INFO] trader/hyperliquid_trader.go:146 ✓ Found Spot balance: 0.01 USDC
+[GIN] 2025/12/21 - 11:05:25 | 200 | 68.418301ms | 160.16.132.242 | GET "/api/positions?trader_id=b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592"
+12-21 11:05:26 [INFO] trader/hyperliquid_trader.go:183 🔍 [DEBUG] Hyperliquid API CrossMarginSummary (cross margin) complete data:
+12-21 11:05:26 [INFO] trader/hyperliquid_trader.go:184 {
+"accountValue": "96.195895",
+"totalMarginUsed": "4.242144",
+"totalNtlPos": "59.0888",
+"totalRawUsd": "102.449295"
+}
+12-21 11:05:26 [INFO] trader/hyperliquid_trader.go:208 ✓ Using Withdrawable as available balance: 89.99
+12-21 11:05:26 [INFO] trader/hyperliquid_trader.go:231 ✓ Hyperliquid complete account:
+12-21 11:05:26 [INFO] trader/hyperliquid_trader.go:232 • Spot balance: 0.01 USDC (manual transfer to Perpetuals required for opening positions)
+12-21 11:05:26 [INFO] trader/hyperliquid_trader.go:233 • Perpetuals equity: 96.20 USDC (wallet 96.19 + unrealized 0.01)
+12-21 11:05:26 [INFO] trader/hyperliquid_trader.go:237 • Perpetuals available balance: 89.99 USDC (directly usable for opening positions)
+12-21 11:05:26 [INFO] trader/hyperliquid_trader.go:238 • Margin used: 4.24 USDC
+12-21 11:05:26 [INFO] trader/hyperliquid_trader.go:239 • Total assets (Perp+Spot): 96.19 USDC
+12-21 11:05:26 [INFO] trader/hyperliquid_trader.go:240 ⭐ Total assets: 96.19 USDC | Perp available: 89.99 USDC | Spot balance: 0.01 USDC
+12-21 11:05:26 [INFO] api/server.go:2049 ✓ Returning account info [哈哈哈]: equity=96.20, available=89.99, pnl=-0.02 (-0.02%)
+[GIN] 2025/12/21 - 11:05:26 | 200 | 221.346447ms | 160.16.132.242 | GET "/api/account?trader_id=b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592"
+12-21 11:05:27 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313): failed to get trader config: trader not found: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313
+12-21 11:05:27 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
+12-21 11:05:27 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549): failed to get trader config: trader not found: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549
+12-21 11:05:27 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766284011): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
+12-21 11:05:27 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
+12-21 11:05:37 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
+12-21 11:05:37 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549): failed to get trader config: trader not found: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549
+12-21 11:05:37 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766284011): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
+12-21 11:05:37 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
+12-21 11:05:37 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313): failed to get trader config: trader not found: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313
+12-21 11:05:39 [INFO] api/server.go:1632 🔍 Querying exchange configs for user e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34
+12-21 11:05:39 [INFO] api/server.go:1647 ✅ Found 1 exchange configs
+[GIN] 2025/12/21 - 11:05:39 | 200 | 533.23µs | 160.16.132.242 | GET "/api/exchanges"
+[GIN] 2025/12/21 - 11:05:39 | 200 | 726.023µs | 160.16.132.242 | GET "/api/my-traders"
+12-21 11:05:41 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34: 1 traders
+12-21 11:05:41 [INFO] manager/trader_manager.go:523 ⚠️ Trader 哈哈哈 already loaded, skipping
+[GIN] 2025/12/21 - 11:05:41 | 200 | 624.74µs | 160.16.132.242 | GET "/api/status?trader_id=b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592"
+12-21 11:05:41 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34: 1 traders
+12-21 11:05:41 [INFO] manager/trader_manager.go:523 ⚠️ Trader 哈哈哈 already loaded, skipping
+12-21 11:05:41 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34: 1 traders
+12-21 11:05:41 [INFO] manager/trader_manager.go:523 ⚠️ Trader 哈哈哈 already loaded, skipping
+12-21 11:05:41 [INFO] api/server.go:2039 📊 Received account info request [哈哈哈]
+12-21 11:05:41 [INFO] trader/hyperliquid_trader.go:135 🔄 Calling Hyperliquid API to get account balance...
+[GIN] 2025/12/21 - 11:05:41 | 200 | 108.247647ms | 160.16.132.242 | GET "/api/positions?trader_id=b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592"
+12-21 11:05:41 [INFO] trader/hyperliquid_trader.go:146 ✓ Found Spot balance: 0.01 USDC
+12-21 11:05:41 [INFO] trader/hyperliquid_trader.go:183 🔍 [DEBUG] Hyperliquid API CrossMarginSummary (cross margin) complete data:
+12-21 11:05:41 [INFO] trader/hyperliquid_trader.go:184 {
+"accountValue": "96.198095",
+"totalMarginUsed": "4.24056",
+"totalNtlPos": "59.0668",
+"totalRawUsd": "102.449295"
+}
+12-21 11:05:41 [INFO] trader/hyperliquid_trader.go:208 ✓ Using Withdrawable as available balance: 90.00
+12-21 11:05:41 [INFO] trader/hyperliquid_trader.go:231 ✓ Hyperliquid complete account:
+12-21 11:05:41 [INFO] trader/hyperliquid_trader.go:232 • Spot balance: 0.01 USDC (manual transfer to Perpetuals required for opening positions)
+12-21 11:05:41 [INFO] trader/hyperliquid_trader.go:233 • Perpetuals equity: 96.20 USDC (wallet 96.19 + unrealized 0.01)
+12-21 11:05:41 [INFO] trader/hyperliquid_trader.go:237 • Perpetuals available balance: 90.00 USDC (directly usable for opening positions)
+12-21 11:05:41 [INFO] trader/hyperliquid_trader.go:238 • Margin used: 4.24 USDC
+12-21 11:05:41 [INFO] trader/hyperliquid_trader.go:239 • Total assets (Perp+Spot): 96.19 USDC
+12-21 11:05:41 [INFO] trader/hyperliquid_trader.go:240 ⭐ Total assets: 96.19 USDC | Perp available: 90.00 USDC | Spot balance: 0.01 USDC
+12-21 11:05:41 [INFO] api/server.go:2049 ✓ Returning account info [哈哈哈]: equity=96.20, available=90.00, pnl=-0.02 (-0.02%)
+[GIN] 2025/12/21 - 11:05:41 | 200 | 255.517473ms | 160.16.132.242 | GET "/api/account?trader_id=b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592"
+12-21 11:05:45 [INFO] copytrade/provider_hl_ws.go:344 📡 [HL-WS] REST 获取账户状态成功 | 权益=178.43 持仓数=2
+12-21 11:05:45 [INFO] copytrade/provider_hl_ws.go:318 📡 [HL-WS] 收到成交推送 | BTCUSDT close long | 价格=88017.0000 数量=0.0002
+12-21 11:05:45 [INFO] copytrade/engine.go:228 📡 [b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592] 收到信号(WS) | BTCUSDT close long | 价格=88017.0000 数量=0.0002 价值=19.36
+12-21 11:05:45 [INFO] copytrade/engine.go:692 📊 [b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592] posId=BTCUSDT_long size变化 | 上次=0.0006 当前=0.0003 减少=0.0002
+12-21 11:05:45 [INFO] copytrade/engine.go:711 📊 [b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592] 部分减仓 | posId=BTCUSDT_long 领航员剩余=0.0003
+12-21 11:05:45 [INFO] copytrade/engine.go:795 🎯 [b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592] ✅ 跟随 | BTCUSDT | 原因: 部分减仓(posId=BTCUSDT_long)
+12-21 11:05:45 [INFO] trader/hyperliquid_trader.go:135 🔄 Calling Hyperliquid API to get account balance...
+12-21 11:05:45 [INFO] trader/hyperliquid_trader.go:146 ✓ Found Spot balance: 0.01 USDC
+12-21 11:05:45 [INFO] trader/hyperliquid_trader.go:183 🔍 [DEBUG] Hyperliquid API CrossMarginSummary (cross margin) complete data:
+12-21 11:05:45 [INFO] trader/hyperliquid_trader.go:184 {
+"accountValue": "96.198095",
+"totalMarginUsed": "4.24056",
+"totalNtlPos": "59.0668",
+"totalRawUsd": "102.449295"
+}
+12-21 11:05:45 [INFO] trader/hyperliquid_trader.go:208 ✓ Using Withdrawable as available balance: 90.00
+12-21 11:05:45 [INFO] trader/hyperliquid_trader.go:231 ✓ Hyperliquid complete account:
+12-21 11:05:45 [INFO] trader/hyperliquid_trader.go:232 • Spot balance: 0.01 USDC (manual transfer to Perpetuals required for opening positions)
+12-21 11:05:45 [INFO] trader/hyperliquid_trader.go:233 • Perpetuals equity: 96.20 USDC (wallet 96.19 + unrealized 0.01)
+12-21 11:05:45 [INFO] trader/hyperliquid_trader.go:237 • Perpetuals available balance: 90.00 USDC (directly usable for opening positions)
+12-21 11:05:45 [INFO] trader/hyperliquid_trader.go:238 • Margin used: 4.24 USDC
+12-21 11:05:45 [INFO] trader/hyperliquid_trader.go:239 • Total assets (Perp+Spot): 96.19 USDC
+12-21 11:05:45 [INFO] trader/hyperliquid_trader.go:240 ⭐ Total assets: 96.19 USDC | Perp available: 90.00 USDC | Spot balance: 0.01 USDC
+12-21 11:05:45 [INFO] copytrade/engine.go:965 📊 [b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592] 比例计算 | BTCUSDT | 领航员: 交易=19.36 权益=178.43 占比=10.85% | 跟随者: 权益=96.20 系数=100% → 跟单=10.44
+12-21 11:05:45 [INFO] copytrade/engine.go:922 📊 [b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592] BTCUSDT 减仓比例 | 减仓量=0.0002 当前=0.0003 减仓前=0.0006 → 39.3%
+12-21 11:05:45 [INFO] copytrade/engine.go:887 📊 [b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592] 部分平仓 39.3% marginMode=cross
+12-21 11:05:45 [INFO] trader/hyperliquid_trader.go:135 🔄 Calling Hyperliquid API to get account balance...
+12-21 11:05:46 [INFO] trader/hyperliquid_trader.go:146 ✓ Found Spot balance: 0.01 USDC
+12-21 11:05:46 [INFO] trader/hyperliquid_trader.go:183 🔍 [DEBUG] Hyperliquid API CrossMarginSummary (cross margin) complete data:
+12-21 11:05:46 [INFO] trader/hyperliquid_trader.go:184 {
+"accountValue": "96.198095",
+"totalMarginUsed": "4.24056",
+"totalNtlPos": "59.0668",
+"totalRawUsd": "102.449295"
+}
+12-21 11:05:46 [INFO] trader/hyperliquid_trader.go:208 ✓ Using Withdrawable as available balance: 90.00
+12-21 11:05:46 [INFO] trader/hyperliquid_trader.go:231 ✓ Hyperliquid complete account:
+12-21 11:05:46 [INFO] trader/hyperliquid_trader.go:232 • Spot balance: 0.01 USDC (manual transfer to Perpetuals required for opening positions)
+12-21 11:05:46 [INFO] trader/hyperliquid_trader.go:233 • Perpetuals equity: 96.20 USDC (wallet 96.19 + unrealized 0.01)
+12-21 11:05:46 [INFO] trader/hyperliquid_trader.go:237 • Perpetuals available balance: 90.00 USDC (directly usable for opening positions)
+12-21 11:05:46 [INFO] trader/hyperliquid_trader.go:238 • Margin used: 4.24 USDC
+12-21 11:05:46 [INFO] trader/hyperliquid_trader.go:239 • Total assets (Perp+Spot): 96.19 USDC
+12-21 11:05:46 [INFO] trader/hyperliquid_trader.go:240 ⭐ Total assets: 96.19 USDC | Perp available: 90.00 USDC | Spot balance: 0.01 USDC
+12-21 11:05:46 [INFO] copytrade/engine.go:833 ⚡ [b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592] 决策生成 | reduce_long BTCUSDT | 金额=10.44
+12-21 11:05:46 [INFO] copytrade/integration.go:352 📝 [b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592] 跟单决策 | reduce_long BTCUSDT | reasoning=Copy trading: reduce 39% following hyperliquid leader 0x4899Fc894a663e317C6F681D02F709fC5da8b535
+12-21 11:05:46 [INFO] trader/auto_trader.go:827 [哈哈哈] Executing external decision: reduce_long BTCUSDT
+12-21 11:05:46 [INFO] trader/auto_trader.go:810 📉 Reduce long: BTCUSDT (ratio=0.39)
+12-21 11:05:46 [INFO] trader/auto_trader.go:1153 🔄 Close long: BTCUSDT
+2025/12/21 11:05:46 🔌 Do not find hook: SET_HTTP_CLIENT
+12-21 11:05:46 [INFO] trader/hyperliquid_trader.go:320 ✓ BTCUSDT will use cross margin mode
+12-21 11:05:46 [INFO] trader/auto_trader.go:1168 📊 Set marginMode=cross for close long
+12-21 11:05:46 [INFO] trader/hyperliquid_trader.go:523 📏 Quantity precision handling: 0.00030000 -> 0.00030000 (szDecimals=5)
+12-21 11:05:46 [INFO] trader/hyperliquid_trader.go:527 💰 Price precision handling: 87137.32500000 -> 87137.00000000 (5 significant figures)
+🔍 DEBUG actionHash msgpack: 83a474797065a56f72646572a66f72646572739186a16100a162c2a170a53837313337a173a6302e30303033a172c3a17481a56c696d697481a3746966a3496f63a867726f7570696e67a26e61
+[DEBUG] SignL1Action - ActionHash: 5957b5400320883c18df06f5bc81ebcdbd1ece108b1cca12bc0a31fe0461fcdf
+12-21 11:05:47 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
+12-21 11:05:47 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549): failed to get trader config: trader not found: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549
+12-21 11:05:47 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766284011): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
+12-21 11:05:47 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
+12-21 11:05:47 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313): failed to get trader config: trader not found: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313
+12-21 11:05:47 [INFO] trader/hyperliquid_trader.go:548 ✓ Long position closed successfully: BTCUSDT quantity: 0.0003
+12-21 11:05:47 [INFO] trader/hyperliquid_trader.go:671 ✓ Cancelled all pending orders for BTCUSDT
+12-21 11:05:47 [INFO] trader/auto_trader.go:1836 📝 Order ID is empty, using auto-generated: hyperliquid_BTCUSDT_close_long_1766286347533889913
+12-21 11:05:48 [INFO] api/server.go:1632 🔍 Querying exchange configs for user e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34
+12-21 11:05:48 [INFO] api/server.go:1647 ✅ Found 1 exchange configs
+[GIN] 2025/12/21 - 11:05:48 | 200 | 538.203µs | 160.16.132.242 | GET "/api/exchanges"
+[GIN] 2025/12/21 - 11:05:48 | 200 | 694.763µs | 160.16.132.242 | GET "/api/my-traders"
+12-21 11:05:48 [INFO] trader/auto_trader.go:1872 ✅ Order filled: avgPrice=87910.000000, qty=0.000000, fee=0.000000
+12-21 11:05:48 [INFO] trader/auto_trader.go:1882 📝 Recording position (ID: hyperliquid_BTCUSDT_close_long_1766286347533889913, action: close_long, price: 87910.000000, qty: 0.000000, fee: 0.0000)
+12-21 11:05:48 [INFO] trader/auto_trader.go:1945 📊 Position closed [b7c550f8] BTCUSDT LONG @ 87910.0000 → 87910.0000, P&L: 0.00, Fee: 0.0000
+12-21 11:05:48 [INFO] trader/auto_trader.go:1240 ✓ Position closed successfully
+12-21 11:05:48 [INFO] trader/auto_trader.go:847 [哈哈哈] External decision executed successfully: reduce_long BTCUSDT
+12-21 11:05:48 [INFO] copytrade/integration.go:200 ✅ [b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592] 跟单执行成功 | reduce_long BTCUSDT | 耗时=1963ms
+12-21 11:05:48 [INFO] trader/hyperliquid_trader.go:135 🔄 Calling Hyperliquid API to get account balance...
+12-21 11:05:48 [INFO] trader/hyperliquid_trader.go:146 ✓ Found Spot balance: 0.01 USDC
+12-21 11:05:48 [INFO] trader/hyperliquid_trader.go:183 🔍 [DEBUG] Hyperliquid API CrossMarginSummary (cross margin) complete data:
+12-21 11:05:48 [INFO] trader/hyperliquid_trader.go:184 {
+"accountValue": "96.185088",
+"totalMarginUsed": "1.306316",
+"totalNtlPos": "32.6579",
+"totalRawUsd": "128.842988"
+}
+12-21 11:05:48 [INFO] trader/hyperliquid_trader.go:208 ✓ Using Withdrawable as available balance: 92.92
+12-21 11:05:48 [INFO] trader/hyperliquid_trader.go:231 ✓ Hyperliquid complete account:
+12-21 11:05:48 [INFO] trader/hyperliquid_trader.go:232 • Spot balance: 0.01 USDC (manual transfer to Perpetuals required for opening positions)
+12-21 11:05:48 [INFO] trader/hyperliquid_trader.go:233 • Perpetuals equity: 96.19 USDC (wallet 96.18 + unrealized 0.00)
+12-21 11:05:48 [INFO] trader/hyperliquid_trader.go:237 • Perpetuals available balance: 92.92 USDC (directly usable for opening positions)
+12-21 11:05:48 [INFO] trader/hyperliquid_trader.go:238 • Margin used: 1.31 USDC
+12-21 11:05:48 [INFO] trader/hyperliquid_trader.go:239 • Total assets (Perp+Spot): 96.19 USDC
+12-21 11:05:48 [INFO] trader/hyperliquid_trader.go:240 ⭐ Total assets: 96.19 USDC | Perp available: 92.92 USDC | Spot balance: 0.01 USDC
+12-21 11:05:48 [INFO] copytrade/integration.go:288 📝 [b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592] 跟单决策记录已保存: cycle=5
+[GIN] 2025/12/21 - 11:05:56 | 200 | 560.337µs | 160.16.132.242 | GET "/api/my-traders"
+12-21 11:05:56 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34: 1 traders
+12-21 11:05:56 [INFO] manager/trader_manager.go:523 ⚠️ Trader 哈哈哈 already loaded, skipping
+[GIN] 2025/12/21 - 11:05:56 | 200 | 618.907µs | 160.16.132.242 | GET "/api/status?trader_id=b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592"
+12-21 11:05:56 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34: 1 traders
+12-21 11:05:56 [INFO] manager/trader_manager.go:523 ⚠️ Trader 哈哈哈 already loaded, skipping
+[GIN] 2025/12/21 - 11:05:56 | 200 | 133.987528ms | 160.16.132.242 | GET "/api/positions?trader_id=b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592"
+12-21 11:05:57 [INFO] trader/okx_trader.go:310 ✓ Using cached OKX positions
+12-21 11:05:57 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549): failed to get trader config: trader not found: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549
+12-21 11:05:57 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766284011): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
+12-21 11:05:57 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
+12-21 11:05:57 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313): failed to get trader config: trader not found: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313
+12-21 11:05:57 [INFO] manager/trader_manager.go:504 📋 Loading trader configurations for user e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34: 1 traders
+12-21 11:05:57 [INFO] manager/trader_manager.go:523 ⚠️ Trader 哈哈哈 already loaded, skipping
+12-21 11:05:57 [INFO] api/server.go:2039 📊 Received account info request [哈哈哈]
+12-21 11:05:57 [INFO] trader/hyperliquid_trader.go:135 🔄 Calling Hyperliquid API to get account balance...
+12-21 11:05:57 [INFO] trader/hyperliquid_trader.go:146 ✓ Found Spot balance: 0.01 USDC
+12-21 11:05:57 [INFO] trader/hyperliquid_trader.go:183 🔍 [DEBUG] Hyperliquid API CrossMarginSummary (cross margin) complete data:
+12-21 11:05:57 [INFO] trader/hyperliquid_trader.go:184 {
+"accountValue": "96.185088",
+"totalMarginUsed": "1.306316",
+"totalNtlPos": "32.6579",
+"totalRawUsd": "128.842988"
+}
+12-21 11:05:57 [INFO] trader/hyperliquid_trader.go:208 ✓ Using Withdrawable as available balance: 92.92
+12-21 11:05:57 [INFO] trader/hyperliquid_trader.go:231 ✓ Hyperliquid complete account:
+12-21 11:05:57 [INFO] trader/hyperliquid_trader.go:232 • Spot balance: 0.01 USDC (manual transfer to Perpetuals required for opening positions)
+12-21 11:05:57 [INFO] trader/hyperliquid_trader.go:233 • Perpetuals equity: 96.19 USDC (wallet 96.18 + unrealized 0.00)
+12-21 11:05:57 [INFO] trader/hyperliquid_trader.go:237 • Perpetuals available balance: 92.92 USDC (directly usable for opening positions)
+12-21 11:05:57 [INFO] trader/hyperliquid_trader.go:238 • Margin used: 1.31 USDC
+12-21 11:05:57 [INFO] trader/hyperliquid_trader.go:239 • Total assets (Perp+Spot): 96.19 USDC
+12-21 11:05:57 [INFO] trader/hyperliquid_trader.go:240 ⭐ Total assets: 96.19 USDC | Perp available: 92.92 USDC | Spot balance: 0.01 USDC
+12-21 11:05:57 [INFO] api/server.go:2049 ✓ Returning account info [哈哈哈]: equity=96.19, available=92.92, pnl=-0.03 (-0.03%)
+[GIN] 2025/12/21 - 11:05:57 | 200 | 224.05429ms | 160.16.132.242 | GET "/api/account?trader_id=b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592"
+12-21 11:06:07 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766284011): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
+12-21 11:06:07 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766285592): failed to create trader instance: failed to parse private key: invalid length, need 256 bits
+12-21 11:06:07 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313): failed to get trader config: trader not found: 8dd37a6e_cdf6b311-af93-4b6a-8976-ee8140262f2c_deepseek_1766169313
+12-21 11:06:07 [INFO] trader/okx_trader.go:315 🔄 Calling OKX API to get positions...
+12-21 11:06:07 [INFO] trader/position_sync.go:117 ⚠️ Failed to get trader instance (ID: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549): failed to get trader config: trader not found: b7c550f8_e8d2eb84-0b65-4d6b-a8eb-3fad26d9ac34_deepseek_1766063549
