@@ -1187,6 +1187,12 @@ func (e *Engine) syncLeaderState() error {
 	logger.Debugf("👁️ [%s] 领航员状态同步 | 权益=%.2f 持仓数=%d",
 		e.traderID, state.TotalEquity, len(state.Positions))
 
+	// 🔍 调试日志：打印 API 返回的所有持仓详情（方便排查 posId 问题）
+	for key, pos := range state.Positions {
+		logger.Infof("🔍 [%s] 领航员持仓 | key=%s posId=%s | %s %s %s | size=%.4f",
+			e.traderID, key, pos.PosID, pos.Symbol, pos.Side, pos.MarginMode, pos.Size)
+	}
+
 	// 🔑 检查 ignored 仓位是否已被领航员平仓
 	// 如果是，标记为 closed，这样后续重新开仓可以跟随
 	e.checkIgnoredPositionsClosed()
