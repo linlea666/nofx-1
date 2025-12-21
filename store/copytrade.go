@@ -404,7 +404,13 @@ func (s *CopyTradeStore) SavePositionMapping(mapping *CopyTradePositionMapping) 
 			 opened_at, open_price, open_size_usd, last_known_size, add_count, reduce_count, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, 0, 0, CURRENT_TIMESTAMP)
 		ON CONFLICT(trader_id, leader_pos_id) DO UPDATE SET
+			status = 'active',
+			opened_at = excluded.opened_at,
+			open_price = excluded.open_price,
+			open_size_usd = excluded.open_size_usd,
 			last_known_size = excluded.last_known_size,
+			add_count = 0,
+			reduce_count = 0,
 			updated_at = CURRENT_TIMESTAMP
 	`, mapping.TraderID, mapping.LeaderPosID, mapping.LeaderID, mapping.Symbol,
 		mapping.Side, mapping.MarginMode, mapping.OpenedAt, mapping.OpenPrice, mapping.OpenSizeUSD, mapping.LastKnownSize)

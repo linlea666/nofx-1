@@ -501,7 +501,16 @@ func (e *Engine) matchOpenAddSignal(signal *TradeSignal, leaderPosMap map[string
 		}
 
 		if mapping.Status == "ignored" {
-			logger.Infof("📊 [%s] 历史仓位 | posId=%s status=ignored → 跳过",
+			// 🔑 关键判断：ignored + ActionOpen = 领航员平仓后重新开仓
+			// Hyperliquid 的 ActionOpen 来自 startPosition=0，说明是全新开仓
+			if fill.Action == ActionOpen {
+				logger.Infof("📊 [%s] 历史仓位重新开仓 | posId=%s (ignored → active) → 跟随新开仓",
+					e.traderID, posID)
+				newPosition = pos
+				break
+			}
+			// ActionAdd = 对历史仓位加仓，继续跳过
+			logger.Infof("📊 [%s] 历史仓位加仓 | posId=%s status=ignored → 跳过",
 				e.traderID, posID)
 		}
 	}
