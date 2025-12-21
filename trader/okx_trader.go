@@ -832,13 +832,13 @@ func (t *OKXTrader) CloseLong(symbol string, quantity float64) (map[string]inter
 
 	// 🔑 posId 方案：使用已设置的 marginMode 筛选仓位
 	tdMode := t.getMgnMode()
-		positions, err := t.GetPositions()
-		if err != nil {
-			return nil, err
-		}
+	positions, err := t.GetPositions()
+	if err != nil {
+		return nil, err
+	}
 	logger.Infof("🔍 OKX CloseLong searching positions: symbol=%s, targetMgnMode=%s, count=%d", symbol, tdMode, len(positions))
-		for _, pos := range positions {
-			if pos["symbol"] == symbol && pos["side"] == "long" {
+	for _, pos := range positions {
+		if pos["symbol"] == symbol && pos["side"] == "long" {
 			posMgnMode, _ := pos["mgnMode"].(string)
 			// 精确匹配 marginMode（posId 方案核心）
 			if posMgnMode != tdMode {
@@ -849,10 +849,10 @@ func (t *OKXTrader) CloseLong(symbol string, quantity float64) (map[string]inter
 				quantity = pos["positionAmt"].(float64)
 			}
 			logger.Infof("📊 Found matching long position: mgnMode=%s, quantity=%.4f", posMgnMode, quantity)
-				break
-			}
+			break
 		}
-		if quantity == 0 {
+	}
+	if quantity == 0 {
 		return nil, fmt.Errorf("long position not found for %s (mgnMode=%s)", symbol, tdMode)
 	}
 
@@ -922,13 +922,13 @@ func (t *OKXTrader) CloseShort(symbol string, quantity float64) (map[string]inte
 
 	// 🔑 posId 方案：使用已设置的 marginMode 筛选仓位
 	tdMode := t.getMgnMode()
-		positions, err := t.GetPositions()
-		if err != nil {
-			return nil, err
-		}
+	positions, err := t.GetPositions()
+	if err != nil {
+		return nil, err
+	}
 	logger.Infof("🔍 OKX CloseShort searching positions: symbol=%s, targetMgnMode=%s, count=%d", symbol, tdMode, len(positions))
-		for _, pos := range positions {
-			if pos["symbol"] == symbol && pos["side"] == "short" {
+	for _, pos := range positions {
+		if pos["symbol"] == symbol && pos["side"] == "short" {
 			posMgnMode, _ := pos["mgnMode"].(string)
 			// 精确匹配 marginMode（posId 方案核心）
 			if posMgnMode != tdMode {
@@ -939,10 +939,10 @@ func (t *OKXTrader) CloseShort(symbol string, quantity float64) (map[string]inte
 				quantity = pos["positionAmt"].(float64)
 			}
 			logger.Infof("📊 Found matching short position: mgnMode=%s, quantity=%.4f", posMgnMode, quantity)
-				break
-			}
+			break
 		}
-		if quantity == 0 {
+	}
+	if quantity == 0 {
 		return nil, fmt.Errorf("short position not found for %s (mgnMode=%s)", symbol, tdMode)
 	}
 
@@ -1373,19 +1373,19 @@ func (t *OKXTrader) GetClosedPnL(startTime time.Time, limit int) ([]ClosedPnLRec
 		Code string `json:"code"`
 		Msg  string `json:"msg"`
 		Data []struct {
-			InstID      string `json:"instId"`      // Instrument ID (e.g., "BTC-USDT-SWAP")
-			Direction   string `json:"direction"`   // Position direction: "long" or "short"
-			OpenAvgPx   string `json:"openAvgPx"`   // Average open price
-			CloseAvgPx  string `json:"closeAvgPx"`  // Average close price
+			InstID        string `json:"instId"`        // Instrument ID (e.g., "BTC-USDT-SWAP")
+			Direction     string `json:"direction"`     // Position direction: "long" or "short"
+			OpenAvgPx     string `json:"openAvgPx"`     // Average open price
+			CloseAvgPx    string `json:"closeAvgPx"`    // Average close price
 			CloseTotalPos string `json:"closeTotalPos"` // Closed position quantity
-			RealizedPnl string `json:"realizedPnl"` // Realized PnL
-			Fee         string `json:"fee"`         // Total fee
-			FundingFee  string `json:"fundingFee"`  // Funding fee
-			Lever       string `json:"lever"`       // Leverage
-			CTime       string `json:"cTime"`       // Position open time
-			UTime       string `json:"uTime"`       // Position close time
-			Type        string `json:"type"`        // Close type: 1=close position, 2=partial close, 3=liquidation, 4=partial liquidation
-			PosId       string `json:"posId"`       // Position ID
+			RealizedPnl   string `json:"realizedPnl"`   // Realized PnL
+			Fee           string `json:"fee"`           // Total fee
+			FundingFee    string `json:"fundingFee"`    // Funding fee
+			Lever         string `json:"lever"`         // Leverage
+			CTime         string `json:"cTime"`         // Position open time
+			UTime         string `json:"uTime"`         // Position close time
+			Type          string `json:"type"`          // Close type: 1=close position, 2=partial close, 3=liquidation, 4=partial liquidation
+			PosId         string `json:"posId"`         // Position ID
 		} `json:"data"`
 	}
 
