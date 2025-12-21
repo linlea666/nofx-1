@@ -138,12 +138,34 @@ func (p *HLWebSocketProvider) GetFills(leaderID string, since time.Time) ([]Fill
 // GetAccountState 获取账户状态（从缓存读取）
 func (p *HLWebSocketProvider) GetAccountState(leaderID string) (*AccountState, error) {
 	p.stateMu.RLock()
-	defer p.stateMu.RUnlock()
+	state := p.latestState
+	p.stateMu.RUnlock()
 
-	if p.latestState == nil {
-		return nil, fmt.Errorf("no state available yet")
+	if state != nil {
+		return state, nil
 	}
-	return p.latestState, nil
+
+	// 🔑 缓存为空（如启动时 WS 还未连接），使用 REST API 作为 fallback
+	// 这样 InitIgnoredPositions() 可以在启动时成功获取领航员持仓
+	if p.restProvider == nil {
+		return nil, fmt.Errorf("no state available yet and no REST provider")
+	}
+
+	logger.Infof("📡 [HL-WS] 缓存为空，使用 REST API 获取领航员状态: %s", leaderID)
+	newState, err := p.restProvider.GetAccountState(leaderID)
+	if err != nil {
+		return nil, fmt.Errorf("REST 获取账户状态失败: %w", err)
+	}
+
+	logger.Infof("📡 [HL-WS] REST 获取成功 | 权益=%.2f 持仓数=%d",
+		newState.TotalEquity, len(newState.Positions))
+
+	// 更新缓存，后续可以直接使用
+	p.stateMu.Lock()
+	p.latestState = newState
+	p.stateMu.Unlock()
+
+	return newState, nil
 }
 
 // ============================================================================
