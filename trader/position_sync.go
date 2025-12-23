@@ -114,7 +114,12 @@ func (m *PositionSyncManager) syncTraderPositions(traderID string, localPosition
 	// Get or create trader instance
 	trader, err := m.getOrCreateTrader(traderID)
 	if err != nil {
-		logger.Infof("⚠️  Failed to get trader instance (ID: %s): %v", traderID, err)
+		// If trader not found (deleted), close all orphan positions automatically
+		if strings.Contains(err.Error(), "trader not found") {
+			m.closeOrphanPositions(traderID, localPositions)
+			return
+		}
+		logger.Infof("⚠️ Failed to get trader instance (ID: %s): %v", traderID, err)
 		return
 	}
 
@@ -533,6 +538,31 @@ func (m *PositionSyncManager) InvalidateCache(traderID string) {
 
 	delete(m.traderCache, traderID)
 	delete(m.configCache, traderID)
+}
+
+// closeOrphanPositions closes orphan positions when trader is deleted
+// This is a self-healing mechanism to clean up positions that belong to deleted traders
+func (m *PositionSyncManager) closeOrphanPositions(traderID string, positions []*store.TraderPosition) {
+	if len(positions) == 0 {
+		return
+	}
+
+	closedCount := 0
+	for _, pos := range positions {
+		err := m.store.Position().ClosePosition(pos.ID, 0, "", 0, 0, "trader_deleted")
+		if err != nil {
+			logger.Warnf("⚠️ Failed to close orphan position (ID: %d, TraderID: %s): %v", pos.ID, traderID, err)
+			continue
+		}
+		closedCount++
+	}
+
+	if closedCount > 0 {
+		logger.Infof("🧹 Closed %d orphan positions for deleted trader: %s", closedCount, traderID)
+	}
+
+	// Clean up cache for this trader
+	m.InvalidateCache(traderID)
 }
 
 // getFloatFromMap Get float64 value from map

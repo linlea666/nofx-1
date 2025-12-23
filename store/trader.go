@@ -300,10 +300,21 @@ func (s *TraderStore) UpdateCustomPrompt(userID, id string, customPrompt string,
 
 // Delete deletes trader and associated data
 func (s *TraderStore) Delete(userID, id string) error {
-	// Delete associated equity snapshots first
+	// 1. Close all OPEN positions (mark as CLOSED with reason 'trader_deleted')
+	// This prevents PositionSyncManager from repeatedly trying to sync these orphan positions
+	now := time.Now().Format(time.RFC3339)
+	_, _ = s.db.Exec(`UPDATE trader_positions SET status = 'CLOSED', close_reason = 'trader_deleted', updated_at = ? WHERE trader_id = ? AND status = 'OPEN'`, now, id)
+
+	// 2. Delete copy trade config
+	_, _ = s.db.Exec(`DELETE FROM copy_trade_configs WHERE trader_id = ?`, id)
+
+	// 3. Delete copy trade position mappings
+	_, _ = s.db.Exec(`DELETE FROM copy_trade_position_mappings WHERE trader_id = ?`, id)
+
+	// 4. Delete associated equity snapshots
 	_, _ = s.db.Exec(`DELETE FROM trader_equity_snapshots WHERE trader_id = ?`, id)
 
-	// Delete the trader
+	// 5. Delete the trader
 	_, err := s.db.Exec(`DELETE FROM traders WHERE id = ? AND user_id = ?`, id, userID)
 	return err
 }
