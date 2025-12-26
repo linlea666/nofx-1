@@ -920,10 +920,18 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 		equity = availableBalance // Fallback to available balance
 	}
 
-	// [CODE ENFORCED] Position Value Ratio Check: position_value <= equity × ratio
-	adjustedPositionSize, wasCapped := at.enforcePositionValueRatio(decision.PositionSizeUSD, equity, decision.Symbol)
-	if wasCapped {
-		decision.PositionSizeUSD = adjustedPositionSize
+	// [CODE ENFORCED] Position Value Ratio Check (跟单模式只提示不封顶，保持领航员盈亏比)
+	if isCopyTrade {
+		// 跟单模式：只提示风险，不封顶（保持领航员盈亏比）
+		_, wasCapped := at.enforcePositionValueRatio(decision.PositionSizeUSD, equity, decision.Symbol)
+		if wasCapped {
+			logger.Infof("  📊 跟单模式，忽略仓位封顶限制（保持领航员盈亏比）")
+		}
+	} else {
+		adjustedPositionSize, wasCapped := at.enforcePositionValueRatio(decision.PositionSizeUSD, equity, decision.Symbol)
+		if wasCapped {
+			decision.PositionSizeUSD = adjustedPositionSize
+		}
 	}
 
 	// ⚠️ Auto-adjust position size if insufficient margin
@@ -948,7 +956,7 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 			return err
 		}
 	} else {
-		logger.Infof("  📊 跟单模式，跳过最小仓位检查")
+		logger.Infof("  📊 跟单模式，跳过最小仓位和最大仓位检查")
 	}
 
 	// Calculate quantity with adjusted position size
@@ -1070,10 +1078,18 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 		equity = availableBalance // Fallback to available balance
 	}
 
-	// [CODE ENFORCED] Position Value Ratio Check: position_value <= equity × ratio
-	adjustedPositionSize, wasCapped := at.enforcePositionValueRatio(decision.PositionSizeUSD, equity, decision.Symbol)
-	if wasCapped {
-		decision.PositionSizeUSD = adjustedPositionSize
+	// [CODE ENFORCED] Position Value Ratio Check (跟单模式只提示不封顶，保持领航员盈亏比)
+	if isCopyTrade {
+		// 跟单模式：只提示风险，不封顶（保持领航员盈亏比）
+		_, wasCapped := at.enforcePositionValueRatio(decision.PositionSizeUSD, equity, decision.Symbol)
+		if wasCapped {
+			logger.Infof("  📊 跟单模式，忽略仓位封顶限制（保持领航员盈亏比）")
+		}
+	} else {
+		adjustedPositionSize, wasCapped := at.enforcePositionValueRatio(decision.PositionSizeUSD, equity, decision.Symbol)
+		if wasCapped {
+			decision.PositionSizeUSD = adjustedPositionSize
+		}
 	}
 
 	// ⚠️ Auto-adjust position size if insufficient margin
@@ -1098,7 +1114,7 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 			return err
 		}
 	} else {
-		logger.Infof("  📊 跟单模式，跳过最小仓位检查")
+		logger.Infof("  📊 跟单模式，跳过最小仓位和最大仓位检查")
 	}
 
 	// Calculate quantity with adjusted position size
