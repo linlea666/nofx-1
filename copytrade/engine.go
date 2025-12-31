@@ -81,7 +81,7 @@ func NewEngine(
 		getFollowerPositions: getPositions,
 		seenFills:            make(map[string]time.Time),
 		seenTTL:              1 * time.Hour,
-		stateSyncInterval:    30 * time.Second,
+		stateSyncInterval:    20 * time.Second,
 		decisionCh:           make(chan *decision.FullDecision, 10),
 		stopCh:               make(chan struct{}),
 		stats:                &EngineStats{StartTime: time.Now()},
