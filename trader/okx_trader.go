@@ -1369,37 +1369,30 @@ func (t *OKXTrader) GetClosedPnL(startTime time.Time, limit int) ([]ClosedPnLRec
 		return nil, fmt.Errorf("failed to get positions history: %w", err)
 	}
 
-	var resp struct {
-		Code string `json:"code"`
-		Msg  string `json:"msg"`
-		Data []struct {
-			InstID        string `json:"instId"`        // Instrument ID (e.g., "BTC-USDT-SWAP")
-			Direction     string `json:"direction"`     // Position direction: "long" or "short"
-			OpenAvgPx     string `json:"openAvgPx"`     // Average open price
-			CloseAvgPx    string `json:"closeAvgPx"`    // Average close price
-			CloseTotalPos string `json:"closeTotalPos"` // Closed position quantity
-			RealizedPnl   string `json:"realizedPnl"`   // Realized PnL
-			Fee           string `json:"fee"`           // Total fee
-			FundingFee    string `json:"fundingFee"`    // Funding fee
-			Lever         string `json:"lever"`         // Leverage
-			CTime         string `json:"cTime"`         // Position open time
-			UTime         string `json:"uTime"`         // Position close time
-			Type          string `json:"type"`          // Close type: 1=close position, 2=partial close, 3=liquidation, 4=partial liquidation
-			PosId         string `json:"posId"`         // Position ID
-		} `json:"data"`
+	// doRequest 已解包外层 {code, msg, data}，这里直接解析 data 数组
+	var positions []struct {
+		InstID        string `json:"instId"`        // Instrument ID (e.g., "BTC-USDT-SWAP")
+		Direction     string `json:"direction"`     // Position direction: "long" or "short"
+		OpenAvgPx     string `json:"openAvgPx"`     // Average open price
+		CloseAvgPx    string `json:"closeAvgPx"`    // Average close price
+		CloseTotalPos string `json:"closeTotalPos"` // Closed position quantity
+		RealizedPnl   string `json:"realizedPnl"`   // Realized PnL
+		Fee           string `json:"fee"`           // Total fee
+		FundingFee    string `json:"fundingFee"`    // Funding fee
+		Lever         string `json:"lever"`         // Leverage
+		CTime         string `json:"cTime"`         // Position open time
+		UTime         string `json:"uTime"`         // Position close time
+		Type          string `json:"type"`          // Close type: 1=close position, 2=partial close, 3=liquidation, 4=partial liquidation
+		PosId         string `json:"posId"`         // Position ID
 	}
 
-	if err := json.Unmarshal(data, &resp); err != nil {
-		return nil, fmt.Errorf("failed to parse response: %w", err)
+	if err := json.Unmarshal(data, &positions); err != nil {
+		return nil, fmt.Errorf("failed to parse positions history: %w", err)
 	}
 
-	if resp.Code != "0" {
-		return nil, fmt.Errorf("OKX API error: %s - %s", resp.Code, resp.Msg)
-	}
+	records := make([]ClosedPnLRecord, 0, len(positions))
 
-	records := make([]ClosedPnLRecord, 0, len(resp.Data))
-
-	for _, pos := range resp.Data {
+	for _, pos := range positions {
 		record := ClosedPnLRecord{}
 
 		// Convert instrument ID to standard format (BTC-USDT-SWAP -> BTCUSDT)
