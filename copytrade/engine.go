@@ -839,9 +839,9 @@ func (e *Engine) processSignal(signal *TradeSignal) {
 	signal.LeaderPosition = matchResult.LeaderPosition
 
 	// ========================================
-	// Step 3: 计算跟单仓位
+	// Step 3: 计算跟单仓位（基于持仓变化量）
 	// ========================================
-	copySize, warnings := e.calculateCopySize(signal)
+	copySize, warnings := e.calculateCopySizeByPositionChange(signal, matchResult)
 
 	// 记录所有预警（不阻止交易）
 	for _, w := range warnings {
@@ -968,22 +968,19 @@ func (e *Engine) calculateReduceRatioV2(signal *TradeSignal, match *SignalMatchR
 // 比例计算
 // ============================================================================
 
-// calculateCopySize 计算跟单仓位大小
-func (e *Engine) calculateCopySize(signal *TradeSignal) (float64, []Warning) {
+// calculateCopySizeByPositionChange 基于持仓变化量计算跟单仓位大小
+// 🔑 核心改进：用 (当前持仓size - 上次记录size) × 价格 作为交易价值
+// 解决问题：Hyperliquid 大订单被拆成多个 fills，用 fill.Value 只能捕获第一个 fill 的价值
+// 改进后：不管拆成多少个 fills，只要最终持仓变化正确，跟单金额就准确
+func (e *Engine) calculateCopySizeByPositionChange(signal *TradeSignal, match *SignalMatchResult) (float64, []Warning) {
 	var warnings []Warning
 	fill := signal.Fill
-
-	// 领航员的成交价值
-	leaderTradeValue := fill.Value
 
 	// 领航员的账户权益
 	leaderEquity := signal.LeaderEquity
 	if leaderEquity <= 0 {
 		leaderEquity = 1 // 防止除零
 	}
-
-	// 领航员该笔交易占其账户的比例
-	leaderTradeRatio := leaderTradeValue / leaderEquity
 
 	// 跟随者账户权益
 	followerEquity := e.getFollowerBalance()
@@ -998,6 +995,58 @@ func (e *Engine) calculateCopySize(signal *TradeSignal) (float64, []Warning) {
 		return 0, warnings
 	}
 
+	// ========================================
+	// 计算领航员实际交易价值（基于持仓变化量）
+	// ========================================
+	var leaderTradeValue float64
+
+	if match.Action == ActionOpen {
+		// 新开仓：用当前持仓的 size × price 作为交易价值
+		if match.LeaderPosition != nil {
+			leaderTradeValue = match.LeaderPosition.Size * fill.Price
+			logger.Infof("📊 [%s] 开仓计算 | 持仓数量=%.4f 价格=%.4f → 交易价值=%.2f",
+				e.traderID, match.LeaderPosition.Size, fill.Price, leaderTradeValue)
+		} else {
+			// 回退：无持仓信息时使用 fill.Value
+			leaderTradeValue = fill.Value
+			logger.Warnf("⚠️ [%s] 开仓无持仓信息，使用 fill.Value=%.2f", e.traderID, fill.Value)
+		}
+	} else if match.Action == ActionAdd {
+		// 加仓：用 (当前size - lastKnownSize) × price 作为交易价值
+		if match.LeaderPosition != nil && e.store != nil {
+			// 获取上次记录的持仓数量
+			mapping, err := e.store.CopyTrade().GetMapping(e.traderID, match.PosID)
+			lastKnownSize := float64(0)
+			if err == nil && mapping != nil {
+				lastKnownSize = mapping.LastKnownSize
+			}
+
+			// 计算持仓变化量
+			sizeChange := match.LeaderPosition.Size - lastKnownSize
+			if sizeChange > 0 {
+				leaderTradeValue = sizeChange * fill.Price
+				logger.Infof("📊 [%s] 加仓计算 | 当前=%.4f 上次=%.4f 变化=%.4f 价格=%.4f → 交易价值=%.2f",
+					e.traderID, match.LeaderPosition.Size, lastKnownSize, sizeChange, fill.Price, leaderTradeValue)
+			} else {
+				// 异常：size 没有增加，使用 fill.Value 作为回退
+				leaderTradeValue = fill.Value
+				logger.Warnf("⚠️ [%s] 加仓但 size 未增加 (当前=%.4f 上次=%.4f)，使用 fill.Value=%.2f",
+					e.traderID, match.LeaderPosition.Size, lastKnownSize, fill.Value)
+			}
+		} else {
+			// 回退：无持仓信息时使用 fill.Value
+			leaderTradeValue = fill.Value
+			logger.Warnf("⚠️ [%s] 加仓无持仓信息或store，使用 fill.Value=%.2f", e.traderID, fill.Value)
+		}
+	} else {
+		// 减仓/平仓：不需要计算金额（使用比例），这里返回 0
+		// 实际上 reduce/close 不走这个分支（在 buildDecisionV2 中直接计算比例）
+		leaderTradeValue = fill.Value
+	}
+
+	// 领航员该笔交易占其账户的比例
+	leaderTradeRatio := leaderTradeValue / leaderEquity
+
 	// 计算跟单金额
 	copySize := e.config.CopyRatio * leaderTradeRatio * followerEquity
 
@@ -1007,16 +1056,13 @@ func (e *Engine) calculateCopySize(signal *TradeSignal) (float64, []Warning) {
 		followerEquity, e.config.CopyRatio*100, copySize)
 
 	// 最小金额检查：如果低于阈值，自动提升到阈值（解决小账户精度问题）
-	// 使用配置的阈值，如果未配置则使用默认值 12 USDT
-	// 🆕 从 10 提升到 12 USDT，预留精度损失余量（Hyperliquid 最小订单 $10）
-	// （避免因数量精度向下取整导致订单价值不足 $10）
 	minTradeThreshold := e.config.MinTradeWarn
 	if minTradeThreshold <= 0 {
 		minTradeThreshold = 12.0 // 默认最小 12 USDT，预留精度损失余量
 	}
 	if copySize > 0 && copySize < minTradeThreshold {
 		originalSize := copySize
-		copySize = minTradeThreshold // 自动提升到最小阈值
+		copySize = minTradeThreshold
 		logger.Infof("📊 [%s] 跟单金额 %.2f < 阈值 %.2f，自动提升到 %.2f USDT",
 			e.traderID, originalSize, minTradeThreshold, copySize)
 		warnings = append(warnings, Warning{
