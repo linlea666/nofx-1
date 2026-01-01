@@ -996,12 +996,18 @@ func (e *Engine) calculateCopySizeByPositionChange(signal *TradeSignal, match *S
 	}
 
 	// ========================================
-	// 计算领航员实际交易价值（基于持仓变化量）
+	// 计算领航员实际交易价值
 	// ========================================
 	var leaderTradeValue float64
 
-	if match.Action == ActionOpen {
-		// 新开仓：用当前持仓的 size × price 作为交易价值
+	// 🔑 OKX: 直接使用 fill.Value（API 返回完整订单价值，不存在拆分问题）
+	// 🔑 Hyperliquid: 使用持仓变化量计算（解决大订单拆分导致金额偏小的问题）
+	if e.config.ProviderType == ProviderOKX {
+		// OKX: 保持原逻辑，直接使用 fill.Value
+		leaderTradeValue = fill.Value
+		logger.Infof("📊 [%s] OKX计算 | 使用 fill.Value=%.2f", e.traderID, fill.Value)
+	} else if match.Action == ActionOpen {
+		// Hyperliquid 新开仓：用当前持仓的 size × price 作为交易价值
 		if match.LeaderPosition != nil {
 			leaderTradeValue = match.LeaderPosition.Size * fill.Price
 			logger.Infof("📊 [%s] 开仓计算 | 持仓数量=%.4f 价格=%.4f → 交易价值=%.2f",
@@ -1012,7 +1018,7 @@ func (e *Engine) calculateCopySizeByPositionChange(signal *TradeSignal, match *S
 			logger.Warnf("⚠️ [%s] 开仓无持仓信息，使用 fill.Value=%.2f", e.traderID, fill.Value)
 		}
 	} else if match.Action == ActionAdd {
-		// 加仓：用 (当前size - lastKnownSize) × price 作为交易价值
+		// Hyperliquid 加仓：用 (当前size - lastKnownSize) × price 作为交易价值
 		if match.LeaderPosition != nil && e.store != nil {
 			// 获取上次记录的持仓数量
 			mapping, err := e.store.CopyTrade().GetMapping(e.traderID, match.PosID)
