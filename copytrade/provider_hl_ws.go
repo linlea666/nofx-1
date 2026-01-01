@@ -244,6 +244,7 @@ func (p *HLWebSocketProvider) reconnect() {
 		}
 
 		logger.Infof("✅ [HL-WS] 重连成功")
+		go p.readLoop() // 重连成功后重启读取循环
 		return
 	}
 }
@@ -424,6 +425,7 @@ func (p *HLWebSocketProvider) sendPing() {
 	data, _ := json.Marshal(msg)
 	if err := p.conn.WriteMessage(websocket.TextMessage, data); err != nil {
 		logger.Warnf("⚠️ [HL-WS] 发送心跳失败: %v", err)
+		go p.reconnect() // 心跳失败触发重连
 	}
 }
 
