@@ -895,9 +895,28 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 	}
 
 	// Get current price
-	marketData, err := market.Get(decision.Symbol)
-	if err != nil {
-		return err
+	// 跟单模式：使用交易所自己的 API 获取价格（避免 Binance 交易对不兼容问题，如 PEPE vs 1000PEPE）
+	var currentPrice float64
+	if isCopyTrade {
+		price, err := at.trader.GetMarketPrice(decision.Symbol)
+		if err != nil {
+			// Fallback: 使用信号中的入场价格
+			if decision.EntryPrice > 0 {
+				currentPrice = decision.EntryPrice
+				logger.Infof("  📊 跟单模式：使用信号入场价 %.6f (GetMarketPrice failed: %v)", currentPrice, err)
+			} else {
+				return fmt.Errorf("failed to get market price: %w", err)
+			}
+		} else {
+			currentPrice = price
+			logger.Infof("  📊 跟单模式：使用交易所实时价格 %.6f", currentPrice)
+		}
+	} else {
+		marketData, err := market.Get(decision.Symbol)
+		if err != nil {
+			return err
+		}
+		currentPrice = marketData.CurrentPrice
 	}
 
 	// Get balance (needed for multiple checks)
@@ -960,9 +979,9 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 	}
 
 	// Calculate quantity with adjusted position size
-	quantity := actualPositionSize / marketData.CurrentPrice
+	quantity := actualPositionSize / currentPrice
 	actionRecord.Quantity = quantity
-	actionRecord.Price = marketData.CurrentPrice
+	actionRecord.Price = currentPrice
 
 	// Set margin mode: 跟单模式下使用 decision 中的模式，否则使用配置
 	isCrossMargin := at.config.IsCrossMargin
@@ -989,7 +1008,7 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 	logger.Infof("  ✓ Position opened successfully, order ID: %v, quantity: %.4f", order["orderId"], quantity)
 
 	// Record order to database and poll for confirmation
-	at.recordAndConfirmOrder(order, decision.Symbol, "open_long", quantity, marketData.CurrentPrice, decision.Leverage, 0)
+	at.recordAndConfirmOrder(order, decision.Symbol, "open_long", quantity, currentPrice, decision.Leverage, 0)
 
 	// Record position opening time
 	posKey := decision.Symbol + "_long"
@@ -1053,9 +1072,28 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 	}
 
 	// Get current price
-	marketData, err := market.Get(decision.Symbol)
-	if err != nil {
-		return err
+	// 跟单模式：使用交易所自己的 API 获取价格（避免 Binance 交易对不兼容问题，如 PEPE vs 1000PEPE）
+	var currentPrice float64
+	if isCopyTrade {
+		price, err := at.trader.GetMarketPrice(decision.Symbol)
+		if err != nil {
+			// Fallback: 使用信号中的入场价格
+			if decision.EntryPrice > 0 {
+				currentPrice = decision.EntryPrice
+				logger.Infof("  📊 跟单模式：使用信号入场价 %.6f (GetMarketPrice failed: %v)", currentPrice, err)
+			} else {
+				return fmt.Errorf("failed to get market price: %w", err)
+			}
+		} else {
+			currentPrice = price
+			logger.Infof("  📊 跟单模式：使用交易所实时价格 %.6f", currentPrice)
+		}
+	} else {
+		marketData, err := market.Get(decision.Symbol)
+		if err != nil {
+			return err
+		}
+		currentPrice = marketData.CurrentPrice
 	}
 
 	// Get balance (needed for multiple checks)
@@ -1118,9 +1156,9 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 	}
 
 	// Calculate quantity with adjusted position size
-	quantity := actualPositionSize / marketData.CurrentPrice
+	quantity := actualPositionSize / currentPrice
 	actionRecord.Quantity = quantity
-	actionRecord.Price = marketData.CurrentPrice
+	actionRecord.Price = currentPrice
 
 	// Set margin mode: 跟单模式下使用 decision 中的模式，否则使用配置
 	isCrossMargin := at.config.IsCrossMargin
@@ -1147,7 +1185,7 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 	logger.Infof("  ✓ Position opened successfully, order ID: %v, quantity: %.4f", order["orderId"], quantity)
 
 	// Record order to database and poll for confirmation
-	at.recordAndConfirmOrder(order, decision.Symbol, "open_short", quantity, marketData.CurrentPrice, decision.Leverage, 0)
+	at.recordAndConfirmOrder(order, decision.Symbol, "open_short", quantity, currentPrice, decision.Leverage, 0)
 
 	// Record position opening time
 	posKey := decision.Symbol + "_short"
@@ -1168,12 +1206,31 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 func (at *AutoTrader) executeCloseLongWithRecord(decision *decision.Decision, actionRecord *store.DecisionAction) error {
 	logger.Infof("  🔄 Close long: %s", decision.Symbol)
 
+	// 检查是否为跟单操作
+	isCopyTrade := strings.Contains(decision.Reasoning, "Copy trading")
+
 	// Get current price
-	marketData, err := market.Get(decision.Symbol)
-	if err != nil {
-		return err
+	// 跟单模式：使用交易所自己的 API 获取价格（避免 Binance 交易对不兼容问题）
+	var currentPrice float64
+	if isCopyTrade {
+		price, err := at.trader.GetMarketPrice(decision.Symbol)
+		if err != nil {
+			if decision.EntryPrice > 0 {
+				currentPrice = decision.EntryPrice
+			} else {
+				return fmt.Errorf("failed to get market price: %w", err)
+			}
+		} else {
+			currentPrice = price
+		}
+	} else {
+		marketData, err := market.Get(decision.Symbol)
+		if err != nil {
+			return err
+		}
+		currentPrice = marketData.CurrentPrice
 	}
-	actionRecord.Price = marketData.CurrentPrice
+	actionRecord.Price = currentPrice
 
 	// 🔑 posId 方案：设置正确的 marginMode（复用 SetMarginMode）
 	if decision.MarginMode != "" {
@@ -1248,7 +1305,7 @@ func (at *AutoTrader) executeCloseLongWithRecord(decision *decision.Decision, ac
 	}
 
 	// Record order to database and poll for confirmation
-	at.recordAndConfirmOrder(order, decision.Symbol, "close_long", recordQuantity, marketData.CurrentPrice, 0, entryPrice)
+	at.recordAndConfirmOrder(order, decision.Symbol, "close_long", recordQuantity, currentPrice, 0, entryPrice)
 
 	if closeQuantity > 0 {
 		logger.Infof("  ✓ Position partially closed: %.4f (%.0f%%)", closeQuantity, decision.CloseRatio*100)
@@ -1262,12 +1319,31 @@ func (at *AutoTrader) executeCloseLongWithRecord(decision *decision.Decision, ac
 func (at *AutoTrader) executeCloseShortWithRecord(decision *decision.Decision, actionRecord *store.DecisionAction) error {
 	logger.Infof("  🔄 Close short: %s", decision.Symbol)
 
+	// 检查是否为跟单操作
+	isCopyTrade := strings.Contains(decision.Reasoning, "Copy trading")
+
 	// Get current price
-	marketData, err := market.Get(decision.Symbol)
-	if err != nil {
-		return err
+	// 跟单模式：使用交易所自己的 API 获取价格（避免 Binance 交易对不兼容问题）
+	var currentPrice float64
+	if isCopyTrade {
+		price, err := at.trader.GetMarketPrice(decision.Symbol)
+		if err != nil {
+			if decision.EntryPrice > 0 {
+				currentPrice = decision.EntryPrice
+			} else {
+				return fmt.Errorf("failed to get market price: %w", err)
+			}
+		} else {
+			currentPrice = price
+		}
+	} else {
+		marketData, err := market.Get(decision.Symbol)
+		if err != nil {
+			return err
+		}
+		currentPrice = marketData.CurrentPrice
 	}
-	actionRecord.Price = marketData.CurrentPrice
+	actionRecord.Price = currentPrice
 
 	// 🔑 posId 方案：设置正确的 marginMode（复用 SetMarginMode）
 	if decision.MarginMode != "" {
@@ -1346,7 +1422,7 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *decision.Decision, a
 	}
 
 	// Record order to database and poll for confirmation
-	at.recordAndConfirmOrder(order, decision.Symbol, "close_short", recordQuantity, marketData.CurrentPrice, 0, entryPrice)
+	at.recordAndConfirmOrder(order, decision.Symbol, "close_short", recordQuantity, currentPrice, 0, entryPrice)
 
 	if closeQuantity > 0 {
 		logger.Infof("  ✓ Position partially closed: %.4f (%.0f%%)", closeQuantity, decision.CloseRatio*100)
