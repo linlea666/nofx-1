@@ -466,6 +466,9 @@ func (ti *TraderIntegration) updatePositionMapping(dec *decision.Decision) {
 // ============================================================================
 
 // getBalanceFunc 返回获取余额的函数
+// 🔑 使用可用余额(available_balance)而非总权益(total_equity)
+// 原因：总权益包含已用保证金，但跟单开仓只能用可用余额
+// 效果：避免计算出的跟单金额超过实际可用资金导致下单失败
 func (ti *TraderIntegration) getBalanceFunc() func() float64 {
 	return func() float64 {
 		info, err := ti.executor.GetAccountInfo()
@@ -474,7 +477,14 @@ func (ti *TraderIntegration) getBalanceFunc() func() float64 {
 			return 0
 		}
 
-		// 从账户信息中提取余额
+		// 🔑 优先使用可用余额（实际可开仓的资金）
+		// 这样跟单金额会基于实际可用资金计算，避免因余额不足导致下单失败
+		if avail, ok := info["available_balance"].(float64); ok && avail > 0 {
+			return avail
+		}
+
+		// 回退：如果没有 available_balance 或为 0，使用 total_equity
+		// (兼容老接口或特殊情况，如减仓/平仓时可用余额为0但仍需计算)
 		if equity, ok := info["total_equity"].(float64); ok {
 			return equity
 		}
