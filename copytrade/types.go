@@ -24,6 +24,27 @@ const (
 	ActionReduce ActionType = "reduce" // 减仓
 )
 
+// ============================================================================
+// 全平判断阈值常量（统一定义，避免多处硬编码）
+// ============================================================================
+const (
+	// FullCloseThreshold 全平阈值：减仓量 >= 仓位的 95% 视为全平
+	// 用于 Provider 层判断 sz/startPosition
+	FullCloseThreshold = 0.95
+
+	// NearZeroThreshold 近零阈值：剩余仓位 < 5% 视为全平
+	// 用于 Engine 层判断 currentSize/lastKnownSize
+	NearZeroThreshold = 0.05
+
+	// AccumulatedCloseThreshold 累积减仓触发全平阈值
+	// 当累积减仓比例 >= 90% 时，自动触发全量平仓
+	AccumulatedCloseThreshold = 0.90
+
+	// MinOrderValue 最小订单价值（适用于 Hyperliquid 等有此限制的交易所）
+	// 减仓价值低于此值时跳过，等待后续全平
+	MinOrderValue = 10.0
+)
+
 // SideType 持仓方向
 type SideType string
 

@@ -223,8 +223,8 @@ func parseHLDirection(side, dir, startPosition, sz string) (tradeSide string, po
 		return "buy", SideLong, ActionAdd
 	case "Close Long":
 		// 🔑 使用 sz/startPosition 判断完全平仓 vs 减仓
-		// sz >= startPos*0.95 表示平掉了 95% 以上，视为完全平仓
-		if startPos > 0 && size >= startPos*0.95 {
+		// sz >= startPos*FullCloseThreshold 表示平掉了大部分，视为完全平仓
+		if startPos > 0 && size >= startPos*FullCloseThreshold {
 			return "sell", SideLong, ActionClose
 		}
 		return "sell", SideLong, ActionReduce
@@ -235,7 +235,7 @@ func parseHLDirection(side, dir, startPosition, sz string) (tradeSide string, po
 		return "sell", SideShort, ActionAdd
 	case "Close Short":
 		// 🔑 同样逻辑判断空仓平仓
-		if startPos > 0 && size >= startPos*0.95 {
+		if startPos > 0 && size >= startPos*FullCloseThreshold {
 			return "buy", SideShort, ActionClose
 		}
 		return "buy", SideShort, ActionReduce

@@ -581,20 +581,24 @@ func parseHLDirWithStartPos(dir string, startPos float64, size float64) (ActionT
 		return ActionAdd, SideShort
 	case "Close Long":
 		// 🔑 使用 sz/startPosition 判断完全平仓 vs 减仓
-		// sz >= startPos*0.95 表示平掉了 95% 以上，视为完全平仓
-		if startPos > 0 && size >= startPos*0.95 {
-			logger.Infof("📡 [HL-WS] Close Long: sz(%.4f) >= 95%% of startPos(%.4f) → 完全平仓", size, startPos)
+		// sz >= startPos*FullCloseThreshold 表示平掉了大部分，视为完全平仓
+		if startPos > 0 && size >= startPos*FullCloseThreshold {
+			logger.Infof("📡 [HL-WS] Close Long: sz(%.4f) >= %.0f%% of startPos(%.4f) → 完全平仓",
+				size, FullCloseThreshold*100, startPos)
 			return ActionClose, SideLong
 		}
-		logger.Infof("📡 [HL-WS] Close Long: sz(%.4f) < 95%% of startPos(%.4f) → 减仓", size, startPos)
+		logger.Infof("📡 [HL-WS] Close Long: sz(%.4f) < %.0f%% of startPos(%.4f) → 减仓",
+			size, FullCloseThreshold*100, startPos)
 		return ActionReduce, SideLong
 	case "Close Short":
 		// 🔑 同样逻辑判断空仓平仓
-		if startPos > 0 && size >= startPos*0.95 {
-			logger.Infof("📡 [HL-WS] Close Short: sz(%.4f) >= 95%% of startPos(%.4f) → 完全平仓", size, startPos)
+		if startPos > 0 && size >= startPos*FullCloseThreshold {
+			logger.Infof("📡 [HL-WS] Close Short: sz(%.4f) >= %.0f%% of startPos(%.4f) → 完全平仓",
+				size, FullCloseThreshold*100, startPos)
 			return ActionClose, SideShort
 		}
-		logger.Infof("📡 [HL-WS] Close Short: sz(%.4f) < 95%% of startPos(%.4f) → 减仓", size, startPos)
+		logger.Infof("📡 [HL-WS] Close Short: sz(%.4f) < %.0f%% of startPos(%.4f) → 减仓",
+			size, FullCloseThreshold*100, startPos)
 		return ActionReduce, SideShort
 
 	// 🔄 反向开仓处理
@@ -607,45 +611,6 @@ func parseHLDirWithStartPos(dir string, startPos float64, size float64) (ActionT
 
 	default:
 		logger.Warnf("⚠️ [HL-WS] 未知 dir: %s，默认为 Open Long", dir)
-		return ActionOpen, SideLong
-	}
-}
-
-// parseHLDir 解析 Hyperliquid 的 dir 字段（旧版本，不使用 startPosition）
-// dir: "Open Long" | "Close Long" | "Open Short" | "Close Short" | "Long > Short" | "Short > Long"
-func parseHLDir(dir string) (ActionType, SideType) {
-	switch dir {
-	case "Open Long":
-		return ActionOpen, SideLong
-	case "Close Long":
-		return ActionClose, SideLong
-	case "Open Short":
-		return ActionOpen, SideShort
-	case "Close Short":
-		return ActionClose, SideShort
-
-	// 🔄 反向开仓处理（Hyperliquid 特有）
-	// 反向开仓 = 平掉原仓位 + 开新方向仓位（一次交易完成）
-	// 处理策略：将新方向视为新开仓
-	case "Long > Short":
-		// 从多翻空：新方向是 Short，当作新开仓处理
-		logger.Infof("📡 [HL-WS] 检测到反向开仓: %s → 转换为 Open Short", dir)
-		return ActionOpen, SideShort
-	case "Short > Long":
-		// 从空翻多：新方向是 Long，当作新开仓处理
-		logger.Infof("📡 [HL-WS] 检测到反向开仓: %s → 转换为 Open Long", dir)
-		return ActionOpen, SideLong
-
-	default:
-		// 尝试从旧格式解析
-		if len(dir) > 0 {
-			if dir[0] == 'B' {
-				return ActionOpen, SideLong
-			} else if dir[0] == 'A' {
-				return ActionOpen, SideShort
-			}
-		}
-		logger.Warnf("⚠️ [HL-WS] 未知的 dir 类型: %s，默认按 Open Long 处理", dir)
 		return ActionOpen, SideLong
 	}
 }

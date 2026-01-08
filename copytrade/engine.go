@@ -732,8 +732,8 @@ func (e *Engine) matchCloseReduceSignal(signal *TradeSignal, leaderPosMap map[st
 				e.traderID, mapping.LeaderPosID, mapping.LastKnownSize, leaderPos.Size, sizeDiff)
 
 			// 判断是全平还是减仓
-			if leaderPos.Size < mapping.LastKnownSize*0.05 {
-				// 剩余不足 5% = 视为全平
+			if leaderPos.Size < mapping.LastKnownSize*NearZeroThreshold {
+				// 剩余不足阈值 = 视为全平
 				logger.Infof("📊 [%s] 剩余(%.4f) < 5%% → 视为全平 | posId=%s",
 					e.traderID, leaderPos.Size, mapping.LeaderPosID)
 				return &SignalMatchResult{
@@ -767,7 +767,7 @@ func (e *Engine) matchCloseReduceSignal(signal *TradeSignal, leaderPosMap map[st
 
 		if leaderPos != nil {
 			// 用 fill.Size vs leaderPos.Size 判断是否是全平
-			if fill.Size >= leaderPos.Size*0.95 {
+			if fill.Size >= leaderPos.Size*FullCloseThreshold {
 				logger.Infof("📊 [%s] 减仓量(%.4f) ≈ 当前持仓(%.4f) → 视为全平 | posId=%s (兜底)",
 					e.traderID, fill.Size, leaderPos.Size, mapping.LeaderPosID)
 				return &SignalMatchResult{
@@ -913,9 +913,9 @@ func (e *Engine) buildDecisionV2(signal *TradeSignal, match *SignalMatchResult, 
 	if match.Action == ActionReduce {
 		ratio := e.calculateReduceRatioV2(signal, match)
 
-		// 边界保护：减仓超过 95% 时，直接全量平仓
-		if ratio >= 0.95 {
-			logger.Infof("📊 [%s] 减仓比例 %.1f%% ≥ 95%%，转为全量平仓", e.traderID, ratio*100)
+		// 边界保护：减仓超过阈值时，直接全量平仓
+		if ratio >= FullCloseThreshold {
+			logger.Infof("📊 [%s] 减仓比例 %.1f%% ≥ %.0f%%，转为全量平仓", e.traderID, ratio*100, FullCloseThreshold*100)
 			dec.CloseRatio = 0
 			dec.Reasoning = fmt.Sprintf("Copy trading: close (reduce %.0f%% → full close) following %s leader %s",
 				ratio*100, e.config.ProviderType, e.config.LeaderID)
@@ -928,10 +928,10 @@ func (e *Engine) buildDecisionV2(signal *TradeSignal, match *SignalMatchResult, 
 			accumulatedRatio := e.getAccumulatedReduceRatio(match.PosID)
 			newAccumulated := accumulatedRatio + ratio
 
-			if newAccumulated >= 0.90 {
-				// 累积减仓超过 90%，转为全平
-				logger.Infof("📊 [%s] 累积减仓 %.1f%% (本次 %.1f%% + 历史 %.1f%%) ≥ 90%%，转为全量平仓",
-					e.traderID, newAccumulated*100, ratio*100, accumulatedRatio*100)
+			if newAccumulated >= AccumulatedCloseThreshold {
+				// 累积减仓超过阈值，转为全平
+				logger.Infof("📊 [%s] 累积减仓 %.1f%% (本次 %.1f%% + 历史 %.1f%%) ≥ %.0f%%，转为全量平仓",
+					e.traderID, newAccumulated*100, ratio*100, accumulatedRatio*100, AccumulatedCloseThreshold*100)
 				dec.CloseRatio = 0
 				dec.Reasoning = fmt.Sprintf("Copy trading: close (accumulated reduce %.0f%% → full close) following %s leader %s",
 					newAccumulated*100, e.config.ProviderType, e.config.LeaderID)
@@ -960,6 +960,10 @@ func (e *Engine) buildDecisionV2(signal *TradeSignal, match *SignalMatchResult, 
 	if match.Action == ActionClose {
 		dec.CloseRatio = 0 // 0 = 全量平仓
 		logger.Infof("📊 [%s] 全量平仓 marginMode=%s", e.traderID, dec.MarginMode)
+		// 🔑 清除累积减仓比例（避免残留影响下次开仓）
+		if e.store != nil {
+			e.store.CopyTrade().ClearAccumulatedReduceRatio(e.traderID, match.PosID)
+		}
 	}
 
 	return dec
