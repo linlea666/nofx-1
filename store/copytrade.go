@@ -350,9 +350,10 @@ type CopyTradePositionMapping struct {
 	ClosePrice float64    `json:"close_price"` // 平仓价格
 
 	// 累计统计（加仓/减仓时更新）
-	AddCount    int       `json:"add_count"`    // 累计加仓次数
-	ReduceCount int       `json:"reduce_count"` // 累计减仓次数
-	UpdatedAt   time.Time `json:"updated_at"`   // 最后更新时间
+	AddCount               int       `json:"add_count"`                 // 累计加仓次数
+	ReduceCount            int       `json:"reduce_count"`              // 累计减仓次数
+	AccumulatedReduceRatio float64   `json:"accumulated_reduce_ratio"`  // 累计减仓比例（用于触发全平）
+	UpdatedAt              time.Time `json:"updated_at"`                // 最后更新时间
 }
 
 // initPositionMappingTable 初始化仓位映射表
@@ -392,6 +393,9 @@ func (s *CopyTradeStore) initPositionMappingTable() error {
 
 	// 添加 last_known_size 字段（如果不存在）
 	s.db.Exec(`ALTER TABLE copy_trade_position_mappings ADD COLUMN last_known_size REAL DEFAULT 0`)
+
+	// 添加 accumulated_reduce_ratio 字段（用于累积减仓触发全平）
+	s.db.Exec(`ALTER TABLE copy_trade_position_mappings ADD COLUMN accumulated_reduce_ratio REAL DEFAULT 0`)
 
 	return nil
 }
@@ -507,6 +511,41 @@ func (s *CopyTradeStore) IncrementReduceCount(traderID, leaderPosID string) erro
 		UPDATE copy_trade_position_mappings 
 		SET reduce_count = reduce_count + 1, updated_at = CURRENT_TIMESTAMP
 		WHERE trader_id = ? AND leader_pos_id = ? AND status = 'active'
+	`, traderID, leaderPosID)
+	return err
+}
+
+// UpdateAccumulatedReduceRatio 更新累积减仓比例（减仓时调用）
+// 用于跟踪累积减仓进度，当超过阈值（如 90%）时触发全平
+func (s *CopyTradeStore) UpdateAccumulatedReduceRatio(traderID, leaderPosID string, ratio float64) error {
+	_, err := s.db.Exec(`
+		UPDATE copy_trade_position_mappings 
+		SET accumulated_reduce_ratio = ?, updated_at = CURRENT_TIMESTAMP
+		WHERE trader_id = ? AND leader_pos_id = ? AND status = 'active'
+	`, ratio, traderID, leaderPosID)
+	return err
+}
+
+// GetAccumulatedReduceRatio 获取累积减仓比例
+func (s *CopyTradeStore) GetAccumulatedReduceRatio(traderID, leaderPosID string) (float64, error) {
+	var ratio float64
+	err := s.db.QueryRow(`
+		SELECT COALESCE(accumulated_reduce_ratio, 0)
+		FROM copy_trade_position_mappings 
+		WHERE trader_id = ? AND leader_pos_id = ? AND status = 'active'
+	`, traderID, leaderPosID).Scan(&ratio)
+	if err != nil {
+		return 0, err
+	}
+	return ratio, nil
+}
+
+// ClearAccumulatedReduceRatio 清除累积减仓比例（全平后调用）
+func (s *CopyTradeStore) ClearAccumulatedReduceRatio(traderID, leaderPosID string) error {
+	_, err := s.db.Exec(`
+		UPDATE copy_trade_position_mappings 
+		SET accumulated_reduce_ratio = 0, updated_at = CURRENT_TIMESTAMP
+		WHERE trader_id = ? AND leader_pos_id = ?
 	`, traderID, leaderPosID)
 	return err
 }

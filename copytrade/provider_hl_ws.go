@@ -456,10 +456,12 @@ func (p *HLWebSocketProvider) convertWsFill(raw WsFill) Fill {
 	closedPnl, _ := strconv.ParseFloat(raw.ClosedPnl, 64)
 	startPos, _ := strconv.ParseFloat(raw.StartPosition, 64)
 
-	// 🔑 使用 startPosition 精确判断动作类型
+	// 🔑 使用 startPosition + size 精确判断动作类型
 	// startPosition=0 + "Open Long/Short" = 新开仓
 	// startPosition>0 + "Open Long/Short" = 加仓
-	action, side := parseHLDirWithStartPos(raw.Dir, startPos)
+	// size >= startPos*0.95 + "Close Long/Short" = 完全平仓
+	// size < startPos*0.95 + "Close Long/Short" = 减仓
+	action, side := parseHLDirWithStartPos(raw.Dir, startPos, size)
 
 	return Fill{
 		ID:           raw.Hash,
@@ -559,13 +561,13 @@ func (p *HLWebSocketProvider) addFillToCache(fill Fill) {
 	p.recentFills = valid
 }
 
-// parseHLDirWithStartPos 使用 startPosition 精确判断动作类型
+// parseHLDirWithStartPos 使用 startPosition 和 size 精确判断动作类型
 // 🔑 核心逻辑：
 //   - "Open Long/Short" + startPosition=0 → ActionOpen（新开仓）
 //   - "Open Long/Short" + startPosition>0 → ActionAdd（加仓）
-//   - "Close Long/Short" + 仓位归零 → ActionClose（平仓）
-//   - "Close Long/Short" + 仓位未归零 → ActionReduce（减仓）
-func parseHLDirWithStartPos(dir string, startPos float64) (ActionType, SideType) {
+//   - "Close Long/Short" + sz >= startPos*0.95 → ActionClose（完全平仓）
+//   - "Close Long/Short" + sz < startPos*0.95 → ActionReduce（减仓）
+func parseHLDirWithStartPos(dir string, startPos float64, size float64) (ActionType, SideType) {
 	switch dir {
 	case "Open Long":
 		if startPos == 0 {
@@ -578,11 +580,22 @@ func parseHLDirWithStartPos(dir string, startPos float64) (ActionType, SideType)
 		}
 		return ActionAdd, SideShort
 	case "Close Long":
-		// 注：Close 时 startPos 是平仓前的仓位大小，无法直接判断是否全平
-		// 全平/减仓的判断交给 matchCloseReduceSignal 通过 size 变化判断
-		return ActionClose, SideLong
+		// 🔑 使用 sz/startPosition 判断完全平仓 vs 减仓
+		// sz >= startPos*0.95 表示平掉了 95% 以上，视为完全平仓
+		if startPos > 0 && size >= startPos*0.95 {
+			logger.Infof("📡 [HL-WS] Close Long: sz(%.4f) >= 95%% of startPos(%.4f) → 完全平仓", size, startPos)
+			return ActionClose, SideLong
+		}
+		logger.Infof("📡 [HL-WS] Close Long: sz(%.4f) < 95%% of startPos(%.4f) → 减仓", size, startPos)
+		return ActionReduce, SideLong
 	case "Close Short":
-		return ActionClose, SideShort
+		// 🔑 同样逻辑判断空仓平仓
+		if startPos > 0 && size >= startPos*0.95 {
+			logger.Infof("📡 [HL-WS] Close Short: sz(%.4f) >= 95%% of startPos(%.4f) → 完全平仓", size, startPos)
+			return ActionClose, SideShort
+		}
+		logger.Infof("📡 [HL-WS] Close Short: sz(%.4f) < 95%% of startPos(%.4f) → 减仓", size, startPos)
+		return ActionReduce, SideShort
 
 	// 🔄 反向开仓处理
 	case "Long > Short":

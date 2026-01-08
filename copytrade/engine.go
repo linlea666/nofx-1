@@ -908,7 +908,7 @@ func (e *Engine) buildDecisionV2(signal *TradeSignal, match *SignalMatchResult, 
 	}
 
 	// ============================================================
-	// 减仓：计算比例
+	// 减仓：计算比例 + 累积减仓检测
 	// ============================================================
 	if match.Action == ActionReduce {
 		ratio := e.calculateReduceRatioV2(signal, match)
@@ -919,11 +919,38 @@ func (e *Engine) buildDecisionV2(signal *TradeSignal, match *SignalMatchResult, 
 			dec.CloseRatio = 0
 			dec.Reasoning = fmt.Sprintf("Copy trading: close (reduce %.0f%% → full close) following %s leader %s",
 				ratio*100, e.config.ProviderType, e.config.LeaderID)
+			// 清除累积减仓比例
+			if e.store != nil {
+				e.store.CopyTrade().ClearAccumulatedReduceRatio(e.traderID, match.PosID)
+			}
 		} else {
-			dec.CloseRatio = ratio
-			dec.Reasoning = fmt.Sprintf("Copy trading: reduce %.0f%% following %s leader %s",
-				ratio*100, e.config.ProviderType, e.config.LeaderID)
-			logger.Infof("📊 [%s] 部分平仓 %.1f%% marginMode=%s", e.traderID, ratio*100, dec.MarginMode)
+			// 🆕 累积减仓检测：当累积减仓超过 90% 时，触发全平
+			accumulatedRatio := e.getAccumulatedReduceRatio(match.PosID)
+			newAccumulated := accumulatedRatio + ratio
+
+			if newAccumulated >= 0.90 {
+				// 累积减仓超过 90%，转为全平
+				logger.Infof("📊 [%s] 累积减仓 %.1f%% (本次 %.1f%% + 历史 %.1f%%) ≥ 90%%，转为全量平仓",
+					e.traderID, newAccumulated*100, ratio*100, accumulatedRatio*100)
+				dec.CloseRatio = 0
+				dec.Reasoning = fmt.Sprintf("Copy trading: close (accumulated reduce %.0f%% → full close) following %s leader %s",
+					newAccumulated*100, e.config.ProviderType, e.config.LeaderID)
+				// 清除累积减仓比例
+				if e.store != nil {
+					e.store.CopyTrade().ClearAccumulatedReduceRatio(e.traderID, match.PosID)
+				}
+			} else {
+				// 正常减仓：更新累积比例
+				dec.CloseRatio = ratio
+				dec.Reasoning = fmt.Sprintf("Copy trading: reduce %.0f%% following %s leader %s",
+					ratio*100, e.config.ProviderType, e.config.LeaderID)
+				logger.Infof("📊 [%s] 部分平仓 %.1f%% marginMode=%s (累积 %.1f%%)",
+					e.traderID, ratio*100, dec.MarginMode, newAccumulated*100)
+				// 更新累积减仓比例
+				if e.store != nil {
+					e.store.CopyTrade().UpdateAccumulatedReduceRatio(e.traderID, match.PosID, newAccumulated)
+				}
+			}
 		}
 	}
 
@@ -961,6 +988,20 @@ func (e *Engine) calculateReduceRatioV2(signal *TradeSignal, match *SignalMatchR
 	logger.Infof("📊 [%s] %s 减仓比例 | 减仓量=%.4f 当前=%.4f 减仓前=%.4f → %.1f%%",
 		e.traderID, signal.Fill.Symbol, reduceSize, leaderCurrentSize, leaderPreviousSize, ratio*100)
 
+	return ratio
+}
+
+// getAccumulatedReduceRatio 获取累积减仓比例
+// 用于跟踪多次小额减仓的累计进度，当超过阈值时触发全平
+func (e *Engine) getAccumulatedReduceRatio(posID string) float64 {
+	if e.store == nil {
+		return 0
+	}
+	ratio, err := e.store.CopyTrade().GetAccumulatedReduceRatio(e.traderID, posID)
+	if err != nil {
+		// 可能是新仓位，没有记录
+		return 0
+	}
 	return ratio
 }
 

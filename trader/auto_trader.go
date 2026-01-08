@@ -1275,7 +1275,7 @@ func (at *AutoTrader) executeCloseLongWithRecord(decision *decision.Decision, ac
 		closeQuantity = totalQuantity * decision.CloseRatio
 		logger.Infof("  📊 Partial close: %.0f%% of %.4f = %.4f", decision.CloseRatio*100, totalQuantity, closeQuantity)
 
-		// 🆕 边界检查：仓位太小无法按比例减仓
+		// 🆕 边界检查 1：仓位太小无法按比例减仓
 		// 当仓位很小时，由于最小下单量（1张合约）约束，减仓可能导致意外全平
 		// 例如：仓位 0.01 BNB（1张），减仓50% = 0.005，但向上取整到1张 → 全平
 		// 为避免这种情况，当仓位 < 阈值且不是接近全平时，跳过减仓
@@ -1283,6 +1283,17 @@ func (at *AutoTrader) executeCloseLongWithRecord(decision *decision.Decision, ac
 		if totalQuantity < minPositionForPartialClose && decision.CloseRatio < 0.9 {
 			logger.Warnf("  ⚠️ 仓位太小 (%.4f < %.4f)，无法按 %.0f%% 比例减仓，跳过本次操作",
 				totalQuantity, minPositionForPartialClose, decision.CloseRatio*100)
+			return nil
+		}
+
+		// 🆕 边界检查 2：价值检查（Hyperliquid 最小订单价值 $10）
+		// 减仓价值太小会被交易所拒绝（Order must have minimum value of $10）
+		// 如果接近全平（>90%），不跳过，让它尝试执行
+		closeValue := closeQuantity * currentPrice
+		const minOrderValue = 10.0 // Hyperliquid 最小 $10
+		if closeValue < minOrderValue && decision.CloseRatio < 0.9 {
+			logger.Warnf("  ⚠️ 减仓价值太小 (%.2f < $%.0f)，跳过本次操作（等待后续全平）",
+				closeValue, minOrderValue)
 			return nil
 		}
 	}
@@ -1392,7 +1403,7 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *decision.Decision, a
 		closeQuantity = totalQuantity * decision.CloseRatio
 		logger.Infof("  📊 Partial close: %.0f%% of %.4f = %.4f", decision.CloseRatio*100, totalQuantity, closeQuantity)
 
-		// 🆕 边界检查：仓位太小无法按比例减仓
+		// 🆕 边界检查 1：仓位太小无法按比例减仓
 		// 当仓位很小时，由于最小下单量（1张合约）约束，减仓可能导致意外全平
 		// 例如：仓位 0.01 BNB（1张），减仓50% = 0.005，但向上取整到1张 → 全平
 		// 为避免这种情况，当仓位 < 阈值且不是接近全平时，跳过减仓
@@ -1400,6 +1411,17 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *decision.Decision, a
 		if totalQuantity < minPositionForPartialClose && decision.CloseRatio < 0.9 {
 			logger.Warnf("  ⚠️ 仓位太小 (%.4f < %.4f)，无法按 %.0f%% 比例减仓，跳过本次操作",
 				totalQuantity, minPositionForPartialClose, decision.CloseRatio*100)
+			return nil
+		}
+
+		// 🆕 边界检查 2：价值检查（Hyperliquid 最小订单价值 $10）
+		// 减仓价值太小会被交易所拒绝（Order must have minimum value of $10）
+		// 如果接近全平（>90%），不跳过，让它尝试执行
+		closeValue := closeQuantity * currentPrice
+		const minOrderValue = 10.0 // Hyperliquid 最小 $10
+		if closeValue < minOrderValue && decision.CloseRatio < 0.9 {
+			logger.Warnf("  ⚠️ 减仓价值太小 (%.2f < $%.0f)，跳过本次操作（等待后续全平）",
+				closeValue, minOrderValue)
 			return nil
 		}
 	}

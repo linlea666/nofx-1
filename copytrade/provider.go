@@ -126,8 +126,8 @@ func (p *HyperliquidProvider) GetFills(leaderID string, since time.Time) ([]Fill
 			Raw:       raw,
 		}
 
-		// 解析方向
-		fill.Side, fill.PositionSide, fill.Action = parseHLDirection(raw.Side, raw.Dir, raw.StartPosition)
+		// 解析方向（传入 Sz 用于判断完全平仓 vs 减仓）
+		fill.Side, fill.PositionSide, fill.Action = parseHLDirection(raw.Side, raw.Dir, raw.StartPosition, raw.Sz)
 
 		// 计算成交价值
 		fill.Value = fill.Price * fill.Size
@@ -210,8 +210,10 @@ func (p *HyperliquidProvider) post(req interface{}, result interface{}) error {
 }
 
 // parseHLDirection 解析 Hyperliquid 的交易方向
-func parseHLDirection(side, dir, startPosition string) (tradeSide string, posSide SideType, action ActionType) {
+// 🔑 使用 startPosition + sz 精确判断平仓类型
+func parseHLDirection(side, dir, startPosition, sz string) (tradeSide string, posSide SideType, action ActionType) {
 	startPos := parseFloat(startPosition)
+	size := parseFloat(sz)
 
 	switch dir {
 	case "Open Long":
@@ -220,14 +222,23 @@ func parseHLDirection(side, dir, startPosition string) (tradeSide string, posSid
 		}
 		return "buy", SideLong, ActionAdd
 	case "Close Long":
-		return "sell", SideLong, ActionClose // 具体是 reduce 还是 close 由 engine 判断
+		// 🔑 使用 sz/startPosition 判断完全平仓 vs 减仓
+		// sz >= startPos*0.95 表示平掉了 95% 以上，视为完全平仓
+		if startPos > 0 && size >= startPos*0.95 {
+			return "sell", SideLong, ActionClose
+		}
+		return "sell", SideLong, ActionReduce
 	case "Open Short":
 		if startPos == 0 {
 			return "sell", SideShort, ActionOpen
 		}
 		return "sell", SideShort, ActionAdd
 	case "Close Short":
-		return "buy", SideShort, ActionClose // 具体是 reduce 还是 close 由 engine 判断
+		// 🔑 同样逻辑判断空仓平仓
+		if startPos > 0 && size >= startPos*0.95 {
+			return "buy", SideShort, ActionClose
+		}
+		return "buy", SideShort, ActionReduce
 
 	// 🔄 反向开仓处理（Hyperliquid 特有）
 	// 反向开仓 = 平掉原仓位 + 开新方向仓位（一次交易完成）
