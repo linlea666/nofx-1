@@ -313,7 +313,7 @@ func (p *OKXProvider) GetFills(uniqueName string, since time.Time) ([]Fill, erro
 			Symbol:    normalizeOKXSymbol(raw.InstId),
 			Price:     parseFloat(raw.AvgPx),
 			Size:      parseFloat(raw.Sz),
-			Value:     parseFloat(raw.Value),
+			Value:     parseFloat(raw.Value) * parseFloat(raw.AvgPx), // OKX value 是代币数量，需要乘以价格得到 USD
 			Timestamp: time.UnixMilli(parseInt64(raw.FillTime)),
 			Raw:       raw,
 		}
