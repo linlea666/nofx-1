@@ -1,5 +1,67 @@
 package copytrade
 
+import (
+	"encoding/json"
+	"strings"
+)
+
+// ============================================================================
+// 自定义类型：处理 API 返回的布尔值/字符串不一致问题
+// ============================================================================
+
+// FlexBool 灵活布尔类型
+// AsterDex API 有时返回 true/false（布尔），有时返回 "true"/"false"（字符串）
+// 此类型自动处理两种情况
+type FlexBool bool
+
+// UnmarshalJSON 实现 json.Unmarshaler 接口
+func (fb *FlexBool) UnmarshalJSON(data []byte) error {
+	// 去除首尾空白
+	s := strings.TrimSpace(string(data))
+
+	// 情况1：布尔值 true/false
+	if s == "true" {
+		*fb = true
+		return nil
+	}
+	if s == "false" {
+		*fb = false
+		return nil
+	}
+
+	// 情况2：字符串 "true"/"false"
+	if s == `"true"` {
+		*fb = true
+		return nil
+	}
+	if s == `"false"` || s == `""` {
+		*fb = false
+		return nil
+	}
+
+	// 情况3：null 或空
+	if s == "null" || s == "" {
+		*fb = false
+		return nil
+	}
+
+	// 兜底：尝试标准 JSON 解析
+	var b bool
+	if err := json.Unmarshal(data, &b); err == nil {
+		*fb = FlexBool(b)
+		return nil
+	}
+
+	// 最终兜底：默认 false
+	*fb = false
+	return nil
+}
+
+// Bool 返回原生 bool 值
+func (fb FlexBool) Bool() bool {
+	return bool(fb)
+}
+
 // ============================================================================
 // AsterDex API 返回结构
 // ============================================================================
@@ -50,9 +112,9 @@ type AsterDexTxData struct {
 	TimeInForce      string `json:"timeInForce,omitempty"`      // "GTC" | "IOC" | "FOK" | "GTE_GTC"
 	Timestamp        string `json:"timestamp,omitempty"`        // 订单时间戳（字符串）
 
-	// 减仓/平仓标识（字符串类型 "true"/"false"）
-	ReduceOnly    string `json:"reduceOnly,omitempty"`    // 是否只减仓
-	ClosePosition string `json:"closePosition,omitempty"` // 是否平仓
+	// 减仓/平仓标识（使用 FlexBool 处理 bool/string 混合类型）
+	ReduceOnly    FlexBool `json:"reduceOnly,omitempty"`    // 是否只减仓
+	ClosePosition FlexBool `json:"closePosition,omitempty"` // 是否平仓
 
 	// 止损止盈单相关
 	StopPrice    string `json:"stopPrice,omitempty"`    // 触发价格
@@ -64,6 +126,9 @@ type AsterDexTxData struct {
 
 	// 取消订单相关
 	OrderId string `json:"orderId,omitempty"` // 订单ID
+
+	// 双向持仓模式切换
+	DualSidePosition string `json:"dualSidePosition,omitempty"` // "true"/"false"
 }
 
 // ============================================================================
@@ -72,12 +137,12 @@ type AsterDexTxData struct {
 
 // IsReduceOnly 判断是否只减仓
 func (d *AsterDexTxData) IsReduceOnly() bool {
-	return d.ReduceOnly == "true"
+	return d.ReduceOnly.Bool()
 }
 
 // IsClosePosition 判断是否平仓
 func (d *AsterDexTxData) IsClosePosition() bool {
-	return d.ClosePosition == "true"
+	return d.ClosePosition.Bool()
 }
 
 // IsValidOrder 判断是否是有效的交易订单（有 symbol 和 side）
@@ -96,16 +161,16 @@ func (tx *AsterDexTx) IsSuccessfulOrder() bool {
 
 // DetermineAsterAction 根据 AsterDex 交易记录判断 Action 类型
 // 判断规则：
-//   - closePosition = "true" → ActionClose（全部平仓）
-//   - reduceOnly = "true" → ActionReduce（部分减仓）
-//   - reduceOnly != "true" && closePosition != "true" → ActionOpen（新开仓/加仓，由 Engine 进一步区分）
+//   - closePosition = true → ActionClose（全部平仓）
+//   - reduceOnly = true → ActionReduce（部分减仓）
+//   - 其他 → ActionOpen（新开仓/加仓，由 Engine 进一步区分）
 func DetermineAsterAction(tx AsterDexTx) ActionType {
-	// 1. 平仓优先（closePosition 为 "true"）
+	// 1. 平仓优先（closePosition 为 true）
 	if tx.Data.IsClosePosition() {
 		return ActionClose
 	}
 
-	// 2. 减仓判断（reduceOnly 为 "true"）
+	// 2. 减仓判断（reduceOnly 为 true）
 	if tx.Data.IsReduceOnly() {
 		return ActionReduce
 	}
