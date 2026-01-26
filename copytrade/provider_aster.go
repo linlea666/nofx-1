@@ -25,16 +25,16 @@ const (
 
 // AsterDexProvider AsterDex 数据提供者
 type AsterDexProvider struct {
-	client       *http.Client
-	apiEndpoint  string
-	lastTxTime   int64  // 上次处理的交易时间戳（避免重复处理）
-	lastTxHash   string // 上次处理的交易哈希（双重校验）
+	client      *http.Client
+	apiEndpoint string
+	lastTxTime  int64  // 上次处理的交易时间戳（避免重复处理）
+	lastTxHash  string // 上次处理的交易哈希（双重校验）
 }
 
 // NewAsterDexProvider 创建 AsterDex Provider
 func NewAsterDexProvider() *AsterDexProvider {
 	return &AsterDexProvider{
-		client: &http.Client{Timeout: 15 * time.Second},
+		client:      &http.Client{Timeout: 15 * time.Second},
 		apiEndpoint: AsterDexExplorerAPI,
 	}
 }
@@ -70,32 +70,37 @@ func (p *AsterDexProvider) GetFills(leaderID string, since time.Time) ([]Fill, e
 	sinceMs := since.UnixMilli()
 
 	for _, tx := range userDetails.Txs {
-		// 1. 只处理已成交的订单
-		if tx.Status != "FILLED" {
+		// 1. 只处理成功的下单操作（PlaceOrder + error为空 + 有交易数据）
+		if !tx.IsSuccessfulOrder() {
 			continue
 		}
 
-		// 2. 只处理新交易（时间过滤）
-		if tx.CreateTime <= sinceMs {
+		// 2. 只处理永续合约订单
+		if tx.BizType != "PERP" {
 			continue
 		}
 
-		// 3. 避免重复处理（时间戳 + 哈希双重校验）
-		if tx.CreateTime < p.lastTxTime {
-			continue
-		}
-		if tx.CreateTime == p.lastTxTime && tx.TxHash == p.lastTxHash {
+		// 3. 只处理新交易（时间过滤）
+		if tx.Timestamp <= sinceMs {
 			continue
 		}
 
-		// 4. 解析交易记录
+		// 4. 避免重复处理（时间戳 + 哈希双重校验）
+		if tx.Timestamp < p.lastTxTime {
+			continue
+		}
+		if tx.Timestamp == p.lastTxTime && tx.Hash == p.lastTxHash {
+			continue
+		}
+
+		// 5. 解析交易记录
 		fill := p.parseTxToFill(tx)
 		fills = append(fills, fill)
 
-		// 5. 更新最后处理标记
-		if tx.CreateTime > p.lastTxTime || (tx.CreateTime == p.lastTxTime && tx.TxHash != p.lastTxHash) {
-			p.lastTxTime = tx.CreateTime
-			p.lastTxHash = tx.TxHash
+		// 6. 更新最后处理标记
+		if tx.Timestamp > p.lastTxTime || (tx.Timestamp == p.lastTxTime && tx.Hash != p.lastTxHash) {
+			p.lastTxTime = tx.Timestamp
+			p.lastTxHash = tx.Hash
 		}
 	}
 
@@ -180,7 +185,7 @@ func (p *AsterDexProvider) fetchUserDetails(leaderID string) (*AsterDexUserDetai
 		return nil, fmt.Errorf("JSON decode failed: %w", err)
 	}
 
-	// 检查是否是错误响应（通过 status 字段判断）
+	// 检查是否是错误响应（通过 type 字段判断）
 	// 错误响应也能解析成功，但 type 会是 "SYS" 而不是 "userDetails"
 	if userDetails.Type != "userDetails" {
 		// 尝试解析为错误响应
@@ -205,26 +210,23 @@ func (p *AsterDexProvider) parseTxToFill(tx AsterDexTx) Fill {
 	// 判断交易方向
 	tradeSide := DetermineAsterTradeSide(tx)
 
-	// 解析数量和价格
-	quantity := parseFloat(tx.Quantity)
-	price := parseFloat(tx.Price)
+	// 解析数量和价格（从嵌套的 data 对象中获取）
+	quantity := parseFloat(tx.Data.Quantity)
+	price := parseFloat(tx.Data.Price)
 
-	// 如果有成交均价，优先使用
-	if tx.AvgPrice != "" {
-		avgPrice := parseFloat(tx.AvgPrice)
-		if avgPrice > 0 {
-			price = avgPrice
-		}
+	// 如果没有价格（市价单），使用 stopPrice 作为参考
+	if price == 0 && tx.Data.StopPrice != "" {
+		price = parseFloat(tx.Data.StopPrice)
 	}
 
 	// 标准化 symbol（确保大写，带 USDT 后缀）
-	symbol := normalizeAsterSymbol(tx.Symbol)
+	symbol := normalizeAsterSymbol(tx.Data.Symbol)
 
 	// 生成虚拟 posId
 	posID := GenerateAsterPosID(symbol, positionSide)
 
 	fill := Fill{
-		ID:           tx.TxHash,
+		ID:           tx.Hash, // 使用 hash 作为唯一标识
 		Symbol:       symbol,
 		Side:         tradeSide,
 		PositionSide: positionSide,
@@ -232,12 +234,12 @@ func (p *AsterDexProvider) parseTxToFill(tx AsterDexTx) Fill {
 		Price:        price,
 		Size:         quantity,
 		Value:        price * quantity,
-		Timestamp:    time.UnixMilli(tx.CreateTime),
+		Timestamp:    time.UnixMilli(tx.Timestamp), // 使用顶层的 timestamp
 		Raw:          tx,
 	}
 
-	logger.Infof("📡 [AsterDex] 解析成交 | hash=%s symbol=%s action=%s side=%s posId=%s size=%.4f price=%.2f",
-		truncateHash(tx.TxHash), symbol, action, positionSide, posID, quantity, price)
+	logger.Infof("📡 [AsterDex] 解析成交 | hash=%s symbol=%s action=%s side=%s posId=%s size=%.4f price=%.2f type=%s",
+		truncateHash(tx.Hash), symbol, action, positionSide, posID, quantity, price, tx.Data.Type)
 
 	return fill
 }
