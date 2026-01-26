@@ -164,17 +164,34 @@ func (p *AsterDexProvider) fetchUserDetails(leaderID string) (*AsterDexUserDetai
 		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBytes))
 	}
 
-	var apiResp AsterDexUserDetailsResp
-	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
+	// 读取响应体
+	respBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response failed: %w", err)
+	}
+
+	// AsterDex API 响应格式：
+	// - 成功时：直接返回 {"balance":..., "type":"userDetails", "txs":[...]}
+	// - 失败时：返回 {"status":"ERROR", "code":"...", "errorData":"..."}
+
+	// 先尝试解析为成功响应（直接是 UserDetails）
+	var userDetails AsterDexUserDetails
+	if err := json.Unmarshal(respBytes, &userDetails); err != nil {
 		return nil, fmt.Errorf("JSON decode failed: %w", err)
 	}
 
-	// 检查 API 返回状态
-	if apiResp.Status == "ERROR" {
-		return nil, fmt.Errorf("API error: %s (code=%s)", apiResp.ErrorData, apiResp.Code)
+	// 检查是否是错误响应（通过 status 字段判断）
+	// 错误响应也能解析成功，但 type 会是 "SYS" 而不是 "userDetails"
+	if userDetails.Type != "userDetails" {
+		// 尝试解析为错误响应
+		var errResp AsterDexUserDetailsResp
+		if err := json.Unmarshal(respBytes, &errResp); err == nil && errResp.Status == "ERROR" {
+			return nil, fmt.Errorf("API error: %s (code=%s)", errResp.ErrorData, errResp.Code)
+		}
+		return nil, fmt.Errorf("unexpected response type: %s", userDetails.Type)
 	}
 
-	return apiResp.Data, nil
+	return &userDetails, nil
 }
 
 // parseTxToFill 将 AsterDex 交易记录转换为标准 Fill
