@@ -101,6 +101,8 @@ type AsterDexTx struct {
 }
 
 // AsterDexTxData 交易详情（嵌套在 data 字段中）
+// 注意：AsterDex API 在多个字段上存在类型不一致问题，有时返回布尔值，有时返回字符串
+// 所有可能是布尔值的字段都使用 FlexBool 类型来处理
 type AsterDexTxData struct {
 	NewClientOrderId string `json:"newClientOrderId,omitempty"` // 客户端订单ID
 	Symbol           string `json:"symbol,omitempty"`           // 交易对 (如 "ETHUSDT")
@@ -112,23 +114,21 @@ type AsterDexTxData struct {
 	TimeInForce      string `json:"timeInForce,omitempty"`      // "GTC" | "IOC" | "FOK" | "GTE_GTC"
 	Timestamp        string `json:"timestamp,omitempty"`        // 订单时间戳（字符串）
 
-	// 减仓/平仓标识（使用 FlexBool 处理 bool/string 混合类型）
-	ReduceOnly    FlexBool `json:"reduceOnly,omitempty"`    // 是否只减仓
-	ClosePosition FlexBool `json:"closePosition,omitempty"` // 是否平仓
+	// ========== 布尔/字符串混合类型字段（使用 FlexBool）==========
+	ReduceOnly       FlexBool `json:"reduceOnly,omitempty"`       // 是否只减仓
+	ClosePosition    FlexBool `json:"closePosition,omitempty"`    // 是否平仓
+	PriceProtect     FlexBool `json:"priceProtect,omitempty"`     // 价格保护
+	DualSidePosition FlexBool `json:"dualSidePosition,omitempty"` // 双向持仓模式
 
 	// 止损止盈单相关
-	StopPrice    string `json:"stopPrice,omitempty"`    // 触发价格
-	WorkingType  string `json:"workingType,omitempty"`  // "MARK_PRICE" | "CONTRACT_PRICE"
-	PriceProtect string `json:"priceProtect,omitempty"` // 价格保护
+	StopPrice   string `json:"stopPrice,omitempty"`   // 触发价格
+	WorkingType string `json:"workingType,omitempty"` // "MARK_PRICE" | "CONTRACT_PRICE"
 
 	// 杠杆调整相关
 	Leverage string `json:"leverage,omitempty"` // 杠杆倍数
 
 	// 取消订单相关
 	OrderId string `json:"orderId,omitempty"` // 订单ID
-
-	// 双向持仓模式切换
-	DualSidePosition string `json:"dualSidePosition,omitempty"` // "true"/"false"
 }
 
 // ============================================================================
