@@ -1,6 +1,7 @@
 package copytrade
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -140,19 +141,25 @@ func (p *AsterDexProvider) GetAccountState(leaderID string) (*AccountState, erro
 
 // fetchUserDetails 获取用户详情
 func (p *AsterDexProvider) fetchUserDetails(leaderID string) (*AsterDexUserDetails, error) {
-	// 构造请求 URL
-	// 注意：实际 API 可能需要 POST 请求或其他参数格式，根据实际情况调整
-	url := fmt.Sprintf("%s?address=%s", p.apiEndpoint, leaderID)
+	// 构造 POST 请求体
+	reqBody := map[string]string{
+		"address": leaderID,
+	}
+	bodyBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("JSON marshal failed: %w", err)
+	}
 
-	resp, err := p.client.Get(url)
+	// 发送 POST 请求
+	resp, err := p.client.Post(p.apiEndpoint, "application/json", bytes.NewReader(bodyBytes))
 	if err != nil {
 		return nil, fmt.Errorf("HTTP request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(bodyBytes))
+		respBytes, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBytes))
 	}
 
 	var apiResp AsterDexUserDetailsResp
