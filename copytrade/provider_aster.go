@@ -142,8 +142,10 @@ func (p *AsterDexProvider) GetAccountState(leaderID string) (*AccountState, erro
 // fetchUserDetails 获取用户详情
 func (p *AsterDexProvider) fetchUserDetails(leaderID string) (*AsterDexUserDetails, error) {
 	// 构造 POST 请求体
+	// AsterDex API 需要 type + user 参数
 	reqBody := map[string]string{
-		"address": leaderID,
+		"type": "userDetails",
+		"user": leaderID,
 	}
 	bodyBytes, err := json.Marshal(reqBody)
 	if err != nil {
