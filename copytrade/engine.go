@@ -518,7 +518,7 @@ func (e *Engine) matchOpenAddSignal(signal *TradeSignal, leaderPosMap map[string
 
 		if mapping.Status == "ignored" {
 			// 🔑 关键区分：根据数据源（ProviderType）使用不同的判断逻辑
-			if e.config.ProviderType == "okx" {
+			if e.config.ProviderType == ProviderOKX {
 				// OKX: ignored 状态永远不跟
 				// 原因：OKX 的 posId 是真实的，平仓后失效，新开仓会分配新的 posId
 				// 所以 ignored 的 posId 永远不会再被使用，直接跳过
@@ -527,12 +527,16 @@ func (e *Engine) matchOpenAddSignal(signal *TradeSignal, leaderPosMap map[string
 				continue
 			}
 
-			// Hyperliquid: 需要判断是否是真正的重新开仓
-			// 原因：Hyperliquid 的 posId 是虚拟的（symbol_side），平仓后重开会复用同一个 posId
-			// 通过 ActionOpen（startPosition=0）判断是否是全新开仓
+			// Hyperliquid / AsterDex: 需要判断是否是真正的重新开仓
+			// 原因：这些交易所的 posId 是虚拟的（symbol_side），平仓后重开会复用同一个 posId
+			// 通过 ActionOpen 判断是否是全新开仓
 			if fill.Action == ActionOpen {
-				logger.Infof("📊 [%s] 历史仓位重新开仓 | posId=%s (ignored → active) → 跟随新开仓（Hyperliquid）",
-					e.traderID, posID)
+				providerName := "Hyperliquid"
+				if e.config.ProviderType == ProviderAsterDex {
+					providerName = "AsterDex"
+				}
+				logger.Infof("📊 [%s] 历史仓位重新开仓 | posId=%s (ignored → active) → 跟随新开仓（%s）",
+					e.traderID, posID, providerName)
 				newPosition = pos
 				break
 			}
@@ -1047,10 +1051,17 @@ func (e *Engine) calculateCopySizeByPositionChange(signal *TradeSignal, match *S
 
 	// 🔑 OKX: 直接使用 fill.Value（API 返回完整订单价值，不存在拆分问题）
 	// 🔑 Hyperliquid: 使用持仓变化量计算（解决大订单拆分导致金额偏小的问题）
+	// 🔑 AsterDex: 使用 price × size 计算（API 返回成交价格和数量）
 	if e.config.ProviderType == ProviderOKX {
 		// OKX: 保持原逻辑，直接使用 fill.Value
 		leaderTradeValue = fill.Value
 		logger.Infof("📊 [%s] OKX计算 | 使用 fill.Value=%.2f", e.traderID, fill.Value)
+	} else if e.config.ProviderType == ProviderAsterDex {
+		// AsterDex: 直接使用 price × size 计算交易价值
+		// API 返回的是成交记录，包含准确的价格和数量
+		leaderTradeValue = fill.Price * fill.Size
+		logger.Infof("📊 [%s] AsterDex计算 | price=%.4f size=%.4f → 交易价值=%.2f",
+			e.traderID, fill.Price, fill.Size, leaderTradeValue)
 	} else if match.Action == ActionOpen {
 		// Hyperliquid 新开仓：用当前持仓的 size × price 作为交易价值
 		if match.LeaderPosition != nil {

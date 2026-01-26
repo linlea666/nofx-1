@@ -12,6 +12,7 @@ type ProviderType string
 const (
 	ProviderHyperliquid ProviderType = "hyperliquid"
 	ProviderOKX         ProviderType = "okx"
+	ProviderAsterDex    ProviderType = "asterdex"
 )
 
 // ActionType 交易动作类型

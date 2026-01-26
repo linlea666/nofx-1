@@ -57,6 +57,8 @@ func NewProvider(providerType ProviderType) (LeaderProvider, error) {
 		return NewHyperliquidProvider(), nil
 	case ProviderOKX:
 		return NewOKXProvider(), nil
+	case ProviderAsterDex:
+		return NewAsterDexProvider(), nil
 	default:
 		return nil, fmt.Errorf("unsupported provider type: %s", providerType)
 	}
