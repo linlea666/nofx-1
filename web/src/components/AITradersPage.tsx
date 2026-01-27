@@ -307,7 +307,7 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
         return
       }
 
-      const request = {
+      const request: CreateTraderRequest = {
         name: data.name,
         ai_model_id: data.ai_model_id,
         exchange_id: data.exchange_id,
@@ -316,6 +316,8 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
         scan_interval_minutes: data.scan_interval_minutes,
         is_cross_margin: data.is_cross_margin,
         show_in_competition: data.show_in_competition,
+        decision_mode: data.decision_mode,  // 决策模式（ai / copy_trade）
+        copy_config: data.copy_config,      // 跟单配置（包含 copy_ratio 跟单系数）
       }
 
       console.log('🔥 handleSaveEditTrader - data:', data)
