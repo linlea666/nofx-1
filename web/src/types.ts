@@ -1,6 +1,6 @@
 // Decision mode types (defined early for use throughout the file)
 export type DecisionMode = 'ai' | 'copy_trade';
-export type CopyTradeProvider = 'hyperliquid' | 'okx' | 'asterdex';
+export type CopyTradeProvider = 'hyperliquid' | 'okx';
 
 export interface SystemStatus {
   trader_id: string

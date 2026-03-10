@@ -12,7 +12,6 @@ type ProviderType string
 const (
 	ProviderHyperliquid ProviderType = "hyperliquid"
 	ProviderOKX         ProviderType = "okx"
-	ProviderAsterDex    ProviderType = "asterdex"
 )
 
 // ActionType 交易动作类型
@@ -52,6 +51,7 @@ type SideType string
 const (
 	SideLong  SideType = "long"
 	SideShort SideType = "short"
+	SideNet   SideType = "net" // OKX 单向持仓模式的原始值，需标准化为 long/short
 )
 
 // Fill 成交记录（标准化结构）

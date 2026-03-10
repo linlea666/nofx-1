@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -57,8 +58,6 @@ func NewProvider(providerType ProviderType) (LeaderProvider, error) {
 		return NewHyperliquidProvider(), nil
 	case ProviderOKX:
 		return NewOKXProvider(), nil
-	case ProviderAsterDex:
-		return NewAsterDexProvider(), nil
 	default:
 		return nil, fmt.Errorf("unsupported provider type: %s", providerType)
 	}
@@ -366,22 +365,32 @@ func (p *OKXProvider) GetAccountState(uniqueName string) (*AccountState, error) 
 		for _, pos := range pd.PosData {
 			symbol := normalizeOKXSymbol(pos.InstId)
 			side := SideType(pos.PosSide)
+			size := parseFloat(pos.Pos)
 			mgnMode := pos.MgnMode // "cross" | "isolated"
 			posId := pos.PosId     // 仓位唯一标识
 
-			// 关键改进：使用 posId 作为 key（如果有），否则回退到 mgnMode key
-			// posId 是 OKX 为每个仓位生成的唯一标识，100% 准确
+			// 单向持仓模式标准化：OKX 单向模式 posSide="net"，方向由 size 正负号表示
+			// 标准化为与双向模式一致的 long/short + 正数 size，使下游逻辑无需区分模式
+			if side == SideNet {
+				if size > 0 {
+					side = SideLong
+				} else if size < 0 {
+					side = SideShort
+					size = math.Abs(size)
+				}
+			}
+
 			var key string
 			if posId != "" {
-				key = posId // 使用 posId 作为 key（推荐）
+				key = posId
 			} else {
-				key = PositionKeyWithMode(symbol, side, mgnMode) // 回退兼容
+				key = PositionKeyWithMode(symbol, side, mgnMode)
 			}
 
 			state.Positions[key] = &Position{
 				Symbol:        symbol,
 				Side:          side,
-				Size:          parseFloat(pos.Pos),
+				Size:          size,
 				EntryPrice:    parseFloat(pos.AvgPx),
 				MarkPrice:     parseFloat(pos.MarkPx),
 				Leverage:      parseInt(pos.Lever),

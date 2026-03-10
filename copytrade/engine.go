@@ -363,14 +363,16 @@ func (e *Engine) poll() {
 		e.stats.SignalsReceived++
 		e.stats.LastSignalTime = time.Now()
 
-		// 构造信号
+		// 单向持仓模式标准化：将 net 模式的 fill 转换为与双向模式等价的语义
+		// 必须在 buildSignal/processSignal 之前执行，使后续全链路无需区分模式
+		e.normalizeNetModeFill(fill)
+
 		signal := e.buildSignal(fill)
 
 		logger.Infof("📡 [%s] 收到信号 | %s %s %s | 价格=%.4f 数量=%.4f 价值=%.2f",
 			e.traderID, fill.Symbol, fill.Action, fill.PositionSide,
 			fill.Price, fill.Size, fill.Value)
 
-		// 处理信号（此时 leaderState 是最新的）
 		e.processSignal(signal)
 	}
 }
@@ -527,16 +529,12 @@ func (e *Engine) matchOpenAddSignal(signal *TradeSignal, leaderPosMap map[string
 				continue
 			}
 
-			// Hyperliquid / AsterDex: 需要判断是否是真正的重新开仓
-			// 原因：这些交易所的 posId 是虚拟的（symbol_side），平仓后重开会复用同一个 posId
+			// Hyperliquid: 需要判断是否是真正的重新开仓
+			// 原因：Hyperliquid 的 posId 是虚拟的（symbol_side），平仓后重开会复用同一个 posId
 			// 通过 ActionOpen 判断是否是全新开仓
 			if fill.Action == ActionOpen {
-				providerName := "Hyperliquid"
-				if e.config.ProviderType == ProviderAsterDex {
-					providerName = "AsterDex"
-				}
-				logger.Infof("📊 [%s] 历史仓位重新开仓 | posId=%s (ignored → active) → 跟随新开仓（%s）",
-					e.traderID, posID, providerName)
+				logger.Infof("📊 [%s] 历史仓位重新开仓 | posId=%s (ignored → active) → 跟随新开仓（Hyperliquid）",
+					e.traderID, posID)
 				newPosition = pos
 				break
 			}
@@ -1051,17 +1049,9 @@ func (e *Engine) calculateCopySizeByPositionChange(signal *TradeSignal, match *S
 
 	// 🔑 OKX: 直接使用 fill.Value（API 返回完整订单价值，不存在拆分问题）
 	// 🔑 Hyperliquid: 使用持仓变化量计算（解决大订单拆分导致金额偏小的问题）
-	// 🔑 AsterDex: 使用 price × size 计算（API 返回成交价格和数量）
 	if e.config.ProviderType == ProviderOKX {
-		// OKX: 保持原逻辑，直接使用 fill.Value
 		leaderTradeValue = fill.Value
 		logger.Infof("📊 [%s] OKX计算 | 使用 fill.Value=%.2f", e.traderID, fill.Value)
-	} else if e.config.ProviderType == ProviderAsterDex {
-		// AsterDex: 直接使用 price × size 计算交易价值
-		// API 返回的是成交记录，包含准确的价格和数量
-		leaderTradeValue = fill.Price * fill.Size
-		logger.Infof("📊 [%s] AsterDex计算 | price=%.4f size=%.4f → 交易价值=%.2f",
-			e.traderID, fill.Price, fill.Size, leaderTradeValue)
 	} else if match.Action == ActionOpen {
 		// Hyperliquid 新开仓：用当前持仓的 size × price 作为交易价值
 		if match.LeaderPosition != nil {
@@ -1180,6 +1170,81 @@ func (e *Engine) getLeaderLeverage(signal *TradeSignal) int {
 
 	// 4. 默认值
 	return 10
+}
+
+// ============================================================================
+// 单向持仓模式标准化（Net Mode Normalization）
+// ============================================================================
+// OKX 领航员可能使用单向持仓模式（posSide="net"），此时 fill 的 PositionSide 和 Action
+// 无法从成交记录本身推断。此函数在信号进入匹配引擎前，将 net 模式的 fill 标准化为
+// 与双向持仓模式等价的语义，使后续全链路（匹配/决策/执行/映射）无需区分模式。
+//
+// 标准化规则：
+//   - PositionSide: 从领航员持仓的 Size 符号推断（已在 GetAccountState 中标准化为 long/short）
+//   - Action: 交易方向与持仓方向同向 → Open（引擎进一步区分 Open/Add）
+//     交易方向与持仓方向反向 → Close（引擎进一步区分 Close/Reduce）
+//   - 持仓消失时: 从数据库映射恢复方向，标记为 Close
+
+func (e *Engine) normalizeNetModeFill(fill *Fill) {
+	if fill.PositionSide != SideNet {
+		return
+	}
+
+	// 查找领航员当前持仓（已在 GetAccountState 中标准化：Side=long/short, Size=正数）
+	leaderPos := e.findLeaderNetPosition(fill.Symbol)
+
+	if leaderPos != nil && leaderPos.Size > 0 {
+		// 领航员有持仓：从持仓方向设置 fill 的 PositionSide
+		fill.PositionSide = leaderPos.Side
+
+		// 通过交易方向与持仓方向的关系推断动作类型
+		// 同向（买入+多头 或 卖出+空头）→ 开仓/加仓
+		// 反向（买入+空头 或 卖出+多头）→ 减仓/平仓
+		tradeIsBuy := fill.Side == "buy"
+		posIsLong := leaderPos.Side == SideLong
+		if tradeIsBuy == posIsLong {
+			fill.Action = ActionOpen
+		} else {
+			fill.Action = ActionClose
+		}
+
+		logger.Infof("📊 [%s] 单向持仓标准化 | %s | side=%s → %s %s",
+			e.traderID, fill.Symbol, SideNet, fill.Action, fill.PositionSide)
+		return
+	}
+
+	// 领航员持仓消失：从数据库映射恢复方向，标记为平仓
+	if e.store != nil {
+		mappings, err := e.store.CopyTrade().FindActiveBySymbol(e.traderID, fill.Symbol)
+		if err == nil && len(mappings) > 0 {
+			fill.PositionSide = SideType(mappings[0].Side)
+			fill.Action = ActionClose
+			logger.Infof("📊 [%s] 单向持仓标准化(平仓) | %s | 从映射恢复 side=%s",
+				e.traderID, fill.Symbol, fill.PositionSide)
+			return
+		}
+	}
+
+	logger.Warnf("⚠️ [%s] 单向持仓标准化失败 | %s | 无持仓且无映射，无法确定方向",
+		e.traderID, fill.Symbol)
+}
+
+// findLeaderNetPosition 按 symbol 查找领航员持仓（用于单向持仓模式）
+// 单向模式下同一 symbol 同一 marginMode 只有一个仓位
+func (e *Engine) findLeaderNetPosition(symbol string) *Position {
+	e.leaderStateMu.RLock()
+	defer e.leaderStateMu.RUnlock()
+
+	if e.leaderState == nil {
+		return nil
+	}
+
+	for _, pos := range e.leaderState.Positions {
+		if pos.Symbol == symbol {
+			return pos
+		}
+	}
+	return nil
 }
 
 func (e *Engine) mapAction(action ActionType, side SideType) string {

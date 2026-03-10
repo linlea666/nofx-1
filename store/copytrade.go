@@ -640,6 +640,54 @@ func (s *CopyTradeStore) FindActiveBySymbolSide(traderID, symbol, side string) (
 	return mappings, nil
 }
 
+// FindActiveBySymbol 查找某 symbol 的所有活跃映射（不限方向）
+// 用于单向持仓模式平仓时的反向查找：领航员持仓已消失，无法确定方向
+func (s *CopyTradeStore) FindActiveBySymbol(traderID, symbol string) ([]*CopyTradePositionMapping, error) {
+	query := `
+		SELECT id, trader_id, leader_pos_id, leader_id, symbol, side, margin_mode, status,
+		       opened_at, open_price, open_size_usd, last_known_size, closed_at, close_price,
+		       add_count, reduce_count, updated_at
+		FROM copy_trade_position_mappings
+		WHERE trader_id = ? AND symbol = ? AND status = 'active'
+		ORDER BY opened_at ASC
+	`
+
+	rows, err := s.db.Query(query, traderID, symbol)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var mappings []*CopyTradePositionMapping
+	for rows.Next() {
+		var mapping CopyTradePositionMapping
+		var openedAt, updatedAt string
+		var closedAt sql.NullString
+
+		err := rows.Scan(
+			&mapping.ID, &mapping.TraderID, &mapping.LeaderPosID, &mapping.LeaderID,
+			&mapping.Symbol, &mapping.Side, &mapping.MarginMode, &mapping.Status,
+			&openedAt, &mapping.OpenPrice, &mapping.OpenSizeUSD, &mapping.LastKnownSize,
+			&closedAt, &mapping.ClosePrice,
+			&mapping.AddCount, &mapping.ReduceCount, &updatedAt,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		mapping.OpenedAt, _ = time.Parse("2006-01-02 15:04:05", openedAt)
+		mapping.UpdatedAt, _ = time.Parse("2006-01-02 15:04:05", updatedAt)
+		if closedAt.Valid {
+			t, _ := time.Parse("2006-01-02 15:04:05", closedAt.String)
+			mapping.ClosedAt = &t
+		}
+
+		mappings = append(mappings, &mapping)
+	}
+
+	return mappings, nil
+}
+
 // ListAllMappings 列出某 trader 所有映射（含历史）
 func (s *CopyTradeStore) ListAllMappings(traderID string, limit int) ([]*CopyTradePositionMapping, error) {
 	return s.listMappings(traderID, "", limit)

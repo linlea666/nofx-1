@@ -538,17 +538,6 @@ export function TraderConfigModal({
                       >
                         OKX
                       </button>
-                      <button
-                        type="button"
-                        onClick={() => handleInputChange('copy_provider_type', 'asterdex')}
-                        className={`flex-1 px-3 py-2 rounded text-sm ${
-                          formData.copy_provider_type === 'asterdex'
-                            ? 'bg-[#F0B90B] text-black'
-                            : 'bg-[#0B0E11] text-[#848E9C] border border-[#2B3139]'
-                        }`}
-                      >
-                        AsterDex
-                      </button>
                     </div>
                   </div>
 
@@ -564,15 +553,12 @@ export function TraderConfigModal({
                       className="w-full px-3 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF] focus:border-[#F0B90B] focus:outline-none font-mono text-sm"
                       placeholder={
                         formData.copy_provider_type === 'hyperliquid' ? '0x...' :
-                        formData.copy_provider_type === 'asterdex' ? '0x...' :
                         'UniqueName (如 F2BCA22ABBB69F57)'
                       }
                     />
                     <p className="text-xs text-[#848E9C] mt-1">
                       {formData.copy_provider_type === 'hyperliquid'
                         ? 'Hyperliquid 钱包地址 (0x开头)'
-                        : formData.copy_provider_type === 'asterdex'
-                        ? 'AsterDex 钱包地址 (0x开头)'
                         : 'OKX 交易员 uniqueName (交易员页面 URL 中的参数)'}
                     </p>
                   </div>
