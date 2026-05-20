@@ -7,8 +7,16 @@ package copytrade
 //   - 官方 API（fapi.binance.com）只能查"自己账户"，无法读其他跟单领航员持仓
 //   - 私有 web 接口需要 p20t（登录 cookie）+ csrftoken（CSRF header）双因子认证
 //
+// portfolioId 双 ID 模型（关键）：
+//   - leadPortfolioId：领航员主页 ID（用户配置时填入），可从 binance 领航员主页 URL 复制
+//   - copyPortfolioId：跟单关系 ID，用户跟单领航员后由 binance 自动生成
+//   - lead-portfolio/detail 接口必须用 leadPortfolioId（返回 marginBalance + copyPortfolioId 映射）
+//   - user-position / trade-history 接口必须用 copyPortfolioId
+//   - Provider 内部用 leadPortfolioId 调 detail 自动反查得到 copyPortfolioId 后缓存
+//
 // 关键约束：
-//   - 用户必须先在 binance.com 上跟单了某个领航员，得到 portfolioId 才能用此 provider
+//   - 用户必须先在 binance.com 上实际跟单了该领航员，detail.hasCopy 才会为 true
+//     否则会得到 copyPortfolioId=null，无法调持仓接口
 //   - p20t 会过期（通常 7-30 天），过期时返回错误码 100001005 / 100002002
 //   - 凭证过期由 ErrBinanceCredentialsExpired 通报，engine 端会触发邮件告警
 //
@@ -34,11 +42,22 @@ import (
 
 // Binance Web 跟单专用 API
 const (
-	// BinanceCopyTradePositionAPI 领航员当前持仓
+	// BinanceCopyTradePositionAPI 领航员当前持仓（需鉴权 p20t+csrftoken）
 	BinanceCopyTradePositionAPI = "https://www.binance.com/bapi/futures/v6/private/future/user-data/user-position"
 
-	// BinanceCopyTradeTradeHistoryAPI 领航员成交记录
+	// BinanceCopyTradeTradeHistoryAPI 领航员成交记录（需鉴权 p20t+csrftoken）
 	BinanceCopyTradeTradeHistoryAPI = "https://www.binance.com/bapi/futures/v1/private/future/copy-trade/copy-portfolio/trade-history"
+
+	// BinanceLeadPortfolioDetailAPI 领航员资料详情接口
+	//   - 用 leadPortfolioId 调用，返回 marginBalance + copyPortfolioId 反向映射
+	//   - 不带 p20t 也能拿 marginBalance，但 copyPortfolioId 会是 null
+	//   - 带 p20t 后返回当前账户对该领航员的 copyPortfolioId（仅当用户已跟单）
+	//   - 我们必须带 p20t，因为还要靠这个 copyPortfolioId 调持仓/成交接口
+	BinanceLeadPortfolioDetailAPI = "https://www.binance.com/bapi/futures/v1/friendly/future/copy-trade/lead-portfolio/detail"
+
+	// BinanceErrPortfolioClosed 领航员已关闭带单：detail 接口对 closed portfolio 返回的码
+	// 同时也是用错 ID（如把 copyPortfolioId 当 leadPortfolioId 用）时的报错
+	BinanceErrPortfolioClosed = "11012030"
 
 	// Binance 错误码：未登录/认证失败 → 凭证过期
 	BinanceErrNotLogin   = "100001005"
@@ -49,11 +68,19 @@ const (
 
 	// 成功码
 	BinanceCodeSuccess = "000000"
+
+	// marginBalance 缓存 TTL：60s 足以覆盖 3 次 engine poll 周期（默认 20s），
+	// 同时领航员盈亏波动后 1 分钟内能刷新到，权衡精度与副接口压力
+	binanceMarginBalanceTTL = 60 * time.Second
 )
 
 // ErrBinanceCredentialsExpired Binance Web 凭证过期错误
 // 上层捕获后应触发邮件告警，提示用户重新粘贴 cURL
 var ErrBinanceCredentialsExpired = errors.New("binance web credentials expired or invalid; please update p20t/csrftoken")
+
+// ErrBinanceNotCopying 用户未在 binance 跟单该领航员（leadPortfolioId 配置错误或还没跟单）
+// 与凭证过期区分：这是配置层面的错误，需要用户自己去 binance 完成跟单关系建立
+var ErrBinanceNotCopying = errors.New("binance: current account not copying this leader; please follow the leader on binance first")
 
 // BinanceProvider Binance 跟单数据提供者（轮询模式）
 type BinanceProvider struct {
@@ -66,6 +93,14 @@ type BinanceProvider struct {
 	leaderUserID   string          // 从持仓接口 id 字段（如 "1239518824_ETHUSDT_LONG"）首次解析获得
 	seenFillKeys   map[string]bool // (time|symbol|side|price|qty|posSide) 五元组指纹去重
 	seenKeysExpiry time.Time       // 指纹缓存过期时间（>24h 清理）
+
+	// detail 接口缓存：marginBalance + copyPortfolioId（同一次调用同时拿到，绑定缓存）
+	//   - marginBalance: 60s TTL，作为领航员权益（state.TotalEquity）
+	//   - copyPortfolioID: 长期缓存（直到下次 detail 成功刷新），用于调持仓/成交接口
+	mbValue         float64   // 最近一次成功拉到的 marginBalance
+	mbFetchedAt     time.Time // 拉取时间，距今 < TTL 视为有效
+	mbValid         bool      // 是否曾成功拉到过 marginBalance
+	copyPortfolioID string    // 用户对该领航员的跟单关系 ID（用于 user-position / trade-history）
 }
 
 // NewBinanceProvider 创建 Binance 数据源
@@ -90,11 +125,23 @@ func (p *BinanceProvider) Type() ProviderType {
 // ============================================================================
 
 // GetAccountState 获取领航员账户状态（持仓）
-// portfolioID: Binance 跟单关系的 portfolioId（用户在跟单管理页"项目ID"字段获取）
-func (p *BinanceProvider) GetAccountState(portfolioID string) (*AccountState, error) {
+// leadPortfolioID: 领航员主页 portfolioId（用户在前端配置）
+// Provider 内部会先调 lead-portfolio/detail 反查 copyPortfolioId 再拉持仓
+func (p *BinanceProvider) GetAccountState(leadPortfolioID string) (*AccountState, error) {
+	leadPortfolioID = strings.TrimSpace(leadPortfolioID)
+	if leadPortfolioID == "" {
+		return nil, errors.New("binance: leadPortfolioId is required")
+	}
+
+	// 先确保拿到 copyPortfolioId（首次调用会刷新 detail 同时填充 marginBalance 缓存）
+	copyPID, err := p.resolveCopyPortfolioID(leadPortfolioID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve copyPortfolioId: %w", err)
+	}
+
 	raw, err := p.postCopyTrade(BinanceCopyTradePositionAPI, map[string]interface{}{
 		"copyTradeType": BinanceCopyTradeType,
-		"portfolioId":   portfolioID,
+		"portfolioId":   copyPID,
 	})
 	if err != nil {
 		return nil, err
@@ -106,8 +153,8 @@ func (p *BinanceProvider) GetAccountState(portfolioID string) (*AccountState, er
 	}
 
 	if isBinanceAuthError(resp.Code) {
-		logger.Warnf("⚠️ Binance copy-trade credentials expired | code=%s msg=%s portfolioId=%s",
-			resp.Code, resp.Message, portfolioID)
+		logger.Warnf("⚠️ Binance copy-trade credentials expired | code=%s msg=%s leadPortfolioId=%s",
+			resp.Code, resp.Message, leadPortfolioID)
 		return nil, ErrBinanceCredentialsExpired
 	}
 
@@ -121,7 +168,7 @@ func (p *BinanceProvider) GetAccountState(portfolioID string) (*AccountState, er
 	}
 
 	// 解析所有持仓
-	totalInitialMargin := 0.0
+	totalNotional := 0.0
 	for _, rp := range resp.Data {
 		// 第一次解析时记录 leader userId（用于 Fill 拼装 PosID）
 		p.captureLeaderUserID(rp.ID)
@@ -153,7 +200,7 @@ func (p *BinanceProvider) GetAccountState(portfolioID string) (*AccountState, er
 		if initialMargin > 0 {
 			leverage = int(math.Round(notional / initialMargin))
 		}
-		totalInitialMargin += initialMargin
+		totalNotional += notional
 
 		// 全/逐仓判定：isolatedWallet/isolatedMargin > 0 即逐仓，否则全仓
 		marginMode := "cross"
@@ -182,21 +229,40 @@ func (p *BinanceProvider) GetAccountState(portfolioID string) (*AccountState, er
 		}
 	}
 
-	// Binance 持仓接口不直接返回账户总权益。
-	// 引擎在跟单计算中使用 leader equity 估算比例，对绝对值不敏感，
-	// 这里用 sum(initialMargin) 作为下限估算（领航员至少需要这么多保证金）。
-	// 真实跟单决策主要看持仓变化，所以这个近似值足够工作。
-	state.TotalEquity = totalInitialMargin
-	state.AvailableBalance = totalInitialMargin
+	// ============================================================
+	// TotalEquity 三级降级策略（与 OKX/HL 钱包余额量纲对齐）
+	// ============================================================
+	// 由于 user-position 接口不返回钱包余额，必须通过 lead-portfolio/detail
+	// 接口获取 marginBalance 作为"领航员权益"
+	//   - 错误用 sum(IM)/sum(notional) 会让 engine.go ratio 计算严重失真
+	//   - 优先级 1: detail 本次成功 → 用最新 marginBalance
+	//   - 优先级 2: detail 本次失败但有缓存 → 用旧 marginBalance + warn
+	//   - 优先级 3: 从未成功过 → 用 sum(notional) + warn（仍能跟动作，比例不精确）
+	leaderEquity, source := p.resolveLeaderEquity(leadPortfolioID, totalNotional)
+	state.TotalEquity = leaderEquity
+	state.AvailableBalance = leaderEquity
+	logger.Debugf("📊 Binance leader equity | leadPortfolioId=%s copyPortfolioId=%s equity=%.4f source=%s totalNotional=%.4f positions=%d",
+		leadPortfolioID, copyPID, leaderEquity, source, totalNotional, len(state.Positions))
 
 	return state, nil
 }
 
 // GetFills 获取领航员最近成交记录
-func (p *BinanceProvider) GetFills(portfolioID string, since time.Time) ([]Fill, error) {
+// leadPortfolioID: 领航员主页 portfolioId（前端配置）
+func (p *BinanceProvider) GetFills(leadPortfolioID string, since time.Time) ([]Fill, error) {
+	leadPortfolioID = strings.TrimSpace(leadPortfolioID)
+	if leadPortfolioID == "" {
+		return nil, errors.New("binance: leadPortfolioId is required")
+	}
+
+	copyPID, err := p.resolveCopyPortfolioID(leadPortfolioID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve copyPortfolioId: %w", err)
+	}
+
 	raw, err := p.postCopyTrade(BinanceCopyTradeTradeHistoryAPI, map[string]interface{}{
 		"copyTradeType": BinanceCopyTradeType,
-		"portfolioId":   portfolioID,
+		"portfolioId":   copyPID,
 		"page":          1,
 		"rows":          50,
 	})
@@ -210,8 +276,8 @@ func (p *BinanceProvider) GetFills(portfolioID string, since time.Time) ([]Fill,
 	}
 
 	if isBinanceAuthError(resp.Code) {
-		logger.Warnf("⚠️ Binance copy-trade credentials expired | code=%s msg=%s portfolioId=%s",
-			resp.Code, resp.Message, portfolioID)
+		logger.Warnf("⚠️ Binance copy-trade credentials expired | code=%s msg=%s leadPortfolioId=%s",
+			resp.Code, resp.Message, leadPortfolioID)
 		return nil, ErrBinanceCredentialsExpired
 	}
 
@@ -247,13 +313,11 @@ func (p *BinanceProvider) GetFills(portfolioID string, since time.Time) ([]Fill,
 		symbol := normalizeSymbol(tr.Symbol)
 		side := strings.ToLower(tr.Side) // BUY -> buy, SELL -> sell
 		posSide := mapBinanceSide(tr.PositionSide)
-		// BOTH 模式兜底：根据 side 推断（虽然罕见）
+		// BOTH（单向持仓）模式：positionSide=BOTH 时无法从 fill 自身判断方向，
+		// 设为 SideNet 让 engine.normalizeNetModeFill 用 leaderState/db 反推方向，
+		// 复用 OKX 单向模式已有的标准化逻辑，避免按 buy/sell 瞎猜导致方向反转
 		if posSide == "" {
-			if side == "buy" {
-				posSide = SideLong
-			} else {
-				posSide = SideShort
-			}
+			posSide = SideNet
 		}
 
 		fill := Fill{
@@ -334,6 +398,161 @@ func (p *BinanceProvider) postCopyTrade(url string, body interface{}) ([]byte, e
 	}
 
 	return rawBody, nil
+}
+
+// resolveCopyPortfolioID 解析 leadPortfolioId → copyPortfolioId
+//
+// 流程：
+//   - 优先返回内存缓存（用户跟单关系一般稳定，长期有效）
+//   - 缓存为空时调 detail 刷新（同时填充 marginBalance 缓存，避免后续重复调）
+//   - detail 失败 / hasCopy=false / copyPortfolioId 为空 → 返回错误，调用者无法继续
+//
+// 返回错误时上层不能降级，因为没有 copyPortfolioId 持仓/成交接口根本无法调用
+func (p *BinanceProvider) resolveCopyPortfolioID(leadPortfolioID string) (string, error) {
+	p.mu.Lock()
+	cached := p.copyPortfolioID
+	p.mu.Unlock()
+	if cached != "" {
+		return cached, nil
+	}
+
+	mb, cpid, err := p.fetchLeaderDetail(leadPortfolioID)
+	if err != nil {
+		return "", err
+	}
+	if cpid == "" {
+		return "", fmt.Errorf("%w (leadPortfolioId=%s)", ErrBinanceNotCopying, leadPortfolioID)
+	}
+
+	p.mu.Lock()
+	p.copyPortfolioID = cpid
+	if mb > 0 {
+		p.mbValue = mb
+		p.mbFetchedAt = time.Now()
+		p.mbValid = true
+	}
+	p.mu.Unlock()
+	return cpid, nil
+}
+
+// resolveLeaderEquity 解析"领航员权益"，三级降级：
+//   - L1 detail 本次成功 → 写缓存后返回新值
+//   - L2 detail 失败但有旧缓存 → 用旧值，warn 提示
+//   - L3 完全无缓存 → 用 sum(notional) 兜底，warn 提示
+//   - L4 sum(notional)==0（领航员空仓） → 返回 1 防止 engine 除零
+//
+// totalNotional 由调用者传入（GetAccountState 已遍历持仓时顺手累加）
+// 返回值: (equity, source) source 用于日志便于排查
+func (p *BinanceProvider) resolveLeaderEquity(leadPortfolioID string, totalNotional float64) (float64, string) {
+	p.mu.Lock()
+	cacheValid := p.mbValid && time.Since(p.mbFetchedAt) < binanceMarginBalanceTTL
+	cachedValue := p.mbValue
+	hasCache := p.mbValid
+	p.mu.Unlock()
+
+	if cacheValid && cachedValue > 0 {
+		return cachedValue, "cache"
+	}
+
+	mb, cpid, err := p.fetchLeaderDetail(leadPortfolioID)
+	if err == nil && mb > 0 {
+		p.mu.Lock()
+		p.mbValue = mb
+		p.mbFetchedAt = time.Now()
+		p.mbValid = true
+		if cpid != "" {
+			p.copyPortfolioID = cpid // 顺便刷新 copyPortfolioId（防用户解除/重建跟单关系）
+		}
+		p.mu.Unlock()
+		return mb, "fresh"
+	}
+
+	if hasCache && cachedValue > 0 {
+		logger.Warnf("⚠️ Binance lead-portfolio/detail 拉取失败，沿用过期缓存 | leadPortfolioId=%s err=%v cachedValue=%.4f",
+			leadPortfolioID, err, cachedValue)
+		return cachedValue, "stale_cache"
+	}
+
+	if totalNotional > 0 {
+		logger.Warnf("⚠️ Binance lead-portfolio/detail 拉取失败且无缓存，降级用 sum(notional) | leadPortfolioId=%s err=%v totalNotional=%.4f",
+			leadPortfolioID, err, totalNotional)
+		return totalNotional, "fallback_notional"
+	}
+
+	logger.Warnf("⚠️ Binance lead-portfolio/detail 拉取失败且领航员空仓，equity 兜底为 1 | leadPortfolioId=%s err=%v",
+		leadPortfolioID, err)
+	return 1, "fallback_one"
+}
+
+// fetchLeaderDetail 调用 lead-portfolio/detail 接口
+//
+// 接口特性：
+//   - GET，公开可访问但**必须带 p20t** 才能返回 copyPortfolioId（用户的跟单关系 ID）
+//   - 不带 p20t：仅返回 marginBalance；copyPortfolioId 为 null
+//   - 失败场景：
+//   - portfolio closed (code=11012030) — 用错 ID（把 copyPortfolioId 当 leadPortfolioId）
+//   - 网络超时 / HTTP 非 2xx
+//
+// 返回 (marginBalance, copyPortfolioId, error)
+//   - marginBalance：领航员保证金余额（USDT 钱包余额量纲，与 OKX/HL TotalEquity 等价）
+//   - copyPortfolioId：当前账户对该领航员的跟单关系 ID；hasCopy=false 时为 ""
+//
+// 注意：aumAmount 是"跟单池总规模"（领航员本金 + 所有跟随者本金），不能用作权益
+func (p *BinanceProvider) fetchLeaderDetail(leadPortfolioID string) (float64, string, error) {
+	url := BinanceLeadPortfolioDetailAPI + "?portfolioId=" + leadPortfolioID
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return 0, "", err
+	}
+	req.Header.Set("accept", "*/*")
+	req.Header.Set("clienttype", "web")
+	req.Header.Set("user-agent", "Mozilla/5.0 (compatible; NOFX/1.0)")
+	// p20t 是关键：没有它 copyPortfolioId 会是 null 导致后续无法调用持仓/成交接口
+	if p.p20t != "" {
+		req.AddCookie(&http.Cookie{Name: "p20t", Value: p.p20t})
+	}
+	if p.csrfToken != "" {
+		req.Header.Set("csrftoken", p.csrfToken)
+	}
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return 0, "", fmt.Errorf("lead-portfolio/detail request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, "", fmt.Errorf("lead-portfolio/detail http %d", resp.StatusCode)
+	}
+
+	rawBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, "", fmt.Errorf("lead-portfolio/detail read body failed: %w", err)
+	}
+
+	var dr BinanceLeadPortfolioDetailResp
+	if err := json.Unmarshal(rawBody, &dr); err != nil {
+		return 0, "", fmt.Errorf("decode lead-portfolio/detail: %w; body=%s", err, truncate(string(rawBody), 200))
+	}
+
+	if dr.Code != BinanceCodeSuccess {
+		// portfolio closed 通常意味着用错 ID（把 copyPortfolioId 当 leadPortfolioId）
+		if dr.Code == BinanceErrPortfolioClosed {
+			return 0, "", fmt.Errorf("lead-portfolio/detail: portfolio closed or invalid leadPortfolioId (code=%s, msg=%s)",
+				dr.Code, dr.Message)
+		}
+		return 0, "", fmt.Errorf("lead-portfolio/detail api error: code=%s msg=%s", dr.Code, dr.Message)
+	}
+
+	mb := parseFloat(dr.Data.MarginBalance)
+	if mb <= 0 {
+		return 0, dr.Data.CopyPortfolioID, fmt.Errorf("lead-portfolio/detail marginBalance non-positive: %q", dr.Data.MarginBalance)
+	}
+
+	logger.Debugf("📊 Binance leader detail refreshed | leadPortfolioId=%s copyPortfolioId=%s marginBalance=%.4f aum=%s status=%s isPaused=%v hasCopy=%v",
+		leadPortfolioID, dr.Data.CopyPortfolioID, mb, dr.Data.AumAmount, dr.Data.Status, dr.Data.IsPaused, dr.Data.HasCopy)
+
+	return mb, dr.Data.CopyPortfolioID, nil
 }
 
 // captureLeaderUserID 从持仓 id 字段首次解析 leader userId
@@ -470,6 +689,29 @@ type BinanceTradeHistoryData struct {
 	IndexValue string               `json:"indexValue"`
 	Total      int                  `json:"total"`
 	List       []BinanceTradeRecord `json:"list"`
+}
+
+// BinanceLeadPortfolioDetailResp /bapi/futures/v1/friendly/future/copy-trade/lead-portfolio/detail 响应
+// 公开接口（免鉴权 GET），用于获取领航员资料含 marginBalance
+type BinanceLeadPortfolioDetailResp struct {
+	Code    string                         `json:"code"`
+	Message string                         `json:"message"`
+	Success bool                           `json:"success"`
+	Data    BinanceLeadPortfolioDetailData `json:"data"`
+}
+
+// BinanceLeadPortfolioDetailData 仅保留我们需要的字段（接口返回字段非常多，按需声明）
+type BinanceLeadPortfolioDetailData struct {
+	LeadPortfolioID string `json:"leadPortfolioId"` // 领航员主页 portfolioId
+	CopyPortfolioID string `json:"copyPortfolioId"` // 🔑 当前账户对该领航员的跟单关系 ID（带 p20t 时才有）
+	HasCopy         bool   `json:"hasCopy"`         // 当前账户是否在跟单（false 时 copyPortfolioId 为 null）
+	Nickname        string `json:"nickname"`        // 昵称
+	Status          string `json:"status"`          // "ACTIVE" / "CLOSED" / "PAUSED"
+	IsPaused        bool   `json:"isPaused"`        // 是否暂停带单
+	MarginBalance   string `json:"marginBalance"`   // 🔑 领航员保证金余额 (USDT) — 用作 leader equity
+	AumAmount       string `json:"aumAmount"`       // 跟单池总规模（含跟随者）— 不用作 equity，仅日志
+	InitInvestAsset string `json:"initInvestAsset"` // "USDT"
+	FuturesType     string `json:"futuresType"`     // "UM"
 }
 
 // BinanceTradeRecord 单条成交记录

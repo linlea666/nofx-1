@@ -1081,11 +1081,11 @@ func (e *Engine) calculateCopySizeByPositionChange(signal *TradeSignal, match *S
 	// ========================================
 	var leaderTradeValue float64
 
-	// 🔑 OKX: 直接使用 fill.Value（API 返回完整订单价值，不存在拆分问题）
+	// 🔑 OKX/Binance: 直接使用 fill.Value（API 返回完整订单价值，不存在拆分问题）
 	// 🔑 Hyperliquid: 使用持仓变化量计算（解决大订单拆分导致金额偏小的问题）
-	if e.config.ProviderType == ProviderOKX {
+	if e.config.ProviderType == ProviderOKX || e.config.ProviderType == ProviderBinance {
 		leaderTradeValue = fill.Value
-		logger.Infof("📊 [%s] OKX计算 | 使用 fill.Value=%.2f", e.traderID, fill.Value)
+		logger.Infof("📊 [%s] %s计算 | 使用 fill.Value=%.2f", e.traderID, e.config.ProviderType, fill.Value)
 	} else if match.Action == ActionOpen {
 		// Hyperliquid 新开仓：用当前持仓的 size × price 作为交易价值
 		if match.LeaderPosition != nil {

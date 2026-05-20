@@ -570,7 +570,7 @@ export function TraderConfigModal({
                   {/* Leader ID */}
                   <div>
                     <label className="text-sm text-[#EAECEF] block mb-2">
-                      {formData.copy_provider_type === 'binance' ? 'PortfolioId（项目ID）' : '领航员地址'}
+                      {formData.copy_provider_type === 'binance' ? '领航员 PortfolioId' : '领航员地址'}
                       <span className="text-red-500"> *</span>
                     </label>
                     <input
@@ -580,7 +580,7 @@ export function TraderConfigModal({
                       className="w-full px-3 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF] focus:border-[#F0B90B] focus:outline-none font-mono text-sm"
                       placeholder={
                         formData.copy_provider_type === 'hyperliquid' ? '0x...' :
-                        formData.copy_provider_type === 'binance' ? 'portfolioId (如 5036434736497137665)' :
+                        formData.copy_provider_type === 'binance' ? '领航员主页 portfolioId (如 5008318166959365632)' :
                         'UniqueName (如 F2BCA22ABBB69F57)'
                       }
                     />
@@ -588,7 +588,7 @@ export function TraderConfigModal({
                       {formData.copy_provider_type === 'hyperliquid'
                         ? 'Hyperliquid 钱包地址 (0x开头)'
                         : formData.copy_provider_type === 'binance'
-                        ? 'Binance 跟单关系的 portfolioId（在浏览器 user-position 请求体里能看到，长数字）'
+                        ? '填领航员主页 URL 末尾的 portfolioId（不是跟单订单里的关系 ID）。前提：你的账户已经在 Binance 上跟单了该领航员'
                         : 'OKX 交易员 uniqueName (交易员页面 URL 中的参数)'}
                     </p>
                   </div>
