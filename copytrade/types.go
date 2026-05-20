@@ -12,6 +12,7 @@ type ProviderType string
 const (
 	ProviderHyperliquid ProviderType = "hyperliquid"
 	ProviderOKX         ProviderType = "okx"
+	ProviderBinance     ProviderType = "binance"
 )
 
 // ActionType 交易动作类型
@@ -107,8 +108,8 @@ type TradeSignal struct {
 
 // CopyConfig 跟单配置
 type CopyConfig struct {
-	ProviderType   ProviderType `json:"provider_type"`    // "hyperliquid" | "okx"
-	LeaderID       string       `json:"leader_id"`        // 领航员地址/uniqueName
+	ProviderType   ProviderType `json:"provider_type"`    // "hyperliquid" | "okx" | "binance"
+	LeaderID       string       `json:"leader_id"`        // 领航员地址/uniqueName，Binance 模式下复用为 portfolioId
 	CopyRatio      float64      `json:"copy_ratio"`       // 跟单系数 (1.0 = 100%)
 	SyncLeverage   bool         `json:"sync_leverage"`    // 同步杠杆
 	SyncMarginMode bool         `json:"sync_margin_mode"` // 同步保证金模式
@@ -116,6 +117,11 @@ type CopyConfig struct {
 	// 预警阈值（不限制，只记录预警）
 	MinTradeWarn float64 `json:"min_trade_warn"` // 低于此金额记录预警
 	MaxTradeWarn float64 `json:"max_trade_warn"` // 高于此金额记录预警 (0=不预警)
+
+	// Binance Web 私有接口凭证（仅 ProviderType=binance 时使用）
+	// 由用户从浏览器开发者工具中抓取，会过期，过期时通过邮件告警
+	BinanceP20T      string `json:"binance_p20t,omitempty"`       // 登录 cookie p20t
+	BinanceCSRFToken string `json:"binance_csrf_token,omitempty"` // CSRF header csrftoken
 }
 
 // Warning 预警记录

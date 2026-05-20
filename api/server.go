@@ -446,11 +446,15 @@ type CreateTraderRequest struct {
 
 // CopyConfigReq Copy trading configuration request
 type CopyConfigReq struct {
-	ProviderType   string  `json:"provider_type"`    // "hyperliquid" or "okx"
-	LeaderID       string  `json:"leader_id"`        // Leader wallet address or uniqueName
+	ProviderType   string  `json:"provider_type"`    // "hyperliquid" | "okx" | "binance"
+	LeaderID       string  `json:"leader_id"`        // Leader wallet address or uniqueName / portfolioId (Binance)
 	CopyRatio      float64 `json:"copy_ratio"`       // Copy ratio (1.0 = 100%)
 	SyncLeverage   bool    `json:"sync_leverage"`    // Whether to sync leverage
 	SyncMarginMode *bool   `json:"sync_margin_mode"` // Whether to sync margin mode (OKX: cross/isolated)
+
+	// Binance Web 凭证（仅 ProviderType=binance 时使用，明文存储）
+	BinanceP20T      string `json:"binance_p20t,omitempty"`       // 登录 cookie p20t
+	BinanceCSRFToken string `json:"binance_csrf_token,omitempty"` // CSRF header csrftoken
 }
 
 type ModelConfig struct {
@@ -749,13 +753,15 @@ func (s *Server) handleCreateTrader(c *gin.Context) {
 		}
 
 		copyConfig := &store.CopyTradeConfig{
-			TraderID:       traderID,
-			ProviderType:   req.CopyConfig.ProviderType,
-			LeaderID:       req.CopyConfig.LeaderID,
-			CopyRatio:      req.CopyConfig.CopyRatio,
-			SyncLeverage:   req.CopyConfig.SyncLeverage,
-			SyncMarginMode: syncMarginMode,
-			Enabled:        false, // Not enabled until explicitly started
+			TraderID:         traderID,
+			ProviderType:     req.CopyConfig.ProviderType,
+			LeaderID:         req.CopyConfig.LeaderID,
+			CopyRatio:        req.CopyConfig.CopyRatio,
+			SyncLeverage:     req.CopyConfig.SyncLeverage,
+			SyncMarginMode:   syncMarginMode,
+			Enabled:          false, // Not enabled until explicitly started
+			BinanceP20T:      req.CopyConfig.BinanceP20T,
+			BinanceCSRFToken: req.CopyConfig.BinanceCSRFToken,
 		}
 
 		// Validate required fields
@@ -938,12 +944,14 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 			}
 
 			copyConfig := &store.CopyTradeConfig{
-				TraderID:       traderID,
-				ProviderType:   req.CopyConfig.ProviderType,
-				LeaderID:       req.CopyConfig.LeaderID,
-				CopyRatio:      req.CopyConfig.CopyRatio,
-				SyncLeverage:   req.CopyConfig.SyncLeverage,
-				SyncMarginMode: syncMarginMode,
+				TraderID:         traderID,
+				ProviderType:     req.CopyConfig.ProviderType,
+				LeaderID:         req.CopyConfig.LeaderID,
+				CopyRatio:        req.CopyConfig.CopyRatio,
+				SyncLeverage:     req.CopyConfig.SyncLeverage,
+				SyncMarginMode:   syncMarginMode,
+				BinanceP20T:      req.CopyConfig.BinanceP20T,
+				BinanceCSRFToken: req.CopyConfig.BinanceCSRFToken,
 			}
 
 			// Default copy ratio to 1.0 (100%)
@@ -1968,14 +1976,16 @@ func (s *Server) handleGetTraderConfig(c *gin.Context) {
 	if decisionMode == "copy_trade" {
 		if cfg, err := s.store.CopyTrade().GetByTraderID(traderID); err == nil && cfg != nil {
 			copyConfig = map[string]interface{}{
-				"enabled":          cfg.Enabled,
-				"provider_type":    cfg.ProviderType,
-				"leader_id":        cfg.LeaderID,
-				"copy_ratio":       cfg.CopyRatio,
-				"sync_leverage":    cfg.SyncLeverage,
-				"sync_margin_mode": cfg.SyncMarginMode,
-				"min_trade_warn":   cfg.MinTradeWarn,
-				"max_trade_warn":   cfg.MaxTradeWarn,
+				"enabled":            cfg.Enabled,
+				"provider_type":      cfg.ProviderType,
+				"leader_id":          cfg.LeaderID,
+				"copy_ratio":         cfg.CopyRatio,
+				"sync_leverage":      cfg.SyncLeverage,
+				"sync_margin_mode":   cfg.SyncMarginMode,
+				"min_trade_warn":     cfg.MinTradeWarn,
+				"max_trade_warn":     cfg.MaxTradeWarn,
+				"binance_p20t":       cfg.BinanceP20T,
+				"binance_csrf_token": cfg.BinanceCSRFToken,
 			}
 		}
 	}

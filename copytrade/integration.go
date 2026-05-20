@@ -65,13 +65,15 @@ func (ti *TraderIntegration) StartCopyTrading() error {
 
 	// 转换为引擎配置
 	engineConfig := &CopyConfig{
-		ProviderType:   ProviderType(copyConfig.ProviderType),
-		LeaderID:       copyConfig.LeaderID,
-		CopyRatio:      copyConfig.CopyRatio,
-		SyncLeverage:   copyConfig.SyncLeverage,
-		SyncMarginMode: copyConfig.SyncMarginMode,
-		MinTradeWarn:   copyConfig.MinTradeWarn,
-		MaxTradeWarn:   copyConfig.MaxTradeWarn,
+		ProviderType:     ProviderType(copyConfig.ProviderType),
+		LeaderID:         copyConfig.LeaderID,
+		CopyRatio:        copyConfig.CopyRatio,
+		SyncLeverage:     copyConfig.SyncLeverage,
+		SyncMarginMode:   copyConfig.SyncMarginMode,
+		MinTradeWarn:     copyConfig.MinTradeWarn,
+		MaxTradeWarn:     copyConfig.MaxTradeWarn,
+		BinanceP20T:      copyConfig.BinanceP20T,
+		BinanceCSRFToken: copyConfig.BinanceCSRFToken,
 	}
 
 	// 创建引擎（Hyperliquid 使用流式模式，OKX 使用轮询模式）

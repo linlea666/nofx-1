@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import { BinanceCredentialsPanel } from './BinanceCredentialsPanel'
 import type { AIModel, Exchange, CreateTraderRequest, Strategy, DecisionMode, CopyTradeProvider, CopyTradeConfig } from '../types'
 import { useLanguage } from '../contexts/LanguageContext'
 import { t } from '../i18n/translations'
@@ -42,6 +43,9 @@ interface FormState {
   copy_ratio: number
   copy_sync_leverage: boolean
   copy_sync_margin_mode: boolean  // 同步保证金模式（OKX 区分全仓/逐仓）
+  // Binance Web 私有接口凭证（仅 copy_provider_type=binance 时使用）
+  copy_binance_p20t: string
+  copy_binance_csrf_token: string
 }
 
 interface TraderConfigModalProps {
@@ -78,6 +82,8 @@ export function TraderConfigModal({
     copy_ratio: 1.0,
     copy_sync_leverage: true,
     copy_sync_margin_mode: true,  // 默认同步保证金模式
+    copy_binance_p20t: '',
+    copy_binance_csrf_token: '',
   })
   const [, setCopyTradeConfig] = useState<CopyTradeConfig | null>(null)
   const [isSaving, setIsSaving] = useState(false)
@@ -129,6 +135,8 @@ export function TraderConfigModal({
             copy_ratio: cfg.copy_ratio,
             copy_sync_leverage: cfg.sync_leverage,
             copy_sync_margin_mode: cfg.sync_margin_mode ?? true,  // 默认 true
+            copy_binance_p20t: cfg.binance_p20t ?? '',
+            copy_binance_csrf_token: cfg.binance_csrf_token ?? '',
           }))
         }
       } catch (error) {
@@ -165,6 +173,8 @@ export function TraderConfigModal({
         copy_ratio: 1.0,
         copy_sync_leverage: true,
         copy_sync_margin_mode: true,  // 默认同步保证金模式
+        copy_binance_p20t: '',
+        copy_binance_csrf_token: '',
       })
     }
   }, [traderData, isEditMode, availableModels, availableExchanges])
@@ -238,6 +248,11 @@ export function TraderConfigModal({
           copy_ratio: formData.copy_ratio,
           sync_leverage: formData.copy_sync_leverage,
           sync_margin_mode: formData.copy_sync_margin_mode,  // 同步保证金模式
+        }
+        // Binance 数据源额外携带 Web 私有接口凭证
+        if (formData.copy_provider_type === 'binance') {
+          saveData.copy_config.binance_p20t = formData.copy_binance_p20t.trim()
+          saveData.copy_config.binance_csrf_token = formData.copy_binance_csrf_token.trim()
         }
       }
 
@@ -538,13 +553,25 @@ export function TraderConfigModal({
                       >
                         OKX
                       </button>
+                      <button
+                        type="button"
+                        onClick={() => handleInputChange('copy_provider_type', 'binance')}
+                        className={`flex-1 px-3 py-2 rounded text-sm ${
+                          formData.copy_provider_type === 'binance'
+                            ? 'bg-[#F0B90B] text-black'
+                            : 'bg-[#0B0E11] text-[#848E9C] border border-[#2B3139]'
+                        }`}
+                      >
+                        Binance
+                      </button>
                     </div>
                   </div>
 
                   {/* Leader ID */}
                   <div>
                     <label className="text-sm text-[#EAECEF] block mb-2">
-                      领航员地址 <span className="text-red-500">*</span>
+                      {formData.copy_provider_type === 'binance' ? 'PortfolioId（项目ID）' : '领航员地址'}
+                      <span className="text-red-500"> *</span>
                     </label>
                     <input
                       type="text"
@@ -553,15 +580,33 @@ export function TraderConfigModal({
                       className="w-full px-3 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF] focus:border-[#F0B90B] focus:outline-none font-mono text-sm"
                       placeholder={
                         formData.copy_provider_type === 'hyperliquid' ? '0x...' :
+                        formData.copy_provider_type === 'binance' ? 'portfolioId (如 5036434736497137665)' :
                         'UniqueName (如 F2BCA22ABBB69F57)'
                       }
                     />
                     <p className="text-xs text-[#848E9C] mt-1">
                       {formData.copy_provider_type === 'hyperliquid'
                         ? 'Hyperliquid 钱包地址 (0x开头)'
+                        : formData.copy_provider_type === 'binance'
+                        ? 'Binance 跟单关系的 portfolioId（在浏览器 user-position 请求体里能看到，长数字）'
                         : 'OKX 交易员 uniqueName (交易员页面 URL 中的参数)'}
                     </p>
                   </div>
+
+                  {/* Binance 凭证面板（仅 binance 数据源显示） */}
+                  {formData.copy_provider_type === 'binance' && (
+                    <BinanceCredentialsPanel
+                      p20t={formData.copy_binance_p20t}
+                      csrfToken={formData.copy_binance_csrf_token}
+                      onChange={(p20t, csrf) => {
+                        setFormData(prev => ({
+                          ...prev,
+                          copy_binance_p20t: p20t,
+                          copy_binance_csrf_token: csrf,
+                        }))
+                      }}
+                    />
+                  )}
 
                   {/* Copy Ratio */}
                   <div>

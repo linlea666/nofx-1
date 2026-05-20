@@ -40,7 +40,7 @@ func (h *CopyTradeHandler) RegisterRoutes(group *gin.RouterGroup) {
 
 // CopyTradeConfigRequest 跟单配置请求
 type CopyTradeConfigRequest struct {
-	ProviderType   string  `json:"provider_type" binding:"required,oneof=hyperliquid okx"`
+	ProviderType   string  `json:"provider_type" binding:"required,oneof=hyperliquid okx binance"`
 	LeaderID       string  `json:"leader_id" binding:"required"`
 	CopyRatio      float64 `json:"copy_ratio" binding:"required,gt=0"`
 	SyncLeverage   bool    `json:"sync_leverage"`
@@ -48,6 +48,10 @@ type CopyTradeConfigRequest struct {
 	MinTradeWarn   float64 `json:"min_trade_warn"`
 	MaxTradeWarn   float64 `json:"max_trade_warn"`
 	Enabled        bool    `json:"enabled"`
+
+	// Binance Web 凭证（仅 ProviderType=binance 时使用）
+	BinanceP20T      string `json:"binance_p20t"`
+	BinanceCSRFToken string `json:"binance_csrf_token"`
 }
 
 // GetConfig 获取跟单配置
@@ -91,15 +95,17 @@ func (h *CopyTradeHandler) SaveConfig(c *gin.Context) {
 
 	// 构造配置
 	config := &store.CopyTradeConfig{
-		TraderID:       traderID,
-		ProviderType:   req.ProviderType,
-		LeaderID:       req.LeaderID,
-		CopyRatio:      req.CopyRatio,
-		SyncLeverage:   req.SyncLeverage,
-		SyncMarginMode: req.SyncMarginMode,
-		MinTradeWarn:   req.MinTradeWarn,
-		MaxTradeWarn:   req.MaxTradeWarn,
-		Enabled:        req.Enabled,
+		TraderID:         traderID,
+		ProviderType:     req.ProviderType,
+		LeaderID:         req.LeaderID,
+		CopyRatio:        req.CopyRatio,
+		SyncLeverage:     req.SyncLeverage,
+		SyncMarginMode:   req.SyncMarginMode,
+		MinTradeWarn:     req.MinTradeWarn,
+		MaxTradeWarn:     req.MaxTradeWarn,
+		Enabled:          req.Enabled,
+		BinanceP20T:      req.BinanceP20T,
+		BinanceCSRFToken: req.BinanceCSRFToken,
 	}
 
 	// 保存配置

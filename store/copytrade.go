@@ -14,14 +14,18 @@ type CopyTradeStore struct {
 // CopyTradeConfig 跟单配置（存储在数据库中）
 type CopyTradeConfig struct {
 	TraderID       string  `json:"trader_id"`
-	ProviderType   string  `json:"provider_type"`    // "hyperliquid" | "okx"
-	LeaderID       string  `json:"leader_id"`        // 领航员地址/uniqueName
+	ProviderType   string  `json:"provider_type"`    // "hyperliquid" | "okx" | "binance"
+	LeaderID       string  `json:"leader_id"`        // 领航员地址/uniqueName，Binance 模式下复用为 portfolioId
 	CopyRatio      float64 `json:"copy_ratio"`       // 跟单系数 (1.0 = 100%)
 	SyncLeverage   bool    `json:"sync_leverage"`    // 同步杠杆
 	SyncMarginMode bool    `json:"sync_margin_mode"` // 同步保证金模式
 	MinTradeWarn   float64 `json:"min_trade_warn"`   // 小额预警阈值
 	MaxTradeWarn   float64 `json:"max_trade_warn"`   // 大额预警阈值 (0=不预警)
 	Enabled        bool    `json:"enabled"`          // 是否启用
+
+	// Binance Web 私有接口凭证（仅 ProviderType=binance 时使用，明文存储）
+	BinanceP20T      string `json:"binance_p20t,omitempty"`       // 登录 cookie p20t
+	BinanceCSRFToken string `json:"binance_csrf_token,omitempty"` // CSRF header csrftoken
 
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
@@ -64,6 +68,10 @@ func (s *CopyTradeStore) initTables() error {
 	// 给 traders 表添加 decision_mode 字段
 	s.db.Exec(`ALTER TABLE traders ADD COLUMN decision_mode TEXT DEFAULT 'ai'`)
 
+	// 给 copy_trade_configs 表添加 Binance 凭证字段（兼容旧库）
+	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN binance_p20t TEXT DEFAULT ''`)
+	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN binance_csrf_token TEXT DEFAULT ''`)
+
 	return nil
 }
 
@@ -72,10 +80,11 @@ func (s *CopyTradeStore) Create(config *CopyTradeConfig) error {
 	_, err := s.db.Exec(`
 		INSERT INTO copy_trade_configs 
 			(trader_id, provider_type, leader_id, copy_ratio, sync_leverage, sync_margin_mode, 
-			 min_trade_warn, max_trade_warn, enabled)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			 min_trade_warn, max_trade_warn, enabled, binance_p20t, binance_csrf_token)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, config.TraderID, config.ProviderType, config.LeaderID, config.CopyRatio,
-		config.SyncLeverage, config.SyncMarginMode, config.MinTradeWarn, config.MaxTradeWarn, config.Enabled)
+		config.SyncLeverage, config.SyncMarginMode, config.MinTradeWarn, config.MaxTradeWarn, config.Enabled,
+		config.BinanceP20T, config.BinanceCSRFToken)
 	return err
 }
 
@@ -90,11 +99,13 @@ func (s *CopyTradeStore) Update(config *CopyTradeConfig) error {
 			sync_margin_mode = ?,
 			min_trade_warn = ?,
 			max_trade_warn = ?,
-			enabled = ?
+			enabled = ?,
+			binance_p20t = ?,
+			binance_csrf_token = ?
 		WHERE trader_id = ?
 	`, config.ProviderType, config.LeaderID, config.CopyRatio,
 		config.SyncLeverage, config.SyncMarginMode, config.MinTradeWarn, config.MaxTradeWarn,
-		config.Enabled, config.TraderID)
+		config.Enabled, config.BinanceP20T, config.BinanceCSRFToken, config.TraderID)
 	return err
 }
 
@@ -103,8 +114,8 @@ func (s *CopyTradeStore) Upsert(config *CopyTradeConfig) error {
 	_, err := s.db.Exec(`
 		INSERT INTO copy_trade_configs 
 			(trader_id, provider_type, leader_id, copy_ratio, sync_leverage, sync_margin_mode, 
-			 min_trade_warn, max_trade_warn, enabled)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			 min_trade_warn, max_trade_warn, enabled, binance_p20t, binance_csrf_token)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(trader_id) DO UPDATE SET
 			provider_type = excluded.provider_type,
 			leader_id = excluded.leader_id,
@@ -113,9 +124,12 @@ func (s *CopyTradeStore) Upsert(config *CopyTradeConfig) error {
 			sync_margin_mode = excluded.sync_margin_mode,
 			min_trade_warn = excluded.min_trade_warn,
 			max_trade_warn = excluded.max_trade_warn,
-			enabled = excluded.enabled
+			enabled = excluded.enabled,
+			binance_p20t = excluded.binance_p20t,
+			binance_csrf_token = excluded.binance_csrf_token
 	`, config.TraderID, config.ProviderType, config.LeaderID, config.CopyRatio,
-		config.SyncLeverage, config.SyncMarginMode, config.MinTradeWarn, config.MaxTradeWarn, config.Enabled)
+		config.SyncLeverage, config.SyncMarginMode, config.MinTradeWarn, config.MaxTradeWarn, config.Enabled,
+		config.BinanceP20T, config.BinanceCSRFToken)
 	return err
 }
 
@@ -129,20 +143,30 @@ func (s *CopyTradeStore) Delete(traderID string) error {
 func (s *CopyTradeStore) GetByTraderID(traderID string) (*CopyTradeConfig, error) {
 	var config CopyTradeConfig
 	var createdAt, updatedAt string
+	var p20t, csrf sql.NullString
 
 	err := s.db.QueryRow(`
 		SELECT trader_id, provider_type, leader_id, copy_ratio, sync_leverage, sync_margin_mode,
-		       min_trade_warn, max_trade_warn, enabled, created_at, updated_at
+		       min_trade_warn, max_trade_warn, enabled,
+		       COALESCE(binance_p20t, '') AS binance_p20t,
+		       COALESCE(binance_csrf_token, '') AS binance_csrf_token,
+		       created_at, updated_at
 		FROM copy_trade_configs WHERE trader_id = ?
 	`, traderID).Scan(
 		&config.TraderID, &config.ProviderType, &config.LeaderID, &config.CopyRatio,
 		&config.SyncLeverage, &config.SyncMarginMode, &config.MinTradeWarn, &config.MaxTradeWarn,
-		&config.Enabled, &createdAt, &updatedAt,
+		&config.Enabled, &p20t, &csrf, &createdAt, &updatedAt,
 	)
 	if err != nil {
 		return nil, err
 	}
 
+	if p20t.Valid {
+		config.BinanceP20T = p20t.String
+	}
+	if csrf.Valid {
+		config.BinanceCSRFToken = csrf.String
+	}
 	config.CreatedAt, _ = time.Parse("2006-01-02 15:04:05", createdAt)
 	config.UpdatedAt, _ = time.Parse("2006-01-02 15:04:05", updatedAt)
 
@@ -153,7 +177,10 @@ func (s *CopyTradeStore) GetByTraderID(traderID string) (*CopyTradeConfig, error
 func (s *CopyTradeStore) ListEnabled() ([]*CopyTradeConfig, error) {
 	rows, err := s.db.Query(`
 		SELECT trader_id, provider_type, leader_id, copy_ratio, sync_leverage, sync_margin_mode,
-		       min_trade_warn, max_trade_warn, enabled, created_at, updated_at
+		       min_trade_warn, max_trade_warn, enabled,
+		       COALESCE(binance_p20t, '') AS binance_p20t,
+		       COALESCE(binance_csrf_token, '') AS binance_csrf_token,
+		       created_at, updated_at
 		FROM copy_trade_configs WHERE enabled = 1
 	`)
 	if err != nil {
@@ -165,16 +192,23 @@ func (s *CopyTradeStore) ListEnabled() ([]*CopyTradeConfig, error) {
 	for rows.Next() {
 		var config CopyTradeConfig
 		var createdAt, updatedAt string
+		var p20t, csrf sql.NullString
 
 		err := rows.Scan(
 			&config.TraderID, &config.ProviderType, &config.LeaderID, &config.CopyRatio,
 			&config.SyncLeverage, &config.SyncMarginMode, &config.MinTradeWarn, &config.MaxTradeWarn,
-			&config.Enabled, &createdAt, &updatedAt,
+			&config.Enabled, &p20t, &csrf, &createdAt, &updatedAt,
 		)
 		if err != nil {
 			return nil, err
 		}
 
+		if p20t.Valid {
+			config.BinanceP20T = p20t.String
+		}
+		if csrf.Valid {
+			config.BinanceCSRFToken = csrf.String
+		}
 		config.CreatedAt, _ = time.Parse("2006-01-02 15:04:05", createdAt)
 		config.UpdatedAt, _ = time.Parse("2006-01-02 15:04:05", updatedAt)
 

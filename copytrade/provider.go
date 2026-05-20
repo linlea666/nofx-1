@@ -52,25 +52,35 @@ type StreamingProvider interface {
 }
 
 // NewProvider 创建 Provider（REST 轮询模式）
-func NewProvider(providerType ProviderType) (LeaderProvider, error) {
-	switch providerType {
+// config 用于向需要凭证的 provider（如 Binance）传入额外参数；
+// HL/OKX provider 不读取 config 任何字段，零影响。
+func NewProvider(config *CopyConfig) (LeaderProvider, error) {
+	if config == nil {
+		return nil, fmt.Errorf("provider config is nil")
+	}
+	switch config.ProviderType {
 	case ProviderHyperliquid:
 		return NewHyperliquidProvider(), nil
 	case ProviderOKX:
 		return NewOKXProvider(), nil
+	case ProviderBinance:
+		return NewBinanceProvider(config.BinanceP20T, config.BinanceCSRFToken), nil
 	default:
-		return nil, fmt.Errorf("unsupported provider type: %s", providerType)
+		return nil, fmt.Errorf("unsupported provider type: %s", config.ProviderType)
 	}
 }
 
 // NewStreamingProvider 创建流式 Provider（WebSocket 事件驱动模式）
 // 目前只有 Hyperliquid 支持
-func NewStreamingProvider(providerType ProviderType) (StreamingProvider, error) {
-	switch providerType {
+func NewStreamingProvider(config *CopyConfig) (StreamingProvider, error) {
+	if config == nil {
+		return nil, fmt.Errorf("provider config is nil")
+	}
+	switch config.ProviderType {
 	case ProviderHyperliquid:
 		return NewHLWebSocketProvider(), nil
 	default:
-		return nil, fmt.Errorf("provider %s does not support streaming mode", providerType)
+		return nil, fmt.Errorf("provider %s does not support streaming mode", config.ProviderType)
 	}
 }
 

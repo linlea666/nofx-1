@@ -2,6 +2,7 @@ package copytrade
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -9,6 +10,7 @@ import (
 
 	"nofx/decision"
 	"nofx/logger"
+	"nofx/notifier"
 	"nofx/store"
 )
 
@@ -95,7 +97,7 @@ func NewEngine(
 	// 根据配置选择 Provider 类型
 	if e.isStreamingMode {
 		// 尝试创建流式 Provider（目前只有 Hyperliquid 支持）
-		streamingProvider, err := NewStreamingProvider(config.ProviderType)
+		streamingProvider, err := NewStreamingProvider(config)
 		if err != nil {
 			// 不支持流式模式，回退到轮询模式
 			logger.Warnf("⚠️ [%s] %s 不支持流式模式，回退到轮询模式", traderID, config.ProviderType)
@@ -109,7 +111,7 @@ func NewEngine(
 	}
 
 	// 轮询模式（默认，或流式模式不可用时回退）
-	provider, err := NewProvider(config.ProviderType)
+	provider, err := NewProvider(config)
 	if err != nil {
 		return nil, err
 	}
@@ -117,6 +119,36 @@ func NewEngine(
 	logger.Infof("✅ [%s] 使用轮询模式 (REST)", traderID)
 
 	return e, nil
+}
+
+// reportBinanceCredentialsExpired 检测错误是否为 Binance 凭证过期
+// 若是则发送邮件告警（限流键按 trader 维度，60s 节流由 notifier 全局控制），返回 true
+// 仅 ProviderType=binance 时生效；其他 provider 永远返回 false
+func (e *Engine) reportBinanceCredentialsExpired(err error, where string) bool {
+	if err == nil || e.config == nil || e.config.ProviderType != ProviderBinance {
+		return false
+	}
+	if !errors.Is(err, ErrBinanceCredentialsExpired) {
+		return false
+	}
+	logger.Warnf("🔐 [%s] Binance 跟单凭证已过期 | portfolioId=%s where=%s",
+		e.traderID, e.config.LeaderID, where)
+	notifier.Notify(notifier.Alert{
+		Time:     time.Now(),
+		Category: "copy_trade",
+		TraderID: e.traderID,
+		Title:    "Binance 跟单凭证已过期，请重新粘贴 cURL",
+		Body: fmt.Sprintf(
+			"Binance Web 跟单凭证 (p20t / csrftoken) 已过期或失效。\n\n"+
+				"影响范围: traderID=%s, portfolioId=%s\n"+
+				"检测位置: %s\n\n"+
+				"请登录 https://www.binance.com 跟单页面后，\n"+
+				"在 NOFX 前端 → 交易员配置 → 重新粘贴 cURL 更新凭证。\n\n"+
+				"在此期间该 trader 的 Binance 数据源将持续失败，但不会影响其他 trader 与其他数据源。",
+			e.traderID, e.config.LeaderID, where),
+		RateKey: "binance_creds_expired|" + e.traderID,
+	})
+	return true
 }
 
 // GetDecisionChannel 获取决策输出通道
@@ -145,6 +177,7 @@ func (e *Engine) InitIgnoredPositions() error {
 	// 获取领航员当前所有持仓
 	state, err := e.provider.GetAccountState(e.config.LeaderID)
 	if err != nil {
+		e.reportBinanceCredentialsExpired(err, "InitIgnoredPositions")
 		return fmt.Errorf("获取领航员持仓失败: %w", err)
 	}
 
@@ -321,6 +354,7 @@ func (e *Engine) poll() {
 	since := time.Now().Add(-1 * time.Minute)
 	fills, err := e.provider.GetFills(e.config.LeaderID, since)
 	if err != nil {
+		e.reportBinanceCredentialsExpired(err, "poll/GetFills")
 		logger.Warnf("⚠️ [%s] 获取成交记录失败: %v", e.traderID, err)
 		return
 	}
@@ -1349,6 +1383,7 @@ Following leader's %s action on %s.
 func (e *Engine) syncLeaderState() error {
 	state, err := e.provider.GetAccountState(e.config.LeaderID)
 	if err != nil {
+		e.reportBinanceCredentialsExpired(err, "syncLeaderState")
 		return err
 	}
 
@@ -1418,6 +1453,7 @@ func (e *Engine) initSeenFills() {
 	since := time.Now().Add(-5 * time.Minute)
 	fills, err := e.provider.GetFills(e.config.LeaderID, since)
 	if err != nil {
+		e.reportBinanceCredentialsExpired(err, "initSeenFills")
 		logger.Warnf("⚠️ [%s] 初始化去重基线失败: %v", e.traderID, err)
 		return
 	}

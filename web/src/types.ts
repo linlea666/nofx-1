@@ -1,6 +1,6 @@
 // Decision mode types (defined early for use throughout the file)
 export type DecisionMode = 'ai' | 'copy_trade';
-export type CopyTradeProvider = 'hyperliquid' | 'okx';
+export type CopyTradeProvider = 'hyperliquid' | 'okx' | 'binance';
 
 export interface SystemStatus {
   trader_id: string
@@ -190,6 +190,9 @@ export interface CopyConfigRequest {
   copy_ratio: number
   sync_leverage: boolean
   sync_margin_mode?: boolean  // 同步保证金模式（OKX 区分全仓/逐仓）
+  // Binance Web 凭证（仅 provider_type=binance 时使用）
+  binance_p20t?: string       // 登录 cookie p20t
+  binance_csrf_token?: string // CSRF header csrftoken
 }
 
 export interface UpdateModelConfigRequest {
@@ -637,6 +640,9 @@ export interface CopyTradeConfig {
   min_trade_warn: number;
   max_trade_warn: number;
   enabled: boolean;
+  // Binance Web 凭证（仅 provider_type=binance 时使用，明文返回，用于编辑表单回填）
+  binance_p20t?: string;
+  binance_csrf_token?: string;
   created_at?: string;
   updated_at?: string;
 }
@@ -680,4 +686,7 @@ export interface CopyTradeConfigRequest {
   min_trade_warn: number;
   max_trade_warn: number;
   enabled: boolean;
+  // Binance Web 凭证（仅 provider_type=binance 时使用）
+  binance_p20t?: string;
+  binance_csrf_token?: string;
 }
