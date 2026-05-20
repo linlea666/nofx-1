@@ -7,6 +7,7 @@ import (
 
 	"nofx/decision"
 	"nofx/logger"
+	"nofx/notifier"
 	"nofx/store"
 )
 
@@ -103,6 +104,28 @@ func (ti *TraderIntegration) StartCopyTrading() error {
 
 	// 启动引擎
 	if err := engine.Start(ti.ctx); err != nil {
+		// 异步发送邮件告警（未启用通知器时为 no-op）
+		notifier.Notify(notifier.Alert{
+			Category: "copy_trade",
+			TraderID: ti.traderID,
+			Title:    "跟单引擎启动失败",
+			Body: fmt.Sprintf(
+				"跟单引擎启动失败 (Copy Trade Engine Start Failed)\n\n"+
+					"Trader ID: %s\n"+
+					"Provider:  %s\n"+
+					"Leader ID: %s\n\n"+
+					"错误信息 (Error):\n%s",
+				ti.traderID,
+				copyConfig.ProviderType,
+				copyConfig.LeaderID,
+				err.Error(),
+			),
+			Fields: map[string]string{
+				"Provider": copyConfig.ProviderType,
+				"Leader":   copyConfig.LeaderID,
+				"Reason":   err.Error(),
+			},
+		})
 		return fmt.Errorf("failed to start copy trade engine: %w", err)
 	}
 
@@ -195,6 +218,26 @@ func (ti *TraderIntegration) executeFullDecision(fullDec *decision.FullDecision)
 				ti.traderID, dec.Action, dec.Symbol, err)
 			executionLogs = append(executionLogs, fmt.Sprintf("❌ %s %s 失败: %v", dec.Action, dec.Symbol, err))
 			ti.saveSignalLog(dec, "failed", err.Error())
+
+			// 异步发送邮件告警（未启用通知器时为 no-op，零阻塞、零副作用）
+			notifier.Notify(notifier.Alert{
+				Category: "copy_trade",
+				TraderID: ti.traderID,
+				Title:    fmt.Sprintf("%s %s 失败", dec.Action, dec.Symbol),
+				Body:     ti.buildExecFailureAlertBody(dec, err),
+				Fields: map[string]string{
+					"Provider":    string(ti.engine.config.ProviderType),
+					"Leader":      ti.engine.config.LeaderID,
+					"Action":      dec.Action,
+					"Symbol":      dec.Symbol,
+					"EntryPrice":  fmt.Sprintf("%.4f", dec.EntryPrice),
+					"PositionUSD": fmt.Sprintf("%.2f", dec.PositionSizeUSD),
+					"Leverage":    fmt.Sprintf("%dx", dec.Leverage),
+					"MarginMode":  dec.MarginMode,
+					"LeaderPosID": dec.LeaderPosID,
+					"Reason":      err.Error(),
+				},
+			})
 		} else {
 			duration := time.Since(startTime).Milliseconds()
 			logger.Infof("✅ [%s] 跟单执行成功 | %s %s | 耗时=%dms",
@@ -353,6 +396,41 @@ func (ti *TraderIntegration) logDecision(fullDec *decision.FullDecision, dec *de
 		ti.traderID, dec.Action, dec.Symbol, dec.Reasoning)
 }
 
+// buildExecFailureAlertBody 构造跟单执行失败的告警正文
+func (ti *TraderIntegration) buildExecFailureAlertBody(dec *decision.Decision, err error) string {
+	providerType := ""
+	leaderID := ""
+	if ti.engine != nil && ti.engine.config != nil {
+		providerType = string(ti.engine.config.ProviderType)
+		leaderID = ti.engine.config.LeaderID
+	}
+	return fmt.Sprintf(
+		"跟单执行失败 (Copy Trade Execution Failed)\n\n"+
+			"Trader ID:   %s\n"+
+			"Provider:    %s\n"+
+			"Leader ID:   %s\n"+
+			"Action:      %s\n"+
+			"Symbol:      %s\n"+
+			"EntryPrice:  %.4f\n"+
+			"PositionUSD: %.2f\n"+
+			"Leverage:    %dx\n"+
+			"MarginMode:  %s\n"+
+			"LeaderPosID: %s\n\n"+
+			"错误信息 (Error):\n%s",
+		ti.traderID,
+		providerType,
+		leaderID,
+		dec.Action,
+		dec.Symbol,
+		dec.EntryPrice,
+		dec.PositionSizeUSD,
+		dec.Leverage,
+		dec.MarginMode,
+		dec.LeaderPosID,
+		err.Error(),
+	)
+}
+
 // saveSignalLog 保存信号日志到数据库
 func (ti *TraderIntegration) saveSignalLog(dec *decision.Decision, status, errorMsg string) {
 	log := &store.CopyTradeSignalLog{
@@ -390,10 +468,29 @@ func (ti *TraderIntegration) updatePositionMapping(dec *decision.Decision) {
 	// 从 action 推断操作类型
 	switch dec.Action {
 	case "open_long", "open_short":
+		// 推断本次决策对应的方向
+		expectedSide := "long"
+		if dec.Action == "open_short" {
+			expectedSide = "short"
+		}
+
 		// 判断是新开仓还是加仓：查数据库映射
 		existingMapping, err := copyTradeStore.GetActiveMapping(ti.traderID, dec.LeaderPosID)
 		if err != nil {
 			logger.Warnf("⚠️ [%s] 查询映射失败: %v", ti.traderID, err)
+		}
+
+		// 🔑 F2: 反手方向检测自愈
+		// 触发条件：领航员在 OKX NET 模式下复用同一 posId 但翻转方向
+		// （例如领航员先平 LONG 再开 SHORT，OKX 复用槽位 posId）
+		// 处理：将旧映射关闭，让下面的"无映射"分支走新开仓写入正确方向
+		if existingMapping != nil && existingMapping.Side != expectedSide {
+			logger.Warnf("⚠️ [%s] posId 方向变更检测 | posId=%s 旧 side=%s 新 side=%s → 关闭旧映射并重建",
+				ti.traderID, dec.LeaderPosID, existingMapping.Side, expectedSide)
+			if err := copyTradeStore.CloseMapping(ti.traderID, dec.LeaderPosID, dec.EntryPrice); err != nil {
+				logger.Warnf("⚠️ [%s] 关闭旧方向映射失败: %v（继续写入新映射）", ti.traderID, err)
+			}
+			existingMapping = nil // 走下方"新开仓"分支重建
 		}
 
 		if existingMapping != nil {
@@ -412,17 +509,12 @@ func (ti *TraderIntegration) updatePositionMapping(dec *decision.Decision) {
 			}
 		} else {
 			// 无映射 → 新开仓：保存映射
-			side := "long"
-			if dec.Action == "open_short" {
-				side = "short"
-			}
-
 			mapping := &store.CopyTradePositionMapping{
 				TraderID:      ti.traderID,
 				LeaderPosID:   dec.LeaderPosID,
 				LeaderID:      ti.engine.config.LeaderID,
 				Symbol:        dec.Symbol,
-				Side:          side,
+				Side:          expectedSide,
 				MarginMode:    dec.MarginMode,
 				OpenedAt:      time.Now(),
 				OpenPrice:     dec.EntryPrice,
@@ -434,7 +526,7 @@ func (ti *TraderIntegration) updatePositionMapping(dec *decision.Decision) {
 				logger.Warnf("⚠️ [%s] 保存仓位映射失败: %v", ti.traderID, err)
 			} else {
 				logger.Infof("📝 [%s] 仓位映射已保存 | posId=%s %s %s %s lastKnownSize=%.4f",
-					ti.traderID, dec.LeaderPosID, dec.Symbol, side, dec.MarginMode, dec.LeaderPosSize)
+					ti.traderID, dec.LeaderPosID, dec.Symbol, expectedSide, dec.MarginMode, dec.LeaderPosSize)
 			}
 		}
 

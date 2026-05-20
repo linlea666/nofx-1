@@ -587,16 +587,20 @@ func parseFloat(s string) float64 {
 }
 
 // parseInt 安全解析整数
+// 兼容 OKX 等接口返回小数形式的整数字段（例如 lever="12.5"）
 func parseInt(s string) int {
 	if s == "" {
 		return 0
 	}
-	i, err := strconv.Atoi(s)
-	if err != nil {
-		logger.Warnf("parseInt failed: %s", s)
-		return 0
+	if i, err := strconv.Atoi(s); err == nil {
+		return i
 	}
-	return i
+	// 回退：按浮点数解析后取整数部分
+	if f, err := strconv.ParseFloat(s, 64); err == nil {
+		return int(f)
+	}
+	logger.Warnf("parseInt failed: %s", s)
+	return 0
 }
 
 // parseInt64 安全解析 int64

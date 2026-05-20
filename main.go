@@ -10,6 +10,7 @@ import (
 	"nofx/manager"
 	"nofx/market"
 	"nofx/mcp"
+	"nofx/notifier"
 	"nofx/store"
 	"nofx/trader"
 	"os"
@@ -95,6 +96,13 @@ func main() {
 	// Set JWT secret
 	auth.SetJWTSecret(cfg.JWTSecret)
 	logger.Info("🔑 JWT secret configured")
+
+	// Initialize email notifier (optional, disabled by default)
+	// Reads SMTP_* and NOTIFY_* from .env, runs as independent module
+	if err := notifier.Init(notifier.LoadFromEnv()); err != nil {
+		logger.Warnf("⚠️ Email notifier init failed: %v (system continues)", err)
+	}
+	defer notifier.Shutdown()
 
 	// Start WebSocket market monitor FIRST (before loading traders that may need market data)
 	// This ensures WSMonitorCli is initialized before any trader tries to access it
