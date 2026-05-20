@@ -24,12 +24,14 @@ export function BinanceCredentialsPanel({ p20t, csrfToken, onChange }: BinanceCr
   const [showTutorial, setShowTutorial] = useState(false)
 
   /**
-   * 解析 cURL 命令中的 p20t 和 csrftoken
+   * 解析 cURL 命令 / 原始 HTTP Request Headers 中的 p20t 和 csrftoken
    *
    * 兼容：
-   *   - `-H 'csrftoken: xxx'` 和 `-H "csrftoken: xxx"`
+   *   - cURL 格式：`-H 'csrftoken: xxx'` 或 `-H "csrftoken: xxx"`
+   *   - 原始请求头格式：单独一行 `csrftoken: xxx`（Chrome DevTools "Copy request headers"）
    *   - `-b 'p20t=xxx; ...'` 和 `--cookie 'p20t=xxx; ...'`
    *   - `-H 'cookie: p20t=xxx; ...'`（部分浏览器把 cookie 放在 header 中）
+   *   - 浏览器原始 cookie 行：`cookie: p20t=xxx; ...`
    */
   const parseCurl = () => {
     if (!curlInput.trim()) {
@@ -41,9 +43,18 @@ export function BinanceCredentialsPanel({ p20t, csrfToken, onChange }: BinanceCr
     let csrfValue = ''
 
     // 1. 解析 csrftoken（不区分大小写）
+    //    优先匹配 cURL 格式 `-H 'csrftoken: xxx'`
     const csrfMatch = curlInput.match(/-H\s+["']?csrftoken:\s*([^"'\s]+)["']?/i)
     if (csrfMatch) {
       csrfValue = csrfMatch[1].trim()
+    }
+    // 兜底：原始 HTTP Headers 格式（行首或换行后直接是 `csrftoken: xxx`）
+    // 例如 Chrome DevTools 直接复制 Request Headers 内容
+    if (!csrfValue) {
+      const csrfFallback = curlInput.match(/(?:^|[\r\n])\s*csrftoken:\s*([a-zA-Z0-9_.-]+)/i)
+      if (csrfFallback) {
+        csrfValue = csrfFallback[1].trim()
+      }
     }
 
     // 2. 解析 p20t（兼容 -b / --cookie / -H 'cookie: ...'）
