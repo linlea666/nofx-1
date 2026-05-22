@@ -14,6 +14,8 @@ import (
 	"nofx/store"
 )
 
+const binancePositionSizeEpsilon = 1e-10
+
 // Engine 跟单引擎
 type Engine struct {
 	traderID string
@@ -380,6 +382,18 @@ func (e *Engine) poll() {
 		} else {
 			logger.Debugf("📡 [%s] 收到 %d 条新成交，已同步领航员持仓", e.traderID, len(newFills))
 		}
+	} else if e.config.ProviderType == ProviderBinance {
+		// Binance 成交历史偶发延迟/漏单时，用持仓快照兜底生成信号。
+		// 只在 Binance 启用，避免改变 OKX posId 历史仓位判断链路。
+		if err := e.syncLeaderState(); err != nil {
+			logger.Warnf("⚠️ [%s] Binance 持仓兜底同步失败: %v", e.traderID, err)
+		} else {
+			snapshotFills := e.detectBinancePositionSnapshotFills()
+			if len(snapshotFills) > 0 {
+				logger.Infof("📡 [%s] Binance 持仓兜底发现 %d 条信号", e.traderID, len(snapshotFills))
+				newFills = append(newFills, snapshotFills...)
+			}
+		}
 	} else {
 		// 无新成交时，保持原有的定时同步作为兜底（防止长时间无交易时数据过旧）
 		if time.Since(e.lastStateSync) > e.stateSyncInterval {
@@ -426,6 +440,126 @@ func (e *Engine) buildSignal(fill *Fill) *TradeSignal {
 	}
 
 	return signal
+}
+
+// detectBinancePositionSnapshotFills 基于 Binance 当前持仓和本地映射生成兜底信号。
+// 这是 Binance 专属逻辑：Binance 在本系统里只是信号源，实际执行仍走 NOFX trader。
+func (e *Engine) detectBinancePositionSnapshotFills() []Fill {
+	if e.store == nil || e.config == nil || e.config.ProviderType != ProviderBinance {
+		return nil
+	}
+
+	leaderPosMap := e.buildLeaderPosMap()
+	var fills []Fill
+
+	for posID, pos := range leaderPosMap {
+		if pos == nil || pos.Size <= 0 {
+			continue
+		}
+		if posID == "" {
+			posID = pos.PosID
+		}
+		if posID == "" {
+			posID = fmt.Sprintf("%s_%s", pos.Symbol, pos.Side)
+		}
+
+		mapping, err := e.store.CopyTrade().GetMapping(e.traderID, posID)
+		if err != nil {
+			logger.Warnf("⚠️ [%s] Binance 持仓兜底查询映射失败: %v (posId=%s)", e.traderID, err, posID)
+			continue
+		}
+		if mapping == nil {
+			fills = append(fills, e.buildBinanceSnapshotFill(posID, pos.Symbol, pos.Side, ActionOpen, pos.Size, e.positionSignalPrice(pos), 0, pos.Size))
+			continue
+		}
+		if mapping.Status == "ignored" {
+			logger.Debugf("📊 [%s] Binance 历史仓位仍在持仓中 | posId=%s → 持仓兜底跳过", e.traderID, posID)
+			continue
+		}
+		if mapping.Status != "active" {
+			continue
+		}
+
+		lastKnownSize := mapping.LastKnownSize
+		if pos.Size > lastKnownSize+binancePositionSizeEpsilon {
+			sizeDelta := pos.Size - lastKnownSize
+			fills = append(fills, e.buildBinanceSnapshotFill(posID, pos.Symbol, pos.Side, ActionAdd, sizeDelta, e.positionSignalPrice(pos), lastKnownSize, pos.Size))
+		} else if lastKnownSize > pos.Size+binancePositionSizeEpsilon {
+			sizeDelta := lastKnownSize - pos.Size
+			action := ActionReduce
+			if pos.Size < lastKnownSize*NearZeroThreshold {
+				action = ActionClose
+			}
+			fills = append(fills, e.buildBinanceSnapshotFill(posID, pos.Symbol, pos.Side, action, sizeDelta, e.positionSignalPrice(pos), lastKnownSize, pos.Size))
+		}
+	}
+
+	activeMappings, err := e.store.CopyTrade().ListActiveMappings(e.traderID)
+	if err != nil {
+		logger.Warnf("⚠️ [%s] Binance 持仓兜底读取 active 映射失败: %v", e.traderID, err)
+		return fills
+	}
+	for _, mapping := range activeMappings {
+		if mapping == nil {
+			continue
+		}
+		if _, exists := leaderPosMap[mapping.LeaderPosID]; exists {
+			continue
+		}
+		fills = append(fills, e.buildBinanceSnapshotFill(
+			mapping.LeaderPosID,
+			mapping.Symbol,
+			SideType(mapping.Side),
+			ActionClose,
+			mapping.LastKnownSize,
+			mapping.ClosePrice,
+			mapping.LastKnownSize,
+			0,
+		))
+	}
+
+	return fills
+}
+
+func (e *Engine) buildBinanceSnapshotFill(posID, symbol string, side SideType, action ActionType, size, price, previousSize, currentSize float64) Fill {
+	if size < 0 {
+		size = -size
+	}
+	value := size * price
+	if value < 0 {
+		value = -value
+	}
+
+	tradeSide := "buy"
+	if (action == ActionOpen || action == ActionAdd) && side == SideShort {
+		tradeSide = "sell"
+	}
+	if (action == ActionReduce || action == ActionClose) && side == SideLong {
+		tradeSide = "sell"
+	}
+
+	return Fill{
+		ID: fmt.Sprintf("binance_snapshot|%s|%s|%.8f|%.8f",
+			posID, action, previousSize, currentSize),
+		Symbol:       symbol,
+		Side:         tradeSide,
+		PositionSide: side,
+		Action:       action,
+		Price:        price,
+		Size:         size,
+		Value:        value,
+		Timestamp:    time.Now(),
+	}
+}
+
+func (e *Engine) positionSignalPrice(pos *Position) float64 {
+	if pos == nil {
+		return 0
+	}
+	if pos.MarkPrice > 0 {
+		return pos.MarkPrice
+	}
+	return pos.EntryPrice
 }
 
 // ============================================================================
@@ -554,12 +688,11 @@ func (e *Engine) matchOpenAddSignal(signal *TradeSignal, leaderPosMap map[string
 
 		if mapping.Status == "ignored" {
 			// 🔑 关键区分：根据数据源（ProviderType）使用不同的判断逻辑
-			if e.config.ProviderType == ProviderOKX {
-				// OKX: ignored 状态永远不跟
-				// 原因：OKX 的 posId 是真实的，平仓后失效，新开仓会分配新的 posId
-				// 所以 ignored 的 posId 永远不会再被使用，直接跳过
-				logger.Infof("📊 [%s] 历史仓位 | posId=%s status=ignored → 不跟随（OKX新开仓会用新posId）",
-					e.traderID, posID)
+			if e.config.ProviderType == ProviderOKX || e.config.ProviderType == ProviderBinance {
+				// OKX/Binance: ignored 表示启动前已存在的历史仓位，当前仍在持仓中时不跟随。
+				// Binance 如果该仓位先消失，checkIgnoredPositionsClosed 会标记 closed，后续重新开仓可按新仓处理。
+				logger.Infof("📊 [%s] 历史仓位 | posId=%s status=ignored → 不跟随（%s）",
+					e.traderID, posID, e.config.ProviderType)
 				continue
 			}
 
@@ -689,6 +822,17 @@ func (e *Engine) matchOpenAddSignal(signal *TradeSignal, leaderPosMap map[string
 		if posID == "" {
 			posID = fmt.Sprintf("%s_%s", fill.Symbol, fill.PositionSide)
 		}
+		if e.config.ProviderType == ProviderBinance &&
+			singleActiveMapping != nil &&
+			singleActiveMapping.LastKnownSize > 0 &&
+			singleActivePos.Size <= singleActiveMapping.LastKnownSize+binancePositionSizeEpsilon {
+			logger.Infof("📊 [%s] Binance 未检测到 size 增加 | posId=%s 上次=%.4f 当前=%.4f → 跳过迟到/重复成交",
+				e.traderID, posID, singleActiveMapping.LastKnownSize, singleActivePos.Size)
+			return &SignalMatchResult{
+				ShouldFollow: false,
+				Reason:       "Binance 持仓 size 未增加，可能是迟到/重复成交",
+			}
+		}
 		logger.Infof("📊 [%s] 唯一 active 仓位 | posId=%s status=active → 加仓",
 			e.traderID, posID)
 		return &SignalMatchResult{
@@ -792,6 +936,21 @@ func (e *Engine) matchCloseReduceSignal(signal *TradeSignal, leaderPosMap map[st
 				PosID:          mapping.LeaderPosID,
 				MarginMode:     mapping.MarginMode,
 				LeaderPosition: leaderPos,
+			}
+		}
+	}
+
+	if e.config.ProviderType == ProviderBinance && len(activeMappings) == 1 {
+		mapping := activeMappings[0]
+		leaderPos := leaderPosMap[mapping.LeaderPosID]
+		if leaderPos != nil &&
+			mapping.LastKnownSize > 0 &&
+			mapping.LastKnownSize <= leaderPos.Size+binancePositionSizeEpsilon {
+			logger.Infof("📊 [%s] Binance 未检测到 size 减少 | posId=%s 上次=%.4f 当前=%.4f → 跳过迟到/重复成交",
+				e.traderID, mapping.LeaderPosID, mapping.LastKnownSize, leaderPos.Size)
+			return &SignalMatchResult{
+				ShouldFollow: false,
+				Reason:       "Binance 持仓 size 未减少，可能是迟到/重复成交",
 			}
 		}
 	}

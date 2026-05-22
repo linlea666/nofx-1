@@ -55,6 +55,9 @@ const (
 	//   - 我们必须带 p20t，因为还要靠这个 copyPortfolioId 调持仓/成交接口
 	BinanceLeadPortfolioDetailAPI = "https://www.binance.com/bapi/futures/v1/friendly/future/copy-trade/lead-portfolio/detail"
 
+	// BinanceAccountBaseInfoAPI 当前登录账号基础信息（用于校验 Web 凭证是否仍有效）
+	BinanceAccountBaseInfoAPI = "https://www.binance.com/bapi/accounts/v1/private/account/get-user-base-info"
+
 	// BinanceErrPortfolioClosed 领航员已关闭带单：detail 接口对 closed portfolio 返回的码
 	// 同时也是用错 ID（如把 copyPortfolioId 当 leadPortfolioId 用）时的报错
 	BinanceErrPortfolioClosed = "11012030"
@@ -247,6 +250,39 @@ func (p *BinanceProvider) GetAccountState(leadPortfolioID string) (*AccountState
 	return state, nil
 }
 
+// ValidateCredentials 使用 Binance 账号状态接口校验 p20t/csrftoken 是否仍有效。
+// 只把明确的登录失效/鉴权失败归类为 ErrBinanceCredentialsExpired；
+// 网络错误、5xx 等临时问题返回普通错误，避免误报凭证过期。
+func (p *BinanceProvider) ValidateCredentials() error {
+	raw, statusCode, err := p.getAccountBaseInfo()
+	if err != nil {
+		return err
+	}
+
+	if statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden {
+		return ErrBinanceCredentialsExpired
+	}
+	if statusCode != http.StatusOK {
+		return fmt.Errorf("binance account status http %d: %s", statusCode, truncate(string(raw), 200))
+	}
+
+	var resp BinanceAccountBaseInfoResp
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return fmt.Errorf("decode binance account status response: %w; body=%s", err, truncate(string(raw), 200))
+	}
+
+	if isBinanceAuthError(resp.Code) {
+		return ErrBinanceCredentialsExpired
+	}
+	if resp.Code != BinanceCodeSuccess {
+		return fmt.Errorf("binance account status api error: code=%s msg=%s", resp.Code, resp.Message)
+	}
+	if strings.TrimSpace(resp.Data.UserID) == "" {
+		return ErrBinanceCredentialsExpired
+	}
+	return nil
+}
+
 // GetFills 获取领航员最近成交记录
 // leadPortfolioID: 领航员主页 portfolioId（前端配置）
 func (p *BinanceProvider) GetFills(leadPortfolioID string, since time.Time) ([]Fill, error) {
@@ -357,7 +393,7 @@ func (p *BinanceProvider) GetFills(leadPortfolioID string, since time.Time) ([]F
 //   - p20t: <p20t value>
 func (p *BinanceProvider) postCopyTrade(url string, body interface{}) ([]byte, error) {
 	if p.p20t == "" || p.csrfToken == "" {
-		return nil, fmt.Errorf("binance credentials not configured (p20t/csrftoken empty)")
+		return nil, ErrBinanceCredentialsExpired
 	}
 
 	payload, err := json.Marshal(body)
@@ -387,10 +423,8 @@ func (p *BinanceProvider) postCopyTrade(url string, body interface{}) ([]byte, e
 		return nil, fmt.Errorf("binance read body failed: %w", err)
 	}
 
-	// 200 + code=100001005 也是凭证错误，让上层用 code 判定（已 read body 完毕）
-	if resp.StatusCode == http.StatusUnauthorized {
-		// 上层会进一步用 resp.Code 判定，先返回 raw 让 JSON 解析正常走
-		return rawBody, nil
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return nil, ErrBinanceCredentialsExpired
 	}
 
 	if resp.StatusCode != http.StatusOK {
@@ -398,6 +432,34 @@ func (p *BinanceProvider) postCopyTrade(url string, body interface{}) ([]byte, e
 	}
 
 	return rawBody, nil
+}
+
+func (p *BinanceProvider) getAccountBaseInfo() ([]byte, int, error) {
+	if p.p20t == "" || p.csrfToken == "" {
+		return nil, 0, ErrBinanceCredentialsExpired
+	}
+
+	req, err := http.NewRequest(http.MethodGet, BinanceAccountBaseInfoAPI, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	req.Header.Set("accept", "*/*")
+	req.Header.Set("clienttype", "web")
+	req.Header.Set("csrftoken", p.csrfToken)
+	req.Header.Set("user-agent", "Mozilla/5.0 (compatible; NOFX/1.0)")
+	req.AddCookie(&http.Cookie{Name: "p20t", Value: p.p20t})
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return nil, 0, fmt.Errorf("binance account status request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	rawBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, resp.StatusCode, fmt.Errorf("binance account status read body failed: %w", err)
+	}
+	return rawBody, resp.StatusCode, nil
 }
 
 // resolveCopyPortfolioID 解析 leadPortfolioId → copyPortfolioId
@@ -409,6 +471,10 @@ func (p *BinanceProvider) postCopyTrade(url string, body interface{}) ([]byte, e
 //
 // 返回错误时上层不能降级，因为没有 copyPortfolioId 持仓/成交接口根本无法调用
 func (p *BinanceProvider) resolveCopyPortfolioID(leadPortfolioID string) (string, error) {
+	if p.p20t == "" || p.csrfToken == "" {
+		return "", ErrBinanceCredentialsExpired
+	}
+
 	p.mu.Lock()
 	cached := p.copyPortfolioID
 	p.mu.Unlock()
@@ -421,6 +487,9 @@ func (p *BinanceProvider) resolveCopyPortfolioID(leadPortfolioID string) (string
 		return "", err
 	}
 	if cpid == "" {
+		if err := p.ValidateCredentials(); err != nil {
+			return "", err
+		}
 		return "", fmt.Errorf("%w (leadPortfolioId=%s)", ErrBinanceNotCopying, leadPortfolioID)
 	}
 
@@ -499,6 +568,10 @@ func (p *BinanceProvider) resolveLeaderEquity(leadPortfolioID string, totalNotio
 //
 // 注意：aumAmount 是"跟单池总规模"（领航员本金 + 所有跟随者本金），不能用作权益
 func (p *BinanceProvider) fetchLeaderDetail(leadPortfolioID string) (float64, string, error) {
+	if p.p20t == "" || p.csrfToken == "" {
+		return 0, "", ErrBinanceCredentialsExpired
+	}
+
 	url := BinanceLeadPortfolioDetailAPI + "?portfolioId=" + leadPortfolioID
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
@@ -521,6 +594,9 @@ func (p *BinanceProvider) fetchLeaderDetail(leadPortfolioID string) (float64, st
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return 0, "", ErrBinanceCredentialsExpired
+	}
 	if resp.StatusCode != http.StatusOK {
 		return 0, "", fmt.Errorf("lead-portfolio/detail http %d", resp.StatusCode)
 	}
@@ -535,6 +611,9 @@ func (p *BinanceProvider) fetchLeaderDetail(leadPortfolioID string) (float64, st
 		return 0, "", fmt.Errorf("decode lead-portfolio/detail: %w; body=%s", err, truncate(string(rawBody), 200))
 	}
 
+	if isBinanceAuthError(dr.Code) {
+		return 0, "", ErrBinanceCredentialsExpired
+	}
 	if dr.Code != BinanceCodeSuccess {
 		// portfolio closed 通常意味着用错 ID（把 copyPortfolioId 当 leadPortfolioId）
 		if dr.Code == BinanceErrPortfolioClosed {
@@ -712,6 +791,19 @@ type BinanceLeadPortfolioDetailData struct {
 	AumAmount       string `json:"aumAmount"`       // 跟单池总规模（含跟随者）— 不用作 equity，仅日志
 	InitInvestAsset string `json:"initInvestAsset"` // "USDT"
 	FuturesType     string `json:"futuresType"`     // "UM"
+}
+
+// BinanceAccountBaseInfoResp /bapi/accounts/v1/private/account/get-user-base-info 响应
+type BinanceAccountBaseInfoResp struct {
+	Code    string                     `json:"code"`
+	Message string                     `json:"message"`
+	Success bool                       `json:"success"`
+	Data    BinanceAccountBaseInfoData `json:"data"`
+}
+
+// BinanceAccountBaseInfoData 仅保留凭证校验需要的字段
+type BinanceAccountBaseInfoData struct {
+	UserID string `json:"userId"`
 }
 
 // BinanceTradeRecord 单条成交记录
