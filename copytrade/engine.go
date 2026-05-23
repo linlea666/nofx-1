@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,6 +16,10 @@ import (
 )
 
 const binancePositionSizeEpsilon = 1e-10
+
+type binancePositionHistoryProvider interface {
+	GetPositionHistory(leadPortfolioID string) ([]BinancePositionHistoryRecord, error)
+}
 
 // Engine 跟单引擎
 type Engine struct {
@@ -358,7 +363,10 @@ func (e *Engine) poll() {
 	if err != nil {
 		e.reportBinanceCredentialsExpired(err, "poll/GetFills")
 		logger.Warnf("⚠️ [%s] 获取成交记录失败: %v", e.traderID, err)
-		return
+		if e.config.ProviderType != ProviderBinance {
+			return
+		}
+		fills = nil
 	}
 
 	// 按时间排序（确保反向开仓按顺序处理）
@@ -374,25 +382,29 @@ func (e *Engine) poll() {
 		}
 	}
 
-	// 🔑 第二步：有新成交时，强制同步领航员持仓（确保用最新数据判断）
-	// 这解决了"平仓后重开仓被误判为历史仓位"的问题
-	if len(newFills) > 0 {
+	// 🔑 第二步：同步领航员持仓（确保用最新数据判断）
+	if e.config.ProviderType == ProviderBinance {
+		// Binance 成交历史会延迟数分钟；实时持仓快照才是开仓/加仓/减仓/平仓的主信号。
+		// 成交历史仍保留为兜底，但只在快照没有检测到变化时处理，避免迟到成交重复触发。
+		if err := e.syncLeaderState(); err != nil {
+			logger.Warnf("⚠️ [%s] Binance 实时持仓同步失败: %v", e.traderID, err)
+		} else {
+			snapshotFills := e.detectBinancePositionSnapshotFills()
+			if len(snapshotFills) > 0 {
+				logger.Infof("📡 [%s] Binance 实时持仓发现 %d 条信号", e.traderID, len(snapshotFills))
+				for _, fill := range newFills {
+					e.markSeen(fill.ID)
+				}
+				newFills = snapshotFills
+			} else if len(newFills) > 0 {
+				logger.Debugf("📡 [%s] Binance 快照无变化，处理 %d 条成交历史信号", e.traderID, len(newFills))
+			}
+		}
+	} else if len(newFills) > 0 {
 		if err := e.syncLeaderState(); err != nil {
 			logger.Warnf("⚠️ [%s] 处理信号前同步状态失败: %v（使用缓存）", e.traderID, err)
 		} else {
 			logger.Debugf("📡 [%s] 收到 %d 条新成交，已同步领航员持仓", e.traderID, len(newFills))
-		}
-	} else if e.config.ProviderType == ProviderBinance {
-		// Binance 成交历史偶发延迟/漏单时，用持仓快照兜底生成信号。
-		// 只在 Binance 启用，避免改变 OKX posId 历史仓位判断链路。
-		if err := e.syncLeaderState(); err != nil {
-			logger.Warnf("⚠️ [%s] Binance 持仓兜底同步失败: %v", e.traderID, err)
-		} else {
-			snapshotFills := e.detectBinancePositionSnapshotFills()
-			if len(snapshotFills) > 0 {
-				logger.Infof("📡 [%s] Binance 持仓兜底发现 %d 条信号", e.traderID, len(snapshotFills))
-				newFills = append(newFills, snapshotFills...)
-			}
 		}
 	} else {
 		// 无新成交时，保持原有的定时同步作为兜底（防止长时间无交易时数据过旧）
@@ -512,7 +524,7 @@ func (e *Engine) detectBinancePositionSnapshotFills() []Fill {
 			SideType(mapping.Side),
 			ActionClose,
 			mapping.LastKnownSize,
-			mapping.ClosePrice,
+			e.binanceCloseSignalPrice(mapping),
 			mapping.LastKnownSize,
 			0,
 		))
@@ -560,6 +572,75 @@ func (e *Engine) positionSignalPrice(pos *Position) float64 {
 		return pos.MarkPrice
 	}
 	return pos.EntryPrice
+}
+
+func (e *Engine) binanceCloseSignalPrice(mapping *store.CopyTradePositionMapping) float64 {
+	if mapping == nil {
+		return 0
+	}
+	if price := e.latestBinanceClosedPositionPrice(mapping.Symbol, SideType(mapping.Side)); price > 0 {
+		return price
+	}
+	return mapping.ClosePrice
+}
+
+func (e *Engine) latestBinanceClosedPositionPrice(symbol string, side SideType) float64 {
+	historyProvider, ok := e.provider.(binancePositionHistoryProvider)
+	if !ok || e.config == nil {
+		return 0
+	}
+
+	records, err := historyProvider.GetPositionHistory(e.config.LeaderID)
+	if err != nil {
+		e.reportBinanceCredentialsExpired(err, "binance/position-history")
+		logger.Debugf("📊 [%s] Binance 仓位历史查询失败，平仓价格回退到映射缓存: %v", e.traderID, err)
+		return 0
+	}
+
+	normalizedSymbol := strings.ToUpper(strings.TrimSpace(symbol))
+	var best *BinancePositionHistoryRecord
+	var bestTime int64
+	for i := range records {
+		rec := &records[i]
+		if strings.ToUpper(strings.TrimSpace(rec.Symbol)) != normalizedSymbol {
+			continue
+		}
+		if !binanceHistorySideMatches(rec.Side, side) {
+			continue
+		}
+		if rec.AvgClosePrice <= 0 {
+			continue
+		}
+		if !strings.Contains(strings.ToLower(rec.Status), "closed") && rec.ClosedVolume <= 0 {
+			continue
+		}
+		closedAt := rec.Closed
+		if rec.UpdateTime > closedAt {
+			closedAt = rec.UpdateTime
+		}
+		if best == nil || closedAt > bestTime {
+			best = rec
+			bestTime = closedAt
+		}
+	}
+	if best == nil {
+		return 0
+	}
+
+	logger.Debugf("📊 [%s] Binance 仓位历史补充平仓价 | %s %s avgClosePrice=%.4f closed=%d",
+		e.traderID, normalizedSymbol, side, best.AvgClosePrice, best.Closed)
+	return best.AvgClosePrice
+}
+
+func binanceHistorySideMatches(raw string, side SideType) bool {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "long":
+		return side == SideLong
+	case "short":
+		return side == SideShort
+	default:
+		return false
+	}
 }
 
 // ============================================================================

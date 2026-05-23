@@ -104,3 +104,33 @@ func TestBinanceEmptyCredentialsAreExpired(t *testing.T) {
 		t.Fatalf("expected postCopyTrade ErrBinanceCredentialsExpired, got %v", err)
 	}
 }
+
+func TestBinanceGetPositionHistory(t *testing.T) {
+	p := newBinanceProviderWithTransport(func(req *http.Request) (*http.Response, error) {
+		body := `{}`
+		switch {
+		case strings.Contains(req.URL.Path, "/lead-portfolio/detail"):
+			body = `{"code":"000000","data":{"copyPortfolioId":"copy-123","hasCopy":true,"marginBalance":"100.5"}}`
+		case strings.Contains(req.URL.Path, "/position-history"):
+			body = `{"code":"000000","data":{"total":1,"list":[{"id":1,"symbol":"ETHUSDT","side":"Long","status":"All Closed","avgCost":2028.4,"avgClosePrice":2041.57,"maxOpenInterest":0.039,"closedVolume":0.039,"closingPnl":0.5136,"opened":1779522626558,"closed":1779548800844,"updateTime":1779548800843}]}}`
+		default:
+			t.Fatalf("unexpected request path: %s", req.URL.Path)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(body)),
+			Header:     make(http.Header),
+		}, nil
+	})
+
+	records, err := p.GetPositionHistory("leader-portfolio")
+	if err != nil {
+		t.Fatalf("GetPositionHistory error: %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("records len=%d want 1", len(records))
+	}
+	if records[0].Symbol != "ETHUSDT" || records[0].Side != "Long" || records[0].AvgClosePrice != 2041.57 {
+		t.Fatalf("unexpected record: %+v", records[0])
+	}
+}

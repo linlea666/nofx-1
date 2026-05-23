@@ -1,6 +1,7 @@
 package copytrade
 
 import (
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -42,6 +43,41 @@ func newTestCopyTradeEngine(t *testing.T, providerType ProviderType) (*Engine, *
 		},
 	}
 	return e, st
+}
+
+type binancePollTestProvider struct {
+	fills       []Fill
+	fillsErr    error
+	state       *AccountState
+	history     []BinancePositionHistoryRecord
+	fillsCalls  int
+	stateCalls  int
+	historyCall int
+}
+
+func (p *binancePollTestProvider) GetFills(_ string, _ time.Time) ([]Fill, error) {
+	p.fillsCalls++
+	if p.fillsErr != nil {
+		return nil, p.fillsErr
+	}
+	return p.fills, nil
+}
+
+func (p *binancePollTestProvider) GetAccountState(_ string) (*AccountState, error) {
+	p.stateCalls++
+	if p.state == nil {
+		return &AccountState{TotalEquity: 1000, Positions: map[string]*Position{}}, nil
+	}
+	return p.state, nil
+}
+
+func (p *binancePollTestProvider) Type() ProviderType {
+	return ProviderBinance
+}
+
+func (p *binancePollTestProvider) GetPositionHistory(_ string) ([]BinancePositionHistoryRecord, error) {
+	p.historyCall++
+	return p.history, nil
 }
 
 func binanceTestPosition(posID string, size float64) *Position {
@@ -146,6 +182,112 @@ func TestBinancePositionSnapshotDetectsOpenAddReduceCloseAndIgnoresHistorical(t 
 			t.Fatalf("unexpected close fill: %+v", fills[0])
 		}
 	})
+}
+
+func TestBinancePollUsesRealtimeSnapshotBeforeDelayedTradeHistory(t *testing.T) {
+	const posID = "1239518824_ETHUSDT_LONG"
+	e, st := newTestCopyTradeEngine(t, ProviderBinance)
+	saveActiveMapping(t, st, posID, 0.01)
+
+	provider := &binancePollTestProvider{
+		fills: []Fill{{
+			ID:           "delayed-trade-history-fill",
+			Symbol:       "ETHUSDT",
+			Side:         "buy",
+			PositionSide: SideLong,
+			Action:       ActionAdd,
+			Price:        2096.58,
+			Size:         0.01,
+			Value:        20.9658,
+			Timestamp:    time.Now(),
+		}},
+		state: &AccountState{
+			TotalEquity: 1000,
+			Positions: map[string]*Position{
+				posID: binanceTestPosition(posID, 0.02),
+			},
+		},
+	}
+	e.provider = provider
+
+	e.poll()
+
+	if provider.stateCalls == 0 {
+		t.Fatalf("expected realtime position sync")
+	}
+	if !e.isSeen("delayed-trade-history-fill") {
+		t.Fatalf("expected delayed trade-history fill to be marked seen after snapshot signal")
+	}
+
+	select {
+	case dec := <-e.decisionCh:
+		if len(dec.Decisions) != 1 {
+			t.Fatalf("decision len=%d want 1", len(dec.Decisions))
+		}
+		got := dec.Decisions[0]
+		if got.Action != "open_long" || got.LeaderPosID != posID || got.LeaderPosSize != 0.02 {
+			t.Fatalf("unexpected decision from snapshot: %+v", got)
+		}
+	default:
+		t.Fatalf("expected snapshot decision")
+	}
+	select {
+	case extra := <-e.decisionCh:
+		t.Fatalf("unexpected duplicate decision: %+v", extra.Decisions)
+	default:
+	}
+}
+
+func TestBinancePollStillUsesSnapshotWhenTradeHistoryFails(t *testing.T) {
+	const posID = "1239518824_ETHUSDT_LONG"
+	e, _ := newTestCopyTradeEngine(t, ProviderBinance)
+	e.provider = &binancePollTestProvider{
+		fillsErr: errors.New("temporary trade-history delay"),
+		state: &AccountState{
+			TotalEquity: 1000,
+			Positions: map[string]*Position{
+				posID: binanceTestPosition(posID, 0.01),
+			},
+		},
+	}
+
+	e.poll()
+
+	select {
+	case dec := <-e.decisionCh:
+		if got := dec.Decisions[0]; got.Action != "open_long" || got.LeaderPosID != posID {
+			t.Fatalf("unexpected decision: %+v", got)
+		}
+	default:
+		t.Fatalf("expected snapshot decision despite trade-history error")
+	}
+}
+
+func TestBinanceCloseSnapshotUsesPositionHistoryPrice(t *testing.T) {
+	const posID = "1239518824_ETHUSDT_LONG"
+	e, st := newTestCopyTradeEngine(t, ProviderBinance)
+	saveActiveMapping(t, st, posID, 0.039)
+	e.provider = &binancePollTestProvider{
+		history: []BinancePositionHistoryRecord{{
+			Symbol:        "ETHUSDT",
+			Side:          "Long",
+			Status:        "All Closed",
+			AvgClosePrice: 2041.57358974,
+			ClosedVolume:  0.039,
+			Closed:        time.Now().UnixMilli(),
+		}},
+	}
+
+	fills := e.detectBinancePositionSnapshotFills()
+	if len(fills) != 1 {
+		t.Fatalf("fills len=%d want 1", len(fills))
+	}
+	if fills[0].Action != ActionClose {
+		t.Fatalf("unexpected action: %+v", fills[0])
+	}
+	if fills[0].Price != 2041.57358974 {
+		t.Fatalf("close price=%f want position-history avg close", fills[0].Price)
+	}
 }
 
 func TestBinanceLateTradeHistoryDoesNotDuplicateSnapshotOpenAdd(t *testing.T) {

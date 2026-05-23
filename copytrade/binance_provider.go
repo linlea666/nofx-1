@@ -48,6 +48,9 @@ const (
 	// BinanceCopyTradeTradeHistoryAPI 领航员成交记录（需鉴权 p20t+csrftoken）
 	BinanceCopyTradeTradeHistoryAPI = "https://www.binance.com/bapi/futures/v1/private/future/copy-trade/copy-portfolio/trade-history"
 
+	// BinanceCopyTradePositionHistoryAPI 领航员仓位历史（仅已完全平仓后出现，用于补充平仓均价/时间）
+	BinanceCopyTradePositionHistoryAPI = "https://www.binance.com/bapi/futures/v1/private/future/copy-trade/copy-portfolio/position-history"
+
 	// BinanceLeadPortfolioDetailAPI 领航员资料详情接口
 	//   - 用 leadPortfolioId 调用，返回 marginBalance + copyPortfolioId 反向映射
 	//   - 不带 p20t 也能拿 marginBalance，但 copyPortfolioId 会是 null
@@ -376,6 +379,46 @@ func (p *BinanceProvider) GetFills(leadPortfolioID string, since time.Time) ([]F
 	}
 
 	return fills, nil
+}
+
+// GetPositionHistory 获取 Binance 已平仓仓位历史。
+// 注意：该接口只在仓位完全平仓后出现记录，不适合作为开仓/加仓/减仓主信号源。
+func (p *BinanceProvider) GetPositionHistory(leadPortfolioID string) ([]BinancePositionHistoryRecord, error) {
+	leadPortfolioID = strings.TrimSpace(leadPortfolioID)
+	if leadPortfolioID == "" {
+		return nil, errors.New("binance: leadPortfolioId is required")
+	}
+
+	copyPID, err := p.resolveCopyPortfolioID(leadPortfolioID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve copyPortfolioId: %w", err)
+	}
+
+	raw, err := p.postCopyTrade(BinanceCopyTradePositionHistoryAPI, map[string]interface{}{
+		"copyTradeType": BinanceCopyTradeType,
+		"portfolioId":   copyPID,
+		"page":          1,
+		"rows":          50,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	var resp BinancePositionHistoryResp
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return nil, fmt.Errorf("decode binance position-history response: %w; body=%s", err, truncate(string(raw), 200))
+	}
+
+	if isBinanceAuthError(resp.Code) {
+		logger.Warnf("⚠️ Binance copy-trade credentials expired | code=%s msg=%s leadPortfolioId=%s",
+			resp.Code, resp.Message, leadPortfolioID)
+		return nil, ErrBinanceCredentialsExpired
+	}
+	if resp.Code != BinanceCodeSuccess {
+		return nil, fmt.Errorf("binance position-history api error: code=%s msg=%s", resp.Code, resp.Message)
+	}
+
+	return resp.Data.List, nil
 }
 
 // ============================================================================
@@ -768,6 +811,37 @@ type BinanceTradeHistoryData struct {
 	IndexValue string               `json:"indexValue"`
 	Total      int                  `json:"total"`
 	List       []BinanceTradeRecord `json:"list"`
+}
+
+// BinancePositionHistoryResp /bapi/futures/v1/private/future/copy-trade/copy-portfolio/position-history 响应
+type BinancePositionHistoryResp struct {
+	Code    string                     `json:"code"`
+	Message string                     `json:"message"`
+	Success bool                       `json:"success"`
+	Data    BinancePositionHistoryData `json:"data"`
+}
+
+type BinancePositionHistoryData struct {
+	Total int                            `json:"total"`
+	List  []BinancePositionHistoryRecord `json:"list"`
+}
+
+// BinancePositionHistoryRecord 已完全平仓的仓位历史
+type BinancePositionHistoryRecord struct {
+	ID              int64   `json:"id"`
+	Symbol          string  `json:"symbol"`
+	Side            string  `json:"side"`   // Long / Short
+	Status          string  `json:"status"` // All Closed
+	Isolated        string  `json:"isolated"`
+	Leverage        string  `json:"leverage"`
+	AvgCost         float64 `json:"avgCost"`
+	AvgClosePrice   float64 `json:"avgClosePrice"`
+	MaxOpenInterest float64 `json:"maxOpenInterest"`
+	ClosedVolume    float64 `json:"closedVolume"`
+	ClosingPnL      float64 `json:"closingPnl"`
+	Opened          int64   `json:"opened"`
+	Closed          int64   `json:"closed"`
+	UpdateTime      int64   `json:"updateTime"`
 }
 
 // BinanceLeadPortfolioDetailResp /bapi/futures/v1/friendly/future/copy-trade/lead-portfolio/detail 响应
