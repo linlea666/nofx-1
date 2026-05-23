@@ -3,6 +3,7 @@ package copytrade
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"nofx/decision"
@@ -216,8 +217,9 @@ func (ti *TraderIntegration) executeFullDecision(fullDec *decision.FullDecision)
 		}
 
 		if err != nil {
-			logger.Errorf("❌ [%s] 跟单执行失败 | %s %s | error=%v",
-				ti.traderID, dec.Action, dec.Symbol, err)
+			traderName := ti.traderDisplayName()
+			logger.Errorf("❌ [%s/%s] 跟单执行失败 | %s %s | error=%v",
+				traderName, ti.traderID, dec.Action, dec.Symbol, err)
 			executionLogs = append(executionLogs, fmt.Sprintf("❌ %s %s 失败: %v", dec.Action, dec.Symbol, err))
 			ti.saveSignalLog(dec, "failed", err.Error())
 
@@ -225,9 +227,10 @@ func (ti *TraderIntegration) executeFullDecision(fullDec *decision.FullDecision)
 			notifier.Notify(notifier.Alert{
 				Category: "copy_trade",
 				TraderID: ti.traderID,
-				Title:    fmt.Sprintf("%s %s 失败", dec.Action, dec.Symbol),
-				Body:     ti.buildExecFailureAlertBody(dec, err),
+				Title:    fmt.Sprintf("%s | %s %s 失败", traderName, dec.Action, dec.Symbol),
+				Body:     ti.buildExecFailureAlertBody(dec, err, traderName),
 				Fields: map[string]string{
+					"TraderName":  traderName,
 					"Provider":    string(ti.engine.config.ProviderType),
 					"Leader":      ti.engine.config.LeaderID,
 					"Action":      dec.Action,
@@ -399,7 +402,7 @@ func (ti *TraderIntegration) logDecision(fullDec *decision.FullDecision, dec *de
 }
 
 // buildExecFailureAlertBody 构造跟单执行失败的告警正文
-func (ti *TraderIntegration) buildExecFailureAlertBody(dec *decision.Decision, err error) string {
+func (ti *TraderIntegration) buildExecFailureAlertBody(dec *decision.Decision, err error, traderName string) string {
 	providerType := ""
 	leaderID := ""
 	if ti.engine != nil && ti.engine.config != nil {
@@ -408,6 +411,7 @@ func (ti *TraderIntegration) buildExecFailureAlertBody(dec *decision.Decision, e
 	}
 	return fmt.Sprintf(
 		"跟单执行失败 (Copy Trade Execution Failed)\n\n"+
+			"Trader Name: %s\n"+
 			"Trader ID:   %s\n"+
 			"Provider:    %s\n"+
 			"Leader ID:   %s\n"+
@@ -419,6 +423,7 @@ func (ti *TraderIntegration) buildExecFailureAlertBody(dec *decision.Decision, e
 			"MarginMode:  %s\n"+
 			"LeaderPosID: %s\n\n"+
 			"错误信息 (Error):\n%s",
+		traderName,
 		ti.traderID,
 		providerType,
 		leaderID,
@@ -431,6 +436,24 @@ func (ti *TraderIntegration) buildExecFailureAlertBody(dec *decision.Decision, e
 		dec.LeaderPosID,
 		err.Error(),
 	)
+}
+
+func (ti *TraderIntegration) traderDisplayName() string {
+	if ti == nil {
+		return ""
+	}
+	if ti.store == nil {
+		return ti.traderID
+	}
+	trader, err := ti.store.Trader().GetByID(ti.traderID)
+	if err != nil || trader == nil {
+		return ti.traderID
+	}
+	name := strings.TrimSpace(trader.Name)
+	if name == "" {
+		return ti.traderID
+	}
+	return name
 }
 
 // saveSignalLog 保存信号日志到数据库
