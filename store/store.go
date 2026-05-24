@@ -16,16 +16,17 @@ type Store struct {
 	db *sql.DB
 
 	// Sub-stores (lazy initialization)
-	user      *UserStore
-	aiModel   *AIModelStore
-	exchange  *ExchangeStore
-	trader    *TraderStore
-	decision  *DecisionStore
-	backtest  *BacktestStore
-	position  *PositionStore
-	strategy  *StrategyStore
-	equity    *EquityStore
-	copyTrade *CopyTradeStore
+	user           *UserStore
+	aiModel        *AIModelStore
+	exchange       *ExchangeStore
+	trader         *TraderStore
+	decision       *DecisionStore
+	backtest       *BacktestStore
+	position       *PositionStore
+	strategy       *StrategyStore
+	equity         *EquityStore
+	copyTrade      *CopyTradeStore
+	binanceCreds   *BinanceCredentialsStore
 
 	// Encryption functions
 	encryptFunc func(string) string
@@ -153,6 +154,9 @@ func (s *Store) initTables() error {
 	if err := s.CopyTrade().initPositionMappingTable(); err != nil {
 		return fmt.Errorf("failed to initialize copy trade position mapping table: %w", err)
 	}
+	if err := s.BinanceCreds().initTables(); err != nil {
+		return fmt.Errorf("failed to initialize binance credentials tables: %w", err)
+	}
 	return nil
 }
 
@@ -172,6 +176,12 @@ func (s *Store) initDefaultData() error {
 		logger.Warnf("failed to migrate equity data: %v", err)
 	} else if migrated > 0 {
 		logger.Infof("✅ Migrated %d equity records to new table", migrated)
+	}
+	// Migrate latest per-trader Binance credentials to global store (one-time on upgrade)
+	if migrated, err := s.BinanceCreds().MigrateFromCopyTradeConfigs(); err != nil {
+		logger.Warnf("failed to migrate binance credentials: %v", err)
+	} else if migrated {
+		logger.Infof("✅ Migrated Binance credentials from per-trader to global store")
 	}
 	return nil
 }
@@ -285,6 +295,16 @@ func (s *Store) CopyTrade() *CopyTradeStore {
 		s.copyTrade = &CopyTradeStore{db: s.db}
 	}
 	return s.copyTrade
+}
+
+// BinanceCreds gets binance global credentials storage
+func (s *Store) BinanceCreds() *BinanceCredentialsStore {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.binanceCreds == nil {
+		s.binanceCreds = &BinanceCredentialsStore{db: s.db}
+	}
+	return s.binanceCreds
 }
 
 // Close closes database connection

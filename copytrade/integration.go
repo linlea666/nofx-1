@@ -82,6 +82,11 @@ func (ti *TraderIntegration) StartCopyTrading() error {
 	if engineConfig.ProviderType == ProviderHyperliquid {
 		engineOpts = append(engineOpts, WithStreamingMode())
 	}
+	// Binance 启用全局凭证热加载（store.BinanceCreds 实现了 BinanceCredentialsLoader 接口）
+	// OKX/HL 路径下 NewProviderWithLoader 不会消费 loader，零影响。
+	if engineConfig.ProviderType == ProviderBinance && ti.store != nil {
+		engineOpts = append(engineOpts, WithBinanceCredentialsLoader(ti.store.BinanceCreds()))
+	}
 
 	engine, err := NewEngine(
 		ti.traderID,

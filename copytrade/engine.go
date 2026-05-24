@@ -31,6 +31,9 @@ type Engine struct {
 	streamingProvider StreamingProvider
 	isStreamingMode   bool
 
+	// Binance 全局凭证加载器（仅 ProviderType=binance 时生效；nil 时走旧的 config 字段路径）
+	binanceCredLoader BinanceCredentialsLoader
+
 	// 跟随者账户信息（由外部注入）
 	getFollowerBalance   func() float64
 	getFollowerPositions func() map[string]*Position
@@ -72,6 +75,16 @@ type EngineOption func(*Engine)
 func WithStreamingMode() EngineOption {
 	return func(e *Engine) {
 		e.isStreamingMode = true
+	}
+}
+
+// WithBinanceCredentialsLoader 注入 Binance 全局凭证加载器（启用热加载）
+//
+// 仅 ProviderType=binance 生效；OKX/HL 完全不读 loader。
+// loader 为 nil 时等同未启用全局凭证（行为与旧版本一致）。
+func WithBinanceCredentialsLoader(loader BinanceCredentialsLoader) EngineOption {
+	return func(e *Engine) {
+		e.binanceCredLoader = loader
 	}
 }
 
@@ -118,7 +131,8 @@ func NewEngine(
 	}
 
 	// 轮询模式（默认，或流式模式不可用时回退）
-	provider, err := NewProvider(config)
+	// 仅 Binance 路径会消费 binanceCredLoader；OKX/HL 完全不读，零影响。
+	provider, err := NewProviderWithLoader(config, e.binanceCredLoader)
 	if err != nil {
 		return nil, err
 	}
@@ -129,8 +143,12 @@ func NewEngine(
 }
 
 // reportBinanceCredentialsExpired 检测错误是否为 Binance 凭证过期
-// 若是则发送邮件告警（限流键按 trader 维度，60s 节流由 notifier 全局控制），返回 true
-// 仅 ProviderType=binance 时生效；其他 provider 永远返回 false
+// 若是则发送邮件告警，返回 true。仅 ProviderType=binance 时生效；其他 provider 永远返回 false。
+//
+// 全局化设计：
+//   - RateKey 按 label 维度限流（v1 单 label "default"），无论多少个 trader 触发只发一封
+//   - Body 列出所有受影响的 Binance trader（从 store 查询，让用户一目了然）
+//   - 标题与 body 中引导用户去"系统设置 → Binance 凭证"页面（v2 全局凭证位置）
 func (e *Engine) reportBinanceCredentialsExpired(err error, where string) bool {
 	if err == nil || e.config == nil || e.config.ProviderType != ProviderBinance {
 		return false
@@ -138,24 +156,57 @@ func (e *Engine) reportBinanceCredentialsExpired(err error, where string) bool {
 	if !errors.Is(err, ErrBinanceCredentialsExpired) {
 		return false
 	}
-	logger.Warnf("🔐 [%s] Binance 跟单凭证已过期 | portfolioId=%s where=%s",
-		e.traderID, e.config.LeaderID, where)
+
+	// 查询全部受影响的 Binance trader（用于告警 body；查询失败不阻断告警）
+	var affectedTraders []string
+	if e.store != nil {
+		if ids, qerr := e.store.BinanceCreds().CountBinanceCopyTraderIDs(); qerr == nil {
+			affectedTraders = ids
+		}
+	}
+
+	logger.Warnf("🔐 [%s] Binance 跟单凭证已过期 | portfolioId=%s where=%s affected_traders=%d",
+		e.traderID, e.config.LeaderID, where, len(affectedTraders))
+
+	// label 在 v1 单账号场景下固定为 default；future-proof: 引擎层有 binanceCredLoader 时
+	// 实际 label 由 Provider 决定，这里仅用于 RateKey 与 Body 文案。
+	label := DefaultBinanceCredentialsLabel
+
 	notifier.Notify(notifier.Alert{
 		Time:     time.Now(),
 		Category: "copy_trade",
 		TraderID: e.traderID,
 		Title:    "Binance 跟单凭证已过期，请重新粘贴 cURL",
-		Body: fmt.Sprintf(
-			"Binance Web 跟单凭证 (p20t / csrftoken) 已过期或失效。\n\n"+
-				"影响范围: traderID=%s, portfolioId=%s\n"+
-				"检测位置: %s\n\n"+
-				"请登录 https://www.binance.com 跟单页面后，\n"+
-				"在 NOFX 前端 → 交易员配置 → 重新粘贴 cURL 更新凭证。\n\n"+
-				"在此期间该 trader 的 Binance 数据源将持续失败，但不会影响其他 trader 与其他数据源。",
-			e.traderID, e.config.LeaderID, where),
-		RateKey: "binance_creds_expired|" + e.traderID,
+		Body: buildBinanceCredsExpiredAlertBody(label, e.traderID, e.config.LeaderID, where, affectedTraders),
+		// 🔑 全局唯一限流键：无论多少 trader 触发，60s 内只发一封
+		RateKey: "binance_creds_expired|" + label,
 	})
 	return true
+}
+
+// buildBinanceCredsExpiredAlertBody 构造凭证过期告警 body
+// 抽到独立函数便于单元测试 + 多触发点复用
+func buildBinanceCredsExpiredAlertBody(label, currentTraderID, leaderID, where string, affectedTraders []string) string {
+	affectedSection := ""
+	if len(affectedTraders) > 0 {
+		affectedSection = fmt.Sprintf("\n受影响的 Binance 跟单交易员（共 %d 个）:\n", len(affectedTraders))
+		for _, id := range affectedTraders {
+			affectedSection += "  - " + id + "\n"
+		}
+		affectedSection += "\n"
+	}
+	return fmt.Sprintf(
+		"Binance Web 跟单凭证 (p20t / csrftoken) 已过期或失效。\n\n"+
+			"凭证 Label: %s\n"+
+			"首次检测: traderID=%s portfolioId=%s 位置=%s\n"+
+			"%s"+
+			"修复方法：\n"+
+			"  1. 登录 https://www.binance.com 跟单管理页面（保持登录状态）\n"+
+			"  2. 打开 NOFX 前端 → 系统设置 → Binance 凭证\n"+
+			"  3. 粘贴新的 cURL（自动提取 p20t / csrftoken）\n"+
+			"  4. 点击保存后所有 Binance 交易员将自动恢复，无需重启\n\n"+
+			"在此期间所有 Binance trader 的数据源将持续失败，OKX / Hyperliquid 不受影响。",
+		label, currentTraderID, leaderID, where, affectedSection)
 }
 
 // GetDecisionChannel 获取决策输出通道
@@ -1297,8 +1348,22 @@ func (e *Engine) calculateCopySizeByPositionChange(signal *TradeSignal, match *S
 	var warnings []Warning
 	fill := signal.Fill
 
-	// 领航员的账户权益
+	// 领航员的账户权益（用作比例计算分母）
+	//
+	// ⚠️ Binance 专属修正：fill.Value 是跟随者镜像价值（已被币安按定比缩放），
+	// 与 signal.LeaderEquity（领航员真实权益）量纲不一致，会导致跟单金额偏小。
+	// 修复：用 copy-portfolio/detail-list.marginBalance（跟随者实时权益）作为锚定，
+	// 与 fill.Value 严格同量纲。失败时降级回 signal.LeaderEquity（保留当前行为）。
 	leaderEquity := signal.LeaderEquity
+	anchorSource := "leader_equity"
+	if e.config.ProviderType == ProviderBinance {
+		if anchorEquity, src, anchorErr := e.resolveBinanceAnchorEquity(); anchorErr == nil && anchorEquity > 0 {
+			leaderEquity = anchorEquity
+			anchorSource = src
+		} else if anchorErr != nil {
+			logger.Warnf("⚠️ [%s] Binance 跟随者权益获取失败，降级用领航员权益: %v", e.traderID, anchorErr)
+		}
+	}
 	if leaderEquity <= 0 {
 		leaderEquity = 1 // 防止除零
 	}
@@ -1376,9 +1441,9 @@ func (e *Engine) calculateCopySizeByPositionChange(signal *TradeSignal, match *S
 	// 计算跟单金额
 	copySize := e.config.CopyRatio * leaderTradeRatio * followerEquity
 
-	logger.Infof("📊 [%s] 比例计算 | %s | 领航员: 交易=%.2f 权益=%.2f 占比=%.2f%% | 跟随者: 权益=%.2f 系数=%.0f%% → 跟单=%.2f",
+	logger.Infof("📊 [%s] 比例计算 | %s | 领航员: 交易=%.2f 权益=%.2f(锚定=%s) 占比=%.2f%% | 跟随者: 权益=%.2f 系数=%.0f%% → 跟单=%.2f",
 		e.traderID, fill.Symbol,
-		leaderTradeValue, leaderEquity, leaderTradeRatio*100,
+		leaderTradeValue, leaderEquity, anchorSource, leaderTradeRatio*100,
 		followerEquity, e.config.CopyRatio*100, copySize)
 
 	// 最小金额检查：如果低于阈值，自动提升到阈值（解决小账户精度问题）
@@ -1415,6 +1480,53 @@ func (e *Engine) calculateCopySizeByPositionChange(signal *TradeSignal, match *S
 	}
 
 	return copySize, warnings
+}
+
+// resolveBinanceAnchorEquity 解析 Binance 跟单金额比例计算的锚定权益。
+//
+// 量纲背景：
+//   - Binance copytrade fill.Value 来自 user-position（COPY 模式），
+//     是跟随者镜像仓位的价值，已被币安按定比缩放。
+//   - signal.LeaderEquity 来自 lead-portfolio/detail.marginBalance，
+//     是领航员真实权益，与镜像价值不同尺度。
+//   - 二者直接相除 → ratio 偏小约 (leader_marginBalance / follower_invest) 倍。
+//
+// 修复策略：
+//   - 调 copy-portfolio/detail-list 取跟随者实时权益（marginBalance）
+//   - 该值与镜像价值严格同量纲，比例计算正确
+//
+// 返回 (anchorEquity, source, error)：
+//   - source 用于日志标注："follower_margin"（成功）/ ""（失败 → 调用方降级）
+//   - 错误时上层会自动降级到 signal.LeaderEquity（保留量纲错配但不会崩）
+func (e *Engine) resolveBinanceAnchorEquity() (float64, string, error) {
+	if e.config == nil || e.config.ProviderType != ProviderBinance {
+		return 0, "", fmt.Errorf("not binance provider")
+	}
+
+	bp, ok := e.provider.(*BinanceProvider)
+	if !ok || bp == nil {
+		return 0, "", fmt.Errorf("provider is not *BinanceProvider")
+	}
+
+	detail, err := bp.GetCopyPortfolioDetail(e.config.LeaderID)
+	if err != nil {
+		return 0, "", err
+	}
+	if detail == nil || detail.MarginBalance <= 0 {
+		return 0, "", fmt.Errorf("follower marginBalance non-positive")
+	}
+
+	// 非 FIXED_RATIO 模式下两侧 ratio 不严格相等，但跟随者权益仍是更合适的锚定
+	// （比领航员 marginBalance 量纲偏差小得多）。仅打日志告警，不阻断。
+	if detail.CopyMode != BinanceCopyModeFixedRatio {
+		logger.Warnf("⚠️ [%s] Binance copyMode=%s 非定比，比例计算可能不严格精确（仍优于 leader_equity）",
+			e.traderID, detail.CopyMode)
+	}
+	if detail.IsPaused {
+		logger.Warnf("⚠️ [%s] Binance 领航员已暂停带单 leadStatus=%s", e.traderID, detail.LeadStatus)
+	}
+
+	return detail.MarginBalance, "follower_margin", nil
 }
 
 // getLeaderLeverage 获取领航员杠杆

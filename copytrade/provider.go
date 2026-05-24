@@ -54,7 +54,20 @@ type StreamingProvider interface {
 // NewProvider 创建 Provider（REST 轮询模式）
 // config 用于向需要凭证的 provider（如 Binance）传入额外参数；
 // HL/OKX provider 不读取 config 任何字段，零影响。
+//
+// Binance 凭证优先级：
+//  1. 不传 loader → 仅用 config.BinanceP20T / config.BinanceCSRFToken（旧行为）
+//  2. 传 loader   → 优先全局凭证，未配置时降级到 config 中的旧字段
+//
+// 推荐生产代码使用 NewProviderWithLoader。NewProvider 保留供旧调用方与测试使用。
 func NewProvider(config *CopyConfig) (LeaderProvider, error) {
+	return NewProviderWithLoader(config, nil)
+}
+
+// NewProviderWithLoader 创建 Provider 并启用 Binance 凭证热加载
+//
+// loader 可为 nil（行为等同 NewProvider）。OKX/HL 完全不使用 loader，零影响。
+func NewProviderWithLoader(config *CopyConfig, loader BinanceCredentialsLoader) (LeaderProvider, error) {
 	if config == nil {
 		return nil, fmt.Errorf("provider config is nil")
 	}
@@ -64,6 +77,12 @@ func NewProvider(config *CopyConfig) (LeaderProvider, error) {
 	case ProviderOKX:
 		return NewOKXProvider(), nil
 	case ProviderBinance:
+		if loader != nil {
+			// 启用全局凭证 + 旧字段降级（迁移过渡期）
+			return NewBinanceProviderWithLoader(loader, DefaultBinanceCredentialsLabel,
+				config.BinanceP20T, config.BinanceCSRFToken), nil
+		}
+		// 兼容旧调用方：仅用 config 中的本地凭证
 		return NewBinanceProvider(config.BinanceP20T, config.BinanceCSRFToken), nil
 	default:
 		return nil, fmt.Errorf("unsupported provider type: %s", config.ProviderType)
