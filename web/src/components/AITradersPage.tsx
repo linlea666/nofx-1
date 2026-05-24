@@ -15,6 +15,7 @@ import { getExchangeIcon } from './ExchangeIcons'
 import { getModelIcon } from './ModelIcons'
 import { TraderConfigModal } from './TraderConfigModal'
 import { ExchangeConfigModal } from './traders/ExchangeConfigModal'
+import { BinanceGlobalCredsModal } from './traders/BinanceGlobalCredsModal'
 import { PunkAvatar, getTraderAvatar } from './PunkAvatar'
 import {
   Bot,
@@ -28,6 +29,7 @@ import {
   Eye,
   EyeOff,
   ExternalLink,
+  KeyRound,
 } from 'lucide-react'
 import { confirmToast } from '../lib/notify'
 import { toast } from 'sonner'
@@ -113,6 +115,8 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
   const { user, token } = useAuth()
   const navigate = useNavigate()
   const [showCreateModal, setShowCreateModal] = useState(false)
+  // Binance 全局共享凭证管理弹窗（v2 凭证全局化入口）
+  const [showBinanceCredsModal, setShowBinanceCredsModal] = useState(false)
   const [showEditModal, setShowEditModal] = useState(false)
   const [showModelModal, setShowModelModal] = useState(false)
   const [showExchangeModal, setShowExchangeModal] = useState(false)
@@ -787,6 +791,21 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
             {t('exchanges', language)}
           </button>
 
+          {/* Binance 全局共享凭证管理（v2）：所有 Binance 跟单 trader 共享一份凭证 */}
+          <button
+            onClick={() => setShowBinanceCredsModal(true)}
+            title="Binance 跟单共享凭证（所有 Binance 跟单交易员共用）"
+            className="px-3 md:px-4 py-2 rounded text-xs md:text-sm font-semibold transition-all hover:scale-105 flex items-center gap-1 md:gap-2 whitespace-nowrap"
+            style={{
+              background: '#2B3139',
+              color: '#F0B90B',
+              border: '1px solid #F0B90B66',
+            }}
+          >
+            <KeyRound className="w-3 h-3 md:w-4 md:h-4" />
+            Binance 凭证
+          </button>
+
           <button
             onClick={() => setShowCreateModal(true)}
             disabled={
@@ -1215,6 +1234,13 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
           onClose={() => setShowCreateModal(false)}
         />
       )}
+
+      {/* Binance 全局共享凭证管理 Modal */}
+      <BinanceGlobalCredsModal
+        isOpen={showBinanceCredsModal}
+        onClose={() => setShowBinanceCredsModal(false)}
+      />
+
 
       {/* Edit Trader Modal */}
       {showEditModal && editingTrader && (

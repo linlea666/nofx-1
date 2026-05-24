@@ -690,3 +690,47 @@ export interface CopyTradeConfigRequest {
   binance_p20t?: string;
   binance_csrf_token?: string;
 }
+
+// ============================================================================
+// Binance 全局共享凭证（v2 凭证全局化）
+// ============================================================================
+// 所有 Binance 跟单 trader 共享同一份凭证，避免逐个交易员维护
+
+export type BinanceCredsStatus = 'valid' | 'expired' | 'unknown' | 'error';
+
+// 凭证视图（脱敏后；对应后端 BinanceCredentialsView）
+export interface BinanceCredentialsView {
+  label: string;
+  binance_user_id: string;
+  masked_p20t: string;
+  masked_csrf_token: string;
+  last_validated_at: string;
+  last_status: BinanceCredsStatus;
+  last_error: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface BinanceCredentialsListResponse {
+  credentials: BinanceCredentialsView[];
+  count: number;
+}
+
+export interface BinanceCredentialsSetRequest {
+  label?: string;       // 默认 'default'
+  p20t?: string;
+  csrftoken?: string;
+  curl?: string;        // 任选其一：直接填字段，或粘贴整段 cURL
+}
+
+export interface BinanceCredentialsTestResponse {
+  label: string;
+  status: BinanceCredsStatus;
+  binance_user_id: string;
+  error: string;
+}
+
+export interface BinanceCredentialsAffectedResponse {
+  trader_ids: string[];
+  count: number;
+}

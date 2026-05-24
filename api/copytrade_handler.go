@@ -1,7 +1,11 @@
 package api
 
 import (
+	"errors"
 	"net/http"
+	"regexp"
+	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"nofx/copytrade"
@@ -35,6 +39,18 @@ func (h *CopyTradeHandler) RegisterRoutes(group *gin.RouterGroup) {
 		copyTrade.POST("/stop/:trader_id", h.Stop)
 		copyTrade.GET("/stats/:trader_id", h.GetStats)
 		copyTrade.GET("/logs/:trader_id", h.GetLogs)
+
+		// Binance 全局共享凭证管理（v2 凭证全局化）
+		// 所有 Binance 跟单交易员共享同一份凭证（p20t / csrftoken），
+		// 一处更新全局生效，无需逐个交易员维护。
+		creds := copyTrade.Group("/binance-credentials")
+		{
+			creds.GET("", h.ListBinanceCredentials)
+			creds.POST("", h.SetBinanceCredentials)
+			creds.POST("/test", h.TestBinanceCredentials)
+			creds.GET("/affected", h.ListBinanceCredentialsAffectedTraders)
+			creds.DELETE("/:label", h.DeleteBinanceCredentials)
+		}
 	}
 }
 
@@ -289,5 +305,228 @@ func parseInt(s string) (int, bool) {
 		n = n*10 + int(c-'0')
 	}
 	return n, true
+}
+
+// ============================================================================
+// Binance 全局凭证管理（v2）
+// ============================================================================
+
+// BinanceCredentialsView 凭证列表项响应（已脱敏）
+type BinanceCredentialsView struct {
+	Label           string    `json:"label"`
+	BinanceUserID   string    `json:"binance_user_id"`
+	MaskedP20T      string    `json:"masked_p20t"`
+	MaskedCSRFToken string    `json:"masked_csrf_token"`
+	LastValidatedAt time.Time `json:"last_validated_at"`
+	LastStatus      string    `json:"last_status"`
+	LastError       string    `json:"last_error"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
+}
+
+func toBinanceCredentialsView(c *store.BinanceCredentials) *BinanceCredentialsView {
+	if c == nil {
+		return nil
+	}
+	return &BinanceCredentialsView{
+		Label:           c.Label,
+		BinanceUserID:   c.BinanceUserID,
+		MaskedP20T:      c.MaskedP20T(),
+		MaskedCSRFToken: c.MaskedCSRFToken(),
+		LastValidatedAt: c.LastValidatedAt,
+		LastStatus:      c.LastStatus,
+		LastError:       c.LastError,
+		CreatedAt:       c.CreatedAt,
+		UpdatedAt:       c.UpdatedAt,
+	}
+}
+
+// ListBinanceCredentials 列出所有 label 的凭证（脱敏）
+// @Router /api/copytrade/binance-credentials [get]
+func (h *CopyTradeHandler) ListBinanceCredentials(c *gin.Context) {
+	creds, err := h.store.BinanceCreds().List()
+	if err != nil {
+		logger.Errorf("Failed to list binance credentials: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list credentials"})
+		return
+	}
+	views := make([]*BinanceCredentialsView, 0, len(creds))
+	for _, item := range creds {
+		views = append(views, toBinanceCredentialsView(item))
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"credentials": views,
+		"count":       len(views),
+	})
+}
+
+// BinanceCredentialsSetRequest 设置凭证请求
+//
+// 支持两种填法（任选其一）：
+//  1. 直接填 p20t / csrftoken
+//  2. 粘贴完整 cURL 字符串到 curl 字段，由后端自动提取
+//
+// label 默认 "default"（v1 单账号）。
+type BinanceCredentialsSetRequest struct {
+	Label     string `json:"label"`
+	P20T      string `json:"p20t"`
+	CSRFToken string `json:"csrftoken"`
+	Curl      string `json:"curl"`
+}
+
+// SetBinanceCredentials 保存或更新凭证（保存后立即探活并回写状态）
+// @Router /api/copytrade/binance-credentials [post]
+func (h *CopyTradeHandler) SetBinanceCredentials(c *gin.Context) {
+	var req BinanceCredentialsSetRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	p20t := strings.TrimSpace(req.P20T)
+	csrf := strings.TrimSpace(req.CSRFToken)
+
+	// 自动从 cURL 提取（用户从浏览器开发者工具复制 cURL 时方便）
+	if (p20t == "" || csrf == "") && strings.TrimSpace(req.Curl) != "" {
+		extP20T, extCSRF := extractBinanceCredentialsFromCurl(req.Curl)
+		if p20t == "" {
+			p20t = extP20T
+		}
+		if csrf == "" {
+			csrf = extCSRF
+		}
+	}
+
+	if p20t == "" || csrf == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "p20t 与 csrftoken 不能为空（可直接填字段或粘贴完整 cURL）",
+		})
+		return
+	}
+
+	label := strings.TrimSpace(req.Label)
+	if label == "" {
+		label = store.BinanceCredsLabelDefault
+	}
+
+	if err := h.store.BinanceCreds().Set(label, p20t, csrf); err != nil {
+		logger.Errorf("Failed to save binance credentials: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save credentials"})
+		return
+	}
+
+	// 保存后立即探活并写状态（同步执行，给前端即时反馈）
+	status, errMsg, userID := h.validateBinanceCredsByLabel(label)
+	if err := h.store.BinanceCreds().UpdateStatus(label, status, errMsg, userID); err != nil {
+		logger.Warnf("Failed to update credentials status: %v", err)
+	}
+
+	creds, _ := h.store.BinanceCreds().Get(label)
+	c.JSON(http.StatusOK, gin.H{
+		"message":     "credentials saved",
+		"credentials": toBinanceCredentialsView(creds),
+	})
+}
+
+// TestBinanceCredentials 测试当前 label 凭证（不写入新值，仅探活）
+// @Router /api/copytrade/binance-credentials/test [post]
+func (h *CopyTradeHandler) TestBinanceCredentials(c *gin.Context) {
+	label := strings.TrimSpace(c.Query("label"))
+	if label == "" {
+		label = store.BinanceCredsLabelDefault
+	}
+
+	status, errMsg, userID := h.validateBinanceCredsByLabel(label)
+	if err := h.store.BinanceCreds().UpdateStatus(label, status, errMsg, userID); err != nil {
+		logger.Warnf("Failed to update credentials status: %v", err)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"label":           label,
+		"status":          status,
+		"binance_user_id": userID,
+		"error":           errMsg,
+	})
+}
+
+// DeleteBinanceCredentials 删除凭证
+// @Router /api/copytrade/binance-credentials/{label} [delete]
+func (h *CopyTradeHandler) DeleteBinanceCredentials(c *gin.Context) {
+	label := strings.TrimSpace(c.Param("label"))
+	if label == "" {
+		label = store.BinanceCredsLabelDefault
+	}
+	if err := h.store.BinanceCreds().Delete(label); err != nil {
+		logger.Errorf("Failed to delete binance credentials: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "deleted", "label": label})
+}
+
+// ListBinanceCredentialsAffectedTraders 列出哪些 trader 在用 Binance 凭证
+// （前端展示"该凭证影响 N 个交易员"用）
+// @Router /api/copytrade/binance-credentials/affected [get]
+func (h *CopyTradeHandler) ListBinanceCredentialsAffectedTraders(c *gin.Context) {
+	ids, err := h.store.BinanceCreds().CountBinanceCopyTraderIDs()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"trader_ids": ids,
+		"count":      len(ids),
+	})
+}
+
+// validateBinanceCredsByLabel 临时构造一个 Provider 调用 ValidateCredentials 探活
+//
+// 注意：临时实例与运行中的 Provider 不共享缓存，仅用于一次性探活。
+// 不会影响在跑的 trader（它们仍按自己 Provider 的缓存运行）。
+func (h *CopyTradeHandler) validateBinanceCredsByLabel(label string) (status, errMsg, userID string) {
+	creds, err := h.store.BinanceCreds().Get(label)
+	if err != nil {
+		return store.BinanceCredsStatusError, err.Error(), ""
+	}
+	if creds == nil || strings.TrimSpace(creds.P20T) == "" || strings.TrimSpace(creds.CSRFToken) == "" {
+		return store.BinanceCredsStatusUnknown, "credentials not configured", ""
+	}
+
+	// 用临时 BinanceProvider（带本地凭证）调用 ValidateCredentials
+	probe := copytrade.NewBinanceProvider(creds.P20T, creds.CSRFToken)
+	if verr := probe.ValidateCredentials(); verr != nil {
+		if errors.Is(verr, copytrade.ErrBinanceCredentialsExpired) {
+			return store.BinanceCredsStatusExpired, verr.Error(), ""
+		}
+		return store.BinanceCredsStatusError, verr.Error(), ""
+	}
+
+	// 探活成功：再调一次 get-user-base-info 拿 userId（用于显示绑定的币安账号）
+	uid := probe.FetchedBinanceUserID()
+	return store.BinanceCredsStatusValid, "", uid
+}
+
+// extractBinanceCredentialsFromCurl 从浏览器复制的 cURL 文本中提取 p20t / csrftoken
+//
+// 容忍多种格式：
+//   - -H 'csrftoken: xxx'
+//   - --header 'csrftoken: xxx'
+//   - cookie: ...; p20t=xxx; ...
+//   - -b 'p20t=xxx'
+//
+// 提取失败时返回空字符串，由调用方报错。
+func extractBinanceCredentialsFromCurl(curl string) (p20t, csrfToken string) {
+	// csrftoken 匹配（header 形式）
+	csrfRe := regexp.MustCompile(`(?i)csrftoken['":\s]*([0-9a-f]{16,})`)
+	if m := csrfRe.FindStringSubmatch(curl); len(m) >= 2 {
+		csrfToken = m[1]
+	}
+
+	// p20t 匹配（cookie 形式）
+	p20tRe := regexp.MustCompile(`(?i)p20t=([^\s;'"]+)`)
+	if m := p20tRe.FindStringSubmatch(curl); len(m) >= 2 {
+		p20t = m[1]
+	}
+	return p20t, csrfToken
 }
 

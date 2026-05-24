@@ -28,6 +28,11 @@ import type {
   DebateMessage,
   DebateVote,
   DebatePersonalityInfo,
+  BinanceCredentialsView,
+  BinanceCredentialsListResponse,
+  BinanceCredentialsSetRequest,
+  BinanceCredentialsTestResponse,
+  BinanceCredentialsAffectedResponse,
 } from '../types'
 import { CryptoService } from './crypto'
 import { httpClient } from './httpClient'
@@ -758,5 +763,51 @@ export const api = {
   createDebateStream(debateId: string): EventSource {
     const token = localStorage.getItem('auth_token')
     return new EventSource(`${API_BASE}/debates/${debateId}/stream?token=${token}`)
+  },
+
+  // ==========================================================================
+  // Binance 全局共享凭证管理（v2 凭证全局化）
+  // ==========================================================================
+  // 所有 Binance 跟单 trader 共享同一份凭证；一处更新全局生效，无需逐个 trader 维护
+
+  async listBinanceCredentials(): Promise<BinanceCredentialsView[]> {
+    const result = await httpClient.get<BinanceCredentialsListResponse>(
+      `${API_BASE}/copytrade/binance-credentials`
+    )
+    if (!result.success) throw new Error(result.message || '获取 Binance 凭证失败')
+    return result.data?.credentials ?? []
+  },
+
+  async setBinanceCredentials(req: BinanceCredentialsSetRequest): Promise<BinanceCredentialsView | null> {
+    const result = await httpClient.post<{ message: string; credentials: BinanceCredentialsView }>(
+      `${API_BASE}/copytrade/binance-credentials`,
+      req
+    )
+    if (!result.success) throw new Error(result.message || '保存 Binance 凭证失败')
+    return result.data?.credentials ?? null
+  },
+
+  async testBinanceCredentials(label?: string): Promise<BinanceCredentialsTestResponse> {
+    const url = label
+      ? `${API_BASE}/copytrade/binance-credentials/test?label=${encodeURIComponent(label)}`
+      : `${API_BASE}/copytrade/binance-credentials/test`
+    const result = await httpClient.post<BinanceCredentialsTestResponse>(url)
+    if (!result.success) throw new Error(result.message || '测试 Binance 凭证失败')
+    return result.data!
+  },
+
+  async deleteBinanceCredentials(label: string): Promise<void> {
+    const result = await httpClient.delete(
+      `${API_BASE}/copytrade/binance-credentials/${encodeURIComponent(label)}`
+    )
+    if (!result.success) throw new Error(result.message || '删除 Binance 凭证失败')
+  },
+
+  async getBinanceCredentialsAffectedTraders(): Promise<string[]> {
+    const result = await httpClient.get<BinanceCredentialsAffectedResponse>(
+      `${API_BASE}/copytrade/binance-credentials/affected`
+    )
+    if (!result.success) throw new Error(result.message || '获取受影响交易员失败')
+    return result.data?.trader_ids ?? []
   },
 }

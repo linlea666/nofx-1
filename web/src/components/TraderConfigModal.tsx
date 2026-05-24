@@ -1,11 +1,33 @@
 import { useState, useEffect } from 'react'
-import { BinanceCredentialsPanel } from './BinanceCredentialsPanel'
-import type { AIModel, Exchange, CreateTraderRequest, Strategy, DecisionMode, CopyTradeProvider, CopyTradeConfig } from '../types'
+import type {
+  AIModel,
+  Exchange,
+  CreateTraderRequest,
+  Strategy,
+  DecisionMode,
+  CopyTradeProvider,
+  CopyTradeConfig,
+  BinanceCredentialsView,
+} from '../types'
 import { useLanguage } from '../contexts/LanguageContext'
 import { t } from '../i18n/translations'
 import { toast } from 'sonner'
-import { Pencil, Plus, X as IconX, Sparkles, ExternalLink, UserPlus, Bot, Users } from 'lucide-react'
+import {
+  Pencil,
+  Plus,
+  X as IconX,
+  Sparkles,
+  ExternalLink,
+  UserPlus,
+  Bot,
+  Users,
+  KeyRound,
+  CheckCircle2,
+  AlertCircle,
+} from 'lucide-react'
 import { httpClient } from '../lib/httpClient'
+import { api } from '../lib/api'
+import { BinanceGlobalCredsModal } from './traders/BinanceGlobalCredsModal'
 
 // 提取下划线后面的名称部分
 function getShortName(fullName: string): string {
@@ -90,6 +112,26 @@ export function TraderConfigModal({
   const [strategies, setStrategies] = useState<Strategy[]>([])
   const [isFetchingBalance, setIsFetchingBalance] = useState(false)
   const [balanceFetchError, setBalanceFetchError] = useState<string>('')
+
+  // Binance 全局凭证状态（仅 provider=binance 时拉取，作为状态展示）
+  const [binanceGlobalCreds, setBinanceGlobalCreds] = useState<BinanceCredentialsView | null>(null)
+  const [showBinanceCredsModal, setShowBinanceCredsModal] = useState(false)
+  const [refreshGlobalCredsTick, setRefreshGlobalCredsTick] = useState(0)
+
+  // 拉取 Binance 全局凭证状态（用于顶部状态卡展示）
+  // 仅在弹窗打开 + provider=binance 时拉取，避免无谓的请求
+  useEffect(() => {
+    if (!isOpen || formData.copy_provider_type !== 'binance') return
+    let cancelled = false
+    api.listBinanceCredentials()
+      .then((list) => {
+        if (cancelled) return
+        const def = list.find((c) => c.label === 'default') ?? null
+        setBinanceGlobalCreds(def)
+      })
+      .catch(() => { /* 静默：状态卡仅展示用，失败时显示"未配置"即可 */ })
+    return () => { cancelled = true }
+  }, [isOpen, formData.copy_provider_type, refreshGlobalCredsTick])
 
   // 获取用户的策略列表
   useEffect(() => {
@@ -593,19 +635,62 @@ export function TraderConfigModal({
                     </p>
                   </div>
 
-                  {/* Binance 凭证面板（仅 binance 数据源显示） */}
+                  {/* Binance 全局共享凭证状态卡（v2 凭证全局化） */}
+                  {/* 旧字段 copy_binance_p20t/copy_binance_csrf_token 仍保留在 formData 中
+                      作为向后兼容的降级凭证；新用户使用全局凭证即可，无需在交易员级别配置 */}
                   {formData.copy_provider_type === 'binance' && (
-                    <BinanceCredentialsPanel
-                      p20t={formData.copy_binance_p20t}
-                      csrfToken={formData.copy_binance_csrf_token}
-                      onChange={(p20t, csrf) => {
-                        setFormData(prev => ({
-                          ...prev,
-                          copy_binance_p20t: p20t,
-                          copy_binance_csrf_token: csrf,
-                        }))
-                      }}
-                    />
+                    <div className="mt-4 p-4 bg-[#0B0E11] border border-[#F0B90B33] rounded-lg space-y-3">
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-2">
+                          <KeyRound className="w-4 h-4 text-[#F0B90B]" />
+                          <span className="text-[#F0B90B] text-sm font-medium">Binance 共享凭证</span>
+                          <span className="px-2 py-0.5 text-[10px] bg-[#F0B90B22] text-[#F0B90B] rounded">全局共享</span>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => setShowBinanceCredsModal(true)}
+                          className="text-xs text-[#F0B90B] hover:underline"
+                        >
+                          {binanceGlobalCreds ? '管理凭证 →' : '立即配置 →'}
+                        </button>
+                      </div>
+
+                      {binanceGlobalCreds ? (
+                        <div className="flex items-center gap-3 text-xs">
+                          {binanceGlobalCreds.last_status === 'valid' ? (
+                            <span className="flex items-center gap-1.5 text-[#0ECB81]">
+                              <CheckCircle2 className="w-3.5 h-3.5" />
+                              凭证有效
+                            </span>
+                          ) : binanceGlobalCreds.last_status === 'expired' ? (
+                            <span className="flex items-center gap-1.5 text-[#F6465D]">
+                              <AlertCircle className="w-3.5 h-3.5" />
+                              凭证已过期
+                            </span>
+                          ) : (
+                            <span className="flex items-center gap-1.5 text-[#848E9C]">
+                              <AlertCircle className="w-3.5 h-3.5" />
+                              未校验
+                            </span>
+                          )}
+                          {binanceGlobalCreds.binance_user_id && (
+                            <span className="text-[#848E9C]">
+                              账号 ID: <span className="font-mono text-[#EAECEF]">{binanceGlobalCreds.binance_user_id}</span>
+                            </span>
+                          )}
+                        </div>
+                      ) : (
+                        <div className="text-xs text-[#F6465D] flex items-center gap-1.5">
+                          <AlertCircle className="w-3.5 h-3.5" />
+                          全局凭证尚未配置，本交易员无法读取领航员数据
+                        </div>
+                      )}
+
+                      <p className="text-[11px] text-[#848E9C] leading-relaxed">
+                        所有 Binance 跟单交易员共用同一份凭证（p20t / csrftoken）。
+                        在此处或顶部"Binance 凭证"按钮配置一次后，所有 Binance 交易员立即生效，无需重启。
+                      </p>
+                    </div>
                   )}
 
                   {/* Copy Ratio */}
@@ -876,6 +961,16 @@ export function TraderConfigModal({
           )}
         </div>
       </div>
+
+      {/* Binance 全局共享凭证 Modal（嵌套在 TraderConfigModal 内，方便用户在配置 Binance 跟单时直接配置凭证） */}
+      <BinanceGlobalCredsModal
+        isOpen={showBinanceCredsModal}
+        onClose={() => {
+          setShowBinanceCredsModal(false)
+          // 关闭后刷新一次凭证状态，立即反映新值
+          setRefreshGlobalCredsTick((n) => n + 1)
+        }}
+      />
     </div>
   )
 }
