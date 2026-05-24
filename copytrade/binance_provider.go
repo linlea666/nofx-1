@@ -815,42 +815,61 @@ func (p *BinanceProvider) fetchLeaderDetail(leadPortfolioID string) (float64, st
 //
 // 用途：跟单金额比例计算分母（解决"镜像价值/领航员权益"量纲错配）
 //
-// 行为：
-//   - 60s TTL 缓存（list 接口一次返回所有领航员，按 leadPortfolioId 索引）
-//   - 缓存命中：直接返回（不发网络请求）
-//   - 缓存过期/未初始化：调一次 detail-list 刷新整个 map
-//   - 凭证缺失/失效 → 返回 ErrBinanceCredentialsExpired
-//   - leadPortfolioId 不在用户跟单列表 → 返回 ErrBinanceNotCopying
+// 行为（fresh / refresh / stale 三级降级）：
+//   - L1 Fresh: 缓存有效（< binanceCopyDetailTTL）→ 直接返回缓存
+//   - L2 Refresh: 缓存失效或未命中 → 调 detail-list 刷新整个 map → 命中返回新值
+//   - L3 Stale: refresh 失败但有旧缓存命中（量纲仍然正确，仅时效性差）
+//     → 返回旧缓存 + warn log，避免雪崩 + 避免上层错配 fallback
+//   - 错误：
+//   - 凭证缺失/失效 → ErrBinanceCredentialsExpired（且无 stale 时返回）
+//   - 完全无缓存 + leadPortfolioId 不在列表 → ErrBinanceNotCopying
+//   - 完全无缓存 + 接口失败 → 透传底层 error
 //
-// 返回的 detail.MarginBalance 与 fill.Value 严格同量纲。
+// 返回的 detail.MarginBalance 与 fill.Value 严格同量纲（量纲对齐是修复用户最初
+// 跟单金额过小问题的关键，不能因临时失败回退到不同量纲的值）。
 func (p *BinanceProvider) GetCopyPortfolioDetail(leadPortfolioID string) (*BinanceCopyPortfolioDetail, error) {
 	leadPortfolioID = strings.TrimSpace(leadPortfolioID)
 	if leadPortfolioID == "" {
 		return nil, errors.New("binance: leadPortfolioId is required")
 	}
 
-	// 1) 尝试缓存命中
+	// L1 Fresh: 缓存有效命中
 	p.mu.Lock()
 	cacheValid := p.copyDetailsValid && time.Since(p.copyDetailsAt) < binanceCopyDetailTTL
-	var cached *BinanceCopyPortfolioDetail
+	var fresh *BinanceCopyPortfolioDetail
 	if cacheValid && p.copyDetails != nil {
 		if hit, ok := p.copyDetails[leadPortfolioID]; ok {
-			cached = hit
+			fresh = hit
+		}
+	}
+	// 同时取出 stale 候选（用于 L3 fallback）
+	var stale *BinanceCopyPortfolioDetail
+	var staleAt time.Time
+	if p.copyDetailsValid && p.copyDetails != nil {
+		if hit, ok := p.copyDetails[leadPortfolioID]; ok {
+			stale = hit
+			staleAt = p.copyDetailsAt
 		}
 	}
 	p.mu.Unlock()
-	if cached != nil {
-		return cached, nil
+	if fresh != nil {
+		return fresh, nil
 	}
 
-	// 2) 缓存未命中：刷新整个 list
+	// L2 Refresh: 缓存未命中或过期 → 拉新
 	rawList, err := p.fetchCopyPortfolioDetailList()
 	if err != nil {
+		// L3 Stale: 拉新失败但有旧缓存 → 返回 stale 而不是 error，避免上层
+		// 错配 fallback。stale 是 60s 前的跟随者权益，与 fill.Value 量纲仍然
+		// 严格一致，仅时效性差几十秒，比 leader_equity 准确得多。
+		if stale != nil {
+			logger.Warnf("⚠️ Binance copy-portfolio/detail-list 刷新失败，沿用旧缓存（量纲仍正确） | leadPortfolioId=%s ageMs=%d err=%v",
+				leadPortfolioID, time.Since(staleAt).Milliseconds(), err)
+			return stale, nil
+		}
 		return nil, err
 	}
 
-	// 3) 转换 + 写缓存（即使 leadPortfolioId 不在 list 中，也要更新 cache 时间，
-	//    避免短时间内反复发请求同一个失败查询）
 	now := time.Now()
 	newMap := make(map[string]*BinanceCopyPortfolioDetail, len(rawList))
 	for i := range rawList {
@@ -878,6 +897,7 @@ func (p *BinanceProvider) GetCopyPortfolioDetail(leadPortfolioID string) (*Binan
 	p.mu.Unlock()
 
 	if hit == nil {
+		// 用户在币安上还未对该领航员建立跟单关系（或刚解除）
 		return nil, fmt.Errorf("%w (leadPortfolioId=%s)", ErrBinanceNotCopying, leadPortfolioID)
 	}
 

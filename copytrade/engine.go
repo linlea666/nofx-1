@@ -165,7 +165,7 @@ func (e *Engine) reportBinanceCredentialsExpired(err error, where string) bool {
 		}
 	}
 
-	logger.Warnf("🔐 [%s] Binance 跟单凭证已过期 | portfolioId=%s where=%s affected_traders=%d",
+	logger.Warnf("🔐 [%s] Binance 跟单凭证未配置或已过期 | portfolioId=%s where=%s affected_traders=%d",
 		e.traderID, e.config.LeaderID, where, len(affectedTraders))
 
 	// label 在 v1 单账号场景下固定为 default；future-proof: 引擎层有 binanceCredLoader 时
@@ -176,8 +176,8 @@ func (e *Engine) reportBinanceCredentialsExpired(err error, where string) bool {
 		Time:     time.Now(),
 		Category: "copy_trade",
 		TraderID: e.traderID,
-		Title:    "Binance 跟单凭证已过期，请重新粘贴 cURL",
-		Body: buildBinanceCredsExpiredAlertBody(label, e.traderID, e.config.LeaderID, where, affectedTraders),
+		Title:    "Binance 跟单凭证未配置或已过期，请粘贴 cURL",
+		Body:     buildBinanceCredsExpiredAlertBody(label, e.traderID, e.config.LeaderID, where, affectedTraders),
 		// 🔑 全局唯一限流键：无论多少 trader 触发，60s 内只发一封
 		RateKey: "binance_creds_expired|" + label,
 	})
@@ -196,14 +196,14 @@ func buildBinanceCredsExpiredAlertBody(label, currentTraderID, leaderID, where s
 		affectedSection += "\n"
 	}
 	return fmt.Sprintf(
-		"Binance Web 跟单凭证 (p20t / csrftoken) 已过期或失效。\n\n"+
+		"Binance Web 跟单凭证 (p20t / csrftoken) 未配置或已过期失效。\n\n"+
 			"凭证 Label: %s\n"+
 			"首次检测: traderID=%s portfolioId=%s 位置=%s\n"+
 			"%s"+
 			"修复方法：\n"+
 			"  1. 登录 https://www.binance.com 跟单管理页面（保持登录状态）\n"+
-			"  2. 打开 NOFX 前端 → 系统设置 → Binance 凭证\n"+
-			"  3. 粘贴新的 cURL（自动提取 p20t / csrftoken）\n"+
+			"  2. 打开 NOFX 前端 → AI 交易员管理 → 顶部 \"Binance 凭证\" 按钮\n"+
+			"  3. 粘贴 cURL（自动提取 p20t / csrftoken）\n"+
 			"  4. 点击保存后所有 Binance 交易员将自动恢复，无需重启\n\n"+
 			"在此期间所有 Binance trader 的数据源将持续失败，OKX / Hyperliquid 不受影响。",
 		label, currentTraderID, leaderID, where, affectedSection)
@@ -1350,18 +1350,37 @@ func (e *Engine) calculateCopySizeByPositionChange(signal *TradeSignal, match *S
 
 	// 领航员的账户权益（用作比例计算分母）
 	//
-	// ⚠️ Binance 专属修正：fill.Value 是跟随者镜像价值（已被币安按定比缩放），
-	// 与 signal.LeaderEquity（领航员真实权益）量纲不一致，会导致跟单金额偏小。
-	// 修复：用 copy-portfolio/detail-list.marginBalance（跟随者实时权益）作为锚定，
-	// 与 fill.Value 严格同量纲。失败时降级回 signal.LeaderEquity（保留当前行为）。
+	// ⚠️ Binance 专属锚定：fill.Value 是跟随者镜像价值（已被币安按定比缩放），
+	// 与 signal.LeaderEquity（领航员真实权益）量纲不一致——直接相除会让
+	// 跟单金额偏小约 (leader_marginBalance / follower_invest) 倍。
+	// 正确锚定：copy-portfolio/detail-list.marginBalance（跟随者实时权益），
+	// 与 fill.Value 严格同量纲；Provider 内部已实现 stale cache 兜底，
+	// 让网络抖动等临时失败不会回退到错误量纲。
 	leaderEquity := signal.LeaderEquity
 	anchorSource := "leader_equity"
 	if e.config.ProviderType == ProviderBinance {
-		if anchorEquity, src, anchorErr := e.resolveBinanceAnchorEquity(); anchorErr == nil && anchorEquity > 0 {
+		anchorEquity, src, anchorErr := e.resolveBinanceAnchorEquity()
+		if anchorErr == nil && anchorEquity > 0 {
 			leaderEquity = anchorEquity
 			anchorSource = src
 		} else if anchorErr != nil {
-			logger.Warnf("⚠️ [%s] Binance 跟随者权益获取失败，降级用领航员权益: %v", e.traderID, anchorErr)
+			// 凭证类错误兜底告警（避免用户错过过期通知）
+			e.reportBinanceCredentialsExpired(anchorErr, "calculateCopySize/anchor")
+			// 仅在"完全没有 stale 缓存"的极端场景才会走到这里：
+			//   - 启动后首次拉 detail-list 就失败
+			//   - 且无凭证 / 凭证从未成功过
+			// 此时回退到 LeaderEquity 量纲会偏小，但能"跟动作"不至于完全停摆；
+			// 同时记录 high 级 warning 让用户感知（搜 "ANCHOR_FALLBACK" 即可定位）。
+			anchorSource = "leader_equity_FALLBACK"
+			logger.Warnf("⚠️ [%s] ANCHOR_FALLBACK Binance 跟随者权益获取失败，本次跟单金额量纲可能偏小: %v",
+				e.traderID, anchorErr)
+			warnings = append(warnings, Warning{
+				Timestamp: time.Now(),
+				Symbol:    fill.Symbol,
+				Type:      "anchor_fallback",
+				Message:   fmt.Sprintf("跟随者权益接口失败，回退用领航员权益锚定，本次跟单金额可能偏小: %v", anchorErr),
+				Executed:  true,
+			})
 		}
 	}
 	if leaderEquity <= 0 {

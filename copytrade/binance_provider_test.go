@@ -310,6 +310,54 @@ func TestBinanceGetCopyPortfolioDetail(t *testing.T) {
 			t.Fatalf("want ErrBinanceCredentialsExpired, got %v", err)
 		}
 	})
+
+	// stale fallback：曾成功过的缓存在网络失败时仍可用，避免上层错配 fallback。
+	// 这是修复"anchor 失败时 fallback 量纲偏小"问题的核心保障。
+	t.Run("stale cache survives transient failure", func(t *testing.T) {
+		var calls int
+		var failNext bool
+		p := newBinanceProviderWithTransport(func(req *http.Request) (*http.Response, error) {
+			calls++
+			if failNext {
+				return nil, errors.New("simulated network error")
+			}
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+		})
+
+		d, err := p.GetCopyPortfolioDetail(targetID)
+		if err != nil {
+			t.Fatalf("warm-up call err: %v", err)
+		}
+		expectedMB := d.MarginBalance
+
+		// 强制使缓存过期（让下次调用走 refresh 路径）
+		p.mu.Lock()
+		p.copyDetailsAt = p.copyDetailsAt.Add(-2 * binanceCopyDetailTTL)
+		p.mu.Unlock()
+
+		failNext = true
+		d2, err := p.GetCopyPortfolioDetail(targetID)
+		if err != nil {
+			t.Fatalf("expected stale fallback to succeed, got err: %v", err)
+		}
+		if d2 == nil || d2.MarginBalance != expectedMB {
+			t.Fatalf("stale fallback returned wrong value: got=%+v want marginBalance=%v", d2, expectedMB)
+		}
+		if calls != 2 {
+			t.Fatalf("expected 2 HTTP calls (warm + failed refresh), got %d", calls)
+		}
+	})
+
+	// 完全无缓存 + refresh 失败 → 应该返回 error 而不是悄悄成功
+	t.Run("no cache + refresh fails returns error", func(t *testing.T) {
+		p := newBinanceProviderWithTransport(func(req *http.Request) (*http.Response, error) {
+			return nil, errors.New("simulated network error")
+		})
+		_, err := p.GetCopyPortfolioDetail(targetID)
+		if err == nil {
+			t.Fatalf("expected error when no cache and refresh fails")
+		}
+	})
 }
 
 func TestBinanceGetPositionHistory(t *testing.T) {
