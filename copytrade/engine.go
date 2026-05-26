@@ -1168,7 +1168,13 @@ func (e *Engine) processSignal(signal *TradeSignal) {
 	// ========================================
 	// Step 3: 计算跟单仓位（基于持仓变化量）
 	// ========================================
-	copySize, warnings := e.calculateCopySizeByPositionChange(signal, matchResult)
+	copySize := 0.0
+	var warnings []Warning
+	if matchResult.Action == ActionOpen || matchResult.Action == ActionAdd {
+		copySize, warnings = e.calculateCopySizeByPositionChange(signal, matchResult)
+	} else {
+		logger.Debugf("📊 [%s] %s 不需要计算开仓金额，跳过金额锚定", e.traderID, matchResult.Action)
+	}
 
 	// 记录所有预警（不阻止交易）
 	for _, w := range warnings {
@@ -1574,6 +1580,8 @@ func (e *Engine) getLeaderLeverage(signal *TradeSignal) int {
 	}
 
 	// 4. 默认值
+	logger.Warnf("⚠️ [%s] 同步杠杆已开启，但未获取到领航员 %s %s 的有效杠杆，使用默认 10x",
+		e.traderID, signal.Fill.Symbol, signal.Fill.PositionSide)
 	return 10
 }
 

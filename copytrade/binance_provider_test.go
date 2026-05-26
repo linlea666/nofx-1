@@ -389,3 +389,93 @@ func TestBinanceGetPositionHistory(t *testing.T) {
 		t.Fatalf("unexpected record: %+v", records[0])
 	}
 }
+
+func TestBinanceGetAccountStateInfersLeverageFromPositionMargins(t *testing.T) {
+	p := newBinanceProviderWithTransport(func(req *http.Request) (*http.Response, error) {
+		body := `{}`
+		switch {
+		case strings.Contains(req.URL.Path, "/lead-portfolio/detail"):
+			body = `{"code":"000000","data":{"copyPortfolioId":"copy-123","hasCopy":true,"marginBalance":"100.5"}}`
+		case strings.Contains(req.URL.Path, "/user-position"):
+			body = `{"code":"000000","data":[{
+				"id":"1239518824_ETHUSDT_LONG",
+				"symbol":"ETHUSDT",
+				"positionSide":"LONG",
+				"positionAmount":"0.02",
+				"entryPrice":"2000",
+				"markPrice":"2010",
+				"notionalValue":"80",
+				"initialMargin":"8",
+				"positionInitialMargin":"4"
+			},{
+				"id":"1239518824_ETHUSDT_SHORT",
+				"symbol":"ETHUSDT",
+				"positionSide":"SHORT",
+				"positionAmount":"-0.036",
+				"entryPrice":"2110.62",
+				"markPrice":"2099.83",
+				"notionalValue":"-75.59388000",
+				"initialMargin":"3.97862535",
+				"positionInitialMargin":"3.97862535"
+			},{
+				"id":"1239518824_BTCUSDT_BOTH",
+				"symbol":"BTCUSDT",
+				"positionSide":"BOTH",
+				"positionAmount":"-0.002",
+				"entryPrice":"60000",
+				"markPrice":"60000",
+				"notionalValue":"-120",
+				"initialMargin":"6",
+				"positionInitialMargin":"0"
+			}]}`
+		default:
+			t.Fatalf("unexpected request path: %s", req.URL.Path)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(body)),
+			Header:     make(http.Header),
+		}, nil
+	})
+
+	state, err := p.GetAccountState("leader-portfolio")
+	if err != nil {
+		t.Fatalf("GetAccountState error: %v", err)
+	}
+
+	longPos := state.Positions["1239518824_ETHUSDT_LONG"]
+	if longPos == nil {
+		t.Fatalf("expected long position")
+	}
+	if longPos.Leverage != 20 {
+		t.Fatalf("expected long leverage 20x from positionInitialMargin, got %dx", longPos.Leverage)
+	}
+	if longPos.PositionValue != 80 {
+		t.Fatalf("expected long position value 80, got %.8f", longPos.PositionValue)
+	}
+
+	shortPos := state.Positions["1239518824_ETHUSDT_SHORT"]
+	if shortPos == nil {
+		t.Fatalf("expected short position")
+	}
+	if shortPos.Side != SideShort {
+		t.Fatalf("expected short side, got %s", shortPos.Side)
+	}
+	if shortPos.Leverage != 19 {
+		t.Fatalf("expected short leverage 19x from abs(notional)/positionInitialMargin, got %dx", shortPos.Leverage)
+	}
+	if shortPos.PositionValue != 75.59388 {
+		t.Fatalf("expected positive short position value 75.59388, got %.8f", shortPos.PositionValue)
+	}
+
+	bothPos := state.Positions["1239518824_BTCUSDT_BOTH"]
+	if bothPos == nil {
+		t.Fatalf("expected BOTH position")
+	}
+	if bothPos.Side != SideShort {
+		t.Fatalf("expected BOTH negative amount to map to short, got %s", bothPos.Side)
+	}
+	if bothPos.Leverage != 20 {
+		t.Fatalf("expected BOTH leverage 20x from initialMargin fallback, got %dx", bothPos.Leverage)
+	}
+}

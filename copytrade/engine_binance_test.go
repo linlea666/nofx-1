@@ -468,6 +468,185 @@ func TestBinanceCalculateFallbackOnDetailListFailure(t *testing.T) {
 	}
 }
 
+func TestBinanceDecisionSyncsLeaderLeverage(t *testing.T) {
+	e, _ := newTestCopyTradeEngine(t, ProviderBinance)
+	e.config.SyncLeverage = true
+
+	pos := binanceTestPosition("1239518824_ETHUSDT_LONG", 0.02)
+	pos.Leverage = 40
+	signal := &TradeSignal{
+		ProviderType:   ProviderBinance,
+		Fill:           &Fill{Symbol: "ETHUSDT", PositionSide: SideLong, Price: 2000},
+		LeaderPosition: pos,
+		LeaderEquity:   1000,
+		LeaderPosID:    pos.PosID,
+	}
+	match := &SignalMatchResult{
+		ShouldFollow:   true,
+		Action:         ActionOpen,
+		PosID:          pos.PosID,
+		MarginMode:     "cross",
+		LeaderPosition: pos,
+	}
+
+	dec := e.buildDecisionV2(signal, match, 100)
+	if dec.Leverage != 40 {
+		t.Fatalf("expected synced leader leverage 40x, got %dx", dec.Leverage)
+	}
+
+	shortPos := binanceTestPosition("1239518824_ETHUSDT_SHORT", 0.036)
+	shortPos.Side = SideShort
+	shortPos.Leverage = 19
+	shortSignal := &TradeSignal{
+		ProviderType:   ProviderBinance,
+		Fill:           &Fill{Symbol: "ETHUSDT", PositionSide: SideShort, Price: 2000},
+		LeaderPosition: shortPos,
+		LeaderEquity:   1000,
+		LeaderPosID:    shortPos.PosID,
+	}
+	shortMatch := &SignalMatchResult{
+		ShouldFollow:   true,
+		Action:         ActionAdd,
+		PosID:          shortPos.PosID,
+		MarginMode:     "cross",
+		LeaderPosition: shortPos,
+	}
+	dec = e.buildDecisionV2(shortSignal, shortMatch, 50)
+	if dec.Action != "open_short" || dec.Leverage != 19 {
+		t.Fatalf("expected add short decision with synced 19x leverage, got %+v", dec)
+	}
+
+	e.config.SyncLeverage = false
+	dec = e.buildDecisionV2(signal, match, 100)
+	if dec.Leverage != 10 {
+		t.Fatalf("expected default leverage 10x when sync disabled, got %dx", dec.Leverage)
+	}
+}
+
+func TestBinanceReduceDoesNotResolveAnchorOrRequireLeverage(t *testing.T) {
+	const posID = "1239518824_ETHUSDT_LONG"
+	e, st := newTestCopyTradeEngine(t, ProviderBinance)
+	saveActiveMapping(t, st, posID, 0.02)
+
+	bp := newBinanceProviderWithTransport(func(req *http.Request) (*http.Response, error) {
+		body := `{}`
+		switch {
+		case strings.Contains(req.URL.Path, "/lead-portfolio/detail"):
+			body = `{"code":"000000","data":{"copyPortfolioId":"copy-123","hasCopy":true,"marginBalance":"1000"}}`
+		case strings.Contains(req.URL.Path, "/user-position"):
+			body = `{"code":"000000","data":[{
+				"id":"` + posID + `",
+				"symbol":"ETHUSDT",
+				"positionSide":"LONG",
+				"positionAmount":"0.01",
+				"entryPrice":"2000",
+				"markPrice":"2000",
+				"notionalValue":"20",
+				"initialMargin":"2",
+				"positionInitialMargin":"0"
+			}]}`
+		case strings.Contains(req.URL.Path, "/copy-portfolio/detail-list"):
+			t.Fatalf("reduce/close path must not resolve Binance follower margin anchor")
+		default:
+			t.Fatalf("unexpected request path: %s", req.URL.Path)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(body)),
+			Header:     make(http.Header),
+		}, nil
+	})
+	e.provider = bp
+
+	e.processSignal(&TradeSignal{Fill: &Fill{
+		ID:           "reduce-snapshot",
+		Symbol:       "ETHUSDT",
+		Side:         "sell",
+		PositionSide: SideLong,
+		Action:       ActionClose,
+		Price:        2000,
+		Size:         0.01,
+		Value:        20,
+		Timestamp:    time.Now(),
+	}})
+
+	select {
+	case fullDec := <-e.decisionCh:
+		if len(fullDec.Decisions) != 1 {
+			t.Fatalf("decision len=%d want 1", len(fullDec.Decisions))
+		}
+		dec := fullDec.Decisions[0]
+		if dec.Action != "reduce_long" {
+			t.Fatalf("expected reduce_long, got %+v", dec)
+		}
+		if dec.PositionSizeUSD != 0 {
+			t.Fatalf("reduce must not carry open position size, got %.8f", dec.PositionSizeUSD)
+		}
+		if dec.Leverage != 0 {
+			t.Fatalf("reduce must not require leverage, got %dx", dec.Leverage)
+		}
+	default:
+		t.Fatalf("expected reduce decision")
+	}
+}
+
+func TestBinanceCloseDoesNotResolveAnchorOrRequireLeverage(t *testing.T) {
+	const posID = "1239518824_ETHUSDT_LONG"
+	e, st := newTestCopyTradeEngine(t, ProviderBinance)
+	saveActiveMapping(t, st, posID, 0.02)
+
+	bp := newBinanceProviderWithTransport(func(req *http.Request) (*http.Response, error) {
+		body := `{}`
+		switch {
+		case strings.Contains(req.URL.Path, "/lead-portfolio/detail"):
+			body = `{"code":"000000","data":{"copyPortfolioId":"copy-123","hasCopy":true,"marginBalance":"1000"}}`
+		case strings.Contains(req.URL.Path, "/user-position"):
+			body = `{"code":"000000","data":[]}`
+		case strings.Contains(req.URL.Path, "/copy-portfolio/detail-list"):
+			t.Fatalf("close path must not resolve Binance follower margin anchor")
+		default:
+			t.Fatalf("unexpected request path: %s", req.URL.Path)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(body)),
+			Header:     make(http.Header),
+		}, nil
+	})
+	e.provider = bp
+
+	e.processSignal(&TradeSignal{Fill: &Fill{
+		ID:           "close-snapshot",
+		Symbol:       "ETHUSDT",
+		Side:         "sell",
+		PositionSide: SideLong,
+		Action:       ActionClose,
+		Price:        2000,
+		Size:         0.02,
+		Value:        40,
+		Timestamp:    time.Now(),
+	}})
+
+	select {
+	case fullDec := <-e.decisionCh:
+		if len(fullDec.Decisions) != 1 {
+			t.Fatalf("decision len=%d want 1", len(fullDec.Decisions))
+		}
+		dec := fullDec.Decisions[0]
+		if dec.Action != "close_long" {
+			t.Fatalf("expected close_long, got %+v", dec)
+		}
+		if dec.PositionSizeUSD != 0 {
+			t.Fatalf("close must not carry open position size, got %.8f", dec.PositionSizeUSD)
+		}
+		if dec.Leverage != 0 {
+			t.Fatalf("close must not require leverage, got %dx", dec.Leverage)
+		}
+	default:
+		t.Fatalf("expected close decision")
+	}
+}
+
 // TestOKXCalculateNotAffectedByBinanceLogic 验证：OKX 与 Binance 配置完全隔离，
 // OKX 走老逻辑（leaderEquity 当分母），新加的 resolveBinanceAnchorEquity 完全不参与。
 func TestOKXCalculateNotAffectedByBinanceLogic(t *testing.T) {

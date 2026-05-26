@@ -138,7 +138,7 @@ type BinanceProvider struct {
 	csrfToken  string                   // 旧版本本地凭证（向后兼容路径）
 
 	// 内部状态（线程安全）
-	mu sync.Mutex
+	mu             sync.Mutex
 	leaderUserID   string          // 从持仓接口 id 字段（如 "1239518824_ETHUSDT_LONG"）首次解析获得
 	seenFillKeys   map[string]bool // (time|symbol|side|price|qty|posSide) 五元组指纹去重
 	seenKeysExpiry time.Time       // 指纹缓存过期时间（>24h 清理）
@@ -319,13 +319,11 @@ func (p *BinanceProvider) GetAccountState(leadPortfolioID string) (*AccountState
 			continue
 		}
 
-		// 杠杆反推：notionalValue / initialMargin（常见 5x/10x/20x/40x/50x/100x 都精确）
-		initialMargin := parseFloat(rp.InitialMargin)
-		notional := parseFloat(rp.NotionalValue)
-		leverage := 0
-		if initialMargin > 0 {
-			leverage = int(math.Round(notional / initialMargin))
-		}
+		// Binance Web 持仓接口通常不直接返回 leverage。
+		// 页面展示杠杆可由 abs(notionalValue) / positionInitialMargin 反推；
+		// SHORT 的 notionalValue 为负，必须取绝对值，否则会回退到默认 10x。
+		notional := math.Abs(parseFloat(rp.NotionalValue))
+		leverage := inferBinancePositionLeverage(rp)
 		totalNotional += notional
 
 		// 全/逐仓判定：isolatedWallet/isolatedMargin > 0 即逐仓，否则全仓
@@ -1031,6 +1029,43 @@ func guessBinanceAction(side string, posSide SideType, realized float64) ActionT
 	return ActionOpen
 }
 
+func inferBinancePositionLeverage(rp BinancePositionRaw) int {
+	notional := math.Abs(parseFloat(rp.NotionalValue))
+	if notional <= 0 {
+		return parseBinanceLeverage(rp.Leverage)
+	}
+
+	margin := parseFloat(rp.PositionInitialMargin)
+	if margin <= 0 {
+		margin = parseFloat(rp.InitialMargin)
+	}
+	if margin > 0 {
+		return int(math.Round(notional / margin))
+	}
+
+	// 兼容少数响应可能直接带 leverage 的情况，但 Binance 当前 Web 持仓接口主路径不依赖它。
+	return parseBinanceLeverage(rp.Leverage)
+}
+
+func parseBinanceLeverage(v any) int {
+	switch x := v.(type) {
+	case nil:
+		return 0
+	case string:
+		return parseInt(x)
+	case float64:
+		return int(math.Round(x))
+	case json.Number:
+		if i, err := x.Int64(); err == nil {
+			return int(i)
+		}
+		if f, err := x.Float64(); err == nil {
+			return int(math.Round(f))
+		}
+	}
+	return parseInt(fmt.Sprint(v))
+}
+
 // fillFingerprint 五元组指纹（用于 Fill 去重）
 // Binance 成交无唯一 id，组合 time+symbol+side+price+qty+positionSide 作为去重 key
 func fillFingerprint(tr BinanceTradeRecord) string {
@@ -1070,6 +1105,7 @@ type BinancePositionRaw struct {
 	MarkPrice              string `json:"markPrice"`              // 标记价
 	UnrealizedProfit       string `json:"unrealizedProfit"`       // 未实现盈亏
 	LiquidationPrice       string `json:"liquidationPrice"`       // 强平价（"0" 表示无）
+	Leverage               any    `json:"leverage"`               // 杠杆倍数（部分 Binance Web 响应直接返回，可能是 string/number）
 	IsolatedMargin         string `json:"isolatedMargin"`         // 逐仓保证金（>0 即逐仓）
 	NotionalValue          string `json:"notionalValue"`          // 名义价值（USDT）
 	Collateral             string `json:"collateral"`             // 保证金币种 ("USDT")
