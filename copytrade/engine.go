@@ -1246,6 +1246,15 @@ func (e *Engine) buildDecisionV2(signal *TradeSignal, match *SignalMatchResult, 
 	if match.Action == ActionReduce {
 		ratio := e.calculateReduceRatioV2(signal, match)
 
+		if e.config.ProviderType == ProviderBinance {
+			dec.CloseRatio = ratio
+			dec.Reasoning = fmt.Sprintf("Copy trading: reduce %.0f%% following %s leader %s",
+				ratio*100, e.config.ProviderType, e.config.LeaderID)
+			logger.Infof("📊 [%s] Binance 部分平仓 %.1f%% marginMode=%s（以实时持仓快照为准，不使用累计减仓触发全平）",
+				e.traderID, ratio*100, dec.MarginMode)
+			return dec
+		}
+
 		// 边界保护：减仓超过阈值时，直接全量平仓
 		if ratio >= FullCloseThreshold {
 			logger.Infof("📊 [%s] 减仓比例 %.1f%% ≥ %.0f%%，转为全量平仓", e.traderID, ratio*100, FullCloseThreshold*100)

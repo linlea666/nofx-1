@@ -3,6 +3,7 @@ package copytrade
 import (
 	"errors"
 	"io"
+	"math"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -169,6 +170,20 @@ func TestBinancePositionSnapshotDetectsOpenAddReduceCloseAndIgnoresHistorical(t 
 		}
 		if fills[0].Action != ActionReduce || fills[0].Size != 0.01 {
 			t.Fatalf("unexpected reduce fill: %+v", fills[0])
+		}
+	})
+
+	t.Run("close when remaining size is near zero", func(t *testing.T) {
+		e, st := newTestCopyTradeEngine(t, ProviderBinance)
+		saveActiveMapping(t, st, posID, 0.02)
+		e.leaderState.Positions[posID] = binanceTestPosition(posID, 0.0009)
+
+		fills := e.detectBinancePositionSnapshotFills()
+		if len(fills) != 1 {
+			t.Fatalf("fills len=%d want 1", len(fills))
+		}
+		if fills[0].Action != ActionClose || math.Abs(fills[0].Size-0.0191) > 1e-12 {
+			t.Fatalf("unexpected near-zero close fill: %+v", fills[0])
 		}
 	})
 
@@ -587,6 +602,69 @@ func TestBinanceReduceDoesNotResolveAnchorOrRequireLeverage(t *testing.T) {
 		}
 	default:
 		t.Fatalf("expected reduce decision")
+	}
+}
+
+func TestBinanceReduceIgnoresAccumulatedRatioAndUsesSnapshotRatio(t *testing.T) {
+	const posID = "1243719130_ETHUSDT_SHORT"
+	e, st := newTestCopyTradeEngine(t, ProviderBinance)
+	e.config.LeaderID = "4980868128621309440"
+
+	err := st.CopyTrade().SavePositionMapping(&store.CopyTradePositionMapping{
+		TraderID:               "test-trader",
+		LeaderPosID:            posID,
+		LeaderID:               e.config.LeaderID,
+		Symbol:                 "ETHUSDT",
+		Side:                   string(SideShort),
+		MarginMode:             "cross",
+		OpenedAt:               time.Now(),
+		OpenPrice:              2088.15,
+		OpenSizeUSD:            0.097 * 2088.15,
+		LastKnownSize:          0.097,
+		AccumulatedReduceRatio: 0.556,
+	})
+	if err != nil {
+		t.Fatalf("save active mapping: %v", err)
+	}
+	if err := st.CopyTrade().UpdateAccumulatedReduceRatio("test-trader", posID, 0.556); err != nil {
+		t.Fatalf("seed accumulated ratio: %v", err)
+	}
+
+	e.leaderState.Positions[posID] = &Position{
+		Symbol:     "ETHUSDT",
+		Side:       SideShort,
+		Size:       0.047,
+		MarkPrice:  2080.07,
+		MarginMode: "cross",
+		PosID:      posID,
+	}
+
+	signal := e.buildSignal(&Fill{
+		ID:           "binance_snapshot|" + posID + "|reduce|0.09700000|0.04700000",
+		Symbol:       "ETHUSDT",
+		Side:         "buy",
+		PositionSide: SideShort,
+		Action:       ActionReduce,
+		Price:        2080.07,
+		Size:         0.05,
+		Value:        104.0035,
+		Timestamp:    time.Now(),
+	})
+	match := e.matchSignalWithMapping(signal)
+	if !match.ShouldFollow || match.Action != ActionReduce {
+		t.Fatalf("expected Binance partial reduce match, got %+v", match)
+	}
+
+	dec := e.buildDecisionV2(signal, match, 0)
+	if dec.Action != "reduce_short" {
+		t.Fatalf("expected reduce_short, got %+v", dec)
+	}
+	wantRatio := 0.05 / 0.097
+	if math.Abs(dec.CloseRatio-wantRatio) > 1e-9 {
+		t.Fatalf("CloseRatio=%.12f want %.12f", dec.CloseRatio, wantRatio)
+	}
+	if strings.Contains(dec.Reasoning, "accumulated") || strings.Contains(dec.Reasoning, "full close") {
+		t.Fatalf("Binance reduce must not be converted by accumulated ratio, reasoning=%q", dec.Reasoning)
 	}
 }
 
