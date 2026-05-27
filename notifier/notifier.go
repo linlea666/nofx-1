@@ -17,17 +17,17 @@ import (
 
 // Config 邮件通知配置
 type Config struct {
-	Enabled        bool          // 是否启用邮件通知
-	SMTPHost       string        // SMTP 服务器（smtp.163.com / smtp.qq.com / ...）
-	SMTPPort       int           // 端口（465 SSL / 25 STARTTLS / 587 STARTTLS）
-	SMTPUser       string        // 发件邮箱
-	SMTPPass       string        // 授权码 / 应用密码
-	From           string        // 发件人邮箱地址（默认同 SMTPUser）
-	FromName       string        // 发件人显示名
-	To             []string      // 收件人列表
-	MinInterval    time.Duration // 同 key 告警最小间隔，默认 60s
-	QueueSize      int           // 异步队列大小，默认 100
-	SendOnStartup  bool          // 启动时发送测试邮件，默认 true
+	Enabled       bool          // 是否启用邮件通知
+	SMTPHost      string        // SMTP 服务器（smtp.163.com / smtp.qq.com / ...）
+	SMTPPort      int           // 端口（465 SSL / 25 STARTTLS / 587 STARTTLS）
+	SMTPUser      string        // 发件邮箱
+	SMTPPass      string        // 授权码 / 应用密码
+	From          string        // 发件人邮箱地址（默认同 SMTPUser）
+	FromName      string        // 发件人显示名
+	To            []string      // 收件人列表
+	MinInterval   time.Duration // 同 key 告警最小间隔，默认 60s
+	QueueSize     int           // 异步队列大小，默认 100
+	SendOnStartup bool          // 启动时发送测试邮件，默认 true
 }
 
 // LoadFromEnv 从环境变量加载配置
@@ -109,6 +109,7 @@ type Alert struct {
 	Body     string            // 详情正文
 	Fields   map[string]string // 可选附加字段（会附在正文）
 	RateKey  string            // 限流键，留空时按 Category+TraderID+Title 自动生成
+	DedupKey string            // 一次性去重键：同 key 告警进程生命周期内只发送一次
 }
 
 // ============================================================================
@@ -124,8 +125,8 @@ type Notifier interface {
 // noopNotifier 不发送任何通知（未启用时使用）
 type noopNotifier struct{}
 
-func (n noopNotifier) Notify(Alert)  {}
-func (n noopNotifier) Shutdown()     {}
+func (n noopNotifier) Notify(Alert) {}
+func (n noopNotifier) Shutdown()    {}
 
 // 全局单例（默认 no-op，未初始化时调用零副作用）
 var (
@@ -251,6 +252,9 @@ type emailNotifier struct {
 
 	// 限流：rateKey -> 上次发送时间
 	lastSent sync.Map
+
+	// 一次性去重：dedupKey -> 首次入队时间
+	deduped sync.Map
 }
 
 func newEmailNotifier(cfg Config) *emailNotifier {
@@ -267,6 +271,15 @@ func newEmailNotifier(cfg Config) *emailNotifier {
 
 // Notify 入队，非阻塞
 func (n *emailNotifier) Notify(a Alert) {
+	dedupReserved := false
+	if a.DedupKey != "" {
+		if _, loaded := n.deduped.LoadOrStore(a.DedupKey, time.Now()); loaded {
+			logger.Debugf("📭 通知去重跳过 | dedupKey=%s", a.DedupKey)
+			return
+		}
+		dedupReserved = true
+	}
+
 	// 1. 限流键
 	key := a.RateKey
 	if key == "" {
@@ -280,6 +293,9 @@ func (n *emailNotifier) Notify(a Alert) {
 				// 命中限流，静默丢弃（debug 级日志，避免日志刷屏）
 				logger.Debugf("📭 通知限流跳过 | key=%s elapsed=%s < interval=%s",
 					key, time.Since(last).Truncate(time.Second), n.cfg.MinInterval)
+				if dedupReserved {
+					n.deduped.Delete(a.DedupKey)
+				}
 				return
 			}
 		}
@@ -291,8 +307,14 @@ func (n *emailNotifier) Notify(a Alert) {
 	case n.queue <- a:
 	case <-n.stopCh:
 		// 已关闭，丢弃
+		if dedupReserved {
+			n.deduped.Delete(a.DedupKey)
+		}
 	default:
 		// 队列满，丢弃 + warn
+		if dedupReserved {
+			n.deduped.Delete(a.DedupKey)
+		}
 		logger.Warnf("⚠️ 邮件通知队列已满（容量=%d），丢弃: %s", n.cfg.QueueSize, a.Title)
 	}
 }

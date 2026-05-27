@@ -227,6 +227,7 @@ func (ti *TraderIntegration) executeFullDecision(fullDec *decision.FullDecision)
 				traderName, ti.traderID, dec.Action, dec.Symbol, err)
 			executionLogs = append(executionLogs, fmt.Sprintf("❌ %s %s 失败: %v", dec.Action, dec.Symbol, err))
 			ti.saveSignalLog(dec, "failed", err.Error())
+			alertKey := ti.execFailureDedupKey(dec, err)
 
 			// 异步发送邮件告警（未启用通知器时为 no-op，零阻塞、零副作用）
 			notifier.Notify(notifier.Alert{
@@ -234,6 +235,8 @@ func (ti *TraderIntegration) executeFullDecision(fullDec *decision.FullDecision)
 				TraderID: ti.traderID,
 				Title:    fmt.Sprintf("%s | %s %s 失败", traderName, dec.Action, dec.Symbol),
 				Body:     ti.buildExecFailureAlertBody(dec, err, traderName),
+				RateKey:  alertKey,
+				DedupKey: alertKey,
 				Fields: map[string]string{
 					"TraderName":  traderName,
 					"Provider":    string(ti.engine.config.ProviderType),
@@ -264,6 +267,32 @@ func (ti *TraderIntegration) executeFullDecision(fullDec *decision.FullDecision)
 
 	// 保存到 decision_records 表，复用现有日志系统
 	ti.saveDecisionRecord(fullDec, decisionActions, executionLogs)
+}
+
+func (ti *TraderIntegration) execFailureDedupKey(dec *decision.Decision, err error) string {
+	providerType := ""
+	leaderID := ""
+	if ti.engine != nil && ti.engine.config != nil {
+		providerType = string(ti.engine.config.ProviderType)
+		leaderID = ti.engine.config.LeaderID
+	}
+	errText := ""
+	if err != nil {
+		errText = err.Error()
+	}
+	return fmt.Sprintf("copy_trade_exec_failed|%s|%s|%s|%s|%s|%s|%.8f|%.8f|%.2f|%s|%s",
+		ti.traderID,
+		providerType,
+		leaderID,
+		dec.Action,
+		dec.Symbol,
+		dec.LeaderPosID,
+		dec.LeaderPosSize,
+		dec.CloseRatio,
+		dec.PositionSizeUSD,
+		dec.MarginMode,
+		errText,
+	)
 }
 
 // saveDecisionRecord 保存跟单决策到 decision_records 表
