@@ -388,6 +388,11 @@ type CopyTradePositionMapping struct {
 	ReduceCount            int       `json:"reduce_count"`              // 累计减仓次数
 	AccumulatedReduceRatio float64   `json:"accumulated_reduce_ratio"`  // 累计减仓比例（用于触发全平）
 	UpdatedAt              time.Time `json:"updated_at"`                // 最后更新时间
+
+	// 连续失败熔断（执行失败时累加，成功时清零；超过阈值自动 CloseMapping）
+	ConsecutiveFailCount int        `json:"consecutive_fail_count"` // 连续失败次数
+	LastFailureAt        *time.Time `json:"last_failure_at"`        // 最后一次失败时间
+	LastFailureReason    string     `json:"last_failure_reason"`    // 最后一次失败原因
 }
 
 // initPositionMappingTable 初始化仓位映射表
@@ -430,6 +435,11 @@ func (s *CopyTradeStore) initPositionMappingTable() error {
 
 	// 添加 accumulated_reduce_ratio 字段（用于累积减仓触发全平）
 	s.db.Exec(`ALTER TABLE copy_trade_position_mappings ADD COLUMN accumulated_reduce_ratio REAL DEFAULT 0`)
+
+	// 添加连续失败熔断字段（兼容旧库；ALTER 失败说明已存在，忽略）
+	s.db.Exec(`ALTER TABLE copy_trade_position_mappings ADD COLUMN consecutive_fail_count INTEGER DEFAULT 0`)
+	s.db.Exec(`ALTER TABLE copy_trade_position_mappings ADD COLUMN last_failure_at DATETIME`)
+	s.db.Exec(`ALTER TABLE copy_trade_position_mappings ADD COLUMN last_failure_reason TEXT DEFAULT ''`)
 
 	return nil
 }
@@ -583,6 +593,61 @@ func (s *CopyTradeStore) ClearAccumulatedReduceRatio(traderID, leaderPosID strin
 		UPDATE copy_trade_position_mappings 
 		SET accumulated_reduce_ratio = 0, updated_at = CURRENT_TIMESTAMP
 		WHERE trader_id = ? AND leader_pos_id = ?
+	`, traderID, leaderPosID)
+	return err
+}
+
+// IncrementMappingFailure 累加 active mapping 的连续失败次数并记录原因，
+// 返回累加后的最新 count。
+//
+// 调用时机：跟单决策执行失败且非"良性失败"时（良性失败已主动 CloseMapping）。
+// 配合 ResetMappingFailure（成功时清零）与上层熔断阈值，自动回收"长期失败"的映射。
+//
+// 错误返回包括：
+//   - active mapping 不存在（UPDATE 影响 0 行 → 返回 0, nil；上层可据此判断"无熔断对象"）
+//   - 数据库写入失败 → 返回 0, err
+func (s *CopyTradeStore) IncrementMappingFailure(traderID, leaderPosID, reason string) (int, error) {
+	res, err := s.db.Exec(`
+		UPDATE copy_trade_position_mappings 
+		SET consecutive_fail_count = consecutive_fail_count + 1,
+		    last_failure_at = CURRENT_TIMESTAMP,
+		    last_failure_reason = ?,
+		    updated_at = CURRENT_TIMESTAMP
+		WHERE trader_id = ? AND leader_pos_id = ? AND status = 'active'
+	`, reason, traderID, leaderPosID)
+	if err != nil {
+		return 0, err
+	}
+	if affected, _ := res.RowsAffected(); affected == 0 {
+		// 无 active mapping（可能已被 CloseMapping/ignored），无熔断对象
+		return 0, nil
+	}
+
+	var count int
+	err = s.db.QueryRow(`
+		SELECT COALESCE(consecutive_fail_count, 0)
+		FROM copy_trade_position_mappings 
+		WHERE trader_id = ? AND leader_pos_id = ? AND status = 'active'
+	`, traderID, leaderPosID).Scan(&count)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return 0, nil
+		}
+		return 0, err
+	}
+	return count, nil
+}
+
+// ResetMappingFailure 清零 active mapping 的连续失败计数（执行成功时调用）。
+// 若没有 active mapping 则视为 no-op（不报错）。
+func (s *CopyTradeStore) ResetMappingFailure(traderID, leaderPosID string) error {
+	_, err := s.db.Exec(`
+		UPDATE copy_trade_position_mappings 
+		SET consecutive_fail_count = 0,
+		    last_failure_reason = '',
+		    updated_at = CURRENT_TIMESTAMP
+		WHERE trader_id = ? AND leader_pos_id = ? AND status = 'active'
+		  AND consecutive_fail_count > 0
 	`, traderID, leaderPosID)
 	return err
 }

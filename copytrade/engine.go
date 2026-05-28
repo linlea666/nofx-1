@@ -441,12 +441,34 @@ func (e *Engine) poll() {
 			logger.Warnf("⚠️ [%s] Binance 实时持仓同步失败: %v", e.traderID, err)
 		} else {
 			snapshotFills := e.detectBinancePositionSnapshotFills()
-			if len(snapshotFills) > 0 {
-				logger.Infof("📡 [%s] Binance 实时持仓发现 %d 条信号", e.traderID, len(snapshotFills))
+			// 🔑 关键去重：snapshot fill.ID 形如
+			//   "binance_snapshot|<posId>|<action>|<previousSize>|<currentSize>"
+			// 在"领航员已平 / 跟随者本地无对应仓位 / 执行失败 mapping 未回收"
+			// 的死锁场景下，每轮 poll 都会生成完全相同 ID 的 close 信号。
+			// 第三步循环已经 markSeen，但此处直接 `newFills = snapshotFills`
+			// 跳过了第一步 isSeen 过滤，导致每 3s 重复处理。
+			// 这里显式过滤一次，保证去重链路完整。
+			var freshSnapshotFills []Fill
+			for _, fill := range snapshotFills {
+				if !e.isSeen(fill.ID) {
+					freshSnapshotFills = append(freshSnapshotFills, fill)
+				}
+			}
+			if len(freshSnapshotFills) > 0 {
+				logger.Infof("📡 [%s] Binance 实时持仓发现 %d 条信号（原始 %d 条，去重保留 %d 条）",
+					e.traderID, len(freshSnapshotFills), len(snapshotFills), len(freshSnapshotFills))
 				for _, fill := range newFills {
 					e.markSeen(fill.ID)
 				}
-				newFills = snapshotFills
+				newFills = freshSnapshotFills
+			} else if len(snapshotFills) > 0 {
+				logger.Debugf("📡 [%s] Binance 快照检测到 %d 条信号但全部为重复（已 seen），跳过",
+					e.traderID, len(snapshotFills))
+				// 同样把 trade-history 路径迟到的 fills 标记 seen，避免后续路径重复处理
+				for _, fill := range newFills {
+					e.markSeen(fill.ID)
+				}
+				newFills = nil
 			} else if len(newFills) > 0 {
 				logger.Debugf("📡 [%s] Binance 快照无变化，处理 %d 条成交历史信号", e.traderID, len(newFills))
 			}
@@ -1181,6 +1203,14 @@ func (e *Engine) processSignal(signal *TradeSignal) {
 		e.logWarning(w)
 	}
 
+	// 🔧 加仓 + copySize=0 → 加仓金额不足阈值（已在 calculateCopySizeByPositionChange 中跳过）。
+	// 不生成决策，也不更新 last_known_size（让下一次累积的加仓信号能继续触发）。
+	if matchResult.Action == ActionAdd && copySize == 0 {
+		logger.Infof("🎯 [%s] ⏭️ 加仓跳过 | %s | 金额低于阈值，等待累积", e.traderID, fill.Symbol)
+		e.stats.SignalsSkipped++
+		return
+	}
+
 	// ========================================
 	// Step 4: 构造 Decision
 	// ========================================
@@ -1480,21 +1510,47 @@ func (e *Engine) calculateCopySizeByPositionChange(signal *TradeSignal, match *S
 		leaderTradeValue, leaderEquity, anchorSource, leaderTradeRatio*100,
 		followerEquity, e.config.CopyRatio*100, copySize)
 
-	// 最小金额检查：如果低于阈值，自动提升到阈值（解决小账户精度问题）
+	// 最小金额检查：仅开仓时自动提升到阈值；加仓时直接跳过（不提升）。
+	//
+	// 原因：旧逻辑对 open/add 都无条件提升到 minTradeThreshold（默认 12 USDT），
+	// 在领航员高频小额加仓场景（例如每次加 0.5 USDT）会导致跟随者每次都被
+	// 强制加 12 USDT，仓位累积速度远高于领航员，破坏了"按比例镜像"语义。
+	//
+	// 修复策略：
+	//   - ActionOpen：保留 boost（开仓只发生一次，必须达到交易所最小起步金额）
+	//   - ActionAdd ：copySize < threshold → 直接置零（信号被跳过，不更新 last_known_size，
+	//                  等领航员后续加仓累积到 threshold 以上再跟），保持长期比例镜像
 	minTradeThreshold := e.config.MinTradeWarn
 	if minTradeThreshold <= 0 {
 		minTradeThreshold = 12.0 // 默认最小 12 USDT，预留精度损失余量
 	}
 	if copySize > 0 && copySize < minTradeThreshold {
+		if match.Action == ActionAdd {
+			// 跳过：让 processSignal 看到 copySize==0 + add 信号 → 不生成决策
+			logger.Infof("📊 [%s] 加仓金额 %.2f < 阈值 %.2f，跳过本次跟随（等待累积）",
+				e.traderID, copySize, minTradeThreshold)
+			warnings = append(warnings, Warning{
+				Timestamp:   time.Now(),
+				Symbol:      fill.Symbol,
+				Type:        "add_below_threshold_skip",
+				Message:     fmt.Sprintf("加仓金额 %.2f 低于阈值 %.2f，跳过", copySize, minTradeThreshold),
+				SignalValue: leaderTradeValue,
+				CopyValue:   0,
+				Executed:    false,
+			})
+			return 0, warnings
+		}
+
+		// 仅开仓走 boost
 		originalSize := copySize
 		copySize = minTradeThreshold
-		logger.Infof("📊 [%s] 跟单金额 %.2f < 阈值 %.2f，自动提升到 %.2f USDT",
+		logger.Infof("📊 [%s] 开仓金额 %.2f < 阈值 %.2f，自动提升到 %.2f USDT",
 			e.traderID, originalSize, minTradeThreshold, copySize)
 		warnings = append(warnings, Warning{
 			Timestamp:   time.Now(),
 			Symbol:      fill.Symbol,
 			Type:        "size_boosted",
-			Message:     fmt.Sprintf("跟单金额 %.2f 低于阈值，已提升到 %.2f USDT", originalSize, minTradeThreshold),
+			Message:     fmt.Sprintf("开仓金额 %.2f 低于阈值，已提升到 %.2f USDT", originalSize, minTradeThreshold),
 			SignalValue: leaderTradeValue,
 			CopyValue:   copySize,
 			Executed:    true,

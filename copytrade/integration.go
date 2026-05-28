@@ -20,6 +20,15 @@ type DecisionExecutor interface {
 	GetPositions() ([]map[string]interface{}, error)
 }
 
+// mappingFailureCircuitThreshold 跟单 active mapping 的连续失败熔断阈值。
+//
+// 触发条件：同一 leaderPosID 的开/加/平/减仓决策连续失败 N 次（成功时清零）。
+// 触发动作：自动 CloseMapping（断开重试链）+ 发送一次熔断告警邮件。
+//
+// 设计目的：作为防御性兜底，避免 PR-1 的"良性 close 错误关键字"未覆盖到的新错误
+// 类型导致死循环；阈值取 5 既能容忍偶发网络/API 抖动，也能在 15s（5×3s）内收敛。
+const mappingFailureCircuitThreshold = 5
+
 // TraderIntegration 跟单与交易执行的集成
 type TraderIntegration struct {
 	traderID    string
@@ -222,35 +231,54 @@ func (ti *TraderIntegration) executeFullDecision(fullDec *decision.FullDecision)
 		}
 
 		if err != nil {
-			traderName := ti.traderDisplayName()
-			logger.Errorf("❌ [%s/%s] 跟单执行失败 | %s %s | error=%v",
-				traderName, ti.traderID, dec.Action, dec.Symbol, err)
-			executionLogs = append(executionLogs, fmt.Sprintf("❌ %s %s 失败: %v", dec.Action, dec.Symbol, err))
-			ti.saveSignalLog(dec, "failed", err.Error())
-			alertKey := ti.execFailureDedupKey(dec, err)
+			// 🔑 良性失败识别：close/reduce 类决策遇到"本地无对应仓位"错误时，
+			// 说明跟随者本地仓位已经通过其他途径消失（手动平、强平、历史 mapping 残留等）。
+			// 这种情况下：
+			//   1. 主动关闭 mapping，避免引擎下个轮询又生成同样的 close 信号 → 死循环
+			//   2. 不发邮件告警（不是真正的错误，是数据自愈）
+			//   3. 状态记 silent_close 区分于真正的 failed
+			// 开仓/加仓 (open_*/reduce_*) 永远不会进入这里。
+			if ti.isBenignCloseError(dec, err) {
+				ti.handleBenignCloseFailure(dec, err)
+				executionLogs = append(executionLogs,
+					fmt.Sprintf("🟡 %s %s silent_close (本地仓位已不存在，自动回收映射): %v",
+						dec.Action, dec.Symbol, err))
+			} else {
+				traderName := ti.traderDisplayName()
+				logger.Errorf("❌ [%s/%s] 跟单执行失败 | %s %s | error=%v",
+					traderName, ti.traderID, dec.Action, dec.Symbol, err)
+				executionLogs = append(executionLogs, fmt.Sprintf("❌ %s %s 失败: %v", dec.Action, dec.Symbol, err))
+				ti.saveSignalLog(dec, "failed", err.Error())
+				alertKey := ti.execFailureDedupKey(dec, err)
 
-			// 异步发送邮件告警（未启用通知器时为 no-op，零阻塞、零副作用）
-			notifier.Notify(notifier.Alert{
-				Category: "copy_trade",
-				TraderID: ti.traderID,
-				Title:    fmt.Sprintf("%s | %s %s 失败", traderName, dec.Action, dec.Symbol),
-				Body:     ti.buildExecFailureAlertBody(dec, err, traderName),
-				RateKey:  alertKey,
-				DedupKey: alertKey,
-				Fields: map[string]string{
-					"TraderName":  traderName,
-					"Provider":    string(ti.engine.config.ProviderType),
-					"Leader":      ti.engine.config.LeaderID,
-					"Action":      dec.Action,
-					"Symbol":      dec.Symbol,
-					"EntryPrice":  fmt.Sprintf("%.4f", dec.EntryPrice),
-					"PositionUSD": fmt.Sprintf("%.2f", dec.PositionSizeUSD),
-					"Leverage":    fmt.Sprintf("%dx", dec.Leverage),
-					"MarginMode":  dec.MarginMode,
-					"LeaderPosID": dec.LeaderPosID,
-					"Reason":      err.Error(),
-				},
-			})
+				// 异步发送邮件告警（未启用通知器时为 no-op，零阻塞、零副作用）
+				notifier.Notify(notifier.Alert{
+					Category: "copy_trade",
+					TraderID: ti.traderID,
+					Title:    fmt.Sprintf("%s | %s %s 失败", traderName, dec.Action, dec.Symbol),
+					Body:     ti.buildExecFailureAlertBody(dec, err, traderName),
+					RateKey:  alertKey,
+					DedupKey: alertKey,
+					Fields: map[string]string{
+						"TraderName":  traderName,
+						"Provider":    string(ti.engine.config.ProviderType),
+						"Leader":      ti.engine.config.LeaderID,
+						"Action":      dec.Action,
+						"Symbol":      dec.Symbol,
+						"EntryPrice":  fmt.Sprintf("%.4f", dec.EntryPrice),
+						"PositionUSD": fmt.Sprintf("%.2f", dec.PositionSizeUSD),
+						"Leverage":    fmt.Sprintf("%dx", dec.Leverage),
+						"MarginMode":  dec.MarginMode,
+						"LeaderPosID": dec.LeaderPosID,
+						"Reason":      err.Error(),
+					},
+				})
+
+				// 🔧 连续失败熔断（防御兜底）：
+				// 同一 leaderPosID 连续失败 ≥ 阈值 → 主动 CloseMapping 并发熔断告警，
+				// 避免良性错误关键字未覆盖的新错误形态导致死循环。
+				ti.checkAndTripMappingCircuit(dec, err)
+			}
 		} else {
 			duration := time.Since(startTime).Milliseconds()
 			logger.Infof("✅ [%s] 跟单执行成功 | %s %s | 耗时=%dms",
@@ -260,6 +288,13 @@ func (ti *TraderIntegration) executeFullDecision(fullDec *decision.FullDecision)
 
 			// 执行成功后更新仓位映射
 			ti.updatePositionMapping(dec)
+
+			// 🔧 成功一次即清零连续失败计数；下次再失败重新累计
+			if ti.store != nil && dec.LeaderPosID != "" {
+				if rerr := ti.store.CopyTrade().ResetMappingFailure(ti.traderID, dec.LeaderPosID); rerr != nil {
+					logger.Debugf("[%s] 清零失败计数失败（不影响主流程）: %v", ti.traderID, rerr)
+				}
+			}
 		}
 
 		decisionActions = append(decisionActions, action)
@@ -267,6 +302,141 @@ func (ti *TraderIntegration) executeFullDecision(fullDec *decision.FullDecision)
 
 	// 保存到 decision_records 表，复用现有日志系统
 	ti.saveDecisionRecord(fullDec, decisionActions, executionLogs)
+}
+
+// isBenignCloseError 判断 close/reduce 类决策的失败是否属于"本地仓位已不存在"。
+//
+// 触发场景（举例）：
+//   - 跟随者本地从未真正开仓成功（历史失败遗留的 active mapping）
+//   - 跟随者本地仓位被用户手动平掉
+//   - 跟随者本地仓位被 OKX/Binance 强平
+//   - 跟随者切换账户/重启等导致仓位状态错位
+//
+// 仅作用于 close_*/reduce_* 决策；open_*/add_* 永远返回 false。
+//
+// 关键字来源（统一小写匹配）：
+//   - "position not found"        OKX (okx_trader.go:856,946)、Bitget (bitget_trader.go:613,676)
+//   - "no long position" / "no short position"
+//                                 Binance (binance_futures.go:443,498)
+//                                 Aster (aster_trader.go:755,846)
+//                                 Hyperliquid (hyperliquid_trader.go:516,588)
+//                                 Bybit (bybit_trader.go:383,428 — "no X position to close")
+//   - "reduceonly order is rejected" / "position size is 0"
+//                                 Binance fapi 返回的 reduce-only 拒绝（保险关键字）
+func (ti *TraderIntegration) isBenignCloseError(dec *decision.Decision, err error) bool {
+	if err == nil || dec == nil {
+		return false
+	}
+	switch dec.Action {
+	case "close_long", "close_short", "reduce_long", "reduce_short":
+		// 允许进入良性判定
+	default:
+		return false
+	}
+
+	msg := strings.ToLower(err.Error())
+	keywords := []string{
+		"position not found",
+		"no long position",
+		"no short position",
+		"reduceonly order is rejected",
+		"reduce only order is rejected",
+		"position size is 0",
+	}
+	for _, kw := range keywords {
+		if strings.Contains(msg, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+// handleBenignCloseFailure 处理良性 close/reduce 失败：
+//   - 主动关闭 mapping（断开死循环）
+//   - 写 silent_close 信号日志（与真正 failed 区分）
+//   - 不发邮件告警（数据自愈不需要通知用户）
+//
+// 必须仅在 isBenignCloseError(dec, err) == true 时调用。
+func (ti *TraderIntegration) handleBenignCloseFailure(dec *decision.Decision, err error) {
+	traderName := ti.traderDisplayName()
+	logger.Warnf("🟡 [%s/%s] 良性 close 失败 → 主动关闭映射 | %s %s | error=%v",
+		traderName, ti.traderID, dec.Action, dec.Symbol, err)
+
+	if ti.store != nil && dec.LeaderPosID != "" {
+		// 复用 SavePositionMapping/CloseMapping 路径，保持 status='closed' 语义一致
+		if cerr := ti.store.CopyTrade().CloseMapping(ti.traderID, dec.LeaderPosID, dec.EntryPrice); cerr != nil {
+			// 不阻断流程，但记录便于排查；此时 mapping 仍可能保持 active，
+			// 下一轮 detectBinancePositionSnapshotFills/matchCloseReduceSignal 会再次进入本路径
+			logger.Warnf("⚠️ [%s] 关闭映射失败（已记 silent_close）: %v", ti.traderID, cerr)
+		} else {
+			logger.Infof("📝 [%s] 仓位映射已自动关闭（良性 close）| posId=%s %s",
+				ti.traderID, dec.LeaderPosID, dec.Symbol)
+		}
+	}
+
+	ti.saveSignalLog(dec, "silent_close", err.Error())
+}
+
+// checkAndTripMappingCircuit 累加 active mapping 的连续失败次数；
+// 达到阈值则触发熔断：CloseMapping + 发送一次告警邮件。
+//
+// 说明：
+//   - 仅对存在 LeaderPosID 的决策有效（开仓/加仓/平仓/减仓都会带 LeaderPosID）
+//   - 良性失败已在上层走 handleBenignCloseFailure 分支，不会进入本路径
+//   - 调用 IncrementMappingFailure 返回 0 表示无 active mapping（无需熔断）
+//   - 熔断告警与普通失败告警走不同 DedupKey，确保用户能感知"系统主动止损"
+func (ti *TraderIntegration) checkAndTripMappingCircuit(dec *decision.Decision, execErr error) {
+	if ti.store == nil || dec == nil || dec.LeaderPosID == "" {
+		return
+	}
+
+	count, err := ti.store.CopyTrade().IncrementMappingFailure(ti.traderID, dec.LeaderPosID, execErr.Error())
+	if err != nil {
+		logger.Warnf("[%s] 累加失败计数失败: %v", ti.traderID, err)
+		return
+	}
+	if count == 0 {
+		// 无 active mapping（可能已被良性失败/历史清理流程关闭），无熔断对象
+		return
+	}
+	if count < mappingFailureCircuitThreshold {
+		logger.Debugf("[%s] mapping 失败计数 %d/%d | %s %s",
+			ti.traderID, count, mappingFailureCircuitThreshold, dec.Action, dec.Symbol)
+		return
+	}
+
+	// 触发熔断：先关闭映射，再发独立告警
+	traderName := ti.traderDisplayName()
+	if cerr := ti.store.CopyTrade().CloseMapping(ti.traderID, dec.LeaderPosID, dec.EntryPrice); cerr != nil {
+		logger.Warnf("⚠️ [%s] 熔断关闭映射失败: %v", ti.traderID, cerr)
+	}
+	logger.Warnf("🛑 [%s/%s] mapping 熔断 | 连续失败 %d 次 → 主动关闭 | %s %s | 最近错误=%v",
+		traderName, ti.traderID, count, dec.Action, dec.Symbol, execErr)
+
+	alertKey := fmt.Sprintf("circuit|%s|%s", ti.traderID, dec.LeaderPosID)
+	notifier.Notify(notifier.Alert{
+		Category: "copy_trade",
+		TraderID: ti.traderID,
+		Title:    fmt.Sprintf("%s | 跟单映射熔断（%s %s）", traderName, dec.Action, dec.Symbol),
+		Body: fmt.Sprintf(
+			"跟随者 %s 的 leaderPosID=%s 已连续失败 %d 次（阈值 %d），系统主动关闭该映射，停止重试。\n"+
+				"最近一次错误：%v\n"+
+				"建议人工排查：领航员当前持仓状态、跟随者账户余额/杠杆/保证金模式，确认无误后可由领航员重新开仓自动恢复跟单。",
+			traderName, dec.LeaderPosID, count, mappingFailureCircuitThreshold, execErr),
+		RateKey:  alertKey,
+		DedupKey: alertKey,
+		Fields: map[string]string{
+			"TraderName":  traderName,
+			"Provider":    string(ti.engine.config.ProviderType),
+			"Leader":      ti.engine.config.LeaderID,
+			"Action":      dec.Action,
+			"Symbol":      dec.Symbol,
+			"LeaderPosID": dec.LeaderPosID,
+			"FailCount":   fmt.Sprintf("%d", count),
+			"Threshold":   fmt.Sprintf("%d", mappingFailureCircuitThreshold),
+			"LastError":   execErr.Error(),
+		},
+	})
 }
 
 func (ti *TraderIntegration) execFailureDedupKey(dec *decision.Decision, err error) string {

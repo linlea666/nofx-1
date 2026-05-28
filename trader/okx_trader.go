@@ -550,58 +550,44 @@ func (t *OKXTrader) getInstrument(symbol string) (*OKXInstrument, error) {
 	return instrument, nil
 }
 
-// SetMarginMode sets margin mode
-// OKX 特性：开仓时通过 tdMode 参数直接指定模式，所以这里主要是更新缓存
+// SetMarginMode sets margin mode for a symbol.
+//
+// 重要说明（PR-5 / 修复 H）：OKX 的"逐仓 / 全仓"在开仓 API 中通过 `tdMode` 参数
+// 直接指定，不依赖账户级或合约级的全局设置。OKX 统一账户（Unified Account，
+// 当前线上跟单账户的主流形态）下也没有暴露逐合约切换保证金模式的官方 API；
+// 原本调用的 `/api/v5/account/set-isolated-mode` 端点在统一账户下会返回
+// `code=51000, msg=Parameter type error`，旧实现虽吞掉了错误，但每 3s 跟单
+// 轮询都会触发，产生大量噪声日志、误导排查。
+//
+// 实际行为：
+//   - 维护本地缓存（isCrossMargin、symbolMgnModes、pending 标记、cachedPositions 清空）
+//   - 不再发起任何 HTTP 请求，由开仓 API 的 tdMode 在订单上精确生效
+//
+// 副作用对比（修复前 vs 修复后）：
+//   - 缓存语义：完全一致
+//   - 跟单准确性：完全一致（依然由 tdMode 在订单上生效）
+//   - 日志噪声：消失（OKX 51000 错误不再每 3s 出现）
+//   - 网络成本：每次开仓少一次失败 HTTP 调用
 func (t *OKXTrader) SetMarginMode(symbol string, isCrossMargin bool) error {
-	instId := t.convertSymbol(symbol)
-
 	mgnMode := "isolated"
 	if isCrossMargin {
 		mgnMode = "cross"
 	}
 
-	// 先更新缓存（关键！确保后续 OpenLong/OpenShort 使用正确的 tdMode）
-	// OKX 开仓时 tdMode 参数会直接指定模式，不依赖账户全局设置
 	t.isCrossMargin = isCrossMargin
 
-	// 记录"待开仓"的 mgnMode（关键！用于开仓成功后填充仓位的 mgnMode）
-	// 使用 symbol 作为临时 key，开仓成功后会更新为 symbol_side_mgnMode
 	t.symbolMgnModesMutex.Lock()
 	t.symbolMgnModes[symbol] = mgnMode
-	// 同时记录 symbol_long 和 symbol_short 的 pending 模式（因为不知道具体开哪个方向）
 	t.symbolMgnModes[symbol+"_long_pending"] = mgnMode
 	t.symbolMgnModes[symbol+"_short_pending"] = mgnMode
 	t.symbolMgnModesMutex.Unlock()
-	logger.Debugf("  📝 缓存 %s 待开仓保证金模式: %s", symbol, mgnMode)
 
-	// 清除持仓缓存，确保下次查询时使用最新的 mgnMode
 	t.positionsCacheMutex.Lock()
 	t.cachedPositions = nil
 	t.positionsCacheMutex.Unlock()
 
-	body := map[string]interface{}{
-		"instId":  instId,
-		"mgnMode": mgnMode,
-	}
-
-	_, err := t.doRequest("POST", "/api/v5/account/set-isolated-mode", body)
-	if err != nil {
-		// Ignore error if already in target mode
-		if strings.Contains(err.Error(), "already") {
-			logger.Infof("  ✓ %s margin mode is already %s", symbol, mgnMode)
-			return nil
-		}
-		// Cannot change when there are positions
-		if strings.Contains(err.Error(), "position") {
-			logger.Infof("  ⚠️ %s has positions, cannot change margin mode", symbol)
-			return nil
-		}
-		// API 调用失败也不返回错误，因为开仓时 tdMode 会直接指定模式
-		logger.Infof("  ⚠️ SetMarginMode API failed: %v (will use tdMode=%s in order)", err, mgnMode)
-		return nil
-	}
-
-	logger.Infof("  ✓ %s margin mode set to %s", symbol, mgnMode)
+	logger.Debugf("  📝 [OKX] 缓存 %s 待开仓保证金模式: %s（不调用 set-isolated-mode，依赖订单 tdMode）",
+		symbol, mgnMode)
 	return nil
 }
 

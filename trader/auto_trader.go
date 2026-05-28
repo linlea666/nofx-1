@@ -997,7 +997,36 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 	// Open position
 	order, err := at.trader.OpenLong(decision.Symbol, quantity, decision.Leverage)
 	if err != nil {
-		return err
+		// 🔁 PR-4 / 修复 E'：跟单开仓遇到保证金不足，自动减半重试一次。
+		//
+		// 触发条件（同时满足）：
+		//   1. isCopyTrade（仅跟单路径，AI 决策不受影响）
+		//   2. isInsufficientMarginError(err)（精确识别保证金/可用余额不足）
+		//
+		// 重试动作：quantity / actualPositionSize 各减半，再次调用 OpenLong。
+		// 重试失败：返回包装错误（包含原始错误 + 重试错误），便于熔断与告警识别。
+		//
+		// 不重试的情况：
+		//   - 非跟单（AI 决策已有自己的余额预扣逻辑）
+		//   - 非保证金错误（如 size below minSz、风控拒单等，减半通常无济于事）
+		if isCopyTrade && isInsufficientMarginError(err) {
+			retryQty := quantity * 0.5
+			retrySize := actualPositionSize * 0.5
+			logger.Warnf("  🔁 [%s] 跟单开多保证金不足，减半重试一次 | qty=%.4f→%.4f USD=%.2f→%.2f | 原err=%v",
+				decision.Symbol, quantity, retryQty, actualPositionSize, retrySize, err)
+			order2, err2 := at.trader.OpenLong(decision.Symbol, retryQty, decision.Leverage)
+			if err2 != nil {
+				return fmt.Errorf("open long retry-halved failed: initial=%v retry=%v", err, err2)
+			}
+			order = order2
+			quantity = retryQty
+			actualPositionSize = retrySize
+			actionRecord.Quantity = quantity
+			decision.PositionSizeUSD = actualPositionSize
+			logger.Infof("  ✓ [%s] 跟单开多减半重试成功 | qty=%.4f USD=%.2f", decision.Symbol, quantity, actualPositionSize)
+		} else {
+			return err
+		}
 	}
 
 	// Record order ID
@@ -1174,7 +1203,26 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 	// Open position
 	order, err := at.trader.OpenShort(decision.Symbol, quantity, decision.Leverage)
 	if err != nil {
-		return err
+		// 🔁 PR-4 / 修复 E'：跟单开空保证金不足，自动减半重试一次。逻辑与 OpenLong 对称。
+		// 详见 executeOpenLongWithRecord 中相同位置的注释。
+		if isCopyTrade && isInsufficientMarginError(err) {
+			retryQty := quantity * 0.5
+			retrySize := actualPositionSize * 0.5
+			logger.Warnf("  🔁 [%s] 跟单开空保证金不足，减半重试一次 | qty=%.4f→%.4f USD=%.2f→%.2f | 原err=%v",
+				decision.Symbol, quantity, retryQty, actualPositionSize, retrySize, err)
+			order2, err2 := at.trader.OpenShort(decision.Symbol, retryQty, decision.Leverage)
+			if err2 != nil {
+				return fmt.Errorf("open short retry-halved failed: initial=%v retry=%v", err, err2)
+			}
+			order = order2
+			quantity = retryQty
+			actualPositionSize = retrySize
+			actionRecord.Quantity = quantity
+			decision.PositionSizeUSD = actualPositionSize
+			logger.Infof("  ✓ [%s] 跟单开空减半重试成功 | qty=%.4f USD=%.2f", decision.Symbol, quantity, actualPositionSize)
+		} else {
+			return err
+		}
 	}
 
 	// Record order ID

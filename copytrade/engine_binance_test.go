@@ -204,6 +204,9 @@ func TestBinancePositionSnapshotDetectsOpenAddReduceCloseAndIgnoresHistorical(t 
 func TestBinancePollUsesRealtimeSnapshotBeforeDelayedTradeHistory(t *testing.T) {
 	const posID = "1239518824_ETHUSDT_LONG"
 	e, st := newTestCopyTradeEngine(t, ProviderBinance)
+	// PR-3 后 ActionAdd 不再 boost；此测试场景 copySize≈2.09 USDT
+	// 会被默认阈值 12 跳过，显式调小阈值以聚焦"snapshot 优先于 trade-history"主题。
+	e.config.MinTradeWarn = 1
 	saveActiveMapping(t, st, posID, 0.01)
 
 	provider := &binancePollTestProvider{
@@ -755,5 +758,264 @@ func TestOKXCalculateNotAffectedByBinanceLogic(t *testing.T) {
 	// 期望走 OKX 老逻辑：100 × 1.0 × 200/1000 = 20
 	if copySize < 18 || copySize > 22 {
 		t.Fatalf("OKX copySize=%.2f want ~20 (老逻辑未被影响)", copySize)
+	}
+}
+
+// TestBinanceSnapshotFillsDeduplicateAcrossPolls 验证修复 A：
+//
+// 场景重现（"大爷的弟弟"日志）：
+//   - 领航员 ETHUSDT_SHORT 已平仓（leaderState 中无该 posId）
+//   - 跟随者本地 active mapping 仍指向该 posId（历史遗留）
+//   - 引擎每 3 秒 poll 一次，每次 detectBinancePositionSnapshotFills 都
+//     生成相同 fill.ID 的 close 信号（"binance_snapshot|posId|close|prev|0"）
+//
+// 修复前：每次 poll 都触发决策，下游 OKX/Binance trader 报 "position not found"
+// 修复后：第一次 poll 后 fill.ID 被 markSeen，第二次起被 isSeen 过滤，决策不再生成
+func TestBinanceSnapshotFillsDeduplicateAcrossPolls(t *testing.T) {
+	const posID = "1243719130_ETHUSDT_SHORT"
+
+	e, st := newTestCopyTradeEngine(t, ProviderBinance)
+
+	// seed: 历史遗留的 active mapping（领航员持仓中没有该 posId）
+	if err := st.CopyTrade().SavePositionMapping(&store.CopyTradePositionMapping{
+		TraderID:      "test-trader",
+		LeaderPosID:   posID,
+		LeaderID:      "leader",
+		Symbol:        "ETHUSDT",
+		Side:          string(SideShort),
+		MarginMode:    "cross",
+		OpenedAt:      time.Now(),
+		OpenPrice:     2062.21,
+		LastKnownSize: 0.047,
+	}); err != nil {
+		t.Fatalf("seed active mapping: %v", err)
+	}
+
+	// provider 始终返回空持仓 + 空成交（模拟领航员已平仓）
+	e.provider = &binancePollTestProvider{
+		fills: nil,
+		state: &AccountState{
+			TotalEquity: 1000,
+			Positions:   map[string]*Position{},
+		},
+	}
+
+	// 第一次 poll：应该产生 1 条 silent close 决策
+	e.poll()
+
+	select {
+	case dec := <-e.decisionCh:
+		if len(dec.Decisions) != 1 {
+			t.Fatalf("first poll: decision len=%d want 1", len(dec.Decisions))
+		}
+		if got := dec.Decisions[0]; got.Action != "close_short" || got.LeaderPosID != posID {
+			t.Fatalf("first poll: unexpected decision: %+v", got)
+		}
+	default:
+		t.Fatalf("first poll: expected close decision but got none")
+	}
+
+	// 第二/三次 poll：snapshot fill.ID 完全相同，应该被 isSeen 拦截
+	for i := 2; i <= 4; i++ {
+		e.poll()
+		select {
+		case dec := <-e.decisionCh:
+			t.Fatalf("poll #%d: snapshot 应被去重，但仍生成决策: %+v", i, dec.Decisions)
+		default:
+			// 期望路径：无新决策
+		}
+	}
+}
+
+// TestAddBelowMinThresholdIsSkippedNotBoosted 验证修复 D：
+// 加仓时（match.Action == ActionAdd）若 copySize < minTradeThreshold，
+// 应返回 0 且发出 "add_below_threshold_skip" 警告，而不是被强制提升到阈值。
+//
+// 复现场景：领航员持续小额加仓 0.5 USDT，旧逻辑每次都被 boost 到 12 USDT，
+// 跟随者仓位累积速度远高于领航员，破坏"按比例镜像"语义。
+func TestAddBelowMinThresholdIsSkippedNotBoosted(t *testing.T) {
+	e, _ := newTestCopyTradeEngine(t, ProviderOKX)
+	e.config.MinTradeWarn = 12.0
+	e.config.CopyRatio = 1.0
+	// 跟随者权益小（100 USDT），领航员小额加仓 → 计算出的 copySize 必然 < 12
+	e.getFollowerBalance = func() float64 { return 100 }
+
+	signal := &TradeSignal{
+		ProviderType: ProviderOKX,
+		Fill: &Fill{
+			Symbol:       "ETHUSDT",
+			PositionSide: SideLong,
+			Action:       ActionAdd,
+			Price:        2000,
+			Size:         0.0001,
+			Value:        0.5, // 领航员加仓 0.5 USDT
+		},
+		LeaderEquity: 1000,
+		LeaderPosition: &Position{
+			Symbol:        "ETHUSDT",
+			Side:          SideLong,
+			Size:          0.0101, // 当前持仓
+			EntryPrice:    2000,
+			PositionValue: 20.2,
+		},
+	}
+	match := &SignalMatchResult{
+		Action:         ActionAdd,
+		LeaderPosition: signal.LeaderPosition,
+	}
+
+	copySize, warnings := e.calculateCopySizeByPositionChange(signal, match)
+
+	if copySize != 0 {
+		t.Fatalf("ActionAdd 不足阈值应跳过 (copySize=0)，实际 copySize=%.4f", copySize)
+	}
+
+	found := false
+	for _, w := range warnings {
+		if w.Type == "add_below_threshold_skip" {
+			found = true
+			if w.Executed {
+				t.Fatalf("add_below_threshold_skip 警告应 Executed=false")
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("期望 add_below_threshold_skip 警告，实际: %+v", warnings)
+	}
+}
+
+// TestOpenBelowMinThresholdStillBoosted 验证修复 D 的"反向"：
+// 开仓时（match.Action == ActionOpen）若 copySize < minTradeThreshold，
+// 仍然要 boost 到阈值（开仓只发生一次，必须达到交易所最小起步金额）。
+func TestOpenBelowMinThresholdStillBoosted(t *testing.T) {
+	e, _ := newTestCopyTradeEngine(t, ProviderOKX)
+	e.config.MinTradeWarn = 12.0
+	e.config.CopyRatio = 1.0
+	e.getFollowerBalance = func() float64 { return 100 }
+
+	signal := &TradeSignal{
+		ProviderType: ProviderOKX,
+		Fill: &Fill{
+			Symbol:       "ETHUSDT",
+			PositionSide: SideLong,
+			Action:       ActionOpen,
+			Price:        2000,
+			Size:         0.0001,
+			Value:        0.5,
+		},
+		LeaderEquity: 1000,
+	}
+	match := &SignalMatchResult{Action: ActionOpen}
+
+	copySize, warnings := e.calculateCopySizeByPositionChange(signal, match)
+
+	if copySize < 11.99 || copySize > 12.01 {
+		t.Fatalf("ActionOpen 不足阈值应 boost 到 12，实际 copySize=%.4f", copySize)
+	}
+
+	foundBoost := false
+	foundSkip := false
+	for _, w := range warnings {
+		if w.Type == "size_boosted" {
+			foundBoost = true
+			if !w.Executed {
+				t.Fatalf("size_boosted 警告应 Executed=true")
+			}
+		}
+		if w.Type == "add_below_threshold_skip" {
+			foundSkip = true
+		}
+	}
+	if !foundBoost {
+		t.Fatalf("ActionOpen 期望 size_boosted 警告，实际: %+v", warnings)
+	}
+	if foundSkip {
+		t.Fatalf("ActionOpen 不应产生 add_below_threshold_skip 警告")
+	}
+}
+
+// TestProcessSignalSkipsAddWhenBelowThreshold 端到端验证修复 D：
+// 领航员小额加仓 → poll 路径不应推送决策、不应更新 last_known_size。
+func TestProcessSignalSkipsAddWhenBelowThreshold(t *testing.T) {
+	const posID = "1239518824_ETHUSDT_LONG"
+
+	e, st := newTestCopyTradeEngine(t, ProviderBinance)
+	e.config.MinTradeWarn = 12.0
+	e.config.CopyRatio = 1.0
+	e.getFollowerBalance = func() float64 { return 100 }
+
+	// seed active mapping with lastKnownSize=0.01
+	saveActiveMapping(t, st, posID, 0.01)
+
+	// 模拟领航员 size 从 0.01 → 0.0101（加仓 ~0.5 USDT）
+	e.provider = &binancePollTestProvider{
+		state: &AccountState{
+			TotalEquity: 1000,
+			Positions: map[string]*Position{
+				posID: binanceTestPosition(posID, 0.0101),
+			},
+		},
+	}
+
+	e.poll()
+
+	// 预期：无决策推送
+	select {
+	case dec := <-e.decisionCh:
+		t.Fatalf("加仓金额不足应跳过决策，但收到: %+v", dec.Decisions)
+	default:
+	}
+
+	// 验证 last_known_size 未被更新（仍为 0.01，不是 0.0101）
+	mapping, err := st.CopyTrade().GetActiveMapping("test-trader", posID)
+	if err != nil || mapping == nil {
+		t.Fatalf("mapping 应仍 active: err=%v mapping=%+v", err, mapping)
+	}
+	if mapping.LastKnownSize != 0.01 {
+		t.Fatalf("加仓跳过后 LastKnownSize 不应更新，实际=%f want 0.01", mapping.LastKnownSize)
+	}
+}
+
+// TestBinanceSnapshotDifferentSizeStillTriggers 验证修复 A 的"反向"：
+// 当 size 真正变化（previousSize 不同 → fill.ID 不同）时，仍然必须触发新决策。
+// 防止"过度去重"误杀真实减仓/加仓信号。
+func TestBinanceSnapshotDifferentSizeStillTriggers(t *testing.T) {
+	const posID = "1239518824_ETHUSDT_LONG"
+
+	e, st := newTestCopyTradeEngine(t, ProviderBinance)
+	saveActiveMapping(t, st, posID, 0.02)
+
+	provider := &binancePollTestProvider{
+		state: &AccountState{
+			TotalEquity: 1000,
+			Positions: map[string]*Position{
+				posID: binanceTestPosition(posID, 0.01), // 减仓：0.02 → 0.01
+			},
+		},
+	}
+	e.provider = provider
+
+	// 第一次 poll：应该产生 reduce 决策
+	e.poll()
+	select {
+	case dec := <-e.decisionCh:
+		if got := dec.Decisions[0]; got.Action != "reduce_long" {
+			t.Fatalf("expected reduce_long, got %+v", got)
+		}
+	default:
+		t.Fatalf("expected reduce decision")
+	}
+
+	// 改变持仓再 poll：fill.ID 因 previousSize/currentSize 变化而不同 → 应再次触发
+	// 注：实际 LastKnownSize 在 trader 执行成功后才会更新，此处只验证 ID 变化时去重不误伤
+	provider.state.Positions[posID] = binanceTestPosition(posID, 0.005) // 继续减
+	// 第二次 poll 因为 mapping.LastKnownSize 还是 0.02（执行链路在此 mock 不更新），
+	// 但 currentSize 已从 0.01 变为 0.005 → fill.ID 不同 → 应再次产生决策
+	e.poll()
+	select {
+	case <-e.decisionCh:
+		// 期望路径：新 size 产生新 fill.ID，未被去重
+	default:
+		t.Fatalf("size 变化后 fill.ID 应该不同，期望新决策但未收到")
 	}
 }
