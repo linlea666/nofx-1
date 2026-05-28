@@ -28,6 +28,13 @@ type Config struct {
 	MinInterval   time.Duration // 同 key 告警最小间隔，默认 60s
 	QueueSize     int           // 异步队列大小，默认 100
 	SendOnStartup bool          // 启动时发送测试邮件，默认 true
+
+	// NotifyBinanceCopyActionEnabled 是否在"Binance 跟单成功执行动作"时也发邮件。
+	// 默认 false，避免活跃领航员邮件爆量。启用时通过 env
+	// NOTIFY_BINANCE_COPY_ACTION_ENABLED=true 打开。
+	// 仅对跟单数据源 = Binance 的 trader 生效；OKX / Hyperliquid 永不触发。
+	// 限流粒度由全局 MinInterval 控制；限流键 = <traderID>|<symbol>|<action>。
+	NotifyBinanceCopyActionEnabled bool
 }
 
 // LoadFromEnv 从环境变量加载配置
@@ -45,6 +52,7 @@ type Config struct {
 //	NOTIFY_MIN_INTERVAL    = 60                   (秒，默认 60)
 //	NOTIFY_QUEUE_SIZE      = 100                  (默认 100)
 //	NOTIFY_SEND_ON_STARTUP = true                 (默认 true)
+//	NOTIFY_BINANCE_COPY_ACTION_ENABLED = false    (默认 false，仅 Binance 跟单数据源生效)
 func LoadFromEnv() Config {
 	cfg := Config{
 		SMTPPort:      465,
@@ -92,6 +100,9 @@ func LoadFromEnv() Config {
 	if v := os.Getenv("NOTIFY_SEND_ON_STARTUP"); v != "" {
 		cfg.SendOnStartup = parseBool(v, true)
 	}
+
+	cfg.NotifyBinanceCopyActionEnabled = parseBool(
+		os.Getenv("NOTIFY_BINANCE_COPY_ACTION_ENABLED"), false)
 
 	return cfg
 }
@@ -236,6 +247,17 @@ func Enabled() bool {
 	defer globalMu.RUnlock()
 	_, isEmail := global.(*emailNotifier)
 	return isEmail
+}
+
+// CopyTradeActionEnabled 跟单"成功执行动作"邮件通知是否启用。
+//
+// 用于 copytrade 层在执行成功后决定是否发送一封"成功动作"邮件。
+// 仅当全局 notifier 启用 + NOTIFY_BINANCE_COPY_ACTION_ENABLED=true 时返回 true。
+// 守卫语义：未启用时整条路径短路，等价于"开关 = 关"。
+func CopyTradeActionEnabled() bool {
+	globalMu.RLock()
+	defer globalMu.RUnlock()
+	return globalInited && globalCfg.NotifyBinanceCopyActionEnabled
 }
 
 // ============================================================================

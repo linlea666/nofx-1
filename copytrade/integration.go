@@ -295,6 +295,22 @@ func (ti *TraderIntegration) executeFullDecision(fullDec *decision.FullDecision)
 					logger.Debugf("[%s] 清零失败计数失败（不影响主流程）: %v", ti.traderID, rerr)
 				}
 			}
+
+			// 📨 Binance 跟单成功动作邮件通知（PR-Notify-1）
+			//
+			// 触发条件（同时满足）：
+			//   1. 跟单数据源 = Binance（OKX / Hyperliquid 不发，作用域隔离）
+			//   2. NOTIFY_BINANCE_COPY_ACTION_ENABLED=true（全局 env 开关，默认关）
+			//   3. 全局 notifier 已启用（NOTIFY_EMAIL_ENABLED=true + SMTP 完整）
+			//
+			// 限流粒度（L1 精修）：<traderID>|<symbol>|<action>
+			//   - 同动作 60s 内最多 1 封（避免领航员高频加仓邮件爆量）
+			//   - 不同动作（如 open_long 与 close_long）互不压制
+			//
+			// 与失败/熔断/凭证告警互斥共存：成功路径走这里，失败路径走上面的告警分支。
+			if ti.engine.config.ProviderType == ProviderBinance && notifier.CopyTradeActionEnabled() {
+				ti.sendCopyActionAlert(dec, duration)
+			}
 		}
 
 		decisionActions = append(decisionActions, action)
@@ -639,6 +655,94 @@ func (ti *TraderIntegration) buildExecFailureAlertBody(dec *decision.Decision, e
 		dec.MarginMode,
 		dec.LeaderPosID,
 		err.Error(),
+	)
+}
+
+// sendCopyActionAlert 发送一封"Binance 跟单成功执行动作"邮件。
+//
+// 调用前置条件（由调用点保证，本函数不再重复判断，保持职责单一）：
+//   - 跟单数据源 = Binance
+//   - notifier.CopyTradeActionEnabled() == true
+//   - 决策已成功执行（err == nil）
+//
+// 限流键 = "copy_action|<traderID>|<symbol>|<action>"：
+//   - 同 trader 同 symbol 同 action 60s 内最多 1 封
+//   - 不同 action（open/add/close/reduce）互不压制
+//
+// 注意：不设 DedupKey（一次性去重），让每个独立动作窗口都能发；
+// 限流由全局 MinInterval 控制。
+func (ti *TraderIntegration) sendCopyActionAlert(dec *decision.Decision, durationMs int64) {
+	if dec == nil {
+		return
+	}
+	traderName := ti.traderDisplayName()
+	leaderID := ""
+	if ti.engine != nil && ti.engine.config != nil {
+		leaderID = ti.engine.config.LeaderID
+	}
+
+	rateKey := fmt.Sprintf("copy_action|%s|%s|%s", ti.traderID, dec.Symbol, dec.Action)
+
+	notifier.Notify(notifier.Alert{
+		Category: "copy_trade",
+		TraderID: ti.traderID,
+		Title:    fmt.Sprintf("%s | 跟单成功 %s %s", traderName, dec.Action, dec.Symbol),
+		Body:     ti.buildCopyActionAlertBody(dec, traderName, durationMs),
+		RateKey:  rateKey,
+		Fields: map[string]string{
+			"TraderName":    traderName,
+			"Provider":      string(ProviderBinance),
+			"Leader":        leaderID,
+			"Action":        dec.Action,
+			"Symbol":        dec.Symbol,
+			"EntryPrice":    fmt.Sprintf("%.4f", dec.EntryPrice),
+			"PositionUSD":   fmt.Sprintf("%.2f", dec.PositionSizeUSD),
+			"Leverage":      fmt.Sprintf("%dx", dec.Leverage),
+			"MarginMode":    dec.MarginMode,
+			"LeaderPosID":   dec.LeaderPosID,
+			"LeaderPosSize": fmt.Sprintf("%.6f", dec.LeaderPosSize),
+			"CloseRatio":    fmt.Sprintf("%.4f", dec.CloseRatio),
+			"DurationMs":    fmt.Sprintf("%d", durationMs),
+		},
+	})
+}
+
+// buildCopyActionAlertBody 构造跟单成功动作的告警正文。
+// 与 buildExecFailureAlertBody 结构对称，便于用户在收件箱中并列阅读。
+func (ti *TraderIntegration) buildCopyActionAlertBody(dec *decision.Decision, traderName string, durationMs int64) string {
+	leaderID := ""
+	if ti.engine != nil && ti.engine.config != nil {
+		leaderID = ti.engine.config.LeaderID
+	}
+	return fmt.Sprintf(
+		"跟单执行成功 (Copy Trade Action Executed)\n\n"+
+			"Trader Name: %s\n"+
+			"Trader ID:   %s\n"+
+			"Provider:    binance\n"+
+			"Leader ID:   %s\n"+
+			"Action:      %s\n"+
+			"Symbol:      %s\n"+
+			"EntryPrice:  %.4f\n"+
+			"PositionUSD: %.2f\n"+
+			"Leverage:    %dx\n"+
+			"MarginMode:  %s\n"+
+			"LeaderPosID: %s\n"+
+			"LeaderSize:  %.6f\n"+
+			"CloseRatio:  %.4f\n"+
+			"Duration:    %dms",
+		traderName,
+		ti.traderID,
+		leaderID,
+		dec.Action,
+		dec.Symbol,
+		dec.EntryPrice,
+		dec.PositionSizeUSD,
+		dec.Leverage,
+		dec.MarginMode,
+		dec.LeaderPosID,
+		dec.LeaderPosSize,
+		dec.CloseRatio,
+		durationMs,
 	)
 }
 

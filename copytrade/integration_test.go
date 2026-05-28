@@ -3,10 +3,12 @@ package copytrade
 import (
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"nofx/decision"
+	"nofx/notifier"
 	"nofx/store"
 )
 
@@ -451,5 +453,186 @@ func TestBenignCloseStatusDistinctFromHardFailure(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected signal log with status=silent_close, got: %+v", logs)
+	}
+}
+
+// ============================================================================
+// PR-Notify-1: Binance 跟单成功动作邮件通知（hook + helper）
+// ============================================================================
+
+// newTestIntegrationWithProvider 构造一个最小化 TraderIntegration 用于 hook 测试。
+func newTestIntegrationWithProvider(t *testing.T, provider ProviderType) *TraderIntegration {
+	t.Helper()
+	st, err := store.New(filepath.Join(t.TempDir(), "nofx-notify-action.db"))
+	if err != nil {
+		t.Fatalf("create store: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	return &TraderIntegration{
+		traderID: "test-trader-notify",
+		store:    st,
+		engine: &Engine{config: &CopyConfig{
+			ProviderType: provider,
+			LeaderID:     "5008318166959365632",
+		}},
+	}
+}
+
+func newBinanceDecisionForNotify() *decision.Decision {
+	return &decision.Decision{
+		Action:          "open_long",
+		Symbol:          "ETHUSDT",
+		Leverage:        40,
+		PositionSizeUSD: 49.03,
+		MarginMode:      "cross",
+		EntryPrice:      2095.4200,
+		LeaderPosID:     "1239518824_ETHUSDT_LONG",
+		LeaderPosSize:   0.0335,
+		Reasoning:       "Copy trading from Binance leader",
+	}
+}
+
+// TestSendCopyActionAlertBuildsAlertWithExpectedFields 验证 helper 构造的 Alert
+// 字段、限流键、Body 内容符合预期。直接调用 sendCopyActionAlert（不走 Provider 守卫）。
+func TestSendCopyActionAlertBuildsAlertWithExpectedFields(t *testing.T) {
+	cap := &notifier.CaptureNotifier{}
+	restore := notifier.SetGlobalForTesting(cap, true)
+	t.Cleanup(restore)
+
+	ti := newTestIntegrationWithProvider(t, ProviderBinance)
+	dec := newBinanceDecisionForNotify()
+
+	ti.sendCopyActionAlert(dec, 1832)
+
+	if len(cap.Alerts) != 1 {
+		t.Fatalf("expected 1 alert, got %d: %+v", len(cap.Alerts), cap.Alerts)
+	}
+	a := cap.Alerts[0]
+
+	if a.Category != "copy_trade" {
+		t.Fatalf("Category=%q want copy_trade", a.Category)
+	}
+	if a.TraderID != "test-trader-notify" {
+		t.Fatalf("TraderID=%q unexpected", a.TraderID)
+	}
+	wantRateKey := "copy_action|test-trader-notify|ETHUSDT|open_long"
+	if a.RateKey != wantRateKey {
+		t.Fatalf("RateKey=%q want %q", a.RateKey, wantRateKey)
+	}
+	if a.DedupKey != "" {
+		t.Fatalf("DedupKey 不应设置（每个独立动作都该发），实际=%q", a.DedupKey)
+	}
+	if !strings.Contains(a.Title, "跟单成功") || !strings.Contains(a.Title, "ETHUSDT") {
+		t.Fatalf("Title 缺失关键词: %q", a.Title)
+	}
+	if !strings.Contains(a.Body, "Copy Trade Action Executed") {
+		t.Fatalf("Body 缺失关键标识: %q", a.Body)
+	}
+	wantFields := map[string]string{
+		"Provider":    "binance",
+		"Leader":      "5008318166959365632",
+		"Action":      "open_long",
+		"Symbol":      "ETHUSDT",
+		"Leverage":    "40x",
+		"MarginMode":  "cross",
+		"LeaderPosID": "1239518824_ETHUSDT_LONG",
+		"DurationMs":  "1832",
+	}
+	for k, want := range wantFields {
+		got, ok := a.Fields[k]
+		if !ok {
+			t.Fatalf("Fields 缺少 key=%s", k)
+		}
+		if got != want {
+			t.Fatalf("Fields[%s]=%q want %q", k, got, want)
+		}
+	}
+}
+
+// TestExecuteFullDecisionSkipsActionAlertWhenSwitchOff 验证守卫 1：
+// NOTIFY_BINANCE_COPY_ACTION_ENABLED=false 时即使 provider=Binance 也不发邮件。
+// 直接测试 hook 入口条件而非走完整执行链。
+func TestExecuteFullDecisionSkipsActionAlertWhenSwitchOff(t *testing.T) {
+	cap := &notifier.CaptureNotifier{}
+	restore := notifier.SetGlobalForTesting(cap, false) // 开关 OFF
+	t.Cleanup(restore)
+
+	ti := newTestIntegrationWithProvider(t, ProviderBinance)
+	dec := newBinanceDecisionForNotify()
+
+	// 模拟 executeFullDecision 成功分支末尾的守卫
+	if ti.engine.config.ProviderType == ProviderBinance && notifier.CopyTradeActionEnabled() {
+		ti.sendCopyActionAlert(dec, 100)
+	}
+
+	if len(cap.Alerts) != 0 {
+		t.Fatalf("env 关闭时不应发邮件，实际 %d 封: %+v", len(cap.Alerts), cap.Alerts)
+	}
+}
+
+// TestExecuteFullDecisionSkipsActionAlertForNonBinanceProvider 验证守卫 2：
+// 即使开关开启，OKX / Hyperliquid 数据源也永不发邮件。
+func TestExecuteFullDecisionSkipsActionAlertForNonBinanceProvider(t *testing.T) {
+	cases := []ProviderType{ProviderOKX, ProviderHyperliquid}
+	for _, p := range cases {
+		t.Run(string(p), func(t *testing.T) {
+			cap := &notifier.CaptureNotifier{}
+			restore := notifier.SetGlobalForTesting(cap, true) // 开关 ON
+			t.Cleanup(restore)
+
+			ti := newTestIntegrationWithProvider(t, p)
+			dec := newBinanceDecisionForNotify()
+
+			if ti.engine.config.ProviderType == ProviderBinance && notifier.CopyTradeActionEnabled() {
+				ti.sendCopyActionAlert(dec, 100)
+			}
+
+			if len(cap.Alerts) != 0 {
+				t.Fatalf("provider=%s 不应发邮件，实际 %d 封", p, len(cap.Alerts))
+			}
+		})
+	}
+}
+
+// TestSendCopyActionAlertHandlesNilDec 边界：nil decision 应安全返回不发邮件。
+func TestSendCopyActionAlertHandlesNilDec(t *testing.T) {
+	cap := &notifier.CaptureNotifier{}
+	restore := notifier.SetGlobalForTesting(cap, true)
+	t.Cleanup(restore)
+
+	ti := newTestIntegrationWithProvider(t, ProviderBinance)
+	ti.sendCopyActionAlert(nil, 0) // 不应 panic、不应发邮件
+
+	if len(cap.Alerts) != 0 {
+		t.Fatalf("nil decision 不应发邮件，实际 %d 封", len(cap.Alerts))
+	}
+}
+
+// TestSendCopyActionAlertRateKeyDistinguishesActions 验证限流键设计：
+// 同 trader 同 symbol 不同 action 应有不同 RateKey，确保不会互相压制。
+func TestSendCopyActionAlertRateKeyDistinguishesActions(t *testing.T) {
+	cap := &notifier.CaptureNotifier{}
+	restore := notifier.SetGlobalForTesting(cap, true)
+	t.Cleanup(restore)
+
+	ti := newTestIntegrationWithProvider(t, ProviderBinance)
+
+	actions := []string{"open_long", "open_short", "close_long", "close_short",
+		"reduce_long", "reduce_short"}
+	seen := map[string]bool{}
+	for _, a := range actions {
+		dec := newBinanceDecisionForNotify()
+		dec.Action = a
+		ti.sendCopyActionAlert(dec, 0)
+	}
+	for _, alert := range cap.Alerts {
+		if seen[alert.RateKey] {
+			t.Fatalf("RateKey 重复：%s 应该按 action 区分", alert.RateKey)
+		}
+		seen[alert.RateKey] = true
+	}
+	if len(seen) != len(actions) {
+		t.Fatalf("期望 %d 个不同 RateKey，实际 %d", len(actions), len(seen))
 	}
 }
