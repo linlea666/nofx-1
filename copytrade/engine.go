@@ -55,6 +55,11 @@ type Engine struct {
 	// 决策输出
 	decisionCh chan *decision.FullDecision
 
+	// 风控事件输出（v3 风控邮件告警机制）
+	// 设计：buffered channel，写入失败时 select-default 降级（丢事件不阻塞主流程）
+	// 容量 32：考虑极端情况下批量 SL 触发，3 秒 poll 周期内 32 个告警足够
+	riskEventCh chan *RiskEvent
+
 	// 预警日志
 	warnings   []Warning
 	warningsMu sync.Mutex
@@ -66,6 +71,12 @@ type Engine struct {
 
 	// 统计
 	stats *EngineStats
+
+	// v3 风控：账户保护止损疑似计数（防 GetPositions API 抖动误判）
+	// key = leaderPosID，value = 连续疑似 SL 触发的次数
+	// 达到 stopRiskSuspectThreshold 后才正式标 stopped_by_risk
+	// 仅 OKX 路径使用；checkStoppedByRisk 内部访问，与 poll 串行执行无需额外锁
+	stopRiskSuspectCount map[string]int
 }
 
 // EngineOption 引擎配置选项
@@ -105,8 +116,10 @@ func NewEngine(
 		seenTTL:              1 * time.Hour,
 		stateSyncInterval:    20 * time.Second,
 		decisionCh:           make(chan *decision.FullDecision, 10),
+		riskEventCh:          make(chan *RiskEvent, 32),
 		stopCh:               make(chan struct{}),
 		stats:                &EngineStats{StartTime: time.Now()},
+		stopRiskSuspectCount: make(map[string]int),
 	}
 
 	// 应用选项
@@ -212,6 +225,27 @@ func buildBinanceCredsExpiredAlertBody(label, currentTraderID, leaderID, where s
 // GetDecisionChannel 获取决策输出通道
 func (e *Engine) GetDecisionChannel() <-chan *decision.FullDecision {
 	return e.decisionCh
+}
+
+// GetRiskEventChannel 获取风控事件输出通道（v3 风控邮件告警）
+// 由 integration 层消费，转发为邮件告警
+func (e *Engine) GetRiskEventChannel() <-chan *RiskEvent {
+	return e.riskEventCh
+}
+
+// emitRiskEvent 推送风控事件（非阻塞）
+// 失败时（channel 满）记 Debug 日志降级，不影响主流程
+func (e *Engine) emitRiskEvent(event *RiskEvent) {
+	if event == nil {
+		return
+	}
+	select {
+	case e.riskEventCh <- event:
+		// 推送成功
+	default:
+		logger.Debugf("⚠️ [%s] 风控事件 channel 已满，丢弃 | type=%s posId=%s",
+			e.traderID, event.Type, event.LeaderPosID)
+	}
 }
 
 // GetStats 获取统计信息
@@ -840,6 +874,14 @@ func (e *Engine) matchOpenAddSignal(signal *TradeSignal, leaderPosMap map[string
 			break
 		}
 
+		// 🛑 风控止损熔断：该 posId 已被账户保护止损触发，等领航员完全平掉旧 posId 才能恢复
+		// 用户如果启用了二次进场（RiskReentryEnabled），由 reentryMonitor 异步推决策，不走这里
+		if mapping.Status == store.MappingStatusStoppedByRisk {
+			logger.Infof("🛑 [%s] 账户保护止损熔断中 | posId=%s → 忽略开仓/加仓信号（等领航员平掉旧 posId 或触发二次进场）",
+				e.traderID, posID)
+			continue
+		}
+
 		if mapping.Status == "ignored" {
 			// 🔑 关键区分：根据数据源（ProviderType）使用不同的判断逻辑
 			if e.config.ProviderType == ProviderOKX || e.config.ProviderType == ProviderBinance {
@@ -1268,6 +1310,31 @@ func (e *Engine) buildDecisionV2(signal *TradeSignal, match *SignalMatchResult, 
 		dec.Confidence = 90
 		logger.Infof("📊 [%s] %s | 金额=%.2f 杠杆=%dx 模式=%s 入场价=%.4f",
 			e.traderID, match.Action, copySize, dec.Leverage, dec.MarginMode, fill.Price)
+
+		// 🛑 v3 风控：账户保护止损（仅 OKX + 启用风控）
+		// 这里基于 fill.Price 估算 SL（作为兜底）；integration 层执行后会用实际成交价精确重挂
+		// 双层保险：即使 integration 重挂失败，至少 auto_trader 自动挂的估算 SL 还在
+		if e.config.ProviderType == ProviderOKX && e.config.RiskStopLossEnabled && copySize > 0 {
+			slInput := &StopLossCalcInput{
+				Symbol:         fill.Symbol,
+				Side:           fill.PositionSide,
+				EntryPrice:     fill.Price,
+				Leverage:       dec.Leverage,
+				PositionValue:  copySize * float64(dec.Leverage), // 仓位价值 = 保证金 × 杠杆
+				FollowerEquity: e.getFollowerBalance(),
+			}
+			if slResult, err := calcStopLossPrice(e.config, slInput); err == nil && slResult.SLPrice > 0 {
+				dec.StopLoss = slResult.SLPrice
+				logger.Infof("🛑 [%s] SL 估算（开仓即挂） | %s %s | SL=%.4f 距离=%.4f(%.2f%%) 控线=%s ATR=%.4f tickSz=%.6f",
+					e.traderID, fill.Symbol, fill.PositionSide,
+					slResult.SLPrice, slResult.SLDistance,
+					(slResult.SLDistance/fill.Price)*100, slResult.GovernedBy, slResult.ATRValue, slResult.TickSize)
+			} else if err != nil {
+				logger.Warnf("⚠️ [%s] SL 估算失败（仅记录，integration 层会用实际成交价重算）: %v", e.traderID, err)
+			} else if slResult != nil && slResult.OpenImmediateHit {
+				logger.Warnf("⚠️ [%s] SL 距离过近(<0.1%%)，跳过挂单 | %s 入场=%.4f", e.traderID, fill.Symbol, fill.Price)
+			}
+		}
 	}
 
 	// ============================================================
@@ -1847,7 +1914,16 @@ func (e *Engine) syncLeaderState() error {
 
 	// 🔑 检查 ignored 仓位是否已被领航员平仓
 	// 如果是，标记为 closed，这样后续重新开仓可以跟随
+	// 同时处理 stopped_by_risk → closed（v3 风控恢复机制）
 	e.checkIgnoredPositionsClosed()
+
+	// 🔑 v3 风控：SL 触发对账 + 二次进场监控（仅 OKX）
+	// 调用时机：领航员状态刚同步完，本地持仓由 getFollowerPositions() 实时取
+	// 设计原则：放在 syncLeaderState 末尾，保证所有 active mapping 的对账用最新数据
+	if e.config != nil && e.config.ProviderType == ProviderOKX {
+		e.checkStoppedByRisk()
+		e.checkReentryConditions()
+	}
 
 	return nil
 }
@@ -1855,38 +1931,60 @@ func (e *Engine) syncLeaderState() error {
 // checkIgnoredPositionsClosed 检查 ignored 仓位是否已被领航员平仓
 // 当历史仓位被领航员平仓后，将状态从 ignored 改为 closed
 // 这样如果领航员重新开仓（即使 posId 被复用），也能正确跟随
+//
+// 同时处理 stopped_by_risk 状态（v3 风控）：
+// 当账户保护止损触发后，等领航员完全平掉旧 posId → stopped_by_risk → closed
+// 下次他开同币种同方向时会用新 posId（OKX）或同一 posId 但走 closed → new 路径（理论 fallback）
 func (e *Engine) checkIgnoredPositionsClosed() {
 	if e.store == nil {
 		return
 	}
 
-	// 获取所有 ignored 映射
-	ignoredMappings, err := e.store.CopyTrade().ListIgnoredMappings(e.traderID)
-	if err != nil {
-		logger.Warnf("⚠️ [%s] 获取 ignored 映射失败: %v", e.traderID, err)
-		return
-	}
-
-	if len(ignoredMappings) == 0 {
-		return
-	}
-
-	// 获取领航员当前持仓的 posId 集合
+	// 获取领航员当前持仓的 posId 集合（一次构建，两个分支共用）
 	leaderPosMap := e.buildLeaderPosMap()
 	leaderPosIds := make(map[string]bool)
 	for posId := range leaderPosMap {
 		leaderPosIds[posId] = true
 	}
 
-	// 检查每个 ignored 映射
-	for _, mapping := range ignoredMappings {
+	// ============================================================
+	// 处理 ignored 状态
+	// ============================================================
+	ignoredMappings, err := e.store.CopyTrade().ListIgnoredMappings(e.traderID)
+	if err != nil {
+		logger.Warnf("⚠️ [%s] 获取 ignored 映射失败: %v", e.traderID, err)
+	} else {
+		for _, mapping := range ignoredMappings {
+			if _, exists := leaderPosIds[mapping.LeaderPosID]; !exists {
+				// ignored 仓位不在领航员持仓中 → 说明已被平仓 → 改为 closed
+				if err := e.store.CopyTrade().MarkIgnoredAsClosed(e.traderID, mapping.LeaderPosID); err != nil {
+					logger.Warnf("⚠️ [%s] 更新 ignored→closed 失败: %v (posId=%s)",
+						e.traderID, err, mapping.LeaderPosID)
+				} else {
+					logger.Infof("📊 [%s] 历史仓位已平仓 | posId=%s %s %s → ignored→closed",
+						e.traderID, mapping.LeaderPosID, mapping.Symbol, mapping.Side)
+				}
+			}
+		}
+	}
+
+	// ============================================================
+	// 处理 stopped_by_risk 状态（v3 风控恢复机制）
+	// 当领航员完全平掉旧 posId 后，把熔断映射也置为 closed，下次新 posId 可以正常跟随
+	// ============================================================
+	stoppedMappings, err := e.store.CopyTrade().ListStoppedByRiskMappings(e.traderID)
+	if err != nil {
+		logger.Warnf("⚠️ [%s] 获取 stopped_by_risk 映射失败: %v", e.traderID, err)
+		return
+	}
+	for _, mapping := range stoppedMappings {
 		if _, exists := leaderPosIds[mapping.LeaderPosID]; !exists {
-			// ignored 仓位不在领航员持仓中 → 说明已被平仓 → 改为 closed
-			if err := e.store.CopyTrade().MarkIgnoredAsClosed(e.traderID, mapping.LeaderPosID); err != nil {
-				logger.Warnf("⚠️ [%s] 更新 ignored→closed 失败: %v (posId=%s)",
+			// 领航员完全平掉了该 posId → 熔断解除（标 closed）
+			if err := e.store.CopyTrade().MarkStoppedByRiskAsClosed(e.traderID, mapping.LeaderPosID); err != nil {
+				logger.Warnf("⚠️ [%s] 更新 stopped_by_risk→closed 失败: %v (posId=%s)",
 					e.traderID, err, mapping.LeaderPosID)
 			} else {
-				logger.Infof("📊 [%s] 历史仓位已平仓 | posId=%s %s %s → ignored→closed",
+				logger.Infof("✅ [%s] 风控熔断解除 | posId=%s %s %s → stopped_by_risk→closed（领航员已平掉旧仓）",
 					e.traderID, mapping.LeaderPosID, mapping.Symbol, mapping.Side)
 			}
 		}

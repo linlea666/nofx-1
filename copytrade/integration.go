@@ -20,6 +20,21 @@ type DecisionExecutor interface {
 	GetPositions() ([]map[string]interface{}, error)
 }
 
+// StopLossManager 跟单专用的 SL 管理扩展接口（可选实现）
+//
+// 设计目的：为账户保护止损（v3 风控）提供撤旧/挂新/拿价的能力，
+// 同时不污染核心 DecisionExecutor 接口。AutoTrader 自动实现这三个方法。
+//
+// 调用方通过 type assertion 检测；不实现就降级到「仅依赖 buildDecisionV2 估算的 dec.StopLoss」。
+type StopLossManager interface {
+	// SetStopLoss 挂一个 algo 条件止损单（多/空均支持）
+	SetStopLoss(symbol string, positionSide string, quantity, stopPrice float64) error
+	// CancelStopLossOrders 撤销该 symbol 的所有 algo 止损单（不影响止盈单）
+	CancelStopLossOrders(symbol string) error
+	// GetMarketPrice 获取该 symbol 的实时市价（用于 SL 价格校验等）
+	GetMarketPrice(symbol string) (float64, error)
+}
+
 // mappingFailureCircuitThreshold 跟单 active mapping 的连续失败熔断阈值。
 //
 // 触发条件：同一 leaderPosID 的开/加/平/减仓决策连续失败 N 次（成功时清零）。
@@ -84,7 +99,20 @@ func (ti *TraderIntegration) StartCopyTrading() error {
 		MaxTradeWarn:     copyConfig.MaxTradeWarn,
 		BinanceP20T:      copyConfig.BinanceP20T,
 		BinanceCSRFToken: copyConfig.BinanceCSRFToken,
+
+		// v3 风控字段透传（账户保护止损）
+		RiskStopLossEnabled:  copyConfig.RiskStopLossEnabled,
+		RiskAccountPct:       copyConfig.RiskAccountPct,
+		RiskATREnabled:       copyConfig.RiskATREnabled,
+		RiskATRMultiplier:    copyConfig.RiskATRMultiplier,
+		RiskATRTimeframe:     copyConfig.RiskATRTimeframe,
+		RiskLeverageFallback: copyConfig.RiskLeverageFallback,
+		RiskLeverageMaxLoss:  copyConfig.RiskLeverageMaxLoss,
+		RiskReentryEnabled:   copyConfig.RiskReentryEnabled,
+		RiskReentryRatio:     copyConfig.RiskReentryRatio,
+		RiskReentryTolerance: copyConfig.RiskReentryTolerance,
 	}
+	engineConfig.FillRiskDefaults() // 兜底默认值（旧库迁移 / 前端未传时）
 
 	// 创建引擎（Hyperliquid 使用流式模式，OKX 使用轮询模式）
 	var engineOpts []EngineOption
@@ -148,6 +176,8 @@ func (ti *TraderIntegration) StartCopyTrading() error {
 
 	// 启动决策消费协程
 	go ti.consumeDecisions()
+	// 启动风控事件消费协程（v3 风控：SL 触发 / 二次进场告警邮件）
+	go ti.consumeRiskEvents()
 
 	ti.running = true
 	logger.Infof("🚀 [%s] 跟单集成已启动 | provider=%s leader=%s",
@@ -215,6 +245,11 @@ func (ti *TraderIntegration) executeFullDecision(fullDec *decision.FullDecision)
 
 		// 记录决策日志
 		ti.logDecision(fullDec, dec)
+
+		// 🛑 v3 风控：跟单 OKX 路径，执行前先撤旧 SL（避免加仓/减仓后挂出多个 SL）
+		// 不区分动作类型：开仓/加仓/减仓/平仓前都撤一次最简单可靠
+		// 节流：本函数本身是 channel 串行消费，同 trader 不会并发触发，无需额外节流
+		ti.cancelExistingStopLoss(dec, "before-execute")
 
 		// 执行交易
 		startTime := time.Now()
@@ -288,6 +323,11 @@ func (ti *TraderIntegration) executeFullDecision(fullDec *decision.FullDecision)
 
 			// 执行成功后更新仓位映射
 			ti.updatePositionMapping(dec)
+
+			// 🛑 v3 风控：开仓/加仓/部分减仓 → 用实际成交均价精确重挂 SL
+			// 平仓不重挂（仓位已经全清空）
+			// 设计：放在 mapping 更新后，保证后续 SL 触发对账能找到正确的 active mapping
+			ti.refreshStopLossAfterExecute(dec)
 
 			// 🔧 成功一次即清零连续失败计数；下次再失败重新累计
 			if ti.store != nil && dec.LeaderPosID != "" {
@@ -1049,6 +1089,427 @@ func getIntOrFloatField(m map[string]interface{}, key string) int {
 		}
 	}
 	return 0
+}
+
+// ============================================================================
+// v3 风控：账户保护止损（SL）管理钩子
+//
+// 设计原则：
+//  1. 仅 OKX 路径生效（HL/Binance 暂不支持账户保护 SL）
+//  2. executor 不实现 StopLossManager 接口时降级（不报错，仅记 Debug 日志）
+//  3. 任何 SL 操作失败都不阻断主交易流程（仅记日志 + 由 orphan_algo_sweep 兜底）
+// ============================================================================
+
+// shouldManageStopLoss 判断当前决策是否走 v3 风控 SL 管理路径
+// 返回 false 时跳过所有 SL 钩子（透明降级）
+func (ti *TraderIntegration) shouldManageStopLoss(dec *decision.Decision) bool {
+	if ti.engine == nil || ti.engine.config == nil {
+		return false
+	}
+	if ti.engine.config.ProviderType != ProviderOKX {
+		return false
+	}
+	if !ti.engine.config.RiskStopLossEnabled {
+		return false
+	}
+	if dec == nil || dec.Symbol == "" {
+		return false
+	}
+	return true
+}
+
+// cancelExistingStopLoss 执行前撤旧 SL
+// 调用时机：跟单 OKX 开仓/加仓/减仓/平仓 → ExecuteDecision 之前
+// 设计：失败不阻断（只是没撤掉旧单），主流程继续；旧单触发可能比新单更紧，安全降级
+func (ti *TraderIntegration) cancelExistingStopLoss(dec *decision.Decision, where string) {
+	if !ti.shouldManageStopLoss(dec) {
+		return
+	}
+	slMgr, ok := ti.executor.(StopLossManager)
+	if !ok {
+		return
+	}
+	if err := slMgr.CancelStopLossOrders(dec.Symbol); err != nil {
+		logger.Debugf("[%s] 撤旧 SL 失败（%s，不阻断主流程）: %v | %s", ti.traderID, where, err, dec.Symbol)
+	} else {
+		logger.Debugf("🧹 [%s] 撤旧 SL 完成 | %s @%s", ti.traderID, dec.Symbol, where)
+	}
+}
+
+// refreshStopLossAfterExecute 执行成功后用实际成交均价精确重挂 SL
+//
+// 调用时机：跟单 OKX 开仓/加仓/部分减仓执行成功 + mapping 更新完成后
+// 平仓（close_long/close_short）不重挂（仓位已清空）
+//
+// 实现细节：
+//  1. 通过 GetPositions() 拿到最新本地持仓的 EntryPrice / Quantity（实际成交均价）
+//  2. 用 calcStopLossPrice 算 SL 价
+//  3. 调 SetStopLoss 挂 algo 单
+//
+// 失败处理：日志告警 + 由 engine.checkStoppedByRisk 的 orphan 兜底 + 估算版 dec.StopLoss 还在
+func (ti *TraderIntegration) refreshStopLossAfterExecute(dec *decision.Decision) {
+	if !ti.shouldManageStopLoss(dec) {
+		return
+	}
+
+	// 平仓不重挂
+	switch dec.Action {
+	case "close_long", "close_short":
+		return
+	}
+
+	slMgr, ok := ti.executor.(StopLossManager)
+	if !ok {
+		logger.Debugf("[%s] executor 未实现 StopLossManager，跳过精确重挂 SL", ti.traderID)
+		return
+	}
+
+	// 拿最新持仓
+	positions, err := ti.executor.GetPositions()
+	if err != nil {
+		logger.Warnf("⚠️ [%s] 重挂 SL 失败（GetPositions 错误）: %v | %s", ti.traderID, err, dec.Symbol)
+		return
+	}
+
+	// 匹配本次决策对应的本地仓位
+	// 优先按 posId 匹配（OKX 精确），fallback 按 symbol+side+marginMode
+	expectedSide := ""
+	switch dec.Action {
+	case "open_long", "reduce_long":
+		expectedSide = "long"
+	case "open_short", "reduce_short":
+		expectedSide = "short"
+	default:
+		return
+	}
+
+	// 本地仓位匹配：用 symbol+side+marginMode 三元组
+	// 关键认知：跟随者账户的本地 posId（pos["posId"]）与领航员的 posId（dec.LeaderPosID）
+	// 属于不同账户，永远不会相等，因此不能用 posId 跨账户匹配
+	var matchedPos map[string]interface{}
+	for _, pos := range positions {
+		symbol, _ := pos["symbol"].(string)
+		sideStr, _ := pos["side"].(string)
+		marginMode := getStringField(pos, "marginMode", "mgnMode")
+		quantity := getFloatField(pos, "positionAmt", "quantity")
+
+		if symbol != dec.Symbol || sideStr != expectedSide || quantity == 0 {
+			continue
+		}
+
+		// 优先按 marginMode 严格匹配（OKX 全仓/逐仓是独立 posId，必须区分）
+		if dec.MarginMode != "" && marginMode != "" && marginMode == dec.MarginMode {
+			matchedPos = pos
+			break
+		}
+		// 兜底：第一个 symbol+side 匹配的（dec.MarginMode 为空 或 本地未返回 marginMode）
+		if matchedPos == nil {
+			matchedPos = pos
+		}
+	}
+
+	if matchedPos == nil {
+		logger.Warnf("⚠️ [%s] 重挂 SL：找不到本地仓位 | %s %s posId=%s", ti.traderID, dec.Symbol, expectedSide, dec.LeaderPosID)
+		return
+	}
+
+	entryPrice := getFloatField(matchedPos, "entryPrice", "entry_price")
+	quantity := absFloat(getFloatField(matchedPos, "positionAmt", "quantity"))
+	leverage := getIntOrFloatField(matchedPos, "leverage")
+	if leverage <= 0 {
+		leverage = dec.Leverage
+	}
+	if entryPrice <= 0 || quantity <= 0 {
+		logger.Warnf("⚠️ [%s] 重挂 SL：本地仓位数据异常 | entry=%.4f qty=%.4f", ti.traderID, entryPrice, quantity)
+		return
+	}
+
+	followerEquity := ti.getBalanceFunc()()
+	if followerEquity <= 0 {
+		logger.Warnf("⚠️ [%s] 重挂 SL：跟随者权益为零", ti.traderID)
+		return
+	}
+
+	side := SideLong
+	if expectedSide == "short" {
+		side = SideShort
+	}
+
+	slInput := &StopLossCalcInput{
+		Symbol:         dec.Symbol,
+		Side:           side,
+		EntryPrice:     entryPrice,
+		Leverage:       leverage,
+		PositionValue:  entryPrice * quantity,
+		FollowerEquity: followerEquity,
+	}
+
+	slResult, err := calcStopLossPrice(ti.engine.config, slInput)
+	if err != nil {
+		logger.Warnf("⚠️ [%s] 重挂 SL：算法失败: %v | %s", ti.traderID, err, dec.Symbol)
+		return
+	}
+	if slResult.SLPrice <= 0 {
+		if slResult.OpenImmediateHit {
+			logger.Warnf("⚠️ [%s] 重挂 SL：SL 距离过近(<0.1%%)，跳过挂单 | %s entry=%.4f", ti.traderID, dec.Symbol, entryPrice)
+		}
+		return
+	}
+
+	// 先撤旧（双保险，覆盖 ExecuteDecision 内部自动挂的估算 SL）
+	if err := slMgr.CancelStopLossOrders(dec.Symbol); err != nil {
+		logger.Debugf("[%s] 重挂前撤旧 SL 失败（不阻断）: %v", ti.traderID, err)
+	}
+
+	// 挂新（用实际成交价计算）
+	positionSide := "LONG"
+	if expectedSide == "short" {
+		positionSide = "SHORT"
+	}
+	if err := slMgr.SetStopLoss(dec.Symbol, positionSide, quantity, slResult.SLPrice); err != nil {
+		logger.Errorf("❌ [%s] 重挂 SL 失败（账户保护可能失效）| %s %s SL=%.4f: %v",
+			ti.traderID, dec.Symbol, positionSide, slResult.SLPrice, err)
+
+		// 邮件告警：SL 挂单失败 = 账户保护可能失效，用户必须感知
+		// RateKey 按 trader+symbol+side 限流，避免同一仓位反复挂失败时邮件爆量
+		traderName := ti.traderDisplayName()
+		alertKey := fmt.Sprintf("sl_attach_failed|%s|%s|%s", ti.traderID, dec.Symbol, positionSide)
+		notifier.Notify(notifier.Alert{
+			Category: "copy_trade",
+			TraderID: ti.traderID,
+			Title:    fmt.Sprintf("%s | 账户保护 SL 挂单失败（%s %s）", traderName, dec.Symbol, positionSide),
+			Body: fmt.Sprintf(
+				"账户保护止损单挂单失败 (Stop Loss Attach Failed)\n\n"+
+					"Trader Name: %s\n"+
+					"Trader ID:   %s\n"+
+					"Symbol:      %s\n"+
+					"Side:        %s\n"+
+					"Entry Price: %.4f\n"+
+					"SL Price:    %.4f (距离 %.2f%%, 控线=%s)\n"+
+					"Quantity:    %.4f\n\n"+
+					"错误信息 (Error):\n%v\n\n"+
+					"⚠️ 该仓位当前没有交易所托管的止损单，账户保护可能失效。\n"+
+					"建议：手动在 OKX 上检查该仓位的 algo 条件单，或重启该交易员让对账逻辑重新挂单。",
+				traderName, ti.traderID, dec.Symbol, positionSide,
+				entryPrice, slResult.SLPrice, (slResult.SLDistance/entryPrice)*100, slResult.GovernedBy,
+				quantity, err),
+			RateKey:  alertKey,
+			DedupKey: alertKey,
+			Fields: map[string]string{
+				"TraderName":  traderName,
+				"Symbol":      dec.Symbol,
+				"Side":        positionSide,
+				"EntryPrice":  fmt.Sprintf("%.4f", entryPrice),
+				"SLPrice":     fmt.Sprintf("%.4f", slResult.SLPrice),
+				"Quantity":    fmt.Sprintf("%.4f", quantity),
+				"GovernedBy":  slResult.GovernedBy,
+				"LastError":   err.Error(),
+			},
+		})
+		return
+	}
+
+	logger.Infof("🛑 [%s] SL 精确重挂 | %s %s | 入场=%.4f SL=%.4f 距离=%.4f(%.2f%%) 控线=%s qty=%.4f",
+		ti.traderID, dec.Symbol, positionSide,
+		entryPrice, slResult.SLPrice, slResult.SLDistance,
+		(slResult.SLDistance/entryPrice)*100, slResult.GovernedBy, quantity)
+}
+
+// ============================================================================
+// v3 风控：邮件告警（SL 触发 + 二次进场）
+//
+// 设计：engine 内部检测到风控事件 → 推入 riskEventCh channel；
+// integration 这层协程消费 → 发邮件告警（能拿 trader name，与现有 sendCopyActionAlert 风格一致）
+//
+// 触发邮件的事件：
+//  1. SL 被交易所触发（engine.checkStoppedByRisk 标记 stopped_by_risk 后）
+//  2. 二次进场决策已生成（engine.emitReentryDecision 推出决策后）
+//
+// 注意：决策执行成功的告警仍由 executeFullDecision 的成功分支处理（识别 reentry decision 后单独发）
+// ============================================================================
+
+// consumeRiskEvents 消费引擎推送的风控事件，转发为邮件告警
+// 调用时机：StartCopyTrading 启动时作为独立协程运行，与 consumeDecisions 平行
+func (ti *TraderIntegration) consumeRiskEvents() {
+	if ti.engine == nil {
+		return
+	}
+	eventCh := ti.engine.GetRiskEventChannel()
+	for {
+		select {
+		case <-ti.ctx.Done():
+			return
+		case event, ok := <-eventCh:
+			if !ok {
+				return
+			}
+			if event == nil {
+				continue
+			}
+			switch event.Type {
+			case RiskEventStopLossTriggered:
+				ti.sendStopLossTriggerAlert(event)
+			case RiskEventReentryInitiated:
+				ti.sendReentryInitiatedAlert(event)
+			default:
+				logger.Debugf("[%s] 未知风控事件类型: %s", ti.traderID, event.Type)
+			}
+		}
+	}
+}
+
+// sendStopLossTriggerAlert 发送账户保护止损触发邮件
+//
+// 限流：RateKey + DedupKey 都用 "sl_trigger|<traderID>|<posId>"
+//   - RateKey：60s 内同 posId 最多 1 封（防止频繁对账重发）
+//   - DedupKey：彻底去重（同 posId 一次性，理论上 SL 仅触发一次）
+//
+// 邮件正文：完整上下文，让用户能立刻判断后续动作（是否手动干预、是否启用二次进场等）
+func (ti *TraderIntegration) sendStopLossTriggerAlert(event *RiskEvent) {
+	traderName := ti.traderDisplayName()
+	providerType := ""
+	leaderID := ""
+	if ti.engine != nil && ti.engine.config != nil {
+		providerType = string(ti.engine.config.ProviderType)
+		leaderID = ti.engine.config.LeaderID
+	}
+
+	alertKey := fmt.Sprintf("sl_trigger|%s|%s", ti.traderID, event.LeaderPosID)
+
+	// 恢复条件文案（根据是否启用二次进场动态调整）
+	recoveryHint := "等领航员完全平掉旧 posId 后，下次他重新开仓时跟单系统自动恢复跟随"
+	if ti.engine != nil && ti.engine.config != nil && ti.engine.config.RiskReentryEnabled {
+		recoveryHint = fmt.Sprintf(
+			"已启用二次进场：若价格回到入场价附近(±%.2f%%)、领航员浮亏收窄一半、未继续加仓 → 自动按 %.0f%% 系数重入；\n"+
+				"  或等领航员完全平掉旧 posId，下次他新开仓时自动恢复跟随",
+			ti.engine.config.RiskReentryTolerance*100, ti.engine.config.RiskReentryRatio*100)
+	}
+
+	body := fmt.Sprintf(
+		"🛑 账户保护止损已触发 (Stop Loss Triggered by Exchange)\n\n"+
+			"Trader Name:   %s\n"+
+			"Trader ID:     %s\n"+
+			"Provider:      %s\n"+
+			"Leader ID:     %s\n"+
+			"Symbol:        %s\n"+
+			"Side:          %s\n"+
+			"Margin Mode:   %s\n"+
+			"Leader PosID:  %s\n\n"+
+			"📊 SL 触发时领航员状态:\n"+
+			"  浮亏 (PnL):    %.2f USDT\n"+
+			"  持仓数量:      %.6f\n"+
+			"  跟随加仓次数:  %d\n\n"+
+			"📋 跟单状态:\n"+
+			"  本地仓位:      已被 OKX algo 条件单兜底平仓\n"+
+			"  Mapping:       已转为 stopped_by_risk，该 posId 后续信号被忽略\n\n"+
+			"🔄 恢复条件:\n"+
+			"  %s\n\n"+
+			"💡 提示:\n"+
+			"  此次触发是「价格反向走到账户风险线」导致，由交易所托管的 algo 条件单自动平仓。\n"+
+			"  系统已自动避免在被打过的仓位上反复进出，保护账户。",
+		traderName, ti.traderID, providerType, leaderID,
+		event.Symbol, event.Side, event.MarginMode, event.LeaderPosID,
+		event.LeaderPnL, event.LeaderSize, event.AddCount,
+		recoveryHint)
+
+	notifier.Notify(notifier.Alert{
+		Time:     event.Timestamp,
+		Category: "copy_trade",
+		TraderID: ti.traderID,
+		Title:    fmt.Sprintf("%s | 账户保护止损触发 %s %s", traderName, event.Symbol, event.Side),
+		Body:     body,
+		RateKey:  alertKey,
+		DedupKey: alertKey,
+		Fields: map[string]string{
+			"TraderName":  traderName,
+			"Provider":    providerType,
+			"Leader":      leaderID,
+			"Symbol":      event.Symbol,
+			"Side":        event.Side,
+			"MarginMode":  event.MarginMode,
+			"LeaderPosID": event.LeaderPosID,
+			"LeaderPnL":   fmt.Sprintf("%.2f", event.LeaderPnL),
+			"LeaderSize":  fmt.Sprintf("%.6f", event.LeaderSize),
+			"AddCount":    fmt.Sprintf("%d", event.AddCount),
+		},
+	})
+
+	logger.Infof("📧 [%s] 已发送 SL 触发告警邮件 | posId=%s", ti.traderID, event.LeaderPosID)
+}
+
+// sendReentryInitiatedAlert 发送二次进场决策已生成邮件
+//
+// 限流：RateKey + DedupKey 都用 "reentry|<traderID>|<posId>"
+//   - 同 posId 二次进场限 1 次（与判据 E 的 ReentryUsed 安全阀对应），DedupKey 彻底去重
+//
+// 注意：这是"决策已生成"告警。实际执行成功/失败的告警分别走：
+//   - 成功：executeFullDecision 成功分支（识别 reentry decision 后单独发 sendReentryExecutedAlert）
+//   - 失败：execFailureDedupKey 路径（普通跟单失败告警）
+func (ti *TraderIntegration) sendReentryInitiatedAlert(event *RiskEvent) {
+	traderName := ti.traderDisplayName()
+	providerType := ""
+	leaderID := ""
+	copyRatio := float64(0)
+	reentryRatio := float64(0)
+	if ti.engine != nil && ti.engine.config != nil {
+		providerType = string(ti.engine.config.ProviderType)
+		leaderID = ti.engine.config.LeaderID
+		copyRatio = ti.engine.config.CopyRatio
+		reentryRatio = ti.engine.config.RiskReentryRatio
+	}
+
+	alertKey := fmt.Sprintf("reentry|%s|%s", ti.traderID, event.LeaderPosID)
+
+	body := fmt.Sprintf(
+		"🔄 二次进场决策已触发 (Reentry Decision Initiated, Judge E)\n\n"+
+			"Trader Name:   %s\n"+
+			"Trader ID:     %s\n"+
+			"Provider:      %s\n"+
+			"Leader ID:     %s\n"+
+			"Symbol:        %s\n"+
+			"Side:          %s\n"+
+			"Margin Mode:   %s\n"+
+			"Leader PosID:  %s\n\n"+
+			"📊 判据 E 满足条件:\n"+
+			"  领航员仍持仓:  ✓ size=%.6f\n"+
+			"  价格回归:      ✓\n"+
+			"  浮亏收窄:      ✓ 当前 %.2f USDT (已收窄到 SL 触发时的 ≤50%%)\n"+
+			"  未继续加仓:    ✓ 领航员 size 未超过 SL 触发时\n"+
+			"  重入限 1 次:    ✓ 同 posId 仅此一次\n\n"+
+			"💰 重入参数:\n"+
+			"  入场价基准:    %.4f\n"+
+			"  重入金额:      %.2f USDT (=跟单系数 %.0f%% × 重入系数 %.0f%%)\n\n"+
+			"⚠️ 风控约束:\n"+
+			"  - 同 posId 重入仅 1 次，重入后再次被 SL 触发将永久熔断该 posId\n"+
+			"  - 重入决策已推送给执行器，实际执行结果将另行告警（成功/失败）",
+		traderName, ti.traderID, providerType, leaderID,
+		event.Symbol, event.Side, event.MarginMode, event.LeaderPosID,
+		event.LeaderSize, event.LeaderPnL,
+		event.ReentryEntryPrice, event.ReentrySize, copyRatio*100, reentryRatio*100)
+
+	notifier.Notify(notifier.Alert{
+		Time:     event.Timestamp,
+		Category: "copy_trade",
+		TraderID: ti.traderID,
+		Title:    fmt.Sprintf("%s | 二次进场触发 %s %s", traderName, event.Symbol, event.Side),
+		Body:     body,
+		RateKey:  alertKey,
+		DedupKey: alertKey,
+		Fields: map[string]string{
+			"TraderName":        traderName,
+			"Provider":          providerType,
+			"Leader":            leaderID,
+			"Symbol":            event.Symbol,
+			"Side":              event.Side,
+			"LeaderPosID":       event.LeaderPosID,
+			"LeaderPnL":         fmt.Sprintf("%.2f", event.LeaderPnL),
+			"LeaderSize":        fmt.Sprintf("%.6f", event.LeaderSize),
+			"ReentryEntryPrice": fmt.Sprintf("%.4f", event.ReentryEntryPrice),
+			"ReentrySize":       fmt.Sprintf("%.2f", event.ReentrySize),
+		},
+	})
+
+	logger.Infof("📧 [%s] 已发送二次进场触发告警邮件 | posId=%s", ti.traderID, event.LeaderPosID)
 }
 
 // ============================================================================

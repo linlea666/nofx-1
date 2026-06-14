@@ -27,8 +27,64 @@ type CopyTradeConfig struct {
 	BinanceP20T      string `json:"binance_p20t,omitempty"`       // 登录 cookie p20t
 	BinanceCSRFToken string `json:"binance_csrf_token,omitempty"` // CSRF header csrftoken
 
+	// ============================================================
+	// 账户保护 / 止损兜底配置（v3 风控）
+	// 仅 OKX 路径生效（OKX 的 algo 条件单提供交易所托管的硬止损）
+	// HL / Binance 路径下这些字段被忽略，零影响向后兼容
+	// ============================================================
+
+	// 主开关
+	RiskStopLossEnabled bool `json:"risk_stop_loss_enabled"` // 默认 true
+
+	// 账户风险线（硬上限：单笔最多亏账户的百分比）
+	RiskAccountPct float64 `json:"risk_account_pct"` // 默认 0.005 (0.5%)，范围 0.001-0.05
+
+	// ATR 噪音防护（下界保护：避免被币种正常波动扫出）
+	RiskATREnabled    bool    `json:"risk_atr_enabled"`    // 默认 true
+	RiskATRMultiplier float64 `json:"risk_atr_multiplier"` // 默认 1.5，范围 1.0-3.0
+	RiskATRTimeframe  string  `json:"risk_atr_timeframe"`  // 默认 "1h"，可选 "15m"/"1h"/"4h"
+
+	// 杠杆兜底 cap（最外层封顶：保证金最大亏损不超此比例）
+	RiskLeverageFallback bool    `json:"risk_leverage_fallback"` // 默认 true
+	RiskLeverageMaxLoss  float64 `json:"risk_leverage_max_loss"` // 默认 0.5 (=50% 保证金)
+
+	// 二次进场（判据 E 双门控）—— 默认 off，用户 opt-in
+	RiskReentryEnabled   bool    `json:"risk_reentry_enabled"`   // 默认 false
+	RiskReentryRatio     float64 `json:"risk_reentry_ratio"`     // 默认 0.5，范围 0.1-1.0
+	RiskReentryTolerance float64 `json:"risk_reentry_tolerance"` // 价格回归容差，默认 0.005 (0.5%)
+
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// FillRiskDefaults 为零值字段填充默认值
+// 调用时机：从数据库读出后立即调用，或前端未传字段时
+// 设计目的：保证旧库（ALTER TABLE 后字段为 0/false/""）也能跑出合理默认行为
+//
+// 关键设计决策（v3.1）：
+//   - RiskAccountPct 默认 0.5 (=50%) 是用户明确选择的激进配置（参考方案确认）
+//     语义：单笔最多亏账户的 50%；用户在 UI 上自由调节（无上限）
+//     ⚠️ 这是高风险默认值，对应"领航员是预先严格筛选"的使用场景
+//     新手应在 UI 上手动调低到 0.5-1%
+func (c *CopyTradeConfig) FillRiskDefaults() {
+	if c.RiskAccountPct == 0 {
+		c.RiskAccountPct = 0.5
+	}
+	if c.RiskATRMultiplier == 0 {
+		c.RiskATRMultiplier = 1.5
+	}
+	if c.RiskATRTimeframe == "" {
+		c.RiskATRTimeframe = "1h"
+	}
+	if c.RiskLeverageMaxLoss == 0 {
+		c.RiskLeverageMaxLoss = 0.5
+	}
+	if c.RiskReentryRatio == 0 {
+		c.RiskReentryRatio = 0.5
+	}
+	if c.RiskReentryTolerance == 0 {
+		c.RiskReentryTolerance = 0.005
+	}
 }
 
 func (s *CopyTradeStore) initTables() error {
@@ -72,24 +128,47 @@ func (s *CopyTradeStore) initTables() error {
 	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN binance_p20t TEXT DEFAULT ''`)
 	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN binance_csrf_token TEXT DEFAULT ''`)
 
+	// 给 copy_trade_configs 表添加风控字段（v3：账户保护 / 止损兜底）
+	// 旧库 ALTER 失败说明已存在，忽略；新库随表创建即有这些列
+	// 默认值与 FillRiskDefaults 保持一致：启用 SL + ATR + 杠杆兜底；二次进场默认 off
+	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_stop_loss_enabled INTEGER DEFAULT 1`)
+	// risk_account_pct 默认 0.5 (=50%)：v3.1 用户明确选择的激进默认值（参考 FillRiskDefaults 注释）
+	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_account_pct REAL DEFAULT 0.5`)
+	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_atr_enabled INTEGER DEFAULT 1`)
+	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_atr_multiplier REAL DEFAULT 1.5`)
+	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_atr_timeframe TEXT DEFAULT '1h'`)
+	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_leverage_fallback INTEGER DEFAULT 1`)
+	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_leverage_max_loss REAL DEFAULT 0.5`)
+	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_reentry_enabled INTEGER DEFAULT 0`)
+	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_reentry_ratio REAL DEFAULT 0.5`)
+	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_reentry_tolerance REAL DEFAULT 0.005`)
+
 	return nil
 }
 
 // Create 创建跟单配置
 func (s *CopyTradeStore) Create(config *CopyTradeConfig) error {
+	config.FillRiskDefaults()
 	_, err := s.db.Exec(`
 		INSERT INTO copy_trade_configs 
 			(trader_id, provider_type, leader_id, copy_ratio, sync_leverage, sync_margin_mode, 
-			 min_trade_warn, max_trade_warn, enabled, binance_p20t, binance_csrf_token)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			 min_trade_warn, max_trade_warn, enabled, binance_p20t, binance_csrf_token,
+			 risk_stop_loss_enabled, risk_account_pct, risk_atr_enabled, risk_atr_multiplier,
+			 risk_atr_timeframe, risk_leverage_fallback, risk_leverage_max_loss,
+			 risk_reentry_enabled, risk_reentry_ratio, risk_reentry_tolerance)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, config.TraderID, config.ProviderType, config.LeaderID, config.CopyRatio,
 		config.SyncLeverage, config.SyncMarginMode, config.MinTradeWarn, config.MaxTradeWarn, config.Enabled,
-		config.BinanceP20T, config.BinanceCSRFToken)
+		config.BinanceP20T, config.BinanceCSRFToken,
+		config.RiskStopLossEnabled, config.RiskAccountPct, config.RiskATREnabled, config.RiskATRMultiplier,
+		config.RiskATRTimeframe, config.RiskLeverageFallback, config.RiskLeverageMaxLoss,
+		config.RiskReentryEnabled, config.RiskReentryRatio, config.RiskReentryTolerance)
 	return err
 }
 
 // Update 更新跟单配置
 func (s *CopyTradeStore) Update(config *CopyTradeConfig) error {
+	config.FillRiskDefaults()
 	_, err := s.db.Exec(`
 		UPDATE copy_trade_configs SET
 			provider_type = ?,
@@ -101,21 +180,39 @@ func (s *CopyTradeStore) Update(config *CopyTradeConfig) error {
 			max_trade_warn = ?,
 			enabled = ?,
 			binance_p20t = ?,
-			binance_csrf_token = ?
+			binance_csrf_token = ?,
+			risk_stop_loss_enabled = ?,
+			risk_account_pct = ?,
+			risk_atr_enabled = ?,
+			risk_atr_multiplier = ?,
+			risk_atr_timeframe = ?,
+			risk_leverage_fallback = ?,
+			risk_leverage_max_loss = ?,
+			risk_reentry_enabled = ?,
+			risk_reentry_ratio = ?,
+			risk_reentry_tolerance = ?
 		WHERE trader_id = ?
 	`, config.ProviderType, config.LeaderID, config.CopyRatio,
 		config.SyncLeverage, config.SyncMarginMode, config.MinTradeWarn, config.MaxTradeWarn,
-		config.Enabled, config.BinanceP20T, config.BinanceCSRFToken, config.TraderID)
+		config.Enabled, config.BinanceP20T, config.BinanceCSRFToken,
+		config.RiskStopLossEnabled, config.RiskAccountPct, config.RiskATREnabled, config.RiskATRMultiplier,
+		config.RiskATRTimeframe, config.RiskLeverageFallback, config.RiskLeverageMaxLoss,
+		config.RiskReentryEnabled, config.RiskReentryRatio, config.RiskReentryTolerance,
+		config.TraderID)
 	return err
 }
 
 // Upsert 创建或更新跟单配置
 func (s *CopyTradeStore) Upsert(config *CopyTradeConfig) error {
+	config.FillRiskDefaults()
 	_, err := s.db.Exec(`
 		INSERT INTO copy_trade_configs 
 			(trader_id, provider_type, leader_id, copy_ratio, sync_leverage, sync_margin_mode, 
-			 min_trade_warn, max_trade_warn, enabled, binance_p20t, binance_csrf_token)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			 min_trade_warn, max_trade_warn, enabled, binance_p20t, binance_csrf_token,
+			 risk_stop_loss_enabled, risk_account_pct, risk_atr_enabled, risk_atr_multiplier,
+			 risk_atr_timeframe, risk_leverage_fallback, risk_leverage_max_loss,
+			 risk_reentry_enabled, risk_reentry_ratio, risk_reentry_tolerance)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(trader_id) DO UPDATE SET
 			provider_type = excluded.provider_type,
 			leader_id = excluded.leader_id,
@@ -126,10 +223,23 @@ func (s *CopyTradeStore) Upsert(config *CopyTradeConfig) error {
 			max_trade_warn = excluded.max_trade_warn,
 			enabled = excluded.enabled,
 			binance_p20t = excluded.binance_p20t,
-			binance_csrf_token = excluded.binance_csrf_token
+			binance_csrf_token = excluded.binance_csrf_token,
+			risk_stop_loss_enabled = excluded.risk_stop_loss_enabled,
+			risk_account_pct = excluded.risk_account_pct,
+			risk_atr_enabled = excluded.risk_atr_enabled,
+			risk_atr_multiplier = excluded.risk_atr_multiplier,
+			risk_atr_timeframe = excluded.risk_atr_timeframe,
+			risk_leverage_fallback = excluded.risk_leverage_fallback,
+			risk_leverage_max_loss = excluded.risk_leverage_max_loss,
+			risk_reentry_enabled = excluded.risk_reentry_enabled,
+			risk_reentry_ratio = excluded.risk_reentry_ratio,
+			risk_reentry_tolerance = excluded.risk_reentry_tolerance
 	`, config.TraderID, config.ProviderType, config.LeaderID, config.CopyRatio,
 		config.SyncLeverage, config.SyncMarginMode, config.MinTradeWarn, config.MaxTradeWarn, config.Enabled,
-		config.BinanceP20T, config.BinanceCSRFToken)
+		config.BinanceP20T, config.BinanceCSRFToken,
+		config.RiskStopLossEnabled, config.RiskAccountPct, config.RiskATREnabled, config.RiskATRMultiplier,
+		config.RiskATRTimeframe, config.RiskLeverageFallback, config.RiskLeverageMaxLoss,
+		config.RiskReentryEnabled, config.RiskReentryRatio, config.RiskReentryTolerance)
 	return err
 }
 
@@ -139,23 +249,40 @@ func (s *CopyTradeStore) Delete(traderID string) error {
 	return err
 }
 
-// GetByTraderID 根据 trader_id 获取跟单配置
-func (s *CopyTradeStore) GetByTraderID(traderID string) (*CopyTradeConfig, error) {
+// copyTradeConfigSelectColumns 统一的 SELECT 列清单
+// 提取为常量便于 GetByTraderID / ListEnabled 共用，新增字段时一处改动
+const copyTradeConfigSelectColumns = `
+	trader_id, provider_type, leader_id, copy_ratio, sync_leverage, sync_margin_mode,
+	min_trade_warn, max_trade_warn, enabled,
+	COALESCE(binance_p20t, '') AS binance_p20t,
+	COALESCE(binance_csrf_token, '') AS binance_csrf_token,
+	COALESCE(risk_stop_loss_enabled, 1) AS risk_stop_loss_enabled,
+	COALESCE(risk_account_pct, 0.5) AS risk_account_pct,
+	COALESCE(risk_atr_enabled, 1) AS risk_atr_enabled,
+	COALESCE(risk_atr_multiplier, 1.5) AS risk_atr_multiplier,
+	COALESCE(risk_atr_timeframe, '1h') AS risk_atr_timeframe,
+	COALESCE(risk_leverage_fallback, 1) AS risk_leverage_fallback,
+	COALESCE(risk_leverage_max_loss, 0.5) AS risk_leverage_max_loss,
+	COALESCE(risk_reentry_enabled, 0) AS risk_reentry_enabled,
+	COALESCE(risk_reentry_ratio, 0.5) AS risk_reentry_ratio,
+	COALESCE(risk_reentry_tolerance, 0.005) AS risk_reentry_tolerance,
+	created_at, updated_at`
+
+// scanCopyTradeConfig 共用 Scan 逻辑（避免 GetByTraderID 与 ListEnabled 重复实现）
+// 参数列表必须与 copyTradeConfigSelectColumns 顺序一致
+func scanCopyTradeConfig(scanner interface{ Scan(dest ...interface{}) error }) (*CopyTradeConfig, error) {
 	var config CopyTradeConfig
 	var createdAt, updatedAt string
 	var p20t, csrf sql.NullString
 
-	err := s.db.QueryRow(`
-		SELECT trader_id, provider_type, leader_id, copy_ratio, sync_leverage, sync_margin_mode,
-		       min_trade_warn, max_trade_warn, enabled,
-		       COALESCE(binance_p20t, '') AS binance_p20t,
-		       COALESCE(binance_csrf_token, '') AS binance_csrf_token,
-		       created_at, updated_at
-		FROM copy_trade_configs WHERE trader_id = ?
-	`, traderID).Scan(
+	err := scanner.Scan(
 		&config.TraderID, &config.ProviderType, &config.LeaderID, &config.CopyRatio,
 		&config.SyncLeverage, &config.SyncMarginMode, &config.MinTradeWarn, &config.MaxTradeWarn,
-		&config.Enabled, &p20t, &csrf, &createdAt, &updatedAt,
+		&config.Enabled, &p20t, &csrf,
+		&config.RiskStopLossEnabled, &config.RiskAccountPct, &config.RiskATREnabled, &config.RiskATRMultiplier,
+		&config.RiskATRTimeframe, &config.RiskLeverageFallback, &config.RiskLeverageMaxLoss,
+		&config.RiskReentryEnabled, &config.RiskReentryRatio, &config.RiskReentryTolerance,
+		&createdAt, &updatedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -169,20 +296,19 @@ func (s *CopyTradeStore) GetByTraderID(traderID string) (*CopyTradeConfig, error
 	}
 	config.CreatedAt, _ = time.Parse("2006-01-02 15:04:05", createdAt)
 	config.UpdatedAt, _ = time.Parse("2006-01-02 15:04:05", updatedAt)
-
+	config.FillRiskDefaults() // 兜底：即使 COALESCE 失效也确保默认值
 	return &config, nil
+}
+
+// GetByTraderID 根据 trader_id 获取跟单配置
+func (s *CopyTradeStore) GetByTraderID(traderID string) (*CopyTradeConfig, error) {
+	row := s.db.QueryRow(`SELECT `+copyTradeConfigSelectColumns+` FROM copy_trade_configs WHERE trader_id = ?`, traderID)
+	return scanCopyTradeConfig(row)
 }
 
 // ListEnabled 列出所有启用的跟单配置
 func (s *CopyTradeStore) ListEnabled() ([]*CopyTradeConfig, error) {
-	rows, err := s.db.Query(`
-		SELECT trader_id, provider_type, leader_id, copy_ratio, sync_leverage, sync_margin_mode,
-		       min_trade_warn, max_trade_warn, enabled,
-		       COALESCE(binance_p20t, '') AS binance_p20t,
-		       COALESCE(binance_csrf_token, '') AS binance_csrf_token,
-		       created_at, updated_at
-		FROM copy_trade_configs WHERE enabled = 1
-	`)
+	rows, err := s.db.Query(`SELECT ` + copyTradeConfigSelectColumns + ` FROM copy_trade_configs WHERE enabled = 1`)
 	if err != nil {
 		return nil, err
 	}
@@ -190,31 +316,12 @@ func (s *CopyTradeStore) ListEnabled() ([]*CopyTradeConfig, error) {
 
 	var configs []*CopyTradeConfig
 	for rows.Next() {
-		var config CopyTradeConfig
-		var createdAt, updatedAt string
-		var p20t, csrf sql.NullString
-
-		err := rows.Scan(
-			&config.TraderID, &config.ProviderType, &config.LeaderID, &config.CopyRatio,
-			&config.SyncLeverage, &config.SyncMarginMode, &config.MinTradeWarn, &config.MaxTradeWarn,
-			&config.Enabled, &p20t, &csrf, &createdAt, &updatedAt,
-		)
+		config, err := scanCopyTradeConfig(rows)
 		if err != nil {
 			return nil, err
 		}
-
-		if p20t.Valid {
-			config.BinanceP20T = p20t.String
-		}
-		if csrf.Valid {
-			config.BinanceCSRFToken = csrf.String
-		}
-		config.CreatedAt, _ = time.Parse("2006-01-02 15:04:05", createdAt)
-		config.UpdatedAt, _ = time.Parse("2006-01-02 15:04:05", updatedAt)
-
-		configs = append(configs, &config)
+		configs = append(configs, config)
 	}
-
 	return configs, nil
 }
 
@@ -360,6 +467,14 @@ func (s *CopyTradeStore) GetRecentSignalLogs(traderID string, limit int) ([]*Cop
 // 仓位映射（跟单仓位生命周期管理）
 // ============================================================================
 
+// Mapping 状态常量（避免散落的魔法字符串）
+const (
+	MappingStatusActive         = "active"
+	MappingStatusClosed         = "closed"
+	MappingStatusIgnored        = "ignored"
+	MappingStatusStoppedByRisk  = "stopped_by_risk" // v3 风控：账户保护止损被交易所触发
+)
+
 // CopyTradePositionMapping 仓位映射记录
 // 一条映射 = 一笔跟单仓位的完整生命周期（开仓 → 平仓）
 // 用于精确匹配领航员仓位与跟随者仓位，解决同币种多仓位（cross/isolated）的识别问题
@@ -371,7 +486,7 @@ type CopyTradePositionMapping struct {
 	Symbol      string `json:"symbol"`        // LINKUSDT
 	Side        string `json:"side"`          // long | short
 	MarginMode  string `json:"margin_mode"`   // cross | isolated
-	Status      string `json:"status"`        // active | closed
+	Status      string `json:"status"`        // active | closed | ignored | stopped_by_risk
 
 	// 开仓信息
 	OpenedAt      time.Time `json:"opened_at"`       // 跟单开仓时间
@@ -384,15 +499,25 @@ type CopyTradePositionMapping struct {
 	ClosePrice float64    `json:"close_price"` // 平仓价格
 
 	// 累计统计（加仓/减仓时更新）
-	AddCount               int       `json:"add_count"`                 // 累计加仓次数
-	ReduceCount            int       `json:"reduce_count"`              // 累计减仓次数
-	AccumulatedReduceRatio float64   `json:"accumulated_reduce_ratio"`  // 累计减仓比例（用于触发全平）
-	UpdatedAt              time.Time `json:"updated_at"`                // 最后更新时间
+	AddCount               int       `json:"add_count"`                // 累计加仓次数
+	ReduceCount            int       `json:"reduce_count"`             // 累计减仓次数
+	AccumulatedReduceRatio float64   `json:"accumulated_reduce_ratio"` // 累计减仓比例（用于触发全平）
+	UpdatedAt              time.Time `json:"updated_at"`               // 最后更新时间
 
 	// 连续失败熔断（执行失败时累加，成功时清零；超过阈值自动 CloseMapping）
 	ConsecutiveFailCount int        `json:"consecutive_fail_count"` // 连续失败次数
 	LastFailureAt        *time.Time `json:"last_failure_at"`        // 最后一次失败时间
 	LastFailureReason    string     `json:"last_failure_reason"`    // 最后一次失败原因
+
+	// ============================================================
+	// 账户保护止损触发快照（v3 风控，仅 status=stopped_by_risk 时有效）
+	// 用于判据 E（双门控）二次进场判断
+	// ============================================================
+	StoppedAt        *time.Time `json:"stopped_at,omitempty"`         // SL 触发时间
+	LeaderPnLAtStop  float64    `json:"leader_pnl_at_stop,omitempty"` // SL 触发时领航员该仓位浮亏（负值）
+	LeaderSizeAtStop float64    `json:"leader_size_at_stop,omitempty"` // SL 触发时领航员该仓位大小
+	AddCountAtStop   int        `json:"add_count_at_stop,omitempty"`   // SL 触发时 AddCount 值（判反加仓）
+	ReentryUsed      bool       `json:"reentry_used,omitempty"`        // 该 posId 二次进场是否已用过（限 1 次）
 }
 
 // initPositionMappingTable 初始化仓位映射表
@@ -441,6 +566,13 @@ func (s *CopyTradeStore) initPositionMappingTable() error {
 	s.db.Exec(`ALTER TABLE copy_trade_position_mappings ADD COLUMN last_failure_at DATETIME`)
 	s.db.Exec(`ALTER TABLE copy_trade_position_mappings ADD COLUMN last_failure_reason TEXT DEFAULT ''`)
 
+	// 添加账户保护止损触发快照字段（v3 风控）
+	s.db.Exec(`ALTER TABLE copy_trade_position_mappings ADD COLUMN stopped_at DATETIME`)
+	s.db.Exec(`ALTER TABLE copy_trade_position_mappings ADD COLUMN leader_pnl_at_stop REAL DEFAULT 0`)
+	s.db.Exec(`ALTER TABLE copy_trade_position_mappings ADD COLUMN leader_size_at_stop REAL DEFAULT 0`)
+	s.db.Exec(`ALTER TABLE copy_trade_position_mappings ADD COLUMN add_count_at_stop INTEGER DEFAULT 0`)
+	s.db.Exec(`ALTER TABLE copy_trade_position_mappings ADD COLUMN reentry_used INTEGER DEFAULT 0`)
+
 	return nil
 }
 
@@ -468,16 +600,61 @@ func (s *CopyTradeStore) SavePositionMapping(mapping *CopyTradePositionMapping) 
 	return err
 }
 
+// mappingSelectColumns 统一的 mapping SELECT 列清单
+// 提取为常量便于多处 SELECT 共用，新增字段时一处改动
+const mappingSelectColumns = `
+	id, trader_id, leader_pos_id, leader_id, symbol, side, margin_mode, status,
+	opened_at, open_price, open_size_usd, last_known_size, closed_at, close_price,
+	add_count, reduce_count, updated_at,
+	COALESCE(stopped_at, '') AS stopped_at,
+	COALESCE(leader_pnl_at_stop, 0) AS leader_pnl_at_stop,
+	COALESCE(leader_size_at_stop, 0) AS leader_size_at_stop,
+	COALESCE(add_count_at_stop, 0) AS add_count_at_stop,
+	COALESCE(reentry_used, 0) AS reentry_used`
+
+// scanMapping 共用 mapping Scan 逻辑
+// 参数顺序与 mappingSelectColumns 一致
+func scanMapping(scanner interface{ Scan(dest ...interface{}) error }) (*CopyTradePositionMapping, error) {
+	var mapping CopyTradePositionMapping
+	var openedAt, updatedAt string
+	var closedAt, stoppedAt sql.NullString
+
+	err := scanner.Scan(
+		&mapping.ID, &mapping.TraderID, &mapping.LeaderPosID, &mapping.LeaderID,
+		&mapping.Symbol, &mapping.Side, &mapping.MarginMode, &mapping.Status,
+		&openedAt, &mapping.OpenPrice, &mapping.OpenSizeUSD, &mapping.LastKnownSize, &closedAt, &mapping.ClosePrice,
+		&mapping.AddCount, &mapping.ReduceCount, &updatedAt,
+		&stoppedAt, &mapping.LeaderPnLAtStop, &mapping.LeaderSizeAtStop,
+		&mapping.AddCountAtStop, &mapping.ReentryUsed,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	mapping.OpenedAt, _ = time.Parse("2006-01-02 15:04:05", openedAt)
+	mapping.UpdatedAt, _ = time.Parse("2006-01-02 15:04:05", updatedAt)
+	if closedAt.Valid && closedAt.String != "" {
+		t, _ := time.Parse("2006-01-02 15:04:05", closedAt.String)
+		mapping.ClosedAt = &t
+	}
+	if stoppedAt.Valid && stoppedAt.String != "" {
+		t, _ := time.Parse("2006-01-02 15:04:05", stoppedAt.String)
+		mapping.StoppedAt = &t
+	}
+	return &mapping, nil
+}
+
 // GetActiveMapping 查询活跃的仓位映射（判断开仓/加仓时调用）
 func (s *CopyTradeStore) GetActiveMapping(traderID, leaderPosID string) (*CopyTradePositionMapping, error) {
 	return s.getMappingByStatus(traderID, leaderPosID, "active")
 }
 
-// GetMapping 查询任意状态的仓位映射（包括 active/ignored/closed）
+// GetMapping 查询任意状态的仓位映射（包括 active/ignored/closed/stopped_by_risk）
 // 用于判断是否应该跟随信号：
 //   - active: 已跟随的仓位 → 继续跟随
 //   - ignored: 启动时的历史仓位 → 不跟随
 //   - closed: 已平仓 → 可以重新开仓
+//   - stopped_by_risk: 风控止损触发 → 不跟随，等领航员完全平掉该 posId
 //   - nil: 无映射 → 新开仓
 func (s *CopyTradeStore) GetMapping(traderID, leaderPosID string) (*CopyTradePositionMapping, error) {
 	return s.getMappingByStatus(traderID, leaderPosID, "")
@@ -485,48 +662,24 @@ func (s *CopyTradeStore) GetMapping(traderID, leaderPosID string) (*CopyTradePos
 
 // getMappingByStatus 内部方法：按状态查询映射
 func (s *CopyTradeStore) getMappingByStatus(traderID, leaderPosID, status string) (*CopyTradePositionMapping, error) {
-	var mapping CopyTradePositionMapping
-	var openedAt, updatedAt string
-	var closedAt sql.NullString
-
-	query := `
-		SELECT id, trader_id, leader_pos_id, leader_id, symbol, side, margin_mode, status,
-		       opened_at, open_price, open_size_usd, last_known_size, closed_at, close_price,
-		       add_count, reduce_count, updated_at
-		FROM copy_trade_position_mappings
-		WHERE trader_id = ? AND leader_pos_id = ?
-	`
+	query := `SELECT ` + mappingSelectColumns + ` FROM copy_trade_position_mappings WHERE trader_id = ? AND leader_pos_id = ?`
 	args := []interface{}{traderID, leaderPosID}
 
 	if status != "" {
 		query += " AND status = ?"
 		args = append(args, status)
 	} else {
-		// 无状态筛选时，优先返回 active/ignored，忽略 closed
-		query += " AND status IN ('active', 'ignored') ORDER BY CASE status WHEN 'active' THEN 1 WHEN 'ignored' THEN 2 END LIMIT 1"
+		// 无状态筛选时，优先级 active > stopped_by_risk > ignored，忽略 closed
+		// stopped_by_risk 排在 ignored 前面：让上层 matchSignal 能及时看到熔断状态
+		query += " AND status IN ('active', 'stopped_by_risk', 'ignored') ORDER BY CASE status WHEN 'active' THEN 1 WHEN 'stopped_by_risk' THEN 2 WHEN 'ignored' THEN 3 END LIMIT 1"
 	}
 
-	err := s.db.QueryRow(query, args...).Scan(
-		&mapping.ID, &mapping.TraderID, &mapping.LeaderPosID, &mapping.LeaderID,
-		&mapping.Symbol, &mapping.Side, &mapping.MarginMode, &mapping.Status,
-		&openedAt, &mapping.OpenPrice, &mapping.OpenSizeUSD, &mapping.LastKnownSize, &closedAt, &mapping.ClosePrice,
-		&mapping.AddCount, &mapping.ReduceCount, &updatedAt,
-	)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, nil // 无映射，返回 nil
-		}
-		return nil, err
+	row := s.db.QueryRow(query, args...)
+	mapping, err := scanMapping(row)
+	if err == sql.ErrNoRows {
+		return nil, nil
 	}
-
-	mapping.OpenedAt, _ = time.Parse("2006-01-02 15:04:05", openedAt)
-	mapping.UpdatedAt, _ = time.Parse("2006-01-02 15:04:05", updatedAt)
-	if closedAt.Valid {
-		t, _ := time.Parse("2006-01-02 15:04:05", closedAt.String)
-		mapping.ClosedAt = &t
-	}
-
-	return &mapping, nil
+	return mapping, err
 }
 
 // SaveIgnoredPosition 保存历史仓位（启动跟单时调用）
@@ -698,14 +851,7 @@ func (s *CopyTradeStore) MarkIgnoredAsClosed(traderID, leaderPosID string) error
 // FindActiveBySymbolSide 查找某 symbol+side 的所有活跃映射
 // 用于平仓/减仓时的反向查找：从本地映射出发，对比领航员持仓判断动作
 func (s *CopyTradeStore) FindActiveBySymbolSide(traderID, symbol, side string) ([]*CopyTradePositionMapping, error) {
-	query := `
-		SELECT id, trader_id, leader_pos_id, leader_id, symbol, side, margin_mode, status,
-		       opened_at, open_price, open_size_usd, last_known_size, closed_at, close_price,
-		       add_count, reduce_count, updated_at
-		FROM copy_trade_position_mappings
-		WHERE trader_id = ? AND symbol = ? AND side = ? AND status = 'active'
-		ORDER BY opened_at ASC
-	`
+	query := `SELECT ` + mappingSelectColumns + ` FROM copy_trade_position_mappings WHERE trader_id = ? AND symbol = ? AND side = ? AND status = 'active' ORDER BY opened_at ASC`
 
 	rows, err := s.db.Query(query, traderID, symbol, side)
 	if err != nil {
@@ -715,44 +861,19 @@ func (s *CopyTradeStore) FindActiveBySymbolSide(traderID, symbol, side string) (
 
 	var mappings []*CopyTradePositionMapping
 	for rows.Next() {
-		var mapping CopyTradePositionMapping
-		var openedAt, updatedAt string
-		var closedAt sql.NullString
-
-		err := rows.Scan(
-			&mapping.ID, &mapping.TraderID, &mapping.LeaderPosID, &mapping.LeaderID,
-			&mapping.Symbol, &mapping.Side, &mapping.MarginMode, &mapping.Status,
-			&openedAt, &mapping.OpenPrice, &mapping.OpenSizeUSD, &mapping.LastKnownSize, &closedAt, &mapping.ClosePrice,
-			&mapping.AddCount, &mapping.ReduceCount, &updatedAt,
-		)
+		m, err := scanMapping(rows)
 		if err != nil {
 			return nil, err
 		}
-
-		mapping.OpenedAt, _ = time.Parse("2006-01-02 15:04:05", openedAt)
-		mapping.UpdatedAt, _ = time.Parse("2006-01-02 15:04:05", updatedAt)
-		if closedAt.Valid {
-			t, _ := time.Parse("2006-01-02 15:04:05", closedAt.String)
-			mapping.ClosedAt = &t
-		}
-
-		mappings = append(mappings, &mapping)
+		mappings = append(mappings, m)
 	}
-
 	return mappings, nil
 }
 
 // FindActiveBySymbol 查找某 symbol 的所有活跃映射（不限方向）
 // 用于单向持仓模式平仓时的反向查找：领航员持仓已消失，无法确定方向
 func (s *CopyTradeStore) FindActiveBySymbol(traderID, symbol string) ([]*CopyTradePositionMapping, error) {
-	query := `
-		SELECT id, trader_id, leader_pos_id, leader_id, symbol, side, margin_mode, status,
-		       opened_at, open_price, open_size_usd, last_known_size, closed_at, close_price,
-		       add_count, reduce_count, updated_at
-		FROM copy_trade_position_mappings
-		WHERE trader_id = ? AND symbol = ? AND status = 'active'
-		ORDER BY opened_at ASC
-	`
+	query := `SELECT ` + mappingSelectColumns + ` FROM copy_trade_position_mappings WHERE trader_id = ? AND symbol = ? AND status = 'active' ORDER BY opened_at ASC`
 
 	rows, err := s.db.Query(query, traderID, symbol)
 	if err != nil {
@@ -762,31 +883,12 @@ func (s *CopyTradeStore) FindActiveBySymbol(traderID, symbol string) ([]*CopyTra
 
 	var mappings []*CopyTradePositionMapping
 	for rows.Next() {
-		var mapping CopyTradePositionMapping
-		var openedAt, updatedAt string
-		var closedAt sql.NullString
-
-		err := rows.Scan(
-			&mapping.ID, &mapping.TraderID, &mapping.LeaderPosID, &mapping.LeaderID,
-			&mapping.Symbol, &mapping.Side, &mapping.MarginMode, &mapping.Status,
-			&openedAt, &mapping.OpenPrice, &mapping.OpenSizeUSD, &mapping.LastKnownSize,
-			&closedAt, &mapping.ClosePrice,
-			&mapping.AddCount, &mapping.ReduceCount, &updatedAt,
-		)
+		m, err := scanMapping(rows)
 		if err != nil {
 			return nil, err
 		}
-
-		mapping.OpenedAt, _ = time.Parse("2006-01-02 15:04:05", openedAt)
-		mapping.UpdatedAt, _ = time.Parse("2006-01-02 15:04:05", updatedAt)
-		if closedAt.Valid {
-			t, _ := time.Parse("2006-01-02 15:04:05", closedAt.String)
-			mapping.ClosedAt = &t
-		}
-
-		mappings = append(mappings, &mapping)
+		mappings = append(mappings, m)
 	}
-
 	return mappings, nil
 }
 
@@ -797,13 +899,7 @@ func (s *CopyTradeStore) ListAllMappings(traderID string, limit int) ([]*CopyTra
 
 // listMappings 内部方法：查询映射列表
 func (s *CopyTradeStore) listMappings(traderID, status string, limit int) ([]*CopyTradePositionMapping, error) {
-	query := `
-		SELECT id, trader_id, leader_pos_id, leader_id, symbol, side, margin_mode, status,
-		       opened_at, open_price, open_size_usd, last_known_size, closed_at, close_price,
-		       add_count, reduce_count, updated_at
-		FROM copy_trade_position_mappings
-		WHERE trader_id = ?
-	`
+	query := `SELECT ` + mappingSelectColumns + ` FROM copy_trade_position_mappings WHERE trader_id = ?`
 	args := []interface{}{traderID}
 
 	if status != "" {
@@ -826,31 +922,82 @@ func (s *CopyTradeStore) listMappings(traderID, status string, limit int) ([]*Co
 
 	var mappings []*CopyTradePositionMapping
 	for rows.Next() {
-		var mapping CopyTradePositionMapping
-		var openedAt, updatedAt string
-		var closedAt sql.NullString
-
-		err := rows.Scan(
-			&mapping.ID, &mapping.TraderID, &mapping.LeaderPosID, &mapping.LeaderID,
-			&mapping.Symbol, &mapping.Side, &mapping.MarginMode, &mapping.Status,
-			&openedAt, &mapping.OpenPrice, &mapping.OpenSizeUSD, &mapping.LastKnownSize, &closedAt, &mapping.ClosePrice,
-			&mapping.AddCount, &mapping.ReduceCount, &updatedAt,
-		)
+		m, err := scanMapping(rows)
 		if err != nil {
 			return nil, err
 		}
-
-		mapping.OpenedAt, _ = time.Parse("2006-01-02 15:04:05", openedAt)
-		mapping.UpdatedAt, _ = time.Parse("2006-01-02 15:04:05", updatedAt)
-		if closedAt.Valid {
-			t, _ := time.Parse("2006-01-02 15:04:05", closedAt.String)
-			mapping.ClosedAt = &t
-		}
-
-		mappings = append(mappings, &mapping)
+		mappings = append(mappings, m)
 	}
-
 	return mappings, nil
+}
+
+// ListStoppedByRiskMappings 列出某 trader 所有 stopped_by_risk 状态的映射
+// 用于二次进场监控循环
+func (s *CopyTradeStore) ListStoppedByRiskMappings(traderID string) ([]*CopyTradePositionMapping, error) {
+	return s.listMappings(traderID, MappingStatusStoppedByRisk, 0)
+}
+
+// MarkStoppedByRisk 标记 active 映射为风控止损触发，并保存快照
+// 用于 SL 被交易所触发后的对账识别
+//
+// 参数：
+//   - leaderPnL: SL 触发时领航员该 posId 的浮亏（应为负值）
+//   - leaderSize: SL 触发时领航员该 posId 的持仓数量
+//   - addCount: SL 触发时 mapping.AddCount 的当前值（用于反加仓判据）
+//
+// 仅 active 状态的映射会被标记，幂等：重复调用不会出错
+func (s *CopyTradeStore) MarkStoppedByRisk(traderID, leaderPosID string, leaderPnL, leaderSize float64, addCount int) error {
+	_, err := s.db.Exec(`
+		UPDATE copy_trade_position_mappings
+		SET status = 'stopped_by_risk',
+		    stopped_at = CURRENT_TIMESTAMP,
+		    leader_pnl_at_stop = ?,
+		    leader_size_at_stop = ?,
+		    add_count_at_stop = ?,
+		    updated_at = CURRENT_TIMESTAMP
+		WHERE trader_id = ? AND leader_pos_id = ? AND status = 'active'
+	`, leaderPnL, leaderSize, addCount, traderID, leaderPosID)
+	return err
+}
+
+// MarkReentryUsed 标记 stopped_by_risk 映射为已用过二次进场，并恢复 active 状态
+// 调用时机：二次进场判据满足且重入下单成功后
+//
+// 参数：
+//   - reentryOpenPrice: 重入时的入场价基准（领航员当前 markPrice 或重入决策时的价格）
+//   - reentryOpenSizeUSD: 重入仓位的目标 USDT 金额
+//
+// 设计：
+//   - reentry_used = true 永久保留（即使后续再次 stopped_by_risk 也保留）→ 同 posId 不会再触发判据 E
+//   - open_price / open_size_usd 用重入价刷新（语义上：「这是新的入场」），便于审计与日志
+//   - 清空 SL 触发快照字段（已用完）
+func (s *CopyTradeStore) MarkReentryUsed(traderID, leaderPosID string, reentryOpenPrice, reentryOpenSizeUSD float64) error {
+	_, err := s.db.Exec(`
+		UPDATE copy_trade_position_mappings
+		SET reentry_used = 1,
+		    status = 'active',
+		    open_price = ?,
+		    open_size_usd = ?,
+		    stopped_at = NULL,
+		    leader_pnl_at_stop = 0,
+		    leader_size_at_stop = 0,
+		    add_count_at_stop = 0,
+		    updated_at = CURRENT_TIMESTAMP
+		WHERE trader_id = ? AND leader_pos_id = ? AND status = 'stopped_by_risk'
+	`, reentryOpenPrice, reentryOpenSizeUSD, traderID, leaderPosID)
+	return err
+}
+
+// MarkStoppedByRiskAsClosed 将 stopped_by_risk 映射标记为 closed
+// 调用时机：领航员完全平掉旧 posId（其持仓中已无该 posId）后
+// 这样下次他用同一 posId 重新开仓（理论上不会复用，但兼容处理），会按 closed → 新开仓走
+func (s *CopyTradeStore) MarkStoppedByRiskAsClosed(traderID, leaderPosID string) error {
+	_, err := s.db.Exec(`
+		UPDATE copy_trade_position_mappings
+		SET status = 'closed', closed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+		WHERE trader_id = ? AND leader_pos_id = ? AND status = 'stopped_by_risk'
+	`, traderID, leaderPosID)
+	return err
 }
 
 // ============================================================================

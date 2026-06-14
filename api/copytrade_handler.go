@@ -68,6 +68,21 @@ type CopyTradeConfigRequest struct {
 	// Binance Web 凭证（仅 ProviderType=binance 时使用）
 	BinanceP20T      string `json:"binance_p20t"`
 	BinanceCSRFToken string `json:"binance_csrf_token"`
+
+	// ============================================================
+	// 账户保护 / 止损兜底（v3 风控）—— 仅 OKX 路径生效
+	// 所有字段都是可选的（前端不传走 store 默认值，详见 store.CopyTradeConfig.FillRiskDefaults）
+	// ============================================================
+	RiskStopLossEnabled  *bool    `json:"risk_stop_loss_enabled,omitempty"`
+	RiskAccountPct       *float64 `json:"risk_account_pct,omitempty"`
+	RiskATREnabled       *bool    `json:"risk_atr_enabled,omitempty"`
+	RiskATRMultiplier    *float64 `json:"risk_atr_multiplier,omitempty"`
+	RiskATRTimeframe     *string  `json:"risk_atr_timeframe,omitempty"`
+	RiskLeverageFallback *bool    `json:"risk_leverage_fallback,omitempty"`
+	RiskLeverageMaxLoss  *float64 `json:"risk_leverage_max_loss,omitempty"`
+	RiskReentryEnabled   *bool    `json:"risk_reentry_enabled,omitempty"`
+	RiskReentryRatio     *float64 `json:"risk_reentry_ratio,omitempty"`
+	RiskReentryTolerance *float64 `json:"risk_reentry_tolerance,omitempty"`
 }
 
 // GetConfig 获取跟单配置
@@ -124,7 +139,69 @@ func (h *CopyTradeHandler) SaveConfig(c *gin.Context) {
 		BinanceCSRFToken: req.BinanceCSRFToken,
 	}
 
-	// 保存配置
+	// 读取已有配置，作为风控字段的旧值兜底
+	// 设计：风控字段全部可选；前端不传字段保持原值；旧库读出来的默认值由 FillRiskDefaults 兜底
+	existing, _ := h.store.CopyTrade().GetByTraderID(traderID)
+
+	// 风控字段透传（指针类型，未传则使用旧值或默认值）
+	if req.RiskStopLossEnabled != nil {
+		config.RiskStopLossEnabled = *req.RiskStopLossEnabled
+	} else if existing != nil {
+		config.RiskStopLossEnabled = existing.RiskStopLossEnabled
+	} else {
+		config.RiskStopLossEnabled = true // 默认 on
+	}
+	if req.RiskAccountPct != nil {
+		config.RiskAccountPct = *req.RiskAccountPct
+	} else if existing != nil {
+		config.RiskAccountPct = existing.RiskAccountPct
+	}
+	if req.RiskATREnabled != nil {
+		config.RiskATREnabled = *req.RiskATREnabled
+	} else if existing != nil {
+		config.RiskATREnabled = existing.RiskATREnabled
+	} else {
+		config.RiskATREnabled = true // 默认 on
+	}
+	if req.RiskATRMultiplier != nil {
+		config.RiskATRMultiplier = *req.RiskATRMultiplier
+	} else if existing != nil {
+		config.RiskATRMultiplier = existing.RiskATRMultiplier
+	}
+	if req.RiskATRTimeframe != nil {
+		config.RiskATRTimeframe = *req.RiskATRTimeframe
+	} else if existing != nil {
+		config.RiskATRTimeframe = existing.RiskATRTimeframe
+	}
+	if req.RiskLeverageFallback != nil {
+		config.RiskLeverageFallback = *req.RiskLeverageFallback
+	} else if existing != nil {
+		config.RiskLeverageFallback = existing.RiskLeverageFallback
+	} else {
+		config.RiskLeverageFallback = true // 默认 on
+	}
+	if req.RiskLeverageMaxLoss != nil {
+		config.RiskLeverageMaxLoss = *req.RiskLeverageMaxLoss
+	} else if existing != nil {
+		config.RiskLeverageMaxLoss = existing.RiskLeverageMaxLoss
+	}
+	if req.RiskReentryEnabled != nil {
+		config.RiskReentryEnabled = *req.RiskReentryEnabled
+	} else if existing != nil {
+		config.RiskReentryEnabled = existing.RiskReentryEnabled
+	}
+	if req.RiskReentryRatio != nil {
+		config.RiskReentryRatio = *req.RiskReentryRatio
+	} else if existing != nil {
+		config.RiskReentryRatio = existing.RiskReentryRatio
+	}
+	if req.RiskReentryTolerance != nil {
+		config.RiskReentryTolerance = *req.RiskReentryTolerance
+	} else if existing != nil {
+		config.RiskReentryTolerance = existing.RiskReentryTolerance
+	}
+
+	// 保存配置（store.Upsert 内部会调 FillRiskDefaults 做最后兜底）
 	if err := h.store.CopyTrade().Upsert(config); err != nil {
 		logger.Errorf("Failed to save copy trade config: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save config"})

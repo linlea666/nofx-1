@@ -193,6 +193,21 @@ export interface CopyConfigRequest {
   // Binance Web 凭证（仅 provider_type=binance 时使用）
   binance_p20t?: string       // 登录 cookie p20t
   binance_csrf_token?: string // CSRF header csrftoken
+
+  // ============================================================
+  // 账户保护 / 止损兜底（v3 风控）—— 仅 OKX 路径生效
+  // 所有字段可选，未传走后端默认值
+  // ============================================================
+  risk_stop_loss_enabled?: boolean    // 默认 true：启用账户保护硬止损
+  risk_account_pct?: number           // 默认 0.005 (0.5%)：单笔最多亏账户的百分比
+  risk_atr_enabled?: boolean          // 默认 true：启用 ATR 噪音防护下界
+  risk_atr_multiplier?: number        // 默认 1.5：SL 距离 ≥ k×ATR14（1.0-3.0）
+  risk_atr_timeframe?: string         // 默认 "1h"：ATR 时间周期（"15m" / "1h" / "4h"）
+  risk_leverage_fallback?: boolean    // 默认 true：启用杠杆兜底 cap
+  risk_leverage_max_loss?: number     // 默认 0.5：保证金最大亏损封顶（0-1）
+  risk_reentry_enabled?: boolean      // 默认 false：启用二次进场（判据 E 双门控）
+  risk_reentry_ratio?: number         // 默认 0.5：重入仓位系数（×copy_ratio）
+  risk_reentry_tolerance?: number     // 默认 0.005 (0.5%)：价格回归容差
 }
 
 export interface UpdateModelConfigRequest {
@@ -643,6 +658,17 @@ export interface CopyTradeConfig {
   // Binance Web 凭证（仅 provider_type=binance 时使用，明文返回，用于编辑表单回填）
   binance_p20t?: string;
   binance_csrf_token?: string;
+  // 账户保护 / 止损兜底（v3 风控）—— 仅 OKX 路径生效，详见 CopyConfigRequest
+  risk_stop_loss_enabled?: boolean;
+  risk_account_pct?: number;
+  risk_atr_enabled?: boolean;
+  risk_atr_multiplier?: number;
+  risk_atr_timeframe?: string;
+  risk_leverage_fallback?: boolean;
+  risk_leverage_max_loss?: number;
+  risk_reentry_enabled?: boolean;
+  risk_reentry_ratio?: number;
+  risk_reentry_tolerance?: number;
   created_at?: string;
   updated_at?: string;
 }

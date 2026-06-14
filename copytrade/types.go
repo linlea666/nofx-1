@@ -122,6 +122,48 @@ type CopyConfig struct {
 	// 由用户从浏览器开发者工具中抓取，会过期，过期时通过邮件告警
 	BinanceP20T      string `json:"binance_p20t,omitempty"`       // 登录 cookie p20t
 	BinanceCSRFToken string `json:"binance_csrf_token,omitempty"` // CSRF header csrftoken
+
+	// ============================================================
+	// 账户保护 / 止损兜底（v3 风控）
+	// 仅 OKX 路径生效；HL/Binance 路径下被忽略
+	// 字段含义见 store/copytrade.go CopyTradeConfig
+	// ============================================================
+	RiskStopLossEnabled  bool    `json:"risk_stop_loss_enabled"`
+	RiskAccountPct       float64 `json:"risk_account_pct"`
+	RiskATREnabled       bool    `json:"risk_atr_enabled"`
+	RiskATRMultiplier    float64 `json:"risk_atr_multiplier"`
+	RiskATRTimeframe     string  `json:"risk_atr_timeframe"`
+	RiskLeverageFallback bool    `json:"risk_leverage_fallback"`
+	RiskLeverageMaxLoss  float64 `json:"risk_leverage_max_loss"`
+	RiskReentryEnabled   bool    `json:"risk_reentry_enabled"`
+	RiskReentryRatio     float64 `json:"risk_reentry_ratio"`
+	RiskReentryTolerance float64 `json:"risk_reentry_tolerance"`
+}
+
+// FillRiskDefaults 兜底默认值（与 store.CopyTradeConfig.FillRiskDefaults 保持一致）
+// 调用时机：integration 从 store.CopyTradeConfig 构造 engine.CopyConfig 时
+//
+// RiskAccountPct 默认 0.5 (=50%) 是用户明确选择的激进配置（v3.1）
+// 详见 store.CopyTradeConfig.FillRiskDefaults 的注释
+func (c *CopyConfig) FillRiskDefaults() {
+	if c.RiskAccountPct == 0 {
+		c.RiskAccountPct = 0.5
+	}
+	if c.RiskATRMultiplier == 0 {
+		c.RiskATRMultiplier = 1.5
+	}
+	if c.RiskATRTimeframe == "" {
+		c.RiskATRTimeframe = "1h"
+	}
+	if c.RiskLeverageMaxLoss == 0 {
+		c.RiskLeverageMaxLoss = 0.5
+	}
+	if c.RiskReentryRatio == 0 {
+		c.RiskReentryRatio = 0.5
+	}
+	if c.RiskReentryTolerance == 0 {
+		c.RiskReentryTolerance = 0.005
+	}
 }
 
 // Warning 预警记录
@@ -145,6 +187,46 @@ type EngineStats struct {
 	WarningsCount      int64     `json:"warnings_count"`
 	LastSignalTime     time.Time `json:"last_signal_time"`
 	StartTime          time.Time `json:"start_time"`
+}
+
+// ============================================================================
+// 风控事件（v3 风控邮件告警机制）
+//
+// 设计：engine 内部检测到风控事件 → 推入 stopRiskCh channel；
+// integration 层消费事件 → 发邮件告警（能拿 trader name，与现有 sendCopyActionAlert 风格一致）
+//
+// 解耦理由：engine 不依赖 notifier / store.Trader().GetByID，保持引擎纯洁；
+// integration 是邮件告警的统一出口（已有 sendCopyActionAlert / 失败告警等路径）
+// ============================================================================
+
+// RiskEventType 风控事件类型
+type RiskEventType string
+
+const (
+	// RiskEventStopLossTriggered 账户保护止损被交易所触发（OKX algo 条件单触发后由对账识别）
+	RiskEventStopLossTriggered RiskEventType = "stop_loss_triggered"
+	// RiskEventReentryInitiated 二次进场决策已生成（判据 E 满足后）
+	// 注意：仅"决策生成"事件，不代表"执行成功"。实际执行成功的告警由 integration 在 executeFullDecision 内发
+	RiskEventReentryInitiated RiskEventType = "reentry_initiated"
+)
+
+// RiskEvent 风控事件（用于 engine → integration 的告警通知）
+type RiskEvent struct {
+	Type        RiskEventType
+	Timestamp   time.Time
+	Symbol      string
+	Side        string
+	MarginMode  string
+	LeaderPosID string
+
+	// SL 触发快照（仅 Type=RiskEventStopLossTriggered 有效）
+	LeaderPnL  float64 // SL 触发时领航员该 posId 浮亏（负值）
+	LeaderSize float64 // SL 触发时领航员持仓数量
+	AddCount   int     // SL 触发时跟单系统已跟随的加仓次数（审计用）
+
+	// 重入快照（仅 Type=RiskEventReentryInitiated 有效）
+	ReentryEntryPrice float64 // 重入入场价基准
+	ReentrySize       float64 // 重入金额（USDT）
 }
 
 // PositionKey 生成仓位的唯一键 (不含保证金模式，向后兼容)

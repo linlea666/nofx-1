@@ -821,6 +821,27 @@ func (at *AutoTrader) executeDecisionWithRecord(decision *decision.Decision, act
 	}
 }
 
+// SetStopLoss exposes the underlying trader's stop-loss capability for copytrade SL management.
+// 跟单 v3 风控通过 copytrade.StopLossManager 接口（type assertion）调用本方法，
+// 在「执行后用实际成交均价精确重挂 SL」「加仓/减仓前撤旧 SL」等路径生效。
+// 不影响 AI 决策模式的 SL 流程（AI 走 executeOpenLong/Short 内部自动挂 SL）。
+func (at *AutoTrader) SetStopLoss(symbol string, positionSide string, quantity, stopPrice float64) error {
+	return at.trader.SetStopLoss(symbol, positionSide, quantity, stopPrice)
+}
+
+// CancelStopLossOrders exposes the underlying trader's SL cancel capability for copytrade SL management.
+// 跟单 v3 风控通过 copytrade.StopLossManager 接口调用本方法，
+// 在每次开仓/加仓/减仓**前**清理可能残留的旧 algo SL 单，避免多挂导致状态污染。
+func (at *AutoTrader) CancelStopLossOrders(symbol string) error {
+	return at.trader.CancelStopLossOrders(symbol)
+}
+
+// GetMarketPrice exposes the underlying trader's market price query for copytrade SL management.
+// 跟单 v3 风控用本方法在「拿不到实际成交价」时降级取市价作为入场价基准。
+func (at *AutoTrader) GetMarketPrice(symbol string) (float64, error) {
+	return at.trader.GetMarketPrice(symbol)
+}
+
 // ExecuteDecision executes a trading decision from external sources (e.g., debate consensus)
 // This is a public method that can be called by other modules
 func (at *AutoTrader) ExecuteDecision(d *decision.Decision) error {
@@ -1044,11 +1065,18 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 	at.positionFirstSeenTime[posKey] = time.Now().UnixMilli()
 
 	// Set stop loss and take profit
-	if err := at.trader.SetStopLoss(decision.Symbol, "LONG", quantity, decision.StopLoss); err != nil {
-		logger.Infof("  ⚠ Failed to set stop loss: %v", err)
+	// 🔑 守卫：StopLoss/TakeProfit <= 0 时跳过挂单
+	// - AI 决策模式：AI 总是会填正值，行为不变
+	// - 跟单模式：buildDecisionV2 在用户禁用风控或开仓即触发风险时会填 0，应跳过避免挂出无效 algo 单
+	if decision.StopLoss > 0 {
+		if err := at.trader.SetStopLoss(decision.Symbol, "LONG", quantity, decision.StopLoss); err != nil {
+			logger.Infof("  ⚠ Failed to set stop loss: %v", err)
+		}
 	}
-	if err := at.trader.SetTakeProfit(decision.Symbol, "LONG", quantity, decision.TakeProfit); err != nil {
-		logger.Infof("  ⚠ Failed to set take profit: %v", err)
+	if decision.TakeProfit > 0 {
+		if err := at.trader.SetTakeProfit(decision.Symbol, "LONG", quantity, decision.TakeProfit); err != nil {
+			logger.Infof("  ⚠ Failed to set take profit: %v", err)
+		}
 	}
 
 	return nil
@@ -1240,11 +1268,16 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 	at.positionFirstSeenTime[posKey] = time.Now().UnixMilli()
 
 	// Set stop loss and take profit
-	if err := at.trader.SetStopLoss(decision.Symbol, "SHORT", quantity, decision.StopLoss); err != nil {
-		logger.Infof("  ⚠ Failed to set stop loss: %v", err)
+	// 🔑 守卫：StopLoss/TakeProfit <= 0 时跳过挂单（同 executeOpenLongWithRecord 注释）
+	if decision.StopLoss > 0 {
+		if err := at.trader.SetStopLoss(decision.Symbol, "SHORT", quantity, decision.StopLoss); err != nil {
+			logger.Infof("  ⚠ Failed to set stop loss: %v", err)
+		}
 	}
-	if err := at.trader.SetTakeProfit(decision.Symbol, "SHORT", quantity, decision.TakeProfit); err != nil {
-		logger.Infof("  ⚠ Failed to set take profit: %v", err)
+	if decision.TakeProfit > 0 {
+		if err := at.trader.SetTakeProfit(decision.Symbol, "SHORT", quantity, decision.TakeProfit); err != nil {
+			logger.Infof("  ⚠ Failed to set take profit: %v", err)
+		}
 	}
 
 	return nil
