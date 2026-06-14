@@ -379,19 +379,33 @@ func (e *Engine) checkReentryConditions() {
 		}
 
 		// ============================================================
-		// 条件 4: SL 触发后领航员未再加仓（反赌徒型铁律）
+		// 条件 4: 反加仓铁律（v3.2 可配置）
 		//
-		// 注意：不能用 mapping.AddCount > AddCountAtStop 判断，因为 stopped_by_risk
-		// 状态下 matchSignalWithMapping 早返，AddCount 永远不会增加。
+		// 背景：止损触发后领航员"亏损加仓救单"是赌徒型行为，是 CFTC 等监管机构
+		// 警告的爆仓主因。但完全禁止任何加仓也会误伤"优秀领航员小幅摊均价"场景。
 		//
-		// 正确做法：直接比较领航员当前 size 与 SL 触发时的 size：
-		//   - leaderPos.Size > LeaderSizeAtStop → 领航员加仓救单（赌徒行为）→ 拒绝重入
-		//   - leaderPos.Size <= LeaderSizeAtStop → 领航员未继续加仓 → 满足条件
+		// v3.2 改进：用 RiskReentryBlockAddback 开关 + RiskReentryAddbackTolerance
+		//   倍数允许灵活配置：
+		//   - RiskReentryBlockAddback=false → 完全无视加仓，仅看价格回归+浮亏收窄
+		//   - RiskReentryBlockAddback=true + Tolerance=1.0 → 严格：完全不允许加仓
+		//   - RiskReentryBlockAddback=true + Tolerance=1.20 → 默认：允许 ≤20% 加仓
+		//   - RiskReentryBlockAddback=true + Tolerance=1.50 → 宽松：允许 ≤50% 加仓
+		//
+		// 实施细节：不能用 mapping.AddCount > AddCountAtStop 判断（stopped_by_risk
+		// 状态下 matchSignalWithMapping 早返，AddCount 永不增加），必须直接比较
+		// 领航员当前 size 与 SL 触发时的 size。
 		// ============================================================
-		if mapping.LeaderSizeAtStop > 0 && leaderPos.Size > mapping.LeaderSizeAtStop*1.001 { // 1.001 容差应付浮点抖动
-			logger.Debugf("⏭️ [%s] 二次进场禁用：领航员 SL 后又加仓 | posId=%s size %.4f → %.4f",
-				e.traderID, mapping.LeaderPosID, mapping.LeaderSizeAtStop, leaderPos.Size)
-			continue
+		if e.config.RiskReentryBlockAddback && mapping.LeaderSizeAtStop > 0 {
+			// Tolerance 兜底（极旧库或前端未传时为 0，按默认 1.20 处理）
+			addbackTolerance := e.config.RiskReentryAddbackTolerance
+			if addbackTolerance <= 0 {
+				addbackTolerance = 1.20
+			}
+			if leaderPos.Size > mapping.LeaderSizeAtStop*addbackTolerance {
+				logger.Debugf("⏭️ [%s] 二次进场禁用：领航员 SL 后加仓超出容差 | posId=%s size %.4f → %.4f (容差倍数=%.2fx)",
+					e.traderID, mapping.LeaderPosID, mapping.LeaderSizeAtStop, leaderPos.Size, addbackTolerance)
+				continue
+			}
 		}
 
 		// 条件 2: 价格回归到入场价 ± tolerance

@@ -470,6 +470,10 @@ type CopyConfigReq struct {
 	RiskReentryEnabled   *bool   `json:"risk_reentry_enabled,omitempty"`
 	RiskReentryRatio     float64 `json:"risk_reentry_ratio,omitempty"`
 	RiskReentryTolerance float64 `json:"risk_reentry_tolerance,omitempty"`
+
+	// v3.2 反加仓铁律配置（详见 store.CopyTradeConfig 注释）
+	RiskReentryBlockAddback     *bool   `json:"risk_reentry_block_addback,omitempty"`
+	RiskReentryAddbackTolerance float64 `json:"risk_reentry_addback_tolerance,omitempty"`
 }
 
 // applyCopyConfigRiskFields 把 CopyConfigReq 中的 v3 风控字段透传到 store.CopyTradeConfig
@@ -488,6 +492,7 @@ func applyCopyConfigRiskFields(copyConfig *store.CopyTradeConfig, req *CopyConfi
 	copyConfig.RiskATREnabled = derefBoolDefault(req.RiskATREnabled, true)
 	copyConfig.RiskLeverageFallback = derefBoolDefault(req.RiskLeverageFallback, true)
 	copyConfig.RiskReentryEnabled = derefBoolDefault(req.RiskReentryEnabled, false)
+	copyConfig.RiskReentryBlockAddback = derefBoolDefault(req.RiskReentryBlockAddback, true) // v3.2 反加仓铁律默认启用
 	// 数值字段：直接透传，零值由 store.FillRiskDefaults 兜底
 	copyConfig.RiskAccountPct = req.RiskAccountPct
 	copyConfig.RiskATRMultiplier = req.RiskATRMultiplier
@@ -495,6 +500,7 @@ func applyCopyConfigRiskFields(copyConfig *store.CopyTradeConfig, req *CopyConfi
 	copyConfig.RiskLeverageMaxLoss = req.RiskLeverageMaxLoss
 	copyConfig.RiskReentryRatio = req.RiskReentryRatio
 	copyConfig.RiskReentryTolerance = req.RiskReentryTolerance
+	copyConfig.RiskReentryAddbackTolerance = req.RiskReentryAddbackTolerance
 }
 
 // derefBoolDefault 安全解引用 *bool：nil 返回 def，非 nil 返回 *p

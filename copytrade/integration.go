@@ -111,6 +111,10 @@ func (ti *TraderIntegration) StartCopyTrading() error {
 		RiskReentryEnabled:   copyConfig.RiskReentryEnabled,
 		RiskReentryRatio:     copyConfig.RiskReentryRatio,
 		RiskReentryTolerance: copyConfig.RiskReentryTolerance,
+
+		// v3.2 反加仓铁律
+		RiskReentryBlockAddback:     copyConfig.RiskReentryBlockAddback,
+		RiskReentryAddbackTolerance: copyConfig.RiskReentryAddbackTolerance,
 	}
 	engineConfig.FillRiskDefaults() // 兜底默认值（旧库迁移 / 前端未传时）
 

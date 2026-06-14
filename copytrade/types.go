@@ -138,6 +138,10 @@ type CopyConfig struct {
 	RiskReentryEnabled   bool    `json:"risk_reentry_enabled"`
 	RiskReentryRatio     float64 `json:"risk_reentry_ratio"`
 	RiskReentryTolerance float64 `json:"risk_reentry_tolerance"`
+
+	// v3.2 反加仓铁律（详见 store.CopyTradeConfig 同名字段注释）
+	RiskReentryBlockAddback     bool    `json:"risk_reentry_block_addback"`
+	RiskReentryAddbackTolerance float64 `json:"risk_reentry_addback_tolerance"`
 }
 
 // FillRiskDefaults 兜底默认值（与 store.CopyTradeConfig.FillRiskDefaults 保持一致）
@@ -163,6 +167,10 @@ func (c *CopyConfig) FillRiskDefaults() {
 	}
 	if c.RiskReentryTolerance == 0 {
 		c.RiskReentryTolerance = 0.005
+	}
+	// v3.2 反加仓铁律默认：允许加仓 ≤ 20%
+	if c.RiskReentryAddbackTolerance == 0 {
+		c.RiskReentryAddbackTolerance = 1.20
 	}
 }
 

@@ -208,6 +208,10 @@ export interface CopyConfigRequest {
   risk_reentry_enabled?: boolean      // 默认 false：启用二次进场（判据 E 双门控）
   risk_reentry_ratio?: number         // 默认 0.5：重入仓位系数（×copy_ratio）
   risk_reentry_tolerance?: number     // 默认 0.005 (0.5%)：价格回归容差
+
+  // v3.2 反加仓铁律
+  risk_reentry_block_addback?: boolean        // 默认 true：阻止领航员止损后加仓时的重入
+  risk_reentry_addback_tolerance?: number     // 默认 1.20：允许加仓的倍数上限（1.0=严格，1.20=允许20%）
 }
 
 export interface UpdateModelConfigRequest {
@@ -669,6 +673,8 @@ export interface CopyTradeConfig {
   risk_reentry_enabled?: boolean;
   risk_reentry_ratio?: number;
   risk_reentry_tolerance?: number;
+  risk_reentry_block_addback?: boolean;
+  risk_reentry_addback_tolerance?: number;
   created_at?: string;
   updated_at?: string;
 }

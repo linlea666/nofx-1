@@ -82,6 +82,9 @@ interface FormState {
   risk_reentry_enabled: boolean     // 默认 false（用户 opt-in）
   risk_reentry_ratio: number        // 默认 50%（前端用百分比，提交时转 0.5）
   risk_reentry_tolerance: number    // 默认 0.5%（前端用百分比，提交时转 0.005）
+  // v3.2 反加仓铁律（仅 risk_reentry_enabled=on 时有效）
+  risk_reentry_block_addback: boolean  // 默认 true：阻止领航员加仓后的重入
+  risk_reentry_addback_tolerance: number // 前端用百分比展示：默认 20 (=20% 加仓容差)，提交时 1+x/100 转倍数
 }
 
 interface TraderConfigModalProps {
@@ -131,6 +134,8 @@ export function TraderConfigModal({
     risk_reentry_enabled: false,
     risk_reentry_ratio: 50,         // %（提交时 /100 转 0.5）
     risk_reentry_tolerance: 0.5,    // %（提交时 /100 转 0.005）
+    risk_reentry_block_addback: true,  // 默认开启（保护账户）
+    risk_reentry_addback_tolerance: 20, // %（提交时 1+x/100 转 1.20）
   })
   const [, setCopyTradeConfig] = useState<CopyTradeConfig | null>(null)
   const [isSaving, setIsSaving] = useState(false)
@@ -217,6 +222,11 @@ export function TraderConfigModal({
             risk_reentry_enabled: cfg.risk_reentry_enabled ?? false,
             risk_reentry_ratio: cfg.risk_reentry_ratio != null ? cfg.risk_reentry_ratio * 100 : 50,
             risk_reentry_tolerance: cfg.risk_reentry_tolerance != null ? cfg.risk_reentry_tolerance * 100 : 0.5,
+            risk_reentry_block_addback: cfg.risk_reentry_block_addback ?? true,
+            // 后端存倍数（如 1.20），前端展示百分比（如 20%）：(倍数 - 1) × 100
+            risk_reentry_addback_tolerance: cfg.risk_reentry_addback_tolerance != null
+              ? (cfg.risk_reentry_addback_tolerance - 1) * 100
+              : 20,
           }))
         }
       } catch (error) {
@@ -266,6 +276,8 @@ export function TraderConfigModal({
         risk_reentry_enabled: false,
         risk_reentry_ratio: 50,
         risk_reentry_tolerance: 0.5,
+        risk_reentry_block_addback: true,
+        risk_reentry_addback_tolerance: 20,
       })
     }
   }, [traderData, isEditMode, availableModels, availableExchanges])
@@ -351,6 +363,9 @@ export function TraderConfigModal({
           risk_reentry_enabled: formData.risk_reentry_enabled,
           risk_reentry_ratio: formData.risk_reentry_ratio / 100,
           risk_reentry_tolerance: formData.risk_reentry_tolerance / 100,
+          risk_reentry_block_addback: formData.risk_reentry_block_addback,
+          // 前端百分比 → 后端倍数：20% → 1.20
+          risk_reentry_addback_tolerance: 1 + formData.risk_reentry_addback_tolerance / 100,
         }
         // Binance 数据源额外携带 Web 私有接口凭证
         if (formData.copy_provider_type === 'binance') {
@@ -989,36 +1004,86 @@ export function TraderConfigModal({
                               </button>
                             </div>
                             {formData.risk_reentry_enabled && (
-                              <div className="grid grid-cols-2 gap-3">
-                                <div>
-                                  <label className="text-xs text-[#848E9C] block mb-1">
-                                    重入仓位系数 <span className="text-[#F0B90B]">{formData.risk_reentry_ratio.toFixed(0)}%</span>
-                                  </label>
-                                  <input
-                                    type="range"
-                                    min="10"
-                                    max="100"
-                                    step="10"
-                                    value={formData.risk_reentry_ratio}
-                                    onChange={(e) => handleInputChange('risk_reentry_ratio', parseFloat(e.target.value))}
-                                    className="w-full accent-[#F0B90B]"
-                                  />
+                              <>
+                                <div className="grid grid-cols-2 gap-3">
+                                  <div>
+                                    <label className="text-xs text-[#848E9C] block mb-1">
+                                      重入仓位系数 <span className="text-[#F0B90B]">{formData.risk_reentry_ratio.toFixed(0)}%</span>
+                                    </label>
+                                    <input
+                                      type="range"
+                                      min="10"
+                                      max="100"
+                                      step="10"
+                                      value={formData.risk_reentry_ratio}
+                                      onChange={(e) => handleInputChange('risk_reentry_ratio', parseFloat(e.target.value))}
+                                      className="w-full accent-[#F0B90B]"
+                                    />
+                                  </div>
+                                  <div>
+                                    <label className="text-xs text-[#848E9C] block mb-1">
+                                      价格回归容差 <span className="text-[#F0B90B]">{formData.risk_reentry_tolerance.toFixed(2)}%</span>
+                                    </label>
+                                    <input
+                                      type="number"
+                                      min="0"
+                                      max="2"
+                                      step="0.1"
+                                      value={formData.risk_reentry_tolerance}
+                                      onChange={(e) => handleInputChange('risk_reentry_tolerance', parseFloat(e.target.value) || 0.5)}
+                                      className="w-full px-3 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF] focus:border-[#F0B90B] focus:outline-none text-sm"
+                                    />
+                                  </div>
                                 </div>
-                                <div>
-                                  <label className="text-xs text-[#848E9C] block mb-1">
-                                    价格回归容差 <span className="text-[#F0B90B]">{formData.risk_reentry_tolerance.toFixed(2)}%</span>
-                                  </label>
-                                  <input
-                                    type="number"
-                                    min="0"
-                                    max="2"
-                                    step="0.1"
-                                    value={formData.risk_reentry_tolerance}
-                                    onChange={(e) => handleInputChange('risk_reentry_tolerance', parseFloat(e.target.value) || 0.5)}
-                                    className="w-full px-3 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF] focus:border-[#F0B90B] focus:outline-none text-sm"
-                                  />
+
+                                {/* v3.2 反加仓铁律配置 */}
+                                <div className="mt-3 pt-3 border-t border-[#2B3139]">
+                                  <div className="flex items-center justify-between mb-2">
+                                    <div>
+                                      <label className="text-sm text-[#EAECEF]">阻止反加仓重入</label>
+                                      <p className="text-xs text-[#848E9C]">领航员止损后又加仓（赌徒行为）时拒绝重入</p>
+                                    </div>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleInputChange('risk_reentry_block_addback', !formData.risk_reentry_block_addback)}
+                                      className={`w-12 h-6 rounded-full transition-colors ${formData.risk_reentry_block_addback ? 'bg-[#F0B90B]' : 'bg-[#2B3139]'}`}
+                                    >
+                                      <div className={`w-5 h-5 rounded-full bg-white shadow transition-transform ${formData.risk_reentry_block_addback ? 'translate-x-6' : 'translate-x-0.5'}`} />
+                                    </button>
+                                  </div>
+
+                                  {formData.risk_reentry_block_addback && (
+                                    <div>
+                                      <label className="text-xs text-[#848E9C] block mb-1">
+                                        允许加仓容差 <span className="text-[#F0B90B]">{formData.risk_reentry_addback_tolerance.toFixed(0)}%</span>
+                                        <span className="text-[#5E6673] ml-2">(0% = 严格禁止, 20% = 推荐, 50%+ = 宽松)</span>
+                                      </label>
+                                      <input
+                                        type="range"
+                                        min="0"
+                                        max="100"
+                                        step="5"
+                                        value={formData.risk_reentry_addback_tolerance}
+                                        onChange={(e) => handleInputChange('risk_reentry_addback_tolerance', parseFloat(e.target.value))}
+                                        className="w-full accent-[#F0B90B]"
+                                      />
+                                      <p className="text-xs text-[#848E9C] mt-1">
+                                        领航员止损后加仓 ≤ <span className="text-[#F0B90B] font-mono">{formData.risk_reentry_addback_tolerance.toFixed(0)}%</span> 时仍允许重入；
+                                        超出视为赌徒型补仓救单，拒绝重入保护账户。
+                                      </p>
+                                    </div>
+                                  )}
+
+                                  {!formData.risk_reentry_block_addback && (
+                                    <div className="p-2 bg-[#F6465D11] border border-[#F6465D44] rounded">
+                                      <p className="text-xs text-[#F6465D]">
+                                        ⚠️ 已关闭反加仓拦截：领航员即使止损后疯狂加仓救单，系统也会重入跟随。
+                                        请确认你信任的是非赌徒型领航员。
+                                      </p>
+                                    </div>
+                                  )}
                                 </div>
-                              </div>
+                              </>
                             )}
                           </div>
 
