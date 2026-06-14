@@ -455,6 +455,55 @@ type CopyConfigReq struct {
 	// Binance Web 凭证（仅 ProviderType=binance 时使用，明文存储）
 	BinanceP20T      string `json:"binance_p20t,omitempty"`       // 登录 cookie p20t
 	BinanceCSRFToken string `json:"binance_csrf_token,omitempty"` // CSRF header csrftoken
+
+	// 账户保护 v3 风控字段 —— 仅 OKX 路径生效
+	// 字段含义详见 store.CopyTradeConfig
+	// 开关字段用 *bool 区分"未传"(nil) 和"显式 false"（避免 Go JSON 零值歧义）
+	// 数值字段直接用值类型，零值由 store.FillRiskDefaults 兜底
+	RiskStopLossEnabled  *bool   `json:"risk_stop_loss_enabled,omitempty"`
+	RiskAccountPct       float64 `json:"risk_account_pct,omitempty"`
+	RiskATREnabled       *bool   `json:"risk_atr_enabled,omitempty"`
+	RiskATRMultiplier    float64 `json:"risk_atr_multiplier,omitempty"`
+	RiskATRTimeframe     string  `json:"risk_atr_timeframe,omitempty"`
+	RiskLeverageFallback *bool   `json:"risk_leverage_fallback,omitempty"`
+	RiskLeverageMaxLoss  float64 `json:"risk_leverage_max_loss,omitempty"`
+	RiskReentryEnabled   *bool   `json:"risk_reentry_enabled,omitempty"`
+	RiskReentryRatio     float64 `json:"risk_reentry_ratio,omitempty"`
+	RiskReentryTolerance float64 `json:"risk_reentry_tolerance,omitempty"`
+}
+
+// applyCopyConfigRiskFields 把 CopyConfigReq 中的 v3 风控字段透传到 store.CopyTradeConfig
+//
+// 设计：开关字段未传时(nil)使用合理默认（启用 SL/ATR/杠杆兜底，禁用二次进场）；
+// 数值字段零值会由 store.Upsert 内部的 FillRiskDefaults 兜底，无需在此处理。
+//
+// 调用点：Create handler / Update handler 内部，构造 copyConfig 后调用一次。
+// 复用理由：两个 handler 透传逻辑完全一致，提取避免重复
+func applyCopyConfigRiskFields(copyConfig *store.CopyTradeConfig, req *CopyConfigReq) {
+	if copyConfig == nil || req == nil {
+		return
+	}
+	// 开关：nil 用合理默认；非 nil 用 *值
+	copyConfig.RiskStopLossEnabled = derefBoolDefault(req.RiskStopLossEnabled, true)
+	copyConfig.RiskATREnabled = derefBoolDefault(req.RiskATREnabled, true)
+	copyConfig.RiskLeverageFallback = derefBoolDefault(req.RiskLeverageFallback, true)
+	copyConfig.RiskReentryEnabled = derefBoolDefault(req.RiskReentryEnabled, false)
+	// 数值字段：直接透传，零值由 store.FillRiskDefaults 兜底
+	copyConfig.RiskAccountPct = req.RiskAccountPct
+	copyConfig.RiskATRMultiplier = req.RiskATRMultiplier
+	copyConfig.RiskATRTimeframe = req.RiskATRTimeframe
+	copyConfig.RiskLeverageMaxLoss = req.RiskLeverageMaxLoss
+	copyConfig.RiskReentryRatio = req.RiskReentryRatio
+	copyConfig.RiskReentryTolerance = req.RiskReentryTolerance
+}
+
+// derefBoolDefault 安全解引用 *bool：nil 返回 def，非 nil 返回 *p
+// 用于 JSON 可选字段：nil 表示"未传"，*p=true/false 表示"显式传值"
+func derefBoolDefault(p *bool, def bool) bool {
+	if p == nil {
+		return def
+	}
+	return *p
 }
 
 type ModelConfig struct {
@@ -764,6 +813,9 @@ func (s *Server) handleCreateTrader(c *gin.Context) {
 			BinanceCSRFToken: req.CopyConfig.BinanceCSRFToken,
 		}
 
+		// v3 风控字段透传（修复 bug：之前 CopyConfigReq 无 risk_* 字段，前端传值被 JSON unmarshal 静默丢弃）
+		applyCopyConfigRiskFields(copyConfig, req.CopyConfig)
+
 		// Validate required fields
 		if copyConfig.ProviderType == "" || copyConfig.LeaderID == "" {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Copy trade config requires provider_type and leader_id"})
@@ -778,8 +830,9 @@ func (s *Server) handleCreateTrader(c *gin.Context) {
 		if err := s.store.CopyTrade().Upsert(copyConfig); err != nil {
 			logger.Infof("⚠️ Failed to create copy trade config: %v", err)
 		} else {
-			logger.Infof("✓ Copy trade config created: provider=%s, leader=%s, ratio=%.0f%%",
-				copyConfig.ProviderType, copyConfig.LeaderID, copyConfig.CopyRatio*100)
+			logger.Infof("✓ Copy trade config created: provider=%s, leader=%s, ratio=%.0f%% (risk SL=%v ATR=%v reentry=%v)",
+				copyConfig.ProviderType, copyConfig.LeaderID, copyConfig.CopyRatio*100,
+				copyConfig.RiskStopLossEnabled, copyConfig.RiskATREnabled, copyConfig.RiskReentryEnabled)
 		}
 	}
 
@@ -954,6 +1007,15 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 				BinanceCSRFToken: req.CopyConfig.BinanceCSRFToken,
 			}
 
+			// v3 风控字段透传（修复 bug：之前 CopyConfigReq 无 risk_* 字段，前端传值被 JSON unmarshal 静默丢弃）
+			applyCopyConfigRiskFields(copyConfig, req.CopyConfig)
+
+			// Update 路径需要保留 Enabled 状态（与 Create 不同：Create 总是 false 等显式启动）
+			// 这里读取已有配置的 Enabled 字段，避免被 Upsert 误覆盖为 false
+			if existing, err := s.store.CopyTrade().GetByTraderID(traderID); err == nil && existing != nil {
+				copyConfig.Enabled = existing.Enabled
+			}
+
 			// Default copy ratio to 1.0 (100%)
 			if copyConfig.CopyRatio <= 0 {
 				copyConfig.CopyRatio = 1.0
@@ -962,8 +1024,9 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 			if err := s.store.CopyTrade().Upsert(copyConfig); err != nil {
 				logger.Infof("⚠️ Failed to update copy trade config: %v", err)
 			} else {
-				logger.Infof("✓ Copy trade config updated: provider=%s, leader=%s, ratio=%.0f%%",
-					copyConfig.ProviderType, copyConfig.LeaderID, copyConfig.CopyRatio*100)
+				logger.Infof("✓ Copy trade config updated: provider=%s, leader=%s, ratio=%.0f%% (risk SL=%v ATR=%v reentry=%v)",
+					copyConfig.ProviderType, copyConfig.LeaderID, copyConfig.CopyRatio*100,
+					copyConfig.RiskStopLossEnabled, copyConfig.RiskATREnabled, copyConfig.RiskReentryEnabled)
 			}
 		} else if decisionMode == "ai" {
 			// If switching to AI mode, disable copy trade
