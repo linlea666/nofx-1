@@ -224,8 +224,9 @@ export function TraderConfigModal({
             risk_reentry_tolerance: cfg.risk_reentry_tolerance != null ? cfg.risk_reentry_tolerance * 100 : 0.5,
             risk_reentry_block_addback: cfg.risk_reentry_block_addback ?? true,
             // 后端存倍数（如 1.20），前端展示百分比（如 20%）：(倍数 - 1) × 100
+            // 防御：DB 异常值（< 1.0）clamp 到 0，避免 UI 显示负百分比
             risk_reentry_addback_tolerance: cfg.risk_reentry_addback_tolerance != null
-              ? (cfg.risk_reentry_addback_tolerance - 1) * 100
+              ? Math.max(0, (cfg.risk_reentry_addback_tolerance - 1) * 100)
               : 20,
           }))
         }

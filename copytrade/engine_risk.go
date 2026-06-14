@@ -395,16 +395,23 @@ func (e *Engine) checkReentryConditions() {
 		// 状态下 matchSignalWithMapping 早返，AddCount 永不增加），必须直接比较
 		// 领航员当前 size 与 SL 触发时的 size。
 		// ============================================================
-		if e.config.RiskReentryBlockAddback && mapping.LeaderSizeAtStop > 0 {
-			// Tolerance 兜底（极旧库或前端未传时为 0，按默认 1.20 处理）
-			addbackTolerance := e.config.RiskReentryAddbackTolerance
-			if addbackTolerance <= 0 {
-				addbackTolerance = 1.20
-			}
-			if leaderPos.Size > mapping.LeaderSizeAtStop*addbackTolerance {
-				logger.Debugf("⏭️ [%s] 二次进场禁用：领航员 SL 后加仓超出容差 | posId=%s size %.4f → %.4f (容差倍数=%.2fx)",
-					e.traderID, mapping.LeaderPosID, mapping.LeaderSizeAtStop, leaderPos.Size, addbackTolerance)
-				continue
+		if e.config.RiskReentryBlockAddback {
+			if mapping.LeaderSizeAtStop > 0 {
+				// Tolerance 兜底（极旧库或前端未传时为 0，按默认 1.20 处理）
+				addbackTolerance := e.config.RiskReentryAddbackTolerance
+				if addbackTolerance <= 0 {
+					addbackTolerance = 1.20
+				}
+				if leaderPos.Size > mapping.LeaderSizeAtStop*addbackTolerance {
+					logger.Debugf("⏭️ [%s] 二次进场禁用：领航员 SL 后加仓超出容差 | posId=%s size %.4f → %.4f (容差倍数=%.2fx)",
+						e.traderID, mapping.LeaderPosID, mapping.LeaderSizeAtStop, leaderPos.Size, addbackTolerance)
+					continue
+				}
+			} else {
+				// 旧数据兼容：v3 之前的 mapping 没有 LeaderSizeAtStop 快照，无法判定加仓
+				// 此时降级为"不拦截"（与 v3.1 行为一致），但记 Debug 让用户知道
+				logger.Debugf("⏭️ [%s] 反加仓判据降级：LeaderSizeAtStop=0（v3 之前的旧 mapping） | posId=%s",
+					e.traderID, mapping.LeaderPosID)
 			}
 		}
 

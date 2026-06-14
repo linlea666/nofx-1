@@ -83,6 +83,11 @@ type CopyTradeConfigRequest struct {
 	RiskReentryEnabled   *bool    `json:"risk_reentry_enabled,omitempty"`
 	RiskReentryRatio     *float64 `json:"risk_reentry_ratio,omitempty"`
 	RiskReentryTolerance *float64 `json:"risk_reentry_tolerance,omitempty"`
+
+	// v3.2 反加仓铁律（详见 store.CopyTradeConfig 注释）
+	// risk_reentry_addback_tolerance 合法范围：[1.0, +∞)，<= 0 时会被 FillRiskDefaults 兜底为 1.20
+	RiskReentryBlockAddback     *bool    `json:"risk_reentry_block_addback,omitempty"`
+	RiskReentryAddbackTolerance *float64 `json:"risk_reentry_addback_tolerance,omitempty"`
 }
 
 // GetConfig 获取跟单配置
@@ -199,6 +204,19 @@ func (h *CopyTradeHandler) SaveConfig(c *gin.Context) {
 		config.RiskReentryTolerance = *req.RiskReentryTolerance
 	} else if existing != nil {
 		config.RiskReentryTolerance = existing.RiskReentryTolerance
+	}
+	// v3.2 反加仓铁律配置（与 server.go 的 CopyConfigReq 字段透传逻辑保持对称）
+	if req.RiskReentryBlockAddback != nil {
+		config.RiskReentryBlockAddback = *req.RiskReentryBlockAddback
+	} else if existing != nil {
+		config.RiskReentryBlockAddback = existing.RiskReentryBlockAddback
+	} else {
+		config.RiskReentryBlockAddback = true // 默认启用（保护账户）
+	}
+	if req.RiskReentryAddbackTolerance != nil {
+		config.RiskReentryAddbackTolerance = *req.RiskReentryAddbackTolerance
+	} else if existing != nil {
+		config.RiskReentryAddbackTolerance = existing.RiskReentryAddbackTolerance
 	}
 
 	// 保存配置（store.Upsert 内部会调 FillRiskDefaults 做最后兜底）
