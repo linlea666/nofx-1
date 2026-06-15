@@ -415,7 +415,8 @@ func (e *Engine) checkReentryConditions() {
 			}
 		}
 
-		// 条件 2: 价格回归到入场价 ± tolerance
+		// 条件 2: 价格回归到入场价附近（v3.3 单边严格区间，仅允许优于或等于领航员入场价时重入）
+		//
 		// 入场价取 mapping.OpenPrice（记录跟单时的领航员开仓价；与 SL 计算用的一致）
 		entryRef := mapping.OpenPrice
 		if entryRef <= 0 {
@@ -430,11 +431,21 @@ func (e *Engine) checkReentryConditions() {
 		}
 		tolerance := e.config.RiskReentryTolerance
 
+		// 单边严格触发区间：
+		//   多单：[entry × (1-tolerance), entry]
+		//     含义：价格至少回到入场价附近（下界）+ 不能超过领航员入场价（上界）
+		//     效果：重入价不差于原入场价，避免追涨
+		//   空单：[entry, entry × (1+tolerance)]
+		//     含义：价格至少回到入场价附近（上界）+ 不能低于领航员入场价（下界）
+		//     效果：重入价不差于原入场价，避免追跌
+		//
+		// 与 v3.2 之前的区别：旧逻辑只检查"下界（多单）/上界（空单）"，没有反方向约束，
+		// 导致价格大幅超出入场价时（如 SL 触发 @63 后涨到 80）仍会重入，等于在更差的位置追单。
 		priceReturned := false
 		if mapping.Side == string(SideLong) {
-			priceReturned = markPrice >= entryRef*(1-tolerance)
+			priceReturned = markPrice >= entryRef*(1-tolerance) && markPrice <= entryRef
 		} else {
-			priceReturned = markPrice <= entryRef*(1+tolerance)
+			priceReturned = markPrice <= entryRef*(1+tolerance) && markPrice >= entryRef
 		}
 		if !priceReturned {
 			continue

@@ -165,8 +165,9 @@ func (c *CopyConfig) FillRiskDefaults() {
 	if c.RiskReentryRatio == 0 {
 		c.RiskReentryRatio = 0.5
 	}
+	// v3.3：与 store.CopyTradeConfig.FillRiskDefaults 保持一致
 	if c.RiskReentryTolerance == 0 {
-		c.RiskReentryTolerance = 0.005
+		c.RiskReentryTolerance = 0.02
 	}
 	// v3.2 反加仓铁律默认：允许加仓 ≤ 20%
 	if c.RiskReentryAddbackTolerance == 0 {

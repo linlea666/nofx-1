@@ -81,7 +81,7 @@ interface FormState {
   risk_leverage_max_loss: number    // 默认 50%（前端用百分比展示，提交时转 0.5）
   risk_reentry_enabled: boolean     // 默认 false（用户 opt-in）
   risk_reentry_ratio: number        // 默认 50%（前端用百分比，提交时转 0.5）
-  risk_reentry_tolerance: number    // 默认 0.5%（前端用百分比，提交时转 0.005）
+  risk_reentry_tolerance: number    // 默认 2%（前端用百分比，提交时 /100 转 0.02）—— v3.3 单边严格区间
   // v3.2 反加仓铁律（仅 risk_reentry_enabled=on 时有效）
   risk_reentry_block_addback: boolean  // 默认 true：阻止领航员加仓后的重入
   risk_reentry_addback_tolerance: number // 前端用百分比展示：默认 20 (=20% 加仓容差)，提交时 1+x/100 转倍数
@@ -133,7 +133,7 @@ export function TraderConfigModal({
     risk_leverage_max_loss: 50,     // %（提交时 /100 转 0.5）
     risk_reentry_enabled: false,
     risk_reentry_ratio: 50,         // %（提交时 /100 转 0.5）
-    risk_reentry_tolerance: 0.5,    // %（提交时 /100 转 0.005）
+    risk_reentry_tolerance: 2,      // %（提交时 /100 转 0.02）—— v3.3 单边严格区间需更宽容差
     risk_reentry_block_addback: true,  // 默认开启（保护账户）
     risk_reentry_addback_tolerance: 20, // %（提交时 1+x/100 转 1.20）
   })
@@ -200,7 +200,7 @@ export function TraderConfigModal({
           const cfg = result.data.config
           setCopyTradeConfig(cfg)
           // 只加载跟单参数，decision_mode 由 traderData 决定
-          // 风控字段：后端用比例（0.005=0.5%）存，前端用百分比展示，× 100 转换
+          // 风控字段：后端用比例（如 0.02=2%）存，前端用百分比展示，× 100 转换
           setFormData(prev => ({
             ...prev,
             copy_provider_type: cfg.provider_type as CopyTradeProvider,
@@ -221,7 +221,7 @@ export function TraderConfigModal({
             risk_leverage_max_loss: cfg.risk_leverage_max_loss != null ? cfg.risk_leverage_max_loss * 100 : 50,
             risk_reentry_enabled: cfg.risk_reentry_enabled ?? false,
             risk_reentry_ratio: cfg.risk_reentry_ratio != null ? cfg.risk_reentry_ratio * 100 : 50,
-            risk_reentry_tolerance: cfg.risk_reentry_tolerance != null ? cfg.risk_reentry_tolerance * 100 : 0.5,
+            risk_reentry_tolerance: cfg.risk_reentry_tolerance != null ? cfg.risk_reentry_tolerance * 100 : 2,
             risk_reentry_block_addback: cfg.risk_reentry_block_addback ?? true,
             // 后端存倍数（如 1.20），前端展示百分比（如 20%）：(倍数 - 1) × 100
             // 防御：DB 异常值（< 1.0）clamp 到 0，避免 UI 显示负百分比
@@ -276,7 +276,7 @@ export function TraderConfigModal({
         risk_leverage_max_loss: 50,
         risk_reentry_enabled: false,
         risk_reentry_ratio: 50,
-        risk_reentry_tolerance: 0.5,
+        risk_reentry_tolerance: 2,
         risk_reentry_block_addback: true,
         risk_reentry_addback_tolerance: 20,
       })
@@ -1028,14 +1028,21 @@ export function TraderConfigModal({
                                     <input
                                       type="number"
                                       min="0"
-                                      max="2"
+                                      max="10"
                                       step="0.1"
                                       value={formData.risk_reentry_tolerance}
-                                      onChange={(e) => handleInputChange('risk_reentry_tolerance', parseFloat(e.target.value) || 0.5)}
+                                      onChange={(e) => handleInputChange('risk_reentry_tolerance', parseFloat(e.target.value) || 2)}
                                       className="w-full px-3 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF] focus:border-[#F0B90B] focus:outline-none text-sm"
                                     />
                                   </div>
                                 </div>
+                                {/* v3.3 单边严格语义说明 */}
+                                <p className="text-xs text-[#848E9C] mt-2 leading-relaxed">
+                                  <span className="text-[#F0B90B]">⚙ 重入价格优于领航员：</span>
+                                  多单仅在 <span className="font-mono">[入场价×(1-{formData.risk_reentry_tolerance.toFixed(2)}%), 入场价]</span> 区间内重入（不追高）；
+                                  空单仅在 <span className="font-mono">[入场价, 入场价×(1+{formData.risk_reentry_tolerance.toFixed(2)}%)]</span> 区间内重入（不追跌）。
+                                  容差越大触发窗口越宽，但重入价偏离原价越多。新逻辑下建议 ≥ 2%。
+                                </p>
 
                                 {/* v3.2 反加仓铁律配置 */}
                                 <div className="mt-3 pt-3 border-t border-[#2B3139]">

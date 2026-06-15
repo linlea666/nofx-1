@@ -207,7 +207,7 @@ export interface CopyConfigRequest {
   risk_leverage_max_loss?: number     // 默认 0.5：保证金最大亏损封顶（0-1）
   risk_reentry_enabled?: boolean      // 默认 false：启用二次进场（判据 E 双门控）
   risk_reentry_ratio?: number         // 默认 0.5：重入仓位系数（×copy_ratio）
-  risk_reentry_tolerance?: number     // 默认 0.005 (0.5%)：价格回归容差
+  risk_reentry_tolerance?: number     // 默认 0.02 (2%)：价格回归容差（v3.3 单边严格区间，仅允许等价或优于领航员入场价时重入）
 
   // v3.2 反加仓铁律
   risk_reentry_block_addback?: boolean        // 默认 true：阻止领航员止损后加仓时的重入

@@ -51,7 +51,7 @@ type CopyTradeConfig struct {
 	// 二次进场（判据 E 双门控）—— 默认 off，用户 opt-in
 	RiskReentryEnabled   bool    `json:"risk_reentry_enabled"`   // 默认 false
 	RiskReentryRatio     float64 `json:"risk_reentry_ratio"`     // 默认 0.5，范围 0.1-1.0
-	RiskReentryTolerance float64 `json:"risk_reentry_tolerance"` // 价格回归容差，默认 0.005 (0.5%)
+	RiskReentryTolerance float64 `json:"risk_reentry_tolerance"` // 价格回归容差，默认 0.02 (2%)，v3.3 单边严格区间
 
 	// 反加仓铁律（v3.2 可配置）—— 二次进场前是否拦截"领航员止损后加仓"的赌徒型行为
 	// RiskReentryBlockAddback: 是否启用反加仓拦截，默认 true（保护账户）
@@ -90,8 +90,10 @@ func (c *CopyTradeConfig) FillRiskDefaults() {
 	if c.RiskReentryRatio == 0 {
 		c.RiskReentryRatio = 0.5
 	}
+	// v3.3 默认 tolerance 从 0.5% 提升到 2%：判据 2 改为单边严格区间后触发窗口变窄，
+	// 需要更宽的容差保证可触发性。详见 engine_risk.go 判据 2 注释。
 	if c.RiskReentryTolerance == 0 {
-		c.RiskReentryTolerance = 0.005
+		c.RiskReentryTolerance = 0.02
 	}
 	// v3.2 反加仓铁律默认：开启 + 允许加仓 ≤ 20%
 	// 注：RiskReentryBlockAddback 是 bool，零值 false 与"用户显式关闭"不可区分，
@@ -155,7 +157,8 @@ func (s *CopyTradeStore) initTables() error {
 	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_leverage_max_loss REAL DEFAULT 0.5`)
 	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_reentry_enabled INTEGER DEFAULT 0`)
 	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_reentry_ratio REAL DEFAULT 0.5`)
-	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_reentry_tolerance REAL DEFAULT 0.005`)
+	// v3.3 默认 tolerance 提升到 2%（旧库已有数据的旧默认 0.005 仍保留；本 ALTER 仅对新建库 / 新行有效）
+	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_reentry_tolerance REAL DEFAULT 0.02`)
 	// v3.2 反加仓铁律配置
 	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_reentry_block_addback INTEGER DEFAULT 1`)
 	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_reentry_addback_tolerance REAL DEFAULT 1.20`)
@@ -291,7 +294,7 @@ const copyTradeConfigSelectColumns = `
 	COALESCE(risk_leverage_max_loss, 0.5) AS risk_leverage_max_loss,
 	COALESCE(risk_reentry_enabled, 0) AS risk_reentry_enabled,
 	COALESCE(risk_reentry_ratio, 0.5) AS risk_reentry_ratio,
-	COALESCE(risk_reentry_tolerance, 0.005) AS risk_reentry_tolerance,
+	COALESCE(risk_reentry_tolerance, 0.02) AS risk_reentry_tolerance,
 	COALESCE(risk_reentry_block_addback, 1) AS risk_reentry_block_addback,
 	COALESCE(risk_reentry_addback_tolerance, 1.20) AS risk_reentry_addback_tolerance,
 	created_at, updated_at`
