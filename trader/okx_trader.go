@@ -109,29 +109,57 @@ func (t *OKXTrader) AmendProtectiveStop(algoID string, req ProtectiveStopRequest
 }
 
 func (t *OKXTrader) GetProtectiveStop(algoID, symbol string) (*ProtectiveStopOrder, error) {
-	paths := []string{fmt.Sprintf("%s?algoId=%s&instType=SWAP", okxAlgoPendingPath, algoID), fmt.Sprintf("%s?algoId=%s&ordType=conditional&instType=SWAP", okxAlgoHistoryPath, algoID)}
+	// orders-algo-pending requires ordType; orders-algo-history requires
+	// state or algoId (algoId satisfies it here).
+	paths := []string{
+		fmt.Sprintf("%s?algoId=%s&ordType=conditional&instType=SWAP", okxAlgoPendingPath, algoID),
+		fmt.Sprintf("%s?algoId=%s&ordType=conditional&instType=SWAP", okxAlgoHistoryPath, algoID),
+	}
 	return t.getProtectiveStopFromPaths(paths, symbol, fmt.Sprintf("protective stop %s not found", algoID))
 }
 
 func (t *OKXTrader) GetProtectiveStopByClientID(clientID, symbol string) (*ProtectiveStopOrder, error) {
-	paths := []string{fmt.Sprintf("%s?algoClOrdId=%s&instType=SWAP", okxAlgoPendingPath, clientID), fmt.Sprintf("%s?algoClOrdId=%s&ordType=conditional&instType=SWAP", okxAlgoHistoryPath, clientID)}
+	// orders-algo-history rejects lookups by algoClOrdId alone with error
+	// 50015 ("Either parameter state or algoId is required"), so each
+	// terminal state must be enumerated explicitly.
+	paths := []string{
+		fmt.Sprintf("%s?algoClOrdId=%s&ordType=conditional&instType=SWAP", okxAlgoPendingPath, clientID),
+		fmt.Sprintf("%s?algoClOrdId=%s&ordType=conditional&instType=SWAP&state=effective", okxAlgoHistoryPath, clientID),
+		fmt.Sprintf("%s?algoClOrdId=%s&ordType=conditional&instType=SWAP&state=canceled", okxAlgoHistoryPath, clientID),
+		fmt.Sprintf("%s?algoClOrdId=%s&ordType=conditional&instType=SWAP&state=order_failed", okxAlgoHistoryPath, clientID),
+	}
 	return t.getProtectiveStopFromPaths(paths, symbol, fmt.Sprintf("protective stop client id %s not found", clientID))
 }
 
+// isOKXAlgoNotExistError reports OKX error 51603 ("Order does not exist").
+// OKX returns this as a top-level error code instead of an empty result set,
+// so it must be treated as a confirmed absence rather than a query failure.
+func isOKXAlgoNotExistError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "51603") && strings.Contains(msg, "does not exist")
+}
+
 // getProtectiveStopFromPaths queries the given endpoints in order.
-// Error contract: if every request failed we return the query error (caller
-// must NOT treat the order as gone); only when at least one request succeeded
-// and no record was found do we return ErrProtectiveStopNotFound.
+// Error contract: ErrProtectiveStopNotFound is returned only when EVERY
+// endpoint answered conclusively (success with no record, or OKX 51603) —
+// any transient failure wins, because the order could exist on the endpoint
+// that failed and the caller must not invalidate local tracking.
 func (t *OKXTrader) getProtectiveStopFromPaths(paths []string, symbol string, notFound string) (*ProtectiveStopOrder, error) {
 	var lastQueryErr error
-	querySucceeded := false
 	for _, path := range paths {
 		data, err := t.doRequest("GET", path, nil)
 		if err != nil {
+			if isOKXAlgoNotExistError(err) {
+				// OKX processed the lookup and confirmed there is no such
+				// order on this endpoint: a conclusive answer.
+				continue
+			}
 			lastQueryErr = err
 			continue
 		}
-		querySucceeded = true
 		var rows []struct {
 			AlgoID          string `json:"algoId"`
 			AlgoClOrdID     string `json:"algoClOrdId"`
@@ -153,7 +181,7 @@ func (t *OKXTrader) getProtectiveStopFromPaths(paths []string, symbol string, no
 			return &ProtectiveStopOrder{AlgoID: rows[0].AlgoID, ClientID: rows[0].AlgoClOrdID, Symbol: symbol, PositionSide: rows[0].PosSide, MarginMode: rows[0].TdMode, Quantity: q, TriggerPrice: px, TriggerType: rows[0].SlTriggerPxType, State: rows[0].State, ActualOrderID: rows[0].OrdID}, nil
 		}
 	}
-	if !querySucceeded {
+	if lastQueryErr != nil {
 		return nil, fmt.Errorf("protective stop query failed: %w", lastQueryErr)
 	}
 	return nil, fmt.Errorf("%s: %w", notFound, ErrProtectiveStopNotFound)

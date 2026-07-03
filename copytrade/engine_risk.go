@@ -407,7 +407,7 @@ func (e *Engine) checkStoppedByRisk() {
 			cycle, cerr := e.store.CopyTrade().GetOpenCopyGuardCycle(e.traderID, mapping.LeaderPosID)
 			if cerr == nil {
 				atr, _ := market.GetOKXATRWithMaxAge(mapping.Symbol, e.config.RiskATRTimeframe, e.config.RiskATRPeriod, riskATRCacheMaxAge(e.config))
-				_ = e.store.CopyTrade().RecordCopyGuardStopObserved(cycle.ID, e.traderID, atr, leaderPos.MarkPrice, leaderSize, leaderPnL, map[string]interface{}{"confirmation": "position_absent_fallback"})
+				_ = e.store.CopyTrade().RecordCopyGuardStopObserved(cycle.ID, e.traderID, cycle.ReentryCount, atr, leaderPos.MarkPrice, leaderSize, leaderPnL, map[string]interface{}{"confirmation": "position_absent_fallback"})
 			}
 		}
 
@@ -504,6 +504,17 @@ func (e *Engine) checkReentryConditions() {
 		leaderPos := leaderPosMap[mapping.LeaderPosID]
 		if leaderPos == nil || leaderPos.Size <= 0 {
 			// 领航员完全平掉了 → 在 checkIgnoredPositionsClosed 里会标 closed
+			continue
+		}
+		// 观察期领航员反手（OKX net 模式同 posId 换向）：本周期不可能再重入，
+		// 直接以 LEADER_REVERSED 闭合，否则周期与 mapping 会永远停在观察态。
+		if e.config.RiskPolicyVersion >= 4 && leaderPos.Side != "" && string(leaderPos.Side) != mapping.Side {
+			_ = e.store.CopyTrade().CloseCopyGuardCycle(v4Cycle.ID, store.CopyGuardLeaderReversed, v4Cycle.ActualPnL, v4Cycle.BaselinePnL, v4Cycle.Fees, v4Cycle.FundingFee, v4Cycle.LiquidationPenalty, v4Cycle.Slippage)
+			_ = e.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: v4Cycle.ID, TraderID: e.traderID, Type: "LEADER_REVERSED", Price: leaderPos.MarkPrice, Metadata: map[string]interface{}{"old_side": mapping.Side, "new_side": string(leaderPos.Side), "phase": "watch"}})
+			if err := e.store.CopyTrade().MarkStoppedByRiskAsClosed(e.traderID, mapping.LeaderPosID); err != nil {
+				logger.Warnf("⚠️ [%s] 观察期反手后关闭 mapping 失败: %v | posId=%s", e.traderID, err, mapping.LeaderPosID)
+			}
+			logger.Infof("🔁 [%s] 观察期领航员反手，周期闭合 | cycle=%d posId=%s %s %s→%s", e.traderID, v4Cycle.ID, mapping.LeaderPosID, mapping.Symbol, mapping.Side, string(leaderPos.Side))
 			continue
 		}
 		if e.config.RiskPolicyVersion >= 4 && (!e.config.RiskReentryEnabled || terminalWatchStatus != "") {
@@ -626,13 +637,17 @@ func (e *Engine) checkReentryConditions() {
 				_ = e.store.CopyTrade().UpdateCopyGuardObservation(v4Cycle.ID, store.CopyGuardStoppedWatching, entryRef, markPrice, currentATR)
 				continue
 			}
-			boundary := entryRef
-			if mapping.Side == string(SideLong) {
-				boundary -= currentATR * e.config.RiskReentryBandATR
-				priceReturned = v4Cycle.LastObservedPrice < boundary && markPrice >= boundary && markPrice <= entryRef+currentATR*e.config.RiskReentryMaxChaseATR
-			} else {
-				boundary += currentATR * e.config.RiskReentryBandATR
-				priceReturned = v4Cycle.LastObservedPrice > boundary && markPrice <= boundary && markPrice >= entryRef-currentATR*e.config.RiskReentryMaxChaseATR
+			// 首轮观察（尚无上一 tick 价格）只记录观测、不判穿越：
+			// LastObservedPrice=0 会让多单的 "0 < boundary" 恒真，造成误触发。
+			if v4Cycle.LastObservedPrice > 0 {
+				boundary := entryRef
+				if mapping.Side == string(SideLong) {
+					boundary -= currentATR * e.config.RiskReentryBandATR
+					priceReturned = v4Cycle.LastObservedPrice < boundary && markPrice >= boundary && markPrice <= entryRef+currentATR*e.config.RiskReentryMaxChaseATR
+				} else {
+					boundary += currentATR * e.config.RiskReentryBandATR
+					priceReturned = v4Cycle.LastObservedPrice > boundary && markPrice <= boundary && markPrice >= entryRef-currentATR*e.config.RiskReentryMaxChaseATR
+				}
 			}
 			_ = e.store.CopyTrade().UpdateCopyGuardObservation(v4Cycle.ID, store.CopyGuardStoppedWatching, entryRef, markPrice, currentATR)
 		} else if mapping.Side == string(SideLong) {

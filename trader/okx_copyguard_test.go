@@ -79,6 +79,77 @@ func TestGetProtectiveStopErrorClassification(t *testing.T) {
 	})
 }
 
+// TestGetProtectiveStopQueryParams reproduces the live failure where OKX
+// rejected our lookups: orders-algo-history requires state or algoId (error
+// 50015) and orders-algo-pending requires ordType. Both queries must carry
+// the required parameters or the 51068-adoption self-heal never works.
+func TestGetProtectiveStopQueryParams(t *testing.T) {
+	var captured []string
+	trader := newOKXTestServer(t, func(path string) (int, string) {
+		if strings.Contains(path, "orders-algo") {
+			captured = append(captured, path)
+		}
+		return 200, `{"code":"0","msg":"","data":[]}`
+	})
+	_, _ = trader.GetProtectiveStop("algo-1", "ETHUSDT")
+	_, _ = trader.GetProtectiveStopByClientID("cg15a0", "ETHUSDT")
+	for _, path := range captured {
+		if strings.Contains(path, "orders-algo-pending") && !strings.Contains(path, "ordType=conditional") {
+			t.Fatalf("orders-algo-pending requires ordType: %s", path)
+		}
+		if strings.Contains(path, "orders-algo-history") && !strings.Contains(path, "algoId=") && !strings.Contains(path, "state=") {
+			t.Fatalf("orders-algo-history requires state or algoId (OKX 50015): %s", path)
+		}
+	}
+	// clientID history lookups must enumerate every terminal state.
+	for _, state := range []string{"effective", "canceled", "order_failed"} {
+		found := false
+		for _, path := range captured {
+			if strings.Contains(path, "orders-algo-history") && strings.Contains(path, "algoClOrdId=cg15a0") && strings.Contains(path, "state="+state) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("clientID history lookup must cover state=%s, got %v", state, captured)
+		}
+	}
+}
+
+// TestGetProtectiveStop51603IsConfirmedAbsence: OKX answers a missing algoId
+// with top-level error 51603 instead of an empty result set. That is a
+// confirmed absence (ErrProtectiveStopNotFound), not a transient failure —
+// otherwise cycles stay UNKNOWN forever (live incident, cycle 15).
+func TestGetProtectiveStop51603IsConfirmedAbsence(t *testing.T) {
+	trader := newOKXTestServer(t, func(path string) (int, string) {
+		if strings.Contains(path, "orders-algo") {
+			return 200, `{"code":"51603","msg":"Order does not exist","data":[]}`
+		}
+		return 200, `{"code":"0","msg":"","data":[]}`
+	})
+	_, err := trader.GetProtectiveStop("missing-algo", "ETHUSDT")
+	if !errors.Is(err, ErrProtectiveStopNotFound) {
+		t.Fatalf("51603 must be classified as confirmed absence, got: %v", err)
+	}
+	// Mixed case: one endpoint fails transiently, the other returns 51603 —
+	// the transient failure must win (state genuinely unknown).
+	calls := 0
+	trader = newOKXTestServer(t, func(path string) (int, string) {
+		if strings.Contains(path, "orders-algo") {
+			calls++
+			if calls == 1 {
+				return 200, `{"code":"50011","msg":"rate limited","data":[]}`
+			}
+			return 200, `{"code":"51603","msg":"Order does not exist","data":[]}`
+		}
+		return 200, `{"code":"0","msg":"","data":[]}`
+	})
+	_, err = trader.GetProtectiveStop("missing-algo", "ETHUSDT")
+	if err == nil || errors.Is(err, ErrProtectiveStopNotFound) {
+		t.Fatalf("transient failure alongside 51603 must stay a query failure: %v", err)
+	}
+}
+
 func TestGetClosedPnLQueryDirection(t *testing.T) {
 	var captured []string
 	trader := newOKXTestServer(t, func(path string) (int, string) {

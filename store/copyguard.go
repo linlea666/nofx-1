@@ -623,13 +623,20 @@ func metadataString(metadata map[string]interface{}, key string) string {
 	return value
 }
 
-func (s *CopyTradeStore) RecordCopyGuardStopObserved(cycleID int64, traderID string, atr, price, quantity, pnl float64, metadata map[string]interface{}) error {
+// RecordCopyGuardStopObserved marks a stop that was detected indirectly (the
+// follower position vanished while the leader still holds): the cycle enters
+// STOPPED_WATCHING and the current attempt is closed with the observed price
+// so it can be reconciled later, mirroring RecordCopyGuardStop.
+func (s *CopyTradeStore) RecordCopyGuardStopObserved(cycleID int64, traderID string, attemptNo int, atr, price, quantity, pnl float64, metadata map[string]interface{}) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 	if _, err = tx.Exec(`UPDATE copy_guard_cycles SET status=?,atr_at_stop=?,stop_count=stop_count+1,stopped_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?`, CopyGuardStoppedWatching, atr, cycleID); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`UPDATE copy_guard_attempts SET status='STOPPED',exit_price=?,stop_fill_price=?,closed_at=CURRENT_TIMESTAMP WHERE cycle_id=? AND attempt_no=? AND status='OPEN'`, price, price, cycleID, attemptNo); err != nil {
 		return err
 	}
 	raw, _ := json.Marshal(metadata)

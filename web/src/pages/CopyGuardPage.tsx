@@ -22,8 +22,8 @@ const statusLabels: Record<string, string> = {
   FOLLOWING_REENTRY: '重入后跟随',
   LEADER_CLOSED: '领航员已平仓',
   LEADER_REVERSED: '领航员已反手',
-  ATTEMPTS_EXHAUSTED: '重入次数已用完',
-  WATCH_TIMEOUT: '观察超时',
+  ATTEMPTS_EXHAUSTED: '重入次数用尽·等待领航员平仓',
+  WATCH_TIMEOUT: '观察超时·等待领航员平仓',
 }
 const protectionLabels: Record<string, string> = {
   PENDING: '待建立',
@@ -70,6 +70,11 @@ const eventLabels: Record<string, string> = {
   PROTECTIVE_STOP_TERMINAL: '保护单已自然终结',
   LIQ_PRICE_IGNORED: '强平价方向异常已忽略',
   BASELINE_CALIBRATED: '基线已用领航员历史校准',
+  CYCLE_BACKFILLED: '存量仓位补建生命周期',
+  STOP_CONFIRMED: '保护止损确认（间接检测）',
+  REENTRY_REQUESTED: '重入条件满足，已请求下单',
+  REENTRY_RECOVERED_AFTER_RESTART: '重启后重入状态已恢复',
+  REENTRY_RECOVERY_PENDING: '重启后重入状态待确认',
 }
 
 const baselineSourceLabels: Record<string, string> = {
@@ -368,7 +373,7 @@ export function CopyGuardPage() {
           value={`${((summary?.average_coverage ?? 0) * 100).toFixed(1)}%`}
         />
         <Metric
-          label="保护缺失时长"
+          label="保护缺失时长(历史累计)"
           value={`${Math.round((summary?.protection_missing_seconds ?? 0) / 60)} 分钟`}
         />
         <Metric label="第1次重入" value={summary?.reentry_first ?? 0} />
@@ -482,10 +487,23 @@ export function CopyGuardPage() {
                   {localized(accountingLabels, c.accounting_status)}
                 </td>
                 <td
-                  className={`p-3 ${c.protection_status === 'VERIFIED' ? 'text-[#0ECB81]' : c.protection_status === 'UNKNOWN' || c.protection_status === 'DEGRADED' ? 'text-[#F6465D]' : 'text-[#F0B90B]'}`}
+                  className={`p-3 ${
+                    c.closed_at
+                      ? 'text-[#848E9C]'
+                      : c.protection_status === 'VERIFIED'
+                        ? 'text-[#0ECB81]'
+                        : c.protection_status === 'UNKNOWN' ||
+                            c.protection_status === 'DEGRADED'
+                          ? 'text-[#F6465D]'
+                          : 'text-[#F0B90B]'
+                  }`}
                 >
-                  {localized(protectionLabels, c.protection_status)} ·{' '}
-                  {(c.protection_coverage * 100).toFixed(0)}%
+                  {c.closed_at &&
+                  (c.protection_status === 'UNKNOWN' ||
+                    c.protection_status === 'DEGRADED' ||
+                    c.protection_status === 'PENDING')
+                    ? '已结束'
+                    : `${localized(protectionLabels, c.protection_status)} · ${(c.protection_coverage * 100).toFixed(0)}%`}
                 </td>
                 <td className="p-3">
                   {c.stop_count}/{c.reentry_count}
