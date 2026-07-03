@@ -19,9 +19,12 @@ import (
 	"time"
 )
 
+// okxBaseURL is a variable (not const) so tests can point the trader at a
+// local httptest server; production code never mutates it.
+var okxBaseURL = "https://www.okx.com"
+
 // OKX API endpoints
 const (
-	okxBaseURL           = "https://www.okx.com"
 	okxAccountPath       = "/api/v5/account/balance"
 	okxPositionPath      = "/api/v5/account/positions"
 	okxOrderPath         = "/api/v5/trade/order"
@@ -82,7 +85,8 @@ func (t *OKXTrader) PlaceProtectiveStop(req ProtectiveStopRequest) (*ProtectiveS
 		return nil, err
 	}
 	if len(out) == 0 || out[0].AlgoID == "" || out[0].SCode != "0" {
-		return nil, fmt.Errorf("OKX protective stop rejected: %v", out)
+		reqJSON, _ := json.Marshal(body)
+		return nil, fmt.Errorf("OKX protective stop rejected: %v (request=%s)", out, reqJSON)
 	}
 	return &ProtectiveStopOrder{AlgoID: out[0].AlgoID, ClientID: out[0].AlgoClOrdID, Symbol: req.Symbol, PositionSide: posSide, MarginMode: mode, Quantity: req.Quantity, TriggerPrice: req.TriggerPrice, TriggerType: req.TriggerType, State: "live"}, nil
 }
@@ -97,16 +101,37 @@ func (t *OKXTrader) AmendProtectiveStop(algoID string, req ProtectiveStopRequest
 	if err != nil {
 		return err
 	}
-	return validateOKXAlgoAck(data, "amend")
+	if ackErr := validateOKXAlgoAck(data, "amend"); ackErr != nil {
+		reqJSON, _ := json.Marshal(body)
+		return fmt.Errorf("%w (request=%s)", ackErr, reqJSON)
+	}
+	return nil
 }
 
 func (t *OKXTrader) GetProtectiveStop(algoID, symbol string) (*ProtectiveStopOrder, error) {
 	paths := []string{fmt.Sprintf("%s?algoId=%s&instType=SWAP", okxAlgoPendingPath, algoID), fmt.Sprintf("%s?algoId=%s&ordType=conditional&instType=SWAP", okxAlgoHistoryPath, algoID)}
+	return t.getProtectiveStopFromPaths(paths, symbol, fmt.Sprintf("protective stop %s not found", algoID))
+}
+
+func (t *OKXTrader) GetProtectiveStopByClientID(clientID, symbol string) (*ProtectiveStopOrder, error) {
+	paths := []string{fmt.Sprintf("%s?algoClOrdId=%s&instType=SWAP", okxAlgoPendingPath, clientID), fmt.Sprintf("%s?algoClOrdId=%s&ordType=conditional&instType=SWAP", okxAlgoHistoryPath, clientID)}
+	return t.getProtectiveStopFromPaths(paths, symbol, fmt.Sprintf("protective stop client id %s not found", clientID))
+}
+
+// getProtectiveStopFromPaths queries the given endpoints in order.
+// Error contract: if every request failed we return the query error (caller
+// must NOT treat the order as gone); only when at least one request succeeded
+// and no record was found do we return ErrProtectiveStopNotFound.
+func (t *OKXTrader) getProtectiveStopFromPaths(paths []string, symbol string, notFound string) (*ProtectiveStopOrder, error) {
+	var lastQueryErr error
+	querySucceeded := false
 	for _, path := range paths {
 		data, err := t.doRequest("GET", path, nil)
 		if err != nil {
+			lastQueryErr = err
 			continue
 		}
+		querySucceeded = true
 		var rows []struct {
 			AlgoID          string `json:"algoId"`
 			AlgoClOrdID     string `json:"algoClOrdId"`
@@ -128,7 +153,10 @@ func (t *OKXTrader) GetProtectiveStop(algoID, symbol string) (*ProtectiveStopOrd
 			return &ProtectiveStopOrder{AlgoID: rows[0].AlgoID, ClientID: rows[0].AlgoClOrdID, Symbol: symbol, PositionSide: rows[0].PosSide, MarginMode: rows[0].TdMode, Quantity: q, TriggerPrice: px, TriggerType: rows[0].SlTriggerPxType, State: rows[0].State, ActualOrderID: rows[0].OrdID}, nil
 		}
 	}
-	return nil, fmt.Errorf("protective stop %s not found", algoID)
+	if !querySucceeded {
+		return nil, fmt.Errorf("protective stop query failed: %w", lastQueryErr)
+	}
+	return nil, fmt.Errorf("%s: %w", notFound, ErrProtectiveStopNotFound)
 }
 
 func (t *OKXTrader) CancelProtectiveStop(algoID, symbol string) error {
@@ -157,6 +185,29 @@ func validateOKXAlgoAck(data []byte, action string) error {
 		}
 	}
 	return nil
+}
+
+// IsOKXAlgoAlreadyExists reports OKX error 51068: an algo order with the same
+// algoClOrdId already exists. Copy Guard must adopt that order instead of
+// treating the placement as failed.
+func IsOKXAlgoAlreadyExists(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "51068") && strings.Contains(strings.ToLower(msg), "already exists")
+}
+
+// IsOKXAlgoTerminalCancelError reports OKX error 51400: cancellation failed
+// because the algo order has already been filled, canceled or purged. When the
+// position is flat this is a normal terminal state, not a protection failure.
+func IsOKXAlgoTerminalCancelError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "51400") &&
+		(strings.Contains(msg, "filled") || strings.Contains(msg, "canceled") || strings.Contains(msg, "does not exist"))
 }
 
 // OKXTrader OKX futures trader
@@ -1559,9 +1610,33 @@ func (t *OKXTrader) GetClosedPnL(startTime time.Time, limit int) ([]ClosedPnLRec
 	// Build query path with parameters
 	path := fmt.Sprintf("/api/v5/account/positions-history?instType=SWAP&limit=%d", limit)
 	if !startTime.IsZero() {
-		path += fmt.Sprintf("&after=%d", startTime.UnixMilli())
+		// OKX positions-history uses "before" for records newer than the
+		// supplied uTime and "after" for older records. Copy Guard needs
+		// freshly closed positions after openedAt, so "after" would exclude
+		// exactly the records we are trying to reconcile.
+		path += fmt.Sprintf("&before=%d", startTime.UnixMilli())
 	}
+	return t.getClosedPnLFromPath(path)
+}
 
+func (t *OKXTrader) GetClosedPnLByPositionID(symbol, posID string, limit int) ([]ClosedPnLRecord, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	if strings.TrimSpace(posID) == "" {
+		return nil, fmt.Errorf("position id is required")
+	}
+	path := fmt.Sprintf("/api/v5/account/positions-history?instType=SWAP&posId=%s&limit=%d", posID, limit)
+	if strings.TrimSpace(symbol) != "" {
+		path += fmt.Sprintf("&instId=%s", t.convertSymbol(symbol))
+	}
+	return t.getClosedPnLFromPath(path)
+}
+
+func (t *OKXTrader) getClosedPnLFromPath(path string) ([]ClosedPnLRecord, error) {
 	data, err := t.doRequest("GET", path, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get positions history: %w", err)
@@ -1580,6 +1655,7 @@ func (t *OKXTrader) GetClosedPnL(startTime time.Time, limit int) ([]ClosedPnLRec
 		FundingFee    string `json:"fundingFee"` // Funding fee
 		LiqPenalty    string `json:"liqPenalty"`
 		Lever         string `json:"lever"` // Leverage
+		MgnMode       string `json:"mgnMode"`
 		CTime         string `json:"cTime"` // Position open time
 		UTime         string `json:"uTime"` // Position close time
 		Type          string `json:"type"`  // Close type: 1=close position, 2=partial close, 3=liquidation, 4=partial liquidation
@@ -1628,6 +1704,7 @@ func (t *OKXTrader) GetClosedPnL(startTime time.Time, limit int) ([]ClosedPnLRec
 		// Leverage
 		lev, _ := strconv.ParseFloat(pos.Lever, 64)
 		record.Leverage = int(lev)
+		record.MarginMode = pos.MgnMode
 
 		// Times
 		cTime, _ := strconv.ParseInt(pos.CTime, 10, 64)

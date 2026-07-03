@@ -1,6 +1,15 @@
 package trader
 
-import "time"
+import (
+	"errors"
+	"time"
+)
+
+// ErrProtectiveStopNotFound reports that the exchange confirmed the protective
+// stop does not exist (queries succeeded but returned no record). Callers must
+// distinguish this from transient query failures: only a confirmed absence may
+// invalidate local state or trigger re-creation.
+var ErrProtectiveStopNotFound = errors.New("protective stop not found")
 
 // ClosedPnLRecord represents a single closed position record from exchange
 type ClosedPnLRecord struct {
@@ -15,6 +24,7 @@ type ClosedPnLRecord struct {
 	LiquidationPenalty float64
 	GrossPnL           float64
 	Leverage           int       // Leverage used
+	MarginMode         string    // "cross" or "isolated"
 	EntryTime          time.Time // Position open time
 	ExitTime           time.Time // Position close time
 	OrderID            string    // Close order ID
@@ -64,6 +74,7 @@ type ProtectiveStopManager interface {
 	PlaceProtectiveStop(req ProtectiveStopRequest) (*ProtectiveStopOrder, error)
 	AmendProtectiveStop(algoID string, req ProtectiveStopRequest) error
 	GetProtectiveStop(algoID, symbol string) (*ProtectiveStopOrder, error)
+	GetProtectiveStopByClientID(clientID, symbol string) (*ProtectiveStopOrder, error)
 	CancelProtectiveStop(algoID, symbol string) error
 }
 
@@ -85,6 +96,13 @@ type CopyTradeIdempotentOrderExecutor interface {
 
 type ClientOrderStatusProvider interface {
 	GetOrderStatusByClientID(symbol, clientOrderID string) (map[string]interface{}, error)
+}
+
+// ClosedPnLByPositionProvider is OKX-only: it queries closed-position history
+// by the exchange position id so Copy Guard reconciliation can match exactly
+// one lifecycle instead of scanning a time window.
+type ClosedPnLByPositionProvider interface {
+	GetClosedPnLByPositionID(symbol, posID string, limit int) ([]ClosedPnLRecord, error)
 }
 
 // FreshPositionProvider bypasses exchange position caches after a mutation.

@@ -3,6 +3,7 @@ package copytrade
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"strings"
@@ -43,11 +44,18 @@ type ProtectiveStopManagerV4 interface {
 	PlaceProtectiveStop(req trader.ProtectiveStopRequest) (*trader.ProtectiveStopOrder, error)
 	AmendProtectiveStop(algoID string, req trader.ProtectiveStopRequest) error
 	GetProtectiveStop(algoID, symbol string) (*trader.ProtectiveStopOrder, error)
+	GetProtectiveStopByClientID(clientID, symbol string) (*trader.ProtectiveStopOrder, error)
 	CancelProtectiveStop(algoID, symbol string) error
 }
 
 type ClosedPnLProvider interface {
 	GetClosedPnL(start time.Time, limit int) ([]trader.ClosedPnLRecord, error)
+}
+
+// ClosedPnLByPositionProvider is optional (OKX only): callers must fall back
+// to the time-window GetClosedPnL scan when the executor lacks it.
+type ClosedPnLByPositionProvider interface {
+	GetClosedPnLByPositionID(symbol, posID string, limit int) ([]trader.ClosedPnLRecord, error)
 }
 type OrderStatusProvider interface {
 	GetOrderStatus(symbol, orderID string) (map[string]interface{}, error)
@@ -60,13 +68,14 @@ type FreshPositionsProvider interface {
 }
 
 var (
-	_ DecisionExecutor          = (*trader.AutoTrader)(nil)
-	_ StopLossManager           = (*trader.AutoTrader)(nil)
-	_ ProtectiveStopManagerV4   = (*trader.AutoTrader)(nil)
-	_ ClosedPnLProvider         = (*trader.AutoTrader)(nil)
-	_ OrderStatusProvider       = (*trader.AutoTrader)(nil)
-	_ ClientOrderStatusProvider = (*trader.AutoTrader)(nil)
-	_ FreshPositionsProvider    = (*trader.AutoTrader)(nil)
+	_ DecisionExecutor            = (*trader.AutoTrader)(nil)
+	_ StopLossManager             = (*trader.AutoTrader)(nil)
+	_ ProtectiveStopManagerV4     = (*trader.AutoTrader)(nil)
+	_ ClosedPnLProvider           = (*trader.AutoTrader)(nil)
+	_ ClosedPnLByPositionProvider = (*trader.AutoTrader)(nil)
+	_ OrderStatusProvider         = (*trader.AutoTrader)(nil)
+	_ ClientOrderStatusProvider   = (*trader.AutoTrader)(nil)
+	_ FreshPositionsProvider      = (*trader.AutoTrader)(nil)
 )
 
 // mappingFailureCircuitThreshold 跟单 active mapping 的连续失败熔断阈值。
@@ -88,7 +97,11 @@ type TraderIntegration struct {
 	cancel               context.CancelFunc
 	running              bool
 	lastAttemptReconcile map[int64]time.Time
-	cycleNumber          int // 跟单周期计数器
+	// protectiveQueryFailures counts consecutive protective-stop lookup
+	// failures per cycle so a single API hiccup does not flag the cycle.
+	// Only touched from the monitorV4ProtectiveStops goroutine.
+	protectiveQueryFailures map[int64]int
+	cycleNumber             int // 跟单周期计数器
 }
 
 // NewTraderIntegration 创建交易集成
@@ -99,12 +112,13 @@ func NewTraderIntegration(
 ) *TraderIntegration {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &TraderIntegration{
-		traderID:             traderID,
-		executor:             executor,
-		store:                st,
-		ctx:                  ctx,
-		cancel:               cancel,
-		lastAttemptReconcile: make(map[int64]time.Time),
+		traderID:                traderID,
+		executor:                executor,
+		store:                   st,
+		ctx:                     ctx,
+		cancel:                  cancel,
+		lastAttemptReconcile:    make(map[int64]time.Time),
+		protectiveQueryFailures: make(map[int64]int),
 	}
 }
 
@@ -306,26 +320,48 @@ func (ti *TraderIntegration) reconcilePendingV4Accounting() {
 	}
 }
 
+// accountingDelayedAfter: a closed cycle still unreconciled after this long is
+// flagged DELAYED (OKX data late; automatic retry continues).
+// accountingUnrecoverableAfter: after this long the cycle is parked as
+// UNRECOVERABLE and leaves the automatic retry queue.
+const (
+	accountingDelayedAfter       = 10 * time.Minute
+	accountingUnrecoverableAfter = 24 * time.Hour
+)
+
 func (ti *TraderIntegration) reconcileV4CycleAccounting(cycle *store.CopyGuardCycle) {
 	if cycle == nil || cycle.AccountingStatus == store.CopyGuardAccountingReconciled {
 		return
 	}
-	needsReview := cycle.ClosedAt != nil && time.Since(*cycle.ClosedAt) >= 10*time.Minute
-	markReview := func(message string) {
-		if !needsReview {
+	markFailure := func(message string) {
+		if cycle.ClosedAt == nil {
+			return
+		}
+		if time.Since(*cycle.ClosedAt) >= accountingUnrecoverableAfter {
+			if err := ti.store.CopyTrade().MarkCopyGuardAccountingUnrecoverable(cycle.ID, message); err != nil {
+				logger.Errorf("❌ [%s] failed to mark accounting unrecoverable cycle=%d: %v", ti.traderID, cycle.ID, err)
+				return
+			}
+			_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "ACCOUNTING_UNRECOVERABLE", Metadata: map[string]interface{}{"error": message}})
+			ti.notifyProtection(cycle, "Copy Guard 对账数据不可自动恢复", fmt.Sprintf("平仓后超过24小时仍无法从OKX确认最终盈亏，自动对账已停止。\n请查看日志并核对该周期。\n错误: %s", message), "accounting_unrecoverable")
+			return
+		}
+		if time.Since(*cycle.ClosedAt) < accountingDelayedAfter {
 			return
 		}
 		wasPending := cycle.AccountingStatus == store.CopyGuardAccountingPending
-		if err := ti.store.CopyTrade().MarkCopyGuardAccountingNeedsReview(cycle.ID, message); err != nil {
-			logger.Errorf("❌ [%s] failed to mark accounting review cycle=%d: %v", ti.traderID, cycle.ID, err)
+		if err := ti.store.CopyTrade().MarkCopyGuardAccountingDelayed(cycle.ID, message); err != nil {
+			logger.Errorf("❌ [%s] failed to mark accounting delayed cycle=%d: %v", ti.traderID, cycle.ID, err)
 			return
 		}
 		if wasPending {
-			_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "ACCOUNTING_NEEDS_REVIEW", Metadata: map[string]interface{}{"error": message}})
-			ti.notifyProtection(cycle, "Copy Guard 对账需人工核对", fmt.Sprintf("平仓后超过10分钟仍无法确认OKX最终盈亏。\n错误: %s", message), "accounting_needs_review")
+			// Delayed is an automatic-retry state: record the event but do not
+			// email the user (the old "needs manual review" mail was noise).
+			_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "ACCOUNTING_DELAYED", Metadata: map[string]interface{}{"error": message}})
 		}
 	}
 	followerPosID, exitOrderID := cycle.FollowerPosID, cycle.ExitOrderID
+	attemptQty := 0.0
 	if attempts, err := ti.store.CopyTrade().ListCopyGuardAttempts(cycle.ID); err == nil {
 		for _, attempt := range attempts {
 			if attempt.AttemptNo == cycle.ReentryCount {
@@ -335,70 +371,121 @@ func (ti *TraderIntegration) reconcileV4CycleAccounting(cycle *store.CopyGuardCy
 				if attempt.ExitOrderID != "" {
 					exitOrderID = attempt.ExitOrderID
 				}
+				attemptQty = attempt.Quantity
 				break
 			}
 		}
 	}
-	if exitOrderID == "" {
-		markReview("missing follower exit order id")
+	if followerPosID == "" && exitOrderID == "" {
+		markFailure("missing both follower position id and exit order id")
 		return
 	}
-	if followerPosID == "" {
-		markReview("missing follower position id")
-		return
-	}
-	orderProvider, ok := ti.executor.(OrderStatusProvider)
-	if !ok {
-		markReview("executor does not support order status")
-		return
-	}
-	order, err := orderProvider.GetOrderStatus(cycle.Symbol, exitOrderID)
-	if err != nil {
-		markReview(err.Error())
-		return
-	}
-	if !strings.EqualFold(getStringField(order, "status"), "FILLED") {
-		markReview(fmt.Sprintf("exit order state is %s", getStringField(order, "status")))
-		return
-	}
-	exitPrice := getFloatField(order, "avgPrice")
-	provider, ok := ti.executor.(ClosedPnLProvider)
-	if !ok {
-		markReview("executor does not support closed PnL")
-		return
-	}
-	records, err := provider.GetClosedPnL(cycle.OpenedAt.Add(-time.Minute), 100)
-	if err != nil {
-		markReview(err.Error())
-		return
-	}
-	var matched *trader.ClosedPnLRecord
-	for i := range records {
-		record := &records[i]
-		if record.ExchangeID != followerPosID || record.Symbol != cycle.Symbol || !strings.EqualFold(record.Side, cycle.Side) || record.ExitTime.Before(cycle.OpenedAt) {
-			continue
+	exitPrice := 0.0
+	if exitOrderID != "" {
+		orderProvider, ok := ti.executor.(OrderStatusProvider)
+		if !ok {
+			markFailure("executor does not support order status")
+			return
 		}
-		if matched == nil || record.ExitTime.After(matched.ExitTime) {
-			matched = record
+		order, err := orderProvider.GetOrderStatus(cycle.Symbol, exitOrderID)
+		if err != nil {
+			markFailure(err.Error())
+			return
 		}
+		if !strings.EqualFold(getStringField(order, "status"), "FILLED") {
+			markFailure(fmt.Sprintf("exit order state is %s", getStringField(order, "status")))
+			return
+		}
+		exitPrice = getFloatField(order, "avgPrice")
+	}
+	matched, err := ti.lookupClosedPnLRecord(cycle.Symbol, cycle.Side, cycle.MarginMode, followerPosID, cycle.OpenedAt.Add(-time.Minute), nil, attemptQty)
+	if err != nil {
+		markFailure(err.Error())
+		return
 	}
 	if matched == nil {
-		markReview("matching OKX position history is not available yet")
+		markFailure("matching OKX position history is not available yet")
 		return
 	}
 	if matched.ExitPrice > 0 {
 		exitPrice = matched.ExitPrice
 	}
 	if err := ti.store.CopyTrade().CompleteCopyGuardAccounting(cycle.ID, cycle.ReentryCount, exitPrice, matched.RealizedPnL, matched.Fee, matched.FundingFee, matched.LiquidationPenalty); err != nil {
-		markReview(err.Error())
+		markFailure(err.Error())
 		return
 	}
-	_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "ACCOUNTING_RECONCILED", Price: exitPrice, Quantity: matched.Quantity, PnL: matched.RealizedPnL, Fee: matched.Fee, Metadata: map[string]interface{}{"follower_pos_id": followerPosID, "exit_order_id": exitOrderID, "funding_fee": matched.FundingFee, "liquidation_penalty": matched.LiquidationPenalty}})
+	_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "ACCOUNTING_RECONCILED", Price: exitPrice, Quantity: matched.Quantity, PnL: matched.RealizedPnL, Fee: matched.Fee, Metadata: map[string]interface{}{"follower_pos_id": followerPosID, "exit_order_id": exitOrderID, "funding_fee": matched.FundingFee, "liquidation_penalty": matched.LiquidationPenalty, "match_source": matchSource(followerPosID)}})
+}
+
+func matchSource(posID string) string {
+	if posID != "" {
+		return "pos_id"
+	}
+	return "fallback_window"
+}
+
+// lookupClosedPnLRecord finds the follower's own closed-position record.
+// Priority: precise posId query (OKX only) → time-window scan. Without a
+// posId the fallback additionally requires margin mode and an approximate
+// quantity so a concurrent same-symbol position cannot be mis-attributed.
+// refTime selects the record closest to it (within 15 minutes); when nil the
+// latest record wins.
+func (ti *TraderIntegration) lookupClosedPnLRecord(symbol, side, marginMode, posID string, notBefore time.Time, refTime *time.Time, quantityHint float64) (*trader.ClosedPnLRecord, error) {
+	var records []trader.ClosedPnLRecord
+	var err error
+	if posID != "" {
+		if p, ok := ti.executor.(ClosedPnLByPositionProvider); ok {
+			records, err = p.GetClosedPnLByPositionID(symbol, posID, 20)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	if records == nil {
+		provider, ok := ti.executor.(ClosedPnLProvider)
+		if !ok {
+			return nil, fmt.Errorf("executor does not support closed PnL")
+		}
+		records, err = provider.GetClosedPnL(notBefore, 100)
+		if err != nil {
+			return nil, err
+		}
+	}
+	var best *trader.ClosedPnLRecord
+	bestDistance := 15 * time.Minute
+	for i := range records {
+		r := &records[i]
+		if r.Symbol != symbol || !strings.EqualFold(r.Side, side) || r.ExitTime.Before(notBefore) {
+			continue
+		}
+		if posID != "" && r.ExchangeID != "" && r.ExchangeID != posID {
+			continue
+		}
+		if posID == "" {
+			if marginMode != "" && r.MarginMode != "" && r.MarginMode != marginMode {
+				continue
+			}
+			if quantityHint > 0 && r.Quantity > 0 && (r.Quantity < quantityHint*0.8 || r.Quantity > quantityHint*1.2) {
+				continue
+			}
+		}
+		if refTime != nil {
+			distance := r.ExitTime.Sub(*refTime)
+			if distance < 0 {
+				distance = -distance
+			}
+			if distance <= bestDistance {
+				bestDistance, best = distance, r
+			}
+		} else if best == nil || r.ExitTime.After(best.ExitTime) {
+			best = r
+		}
+	}
+	return best, nil
 }
 
 func (ti *TraderIntegration) reconcileStoppedV4Attempts() {
-	provider, ok := ti.executor.(ClosedPnLProvider)
-	if !ok {
+	if _, ok := ti.executor.(ClosedPnLProvider); !ok {
 		return
 	}
 	cycles, err := ti.store.CopyTrade().ListCopyGuardCyclesWithUnreconciledStops(ti.traderID)
@@ -421,30 +508,11 @@ func (ti *TraderIntegration) reconcileStoppedV4Attempts() {
 			if followerPosID == "" {
 				followerPosID = cycle.FollowerPosID
 			}
-			if followerPosID == "" {
-				continue
-			}
 			ti.lastAttemptReconcile[attempt.ID] = time.Now()
-			records, historyErr := provider.GetClosedPnL(attempt.OpenedAt.Add(-time.Minute), 100)
-			if historyErr != nil {
-				continue
-			}
-			var best *trader.ClosedPnLRecord
-			bestDistance := 15 * time.Minute
-			for i := range records {
-				record := &records[i]
-				if record.ExchangeID != followerPosID || record.Symbol != cycle.Symbol || !strings.EqualFold(record.Side, cycle.Side) || record.ExitTime.Before(attempt.OpenedAt) {
-					continue
-				}
-				distance := record.ExitTime.Sub(*attempt.ClosedAt)
-				if distance < 0 {
-					distance = -distance
-				}
-				if distance <= bestDistance {
-					bestDistance, best = distance, record
-				}
-			}
-			if best == nil {
+			// posId 缺失时按 symbol+side+marginMode+数量容差+时间窗兜底匹配，
+			// 不再直接放弃（旧逻辑导致重入 attempt 永远无法对账）。
+			best, historyErr := ti.lookupClosedPnLRecord(cycle.Symbol, cycle.Side, cycle.MarginMode, followerPosID, attempt.OpenedAt.Add(-time.Minute), attempt.ClosedAt, attempt.Quantity)
+			if historyErr != nil || best == nil {
 				continue
 			}
 			if reconcileErr := ti.store.CopyTrade().ReconcileCopyGuardAttempt(cycle.ID, attempt.AttemptNo, best.RealizedPnL, best.Fee, best.FundingFee, best.LiquidationPenalty); reconcileErr == nil {
@@ -467,10 +535,25 @@ func (ti *TraderIntegration) pollV4ProtectiveStops() {
 		return
 	}
 	for _, stored := range orders {
-		live, err := mgr.GetProtectiveStop(stored.AlgoID, stored.Symbol)
+		live, err := ti.resolveProtectiveOrder(mgr, stored.AlgoID, stored.AlgoClientID, stored.Symbol)
 		if err != nil {
-			if cycle, cycleErr := ti.store.CopyTrade().GetCopyGuardCycle(stored.CycleID); cycleErr == nil && cycle.ProtectionStatus != store.CopyGuardProtectionUnknown {
-				ti.markProtectionIssue(cycle, store.CopyGuardProtectionUnknown, "PROTECTION_VERIFY_UNKNOWN", err, cycle.ProtectionCoverage, false)
+			// Transient query failure: state unknown. Tolerate a few rounds
+			// before alarming so one API hiccup does not flag the cycle.
+			ti.protectiveQueryFailures[stored.CycleID]++
+			if ti.protectiveQueryFailures[stored.CycleID] >= protectiveQueryFailureThreshold {
+				if cycle, cycleErr := ti.store.CopyTrade().GetCopyGuardCycle(stored.CycleID); cycleErr == nil && cycle.ClosedAt == nil && cycle.ProtectionStatus != store.CopyGuardProtectionUnknown {
+					ti.markProtectionIssue(cycle, store.CopyGuardProtectionUnknown, "PROTECTION_VERIFY_UNKNOWN", err, cycle.ProtectionCoverage, false)
+				}
+			}
+			continue
+		}
+		delete(ti.protectiveQueryFailures, stored.CycleID)
+		if live == nil {
+			// OKX confirmed the tracked order no longer exists: mark it invalid
+			// so retryDegradedV4Protections rebuilds it (poll drops the row).
+			_ = ti.store.CopyTrade().UpdateCopyGuardProtectiveOrderStatus(stored.CycleID, "invalid")
+			if cycle, cycleErr := ti.store.CopyTrade().GetCopyGuardCycle(stored.CycleID); cycleErr == nil && cycle.ClosedAt == nil {
+				ti.markProtectionIssue(cycle, store.CopyGuardProtectionDegraded, "PROTECTION_DEGRADED", fmt.Errorf("protective stop %s no longer exists on OKX", stored.AlgoID), 0, false)
 			}
 			continue
 		}
@@ -565,6 +648,15 @@ func protectionRetryDelay(retries int) time.Duration {
 	return time.Minute
 }
 
+// protectiveQueryFailureThreshold: consecutive protective-stop lookup failures
+// (3s poll → ~9s) tolerated before the cycle is flagged UNKNOWN.
+const protectiveQueryFailureThreshold = 3
+
+// protectionMissingEscalationAfter: when a position has lacked full protection
+// for this long, send one escalated alert per cycle (automatic retries keep
+// running; this is the safety valve replacing silent indefinite retrying).
+const protectionMissingEscalationAfter = 10 * time.Minute
+
 func (ti *TraderIntegration) retryDegradedV4Protections() {
 	if ti.engine == nil || ti.engine.config == nil || !ti.engine.config.RiskStopLossEnabled {
 		return
@@ -579,6 +671,9 @@ func (ti *TraderIntegration) retryDegradedV4Protections() {
 		}
 		if cycle.ProtectionStatus != store.CopyGuardProtectionPending && cycle.ProtectionStatus != store.CopyGuardProtectionUnknown && cycle.ProtectionStatus != store.CopyGuardProtectionDegraded {
 			continue
+		}
+		if cycle.ProtectionMissingAt != nil && time.Since(*cycle.ProtectionMissingAt) >= protectionMissingEscalationAfter {
+			ti.notifyProtection(cycle, "Copy Guard 保护缺失超时", fmt.Sprintf("该仓位已连续 %.0f 分钟没有完整有效的止损保护，系统仍在自动重试。\n建议人工检查 OKX，必要时手动挂止损或平仓。\n当前状态: %s\n最近错误: %s", time.Since(*cycle.ProtectionMissingAt).Minutes(), cycle.ProtectionStatus, cycle.ProtectionError), "missing_escalation")
 		}
 		if cycle.ProtectionLastRetryAt != nil && time.Since(*cycle.ProtectionLastRetryAt) < protectionRetryDelay(cycle.ProtectionRetries) {
 			continue
@@ -1349,9 +1444,7 @@ func (ti *TraderIntegration) updatePositionMapping(dec *decision.Decision) {
 				if oldCycle, cycleErr := copyTradeStore.GetOpenCopyGuardCycle(ti.traderID, dec.LeaderPosID); cycleErr == nil {
 					if mgr, ok := ti.executor.(ProtectiveStopManagerV4); ok {
 						if order, orderErr := copyTradeStore.GetCopyGuardProtectiveOrder(oldCycle.ID); orderErr == nil {
-							if cancelErr := mgr.CancelProtectiveStop(order.AlgoID, order.Symbol); cancelErr == nil {
-								_ = copyTradeStore.UpdateCopyGuardProtectiveOrderStatus(oldCycle.ID, "canceled")
-							} else {
+							if cancelErr := ti.cancelProtectiveOrderForCycle(mgr, oldCycle, order); cancelErr != nil {
 								ti.markProtectionIssue(oldCycle, store.CopyGuardProtectionUnknown, "PROTECTION_VERIFY_UNKNOWN", cancelErr, oldCycle.ProtectionCoverage, false)
 							}
 						}
@@ -1457,8 +1550,7 @@ func (ti *TraderIntegration) finalizeCopyGuardCycle(dec *decision.Decision) {
 	}
 	if mgr, ok := ti.executor.(ProtectiveStopManagerV4); ok {
 		if order, e := ti.store.CopyTrade().GetCopyGuardProtectiveOrder(cycle.ID); e == nil {
-			if cancelErr := mgr.CancelProtectiveStop(order.AlgoID, order.Symbol); cancelErr == nil {
-				_ = ti.store.CopyTrade().UpdateCopyGuardProtectiveOrderStatus(cycle.ID, "canceled")
+			if cancelErr := ti.cancelProtectiveOrderForCycle(mgr, cycle, order); cancelErr == nil {
 				_ = ti.store.CopyTrade().UpdateCopyGuardProtectionHealth(cycle.ID, store.CopyGuardProtectionCanceled, 0, "", cycle.FollowerPosID, cycle.EntryOrderID, false)
 			} else {
 				ti.markProtectionIssue(cycle, store.CopyGuardProtectionUnknown, "PROTECTION_VERIFY_UNKNOWN", cancelErr, cycle.ProtectionCoverage, false)
@@ -1933,6 +2025,12 @@ func (ti *TraderIntegration) refreshStopLossAfterExecute(dec *decision.Decision)
 		return
 	}
 	if ti.engine.config.RiskPolicyVersion >= 4 {
+		if slResult.LiquidationPriceIgnored {
+			logger.Warnf("⚠️ [%s] 强平价方向异常已忽略 | %s %s entry=%.4f liq=%.4f（继续按 ATR 挂保护单）", ti.traderID, dec.Symbol, expectedSide, entryPrice, liquidationPrice)
+			if cycle, cycleErr := ti.store.CopyTrade().GetOpenCopyGuardCycle(ti.traderID, dec.LeaderPosID); cycleErr == nil {
+				_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "LIQ_PRICE_IGNORED", Price: entryPrice, Metadata: map[string]interface{}{"liquidation_price": liquidationPrice, "side": expectedSide, "reason": "direction implausible"}})
+			}
+		}
 		ti.upsertV4Protection(dec, expectedSide, quantity, entryPrice, slResult)
 		return
 	}
@@ -2023,21 +2121,66 @@ func (ti *TraderIntegration) upsertV4Protection(dec *decision.Decision, side str
 	req := trader.ProtectiveStopRequest{Symbol: dec.Symbol, PositionSide: side, MarginMode: dec.MarginMode, Quantity: quantity, TriggerPrice: result.SLPrice, TriggerType: ti.engine.config.RiskTriggerPriceType, ClientID: fmt.Sprintf("cg%da%d", cycle.ID, cycle.ReentryCount)}
 	stored, storedErr := ti.store.CopyTrade().GetCopyGuardProtectiveOrder(cycle.ID)
 	var live *trader.ProtectiveStopOrder
+
+	// Resolve the actual exchange-side state before acting so we never amend a
+	// triggered order, re-place a live one (51068), or invalidate tracking on a
+	// transient query failure (root cause of the cycle-10 dead loop).
+	amendAlgoID, amendClientID := "", ""
 	if storedErr == nil && stored.AlgoID != "" && stored.Status == "live" {
-		err = mgr.AmendProtectiveStop(stored.AlgoID, req)
+		actual, resolveErr := ti.resolveProtectiveOrder(mgr, stored.AlgoID, stored.AlgoClientID, dec.Symbol)
+		switch {
+		case resolveErr != nil:
+			// State unknown: keep the tracked order untouched and retry later.
+			ti.markProtectionIssue(cycle, store.CopyGuardProtectionUnknown, "PROTECTION_VERIFY_UNKNOWN", resolveErr, protectionCoverage(stored.Quantity, quantity), incrementRetry)
+			return
+		case actual == nil:
+			// OKX confirmed the order no longer exists: safe to rebuild.
+			_ = ti.store.CopyTrade().UpdateCopyGuardProtectiveOrderStatus(cycle.ID, "invalid")
+		case isProtectiveStopFired(actual.State):
+			// The stop already fired between polls; let pollV4ProtectiveStops
+			// record the stop instead of failing an amend here.
+			logger.Infof("🛑 [%s] Copy Guard 保护单已触发(state=%s)，跳过重挂 | cycle=%d algoId=%s", ti.traderID, actual.State, cycle.ID, actual.AlgoID)
+			return
+		case strings.EqualFold(actual.State, "live"):
+			amendAlgoID, amendClientID = actual.AlgoID, actual.ClientID
+		default:
+			// canceled / order_failed and similar terminal states: rebuild.
+			_ = ti.store.CopyTrade().UpdateCopyGuardProtectiveOrderStatus(cycle.ID, strings.ToLower(actual.State))
+		}
+	}
+
+	if amendAlgoID != "" {
+		err = mgr.AmendProtectiveStop(amendAlgoID, req)
 		if err == nil {
-			live = &trader.ProtectiveStopOrder{AlgoID: stored.AlgoID, ClientID: stored.AlgoClientID, State: "live"}
+			live = &trader.ProtectiveStopOrder{AlgoID: amendAlgoID, ClientID: amendClientID, State: "live"}
 		}
 	} else {
 		live, err = mgr.PlaceProtectiveStop(req)
+		if err != nil && trader.IsOKXAlgoAlreadyExists(err) {
+			// 51068: an algo with the same client id already exists on OKX.
+			// Adopt it instead of looping on failed placements.
+			adopted, adoptErr := ti.adoptProtectiveOrderByClientID(mgr, cycle, req, result.TickSize)
+			switch {
+			case adoptErr != nil:
+				err = fmt.Errorf("%v; adoption by client id failed: %v", err, adoptErr)
+			case adopted == nil:
+				// The conflicting order is terminal (canceled/failed) but OKX
+				// still reserves its client id: place with a fresh unique id.
+				req.ClientID = fmt.Sprintf("cg%da%dr%d", cycle.ID, cycle.ReentryCount, time.Now().Unix()%1000000)
+				live, err = mgr.PlaceProtectiveStop(req)
+			case isProtectiveStopFired(adopted.State):
+				// The adopted order already fired; poll will record the stop.
+				logger.Infof("🛑 [%s] Copy Guard 接管的保护单已触发(state=%s) | cycle=%d algoId=%s", ti.traderID, adopted.State, cycle.ID, adopted.AlgoID)
+				return
+			default:
+				live, err = adopted, nil
+			}
+		}
 	}
 	if err != nil {
 		coverage := 0.0
 		if storedErr == nil {
 			coverage = protectionCoverage(stored.Quantity, quantity)
-			if existing, queryErr := mgr.GetProtectiveStop(stored.AlgoID, stored.Symbol); queryErr != nil || existing == nil || !strings.EqualFold(existing.State, "live") {
-				_ = ti.store.CopyTrade().UpdateCopyGuardProtectiveOrderStatus(cycle.ID, "invalid")
-			}
 		}
 		ti.markProtectionIssue(cycle, store.CopyGuardProtectionDegraded, "PROTECTION_CREATE_FAILED", err, coverage, incrementRetry)
 		return
@@ -2061,6 +2204,141 @@ func (ti *TraderIntegration) upsertV4Protection(dec *decision.Decision, side str
 	}
 	_ = ti.store.CopyTrade().UpdateCopyGuardProtectionHealth(cycle.ID, store.CopyGuardProtectionVerified, coverage, "", followerPosID, "", false)
 	_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "PROTECTIVE_STOP_ACTIVE", Price: result.SLPrice, Quantity: quantity, Metadata: map[string]interface{}{"algo_id": live.AlgoID, "expected_loss_pct": result.ExpectedLossPct, "governed_by": result.GovernedBy}})
+}
+
+// isProtectiveStopFired reports whether the OKX algo state means the stop has
+// been triggered (order sent / filled). Matches the states handled by
+// pollV4ProtectiveStops when recording a stop.
+func isProtectiveStopFired(state string) bool {
+	switch strings.ToLower(state) {
+	case "effective", "triggered", "filled":
+		return true
+	}
+	return false
+}
+
+// resolveProtectiveOrder returns the actual exchange-side protective order.
+// Contract:
+//   - (order, nil): the order exists on OKX (any state)
+//   - (nil, nil): OKX confirmed the order no longer exists
+//   - (nil, err): state unknown because the lookups failed; the caller must
+//     keep local tracking untouched and retry later
+func (ti *TraderIntegration) resolveProtectiveOrder(mgr ProtectiveStopManagerV4, algoID, clientID, symbol string) (*trader.ProtectiveStopOrder, error) {
+	confirmedAbsent := false
+	var queryErr error
+	if algoID != "" {
+		order, err := mgr.GetProtectiveStop(algoID, symbol)
+		if err == nil {
+			return order, nil
+		}
+		if errors.Is(err, trader.ErrProtectiveStopNotFound) {
+			confirmedAbsent = true
+		} else {
+			queryErr = err
+		}
+	}
+	if clientID != "" {
+		order, err := mgr.GetProtectiveStopByClientID(clientID, symbol)
+		if err == nil {
+			return order, nil
+		}
+		if errors.Is(err, trader.ErrProtectiveStopNotFound) {
+			confirmedAbsent = true
+		} else {
+			queryErr = err
+		}
+	}
+	if queryErr != nil {
+		return nil, queryErr
+	}
+	if confirmedAbsent {
+		return nil, nil
+	}
+	return nil, fmt.Errorf("protective stop identifiers are empty")
+}
+
+// adoptProtectiveOrderByClientID takes over an existing OKX algo order that
+// conflicts with our client id (error 51068). Returns:
+//   - (order, nil): adopted; when live it has been amended to the requested
+//     trigger price/quantity if they diverged
+//   - (nil, nil): the existing order is terminal (canceled/failed) and cannot
+//     be adopted; the caller should place with a fresh client id
+//   - (nil, err): lookup or amend failed; retry later
+func (ti *TraderIntegration) adoptProtectiveOrderByClientID(mgr ProtectiveStopManagerV4, cycle *store.CopyGuardCycle, req trader.ProtectiveStopRequest, tickSize float64) (*trader.ProtectiveStopOrder, error) {
+	existing, err := mgr.GetProtectiveStopByClientID(req.ClientID, req.Symbol)
+	if err != nil {
+		return nil, err
+	}
+	state := strings.ToLower(existing.State)
+	if state != "live" && !isProtectiveStopFired(existing.State) {
+		return nil, nil
+	}
+	// Take over bookkeeping first so even a follow-up amend failure leaves the
+	// tracked algoId pointing at the real order (poll can then manage it).
+	_ = ti.store.CopyTrade().UpsertCopyGuardProtectiveOrder(&store.CopyGuardProtectiveOrder{CycleID: cycle.ID, TraderID: ti.traderID, AlgoID: existing.AlgoID, AlgoClientID: existing.ClientID, Symbol: req.Symbol, Side: req.PositionSide, MarginMode: req.MarginMode, Quantity: existing.Quantity, TriggerPrice: existing.TriggerPrice, TriggerType: req.TriggerType, Status: "live"})
+	_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "PROTECTIVE_STOP_ADOPTED", Price: existing.TriggerPrice, Quantity: existing.Quantity, Metadata: map[string]interface{}{"algo_id": existing.AlgoID, "algo_client_id": existing.ClientID, "state": existing.State}})
+	if isProtectiveStopFired(existing.State) {
+		return existing, nil
+	}
+	ratio := protectionRatio(existing.Quantity, req.Quantity)
+	priceOK := math.Abs(existing.TriggerPrice-req.TriggerPrice) <= math.Max(tickSize, 1e-8)
+	if !priceOK || ratio < 0.999 || ratio > 1.001 {
+		if amendErr := mgr.AmendProtectiveStop(existing.AlgoID, req); amendErr != nil {
+			return nil, amendErr
+		}
+	}
+	return &trader.ProtectiveStopOrder{AlgoID: existing.AlgoID, ClientID: existing.ClientID, Symbol: req.Symbol, PositionSide: req.PositionSide, MarginMode: req.MarginMode, Quantity: req.Quantity, TriggerPrice: req.TriggerPrice, State: "live"}, nil
+}
+
+// isFollowerPositionFlat reports whether the follower currently has no open
+// position for the given symbol/side/marginMode. Returns false when positions
+// cannot be fetched (unknown must not be treated as flat).
+func (ti *TraderIntegration) isFollowerPositionFlat(symbol, side, marginMode string) bool {
+	positions, err := ti.getFreshPositions()
+	if err != nil {
+		return false
+	}
+	for _, pos := range positions {
+		if getStringField(pos, "symbol") != symbol {
+			continue
+		}
+		if !strings.EqualFold(getStringField(pos, "side"), side) {
+			continue
+		}
+		mode := getStringField(pos, "mgnMode", "marginMode")
+		if marginMode != "" && mode != "" && mode != marginMode {
+			continue
+		}
+		if absFloat(getFloatField(pos, "positionAmt", "quantity")) > 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// cancelProtectiveOrderForCycle cancels the tracked protective order and
+// normalizes OKX 51400 (already filled/canceled/purged) into a normal terminal
+// state when the follower position is flat, instead of raising a protection
+// issue on an already-finished lifecycle. Returns nil when the order reached a
+// terminal state either way.
+func (ti *TraderIntegration) cancelProtectiveOrderForCycle(mgr ProtectiveStopManagerV4, cycle *store.CopyGuardCycle, order *store.CopyGuardProtectiveOrder) error {
+	// Already terminal in local tracking (triggered/canceled/invalid/...):
+	// nothing to cancel; don't overwrite the recorded terminal state.
+	if order.Status != "" && order.Status != "live" {
+		return nil
+	}
+	err := mgr.CancelProtectiveStop(order.AlgoID, order.Symbol)
+	if err == nil {
+		_ = ti.store.CopyTrade().UpdateCopyGuardProtectiveOrderStatus(cycle.ID, "canceled")
+		return nil
+	}
+	if trader.IsOKXAlgoTerminalCancelError(err) && ti.isFollowerPositionFlat(cycle.Symbol, cycle.Side, cycle.MarginMode) {
+		_ = ti.store.CopyTrade().UpdateCopyGuardProtectiveOrderStatus(cycle.ID, "canceled")
+		_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "PROTECTIVE_STOP_TERMINAL", Metadata: map[string]interface{}{"algo_id": order.AlgoID, "detail": err.Error()}})
+		logger.Infof("✅ [%s] Copy Guard 保护单已是终态(51400 且仓位为空) | cycle=%d algoId=%s", ti.traderID, cycle.ID, order.AlgoID)
+		return nil
+	}
+	return err
 }
 
 func (ti *TraderIntegration) getFreshPositions() ([]map[string]interface{}, error) {
@@ -2101,7 +2379,7 @@ func (ti *TraderIntegration) markProtectionIssue(cycle *store.CopyGuardCycle, st
 	}
 	_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: eventType, Metadata: metadata})
 	logger.Errorf("❌ [%s] Copy Guard protection %s | cycle=%d posId=%s %s %s coverage=%.2f%% error=%s", ti.traderID, status, cycle.ID, cycle.LeaderPosID, cycle.Symbol, cycle.Side, coverage*100, message)
-	ti.notifyProtection(cycle, "Copy Guard 保护异常", fmt.Sprintf("当前仓位可能没有有效止损，请人工检查 OKX。\n状态: %s\n覆盖率: %.2f%%\n错误: %s", status, coverage*100, message), eventType)
+	ti.notifyProtection(cycle, "Copy Guard 保护单自动重试中", fmt.Sprintf("该仓位的止损保护单暂未确认有效，系统正在自动重试。\n如持续超过 10 分钟将发送升级告警，届时建议人工检查 OKX。\n状态: %s\n覆盖率: %.2f%%\n错误: %s", status, coverage*100, message), eventType)
 }
 
 func (ti *TraderIntegration) notifyProtection(cycle *store.CopyGuardCycle, title, body, kind string) {
@@ -2165,11 +2443,9 @@ func (ti *TraderIntegration) cancelV4Protection(dec *decision.Decision) {
 	if err != nil {
 		return
 	}
-	if err := mgr.CancelProtectiveStop(order.AlgoID, order.Symbol); err != nil {
+	if err := ti.cancelProtectiveOrderForCycle(mgr, cycle, order); err != nil {
 		logger.Warnf("⚠️ [%s] 撤销 v4 保护单失败: %v", ti.traderID, err)
-		return
 	}
-	_ = ti.store.CopyTrade().UpdateCopyGuardProtectiveOrderStatus(cycle.ID, "canceled")
 }
 
 // sendStopLossTriggerAlert 发送账户保护止损触发邮件

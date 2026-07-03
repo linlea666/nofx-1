@@ -7,6 +7,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -294,9 +295,10 @@ func parseHLDirection(side, dir, startPosition, sz string) (tradeSide string, po
 // ============================================================================
 
 const (
-	OKXTradeRecordsAPI = "https://www.okx.com/priapi/v5/ecotrade/public/community/user/trade-records"
-	OKXAssetAPI        = "https://www.okx.com/priapi/v5/ecotrade/public/community/user/asset"
-	OKXPositionAPI     = "https://www.okx.com/priapi/v5/ecotrade/public/community/user/position-current"
+	OKXTradeRecordsAPI    = "https://www.okx.com/priapi/v5/ecotrade/public/community/user/trade-records"
+	OKXAssetAPI           = "https://www.okx.com/priapi/v5/ecotrade/public/community/user/asset"
+	OKXPositionAPI        = "https://www.okx.com/priapi/v5/ecotrade/public/community/user/position-current"
+	OKXPositionHistoryAPI = "https://www.okx.com/priapi/v5/ecotrade/public/community/user/position-history"
 )
 
 // OKXProvider OKX 数据提供者
@@ -355,6 +357,80 @@ func (p *OKXProvider) GetFills(uniqueName string, since time.Time) ([]Fill, erro
 	}
 
 	return fills, nil
+}
+
+// OKXLeaderPositionHistoryRecord 领航员公共历史仓位（只读补强）。
+// 仅用于：确认领航员 posId 是否已全平、修正领航员最终平仓价/时间、
+// 校准未兜底基线。禁止用于跟随者自身盈亏（跟随者只认私有账户历史）。
+type OKXLeaderPositionHistoryRecord struct {
+	PosID       string
+	Symbol      string // 标准化为 ETHUSDT
+	Side        string // "long" | "short" | "net"
+	MarginMode  string // "cross" | "isolated"
+	Leverage    int
+	Quantity    float64 // closeAmount × ctVal（币数量）
+	EntryPrice  float64 // openAvgPx
+	ExitPrice   float64 // closeAvgPx
+	PnL         float64
+	RealizedPnL float64
+	Fee         float64
+	FundingFee  float64
+	CloseType   string
+	OpenedAt    time.Time // cTime
+	ClosedAt    time.Time // uTime
+}
+
+// LeaderPositionHistoryProvider 可选接口：提供领航员公共历史仓位（仅 OKX）。
+type LeaderPositionHistoryProvider interface {
+	GetPositionHistory(uniqueName string, limit int) ([]OKXLeaderPositionHistoryRecord, error)
+}
+
+// GetPositionHistory 获取领航员公共历史仓位。
+// 固定 sortType=1（最新 uTime 倒序）并在本地二次排序，避免接口排序语义变化。
+func (p *OKXProvider) GetPositionHistory(uniqueName string, limit int) ([]OKXLeaderPositionHistoryRecord, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 100
+	}
+	url := fmt.Sprintf("%s?uniqueName=%s&instType=SWAP&limit=%d&sortType=1&t=%d",
+		OKXPositionHistoryAPI, uniqueName, limit, time.Now().UnixMilli())
+	var resp OKXPositionHistoryResp
+	if err := p.get(url, &resp); err != nil {
+		return nil, err
+	}
+	if resp.Code != "0" {
+		return nil, fmt.Errorf("OKX API error: %s", resp.Msg)
+	}
+	return convertOKXPositionHistory(resp.Data), nil
+}
+
+// convertOKXPositionHistory 标准化公共历史仓位并按 uTime 倒序排序（本地兜底排序）。
+func convertOKXPositionHistory(rows []OKXPositionHistoryRawEntry) []OKXLeaderPositionHistoryRecord {
+	out := make([]OKXLeaderPositionHistoryRecord, 0, len(rows))
+	for _, raw := range rows {
+		qty := parseFloat(raw.CloseAmount)
+		if ctVal := parseFloat(raw.CtVal); ctVal > 0 {
+			qty *= ctVal
+		}
+		out = append(out, OKXLeaderPositionHistoryRecord{
+			PosID:       raw.PosId,
+			Symbol:      normalizeOKXSymbol(raw.InstId),
+			Side:        raw.PosSide,
+			MarginMode:  raw.MgnMode,
+			Leverage:    parseInt(raw.Lever),
+			Quantity:    qty,
+			EntryPrice:  parseFloat(raw.OpenAvgPx),
+			ExitPrice:   parseFloat(raw.CloseAvgPx),
+			PnL:         parseFloat(raw.Pnl),
+			RealizedPnL: parseFloat(raw.RealizedPnl),
+			Fee:         parseFloat(raw.Fee),
+			FundingFee:  parseFloat(raw.FundingFee),
+			CloseType:   raw.CloseType,
+			OpenedAt:    time.UnixMilli(parseInt64(raw.CTime)),
+			ClosedAt:    time.UnixMilli(parseInt64(raw.UTime)),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ClosedAt.After(out[j].ClosedAt) })
+	return out
 }
 
 // GetAccountState 获取账户状态
@@ -540,6 +616,32 @@ type OKXTradeRecord struct {
 	Side     string `json:"side"`    // "buy" | "sell"
 	Sz       string `json:"sz"`
 	Value    string `json:"value"`
+}
+
+// OKXPositionHistoryResp position-history 返回结构
+type OKXPositionHistoryResp struct {
+	Code string                       `json:"code"`
+	Msg  string                       `json:"msg"`
+	Data []OKXPositionHistoryRawEntry `json:"data"`
+}
+
+type OKXPositionHistoryRawEntry struct {
+	PosId       string `json:"posId"`
+	InstId      string `json:"instId"`
+	PosSide     string `json:"posSide"`
+	MgnMode     string `json:"mgnMode"`
+	Lever       string `json:"lever"`
+	OpenAvgPx   string `json:"openAvgPx"`
+	CloseAvgPx  string `json:"closeAvgPx"`
+	CloseAmount string `json:"closeAmount"`
+	CtVal       string `json:"ctVal"`
+	Pnl         string `json:"pnl"`
+	RealizedPnl string `json:"realizedPnl"`
+	Fee         string `json:"fee"`
+	FundingFee  string `json:"fundingFee"`
+	CloseType   string `json:"closeType"`
+	CTime       string `json:"cTime"`
+	UTime       string `json:"uTime"`
 }
 
 // OKXAssetResp asset 返回结构

@@ -35,9 +35,11 @@ const protectionLabels: Record<string, string> = {
 }
 const accountingLabels: Record<string, string> = {
   OPEN: '交易进行中',
-  PENDING: '对账中',
+  PENDING: '自动对账中',
   RECONCILED: '已对账',
-  NEEDS_REVIEW: '需人工核对',
+  DELAYED: '对账延迟·自动重试中',
+  UNRECOVERABLE: '数据不可自动恢复',
+  NEEDS_REVIEW: '对账延迟·自动重试中', // 兼容旧导出数据
   LEGACY_UNVERIFIED: '历史未验证',
 }
 const attemptLabels: Record<string, string> = {
@@ -61,7 +63,19 @@ const eventLabels: Record<string, string> = {
   ACCOUNTING_IDENTITY_CAPTURED: '已记录跟单仓位',
   ACCOUNTING_IDENTITY_CAPTURE_FAILED: '跟单仓位识别失败',
   ACCOUNTING_RECONCILED: '实际盈亏已对账',
-  ACCOUNTING_NEEDS_REVIEW: '对账需人工核对',
+  ACCOUNTING_NEEDS_REVIEW: '对账延迟（历史事件）',
+  ACCOUNTING_DELAYED: 'OKX 数据延迟，自动重试中',
+  ACCOUNTING_UNRECOVERABLE: '对账数据不可自动恢复',
+  PROTECTIVE_STOP_ADOPTED: '接管已存在的保护单',
+  PROTECTIVE_STOP_TERMINAL: '保护单已自然终结',
+  LIQ_PRICE_IGNORED: '强平价方向异常已忽略',
+  BASELINE_CALIBRATED: '基线已用领航员历史校准',
+}
+
+const baselineSourceLabels: Record<string, string> = {
+  '': '真实跟随结果',
+  last_observed: '估算·待领航员历史补全',
+  leader_history: '领航员公共历史校准',
 }
 
 const localized = (labels: Record<string, string>, value: string) =>
@@ -301,22 +315,28 @@ export function CopyGuardPage() {
         (summary?.unknown_count ?? 0) +
         (summary?.degraded_count ?? 0) >
         0 && (
-        <div className="border border-[#F6465D] bg-[#F6465D]/10 rounded-lg p-4 text-sm text-[#F6465D]">
+        <div className="border border-[#F0B90B] bg-[#F0B90B]/10 rounded-lg p-4 text-sm text-[#F0B90B]">
           当前有{' '}
           {(summary?.pending_protection_count ?? 0) +
             (summary?.unknown_count ?? 0) +
             (summary?.degraded_count ?? 0)}{' '}
-          个活跃仓位的保护单待建立、未知或降级，仓位可能没有有效止损，请人工检查
-          OKX。系统仍会继续跟随并重试。
+          个活跃仓位的保护单正在自动重试建立/验证。若持续超过 10
+          分钟系统会发送升级告警，届时建议人工检查 OKX。
         </div>
       )}
       {(summary?.accounting_pending_count ?? 0) +
-        (summary?.accounting_review_count ?? 0) >
+        (summary?.accounting_delayed_count ?? 0) >
         0 && (
         <div className="border border-[#F0B90B] bg-[#F0B90B]/10 rounded-lg p-4 text-sm text-[#F0B90B]">
-          当前有 {summary?.accounting_pending_count ?? 0} 个周期正在等待 OKX
-          最终对账，{summary?.accounting_review_count ?? 0}{' '}
-          个周期需人工核对。这些周期暂不计入保护效果。
+          当前有 {summary?.accounting_pending_count ?? 0} 个周期正在自动对账，
+          {summary?.accounting_delayed_count ?? 0}{' '}
+          个周期因 OKX 数据延迟系统继续自动重试。这些周期暂不计入保护效果，无需人工处理。
+        </div>
+      )}
+      {(summary?.accounting_unrecoverable_count ?? 0) > 0 && (
+        <div className="border border-[#F6465D] bg-[#F6465D]/10 rounded-lg p-4 text-sm text-[#F6465D]">
+          有 {summary?.accounting_unrecoverable_count ?? 0}{' '}
+          个周期的对账数据不可自动恢复，请查看日志并人工核对。
         </div>
       )}
       {(summary?.ignored_count ?? 0) > 0 && (
@@ -364,8 +384,12 @@ export function CopyGuardPage() {
         />
         <Metric label="对账中" value={summary?.accounting_pending_count ?? 0} />
         <Metric
-          label="需人工核对"
-          value={summary?.accounting_review_count ?? 0}
+          label="对账延迟"
+          value={summary?.accounting_delayed_count ?? 0}
+        />
+        <Metric
+          label="不可自动恢复"
+          value={summary?.accounting_unrecoverable_count ?? 0}
         />
         <Metric
           label="历史未验证"
@@ -556,7 +580,10 @@ export function CopyGuardPage() {
               label="保护单"
               value={detail.protection?.algo_id || '尚未确认'}
             />
-            <Metric label="重试次数" value={detail.cycle.protection_retries} />
+            <Metric
+              label="自动重试"
+              value={`${detail.cycle.protection_retries} 次 · 最后 ${dateLabel(detail.cycle.protection_last_retry_at)}`}
+            />
             <Metric
               label="生命周期状态"
               value={localized(statusLabels, detail.cycle.status)}
@@ -566,6 +593,13 @@ export function CopyGuardPage() {
               value={localized(
                 accountingLabels,
                 detail.cycle.accounting_status
+              )}
+            />
+            <Metric
+              label="基线来源"
+              value={localized(
+                baselineSourceLabels,
+                detail.cycle.baseline_source ?? ''
               )}
             />
             <Metric

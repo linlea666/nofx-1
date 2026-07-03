@@ -863,6 +863,13 @@ func (at *AutoTrader) GetProtectiveStop(algoID, symbol string) (*ProtectiveStopO
 	}
 	return mgr.GetProtectiveStop(algoID, symbol)
 }
+func (at *AutoTrader) GetProtectiveStopByClientID(clientID, symbol string) (*ProtectiveStopOrder, error) {
+	mgr, ok := at.trader.(ProtectiveStopManager)
+	if !ok {
+		return nil, fmt.Errorf("exchange does not support precise protective stops")
+	}
+	return mgr.GetProtectiveStopByClientID(clientID, symbol)
+}
 func (at *AutoTrader) GetPositionsFresh() ([]map[string]interface{}, error) {
 	if provider, ok := at.trader.(FreshPositionProvider); ok {
 		return provider.GetPositionsFresh()
@@ -879,6 +886,13 @@ func (at *AutoTrader) CancelProtectiveStop(algoID, symbol string) error {
 
 func (at *AutoTrader) GetClosedPnL(start time.Time, limit int) ([]ClosedPnLRecord, error) {
 	return at.trader.GetClosedPnL(start, limit)
+}
+func (at *AutoTrader) GetClosedPnLByPositionID(symbol, posID string, limit int) ([]ClosedPnLRecord, error) {
+	p, ok := at.trader.(ClosedPnLByPositionProvider)
+	if !ok {
+		return nil, fmt.Errorf("exchange does not support closed PnL lookup by position id")
+	}
+	return p.GetClosedPnLByPositionID(symbol, posID, limit)
 }
 func (at *AutoTrader) GetOrderStatus(symbol, orderID string) (map[string]interface{}, error) {
 	return at.trader.GetOrderStatus(symbol, orderID)

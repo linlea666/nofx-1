@@ -740,7 +740,8 @@ export interface CopyGuardSummary {
   unknown_count: number
   degraded_count: number
   accounting_pending_count: number
-  accounting_review_count: number
+  accounting_delayed_count: number
+  accounting_unrecoverable_count: number
   legacy_unverified_count: number
   average_coverage: number
   ignored_count: number
@@ -779,9 +780,11 @@ export interface CopyGuardCycle {
     | 'OPEN'
     | 'PENDING'
     | 'RECONCILED'
-    | 'NEEDS_REVIEW'
+    | 'DELAYED'
+    | 'UNRECOVERABLE'
     | 'LEGACY_UNVERIFIED'
   accounting_error: string
+  baseline_source: '' | 'last_observed' | 'leader_history'
   fees: number
   funding_fee: number
   liquidation_penalty: number
@@ -796,6 +799,7 @@ export interface CopyGuardCycle {
   protection_coverage: number
   protection_retries: number
   protection_error: string
+  protection_last_retry_at?: string
   follower_pos_id?: string
   policy_snapshot: string
   opened_at: string

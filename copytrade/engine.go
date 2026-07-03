@@ -53,6 +53,8 @@ type Engine struct {
 	leaderStateMu     sync.RWMutex
 	lastStateSync     time.Time
 	stateSyncInterval time.Duration
+	// lastBaselineRefresh 限频 refreshEstimatedBaselines（每分钟一次）
+	lastBaselineRefresh time.Time
 
 	// 决策输出
 	decisionCh chan *decision.FullDecision
@@ -1940,9 +1942,86 @@ func (e *Engine) syncLeaderState() error {
 	if e.config != nil && e.config.ProviderType == ProviderOKX {
 		e.checkStoppedByRisk()
 		e.checkReentryConditions()
+		if e.config.RiskPolicyVersion >= 4 {
+			e.refreshEstimatedBaselines()
+		}
 	}
 
 	return nil
+}
+
+// lookupLeaderHistory 从领航员公共历史仓位里找 leaderPosId 对应的平仓记录。
+// 只读补强：查询失败或未命中都返回 nil，调用方必须有降级路径。
+func (e *Engine) lookupLeaderHistory(leaderPosID, symbol, side string) *OKXLeaderPositionHistoryRecord {
+	hp, ok := e.provider.(LeaderPositionHistoryProvider)
+	if !ok || e.config == nil {
+		return nil
+	}
+	records, err := hp.GetPositionHistory(e.config.LeaderID, 100)
+	if err != nil {
+		logger.Debugf("[%s] 领航员公共历史仓位查询失败（降级为最后观测价）: %v", e.traderID, err)
+		return nil
+	}
+	return matchLeaderHistoryRecord(records, leaderPosID, symbol, side)
+}
+
+func matchLeaderHistoryRecord(records []OKXLeaderPositionHistoryRecord, leaderPosID, symbol, side string) *OKXLeaderPositionHistoryRecord {
+	for i := range records {
+		r := &records[i]
+		if r.PosID != leaderPosID {
+			continue
+		}
+		if symbol != "" && r.Symbol != "" && r.Symbol != symbol {
+			continue
+		}
+		// posSide=net（单向模式）无法直接比对方向，只按 posId+symbol 匹配
+		if side != "" && r.Side != "" && !strings.EqualFold(r.Side, "net") && !strings.EqualFold(r.Side, side) {
+			continue
+		}
+		return r
+	}
+	return nil
+}
+
+// refreshEstimatedBaselines 用领航员公共历史仓位补全"最后观测价估算"的基线。
+// 周期关闭时如果公共历史还没出记录，先按估算关闭；这里每分钟重试一次，
+// 命中后校准 baseline_pnl 并重算保护效果（最长回看 6 小时）。
+func (e *Engine) refreshEstimatedBaselines() {
+	if time.Since(e.lastBaselineRefresh) < time.Minute {
+		return
+	}
+	e.lastBaselineRefresh = time.Now()
+	hp, ok := e.provider.(LeaderPositionHistoryProvider)
+	if !ok || e.store == nil {
+		return
+	}
+	cycles, err := e.store.CopyTrade().ListCopyGuardCyclesWithEstimatedBaseline(e.traderID, 6*time.Hour)
+	if err != nil || len(cycles) == 0 {
+		return
+	}
+	records, err := hp.GetPositionHistory(e.config.LeaderID, 100)
+	if err != nil {
+		return
+	}
+	for _, cycle := range cycles {
+		rec := matchLeaderHistoryRecord(records, cycle.LeaderPosID, cycle.Symbol, cycle.Side)
+		if rec == nil || rec.ExitPrice <= 0 {
+			continue
+		}
+		baseline := cycle.BaselineRealizedPnL
+		if cycle.LeaderEntryPrice > 0 {
+			move := (rec.ExitPrice - cycle.LeaderEntryPrice) / cycle.LeaderEntryPrice
+			if cycle.Side == "short" {
+				move = -move
+			}
+			baseline += cycle.BaselineNotional * move
+		}
+		if err := e.store.CopyTrade().UpdateCopyGuardBaselineOutcome(cycle.ID, baseline, "leader_history"); err != nil {
+			continue
+		}
+		_ = e.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: e.traderID, Type: "BASELINE_CALIBRATED", Price: rec.ExitPrice, PnL: baseline, Metadata: map[string]interface{}{"leader_close_price": rec.ExitPrice, "leader_closed_at": rec.ClosedAt.UTC().Format(time.RFC3339), "close_type": rec.CloseType, "baseline_source": "leader_history"}})
+		logger.Infof("📐 [%s] Copy Guard 基线已用领航员历史校准 | cycle=%d closeAvgPx=%.6f baseline=%.4f", e.traderID, cycle.ID, rec.ExitPrice, baseline)
+	}
 }
 
 // checkIgnoredPositionsClosed 检查 ignored 仓位是否已被领航员平仓
@@ -2005,16 +2084,23 @@ func (e *Engine) checkIgnoredPositionsClosed() {
 					e.traderID, mapping.LeaderPosID, mapping.Symbol, mapping.Side)
 				if e.config.RiskPolicyVersion >= 4 {
 					if cycle, cerr := e.store.CopyTrade().GetOpenCopyGuardCycle(e.traderID, mapping.LeaderPosID); cerr == nil {
+						// 优先用领航员公共历史仓位的真实平仓价校准未兜底基线；
+						// 查不到时先用最后观测价关闭，后台 refreshEstimatedBaselines 补全。
+						closePrice, baselineSource := cycle.LastObservedPrice, "last_observed"
+						if rec := e.lookupLeaderHistory(mapping.LeaderPosID, cycle.Symbol, cycle.Side); rec != nil && rec.ExitPrice > 0 {
+							closePrice, baselineSource = rec.ExitPrice, "leader_history"
+						}
 						baseline := cycle.BaselineRealizedPnL
-						if cycle.LeaderEntryPrice > 0 && cycle.LastObservedPrice > 0 {
-							move := (cycle.LastObservedPrice - cycle.LeaderEntryPrice) / cycle.LeaderEntryPrice
+						if cycle.LeaderEntryPrice > 0 && closePrice > 0 {
+							move := (closePrice - cycle.LeaderEntryPrice) / cycle.LeaderEntryPrice
 							if cycle.Side == "short" {
 								move = -move
 							}
 							baseline += cycle.BaselineNotional * move
 						}
 						_ = e.store.CopyTrade().CloseCopyGuardCycle(cycle.ID, store.CopyGuardLeaderClosed, cycle.ActualPnL, baseline, cycle.Fees, cycle.FundingFee, cycle.LiquidationPenalty, cycle.Slippage)
-						_ = e.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: e.traderID, Type: "LEADER_CLOSED", Price: cycle.LastObservedPrice, Metadata: map[string]interface{}{"baseline_estimated": true}})
+						_ = e.store.CopyTrade().SetCopyGuardBaselineSource(cycle.ID, baselineSource)
+						_ = e.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: e.traderID, Type: "LEADER_CLOSED", Price: closePrice, Metadata: map[string]interface{}{"baseline_estimated": true, "baseline_source": baselineSource}})
 					}
 				}
 			}

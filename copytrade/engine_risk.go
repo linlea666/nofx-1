@@ -50,6 +50,9 @@ type StopLossCalcResult struct {
 	ExpectedLossUSD  float64 // 价格损失 + 配置的滑点缓冲
 	ExpectedLossPct  float64 // ExpectedLossUSD / AccountEquityUSD
 	NoiseConflict    bool    // account_hard_limit 位于 ATR 噪音区内
+	// LiquidationPriceIgnored: 交易所返回的强平价方向不合理（多单强平价高于
+	// 入场价 / 空单低于入场价），已忽略强平价校验、按 ATR 止损继续挂单
+	LiquidationPriceIgnored bool
 }
 
 func riskATRCacheMaxAge(cfg *CopyConfig) time.Duration {
@@ -205,6 +208,21 @@ func calcStopLossPrice(cfg *CopyConfig, input *StopLossCalcInput) (*StopLossCalc
 	return result, nil
 }
 
+// isLiquidationPriceDirectionValid checks the liquidation price is on the
+// plausible side of the entry price: a long liquidates below entry, a short
+// above. OKX cross-margin returns account-level liquidation prices that can
+// land on the wrong side (cycle 10: long entry 1717, "liquidation" 2630);
+// such values must be ignored instead of blocking the ATR stop.
+func isLiquidationPriceDirectionValid(side SideType, entryPrice, liquidationPrice float64) bool {
+	if liquidationPrice <= 0 || entryPrice <= 0 {
+		return false
+	}
+	if side == SideLong {
+		return liquidationPrice < entryPrice
+	}
+	return liquidationPrice > entryPrice
+}
+
 func finalizeStopLossPrice(input *StopLossCalcInput, result *StopLossCalcResult, liquidationBufferATR float64) (*StopLossCalcResult, error) {
 	if result.SLDistance/input.EntryPrice < 0.001 {
 		result.OpenImmediateHit = true
@@ -222,6 +240,12 @@ func finalizeStopLossPrice(input *StopLossCalcInput, result *StopLossCalcResult,
 		return result, nil
 	}
 	if input.LiquidationPrice > 0 && result.ATRValue > 0 {
+		if !isLiquidationPriceDirectionValid(input.Side, input.EntryPrice, input.LiquidationPrice) {
+			// Direction-implausible liquidation price: ignore it and keep the
+			// ATR stop; the caller records a diagnostic event.
+			result.LiquidationPriceIgnored = true
+			return result, nil
+		}
 		buffer := result.ATRValue * liquidationBufferATR
 		if input.Side == SideLong && result.SLPrice <= input.LiquidationPrice+buffer {
 			return nil, fmt.Errorf("stop %.8f is not safely above liquidation %.8f (buffer %.8f)", result.SLPrice, input.LiquidationPrice, buffer)

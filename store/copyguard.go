@@ -21,10 +21,16 @@ const (
 )
 
 const (
-	CopyGuardAccountingOpen             = "OPEN"
-	CopyGuardAccountingPending          = "PENDING"
-	CopyGuardAccountingReconciled       = "RECONCILED"
-	CopyGuardAccountingNeedsReview      = "NEEDS_REVIEW"
+	CopyGuardAccountingOpen       = "OPEN"
+	CopyGuardAccountingPending    = "PENDING"
+	CopyGuardAccountingReconciled = "RECONCILED"
+	// DELAYED: OKX has not returned the matching position history yet; the
+	// system keeps retrying automatically. This replaces the former
+	// NEEDS_REVIEW state whose wording wrongly demanded manual action.
+	CopyGuardAccountingDelayed = "DELAYED"
+	// UNRECOVERABLE: permanently missing identifiers or data; automatic
+	// reconciliation stopped and the user is told to inspect the logs.
+	CopyGuardAccountingUnrecoverable    = "UNRECOVERABLE"
 	CopyGuardAccountingLegacyUnverified = "LEGACY_UNVERIFIED"
 )
 
@@ -89,6 +95,10 @@ type CopyGuardCycle struct {
 	TrackingDifference       float64    `json:"tracking_difference"`
 	AccountingStatus         string     `json:"accounting_status"`
 	AccountingError          string     `json:"accounting_error"`
+	// BaselineSource: 未兜底基线的最终价格来源。
+	// "" = 非估算基线；"last_observed" = 最后观测 mark price 估算（待补全）；
+	// "leader_history" = 已用领航员公共历史仓位的 closeAvgPx 校准。
+	BaselineSource string `json:"baseline_source"`
 	ProtectionStatus         string     `json:"protection_status"`
 	ProtectionRetries        int        `json:"protection_retries"`
 	ProtectionCoverage       float64    `json:"protection_coverage"`
@@ -224,6 +234,7 @@ func (s *CopyTradeStore) initCopyGuardTables() error {
 			`ALTER TABLE copy_guard_attempts ADD COLUMN follower_pos_id TEXT DEFAULT ''`,
 			`ALTER TABLE copy_guard_attempts ADD COLUMN entry_order_id TEXT DEFAULT ''`,
 			`ALTER TABLE copy_guard_attempts ADD COLUMN exit_order_id TEXT DEFAULT ''`,
+			`ALTER TABLE copy_guard_cycles ADD COLUMN baseline_source TEXT DEFAULT ''`,
 		}
 		for _, migration := range migrations {
 			_, _ = s.db.Exec(migration)
@@ -231,6 +242,9 @@ func (s *CopyTradeStore) initCopyGuardTables() error {
 		// Existing closed cycles were produced before deterministic settlement was
 		// available. Preserve their raw values but never present them as verified.
 		_, _ = s.db.Exec(`UPDATE copy_guard_cycles SET accounting_status=?,accounting_error=CASE WHEN COALESCE(accounting_error,'')='' THEN 'created before deterministic OKX settlement; raw values preserved' ELSE accounting_error END WHERE closed_at IS NOT NULL AND COALESCE(accounting_status,'OPEN')='OPEN'`, CopyGuardAccountingLegacyUnverified)
+		// NEEDS_REVIEW was renamed to DELAYED (automatic retry continues);
+		// idempotent so it can run on every startup.
+		_, _ = s.db.Exec(`UPDATE copy_guard_cycles SET accounting_status=? WHERE accounting_status='NEEDS_REVIEW'`, CopyGuardAccountingDelayed)
 	}
 	return err
 }
@@ -358,13 +372,13 @@ func (s *CopyTradeStore) GetOpenCopyGuardCycle(traderID, leaderPosID string) (*C
 
 type rowScanner interface{ Scan(...interface{}) error }
 
-const copyGuardCycleSelect = `SELECT id,trader_id,leader_id,leader_pos_id,symbol,side,margin_mode,status,policy_snapshot,leader_entry_price,follower_entry_price,follower_notional,baseline_notional,baseline_realized_pnl,baseline_leader_size,account_equity,atr_at_entry,atr_at_stop,last_observed_price,reentry_count,stop_count,actual_pnl,baseline_pnl,fees,funding_fee,liquidation_penalty,slippage,net_guard_effect,tracking_difference,accounting_status,accounting_error,protection_status,protection_retries,protection_coverage,protection_error,protection_missing_seconds,follower_pos_id,entry_order_id,exit_order_id,protection_missing_at,protection_last_retry_at,pending_since,reconciled_at,opened_at,stopped_at,closed_at,updated_at FROM copy_guard_cycles`
+const copyGuardCycleSelect = `SELECT id,trader_id,leader_id,leader_pos_id,symbol,side,margin_mode,status,policy_snapshot,leader_entry_price,follower_entry_price,follower_notional,baseline_notional,baseline_realized_pnl,baseline_leader_size,account_equity,atr_at_entry,atr_at_stop,last_observed_price,reentry_count,stop_count,actual_pnl,baseline_pnl,fees,funding_fee,liquidation_penalty,slippage,net_guard_effect,tracking_difference,accounting_status,accounting_error,baseline_source,protection_status,protection_retries,protection_coverage,protection_error,protection_missing_seconds,follower_pos_id,entry_order_id,exit_order_id,protection_missing_at,protection_last_retry_at,pending_since,reconciled_at,opened_at,stopped_at,closed_at,updated_at FROM copy_guard_cycles`
 
 func scanCopyGuardCycle(row rowScanner) (*CopyGuardCycle, error) {
 	var c CopyGuardCycle
 	var opened, updated string
 	var stopped, closed, missing, lastRetry, pending, reconciled sql.NullString
-	err := row.Scan(&c.ID, &c.TraderID, &c.LeaderID, &c.LeaderPosID, &c.Symbol, &c.Side, &c.MarginMode, &c.Status, &c.PolicySnapshot, &c.LeaderEntryPrice, &c.FollowerEntryPrice, &c.FollowerNotional, &c.BaselineNotional, &c.BaselineRealizedPnL, &c.BaselineLeaderSize, &c.AccountEquity, &c.ATRAtEntry, &c.ATRAtStop, &c.LastObservedPrice, &c.ReentryCount, &c.StopCount, &c.ActualPnL, &c.BaselinePnL, &c.Fees, &c.FundingFee, &c.LiquidationPenalty, &c.Slippage, &c.NetGuardEffect, &c.TrackingDifference, &c.AccountingStatus, &c.AccountingError, &c.ProtectionStatus, &c.ProtectionRetries, &c.ProtectionCoverage, &c.ProtectionError, &c.ProtectionMissingSeconds, &c.FollowerPosID, &c.EntryOrderID, &c.ExitOrderID, &missing, &lastRetry, &pending, &reconciled, &opened, &stopped, &closed, &updated)
+	err := row.Scan(&c.ID, &c.TraderID, &c.LeaderID, &c.LeaderPosID, &c.Symbol, &c.Side, &c.MarginMode, &c.Status, &c.PolicySnapshot, &c.LeaderEntryPrice, &c.FollowerEntryPrice, &c.FollowerNotional, &c.BaselineNotional, &c.BaselineRealizedPnL, &c.BaselineLeaderSize, &c.AccountEquity, &c.ATRAtEntry, &c.ATRAtStop, &c.LastObservedPrice, &c.ReentryCount, &c.StopCount, &c.ActualPnL, &c.BaselinePnL, &c.Fees, &c.FundingFee, &c.LiquidationPenalty, &c.Slippage, &c.NetGuardEffect, &c.TrackingDifference, &c.AccountingStatus, &c.AccountingError, &c.BaselineSource, &c.ProtectionStatus, &c.ProtectionRetries, &c.ProtectionCoverage, &c.ProtectionError, &c.ProtectionMissingSeconds, &c.FollowerPosID, &c.EntryOrderID, &c.ExitOrderID, &missing, &lastRetry, &pending, &reconciled, &opened, &stopped, &closed, &updated)
 	if err != nil {
 		return nil, err
 	}
@@ -702,13 +716,85 @@ func (s *CopyTradeStore) BeginCopyGuardAccounting(id int64, status, exitOrderID 
 	return tx.Commit()
 }
 
-func (s *CopyTradeStore) MarkCopyGuardAccountingNeedsReview(id int64, message string) error {
-	_, err := s.db.Exec(`UPDATE copy_guard_cycles SET accounting_status=?,accounting_error=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND accounting_status IN (?,?)`, CopyGuardAccountingNeedsReview, message, id, CopyGuardAccountingPending, CopyGuardAccountingNeedsReview)
+// MarkCopyGuardAccountingDelayed flags a cycle whose OKX settlement data is
+// late; automatic reconciliation keeps retrying (DELAYED cycles stay in
+// ListCopyGuardCyclesPendingAccounting).
+func (s *CopyTradeStore) MarkCopyGuardAccountingDelayed(id int64, message string) error {
+	_, err := s.db.Exec(`UPDATE copy_guard_cycles SET accounting_status=?,accounting_error=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND accounting_status IN (?,?)`, CopyGuardAccountingDelayed, message, id, CopyGuardAccountingPending, CopyGuardAccountingDelayed)
+	return err
+}
+
+// MarkCopyGuardAccountingUnrecoverable permanently parks a cycle whose
+// settlement can no longer be reconciled automatically; it leaves the retry
+// queue and the UI shows "not automatically recoverable".
+func (s *CopyTradeStore) MarkCopyGuardAccountingUnrecoverable(id int64, message string) error {
+	_, err := s.db.Exec(`UPDATE copy_guard_cycles SET accounting_status=?,accounting_error=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND accounting_status IN (?,?)`, CopyGuardAccountingUnrecoverable, message, id, CopyGuardAccountingPending, CopyGuardAccountingDelayed)
 	return err
 }
 
 // CompleteCopyGuardAccounting applies one authoritative OKX position-history
 // record exactly once and only then exposes the cycle to aggregate metrics.
+// SetCopyGuardBaselineSource records how the (estimated) baseline price was
+// obtained; see CopyGuardCycle.BaselineSource.
+func (s *CopyTradeStore) SetCopyGuardBaselineSource(id int64, source string) error {
+	_, err := s.db.Exec(`UPDATE copy_guard_cycles SET baseline_source=?,updated_at=CURRENT_TIMESTAMP WHERE id=?`, source, id)
+	return err
+}
+
+// UpdateCopyGuardBaselineOutcome replaces the estimated baseline of a closed
+// cycle (e.g. once the leader's public position history became available) and
+// recomputes tracking difference / net guard effect when the cycle is already
+// reconciled. For PENDING/DELAYED cycles only baseline_pnl changes; the final
+// numbers are computed by CompleteCopyGuardAccounting later.
+func (s *CopyTradeStore) UpdateCopyGuardBaselineOutcome(id int64, baseline float64, source string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var actual float64
+	var stopCount int
+	var accountingStatus string
+	if err = tx.QueryRow(`SELECT actual_pnl,stop_count,accounting_status FROM copy_guard_cycles WHERE id=?`, id).Scan(&actual, &stopCount, &accountingStatus); err != nil {
+		return err
+	}
+	if accountingStatus == CopyGuardAccountingReconciled {
+		tracking, guardEffect := actual-baseline, 0.0
+		if stopCount > 0 {
+			guardEffect = tracking
+		}
+		if _, err = tx.Exec(`UPDATE copy_guard_cycles SET baseline_pnl=?,baseline_source=?,tracking_difference=?,net_guard_effect=?,updated_at=CURRENT_TIMESTAMP WHERE id=?`, baseline, source, tracking, guardEffect, id); err != nil {
+			return err
+		}
+	} else {
+		if _, err = tx.Exec(`UPDATE copy_guard_cycles SET baseline_pnl=?,baseline_source=?,updated_at=CURRENT_TIMESTAMP WHERE id=?`, baseline, source, id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// ListCopyGuardCyclesWithEstimatedBaseline returns recently closed cycles
+// whose baseline still relies on the last observed mark price, so the engine
+// can retry calibrating them from the leader's public position history.
+func (s *CopyTradeStore) ListCopyGuardCyclesWithEstimatedBaseline(traderID string, maxAge time.Duration) ([]*CopyGuardCycle, error) {
+	cutoff := time.Now().Add(-maxAge).UTC().Format("2006-01-02 15:04:05")
+	rows, err := s.db.Query(copyGuardCycleSelect+` WHERE trader_id=? AND baseline_source='last_observed' AND closed_at IS NOT NULL AND closed_at>=? ORDER BY closed_at,id`, traderID, cutoff)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*CopyGuardCycle{}
+	for rows.Next() {
+		c, scanErr := scanCopyGuardCycle(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
 func (s *CopyTradeStore) CompleteCopyGuardAccounting(cycleID int64, attemptNo int, exitPrice, pnl, fee, funding, penalty float64) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -750,7 +836,7 @@ func (s *CopyTradeStore) CompleteCopyGuardAccounting(cycleID int64, attemptNo in
 }
 
 func (s *CopyTradeStore) ListCopyGuardCyclesPendingAccounting(traderID string) ([]*CopyGuardCycle, error) {
-	rows, err := s.db.Query(copyGuardCycleSelect+` WHERE trader_id=? AND accounting_status IN (?,?) ORDER BY closed_at,id`, traderID, CopyGuardAccountingPending, CopyGuardAccountingNeedsReview)
+	rows, err := s.db.Query(copyGuardCycleSelect+` WHERE trader_id=? AND accounting_status IN (?,?) ORDER BY closed_at,id`, traderID, CopyGuardAccountingPending, CopyGuardAccountingDelayed)
 	if err != nil {
 		return nil, err
 	}
@@ -889,8 +975,11 @@ type CopyGuardSummary struct {
 	UnknownCount             int                   `json:"unknown_count"`
 	DegradedCount            int                   `json:"degraded_count"`
 	AccountingPendingCount   int                   `json:"accounting_pending_count"`
-	AccountingReviewCount    int                   `json:"accounting_review_count"`
-	LegacyUnverifiedCount    int                   `json:"legacy_unverified_count"`
+	// AccountingDelayedCount: cycles whose OKX settlement data is late; the
+	// system keeps retrying automatically (formerly "needs review").
+	AccountingDelayedCount       int `json:"accounting_delayed_count"`
+	AccountingUnrecoverableCount int `json:"accounting_unrecoverable_count"`
+	LegacyUnverifiedCount        int `json:"legacy_unverified_count"`
 	AverageCoverage          float64               `json:"average_coverage"`
 	IgnoredCount             int                   `json:"ignored_count"`
 	ReentryFirst             int                   `json:"reentry_first"`
@@ -954,10 +1043,10 @@ func (s *CopyTradeStore) CopyGuardSummary(traderIDs []string, from, to time.Time
 		args = append(args, id)
 	}
 	args = append(args, from.UTC().Format("2006-01-02 15:04:05"), to.UTC().Format("2006-01-02 15:04:05"))
-	q := `SELECT COUNT(DISTINCT trader_id),COUNT(*),COALESCE(SUM(stop_count),0),COALESCE(SUM(reentry_count),0),COALESCE(SUM(CASE WHEN accounting_status='RECONCILED' THEN actual_pnl ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='RECONCILED' THEN baseline_pnl ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='RECONCILED' AND stop_count>0 AND net_guard_effect>0 THEN net_guard_effect ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='RECONCILED' AND stop_count>0 AND net_guard_effect<0 THEN -net_guard_effect ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='RECONCILED' AND stop_count>0 THEN net_guard_effect ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='RECONCILED' THEN fees ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='RECONCILED' THEN funding_fee ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='RECONCILED' THEN liquidation_penalty ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='RECONCILED' THEN slippage ELSE 0 END),0),COALESCE(SUM(CASE WHEN closed_at IS NULL AND protection_status='VERIFIED' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN closed_at IS NULL AND protection_status='PENDING' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN closed_at IS NULL AND protection_status='UNKNOWN' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN closed_at IS NULL AND protection_status='DEGRADED' THEN 1 ELSE 0 END),0),COALESCE(AVG(CASE WHEN closed_at IS NULL THEN protection_coverage END),0),COALESCE(SUM(CASE WHEN accounting_status='PENDING' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='NEEDS_REVIEW' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='LEGACY_UNVERIFIED' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN reentry_count>=1 THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN reentry_count>=2 THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN reentry_count>=3 THEN 1 ELSE 0 END),0),COALESCE(MAX(CASE WHEN accounting_status='RECONCILED' AND stop_count>0 AND net_guard_effect>0 THEN net_guard_effect ELSE 0 END),0),COALESCE(MAX(CASE WHEN accounting_status='RECONCILED' AND stop_count>0 AND net_guard_effect<0 THEN -net_guard_effect ELSE 0 END),0),COALESCE(SUM(protection_missing_seconds+CASE WHEN protection_missing_at IS NOT NULL THEN MAX(0,(julianday(COALESCE(closed_at,CURRENT_TIMESTAMP))-julianday(protection_missing_at))*86400) ELSE 0 END),0) FROM copy_guard_cycles WHERE trader_id IN (` + marks + `) AND opened_at>=? AND opened_at<?`
+	q := `SELECT COUNT(DISTINCT trader_id),COUNT(*),COALESCE(SUM(stop_count),0),COALESCE(SUM(reentry_count),0),COALESCE(SUM(CASE WHEN accounting_status='RECONCILED' THEN actual_pnl ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='RECONCILED' THEN baseline_pnl ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='RECONCILED' AND stop_count>0 AND net_guard_effect>0 THEN net_guard_effect ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='RECONCILED' AND stop_count>0 AND net_guard_effect<0 THEN -net_guard_effect ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='RECONCILED' AND stop_count>0 THEN net_guard_effect ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='RECONCILED' THEN fees ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='RECONCILED' THEN funding_fee ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='RECONCILED' THEN liquidation_penalty ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='RECONCILED' THEN slippage ELSE 0 END),0),COALESCE(SUM(CASE WHEN closed_at IS NULL AND protection_status='VERIFIED' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN closed_at IS NULL AND protection_status='PENDING' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN closed_at IS NULL AND protection_status='UNKNOWN' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN closed_at IS NULL AND protection_status='DEGRADED' THEN 1 ELSE 0 END),0),COALESCE(AVG(CASE WHEN closed_at IS NULL THEN protection_coverage END),0),COALESCE(SUM(CASE WHEN accounting_status='PENDING' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='DELAYED' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='UNRECOVERABLE' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='LEGACY_UNVERIFIED' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN reentry_count>=1 THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN reentry_count>=2 THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN reentry_count>=3 THEN 1 ELSE 0 END),0),COALESCE(MAX(CASE WHEN accounting_status='RECONCILED' AND stop_count>0 AND net_guard_effect>0 THEN net_guard_effect ELSE 0 END),0),COALESCE(MAX(CASE WHEN accounting_status='RECONCILED' AND stop_count>0 AND net_guard_effect<0 THEN -net_guard_effect ELSE 0 END),0),COALESCE(SUM(protection_missing_seconds+CASE WHEN protection_missing_at IS NOT NULL THEN MAX(0,(julianday(COALESCE(closed_at,CURRENT_TIMESTAMP))-julianday(protection_missing_at))*86400) ELSE 0 END),0) FROM copy_guard_cycles WHERE trader_id IN (` + marks + `) AND opened_at>=? AND opened_at<?`
 	q, args = appendCopyGuardFilter(q, args, filter)
 	var x CopyGuardSummary
-	err := s.db.QueryRow(q, args...).Scan(&x.FollowerCount, &x.CycleCount, &x.StopCount, &x.ReentryCount, &x.ActualPnL, &x.BaselinePnL, &x.AvoidedLoss, &x.OpportunityCost, &x.NetGuardEffect, &x.Fees, &x.FundingFee, &x.LiquidationPenalty, &x.Slippage, &x.ProtectedCount, &x.PendingProtectionCount, &x.UnknownCount, &x.DegradedCount, &x.AverageCoverage, &x.AccountingPendingCount, &x.AccountingReviewCount, &x.LegacyUnverifiedCount, &x.ReentryFirst, &x.ReentrySecond, &x.ReentryThirdPlus, &x.MaxAvoidedLoss, &x.MaxOpportunityCost, &x.ProtectionMissingSeconds)
+	err := s.db.QueryRow(q, args...).Scan(&x.FollowerCount, &x.CycleCount, &x.StopCount, &x.ReentryCount, &x.ActualPnL, &x.BaselinePnL, &x.AvoidedLoss, &x.OpportunityCost, &x.NetGuardEffect, &x.Fees, &x.FundingFee, &x.LiquidationPenalty, &x.Slippage, &x.ProtectedCount, &x.PendingProtectionCount, &x.UnknownCount, &x.DegradedCount, &x.AverageCoverage, &x.AccountingPendingCount, &x.AccountingDelayedCount, &x.AccountingUnrecoverableCount, &x.LegacyUnverifiedCount, &x.ReentryFirst, &x.ReentrySecond, &x.ReentryThirdPlus, &x.MaxAvoidedLoss, &x.MaxOpportunityCost, &x.ProtectionMissingSeconds)
 	if err != nil {
 		return &x, err
 	}
