@@ -67,6 +67,31 @@ type ProtectiveStopManager interface {
 	CancelProtectiveStop(algoID, symbol string) error
 }
 
+// CopyTradeOrderExecutor lets copy trading preserve unrelated pending/algo orders.
+// It is optional so existing exchanges and normal AI trading keep their behavior.
+type CopyTradeOrderExecutor interface {
+	OpenLongPreservingOrders(symbol string, quantity float64, leverage int) (map[string]interface{}, error)
+	OpenShortPreservingOrders(symbol string, quantity float64, leverage int) (map[string]interface{}, error)
+	CloseLongPreservingOrders(symbol string, quantity float64) (map[string]interface{}, error)
+	CloseShortPreservingOrders(symbol string, quantity float64) (map[string]interface{}, error)
+}
+
+// CopyTradeIdempotentOrderExecutor is used by Copy Guard reentry so a retry or
+// restart cannot create a second position for the same lifecycle attempt.
+type CopyTradeIdempotentOrderExecutor interface {
+	OpenLongPreservingOrdersWithClientID(symbol string, quantity float64, leverage int, clientOrderID string) (map[string]interface{}, error)
+	OpenShortPreservingOrdersWithClientID(symbol string, quantity float64, leverage int, clientOrderID string) (map[string]interface{}, error)
+}
+
+type ClientOrderStatusProvider interface {
+	GetOrderStatusByClientID(symbol, clientOrderID string) (map[string]interface{}, error)
+}
+
+// FreshPositionProvider bypasses exchange position caches after a mutation.
+type FreshPositionProvider interface {
+	GetPositionsFresh() ([]map[string]interface{}, error)
+}
+
 // Trader Unified trader interface
 // Supports multiple trading platforms (Binance, Hyperliquid, etc.)
 type Trader interface {

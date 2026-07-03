@@ -6,7 +6,7 @@ import (
 )
 
 func TestComputeRiskDistanceV4VolatilityPriorityUsesNotionalWithoutLeverage(t *testing.T) {
-	c := &CopyConfig{RiskPolicyVersion: 4, RiskStopMode: "volatility_priority", RiskAccountPct: 0.02, RiskSlippageBufferBPS: 10}
+	c := &CopyConfig{ProviderType: ProviderOKX, RiskPolicyVersion: 4, RiskStopMode: "volatility_priority", RiskAccountPct: 0.02, RiskSlippageBufferBPS: 10, RiskATRCacheMaxAgeMinutes: 120}
 	r, err := ComputeRiskDistanceV4(c, 100, 1000, 1000, 3)
 	if err != nil {
 		t.Fatal(err)
@@ -32,7 +32,7 @@ func TestComputeRiskDistanceV4AccountHardLimitReportsNoiseConflict(t *testing.T)
 }
 
 func TestValidateRiskPolicyV4(t *testing.T) {
-	c := &CopyConfig{RiskPolicyVersion: 4, RiskStopMode: "volatility_priority", RiskATRPeriod: 14, RiskATRMultiplier: 1.5, RiskATRFallbackPct: 0.02, RiskTriggerPriceType: "mark", RiskAccountPct: 0.02, RiskLiquidationBufferATR: 0.5, RiskMaxReentries: 2, RiskReentryRatio: 0.5, RiskReentryBandATR: 0.5, RiskReentryCooldownSeconds: 60, RiskReentryMaxATRExpansion: 2}
+	c := &CopyConfig{ProviderType: ProviderOKX, RiskPolicyVersion: 4, RiskStopMode: "volatility_priority", RiskATRPeriod: 14, RiskATRCacheMaxAgeMinutes: 120, RiskATRMultiplier: 1.5, RiskATRFallbackPct: 0.02, RiskTriggerPriceType: "mark", RiskAccountPct: 0.02, RiskLiquidationBufferATR: 0.5, RiskMaxReentries: 2, RiskReentryRatio: 0.5, RiskReentryBandATR: 0.5, RiskReentryCooldownSeconds: 60, RiskReentryMaxATRExpansion: 2}
 	if err := ValidateRiskPolicyV4(c); err != nil {
 		t.Fatal(err)
 	}

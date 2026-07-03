@@ -119,7 +119,7 @@ type Context struct {
 	MultiTFMarket   map[string]map[string]*market.Data `json:"-"`
 	OITopDataMap    map[string]*OITopData              `json:"-"`
 	QuantDataMap    map[string]*QuantData              `json:"-"`
-	OIRankingData   *provider.OIRankingData                `json:"-"` // Market-wide OI ranking data
+	OIRankingData   *provider.OIRankingData            `json:"-"` // Market-wide OI ranking data
 	BTCETHLeverage  int                                `json:"-"`
 	AltcoinLeverage int                                `json:"-"`
 	Timeframes      []string                           `json:"-"`
@@ -149,8 +149,10 @@ type Decision struct {
 	EntryPrice float64 `json:"entry_price,omitempty"` // 入场价格（跟单时记录领航员成交价）
 
 	// 跟单专用字段
-	LeaderPosID   string  `json:"leader_pos_id,omitempty"`   // 领航员仓位 ID（用于映射追踪）
-	LeaderPosSize float64 `json:"leader_pos_size,omitempty"` // 领航员当前持仓数量（用于 lastKnownSize 追踪）
+	LeaderPosID     string  `json:"leader_pos_id,omitempty"`   // 领航员仓位 ID（用于映射追踪）
+	LeaderPosSize   float64 `json:"leader_pos_size,omitempty"` // 领航员当前持仓数量（用于 lastKnownSize 追踪）
+	ClientOrderID   string  `json:"client_order_id,omitempty"` // Copy Guard 幂等执行与重启恢复
+	ExchangeOrderID string  `json:"exchange_order_id,omitempty"`
 }
 
 // FullDecision AI's complete decision (including chain of thought)

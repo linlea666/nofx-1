@@ -39,11 +39,17 @@ func ValidateRiskPolicyV4(c *CopyConfig) error {
 	if c.RiskPolicyVersion < 4 {
 		return nil
 	}
+	if c.ProviderType != ProviderOKX {
+		return fmt.Errorf("copy guard v4 is only supported for OKX")
+	}
 	if c.RiskStopMode != "volatility_priority" && c.RiskStopMode != "account_hard_limit" {
 		return fmt.Errorf("invalid risk_stop_mode %q", c.RiskStopMode)
 	}
 	if c.RiskATRPeriod < 5 || c.RiskATRPeriod > 100 {
 		return fmt.Errorf("risk_atr_period must be 5..100")
+	}
+	if c.RiskATRCacheMaxAgeMinutes < 1 || c.RiskATRCacheMaxAgeMinutes > 1440 {
+		return fmt.Errorf("risk_atr_cache_max_age_minutes must be 1..1440")
 	}
 	if invalidRange(c.RiskATRMultiplier, 0.5, 5) {
 		return fmt.Errorf("risk_atr_multiplier must be 0.5..5")
@@ -96,5 +102,5 @@ func ValidateStoredRiskPolicy(c *store.CopyTradeConfig) error {
 		return nil
 	}
 	c.FillRiskDefaults()
-	return ValidateRiskPolicyV4(&CopyConfig{RiskPolicyVersion: c.RiskPolicyVersion, RiskStopMode: c.RiskStopMode, RiskATRPeriod: c.RiskATRPeriod, RiskATRMultiplier: c.RiskATRMultiplier, RiskATRFallbackPct: c.RiskATRFallbackPct, RiskTriggerPriceType: c.RiskTriggerPriceType, RiskAccountPct: c.RiskAccountPct, RiskSlippageBufferBPS: c.RiskSlippageBufferBPS, RiskLiquidationBufferATR: c.RiskLiquidationBufferATR, RiskMaxReentries: c.RiskMaxReentries, RiskReentryRatio: c.RiskReentryRatio, RiskReentryBandATR: c.RiskReentryBandATR, RiskReentryCooldownSeconds: c.RiskReentryCooldownSeconds, RiskReentryMaxChaseATR: c.RiskReentryMaxChaseATR, RiskReentryMaxATRExpansion: c.RiskReentryMaxATRExpansion, RiskWatchTimeoutMinutes: c.RiskWatchTimeoutMinutes})
+	return ValidateRiskPolicyV4(&CopyConfig{ProviderType: ProviderType(c.ProviderType), RiskPolicyVersion: c.RiskPolicyVersion, RiskStopMode: c.RiskStopMode, RiskATRPeriod: c.RiskATRPeriod, RiskATRCacheMaxAgeMinutes: c.RiskATRCacheMaxAgeMinutes, RiskATRMultiplier: c.RiskATRMultiplier, RiskATRFallbackPct: c.RiskATRFallbackPct, RiskTriggerPriceType: c.RiskTriggerPriceType, RiskAccountPct: c.RiskAccountPct, RiskSlippageBufferBPS: c.RiskSlippageBufferBPS, RiskLiquidationBufferATR: c.RiskLiquidationBufferATR, RiskMaxReentries: c.RiskMaxReentries, RiskReentryRatio: c.RiskReentryRatio, RiskReentryBandATR: c.RiskReentryBandATR, RiskReentryCooldownSeconds: c.RiskReentryCooldownSeconds, RiskReentryMaxChaseATR: c.RiskReentryMaxChaseATR, RiskReentryMaxATRExpansion: c.RiskReentryMaxATRExpansion, RiskWatchTimeoutMinutes: c.RiskWatchTimeoutMinutes})
 }

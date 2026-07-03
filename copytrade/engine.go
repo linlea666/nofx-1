@@ -35,9 +35,10 @@ type Engine struct {
 	binanceCredLoader BinanceCredentialsLoader
 
 	// 跟随者账户信息（由外部注入）
-	getFollowerBalance   func() float64
-	getFollowerEquity    func() float64
-	getFollowerPositions func() map[string]*Position
+	getFollowerBalance         func() float64
+	getFollowerEquity          func() float64
+	getFollowerPositions       func() map[string]*Position
+	getFollowerPositionsResult func() (map[string]*Position, error)
 
 	// 数据库存储（用于仓位映射）
 	store *store.Store
@@ -85,6 +86,10 @@ type EngineOption func(*Engine)
 
 func WithFollowerEquity(getEquity func() float64) EngineOption {
 	return func(e *Engine) { e.getFollowerEquity = getEquity }
+}
+
+func WithFollowerPositionsResult(getPositions func() (map[string]*Position, error)) EngineOption {
+	return func(e *Engine) { e.getFollowerPositionsResult = getPositions }
 }
 
 // WithStreamingMode 启用流式模式（WebSocket 事件驱动）
@@ -2000,15 +2005,15 @@ func (e *Engine) checkIgnoredPositionsClosed() {
 					e.traderID, mapping.LeaderPosID, mapping.Symbol, mapping.Side)
 				if e.config.RiskPolicyVersion >= 4 {
 					if cycle, cerr := e.store.CopyTrade().GetOpenCopyGuardCycle(e.traderID, mapping.LeaderPosID); cerr == nil {
-						baseline := cycle.BaselinePnL
+						baseline := cycle.BaselineRealizedPnL
 						if cycle.LeaderEntryPrice > 0 && cycle.LastObservedPrice > 0 {
 							move := (cycle.LastObservedPrice - cycle.LeaderEntryPrice) / cycle.LeaderEntryPrice
 							if cycle.Side == "short" {
 								move = -move
 							}
-							baseline = cycle.BaselineNotional * move
+							baseline += cycle.BaselineNotional * move
 						}
-						_ = e.store.CopyTrade().CloseCopyGuardCycle(cycle.ID, store.CopyGuardLeaderClosed, cycle.ActualPnL, baseline, cycle.Fees, cycle.FundingFee, cycle.Slippage)
+						_ = e.store.CopyTrade().CloseCopyGuardCycle(cycle.ID, store.CopyGuardLeaderClosed, cycle.ActualPnL, baseline, cycle.Fees, cycle.FundingFee, cycle.LiquidationPenalty, cycle.Slippage)
 						_ = e.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: e.traderID, Type: "LEADER_CLOSED", Price: cycle.LastObservedPrice, Metadata: map[string]interface{}{"baseline_estimated": true}})
 					}
 				}

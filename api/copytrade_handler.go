@@ -95,7 +95,7 @@ func riskTimeRange(c *gin.Context) (time.Time, time.Time) {
 	return from, to
 }
 func riskFilter(c *gin.Context) store.CopyGuardFilter {
-	return store.CopyGuardFilter{LeaderID: strings.TrimSpace(c.Query("leader_id")), Symbol: strings.TrimSpace(c.Query("symbol")), Status: strings.TrimSpace(c.Query("status"))}
+	return store.CopyGuardFilter{LeaderID: strings.TrimSpace(c.Query("leader_id")), Symbol: strings.TrimSpace(c.Query("symbol")), Status: strings.TrimSpace(c.Query("status")), ResultType: strings.TrimSpace(c.Query("result_type"))}
 }
 
 func (h *CopyTradeHandler) GetRiskSummary(c *gin.Context) {
@@ -153,7 +153,13 @@ func (h *CopyTradeHandler) GetRiskCycle(c *gin.Context) {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(200, gin.H{"cycle": cycle, "events": events})
+	attempts, err := h.store.CopyTrade().ListCopyGuardAttempts(id)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	protection, _ := h.store.CopyTrade().GetCopyGuardProtectiveOrder(id)
+	c.JSON(200, gin.H{"cycle": cycle, "events": events, "attempts": attempts, "protection": protection})
 }
 func (h *CopyTradeHandler) ExportRiskCycles(c *gin.Context) {
 	ids, _, err := h.ownedTraderIDs(c)
@@ -162,32 +168,52 @@ func (h *CopyTradeHandler) ExportRiskCycles(c *gin.Context) {
 		return
 	}
 	from, to := riskTimeRange(c)
-	rows, err := h.store.CopyTrade().ListCopyGuardCycles(ids, from, to, 500, 0, riskFilter(c))
-	if err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
+	format := strings.ToLower(c.DefaultQuery("format", "csv"))
+	if format != "csv" && format != "jsonl" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "format must be csv or jsonl"})
 		return
 	}
-	format := strings.ToLower(c.DefaultQuery("format", "csv"))
 	if format == "jsonl" {
 		c.Header("Content-Type", "application/x-ndjson")
 		c.Header("Content-Disposition", "attachment; filename=copy-guard.jsonl")
 		enc := json.NewEncoder(c.Writer)
-		for _, cycle := range rows {
-			events, _ := h.store.CopyTrade().ListCopyGuardEvents(cycle.ID)
-			_ = enc.Encode(gin.H{"cycle": cycle, "events": events})
+		for offset := 0; ; offset += 500 {
+			rows, err := h.store.CopyTrade().ListCopyGuardCycles(ids, from, to, 500, offset, riskFilter(c))
+			if err != nil {
+				return
+			}
+			for _, cycle := range rows {
+				events, _ := h.store.CopyTrade().ListCopyGuardEvents(cycle.ID)
+				attempts, _ := h.store.CopyTrade().ListCopyGuardAttempts(cycle.ID)
+				protection, _ := h.store.CopyTrade().GetCopyGuardProtectiveOrder(cycle.ID)
+				_ = enc.Encode(gin.H{"cycle": cycle, "attempts": attempts, "events": events, "protection": protection})
+			}
+			if len(rows) < 500 {
+				break
+			}
 		}
 		return
 	}
 	c.Header("Content-Type", "text/csv; charset=utf-8")
 	c.Header("Content-Disposition", "attachment; filename=copy-guard.csv")
 	w := csv.NewWriter(c.Writer)
-	_ = w.Write([]string{"cycle_id", "trader_id", "leader_id", "leader_pos_id", "symbol", "side", "status", "stop_count", "reentry_count", "actual_pnl", "baseline_no_guard_pnl", "net_guard_effect", "fees", "funding_fee", "slippage", "opened_at", "closed_at"})
-	for _, x := range rows {
-		closed := ""
-		if x.ClosedAt != nil {
-			closed = x.ClosedAt.Format(time.RFC3339)
+	_ = w.Write([]string{"cycle_id", "trader_id", "leader_id", "leader_pos_id", "symbol", "side", "margin_mode", "status", "protection_status", "protection_coverage", "protection_retries", "protection_missing_seconds", "protection_error", "stop_count", "reentry_count", "actual_pnl", "baseline_no_guard_pnl", "net_guard_effect", "fees", "funding_fee", "liquidation_penalty", "slippage", "opened_at", "closed_at"})
+	for offset := 0; ; offset += 500 {
+		rows, err := h.store.CopyTrade().ListCopyGuardCycles(ids, from, to, 500, offset, riskFilter(c))
+		if err != nil {
+			return
 		}
-		_ = w.Write([]string{strconv.FormatInt(x.ID, 10), x.TraderID, x.LeaderID, x.LeaderPosID, x.Symbol, x.Side, x.Status, strconv.Itoa(x.StopCount), strconv.Itoa(x.ReentryCount), fmt.Sprint(x.ActualPnL), fmt.Sprint(x.BaselinePnL), fmt.Sprint(x.NetGuardEffect), fmt.Sprint(x.Fees), fmt.Sprint(x.FundingFee), fmt.Sprint(x.Slippage), x.OpenedAt.Format(time.RFC3339), closed})
+		for _, x := range rows {
+			closed := ""
+			if x.ClosedAt != nil {
+				closed = x.ClosedAt.Format(time.RFC3339)
+			}
+			_ = w.Write([]string{strconv.FormatInt(x.ID, 10), x.TraderID, x.LeaderID, x.LeaderPosID, x.Symbol, x.Side, x.MarginMode, x.Status, x.ProtectionStatus, fmt.Sprint(x.ProtectionCoverage), strconv.Itoa(x.ProtectionRetries), fmt.Sprint(x.ProtectionMissingSeconds), x.ProtectionError, strconv.Itoa(x.StopCount), strconv.Itoa(x.ReentryCount), fmt.Sprint(x.ActualPnL), fmt.Sprint(x.BaselinePnL), fmt.Sprint(x.NetGuardEffect), fmt.Sprint(x.Fees), fmt.Sprint(x.FundingFee), fmt.Sprint(x.LiquidationPenalty), fmt.Sprint(x.Slippage), x.OpenedAt.Format(time.RFC3339), closed})
+		}
+		w.Flush()
+		if len(rows) < 500 {
+			break
+		}
 	}
 	w.Flush()
 }
@@ -229,6 +255,7 @@ type CopyTradeConfigRequest struct {
 	RiskPolicyVersion           *int     `json:"risk_policy_version,omitempty"`
 	RiskStopMode                *string  `json:"risk_stop_mode,omitempty"`
 	RiskATRPeriod               *int     `json:"risk_atr_period,omitempty"`
+	RiskATRCacheMaxAgeMinutes   *int     `json:"risk_atr_cache_max_age_minutes,omitempty"`
 	RiskATRFallbackPct          *float64 `json:"risk_atr_fallback_pct,omitempty"`
 	RiskTriggerPriceType        *string  `json:"risk_trigger_price_type,omitempty"`
 	RiskSlippageBufferBPS       *float64 `json:"risk_slippage_buffer_bps,omitempty"`
@@ -240,6 +267,7 @@ type CopyTradeConfigRequest struct {
 	RiskReentryMaxATRExpansion  *float64 `json:"risk_reentry_max_atr_expansion,omitempty"`
 	RiskWatchTimeoutMinutes     *int     `json:"risk_watch_timeout_minutes,omitempty"`
 	RiskMigrationConfirmed      *bool    `json:"risk_migration_confirmed,omitempty"`
+	RiskHighRiskConfirmed       bool     `json:"risk_high_risk_confirmed,omitempty"`
 }
 
 // GetConfig 获取跟单配置
@@ -371,6 +399,18 @@ func (h *CopyTradeHandler) SaveConfig(c *gin.Context) {
 		config.RiskReentryAddbackTolerance = existing.RiskReentryAddbackTolerance
 	}
 	applyCopyGuardV4Request(config, existing, &req)
+	if config.RiskPolicyVersion >= 4 && config.ProviderType != "okx" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "copy guard v4 is only supported for OKX"})
+		return
+	}
+	if config.RiskPolicyVersion >= 4 && existing != nil && existing.RiskPolicyVersion < 4 && !config.RiskMigrationConfirmed {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "copy guard v4 migration confirmation is required"})
+		return
+	}
+	if config.RiskPolicyVersion >= 4 && config.RiskAccountPct >= 0.10 && !req.RiskHighRiskConfirmed {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "risk_account_pct >= 10% requires risk_high_risk_confirmed"})
+		return
+	}
 	if err := copytrade.ValidateStoredRiskPolicy(config); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -414,6 +454,11 @@ func applyCopyGuardV4Request(c, old *store.CopyTradeConfig, r *CopyTradeConfigRe
 		c.RiskATRPeriod = *r.RiskATRPeriod
 	} else if old != nil {
 		c.RiskATRPeriod = old.RiskATRPeriod
+	}
+	if r.RiskATRCacheMaxAgeMinutes != nil {
+		c.RiskATRCacheMaxAgeMinutes = *r.RiskATRCacheMaxAgeMinutes
+	} else if old != nil {
+		c.RiskATRCacheMaxAgeMinutes = old.RiskATRCacheMaxAgeMinutes
 	}
 	if r.RiskATRFallbackPct != nil {
 		c.RiskATRFallbackPct = *r.RiskATRFallbackPct
@@ -471,6 +516,31 @@ func applyCopyGuardV4Request(c, old *store.CopyTradeConfig, r *CopyTradeConfigRe
 		c.RiskMigrationConfirmed = old.RiskMigrationConfirmed
 	}
 	if c.RiskPolicyVersion >= 4 {
+		// Only missing fields on a brand-new v4 config receive balanced defaults.
+		// Existing values, including valid explicit zero values, are preserved.
+		if old == nil {
+			if r.RiskSlippageBufferBPS == nil {
+				c.RiskSlippageBufferBPS = 10
+			}
+			if r.RiskLiquidationBufferATR == nil {
+				c.RiskLiquidationBufferATR = 0.5
+			}
+			if r.RiskMaxReentries == nil {
+				c.RiskMaxReentries = 2
+			}
+			if r.RiskReentryBandATR == nil {
+				c.RiskReentryBandATR = 0.5
+			}
+			if r.RiskReentryCooldownSeconds == nil {
+				c.RiskReentryCooldownSeconds = 60
+			}
+			if r.RiskReentryMaxATRExpansion == nil {
+				c.RiskReentryMaxATRExpansion = 2
+			}
+			if r.RiskReentryEnabled == nil {
+				c.RiskReentryEnabled = true
+			}
+		}
 		c.FillRiskDefaults()
 	}
 }

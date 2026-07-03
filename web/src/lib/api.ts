@@ -911,6 +911,27 @@ export const api = {
         fee: number
         created_at: string
       }>
+      attempts: Array<{
+        id: number
+        attempt_no: number
+        status: string
+        entry_price: number
+        exit_price: number
+        notional: number
+        pnl: number
+        fee: number
+        funding_fee: number
+        opened_at: string
+        closed_at?: string
+      }>
+      protection?: {
+        algo_id: string
+        algo_client_id: string
+        quantity: number
+        trigger_price: number
+        trigger_type: string
+        status: string
+      }
     }>(`${API_BASE}/copytrade/risk/cycles/${id}`)
     if (!result.success)
       throw new Error(result.message || '获取 Copy Guard 生命周期失败')

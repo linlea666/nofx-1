@@ -52,6 +52,14 @@ type StopLossCalcResult struct {
 	NoiseConflict    bool    // account_hard_limit 位于 ATR 噪音区内
 }
 
+func riskATRCacheMaxAge(cfg *CopyConfig) time.Duration {
+	minutes := 120
+	if cfg != nil && cfg.RiskATRCacheMaxAgeMinutes > 0 {
+		minutes = cfg.RiskATRCacheMaxAgeMinutes
+	}
+	return time.Duration(minutes) * time.Minute
+}
+
 // calcStopLossPrice 计算账户保护止损价
 //
 // 返回值：
@@ -90,7 +98,7 @@ func calcStopLossPrice(cfg *CopyConfig, input *StopLossCalcInput) (*StopLossCalc
 		if period <= 0 {
 			period = 14
 		}
-		atr, atrErr := market.GetOKXATR(input.Symbol, cfg.RiskATRTimeframe, period)
+		atr, atrErr := market.GetOKXATRWithMaxAge(input.Symbol, cfg.RiskATRTimeframe, period, riskATRCacheMaxAge(cfg))
 		if atrErr == nil && atr > 0 {
 			result.ATRValue = atr
 			result.ATRDistance = atr * cfg.RiskATRMultiplier
@@ -135,14 +143,10 @@ func calcStopLossPrice(cfg *CopyConfig, input *StopLossCalcInput) (*StopLossCalc
 			atrDist := cfg.RiskATRMultiplier * atr
 			result.ATRDistance = atrDist
 
-			if atrDist <= accountDist {
-				// ATR 下界比账户线还紧 → 放宽到 ATR（防噪音）
+			if atrDist > accountDist {
+				// ATR 是噪音下界：正常波动空间更大时必须放宽，不能反向收紧。
 				finalDist = atrDist
 				result.GovernedBy = "atr"
-			} else {
-				// ATR 比账户线还大 → 仍坚持账户线，但是个警告信号
-				logger.Warnf("📐 ATR(%.4f×%.2f=%.4f) > 账户线(%.4f) | %s 波动较大，SL 可能频繁被扫出",
-					atr, cfg.RiskATRMultiplier, atrDist, accountDist, input.Symbol)
 			}
 		} else if err != nil {
 			// 降级：ATR 获取失败 → 仅用账户线
@@ -294,6 +298,14 @@ func (e *Engine) checkStoppedByRisk() {
 	// 注意：getFollowerPositions 失败时返回空 map（无法区分"真的空"和"API 抖动"），
 	// 必须配合 stopRiskSuspectCount 多次确认机制做防御
 	localPositions := e.getFollowerPositions()
+	if e.getFollowerPositionsResult != nil {
+		var err error
+		localPositions, err = e.getFollowerPositionsResult()
+		if err != nil {
+			logger.Warnf("⚠️ [%s] 跟随者持仓查询失败，本轮禁止仓位消失判定: %v", e.traderID, err)
+			return
+		}
+	}
 	if localPositions == nil {
 		// 真正的 nil 才跳过（不会发生，integration 实现总是返回非 nil）
 		return
@@ -370,9 +382,8 @@ func (e *Engine) checkStoppedByRisk() {
 		if e.config.RiskPolicyVersion >= 4 {
 			cycle, cerr := e.store.CopyTrade().GetOpenCopyGuardCycle(e.traderID, mapping.LeaderPosID)
 			if cerr == nil {
-				atr, _ := market.GetOKXATR(mapping.Symbol, e.config.RiskATRTimeframe, e.config.RiskATRPeriod)
-				_ = e.store.CopyTrade().MarkCopyGuardStopped(cycle.ID, atr)
-				_ = e.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: e.traderID, Type: "STOP_CONFIRMED", Price: leaderPos.MarkPrice, Quantity: leaderSize, PnL: leaderPnL, Metadata: map[string]interface{}{"confirmation": "position_absent_fallback"}})
+				atr, _ := market.GetOKXATRWithMaxAge(mapping.Symbol, e.config.RiskATRTimeframe, e.config.RiskATRPeriod, riskATRCacheMaxAge(e.config))
+				_ = e.store.CopyTrade().RecordCopyGuardStopObserved(cycle.ID, e.traderID, atr, leaderPos.MarkPrice, leaderSize, leaderPnL, map[string]interface{}{"confirmation": "position_absent_fallback"})
 			}
 		}
 
@@ -441,6 +452,8 @@ func (e *Engine) checkReentryConditions() {
 
 	for _, mapping := range stoppedMappings {
 		var v4Cycle *store.CopyGuardCycle
+		coolingDown := false
+		terminalWatchStatus := ""
 		if e.config.RiskPolicyVersion >= 4 {
 			v4Cycle, err = e.store.CopyTrade().GetOpenCopyGuardCycle(e.traderID, mapping.LeaderPosID)
 			if err != nil {
@@ -450,17 +463,13 @@ func (e *Engine) checkReentryConditions() {
 			if v4Cycle.Status == store.CopyGuardReentryPending {
 				continue
 			}
-			if v4Cycle.ReentryCount >= e.config.RiskMaxReentries {
-				_ = e.store.CopyTrade().UpdateCopyGuardObservation(v4Cycle.ID, store.CopyGuardAttemptsExhausted, v4Cycle.LeaderEntryPrice, v4Cycle.LastObservedPrice, 0)
-				continue
+			if e.config.RiskReentryEnabled && v4Cycle.ReentryCount >= e.config.RiskMaxReentries {
+				terminalWatchStatus = store.CopyGuardAttemptsExhausted
 			}
 			if e.config.RiskWatchTimeoutMinutes > 0 && v4Cycle.StoppedAt != nil && time.Since(*v4Cycle.StoppedAt) > time.Duration(e.config.RiskWatchTimeoutMinutes)*time.Minute {
-				_ = e.store.CopyTrade().UpdateCopyGuardObservation(v4Cycle.ID, store.CopyGuardWatchTimeout, v4Cycle.LeaderEntryPrice, v4Cycle.LastObservedPrice, 0)
-				continue
+				terminalWatchStatus = store.CopyGuardWatchTimeout
 			}
-			if v4Cycle.StoppedAt != nil && time.Since(*v4Cycle.StoppedAt) < time.Duration(e.config.RiskReentryCooldownSeconds)*time.Second {
-				continue
-			}
+			coolingDown = v4Cycle.StoppedAt != nil && time.Since(*v4Cycle.StoppedAt) < time.Duration(e.config.RiskReentryCooldownSeconds)*time.Second
 		}
 		// 安全阀：同 posId 重入限 1 次（硬阀）
 		if e.config.RiskPolicyVersion < 4 && mapping.ReentryUsed {
@@ -473,7 +482,7 @@ func (e *Engine) checkReentryConditions() {
 			// 领航员完全平掉了 → 在 checkIgnoredPositionsClosed 里会标 closed
 			continue
 		}
-		if e.config.RiskPolicyVersion >= 4 && !e.config.RiskReentryEnabled {
+		if e.config.RiskPolicyVersion >= 4 && (!e.config.RiskReentryEnabled || terminalWatchStatus != "") {
 			mark := leaderPos.MarkPrice
 			if mark <= 0 {
 				mark = leaderPos.EntryPrice
@@ -486,11 +495,15 @@ func (e *Engine) checkReentryConditions() {
 			e.leaderStateMu.RUnlock()
 			shadow := v4Cycle.BaselineNotional
 			if leaderEquity > 0 {
-				shadow = leaderPos.Size * mark / leaderEquity * v4Cycle.AccountEquity * e.config.CopyRatio
+				shadow = leaderPos.Size * leaderPos.EntryPrice / leaderEquity * v4Cycle.AccountEquity * e.config.CopyRatio
 			}
-			_ = e.store.CopyTrade().UpdateCopyGuardShadow(v4Cycle.ID, leaderPos.EntryPrice, mark, shadow)
-			atr, _ := market.GetOKXATR(mapping.Symbol, e.config.RiskATRTimeframe, e.config.RiskATRPeriod)
-			_ = e.store.CopyTrade().UpdateCopyGuardObservation(v4Cycle.ID, store.CopyGuardStoppedWatching, leaderPos.EntryPrice, mark, atr)
+			_ = e.store.CopyTrade().UpdateCopyGuardShadow(v4Cycle.ID, leaderPos.EntryPrice, mark, shadow, leaderPos.Size)
+			atr, _ := market.GetOKXATRWithMaxAge(mapping.Symbol, e.config.RiskATRTimeframe, e.config.RiskATRPeriod, riskATRCacheMaxAge(e.config))
+			status := store.CopyGuardStoppedWatching
+			if terminalWatchStatus != "" {
+				status = terminalWatchStatus
+			}
+			_ = e.store.CopyTrade().UpdateCopyGuardObservation(v4Cycle.ID, status, leaderPos.EntryPrice, mark, atr)
 			continue
 		}
 
@@ -557,9 +570,14 @@ func (e *Engine) checkReentryConditions() {
 			e.leaderStateMu.RUnlock()
 			shadow := v4Cycle.BaselineNotional
 			if leaderEquity > 0 {
-				shadow = leaderPos.Size * markPrice / leaderEquity * v4Cycle.AccountEquity * e.config.CopyRatio
+				shadow = leaderPos.Size * leaderPos.EntryPrice / leaderEquity * v4Cycle.AccountEquity * e.config.CopyRatio
 			}
-			_ = e.store.CopyTrade().UpdateCopyGuardShadow(v4Cycle.ID, entryRef, markPrice, shadow)
+			_ = e.store.CopyTrade().UpdateCopyGuardShadow(v4Cycle.ID, entryRef, markPrice, shadow, leaderPos.Size)
+			if coolingDown {
+				atr, _ := market.GetOKXATRWithMaxAge(mapping.Symbol, e.config.RiskATRTimeframe, e.config.RiskATRPeriod, riskATRCacheMaxAge(e.config))
+				_ = e.store.CopyTrade().UpdateCopyGuardObservation(v4Cycle.ID, store.CopyGuardStoppedWatching, entryRef, markPrice, atr)
+				continue
+			}
 		}
 		tolerance := e.config.RiskReentryTolerance
 
@@ -576,7 +594,7 @@ func (e *Engine) checkReentryConditions() {
 		priceReturned := false
 		currentATR := float64(0)
 		if e.config.RiskPolicyVersion >= 4 {
-			currentATR, _ = market.GetOKXATR(mapping.Symbol, e.config.RiskATRTimeframe, e.config.RiskATRPeriod)
+			currentATR, _ = market.GetOKXATRWithMaxAge(mapping.Symbol, e.config.RiskATRTimeframe, e.config.RiskATRPeriod, riskATRCacheMaxAge(e.config))
 			if currentATR <= 0 {
 				currentATR = entryRef * e.config.RiskATRFallbackPct
 			}

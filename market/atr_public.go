@@ -121,6 +121,32 @@ func GetATR(symbol, timeframe string, period int) (float64, error) {
 // GetOKXATR calculates ATR from completed OKX mark-price candles. The open candle is deliberately
 // excluded so stop placement is deterministic across repeated calls in the same interval.
 func GetOKXATR(symbol, timeframe string, period int) (float64, error) {
+	return getOKXATRFresh(symbol, timeframe, period)
+}
+
+// GetOKXATRWithMaxAge falls back to the last successful snapshot when the live
+// request fails. Copy Guard uses a two-hour max age; callers outside Copy Guard
+// retain the strict fresh behavior through GetOKXATR.
+func GetOKXATRWithMaxAge(symbol, timeframe string, period int, maxAge time.Duration) (float64, error) {
+	value, err := getOKXATRFresh(symbol, timeframe, period)
+	if err == nil || maxAge <= 0 {
+		return value, err
+	}
+	bar := map[string]string{"15m": "15m", "1h": "1H", "4h": "4H"}[strings.ToLower(timeframe)]
+	if bar == "" {
+		return 0, err
+	}
+	key := fmt.Sprintf("okx|%s|%s|%d", symbol, bar, period)
+	atrCacheMu.RLock()
+	cached, ok := atrCache[key]
+	atrCacheMu.RUnlock()
+	if ok && time.Since(cached.ts) <= maxAge && cached.value > 0 {
+		return cached.value, nil
+	}
+	return 0, err
+}
+
+func getOKXATRFresh(symbol, timeframe string, period int) (float64, error) {
 	if symbol == "" {
 		return 0, fmt.Errorf("symbol is empty")
 	}

@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"nofx/logger"
 	"strconv"
@@ -92,8 +93,11 @@ func (t *OKXTrader) AmendProtectiveStop(algoID string, req ProtectiveStopRequest
 		return err
 	}
 	body := []map[string]interface{}{{"instId": t.convertSymbol(req.Symbol), "algoId": algoID, "newSz": t.formatSize(req.Quantity/inst.CtVal, inst), "newSlTriggerPx": strconv.FormatFloat(req.TriggerPrice, 'f', -1, 64), "newSlOrdPx": "-1"}}
-	_, err = t.doRequest("POST", okxAmendAlgoPath, body)
-	return err
+	data, err := t.doRequest("POST", okxAmendAlgoPath, body)
+	if err != nil {
+		return err
+	}
+	return validateOKXAlgoAck(data, "amend")
 }
 
 func (t *OKXTrader) GetProtectiveStop(algoID, symbol string) (*ProtectiveStopOrder, error) {
@@ -117,6 +121,9 @@ func (t *OKXTrader) GetProtectiveStop(algoID, symbol string) (*ProtectiveStopOrd
 		}
 		if json.Unmarshal(data, &rows) == nil && len(rows) > 0 {
 			q, _ := strconv.ParseFloat(rows[0].Sz, 64)
+			if inst, instErr := t.getInstrument(symbol); instErr == nil && inst.CtVal > 0 {
+				q *= inst.CtVal
+			}
 			px, _ := strconv.ParseFloat(rows[0].SlTriggerPx, 64)
 			return &ProtectiveStopOrder{AlgoID: rows[0].AlgoID, ClientID: rows[0].AlgoClOrdID, Symbol: symbol, PositionSide: rows[0].PosSide, MarginMode: rows[0].TdMode, Quantity: q, TriggerPrice: px, TriggerType: rows[0].SlTriggerPxType, State: rows[0].State, ActualOrderID: rows[0].OrdID}, nil
 		}
@@ -125,8 +132,31 @@ func (t *OKXTrader) GetProtectiveStop(algoID, symbol string) (*ProtectiveStopOrd
 }
 
 func (t *OKXTrader) CancelProtectiveStop(algoID, symbol string) error {
-	_, err := t.doRequest("POST", okxCancelAlgoPath, []map[string]interface{}{{"algoId": algoID, "instId": t.convertSymbol(symbol)}})
-	return err
+	data, err := t.doRequest("POST", okxCancelAlgoPath, []map[string]interface{}{{"algoId": algoID, "instId": t.convertSymbol(symbol)}})
+	if err != nil {
+		return err
+	}
+	return validateOKXAlgoAck(data, "cancel")
+}
+
+func validateOKXAlgoAck(data []byte, action string) error {
+	var rows []struct {
+		AlgoID string `json:"algoId"`
+		SCode  string `json:"sCode"`
+		SMsg   string `json:"sMsg"`
+	}
+	if err := json.Unmarshal(data, &rows); err != nil {
+		return fmt.Errorf("OKX %s algo acknowledgement parse failed: %w", action, err)
+	}
+	if len(rows) == 0 {
+		return fmt.Errorf("OKX %s algo acknowledgement is empty", action)
+	}
+	for _, row := range rows {
+		if row.SCode != "0" {
+			return fmt.Errorf("OKX %s algo rejected: algoId=%s sCode=%s sMsg=%s", action, row.AlgoID, row.SCode, row.SMsg)
+		}
+	}
+	return nil
 }
 
 // OKXTrader OKX futures trader
@@ -524,6 +554,19 @@ func (t *OKXTrader) GetPositions() ([]map[string]interface{}, error) {
 	return result, nil
 }
 
+func (t *OKXTrader) invalidatePositionsCache() {
+	t.positionsCacheMutex.Lock()
+	t.cachedPositions = nil
+	t.positionsCacheTime = time.Time{}
+	t.positionsCacheMutex.Unlock()
+}
+
+// GetPositionsFresh is used by Copy Guard after an order mutation.
+func (t *OKXTrader) GetPositionsFresh() ([]map[string]interface{}, error) {
+	t.invalidatePositionsCache()
+	return t.GetPositions()
+}
+
 // ensureMgnModeInPositions 确保持仓数据中的 mgnMode 不为空
 // 用于处理从缓存返回数据时，可能存在的空 mgnMode 情况
 func (t *OKXTrader) ensureMgnModeInPositions(positions []map[string]interface{}) []map[string]interface{} {
@@ -748,8 +791,22 @@ func (t *OKXTrader) setLeverageForSide(symbol string, leverage int, posSide stri
 
 // OpenLong opens long position
 func (t *OKXTrader) OpenLong(symbol string, quantity float64, leverage int) (map[string]interface{}, error) {
+	return t.openLong(symbol, quantity, leverage, true, "")
+}
+
+func (t *OKXTrader) OpenLongPreservingOrders(symbol string, quantity float64, leverage int) (map[string]interface{}, error) {
+	return t.openLong(symbol, quantity, leverage, false, "")
+}
+
+func (t *OKXTrader) OpenLongPreservingOrdersWithClientID(symbol string, quantity float64, leverage int, clientOrderID string) (map[string]interface{}, error) {
+	return t.openLong(symbol, quantity, leverage, false, clientOrderID)
+}
+
+func (t *OKXTrader) openLong(symbol string, quantity float64, leverage int, cancelExisting bool, clientOrderID string) (map[string]interface{}, error) {
 	// Cancel old orders
-	t.CancelAllOrders(symbol)
+	if cancelExisting {
+		t.CancelAllOrders(symbol)
+	}
 
 	// Set leverage for long direction only (don't affect existing short positions)
 	if err := t.setLeverageForSide(symbol, leverage, "long"); err != nil {
@@ -778,6 +835,9 @@ func (t *OKXTrader) OpenLong(symbol string, quantity float64, leverage int) (map
 		szStr = t.formatSize(sz, inst)
 	}
 
+	if clientOrderID == "" {
+		clientOrderID = genOkxClOrdID()
+	}
 	body := map[string]interface{}{
 		"instId":  instId,
 		"tdMode":  t.getMgnMode(), // 使用当前设置的保证金模式
@@ -785,7 +845,7 @@ func (t *OKXTrader) OpenLong(symbol string, quantity float64, leverage int) (map
 		"posSide": "long",
 		"ordType": "market",
 		"sz":      szStr,
-		"clOrdId": genOkxClOrdID(),
+		"clOrdId": clientOrderID,
 		"tag":     okxTag,
 	}
 
@@ -815,9 +875,11 @@ func (t *OKXTrader) OpenLong(symbol string, quantity float64, leverage int) (map
 
 	logger.Infof("✓ OKX opened long position successfully: %s size: %s", symbol, szStr)
 	logger.Infof("  Order ID: %s", orders[0].OrdId)
+	t.invalidatePositionsCache()
 
 	return map[string]interface{}{
 		"orderId": orders[0].OrdId,
+		"clOrdId": orders[0].ClOrdId,
 		"symbol":  symbol,
 		"status":  "FILLED",
 	}, nil
@@ -825,8 +887,22 @@ func (t *OKXTrader) OpenLong(symbol string, quantity float64, leverage int) (map
 
 // OpenShort opens short position
 func (t *OKXTrader) OpenShort(symbol string, quantity float64, leverage int) (map[string]interface{}, error) {
+	return t.openShort(symbol, quantity, leverage, true, "")
+}
+
+func (t *OKXTrader) OpenShortPreservingOrders(symbol string, quantity float64, leverage int) (map[string]interface{}, error) {
+	return t.openShort(symbol, quantity, leverage, false, "")
+}
+
+func (t *OKXTrader) OpenShortPreservingOrdersWithClientID(symbol string, quantity float64, leverage int, clientOrderID string) (map[string]interface{}, error) {
+	return t.openShort(symbol, quantity, leverage, false, clientOrderID)
+}
+
+func (t *OKXTrader) openShort(symbol string, quantity float64, leverage int, cancelExisting bool, clientOrderID string) (map[string]interface{}, error) {
 	// Cancel old orders
-	t.CancelAllOrders(symbol)
+	if cancelExisting {
+		t.CancelAllOrders(symbol)
+	}
 
 	// Set leverage for short direction only (don't affect existing long positions)
 	if err := t.setLeverageForSide(symbol, leverage, "short"); err != nil {
@@ -855,6 +931,9 @@ func (t *OKXTrader) OpenShort(symbol string, quantity float64, leverage int) (ma
 		szStr = t.formatSize(sz, inst)
 	}
 
+	if clientOrderID == "" {
+		clientOrderID = genOkxClOrdID()
+	}
 	body := map[string]interface{}{
 		"instId":  instId,
 		"tdMode":  t.getMgnMode(), // 使用当前设置的保证金模式
@@ -862,7 +941,7 @@ func (t *OKXTrader) OpenShort(symbol string, quantity float64, leverage int) (ma
 		"posSide": "short",
 		"ordType": "market",
 		"sz":      szStr,
-		"clOrdId": genOkxClOrdID(),
+		"clOrdId": clientOrderID,
 		"tag":     okxTag,
 	}
 
@@ -893,8 +972,10 @@ func (t *OKXTrader) OpenShort(symbol string, quantity float64, leverage int) (ma
 	logger.Infof("✓ OKX opened short position successfully: %s size: %s", symbol, szStr)
 	logger.Infof("  Order ID: %s", orders[0].OrdId)
 
+	t.invalidatePositionsCache()
 	return map[string]interface{}{
 		"orderId": orders[0].OrdId,
+		"clOrdId": orders[0].ClOrdId,
 		"symbol":  symbol,
 		"status":  "FILLED",
 	}, nil
@@ -902,6 +983,14 @@ func (t *OKXTrader) OpenShort(symbol string, quantity float64, leverage int) (ma
 
 // CloseLong closes long position
 func (t *OKXTrader) CloseLong(symbol string, quantity float64) (map[string]interface{}, error) {
+	return t.closeLong(symbol, quantity, true)
+}
+
+func (t *OKXTrader) CloseLongPreservingOrders(symbol string, quantity float64) (map[string]interface{}, error) {
+	return t.closeLong(symbol, quantity, false)
+}
+
+func (t *OKXTrader) closeLong(symbol string, quantity float64, cancelExisting bool) (map[string]interface{}, error) {
 	instId := t.convertSymbol(symbol)
 
 	// Get instrument info for contract conversion
@@ -980,8 +1069,10 @@ func (t *OKXTrader) CloseLong(symbol string, quantity float64) (map[string]inter
 
 	logger.Infof("✓ OKX closed long position successfully: %s", symbol)
 
-	// Cancel pending orders after closing position
-	t.CancelAllOrders(symbol)
+	t.invalidatePositionsCache()
+	if cancelExisting {
+		t.CancelAllOrders(symbol)
+	}
 
 	return map[string]interface{}{
 		"orderId": orders[0].OrdId,
@@ -992,6 +1083,14 @@ func (t *OKXTrader) CloseLong(symbol string, quantity float64) (map[string]inter
 
 // CloseShort closes short position
 func (t *OKXTrader) CloseShort(symbol string, quantity float64) (map[string]interface{}, error) {
+	return t.closeShort(symbol, quantity, true)
+}
+
+func (t *OKXTrader) CloseShortPreservingOrders(symbol string, quantity float64) (map[string]interface{}, error) {
+	return t.closeShort(symbol, quantity, false)
+}
+
+func (t *OKXTrader) closeShort(symbol string, quantity float64, cancelExisting bool) (map[string]interface{}, error) {
 	instId := t.convertSymbol(symbol)
 
 	// Get instrument info for contract conversion
@@ -1078,8 +1177,10 @@ func (t *OKXTrader) CloseShort(symbol string, quantity float64) (map[string]inte
 
 	logger.Infof("✓ OKX closed short position successfully: %s, ordId=%s", symbol, orders[0].OrdId)
 
-	// Cancel pending orders after closing position
-	t.CancelAllOrders(symbol)
+	t.invalidatePositionsCache()
+	if cancelExisting {
+		t.CancelAllOrders(symbol)
+	}
 
 	return map[string]interface{}{
 		"orderId": orders[0].OrdId,
@@ -1361,7 +1462,16 @@ func (t *OKXTrader) formatSize(sz float64, inst *OKXInstrument) string {
 func (t *OKXTrader) GetOrderStatus(symbol string, orderID string) (map[string]interface{}, error) {
 	instId := t.convertSymbol(symbol)
 	path := fmt.Sprintf("/api/v5/trade/order?instId=%s&ordId=%s", instId, orderID)
+	return t.getOrderStatus(symbol, path)
+}
 
+func (t *OKXTrader) GetOrderStatusByClientID(symbol, clientOrderID string) (map[string]interface{}, error) {
+	instID := t.convertSymbol(symbol)
+	path := fmt.Sprintf("/api/v5/trade/order?instId=%s&clOrdId=%s", instID, clientOrderID)
+	return t.getOrderStatus(symbol, path)
+}
+
+func (t *OKXTrader) getOrderStatus(symbol, path string) (map[string]interface{}, error) {
 	data, err := t.doRequest("GET", path, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get order status: %w", err)
@@ -1400,7 +1510,7 @@ func (t *OKXTrader) GetOrderStatus(symbol string, orderID string) (map[string]in
 	inst, err := t.getInstrument(symbol)
 	if err == nil && inst.CtVal > 0 {
 		executedQty = fillSz * inst.CtVal
-		logger.Debugf("  📊 OKX order %s: fillSz(contracts)=%.4f, ctVal=%.6f, executedQty=%.6f", orderID, fillSz, inst.CtVal, executedQty)
+		logger.Debugf("  📊 OKX order %s: fillSz(contracts)=%.4f, ctVal=%.6f, executedQty=%.6f", order.OrdId, fillSz, inst.CtVal, executedQty)
 	}
 
 	// Status mapping
@@ -1509,9 +1619,10 @@ func (t *OKXTrader) GetClosedPnL(startTime time.Time, limit int) ([]ClosedPnLRec
 		// Fee
 		fee, _ := strconv.ParseFloat(pos.Fee, 64)
 		fundingFee, _ := strconv.ParseFloat(pos.FundingFee, 64)
-		record.Fee = fee // negative means paid; RealizedPnL already includes fee and funding
+		record.Fee = math.Abs(fee) // display as a positive cost; RealizedPnL already includes it
 		record.FundingFee = fundingFee
-		record.LiquidationPenalty, _ = strconv.ParseFloat(pos.LiqPenalty, 64)
+		penalty, _ := strconv.ParseFloat(pos.LiqPenalty, 64)
+		record.LiquidationPenalty = math.Abs(penalty)
 		record.GrossPnL, _ = strconv.ParseFloat(pos.Pnl, 64)
 
 		// Leverage

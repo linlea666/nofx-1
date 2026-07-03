@@ -863,6 +863,12 @@ func (at *AutoTrader) GetProtectiveStop(algoID, symbol string) (*ProtectiveStopO
 	}
 	return mgr.GetProtectiveStop(algoID, symbol)
 }
+func (at *AutoTrader) GetPositionsFresh() ([]map[string]interface{}, error) {
+	if provider, ok := at.trader.(FreshPositionProvider); ok {
+		return provider.GetPositionsFresh()
+	}
+	return at.trader.GetPositions()
+}
 func (at *AutoTrader) CancelProtectiveStop(algoID, symbol string) error {
 	mgr, ok := at.trader.(ProtectiveStopManager)
 	if !ok {
@@ -876,6 +882,13 @@ func (at *AutoTrader) GetClosedPnL(start time.Time, limit int) ([]ClosedPnLRecor
 }
 func (at *AutoTrader) GetOrderStatus(symbol, orderID string) (map[string]interface{}, error) {
 	return at.trader.GetOrderStatus(symbol, orderID)
+}
+func (at *AutoTrader) GetOrderStatusByClientID(symbol, clientOrderID string) (map[string]interface{}, error) {
+	p, ok := at.trader.(ClientOrderStatusProvider)
+	if !ok {
+		return nil, fmt.Errorf("exchange does not support client order lookup")
+	}
+	return p.GetOrderStatusByClientID(symbol, clientOrderID)
 }
 
 // ExecuteDecision executes a trading decision from external sources (e.g., debate consensus)
@@ -903,6 +916,64 @@ func (at *AutoTrader) ExecuteDecision(d *decision.Decision) error {
 
 	logger.Infof("[%s] External decision executed successfully: %s %s", at.name, d.Action, d.Symbol)
 	return nil
+}
+
+func (at *AutoTrader) openLongOrder(copyTrade bool, symbol string, quantity float64, leverage int, clientOrderID string) (map[string]interface{}, error) {
+	if copyTrade {
+		if clientOrderID != "" {
+			if executor, ok := at.trader.(CopyTradeIdempotentOrderExecutor); ok {
+				return executor.OpenLongPreservingOrdersWithClientID(symbol, quantity, leverage, clientOrderID)
+			}
+		}
+		if executor, ok := at.trader.(CopyTradeOrderExecutor); ok {
+			return executor.OpenLongPreservingOrders(symbol, quantity, leverage)
+		}
+	}
+	return at.trader.OpenLong(symbol, quantity, leverage)
+}
+
+func (at *AutoTrader) openShortOrder(copyTrade bool, symbol string, quantity float64, leverage int, clientOrderID string) (map[string]interface{}, error) {
+	if copyTrade {
+		if clientOrderID != "" {
+			if executor, ok := at.trader.(CopyTradeIdempotentOrderExecutor); ok {
+				return executor.OpenShortPreservingOrdersWithClientID(symbol, quantity, leverage, clientOrderID)
+			}
+		}
+		if executor, ok := at.trader.(CopyTradeOrderExecutor); ok {
+			return executor.OpenShortPreservingOrders(symbol, quantity, leverage)
+		}
+	}
+	return at.trader.OpenShort(symbol, quantity, leverage)
+}
+
+func (at *AutoTrader) closeLongOrder(copyTrade bool, symbol string, quantity float64) (map[string]interface{}, error) {
+	if copyTrade {
+		if executor, ok := at.trader.(CopyTradeOrderExecutor); ok {
+			return executor.CloseLongPreservingOrders(symbol, quantity)
+		}
+	}
+	return at.trader.CloseLong(symbol, quantity)
+}
+
+func (at *AutoTrader) closeShortOrder(copyTrade bool, symbol string, quantity float64) (map[string]interface{}, error) {
+	if copyTrade {
+		if executor, ok := at.trader.(CopyTradeOrderExecutor); ok {
+			return executor.CloseShortPreservingOrders(symbol, quantity)
+		}
+	}
+	return at.trader.CloseShort(symbol, quantity)
+}
+
+func captureDecisionOrderIDs(d *decision.Decision, order map[string]interface{}) {
+	if d == nil || order == nil {
+		return
+	}
+	if id, ok := order["orderId"].(string); ok {
+		d.ExchangeOrderID = id
+	}
+	if id, ok := order["clOrdId"].(string); ok && id != "" {
+		d.ClientOrderID = id
+	}
 }
 
 // executeOpenLongWithRecord executes open long position and records detailed information
@@ -1052,7 +1123,7 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 	}
 
 	// Open position
-	order, err := at.trader.OpenLong(decision.Symbol, quantity, decision.Leverage)
+	order, err := at.openLongOrder(isCopyTrade, decision.Symbol, quantity, decision.Leverage, decision.ClientOrderID)
 	if err != nil {
 		// 🔁 PR-4 / 修复 E'：跟单开仓遇到保证金不足，自动减半重试一次。
 		//
@@ -1071,7 +1142,7 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 			retrySize := actualPositionSize * 0.5
 			logger.Warnf("  🔁 [%s] 跟单开多保证金不足，减半重试一次 | qty=%.4f→%.4f USD=%.2f→%.2f | 原err=%v",
 				decision.Symbol, quantity, retryQty, actualPositionSize, retrySize, err)
-			order2, err2 := at.trader.OpenLong(decision.Symbol, retryQty, decision.Leverage)
+			order2, err2 := at.openLongOrder(isCopyTrade, decision.Symbol, retryQty, decision.Leverage, decision.ClientOrderID)
 			if err2 != nil {
 				return fmt.Errorf("open long retry-halved failed: initial=%v retry=%v", err, err2)
 			}
@@ -1085,6 +1156,7 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 			return err
 		}
 	}
+	captureDecisionOrderIDs(decision, order)
 
 	// Record order ID
 	if orderID, ok := order["orderId"].(int64); ok {
@@ -1265,7 +1337,7 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 	}
 
 	// Open position
-	order, err := at.trader.OpenShort(decision.Symbol, quantity, decision.Leverage)
+	order, err := at.openShortOrder(isCopyTrade, decision.Symbol, quantity, decision.Leverage, decision.ClientOrderID)
 	if err != nil {
 		// 🔁 PR-4 / 修复 E'：跟单开空保证金不足，自动减半重试一次。逻辑与 OpenLong 对称。
 		// 详见 executeOpenLongWithRecord 中相同位置的注释。
@@ -1274,7 +1346,7 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 			retrySize := actualPositionSize * 0.5
 			logger.Warnf("  🔁 [%s] 跟单开空保证金不足，减半重试一次 | qty=%.4f→%.4f USD=%.2f→%.2f | 原err=%v",
 				decision.Symbol, quantity, retryQty, actualPositionSize, retrySize, err)
-			order2, err2 := at.trader.OpenShort(decision.Symbol, retryQty, decision.Leverage)
+			order2, err2 := at.openShortOrder(isCopyTrade, decision.Symbol, retryQty, decision.Leverage, decision.ClientOrderID)
 			if err2 != nil {
 				return fmt.Errorf("open short retry-halved failed: initial=%v retry=%v", err, err2)
 			}
@@ -1288,6 +1360,7 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 			return err
 		}
 	}
+	captureDecisionOrderIDs(decision, order)
 
 	// Record order ID
 	if orderID, ok := order["orderId"].(int64); ok {
@@ -1416,10 +1489,11 @@ func (at *AutoTrader) executeCloseLongWithRecord(decision *decision.Decision, ac
 	}
 
 	// Close position
-	order, err := at.trader.CloseLong(decision.Symbol, closeQuantity)
+	order, err := at.closeLongOrder(isCopyTrade, decision.Symbol, closeQuantity)
 	if err != nil {
 		return err
 	}
+	captureDecisionOrderIDs(decision, order)
 
 	// Record order ID
 	if orderID, ok := order["orderId"].(int64); ok {
@@ -1544,10 +1618,11 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *decision.Decision, a
 	}
 
 	// Close position
-	order, err := at.trader.CloseShort(decision.Symbol, closeQuantity)
+	order, err := at.closeShortOrder(isCopyTrade, decision.Symbol, closeQuantity)
 	if err != nil {
 		return err
 	}
+	captureDecisionOrderIDs(decision, order)
 
 	// Record order ID
 	if orderID, ok := order["orderId"].(int64); ok {

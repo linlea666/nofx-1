@@ -216,6 +216,7 @@ export interface CopyConfigRequest {
   risk_policy_version?: number
   risk_stop_mode?: 'volatility_priority' | 'account_hard_limit'
   risk_atr_period?: number
+  risk_atr_cache_max_age_minutes?: number
   risk_atr_fallback_pct?: number
   risk_trigger_price_type?: 'mark' | 'last' | 'index'
   risk_slippage_buffer_bps?: number
@@ -227,6 +228,7 @@ export interface CopyConfigRequest {
   risk_reentry_max_atr_expansion?: number
   risk_watch_timeout_minutes?: number
   risk_migration_confirmed?: boolean
+  risk_high_risk_confirmed?: boolean
 }
 
 export interface UpdateModelConfigRequest {
@@ -703,6 +705,7 @@ export interface CopyTradeConfig {
   risk_policy_version?: number
   risk_stop_mode?: 'volatility_priority' | 'account_hard_limit'
   risk_atr_period?: number
+  risk_atr_cache_max_age_minutes?: number
   risk_atr_fallback_pct?: number
   risk_trigger_price_type?: 'mark' | 'last' | 'index'
   risk_slippage_buffer_bps?: number
@@ -730,7 +733,27 @@ export interface CopyGuardSummary {
   net_guard_effect: number
   fees: number
   funding_fee: number
+  liquidation_penalty: number
   slippage: number
+  protected_count: number
+  unknown_count: number
+  degraded_count: number
+  average_coverage: number
+  ignored_count: number
+  reentry_first: number
+  reentry_second: number
+  reentry_third_plus: number
+  max_avoided_loss: number
+  max_opportunity_cost: number
+  protection_missing_seconds: number
+  reentry_success_rate: number
+  false_kill_rate: number
+  trend: Array<{
+    date: string
+    actual: number
+    baseline: number
+    net_effect: number
+  }>
 }
 export interface CopyGuardCycle {
   id: number
@@ -748,7 +771,20 @@ export interface CopyGuardCycle {
   net_guard_effect: number
   fees: number
   funding_fee: number
+  liquidation_penalty: number
   slippage: number
+  protection_status:
+    | 'PENDING'
+    | 'VERIFIED'
+    | 'UNKNOWN'
+    | 'DEGRADED'
+    | 'TRIGGERED'
+    | 'CANCELED'
+  protection_coverage: number
+  protection_retries: number
+  protection_error: string
+  follower_pos_id?: string
+  policy_snapshot: string
   opened_at: string
   closed_at?: string
 }

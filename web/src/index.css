@@ -12,40 +12,40 @@ html {
 
 :root {
   /* Binance Brand Colors */
-  --brand-yellow: #FCD535;
-  --brand-black: #0B0E11;
-  --brand-dark-gray: #1E2329;
-  --brand-light-gray: #EAECEF;
-  --brand-white: #FFFFFF;
+  --brand-yellow: #fcd535;
+  --brand-black: #0b0e11;
+  --brand-dark-gray: #1e2329;
+  --brand-light-gray: #eaecef;
+  --brand-white: #ffffff;
 
   /* Premium Theme Colors */
-  --binance-yellow: #FCD535;
-  --binance-yellow-dark: #F0B90B;
-  --binance-yellow-light: #FDE059;
+  --binance-yellow: #fcd535;
+  --binance-yellow-dark: #f0b90b;
+  --binance-yellow-light: #fde059;
   --binance-yellow-glow: rgba(252, 213, 53, 0.15);
 
-  --background: #0B0E11;
+  --background: #0b0e11;
   --header-bg: rgba(11, 14, 17, 0.85);
   /* Glass header */
   --glass-bg: rgba(30, 35, 41, 0.4);
   --glass-border: rgba(255, 255, 255, 0.08);
 
-  --panel-bg: #1E2329;
-  --panel-bg-hover: #2B3139;
-  --panel-border: #2B3139;
-  --panel-border-hover: #474D57;
+  --panel-bg: #1e2329;
+  --panel-bg-hover: #2b3139;
+  --panel-border: #2b3139;
+  --panel-border-hover: #474d57;
 
-  --foreground: #EAECEF;
-  --text-primary: #EAECEF;
-  --text-secondary: #848E9C;
-  --text-tertiary: #5E6673;
-  --text-disabled: #474D57;
+  --foreground: #eaecef;
+  --text-primary: #eaecef;
+  --text-secondary: #848e9c;
+  --text-tertiary: #5e6673;
+  --text-disabled: #474d57;
 
   /* Trading Colors */
-  --binance-green: #0ECB81;
+  --binance-green: #0ecb81;
   --binance-green-bg: rgba(14, 203, 129, 0.12);
   --binance-green-border: rgba(14, 203, 129, 0.3);
-  --binance-red: #F6465D;
+  --binance-red: #f6465d;
   --binance-red-bg: rgba(246, 70, 93, 0.12);
   --binance-red-border: rgba(246, 70, 93, 0.3);
 
@@ -80,15 +80,23 @@ body {
   min-height: 100vh;
   background-color: var(--background);
   background-image:
-    radial-gradient(circle at 15% 50%, rgba(252, 213, 53, 0.08), transparent 25%),
-    radial-gradient(circle at 85% 30%, rgba(14, 203, 129, 0.05), transparent 25%);
+    radial-gradient(
+      circle at 15% 50%,
+      rgba(252, 213, 53, 0.08),
+      transparent 25%
+    ),
+    radial-gradient(
+      circle at 85% 30%,
+      rgba(14, 203, 129, 0.05),
+      transparent 25%
+    );
   background-attachment: fixed;
 }
 
 /* Premium Selection Styles */
 ::selection {
   background: rgba(252, 213, 53, 0.3);
-  color: #FFFFFF;
+  color: #ffffff;
 }
 
 #root {
@@ -154,7 +162,6 @@ body {
 }
 
 @keyframes pulse-glow {
-
   0%,
   100% {
     opacity: 1;
@@ -178,7 +185,6 @@ body {
 }
 
 @keyframes pulse-scale {
-
   0%,
   100% {
     transform: scale(1);
@@ -321,7 +327,7 @@ button:disabled {
 /* Button Variants */
 .btn-success {
   background: rgba(14, 203, 129, 0.1);
-  color: #0ECB81;
+  color: #0ecb81;
   border: 1px solid rgba(14, 203, 129, 0.3);
 }
 
@@ -332,7 +338,7 @@ button:disabled {
 
 .btn-danger {
   background: rgba(246, 70, 93, 0.1);
-  color: #F6465D;
+  color: #f6465d;
   border: 1px solid rgba(246, 70, 93, 0.3);
 }
 
@@ -343,13 +349,13 @@ button:disabled {
 
 .btn-outline {
   background: transparent;
-  color: #848E9C;
-  border: 1px solid #2B3139;
+  color: #848e9c;
+  border: 1px solid #2b3139;
 }
 
 .btn-outline:hover:not(:disabled) {
-  border-color: #F0B90B;
-  color: #F0B90B;
+  border-color: #f0b90b;
+  color: #f0b90b;
   background: rgba(240, 185, 11, 0.1);
 }
 
@@ -394,7 +400,9 @@ textarea:focus {
   border-radius: 12px;
   /* More modern radius */
   transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+  box-shadow:
+    0 4px 6px -1px rgba(0, 0, 0, 0.1),
+    0 2px 4px -1px rgba(0, 0, 0, 0.06);
   overflow: hidden;
   /* Ensure rounded corners contain content */
 }
@@ -522,15 +530,19 @@ textarea:focus {
 
 /* Binance gradient backgrounds */
 .binance-gradient {
-  background: linear-gradient(135deg,
-      var(--binance-yellow) 0%,
-      var(--binance-yellow-light) 100%);
+  background: linear-gradient(
+    135deg,
+    var(--binance-yellow) 0%,
+    var(--binance-yellow-light) 100%
+  );
 }
 
 .binance-gradient-subtle {
-  background: linear-gradient(135deg,
-      rgba(240, 185, 11, 0.15) 0%,
-      rgba(252, 213, 53, 0.05) 100%);
+  background: linear-gradient(
+    135deg,
+    rgba(240, 185, 11, 0.15) 0%,
+    rgba(252, 213, 53, 0.05) 100%
+  );
   border: 1px solid rgba(240, 185, 11, 0.2);
 }
 
@@ -564,10 +576,12 @@ textarea:focus {
 /* Skeleton loading */
 .skeleton {
   background: var(--panel-bg);
-  background-image: linear-gradient(90deg,
-      transparent,
-      rgba(240, 185, 11, 0.05),
-      transparent);
+  background-image: linear-gradient(
+    90deg,
+    transparent,
+    rgba(240, 185, 11, 0.05),
+    transparent
+  );
   background-size: 200% 100%;
   animation: shimmer 1.5s infinite;
   border-radius: 4px;
@@ -740,10 +754,12 @@ tr:hover {
   left: 0;
   right: 0;
   height: 2px;
-  background: linear-gradient(90deg,
-      transparent,
-      var(--binance-yellow),
-      transparent);
+  background: linear-gradient(
+    90deg,
+    transparent,
+    var(--binance-yellow),
+    transparent
+  );
   opacity: 0;
   transition: opacity 0.2s ease;
 }

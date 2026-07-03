@@ -145,6 +145,7 @@ type CopyConfig struct {
 	RiskPolicyVersion           int     `json:"risk_policy_version"`
 	RiskStopMode                string  `json:"risk_stop_mode"`
 	RiskATRPeriod               int     `json:"risk_atr_period"`
+	RiskATRCacheMaxAgeMinutes   int     `json:"risk_atr_cache_max_age_minutes"`
 	RiskATRFallbackPct          float64 `json:"risk_atr_fallback_pct"`
 	RiskTriggerPriceType        string  `json:"risk_trigger_price_type"`
 	RiskSlippageBufferBPS       float64 `json:"risk_slippage_buffer_bps"`
@@ -198,23 +199,14 @@ func (c *CopyConfig) FillRiskDefaults() {
 		if c.RiskATRPeriod == 0 {
 			c.RiskATRPeriod = 14
 		}
+		if c.RiskATRCacheMaxAgeMinutes == 0 {
+			c.RiskATRCacheMaxAgeMinutes = 120
+		}
 		if c.RiskATRFallbackPct == 0 {
 			c.RiskATRFallbackPct = 0.02
 		}
 		if c.RiskTriggerPriceType == "" {
 			c.RiskTriggerPriceType = "mark"
-		}
-		if c.RiskLiquidationBufferATR == 0 {
-			c.RiskLiquidationBufferATR = 0.5
-		}
-		if c.RiskMaxReentries == 0 {
-			c.RiskMaxReentries = 2
-		}
-		if c.RiskReentryBandATR == 0 {
-			c.RiskReentryBandATR = 0.5
-		}
-		if c.RiskReentryCooldownSeconds == 0 {
-			c.RiskReentryCooldownSeconds = 60
 		}
 		if c.RiskReentryMaxATRExpansion == 0 {
 			c.RiskReentryMaxATRExpansion = 2
