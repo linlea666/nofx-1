@@ -61,6 +61,22 @@ type CopyTradeConfig struct {
 	RiskReentryBlockAddback     bool    `json:"risk_reentry_block_addback"`
 	RiskReentryAddbackTolerance float64 `json:"risk_reentry_addback_tolerance"`
 
+	// Copy Guard v4。独立存储于 copy_guard_policies，避免破坏 v3 配置表和旧版回滚。
+	RiskPolicyVersion          int     `json:"risk_policy_version"`
+	RiskStopMode               string  `json:"risk_stop_mode"`
+	RiskATRPeriod              int     `json:"risk_atr_period"`
+	RiskATRFallbackPct         float64 `json:"risk_atr_fallback_pct"`
+	RiskTriggerPriceType       string  `json:"risk_trigger_price_type"`
+	RiskSlippageBufferBPS      float64 `json:"risk_slippage_buffer_bps"`
+	RiskLiquidationBufferATR   float64 `json:"risk_liquidation_buffer_atr"`
+	RiskMaxReentries           int     `json:"risk_max_reentries"`
+	RiskReentryBandATR         float64 `json:"risk_reentry_band_atr"`
+	RiskReentryCooldownSeconds int     `json:"risk_reentry_cooldown_seconds"`
+	RiskReentryMaxChaseATR     float64 `json:"risk_reentry_max_chase_atr"`
+	RiskReentryMaxATRExpansion float64 `json:"risk_reentry_max_atr_expansion"`
+	RiskWatchTimeoutMinutes    int     `json:"risk_watch_timeout_minutes"`
+	RiskMigrationConfirmed     bool    `json:"risk_migration_confirmed"`
+
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
@@ -76,7 +92,11 @@ type CopyTradeConfig struct {
 //     新手应在 UI 上手动调低到 0.5-1%
 func (c *CopyTradeConfig) FillRiskDefaults() {
 	if c.RiskAccountPct == 0 {
-		c.RiskAccountPct = 0.5
+		if c.RiskPolicyVersion >= 4 {
+			c.RiskAccountPct = 0.02
+		} else {
+			c.RiskAccountPct = 0.5
+		}
 	}
 	if c.RiskATRMultiplier == 0 {
 		c.RiskATRMultiplier = 1.5
@@ -100,6 +120,35 @@ func (c *CopyTradeConfig) FillRiskDefaults() {
 	// 此处不做兜底（由 API handler 的 *bool 透传机制处理"未传"语义）
 	if c.RiskReentryAddbackTolerance == 0 {
 		c.RiskReentryAddbackTolerance = 1.20
+	}
+	if c.RiskPolicyVersion >= 4 {
+		if c.RiskStopMode == "" {
+			c.RiskStopMode = "volatility_priority"
+		}
+		if c.RiskATRPeriod == 0 {
+			c.RiskATRPeriod = 14
+		}
+		if c.RiskATRFallbackPct == 0 {
+			c.RiskATRFallbackPct = 0.02
+		}
+		if c.RiskTriggerPriceType == "" {
+			c.RiskTriggerPriceType = "mark"
+		}
+		if c.RiskLiquidationBufferATR == 0 {
+			c.RiskLiquidationBufferATR = 0.5
+		}
+		if c.RiskMaxReentries == 0 {
+			c.RiskMaxReentries = 2
+		}
+		if c.RiskReentryBandATR == 0 {
+			c.RiskReentryBandATR = 0.5
+		}
+		if c.RiskReentryCooldownSeconds == 0 {
+			c.RiskReentryCooldownSeconds = 60
+		}
+		if c.RiskReentryMaxATRExpansion == 0 {
+			c.RiskReentryMaxATRExpansion = 2
+		}
 	}
 }
 
@@ -185,7 +234,10 @@ func (s *CopyTradeStore) Create(config *CopyTradeConfig) error {
 		config.RiskATRTimeframe, config.RiskLeverageFallback, config.RiskLeverageMaxLoss,
 		config.RiskReentryEnabled, config.RiskReentryRatio, config.RiskReentryTolerance,
 		config.RiskReentryBlockAddback, config.RiskReentryAddbackTolerance)
-	return err
+	if err != nil {
+		return err
+	}
+	return s.saveCopyGuardPolicy(config)
 }
 
 // Update 更新跟单配置
@@ -224,7 +276,10 @@ func (s *CopyTradeStore) Update(config *CopyTradeConfig) error {
 		config.RiskReentryEnabled, config.RiskReentryRatio, config.RiskReentryTolerance,
 		config.RiskReentryBlockAddback, config.RiskReentryAddbackTolerance,
 		config.TraderID)
-	return err
+	if err != nil {
+		return err
+	}
+	return s.saveCopyGuardPolicy(config)
 }
 
 // Upsert 创建或更新跟单配置
@@ -269,7 +324,10 @@ func (s *CopyTradeStore) Upsert(config *CopyTradeConfig) error {
 		config.RiskATRTimeframe, config.RiskLeverageFallback, config.RiskLeverageMaxLoss,
 		config.RiskReentryEnabled, config.RiskReentryRatio, config.RiskReentryTolerance,
 		config.RiskReentryBlockAddback, config.RiskReentryAddbackTolerance)
-	return err
+	if err != nil {
+		return err
+	}
+	return s.saveCopyGuardPolicy(config)
 }
 
 // Delete 删除跟单配置
@@ -301,7 +359,9 @@ const copyTradeConfigSelectColumns = `
 
 // scanCopyTradeConfig 共用 Scan 逻辑（避免 GetByTraderID 与 ListEnabled 重复实现）
 // 参数列表必须与 copyTradeConfigSelectColumns 顺序一致
-func scanCopyTradeConfig(scanner interface{ Scan(dest ...interface{}) error }) (*CopyTradeConfig, error) {
+func scanCopyTradeConfig(scanner interface {
+	Scan(dest ...interface{}) error
+}) (*CopyTradeConfig, error) {
 	var config CopyTradeConfig
 	var createdAt, updatedAt string
 	var p20t, csrf sql.NullString
@@ -335,7 +395,15 @@ func scanCopyTradeConfig(scanner interface{ Scan(dest ...interface{}) error }) (
 // GetByTraderID 根据 trader_id 获取跟单配置
 func (s *CopyTradeStore) GetByTraderID(traderID string) (*CopyTradeConfig, error) {
 	row := s.db.QueryRow(`SELECT `+copyTradeConfigSelectColumns+` FROM copy_trade_configs WHERE trader_id = ?`, traderID)
-	return scanCopyTradeConfig(row)
+	config, err := scanCopyTradeConfig(row)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.loadCopyGuardPolicy(config); err != nil && err != sql.ErrNoRows {
+		return nil, err
+	}
+	config.FillRiskDefaults()
+	return config, nil
 }
 
 // ListEnabled 列出所有启用的跟单配置
@@ -352,6 +420,10 @@ func (s *CopyTradeStore) ListEnabled() ([]*CopyTradeConfig, error) {
 		if err != nil {
 			return nil, err
 		}
+		if err := s.loadCopyGuardPolicy(config); err != nil && err != sql.ErrNoRows {
+			return nil, err
+		}
+		config.FillRiskDefaults()
 		configs = append(configs, config)
 	}
 	return configs, nil
@@ -501,10 +573,10 @@ func (s *CopyTradeStore) GetRecentSignalLogs(traderID string, limit int) ([]*Cop
 
 // Mapping 状态常量（避免散落的魔法字符串）
 const (
-	MappingStatusActive         = "active"
-	MappingStatusClosed         = "closed"
-	MappingStatusIgnored        = "ignored"
-	MappingStatusStoppedByRisk  = "stopped_by_risk" // v3 风控：账户保护止损被交易所触发
+	MappingStatusActive        = "active"
+	MappingStatusClosed        = "closed"
+	MappingStatusIgnored       = "ignored"
+	MappingStatusStoppedByRisk = "stopped_by_risk" // v3 风控：账户保护止损被交易所触发
 )
 
 // CopyTradePositionMapping 仓位映射记录
@@ -545,8 +617,8 @@ type CopyTradePositionMapping struct {
 	// 账户保护止损触发快照（v3 风控，仅 status=stopped_by_risk 时有效）
 	// 用于判据 E（双门控）二次进场判断
 	// ============================================================
-	StoppedAt        *time.Time `json:"stopped_at,omitempty"`         // SL 触发时间
-	LeaderPnLAtStop  float64    `json:"leader_pnl_at_stop,omitempty"` // SL 触发时领航员该仓位浮亏（负值）
+	StoppedAt        *time.Time `json:"stopped_at,omitempty"`          // SL 触发时间
+	LeaderPnLAtStop  float64    `json:"leader_pnl_at_stop,omitempty"`  // SL 触发时领航员该仓位浮亏（负值）
 	LeaderSizeAtStop float64    `json:"leader_size_at_stop,omitempty"` // SL 触发时领航员该仓位大小
 	AddCountAtStop   int        `json:"add_count_at_stop,omitempty"`   // SL 触发时 AddCount 值（判反加仓）
 	ReentryUsed      bool       `json:"reentry_used,omitempty"`        // 该 posId 二次进场是否已用过（限 1 次）
@@ -646,7 +718,9 @@ const mappingSelectColumns = `
 
 // scanMapping 共用 mapping Scan 逻辑
 // 参数顺序与 mappingSelectColumns 一致
-func scanMapping(scanner interface{ Scan(dest ...interface{}) error }) (*CopyTradePositionMapping, error) {
+func scanMapping(scanner interface {
+	Scan(dest ...interface{}) error
+}) (*CopyTradePositionMapping, error) {
 	var mapping CopyTradePositionMapping
 	var openedAt, updatedAt string
 	var closedAt, stoppedAt sql.NullString
@@ -1017,6 +1091,15 @@ func (s *CopyTradeStore) MarkReentryUsed(traderID, leaderPosID string, reentryOp
 		    updated_at = CURRENT_TIMESTAMP
 		WHERE trader_id = ? AND leader_pos_id = ? AND status = 'stopped_by_risk'
 	`, reentryOpenPrice, reentryOpenSizeUSD, traderID, leaderPosID)
+	return err
+}
+
+// ActivateMappingAfterReentry is the v4 success-only transition. It is deliberately called after
+// exchange execution succeeds, so a rejected order never consumes or activates a reentry.
+func (s *CopyTradeStore) ActivateMappingAfterReentry(traderID, leaderPosID string, entryPrice, openSizeUSD, leaderSize float64) error {
+	_, err := s.db.Exec(`UPDATE copy_trade_position_mappings SET status='active', open_price=?, open_size_usd=?,
+		last_known_size=?, stopped_at=NULL, updated_at=CURRENT_TIMESTAMP
+		WHERE trader_id=? AND leader_pos_id=? AND status='stopped_by_risk'`, entryPrice, openSizeUSD, leaderSize, traderID, leaderPosID)
 	return err
 }
 

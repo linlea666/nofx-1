@@ -36,13 +36,28 @@ function getShortName(fullName: string): string {
 }
 
 // 交易所注册链接配置
-const EXCHANGE_REGISTRATION_LINKS: Record<string, { url: string; hasReferral?: boolean }> = {
-  binance: { url: 'https://www.binance.com/join?ref=NOFXENG', hasReferral: true },
+const EXCHANGE_REGISTRATION_LINKS: Record<
+  string,
+  { url: string; hasReferral?: boolean }
+> = {
+  binance: {
+    url: 'https://www.binance.com/join?ref=NOFXENG',
+    hasReferral: true,
+  },
   okx: { url: 'https://www.okx.com/join/1865360', hasReferral: true },
   bybit: { url: 'https://partner.bybit.com/b/83856', hasReferral: true },
-  hyperliquid: { url: 'https://app.hyperliquid.xyz/join/AITRADING', hasReferral: true },
-  aster: { url: 'https://www.asterdex.com/en/referral/fdfc0e', hasReferral: true },
-  lighter: { url: 'https://app.lighter.xyz/?referral=68151432', hasReferral: true },
+  hyperliquid: {
+    url: 'https://app.hyperliquid.xyz/join/AITRADING',
+    hasReferral: true,
+  },
+  aster: {
+    url: 'https://www.asterdex.com/en/referral/fdfc0e',
+    hasReferral: true,
+  },
+  lighter: {
+    url: 'https://app.lighter.xyz/?referral=68151432',
+    hasReferral: true,
+  },
 }
 
 import type { TraderConfigData } from '../types'
@@ -64,7 +79,7 @@ interface FormState {
   copy_leader_id: string
   copy_ratio: number
   copy_sync_leverage: boolean
-  copy_sync_margin_mode: boolean  // 同步保证金模式（OKX 区分全仓/逐仓）
+  copy_sync_margin_mode: boolean // 同步保证金模式（OKX 区分全仓/逐仓）
   // Binance Web 私有接口凭证（仅 copy_provider_type=binance 时使用）
   copy_binance_p20t: string
   copy_binance_csrf_token: string
@@ -72,19 +87,33 @@ interface FormState {
   // 账户保护 / 止损兜底（v3 风控）—— 仅 OKX 路径生效
   // 所有字段都有合理默认值，用户可在 UI 调整
   // ============================================================
-  risk_stop_loss_enabled: boolean   // 默认 true：启用账户保护硬止损
-  risk_account_pct: number          // 默认 0.5%（前端用百分比展示，提交时转 0.005）
-  risk_atr_enabled: boolean         // 默认 true
-  risk_atr_multiplier: number       // 默认 1.5
-  risk_atr_timeframe: string        // 默认 "1h"
-  risk_leverage_fallback: boolean   // 默认 true
-  risk_leverage_max_loss: number    // 默认 50%（前端用百分比展示，提交时转 0.5）
-  risk_reentry_enabled: boolean     // 默认 false（用户 opt-in）
-  risk_reentry_ratio: number        // 默认 50%（前端用百分比，提交时转 0.5）
-  risk_reentry_tolerance: number    // 默认 2%（前端用百分比，提交时 /100 转 0.02）—— v3.3 单边严格区间
+  risk_stop_loss_enabled: boolean // 默认 true：启用账户保护硬止损
+  risk_account_pct: number // 默认 0.5%（前端用百分比展示，提交时转 0.005）
+  risk_atr_enabled: boolean // 默认 true
+  risk_atr_multiplier: number // 默认 1.5
+  risk_atr_timeframe: string // 默认 "1h"
+  risk_leverage_fallback: boolean // 默认 true
+  risk_leverage_max_loss: number // 默认 50%（前端用百分比展示，提交时转 0.5）
+  risk_reentry_enabled: boolean // 默认 false（用户 opt-in）
+  risk_reentry_ratio: number // 默认 50%（前端用百分比，提交时转 0.5）
+  risk_reentry_tolerance: number // 默认 2%（前端用百分比，提交时 /100 转 0.02）—— v3.3 单边严格区间
   // v3.2 反加仓铁律（仅 risk_reentry_enabled=on 时有效）
-  risk_reentry_block_addback: boolean  // 默认 true：阻止领航员加仓后的重入
+  risk_reentry_block_addback: boolean // 默认 true：阻止领航员加仓后的重入
   risk_reentry_addback_tolerance: number // 前端用百分比展示：默认 20 (=20% 加仓容差)，提交时 1+x/100 转倍数
+  risk_policy_version: number
+  risk_stop_mode: 'volatility_priority' | 'account_hard_limit'
+  risk_atr_period: number
+  risk_atr_fallback_pct: number
+  risk_trigger_price_type: 'mark' | 'last' | 'index'
+  risk_slippage_buffer_bps: number
+  risk_liquidation_buffer_atr: number
+  risk_max_reentries: number
+  risk_reentry_band_atr: number
+  risk_reentry_cooldown_seconds: number
+  risk_reentry_max_chase_atr: number
+  risk_reentry_max_atr_expansion: number
+  risk_watch_timeout_minutes: number
+  risk_migration_confirmed: boolean
 }
 
 interface TraderConfigModalProps {
@@ -120,22 +149,36 @@ export function TraderConfigModal({
     copy_leader_id: '',
     copy_ratio: 1.0,
     copy_sync_leverage: true,
-    copy_sync_margin_mode: true,  // 默认同步保证金模式
+    copy_sync_margin_mode: true, // 默认同步保证金模式
     copy_binance_p20t: '',
     copy_binance_csrf_token: '',
     // 账户保护 v3 风控默认值（与后端 store.FillRiskDefaults 保持一致）
     risk_stop_loss_enabled: true,
-    risk_account_pct: 50,           // %（提交时 /100 转 0.5）—— v3.1 激进默认值
+    risk_account_pct: 50, // %（提交时 /100 转 0.5）—— v3.1 激进默认值
     risk_atr_enabled: true,
     risk_atr_multiplier: 1.5,
     risk_atr_timeframe: '1h',
     risk_leverage_fallback: true,
-    risk_leverage_max_loss: 50,     // %（提交时 /100 转 0.5）
+    risk_leverage_max_loss: 50, // %（提交时 /100 转 0.5）
     risk_reentry_enabled: false,
-    risk_reentry_ratio: 50,         // %（提交时 /100 转 0.5）
-    risk_reentry_tolerance: 2,      // %（提交时 /100 转 0.02）—— v3.3 单边严格区间需更宽容差
-    risk_reentry_block_addback: true,  // 默认开启（保护账户）
+    risk_reentry_ratio: 50, // %（提交时 /100 转 0.5）
+    risk_reentry_tolerance: 2, // %（提交时 /100 转 0.02）—— v3.3 单边严格区间需更宽容差
+    risk_reentry_block_addback: true, // 默认开启（保护账户）
     risk_reentry_addback_tolerance: 20, // %（提交时 1+x/100 转 1.20）
+    risk_policy_version: 4,
+    risk_stop_mode: 'volatility_priority',
+    risk_atr_period: 14,
+    risk_atr_fallback_pct: 2,
+    risk_trigger_price_type: 'mark',
+    risk_slippage_buffer_bps: 10,
+    risk_liquidation_buffer_atr: 0.5,
+    risk_max_reentries: 2,
+    risk_reentry_band_atr: 0.5,
+    risk_reentry_cooldown_seconds: 60,
+    risk_reentry_max_chase_atr: 0,
+    risk_reentry_max_atr_expansion: 2,
+    risk_watch_timeout_minutes: 0,
+    risk_migration_confirmed: true,
   })
   const [, setCopyTradeConfig] = useState<CopyTradeConfig | null>(null)
   const [isSaving, setIsSaving] = useState(false)
@@ -144,7 +187,8 @@ export function TraderConfigModal({
   const [balanceFetchError, setBalanceFetchError] = useState<string>('')
 
   // Binance 全局凭证状态（仅 provider=binance 时拉取，作为状态展示）
-  const [binanceGlobalCreds, setBinanceGlobalCreds] = useState<BinanceCredentialsView | null>(null)
+  const [binanceGlobalCreds, setBinanceGlobalCreds] =
+    useState<BinanceCredentialsView | null>(null)
   const [showBinanceCredsModal, setShowBinanceCredsModal] = useState(false)
   const [refreshGlobalCredsTick, setRefreshGlobalCredsTick] = useState(0)
 
@@ -153,31 +197,44 @@ export function TraderConfigModal({
   useEffect(() => {
     if (!isOpen || formData.copy_provider_type !== 'binance') return
     let cancelled = false
-    api.listBinanceCredentials()
+    api
+      .listBinanceCredentials()
       .then((list) => {
         if (cancelled) return
         const def = list.find((c) => c.label === 'default') ?? null
         setBinanceGlobalCreds(def)
       })
-      .catch(() => { /* 静默：状态卡仅展示用，失败时显示"未配置"即可 */ })
-    return () => { cancelled = true }
+      .catch(() => {
+        /* 静默：状态卡仅展示用，失败时显示"未配置"即可 */
+      })
+    return () => {
+      cancelled = true
+    }
   }, [isOpen, formData.copy_provider_type, refreshGlobalCredsTick])
 
   // 获取用户的策略列表
   useEffect(() => {
     const fetchStrategies = async () => {
       try {
-        const result = await httpClient.get<{ strategies: Strategy[] }>('/api/strategies')
+        const result = await httpClient.get<{ strategies: Strategy[] }>(
+          '/api/strategies'
+        )
         if (result.success && result.data?.strategies) {
           const strategyList = result.data.strategies
           setStrategies(strategyList)
           // 如果没有选择策略，默认选中激活的策略
           if (!formData.strategy_id && !isEditMode) {
-            const activeStrategy = strategyList.find(s => s.is_active)
+            const activeStrategy = strategyList.find((s) => s.is_active)
             if (activeStrategy) {
-              setFormData(prev => ({ ...prev, strategy_id: activeStrategy.id }))
+              setFormData((prev) => ({
+                ...prev,
+                strategy_id: activeStrategy.id,
+              }))
             } else if (strategyList.length > 0) {
-              setFormData(prev => ({ ...prev, strategy_id: strategyList[0].id }))
+              setFormData((prev) => ({
+                ...prev,
+                strategy_id: strategyList[0].id,
+              }))
             }
           }
         }
@@ -195,39 +252,68 @@ export function TraderConfigModal({
     const fetchCopyTradeConfig = async () => {
       if (!isEditMode || !traderData?.trader_id) return
       try {
-        const result = await httpClient.get<{ config: CopyTradeConfig }>(`/api/copytrade/config/${traderData.trader_id}`)
+        const result = await httpClient.get<{ config: CopyTradeConfig }>(
+          `/api/copytrade/config/${traderData.trader_id}`
+        )
         if (result.success && result.data?.config) {
           const cfg = result.data.config
           setCopyTradeConfig(cfg)
           // 只加载跟单参数，decision_mode 由 traderData 决定
           // 风控字段：后端用比例（如 0.02=2%）存，前端用百分比展示，× 100 转换
-          setFormData(prev => ({
+          setFormData((prev) => ({
             ...prev,
             copy_provider_type: cfg.provider_type as CopyTradeProvider,
             copy_leader_id: cfg.leader_id,
             copy_ratio: cfg.copy_ratio,
             copy_sync_leverage: cfg.sync_leverage,
-            copy_sync_margin_mode: cfg.sync_margin_mode ?? true,  // 默认 true
+            copy_sync_margin_mode: cfg.sync_margin_mode ?? true, // 默认 true
             copy_binance_p20t: cfg.binance_p20t ?? '',
             copy_binance_csrf_token: cfg.binance_csrf_token ?? '',
             // 风控字段回填（× 100 转百分比展示）
             // 默认 50% 是 v3.1 用户明确选择的激进配置（与 store.FillRiskDefaults 保持一致）
             risk_stop_loss_enabled: cfg.risk_stop_loss_enabled ?? true,
-            risk_account_pct: cfg.risk_account_pct != null ? cfg.risk_account_pct * 100 : 50,
+            risk_account_pct:
+              cfg.risk_account_pct != null ? cfg.risk_account_pct * 100 : 50,
             risk_atr_enabled: cfg.risk_atr_enabled ?? true,
             risk_atr_multiplier: cfg.risk_atr_multiplier ?? 1.5,
             risk_atr_timeframe: cfg.risk_atr_timeframe ?? '1h',
             risk_leverage_fallback: cfg.risk_leverage_fallback ?? true,
-            risk_leverage_max_loss: cfg.risk_leverage_max_loss != null ? cfg.risk_leverage_max_loss * 100 : 50,
+            risk_leverage_max_loss:
+              cfg.risk_leverage_max_loss != null
+                ? cfg.risk_leverage_max_loss * 100
+                : 50,
             risk_reentry_enabled: cfg.risk_reentry_enabled ?? false,
-            risk_reentry_ratio: cfg.risk_reentry_ratio != null ? cfg.risk_reentry_ratio * 100 : 50,
-            risk_reentry_tolerance: cfg.risk_reentry_tolerance != null ? cfg.risk_reentry_tolerance * 100 : 2,
+            risk_reentry_ratio:
+              cfg.risk_reentry_ratio != null
+                ? cfg.risk_reentry_ratio * 100
+                : 50,
+            risk_reentry_tolerance:
+              cfg.risk_reentry_tolerance != null
+                ? cfg.risk_reentry_tolerance * 100
+                : 2,
             risk_reentry_block_addback: cfg.risk_reentry_block_addback ?? true,
             // 后端存倍数（如 1.20），前端展示百分比（如 20%）：(倍数 - 1) × 100
             // 防御：DB 异常值（< 1.0）clamp 到 0，避免 UI 显示负百分比
-            risk_reentry_addback_tolerance: cfg.risk_reentry_addback_tolerance != null
-              ? Math.max(0, (cfg.risk_reentry_addback_tolerance - 1) * 100)
-              : 20,
+            risk_reentry_addback_tolerance:
+              cfg.risk_reentry_addback_tolerance != null
+                ? Math.max(0, (cfg.risk_reentry_addback_tolerance - 1) * 100)
+                : 20,
+            risk_policy_version: cfg.risk_policy_version ?? 3,
+            risk_stop_mode: cfg.risk_stop_mode ?? 'volatility_priority',
+            risk_atr_period: cfg.risk_atr_period ?? 14,
+            risk_atr_fallback_pct: (cfg.risk_atr_fallback_pct ?? 0.02) * 100,
+            risk_trigger_price_type: cfg.risk_trigger_price_type ?? 'mark',
+            risk_slippage_buffer_bps: cfg.risk_slippage_buffer_bps ?? 10,
+            risk_liquidation_buffer_atr: cfg.risk_liquidation_buffer_atr ?? 0.5,
+            risk_max_reentries: cfg.risk_max_reentries ?? 2,
+            risk_reentry_band_atr: cfg.risk_reentry_band_atr ?? 0.5,
+            risk_reentry_cooldown_seconds:
+              cfg.risk_reentry_cooldown_seconds ?? 60,
+            risk_reentry_max_chase_atr: cfg.risk_reentry_max_chase_atr ?? 0,
+            risk_reentry_max_atr_expansion:
+              cfg.risk_reentry_max_atr_expansion ?? 2,
+            risk_watch_timeout_minutes: cfg.risk_watch_timeout_minutes ?? 0,
+            risk_migration_confirmed: cfg.risk_migration_confirmed ?? false,
           }))
         }
       } catch (error) {
@@ -242,12 +328,13 @@ export function TraderConfigModal({
 
   useEffect(() => {
     if (traderData) {
-      setFormData(prev => ({
+      setFormData((prev) => ({
         ...prev,
         ...traderData,
         strategy_id: traderData.strategy_id || '',
         // Keep decision_mode from traderData if exists, otherwise keep prev value
-        decision_mode: traderData.decision_mode || prev.decision_mode || 'copy_trade',
+        decision_mode:
+          traderData.decision_mode || prev.decision_mode || 'copy_trade',
       }))
     } else if (!isEditMode) {
       setFormData({
@@ -263,7 +350,7 @@ export function TraderConfigModal({
         copy_leader_id: '',
         copy_ratio: 1.0,
         copy_sync_leverage: true,
-        copy_sync_margin_mode: true,  // 默认同步保证金模式
+        copy_sync_margin_mode: true, // 默认同步保证金模式
         copy_binance_p20t: '',
         copy_binance_csrf_token: '',
         // 风控默认值（与 useState 初始值保持一致）
@@ -279,6 +366,20 @@ export function TraderConfigModal({
         risk_reentry_tolerance: 2,
         risk_reentry_block_addback: true,
         risk_reentry_addback_tolerance: 20,
+        risk_policy_version: 4,
+        risk_stop_mode: 'volatility_priority',
+        risk_atr_period: 14,
+        risk_atr_fallback_pct: 2,
+        risk_trigger_price_type: 'mark',
+        risk_slippage_buffer_bps: 10,
+        risk_liquidation_buffer_atr: 0.5,
+        risk_max_reentries: 2,
+        risk_reentry_band_atr: 0.5,
+        risk_reentry_cooldown_seconds: 60,
+        risk_reentry_max_chase_atr: 0,
+        risk_reentry_max_atr_expansion: 2,
+        risk_watch_timeout_minutes: 0,
+        risk_migration_confirmed: true,
       })
     }
   }, [traderData, isEditMode, availableModels, availableExchanges])
@@ -326,8 +427,11 @@ export function TraderConfigModal({
     setIsSaving(true)
     try {
       // Debug: log decision_mode before save
-      console.log('🔧 [DEBUG] Saving trader with decision_mode:', formData.decision_mode)
-      
+      console.log(
+        '🔧 [DEBUG] Saving trader with decision_mode:',
+        formData.decision_mode
+      )
+
       const saveData: CreateTraderRequest = {
         name: formData.trader_name,
         ai_model_id: formData.ai_model,
@@ -351,7 +455,7 @@ export function TraderConfigModal({
           leader_id: formData.copy_leader_id,
           copy_ratio: formData.copy_ratio,
           sync_leverage: formData.copy_sync_leverage,
-          sync_margin_mode: formData.copy_sync_margin_mode,  // 同步保证金模式
+          sync_margin_mode: formData.copy_sync_margin_mode, // 同步保证金模式
           // 账户保护 v3 风控（前端展示百分比 → 后端存比例，× 0.01 转换）
           // 仅 OKX 路径生效；HL/Binance 后端会忽略这些字段（已通过 ProviderType 守卫）
           risk_stop_loss_enabled: formData.risk_stop_loss_enabled,
@@ -366,12 +470,29 @@ export function TraderConfigModal({
           risk_reentry_tolerance: formData.risk_reentry_tolerance / 100,
           risk_reentry_block_addback: formData.risk_reentry_block_addback,
           // 前端百分比 → 后端倍数：20% → 1.20
-          risk_reentry_addback_tolerance: 1 + formData.risk_reentry_addback_tolerance / 100,
+          risk_reentry_addback_tolerance:
+            1 + formData.risk_reentry_addback_tolerance / 100,
+          risk_policy_version: formData.risk_policy_version,
+          risk_stop_mode: formData.risk_stop_mode,
+          risk_atr_period: formData.risk_atr_period,
+          risk_atr_fallback_pct: formData.risk_atr_fallback_pct / 100,
+          risk_trigger_price_type: formData.risk_trigger_price_type,
+          risk_slippage_buffer_bps: formData.risk_slippage_buffer_bps,
+          risk_liquidation_buffer_atr: formData.risk_liquidation_buffer_atr,
+          risk_max_reentries: formData.risk_max_reentries,
+          risk_reentry_band_atr: formData.risk_reentry_band_atr,
+          risk_reentry_cooldown_seconds: formData.risk_reentry_cooldown_seconds,
+          risk_reentry_max_chase_atr: formData.risk_reentry_max_chase_atr,
+          risk_reentry_max_atr_expansion:
+            formData.risk_reentry_max_atr_expansion,
+          risk_watch_timeout_minutes: formData.risk_watch_timeout_minutes,
+          risk_migration_confirmed: formData.risk_migration_confirmed,
         }
         // Binance 数据源额外携带 Web 私有接口凭证
         if (formData.copy_provider_type === 'binance') {
           saveData.copy_config.binance_p20t = formData.copy_binance_p20t.trim()
-          saveData.copy_config.binance_csrf_token = formData.copy_binance_csrf_token.trim()
+          saveData.copy_config.binance_csrf_token =
+            formData.copy_binance_csrf_token.trim()
         }
       }
 
@@ -389,7 +510,7 @@ export function TraderConfigModal({
     }
   }
 
-  const selectedStrategy = strategies.find(s => s.id === formData.strategy_id)
+  const selectedStrategy = strategies.find((s) => s.id === formData.strategy_id)
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50 backdrop-blur-sm p-4 overflow-y-auto">
@@ -482,36 +603,44 @@ export function TraderConfigModal({
                   >
                     {availableExchanges.map((exchange) => (
                       <option key={exchange.id} value={exchange.id}>
-                        {getShortName(exchange.name || exchange.exchange_type || exchange.id).toUpperCase()}
-                        {exchange.account_name ? ` - ${exchange.account_name}` : ''}
+                        {getShortName(
+                          exchange.name || exchange.exchange_type || exchange.id
+                        ).toUpperCase()}
+                        {exchange.account_name
+                          ? ` - ${exchange.account_name}`
+                          : ''}
                       </option>
                     ))}
                   </select>
                   {/* Exchange Registration Link */}
-                  {formData.exchange_id && (() => {
-                    // Find the selected exchange to get its type
-                    const selectedExchange = availableExchanges.find(e => e.id === formData.exchange_id)
-                    const exchangeType = selectedExchange?.exchange_type?.toLowerCase() || ''
-                    const regLink = EXCHANGE_REGISTRATION_LINKS[exchangeType]
-                    if (!regLink) return null
-                    return (
-                      <a
-                        href={regLink.url}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="mt-2 inline-flex items-center gap-1.5 text-xs text-[#848E9C] hover:text-[#F0B90B] transition-colors"
-                      >
-                        <UserPlus className="w-3.5 h-3.5" />
-                        <span>还没有交易所账号？点击注册</span>
-                        {regLink.hasReferral && (
-                          <span className="px-1.5 py-0.5 bg-[#F0B90B]/10 text-[#F0B90B] rounded text-[10px]">
-                            折扣优惠
-                          </span>
-                        )}
-                        <ExternalLink className="w-3 h-3" />
-                      </a>
-                    )
-                  })()}
+                  {formData.exchange_id &&
+                    (() => {
+                      // Find the selected exchange to get its type
+                      const selectedExchange = availableExchanges.find(
+                        (e) => e.id === formData.exchange_id
+                      )
+                      const exchangeType =
+                        selectedExchange?.exchange_type?.toLowerCase() || ''
+                      const regLink = EXCHANGE_REGISTRATION_LINKS[exchangeType]
+                      if (!regLink) return null
+                      return (
+                        <a
+                          href={regLink.url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="mt-2 inline-flex items-center gap-1.5 text-xs text-[#848E9C] hover:text-[#F0B90B] transition-colors"
+                        >
+                          <UserPlus className="w-3.5 h-3.5" />
+                          <span>还没有交易所账号？点击注册</span>
+                          {regLink.hasReferral && (
+                            <span className="px-1.5 py-0.5 bg-[#F0B90B]/10 text-[#F0B90B] rounded text-[10px]">
+                              折扣优惠
+                            </span>
+                          )}
+                          <ExternalLink className="w-3 h-3" />
+                        </a>
+                      )
+                    })()}
                 </div>
               </div>
             </div>
@@ -574,12 +703,25 @@ export function TraderConfigModal({
                   </p>
                   <div className="grid grid-cols-2 gap-2 text-xs text-[#848E9C]">
                     <div>
-                      币种来源: {selectedStrategy.config.coin_source.source_type === 'static' ? '固定币种' :
-                        selectedStrategy.config.coin_source.source_type === 'coinpool' ? 'Coin Pool' :
-                        selectedStrategy.config.coin_source.source_type === 'oi_top' ? 'OI Top' : '混合'}
+                      币种来源:{' '}
+                      {selectedStrategy.config.coin_source.source_type ===
+                      'static'
+                        ? '固定币种'
+                        : selectedStrategy.config.coin_source.source_type ===
+                            'coinpool'
+                          ? 'Coin Pool'
+                          : selectedStrategy.config.coin_source.source_type ===
+                              'oi_top'
+                            ? 'OI Top'
+                            : '混合'}
                     </div>
                     <div>
-                      保证金上限: {((selectedStrategy.config.risk_control?.max_margin_usage || 0.9) * 100).toFixed(0)}%
+                      保证金上限:{' '}
+                      {(
+                        (selectedStrategy.config.risk_control
+                          ?.max_margin_usage || 0.9) * 100
+                      ).toFixed(0)}
+                      %
                     </div>
                   </div>
                 </div>
@@ -597,7 +739,9 @@ export function TraderConfigModal({
                 {/* 跟单交易 - 默认选项，放在前面 */}
                 <button
                   type="button"
-                  onClick={() => handleInputChange('decision_mode', 'copy_trade')}
+                  onClick={() =>
+                    handleInputChange('decision_mode', 'copy_trade')
+                  }
                   className={`p-4 rounded-lg border-2 transition-all ${
                     formData.decision_mode === 'copy_trade'
                       ? 'border-[#F0B90B] bg-[#F0B90B]/10'
@@ -605,8 +749,12 @@ export function TraderConfigModal({
                   }`}
                 >
                   <div className="flex items-center gap-3 mb-2">
-                    <Users className={`w-6 h-6 ${formData.decision_mode === 'copy_trade' ? 'text-[#F0B90B]' : 'text-[#848E9C]'}`} />
-                    <span className={`font-medium ${formData.decision_mode === 'copy_trade' ? 'text-[#EAECEF]' : 'text-[#848E9C]'}`}>
+                    <Users
+                      className={`w-6 h-6 ${formData.decision_mode === 'copy_trade' ? 'text-[#F0B90B]' : 'text-[#848E9C]'}`}
+                    />
+                    <span
+                      className={`font-medium ${formData.decision_mode === 'copy_trade' ? 'text-[#EAECEF]' : 'text-[#848E9C]'}`}
+                    >
                       跟单交易
                     </span>
                   </div>
@@ -625,8 +773,12 @@ export function TraderConfigModal({
                   }`}
                 >
                   <div className="flex items-center gap-3 mb-2">
-                    <Bot className={`w-6 h-6 ${formData.decision_mode === 'ai' ? 'text-[#F0B90B]' : 'text-[#848E9C]'}`} />
-                    <span className={`font-medium ${formData.decision_mode === 'ai' ? 'text-[#EAECEF]' : 'text-[#848E9C]'}`}>
+                    <Bot
+                      className={`w-6 h-6 ${formData.decision_mode === 'ai' ? 'text-[#F0B90B]' : 'text-[#848E9C]'}`}
+                    />
+                    <span
+                      className={`font-medium ${formData.decision_mode === 'ai' ? 'text-[#EAECEF]' : 'text-[#848E9C]'}`}
+                    >
                       AI 决策
                     </span>
                   </div>
@@ -641,7 +793,9 @@ export function TraderConfigModal({
                 <div className="mt-4 p-4 bg-[#1E2329] border border-[#2B3139] rounded-lg space-y-4">
                   <div className="flex items-center gap-2 mb-2">
                     <Users className="w-4 h-4 text-[#F0B90B]" />
-                    <span className="text-[#F0B90B] text-sm font-medium">跟单配置</span>
+                    <span className="text-[#F0B90B] text-sm font-medium">
+                      跟单配置
+                    </span>
                   </div>
 
                   {/* Provider Type */}
@@ -652,7 +806,9 @@ export function TraderConfigModal({
                     <div className="flex gap-2">
                       <button
                         type="button"
-                        onClick={() => handleInputChange('copy_provider_type', 'hyperliquid')}
+                        onClick={() =>
+                          handleInputChange('copy_provider_type', 'hyperliquid')
+                        }
                         className={`flex-1 px-3 py-2 rounded text-sm ${
                           formData.copy_provider_type === 'hyperliquid'
                             ? 'bg-[#F0B90B] text-black'
@@ -663,7 +819,9 @@ export function TraderConfigModal({
                       </button>
                       <button
                         type="button"
-                        onClick={() => handleInputChange('copy_provider_type', 'okx')}
+                        onClick={() =>
+                          handleInputChange('copy_provider_type', 'okx')
+                        }
                         className={`flex-1 px-3 py-2 rounded text-sm ${
                           formData.copy_provider_type === 'okx'
                             ? 'bg-[#F0B90B] text-black'
@@ -674,7 +832,9 @@ export function TraderConfigModal({
                       </button>
                       <button
                         type="button"
-                        onClick={() => handleInputChange('copy_provider_type', 'binance')}
+                        onClick={() =>
+                          handleInputChange('copy_provider_type', 'binance')
+                        }
                         className={`flex-1 px-3 py-2 rounded text-sm ${
                           formData.copy_provider_type === 'binance'
                             ? 'bg-[#F0B90B] text-black'
@@ -689,26 +849,32 @@ export function TraderConfigModal({
                   {/* Leader ID */}
                   <div>
                     <label className="text-sm text-[#EAECEF] block mb-2">
-                      {formData.copy_provider_type === 'binance' ? '领航员 PortfolioId' : '领航员地址'}
+                      {formData.copy_provider_type === 'binance'
+                        ? '领航员 PortfolioId'
+                        : '领航员地址'}
                       <span className="text-red-500"> *</span>
                     </label>
                     <input
                       type="text"
                       value={formData.copy_leader_id}
-                      onChange={(e) => handleInputChange('copy_leader_id', e.target.value)}
+                      onChange={(e) =>
+                        handleInputChange('copy_leader_id', e.target.value)
+                      }
                       className="w-full px-3 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF] focus:border-[#F0B90B] focus:outline-none font-mono text-sm"
                       placeholder={
-                        formData.copy_provider_type === 'hyperliquid' ? '0x...' :
-                        formData.copy_provider_type === 'binance' ? '领航员主页 portfolioId (如 5008318166959365632)' :
-                        'UniqueName (如 F2BCA22ABBB69F57)'
+                        formData.copy_provider_type === 'hyperliquid'
+                          ? '0x...'
+                          : formData.copy_provider_type === 'binance'
+                            ? '领航员主页 portfolioId (如 5008318166959365632)'
+                            : 'UniqueName (如 F2BCA22ABBB69F57)'
                       }
                     />
                     <p className="text-xs text-[#848E9C] mt-1">
                       {formData.copy_provider_type === 'hyperliquid'
                         ? 'Hyperliquid 钱包地址 (0x开头)'
                         : formData.copy_provider_type === 'binance'
-                        ? '填领航员主页 URL 末尾的 portfolioId（不是跟单订单里的关系 ID）。前提：你的账户已经在 Binance 上跟单了该领航员'
-                        : 'OKX 交易员 uniqueName (交易员页面 URL 中的参数)'}
+                          ? '填领航员主页 URL 末尾的 portfolioId（不是跟单订单里的关系 ID）。前提：你的账户已经在 Binance 上跟单了该领航员'
+                          : 'OKX 交易员 uniqueName (交易员页面 URL 中的参数)'}
                     </p>
                   </div>
 
@@ -720,8 +886,12 @@ export function TraderConfigModal({
                       <div className="flex items-center justify-between">
                         <div className="flex items-center gap-2">
                           <KeyRound className="w-4 h-4 text-[#F0B90B]" />
-                          <span className="text-[#F0B90B] text-sm font-medium">Binance 共享凭证</span>
-                          <span className="px-2 py-0.5 text-[10px] bg-[#F0B90B22] text-[#F0B90B] rounded">全局共享</span>
+                          <span className="text-[#F0B90B] text-sm font-medium">
+                            Binance 共享凭证
+                          </span>
+                          <span className="px-2 py-0.5 text-[10px] bg-[#F0B90B22] text-[#F0B90B] rounded">
+                            全局共享
+                          </span>
                         </div>
                         <button
                           type="button"
@@ -752,7 +922,10 @@ export function TraderConfigModal({
                           )}
                           {binanceGlobalCreds.binance_user_id && (
                             <span className="text-[#848E9C]">
-                              账号 ID: <span className="font-mono text-[#EAECEF]">{binanceGlobalCreds.binance_user_id}</span>
+                              账号 ID:{' '}
+                              <span className="font-mono text-[#EAECEF]">
+                                {binanceGlobalCreds.binance_user_id}
+                              </span>
                             </span>
                           )}
                         </div>
@@ -764,8 +937,10 @@ export function TraderConfigModal({
                       )}
 
                       <p className="text-[11px] text-[#848E9C] leading-relaxed">
-                        所有 Binance 跟单交易员共用同一份凭证（p20t / csrftoken）。
-                        在此处或顶部"Binance 凭证"按钮配置一次后，所有 Binance 交易员立即生效，无需重启。
+                        所有 Binance 跟单交易员共用同一份凭证（p20t /
+                        csrftoken）。 在此处或顶部"Binance
+                        凭证"按钮配置一次后，所有 Binance
+                        交易员立即生效，无需重启。
                       </p>
                     </div>
                   )}
@@ -782,11 +957,18 @@ export function TraderConfigModal({
                         max="3"
                         step="0.1"
                         value={formData.copy_ratio}
-                        onChange={(e) => handleInputChange('copy_ratio', parseFloat(e.target.value))}
+                        onChange={(e) =>
+                          handleInputChange(
+                            'copy_ratio',
+                            parseFloat(e.target.value)
+                          )
+                        }
                         className="flex-1 accent-[#F0B90B]"
                       />
                       <div className="w-20 text-center">
-                        <span className="text-[#F0B90B] font-bold text-lg">{(formData.copy_ratio * 100).toFixed(0)}%</span>
+                        <span className="text-[#F0B90B] font-bold text-lg">
+                          {(formData.copy_ratio * 100).toFixed(0)}%
+                        </span>
                       </div>
                     </div>
                     <p className="text-xs text-[#848E9C] mt-1">
@@ -798,50 +980,86 @@ export function TraderConfigModal({
                   <div className="flex items-center justify-between">
                     <div>
                       <label className="text-sm text-[#EAECEF]">同步杠杆</label>
-                      <p className="text-xs text-[#848E9C]">使用与领航员相同的杠杆倍数</p>
+                      <p className="text-xs text-[#848E9C]">
+                        使用与领航员相同的杠杆倍数
+                      </p>
                     </div>
                     <button
                       type="button"
-                      onClick={() => handleInputChange('copy_sync_leverage', !formData.copy_sync_leverage)}
+                      onClick={() =>
+                        handleInputChange(
+                          'copy_sync_leverage',
+                          !formData.copy_sync_leverage
+                        )
+                      }
                       className={`w-12 h-6 rounded-full transition-colors ${
-                        formData.copy_sync_leverage ? 'bg-[#F0B90B]' : 'bg-[#2B3139]'
+                        formData.copy_sync_leverage
+                          ? 'bg-[#F0B90B]'
+                          : 'bg-[#2B3139]'
                       }`}
                     >
-                      <div className={`w-5 h-5 rounded-full bg-white shadow transition-transform ${
-                        formData.copy_sync_leverage ? 'translate-x-6' : 'translate-x-0.5'
-                      }`} />
+                      <div
+                        className={`w-5 h-5 rounded-full bg-white shadow transition-transform ${
+                          formData.copy_sync_leverage
+                            ? 'translate-x-6'
+                            : 'translate-x-0.5'
+                        }`}
+                      />
                     </button>
                   </div>
 
                   {/* Sync Margin Mode (OKX) */}
                   <div className="flex items-center justify-between">
                     <div>
-                      <label className="text-sm text-[#EAECEF]">同步保证金模式</label>
-                      <p className="text-xs text-[#848E9C]">跟随领航员的全仓/逐仓模式（OKX 专用）</p>
+                      <label className="text-sm text-[#EAECEF]">
+                        同步保证金模式
+                      </label>
+                      <p className="text-xs text-[#848E9C]">
+                        跟随领航员的全仓/逐仓模式（OKX 专用）
+                      </p>
                     </div>
                     <button
                       type="button"
-                      onClick={() => handleInputChange('copy_sync_margin_mode', !formData.copy_sync_margin_mode)}
+                      onClick={() =>
+                        handleInputChange(
+                          'copy_sync_margin_mode',
+                          !formData.copy_sync_margin_mode
+                        )
+                      }
                       className={`w-12 h-6 rounded-full transition-colors ${
-                        formData.copy_sync_margin_mode ? 'bg-[#F0B90B]' : 'bg-[#2B3139]'
+                        formData.copy_sync_margin_mode
+                          ? 'bg-[#F0B90B]'
+                          : 'bg-[#2B3139]'
                       }`}
                     >
-                      <div className={`w-5 h-5 rounded-full bg-white shadow transition-transform ${
-                        formData.copy_sync_margin_mode ? 'translate-x-6' : 'translate-x-0.5'
-                      }`} />
+                      <div
+                        className={`w-5 h-5 rounded-full bg-white shadow transition-transform ${
+                          formData.copy_sync_margin_mode
+                            ? 'translate-x-6'
+                            : 'translate-x-0.5'
+                        }`}
+                      />
                     </button>
                   </div>
 
                   {/* Info Box */}
                   <div className="p-3 bg-[#0B0E11] border border-[#2B3139] rounded flex items-start gap-2">
-                    <svg xmlns="http://www.w3.org/2000/svg" className="w-4 h-4 text-[#F0B90B] mt-0.5 flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <svg
+                      xmlns="http://www.w3.org/2000/svg"
+                      className="w-4 h-4 text-[#F0B90B] mt-0.5 flex-shrink-0"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                    >
                       <circle cx="12" cy="12" r="10" />
                       <line x1="12" x2="12" y1="8" y2="12" />
                       <line x1="12" x2="12.01" y1="16" y2="16" />
                     </svg>
                     <span className="text-xs text-[#848E9C]">
                       跟单模式将监听领航员的交易操作，只跟随新开仓（不跟历史仓位）。
-                      跟单金额 = 跟单系数 × (领航员交易金额÷领航员账户余额) × 你的账户余额
+                      跟单金额 = 跟单系数 × (领航员交易金额÷领航员账户余额) ×
+                      你的账户余额
                     </span>
                   </div>
 
@@ -853,35 +1071,188 @@ export function TraderConfigModal({
                   {formData.copy_provider_type === 'okx' && (
                     <div className="mt-4 p-4 bg-[#0B0E11] border border-[#F0B90B33] rounded-lg space-y-4">
                       <div className="flex items-center gap-2">
-                        <svg xmlns="http://www.w3.org/2000/svg" className="w-4 h-4 text-[#F0B90B]" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                        <svg
+                          xmlns="http://www.w3.org/2000/svg"
+                          className="w-4 h-4 text-[#F0B90B]"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="2"
+                        >
                           <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
                         </svg>
-                        <span className="text-[#F0B90B] text-sm font-medium">账户保护（止损兜底）</span>
-                        <span className="px-2 py-0.5 text-[10px] bg-[#F0B90B22] text-[#F0B90B] rounded">仅 OKX</span>
+                        <span className="text-[#F0B90B] text-sm font-medium">
+                          账户保护（止损兜底）
+                        </span>
+                        <span className="px-2 py-0.5 text-[10px] bg-[#F0B90B22] text-[#F0B90B] rounded">
+                          仅 OKX
+                        </span>
                       </div>
 
                       {/* 主开关：账户保护止损 */}
                       <div className="flex items-center justify-between">
                         <div>
-                          <label className="text-sm text-[#EAECEF]">启用账户保护止损</label>
-                          <p className="text-xs text-[#848E9C]">开仓时自动挂交易所托管的硬止损单，防止极端反向走势打穿账户</p>
+                          <label className="text-sm text-[#EAECEF]">
+                            启用账户保护止损
+                          </label>
+                          <p className="text-xs text-[#848E9C]">
+                            开仓时自动挂交易所托管的硬止损单，防止极端反向走势打穿账户
+                          </p>
                         </div>
                         <button
                           type="button"
-                          onClick={() => handleInputChange('risk_stop_loss_enabled', !formData.risk_stop_loss_enabled)}
+                          onClick={() =>
+                            handleInputChange(
+                              'risk_stop_loss_enabled',
+                              !formData.risk_stop_loss_enabled
+                            )
+                          }
                           className={`w-12 h-6 rounded-full transition-colors ${formData.risk_stop_loss_enabled ? 'bg-[#F0B90B]' : 'bg-[#2B3139]'}`}
                         >
-                          <div className={`w-5 h-5 rounded-full bg-white shadow transition-transform ${formData.risk_stop_loss_enabled ? 'translate-x-6' : 'translate-x-0.5'}`} />
+                          <div
+                            className={`w-5 h-5 rounded-full bg-white shadow transition-transform ${formData.risk_stop_loss_enabled ? 'translate-x-6' : 'translate-x-0.5'}`}
+                          />
                         </button>
                       </div>
 
                       {/* 风控参数（开关打开时显示） */}
                       {formData.risk_stop_loss_enabled && (
                         <>
+                          {formData.risk_policy_version < 4 && (
+                            <div className="p-3 border border-[#F0B90B66] rounded bg-[#F0B90B11] text-xs text-[#EAECEF]">
+                              当前为旧版 v3 配置。迁移后将使用 ATR
+                              穿越恢复、精确保护单和持久化统计。
+                              <button
+                                type="button"
+                                className="ml-3 text-[#F0B90B] underline"
+                                onClick={() =>
+                                  setFormData((v) => ({
+                                    ...v,
+                                    risk_policy_version: 4,
+                                    risk_migration_confirmed: true,
+                                  }))
+                                }
+                              >
+                                确认迁移到 v4
+                              </button>
+                            </div>
+                          )}
+                          {formData.risk_policy_version >= 4 && (
+                            <div className="grid grid-cols-2 gap-3">
+                              <label className="text-xs text-[#848E9C]">
+                                止损模式
+                                <select
+                                  value={formData.risk_stop_mode}
+                                  onChange={(e) =>
+                                    handleInputChange(
+                                      'risk_stop_mode',
+                                      e.target.value
+                                    )
+                                  }
+                                  className="mt-1 w-full px-2 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF]"
+                                >
+                                  <option value="volatility_priority">
+                                    波动优先
+                                  </option>
+                                  <option value="account_hard_limit">
+                                    账户硬限制
+                                  </option>
+                                </select>
+                              </label>
+                              <label className="text-xs text-[#848E9C]">
+                                触发价格
+                                <select
+                                  value={formData.risk_trigger_price_type}
+                                  onChange={(e) =>
+                                    handleInputChange(
+                                      'risk_trigger_price_type',
+                                      e.target.value
+                                    )
+                                  }
+                                  className="mt-1 w-full px-2 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF]"
+                                >
+                                  <option value="mark">标记价格</option>
+                                  <option value="last">最新价格</option>
+                                  <option value="index">指数价格</option>
+                                </select>
+                              </label>
+                              <label className="text-xs text-[#848E9C]">
+                                ATR 周期
+                                <input
+                                  type="number"
+                                  min="5"
+                                  max="100"
+                                  value={formData.risk_atr_period}
+                                  onChange={(e) =>
+                                    handleInputChange(
+                                      'risk_atr_period',
+                                      Number(e.target.value)
+                                    )
+                                  }
+                                  className="mt-1 w-full px-2 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF]"
+                                />
+                              </label>
+                              <label className="text-xs text-[#848E9C]">
+                                ATR失败降级（%）
+                                <input
+                                  type="number"
+                                  min="0.1"
+                                  max="20"
+                                  step="0.1"
+                                  value={formData.risk_atr_fallback_pct}
+                                  onChange={(e) =>
+                                    handleInputChange(
+                                      'risk_atr_fallback_pct',
+                                      Number(e.target.value)
+                                    )
+                                  }
+                                  className="mt-1 w-full px-2 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF]"
+                                />
+                              </label>
+                              <label className="text-xs text-[#848E9C]">
+                                滑点缓冲（bps）
+                                <input
+                                  type="number"
+                                  min="0"
+                                  max="1000"
+                                  value={formData.risk_slippage_buffer_bps}
+                                  onChange={(e) =>
+                                    handleInputChange(
+                                      'risk_slippage_buffer_bps',
+                                      Number(e.target.value)
+                                    )
+                                  }
+                                  className="mt-1 w-full px-2 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF]"
+                                />
+                              </label>
+                              <label className="text-xs text-[#848E9C]">
+                                强平缓冲（ATR）
+                                <input
+                                  type="number"
+                                  min="0"
+                                  max="5"
+                                  step="0.1"
+                                  value={formData.risk_liquidation_buffer_atr}
+                                  onChange={(e) =>
+                                    handleInputChange(
+                                      'risk_liquidation_buffer_atr',
+                                      Number(e.target.value)
+                                    )
+                                  }
+                                  className="mt-1 w-full px-2 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF]"
+                                />
+                              </label>
+                            </div>
+                          )}
                           {/* 单笔账户风险 % —— v3.1：无上限 + 默认 50%（激进） */}
                           <div>
                             <label className="text-sm text-[#EAECEF] block mb-2">
-                              单笔最大账户风险 <span className="text-[#F0B90B] font-bold">{formData.risk_account_pct.toFixed(2)}%</span>
+                              {formData.risk_stop_mode === 'account_hard_limit'
+                                ? '账户风险硬限制'
+                                : '预计账户风险警戒'}{' '}
+                              <span className="text-[#F0B90B] font-bold">
+                                {formData.risk_account_pct.toFixed(2)}%
+                              </span>
                             </label>
                             <input
                               type="number"
@@ -890,22 +1261,38 @@ export function TraderConfigModal({
                               value={formData.risk_account_pct}
                               onChange={(e) => {
                                 const v = parseFloat(e.target.value)
-                                handleInputChange('risk_account_pct', isFinite(v) && v > 0 ? v : 0.5)
+                                handleInputChange(
+                                  'risk_account_pct',
+                                  isFinite(v) && v > 0 ? v : 0.5
+                                )
                               }}
                               className="w-full px-3 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF] focus:border-[#F0B90B] focus:outline-none text-sm"
                             />
                             <p className="text-xs text-[#848E9C] mt-1">
-                              单笔最多亏账户的百分比（账户 1000U + {formData.risk_account_pct.toFixed(2)}% = 单笔最多亏 <span className="text-[#F0B90B] font-mono">{(10 * formData.risk_account_pct).toFixed(2)} U</span>）。
+                              波动优先模式下这是告警阈值，不承诺为最大损失；账户硬限制模式才会收紧止损。
                             </p>
                             {/* 激进配置警告：≥ 5% 时显示 */}
                             {formData.risk_account_pct >= 5 && (
                               <div className="mt-2 p-2 bg-[#F6465D11] border border-[#F6465D44] rounded flex items-start gap-2">
-                                <svg xmlns="http://www.w3.org/2000/svg" className="w-4 h-4 text-[#F6465D] mt-0.5 flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                <svg
+                                  xmlns="http://www.w3.org/2000/svg"
+                                  className="w-4 h-4 text-[#F6465D] mt-0.5 flex-shrink-0"
+                                  viewBox="0 0 24 24"
+                                  fill="none"
+                                  stroke="currentColor"
+                                  strokeWidth="2"
+                                >
                                   <path d="M12 9v2m0 4h.01M5.07 19h13.86a2 2 0 0 0 1.74-3l-6.93-12a2 2 0 0 0-3.48 0l-6.93 12a2 2 0 0 0 1.74 3z" />
                                 </svg>
                                 <span className="text-xs text-[#F6465D]">
-                                  <span className="font-bold">高风险设置：</span>
-                                  单笔风险 ≥ 5% 时，{formData.risk_account_pct >= 50 ? '2-3 笔失败就可能造成账户严重亏损' : '建议仅在领航员经过严格筛选时使用'}。新手强烈建议调到 0.5-1%。
+                                  <span className="font-bold">
+                                    高风险设置：
+                                  </span>
+                                  单笔风险 ≥ 5% 时，
+                                  {formData.risk_account_pct >= 50
+                                    ? '2-3 笔失败就可能造成账户严重亏损'
+                                    : '建议仅在领航员经过严格筛选时使用'}
+                                  。新手强烈建议调到 0.5-1%。
                                 </span>
                               </div>
                             )}
@@ -915,36 +1302,61 @@ export function TraderConfigModal({
                           <div className="border-t border-[#2B3139] pt-3">
                             <div className="flex items-center justify-between mb-2">
                               <div>
-                                <label className="text-sm text-[#EAECEF]">ATR 噪音防护</label>
-                                <p className="text-xs text-[#848E9C]">自动适应不同币种波动率，低波动币不被噪音扫损</p>
+                                <label className="text-sm text-[#EAECEF]">
+                                  ATR 噪音防护
+                                </label>
+                                <p className="text-xs text-[#848E9C]">
+                                  自动适应不同币种波动率，低波动币不被噪音扫损
+                                </p>
                               </div>
                               <button
                                 type="button"
-                                onClick={() => handleInputChange('risk_atr_enabled', !formData.risk_atr_enabled)}
+                                onClick={() =>
+                                  handleInputChange(
+                                    'risk_atr_enabled',
+                                    !formData.risk_atr_enabled
+                                  )
+                                }
                                 className={`w-12 h-6 rounded-full transition-colors ${formData.risk_atr_enabled ? 'bg-[#F0B90B]' : 'bg-[#2B3139]'}`}
                               >
-                                <div className={`w-5 h-5 rounded-full bg-white shadow transition-transform ${formData.risk_atr_enabled ? 'translate-x-6' : 'translate-x-0.5'}`} />
+                                <div
+                                  className={`w-5 h-5 rounded-full bg-white shadow transition-transform ${formData.risk_atr_enabled ? 'translate-x-6' : 'translate-x-0.5'}`}
+                                />
                               </button>
                             </div>
                             {formData.risk_atr_enabled && (
                               <div className="grid grid-cols-2 gap-3">
                                 <div>
-                                  <label className="text-xs text-[#848E9C] block mb-1">ATR 倍数</label>
+                                  <label className="text-xs text-[#848E9C] block mb-1">
+                                    ATR 倍数
+                                  </label>
                                   <input
                                     type="number"
                                     min="1.0"
                                     max="3.0"
                                     step="0.1"
                                     value={formData.risk_atr_multiplier}
-                                    onChange={(e) => handleInputChange('risk_atr_multiplier', parseFloat(e.target.value) || 1.5)}
+                                    onChange={(e) =>
+                                      handleInputChange(
+                                        'risk_atr_multiplier',
+                                        parseFloat(e.target.value) || 1.5
+                                      )
+                                    }
                                     className="w-full px-3 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF] focus:border-[#F0B90B] focus:outline-none text-sm"
                                   />
                                 </div>
                                 <div>
-                                  <label className="text-xs text-[#848E9C] block mb-1">时间周期</label>
+                                  <label className="text-xs text-[#848E9C] block mb-1">
+                                    时间周期
+                                  </label>
                                   <select
                                     value={formData.risk_atr_timeframe}
-                                    onChange={(e) => handleInputChange('risk_atr_timeframe', e.target.value)}
+                                    onChange={(e) =>
+                                      handleInputChange(
+                                        'risk_atr_timeframe',
+                                        e.target.value
+                                      )
+                                    }
                                     className="w-full px-3 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF] focus:border-[#F0B90B] focus:outline-none text-sm"
                                   >
                                     <option value="15m">15 分钟</option>
@@ -957,51 +1369,88 @@ export function TraderConfigModal({
                           </div>
 
                           {/* 杠杆兜底 */}
-                          <div className="border-t border-[#2B3139] pt-3">
-                            <div className="flex items-center justify-between mb-2">
-                              <div>
-                                <label className="text-sm text-[#EAECEF]">杠杆兜底封顶</label>
-                                <p className="text-xs text-[#848E9C]">保证金亏损达此比例时强制平仓（高杠杆兜底）</p>
+                          {formData.risk_policy_version < 4 && (
+                            <div className="border-t border-[#2B3139] pt-3">
+                              <div className="flex items-center justify-between mb-2">
+                                <div>
+                                  <label className="text-sm text-[#EAECEF]">
+                                    杠杆兜底封顶
+                                  </label>
+                                  <p className="text-xs text-[#848E9C]">
+                                    保证金亏损达此比例时强制平仓（高杠杆兜底）
+                                  </p>
+                                </div>
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    handleInputChange(
+                                      'risk_leverage_fallback',
+                                      !formData.risk_leverage_fallback
+                                    )
+                                  }
+                                  className={`w-12 h-6 rounded-full transition-colors ${formData.risk_leverage_fallback ? 'bg-[#F0B90B]' : 'bg-[#2B3139]'}`}
+                                >
+                                  <div
+                                    className={`w-5 h-5 rounded-full bg-white shadow transition-transform ${formData.risk_leverage_fallback ? 'translate-x-6' : 'translate-x-0.5'}`}
+                                  />
+                                </button>
                               </div>
-                              <button
-                                type="button"
-                                onClick={() => handleInputChange('risk_leverage_fallback', !formData.risk_leverage_fallback)}
-                                className={`w-12 h-6 rounded-full transition-colors ${formData.risk_leverage_fallback ? 'bg-[#F0B90B]' : 'bg-[#2B3139]'}`}
-                              >
-                                <div className={`w-5 h-5 rounded-full bg-white shadow transition-transform ${formData.risk_leverage_fallback ? 'translate-x-6' : 'translate-x-0.5'}`} />
-                              </button>
+                              {formData.risk_leverage_fallback && (
+                                <div>
+                                  <label className="text-xs text-[#848E9C] block mb-1">
+                                    最大保证金亏损{' '}
+                                    <span className="text-[#F0B90B]">
+                                      {formData.risk_leverage_max_loss.toFixed(
+                                        0
+                                      )}
+                                      %
+                                    </span>
+                                  </label>
+                                  <input
+                                    type="range"
+                                    min="20"
+                                    max="80"
+                                    step="5"
+                                    value={formData.risk_leverage_max_loss}
+                                    onChange={(e) =>
+                                      handleInputChange(
+                                        'risk_leverage_max_loss',
+                                        parseFloat(e.target.value)
+                                      )
+                                    }
+                                    className="w-full accent-[#F0B90B]"
+                                  />
+                                </div>
+                              )}
                             </div>
-                            {formData.risk_leverage_fallback && (
-                              <div>
-                                <label className="text-xs text-[#848E9C] block mb-1">
-                                  最大保证金亏损 <span className="text-[#F0B90B]">{formData.risk_leverage_max_loss.toFixed(0)}%</span>
-                                </label>
-                                <input
-                                  type="range"
-                                  min="20"
-                                  max="80"
-                                  step="5"
-                                  value={formData.risk_leverage_max_loss}
-                                  onChange={(e) => handleInputChange('risk_leverage_max_loss', parseFloat(e.target.value))}
-                                  className="w-full accent-[#F0B90B]"
-                                />
-                              </div>
-                            )}
-                          </div>
+                          )}
 
                           {/* 二次进场（高级） */}
                           <div className="border-t border-[#2B3139] pt-3">
                             <div className="flex items-center justify-between mb-2">
                               <div>
-                                <label className="text-sm text-[#EAECEF]">二次进场（高级）</label>
-                                <p className="text-xs text-[#848E9C]">止损触发后，若价格回到入场价 + 领航员浮亏明显收窄 + 未继续加仓，自动以小仓位重入</p>
+                                <label className="text-sm text-[#EAECEF]">
+                                  二次进场（高级）
+                                </label>
+                                <p className="text-xs text-[#848E9C]">
+                                  止损触发后，若价格回到入场价 +
+                                  领航员浮亏明显收窄 +
+                                  未继续加仓，自动以小仓位重入
+                                </p>
                               </div>
                               <button
                                 type="button"
-                                onClick={() => handleInputChange('risk_reentry_enabled', !formData.risk_reentry_enabled)}
+                                onClick={() =>
+                                  handleInputChange(
+                                    'risk_reentry_enabled',
+                                    !formData.risk_reentry_enabled
+                                  )
+                                }
                                 className={`w-12 h-6 rounded-full transition-colors ${formData.risk_reentry_enabled ? 'bg-[#F0B90B]' : 'bg-[#2B3139]'}`}
                               >
-                                <div className={`w-5 h-5 rounded-full bg-white shadow transition-transform ${formData.risk_reentry_enabled ? 'translate-x-6' : 'translate-x-0.5'}`} />
+                                <div
+                                  className={`w-5 h-5 rounded-full bg-white shadow transition-transform ${formData.risk_reentry_enabled ? 'translate-x-6' : 'translate-x-0.5'}`}
+                                />
                               </button>
                             </div>
                             {formData.risk_reentry_enabled && (
@@ -1009,7 +1458,11 @@ export function TraderConfigModal({
                                 <div className="grid grid-cols-2 gap-3">
                                   <div>
                                     <label className="text-xs text-[#848E9C] block mb-1">
-                                      重入仓位系数 <span className="text-[#F0B90B]">{formData.risk_reentry_ratio.toFixed(0)}%</span>
+                                      重入仓位系数{' '}
+                                      <span className="text-[#F0B90B]">
+                                        {formData.risk_reentry_ratio.toFixed(0)}
+                                        %
+                                      </span>
                                     </label>
                                     <input
                                       type="range"
@@ -1017,13 +1470,24 @@ export function TraderConfigModal({
                                       max="100"
                                       step="10"
                                       value={formData.risk_reentry_ratio}
-                                      onChange={(e) => handleInputChange('risk_reentry_ratio', parseFloat(e.target.value))}
+                                      onChange={(e) =>
+                                        handleInputChange(
+                                          'risk_reentry_ratio',
+                                          parseFloat(e.target.value)
+                                        )
+                                      }
                                       className="w-full accent-[#F0B90B]"
                                     />
                                   </div>
                                   <div>
                                     <label className="text-xs text-[#848E9C] block mb-1">
-                                      价格回归容差 <span className="text-[#F0B90B]">{formData.risk_reentry_tolerance.toFixed(2)}%</span>
+                                      价格回归容差{' '}
+                                      <span className="text-[#F0B90B]">
+                                        {formData.risk_reentry_tolerance.toFixed(
+                                          2
+                                        )}
+                                        %
+                                      </span>
                                     </label>
                                     <input
                                       type="number"
@@ -1031,81 +1495,257 @@ export function TraderConfigModal({
                                       max="10"
                                       step="0.1"
                                       value={formData.risk_reentry_tolerance}
-                                      onChange={(e) => handleInputChange('risk_reentry_tolerance', parseFloat(e.target.value) || 2)}
+                                      onChange={(e) =>
+                                        handleInputChange(
+                                          'risk_reentry_tolerance',
+                                          parseFloat(e.target.value) || 2
+                                        )
+                                      }
                                       className="w-full px-3 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF] focus:border-[#F0B90B] focus:outline-none text-sm"
                                     />
                                   </div>
                                 </div>
+                                {formData.risk_policy_version >= 4 && (
+                                  <div className="grid grid-cols-2 gap-3 mt-3">
+                                    <label className="text-xs text-[#848E9C]">
+                                      最大重入次数
+                                      <input
+                                        type="number"
+                                        min="0"
+                                        max="10"
+                                        value={formData.risk_max_reentries}
+                                        onChange={(e) =>
+                                          handleInputChange(
+                                            'risk_max_reentries',
+                                            Number(e.target.value)
+                                          )
+                                        }
+                                        className="mt-1 w-full px-2 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF]"
+                                      />
+                                    </label>
+                                    <label className="text-xs text-[#848E9C]">
+                                      恢复带（ATR）
+                                      <input
+                                        type="number"
+                                        min="0"
+                                        max="3"
+                                        step="0.1"
+                                        value={formData.risk_reentry_band_atr}
+                                        onChange={(e) =>
+                                          handleInputChange(
+                                            'risk_reentry_band_atr',
+                                            Number(e.target.value)
+                                          )
+                                        }
+                                        className="mt-1 w-full px-2 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF]"
+                                      />
+                                    </label>
+                                    <label className="text-xs text-[#848E9C]">
+                                      冷却时间（秒）
+                                      <input
+                                        type="number"
+                                        min="0"
+                                        max="86400"
+                                        value={
+                                          formData.risk_reentry_cooldown_seconds
+                                        }
+                                        onChange={(e) =>
+                                          handleInputChange(
+                                            'risk_reentry_cooldown_seconds',
+                                            Number(e.target.value)
+                                          )
+                                        }
+                                        className="mt-1 w-full px-2 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF]"
+                                      />
+                                    </label>
+                                    <label className="text-xs text-[#848E9C]">
+                                      最大追价（ATR）
+                                      <input
+                                        type="number"
+                                        min="0"
+                                        max="2"
+                                        step="0.1"
+                                        value={
+                                          formData.risk_reentry_max_chase_atr
+                                        }
+                                        onChange={(e) =>
+                                          handleInputChange(
+                                            'risk_reentry_max_chase_atr',
+                                            Number(e.target.value)
+                                          )
+                                        }
+                                        className="mt-1 w-full px-2 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF]"
+                                      />
+                                    </label>
+                                    <label className="text-xs text-[#848E9C]">
+                                      最大波动扩张倍数
+                                      <input
+                                        type="number"
+                                        min="1"
+                                        max="10"
+                                        step="0.1"
+                                        value={
+                                          formData.risk_reentry_max_atr_expansion
+                                        }
+                                        onChange={(e) =>
+                                          handleInputChange(
+                                            'risk_reentry_max_atr_expansion',
+                                            Number(e.target.value)
+                                          )
+                                        }
+                                        className="mt-1 w-full px-2 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF]"
+                                      />
+                                    </label>
+                                    <label className="text-xs text-[#848E9C]">
+                                      观察超时（分钟，0=直到平仓）
+                                      <input
+                                        type="number"
+                                        min="0"
+                                        value={
+                                          formData.risk_watch_timeout_minutes
+                                        }
+                                        onChange={(e) =>
+                                          handleInputChange(
+                                            'risk_watch_timeout_minutes',
+                                            Number(e.target.value)
+                                          )
+                                        }
+                                        className="mt-1 w-full px-2 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF]"
+                                      />
+                                    </label>
+                                  </div>
+                                )}
                                 {/* v3.3 单边严格语义说明 */}
                                 <p className="text-xs text-[#848E9C] mt-2 leading-relaxed">
-                                  <span className="text-[#F0B90B]">⚙ 重入价格优于领航员：</span>
-                                  多单仅在 <span className="font-mono">[入场价×(1-{formData.risk_reentry_tolerance.toFixed(2)}%), 入场价]</span> 区间内重入（不追高）；
-                                  空单仅在 <span className="font-mono">[入场价, 入场价×(1+{formData.risk_reentry_tolerance.toFixed(2)}%)]</span> 区间内重入（不追跌）。
-                                  容差越大触发窗口越宽，但重入价偏离原价越多。新逻辑下建议 ≥ 2%。
+                                  <span className="text-[#F0B90B]">
+                                    ⚙ 重入价格优于领航员：
+                                  </span>
+                                  多单仅在{' '}
+                                  <span className="font-mono">
+                                    [入场价×(1-
+                                    {formData.risk_reentry_tolerance.toFixed(2)}
+                                    %), 入场价]
+                                  </span>{' '}
+                                  区间内重入（不追高）； 空单仅在{' '}
+                                  <span className="font-mono">
+                                    [入场价, 入场价×(1+
+                                    {formData.risk_reentry_tolerance.toFixed(2)}
+                                    %)]
+                                  </span>{' '}
+                                  区间内重入（不追跌）。
+                                  容差越大触发窗口越宽，但重入价偏离原价越多。新逻辑下建议
+                                  ≥ 2%。
                                 </p>
 
                                 {/* v3.2 反加仓铁律配置 */}
-                                <div className="mt-3 pt-3 border-t border-[#2B3139]">
-                                  <div className="flex items-center justify-between mb-2">
-                                    <div>
-                                      <label className="text-sm text-[#EAECEF]">阻止反加仓重入</label>
-                                      <p className="text-xs text-[#848E9C]">领航员止损后又加仓（赌徒行为）时拒绝重入</p>
+                                {formData.risk_policy_version < 4 && (
+                                  <div className="mt-3 pt-3 border-t border-[#2B3139]">
+                                    <div className="flex items-center justify-between mb-2">
+                                      <div>
+                                        <label className="text-sm text-[#EAECEF]">
+                                          阻止反加仓重入
+                                        </label>
+                                        <p className="text-xs text-[#848E9C]">
+                                          领航员止损后又加仓（赌徒行为）时拒绝重入
+                                        </p>
+                                      </div>
+                                      <button
+                                        type="button"
+                                        onClick={() =>
+                                          handleInputChange(
+                                            'risk_reentry_block_addback',
+                                            !formData.risk_reentry_block_addback
+                                          )
+                                        }
+                                        className={`w-12 h-6 rounded-full transition-colors ${formData.risk_reentry_block_addback ? 'bg-[#F0B90B]' : 'bg-[#2B3139]'}`}
+                                      >
+                                        <div
+                                          className={`w-5 h-5 rounded-full bg-white shadow transition-transform ${formData.risk_reentry_block_addback ? 'translate-x-6' : 'translate-x-0.5'}`}
+                                        />
+                                      </button>
                                     </div>
-                                    <button
-                                      type="button"
-                                      onClick={() => handleInputChange('risk_reentry_block_addback', !formData.risk_reentry_block_addback)}
-                                      className={`w-12 h-6 rounded-full transition-colors ${formData.risk_reentry_block_addback ? 'bg-[#F0B90B]' : 'bg-[#2B3139]'}`}
-                                    >
-                                      <div className={`w-5 h-5 rounded-full bg-white shadow transition-transform ${formData.risk_reentry_block_addback ? 'translate-x-6' : 'translate-x-0.5'}`} />
-                                    </button>
+
+                                    {formData.risk_reentry_block_addback && (
+                                      <div>
+                                        <label className="text-xs text-[#848E9C] block mb-1">
+                                          允许加仓容差{' '}
+                                          <span className="text-[#F0B90B]">
+                                            {formData.risk_reentry_addback_tolerance.toFixed(
+                                              0
+                                            )}
+                                            %
+                                          </span>
+                                          <span className="text-[#5E6673] ml-2">
+                                            (0% = 严格禁止, 20% = 推荐, 50%+ =
+                                            宽松)
+                                          </span>
+                                        </label>
+                                        <input
+                                          type="range"
+                                          min="0"
+                                          max="100"
+                                          step="5"
+                                          value={
+                                            formData.risk_reentry_addback_tolerance
+                                          }
+                                          onChange={(e) =>
+                                            handleInputChange(
+                                              'risk_reentry_addback_tolerance',
+                                              parseFloat(e.target.value)
+                                            )
+                                          }
+                                          className="w-full accent-[#F0B90B]"
+                                        />
+                                        <p className="text-xs text-[#848E9C] mt-1">
+                                          领航员止损后加仓 ≤{' '}
+                                          <span className="text-[#F0B90B] font-mono">
+                                            {formData.risk_reentry_addback_tolerance.toFixed(
+                                              0
+                                            )}
+                                            %
+                                          </span>{' '}
+                                          时仍允许重入；
+                                          超出视为赌徒型补仓救单，拒绝重入保护账户。
+                                        </p>
+                                      </div>
+                                    )}
+
+                                    {!formData.risk_reentry_block_addback && (
+                                      <div className="p-2 bg-[#F6465D11] border border-[#F6465D44] rounded">
+                                        <p className="text-xs text-[#F6465D]">
+                                          ⚠️
+                                          已关闭反加仓拦截：领航员即使止损后疯狂加仓救单，系统也会重入跟随。
+                                          请确认你信任的是非赌徒型领航员。
+                                        </p>
+                                      </div>
+                                    )}
                                   </div>
-
-                                  {formData.risk_reentry_block_addback && (
-                                    <div>
-                                      <label className="text-xs text-[#848E9C] block mb-1">
-                                        允许加仓容差 <span className="text-[#F0B90B]">{formData.risk_reentry_addback_tolerance.toFixed(0)}%</span>
-                                        <span className="text-[#5E6673] ml-2">(0% = 严格禁止, 20% = 推荐, 50%+ = 宽松)</span>
-                                      </label>
-                                      <input
-                                        type="range"
-                                        min="0"
-                                        max="100"
-                                        step="5"
-                                        value={formData.risk_reentry_addback_tolerance}
-                                        onChange={(e) => handleInputChange('risk_reentry_addback_tolerance', parseFloat(e.target.value))}
-                                        className="w-full accent-[#F0B90B]"
-                                      />
-                                      <p className="text-xs text-[#848E9C] mt-1">
-                                        领航员止损后加仓 ≤ <span className="text-[#F0B90B] font-mono">{formData.risk_reentry_addback_tolerance.toFixed(0)}%</span> 时仍允许重入；
-                                        超出视为赌徒型补仓救单，拒绝重入保护账户。
-                                      </p>
-                                    </div>
-                                  )}
-
-                                  {!formData.risk_reentry_block_addback && (
-                                    <div className="p-2 bg-[#F6465D11] border border-[#F6465D44] rounded">
-                                      <p className="text-xs text-[#F6465D]">
-                                        ⚠️ 已关闭反加仓拦截：领航员即使止损后疯狂加仓救单，系统也会重入跟随。
-                                        请确认你信任的是非赌徒型领航员。
-                                      </p>
-                                    </div>
-                                  )}
-                                </div>
+                                )}
                               </>
                             )}
                           </div>
 
                           {/* 风控说明 */}
                           <div className="p-3 bg-[#1E2329] border border-[#F0B90B33] rounded flex items-start gap-2">
-                            <svg xmlns="http://www.w3.org/2000/svg" className="w-4 h-4 text-[#F0B90B] mt-0.5 flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                            <svg
+                              xmlns="http://www.w3.org/2000/svg"
+                              className="w-4 h-4 text-[#F0B90B] mt-0.5 flex-shrink-0"
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              stroke="currentColor"
+                              strokeWidth="2"
+                            >
                               <circle cx="12" cy="12" r="10" />
                               <line x1="12" x2="12" y1="8" y2="12" />
                               <line x1="12" x2="12.01" y1="16" y2="16" />
                             </svg>
                             <span className="text-xs text-[#848E9C]">
-                              账户保护止损算法：账户风险线（硬上限）+ ATR 下界（防噪音）+ 杠杆兜底（最外层封顶）三层取严。
-                              SL 由 OKX 交易所托管（algo 条件单），即使本系统离线也不影响触发。
-                              加仓后会按新均价自动收紧 SL，保护账户最大亏损不变。
+                              账户保护止损算法：账户风险线（硬上限）+ ATR
+                              下界（防噪音）+ 杠杆兜底（最外层封顶）三层取严。
+                              SL 由 OKX 交易所托管（algo
+                              条件单），即使本系统离线也不影响触发。
+                              加仓后会按新均价自动收紧
+                              SL，保护账户最大亏损不变。
                             </span>
                           </div>
                         </>
@@ -1188,7 +1828,9 @@ export function TraderConfigModal({
                 <div className="flex gap-2">
                   <button
                     type="button"
-                    onClick={() => handleInputChange('show_in_competition', true)}
+                    onClick={() =>
+                      handleInputChange('show_in_competition', true)
+                    }
                     className={`flex-1 px-3 py-2 rounded text-sm ${
                       formData.show_in_competition
                         ? 'bg-[#F0B90B] text-black'
@@ -1199,7 +1841,9 @@ export function TraderConfigModal({
                   </button>
                   <button
                     type="button"
-                    onClick={() => handleInputChange('show_in_competition', false)}
+                    onClick={() =>
+                      handleInputChange('show_in_competition', false)
+                    }
                     className={`flex-1 px-3 py-2 rounded text-sm ${
                       !formData.show_in_competition
                         ? 'bg-[#F0B90B] text-black'
@@ -1278,7 +1922,6 @@ export function TraderConfigModal({
               )}
             </div>
           </div>
-
         </div>
 
         {/* Footer */}

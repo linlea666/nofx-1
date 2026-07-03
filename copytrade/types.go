@@ -83,7 +83,7 @@ type Position struct {
 	MarginMode    string   // "cross" | "isolated"
 	UnrealizedPnL float64
 	PositionValue float64 // 仓位价值
-	PosID         string   // OKX 仓位唯一标识（用于精确匹配）
+	PosID         string  // OKX 仓位唯一标识（用于精确匹配）
 }
 
 // AccountState 账户状态
@@ -142,6 +142,20 @@ type CopyConfig struct {
 	// v3.2 反加仓铁律（详见 store.CopyTradeConfig 同名字段注释）
 	RiskReentryBlockAddback     bool    `json:"risk_reentry_block_addback"`
 	RiskReentryAddbackTolerance float64 `json:"risk_reentry_addback_tolerance"`
+	RiskPolicyVersion           int     `json:"risk_policy_version"`
+	RiskStopMode                string  `json:"risk_stop_mode"`
+	RiskATRPeriod               int     `json:"risk_atr_period"`
+	RiskATRFallbackPct          float64 `json:"risk_atr_fallback_pct"`
+	RiskTriggerPriceType        string  `json:"risk_trigger_price_type"`
+	RiskSlippageBufferBPS       float64 `json:"risk_slippage_buffer_bps"`
+	RiskLiquidationBufferATR    float64 `json:"risk_liquidation_buffer_atr"`
+	RiskMaxReentries            int     `json:"risk_max_reentries"`
+	RiskReentryBandATR          float64 `json:"risk_reentry_band_atr"`
+	RiskReentryCooldownSeconds  int     `json:"risk_reentry_cooldown_seconds"`
+	RiskReentryMaxChaseATR      float64 `json:"risk_reentry_max_chase_atr"`
+	RiskReentryMaxATRExpansion  float64 `json:"risk_reentry_max_atr_expansion"`
+	RiskWatchTimeoutMinutes     int     `json:"risk_watch_timeout_minutes"`
+	RiskMigrationConfirmed      bool    `json:"risk_migration_confirmed"`
 }
 
 // FillRiskDefaults 兜底默认值（与 store.CopyTradeConfig.FillRiskDefaults 保持一致）
@@ -151,7 +165,11 @@ type CopyConfig struct {
 // 详见 store.CopyTradeConfig.FillRiskDefaults 的注释
 func (c *CopyConfig) FillRiskDefaults() {
 	if c.RiskAccountPct == 0 {
-		c.RiskAccountPct = 0.5
+		if c.RiskPolicyVersion >= 4 {
+			c.RiskAccountPct = 0.02
+		} else {
+			c.RiskAccountPct = 0.5
+		}
 	}
 	if c.RiskATRMultiplier == 0 {
 		c.RiskATRMultiplier = 1.5
@@ -173,13 +191,42 @@ func (c *CopyConfig) FillRiskDefaults() {
 	if c.RiskReentryAddbackTolerance == 0 {
 		c.RiskReentryAddbackTolerance = 1.20
 	}
+	if c.RiskPolicyVersion >= 4 {
+		if c.RiskStopMode == "" {
+			c.RiskStopMode = "volatility_priority"
+		}
+		if c.RiskATRPeriod == 0 {
+			c.RiskATRPeriod = 14
+		}
+		if c.RiskATRFallbackPct == 0 {
+			c.RiskATRFallbackPct = 0.02
+		}
+		if c.RiskTriggerPriceType == "" {
+			c.RiskTriggerPriceType = "mark"
+		}
+		if c.RiskLiquidationBufferATR == 0 {
+			c.RiskLiquidationBufferATR = 0.5
+		}
+		if c.RiskMaxReentries == 0 {
+			c.RiskMaxReentries = 2
+		}
+		if c.RiskReentryBandATR == 0 {
+			c.RiskReentryBandATR = 0.5
+		}
+		if c.RiskReentryCooldownSeconds == 0 {
+			c.RiskReentryCooldownSeconds = 60
+		}
+		if c.RiskReentryMaxATRExpansion == 0 {
+			c.RiskReentryMaxATRExpansion = 2
+		}
+	}
 }
 
 // Warning 预警记录
 type Warning struct {
 	Timestamp    time.Time `json:"timestamp"`
 	Symbol       string    `json:"symbol"`
-	Type         string    `json:"type"`    // "low_value" | "high_value" | "insufficient_balance" | etc.
+	Type         string    `json:"type"` // "low_value" | "high_value" | "insufficient_balance" | etc.
 	Message      string    `json:"message"`
 	SignalAction string    `json:"signal_action"`
 	SignalValue  float64   `json:"signal_value"`
@@ -267,4 +314,3 @@ func OppositeSide(side SideType) SideType {
 func GenerateHLPosID(leaderID, symbol string, side SideType) string {
 	return "hl_" + leaderID + "_" + symbol + "_" + string(side)
 }
-

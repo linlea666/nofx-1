@@ -1,7 +1,13 @@
 package market
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -109,5 +115,106 @@ func GetATR(symbol, timeframe string, period int) (float64, error) {
 	atrCache[cacheKey] = atrCacheEntry{value: atr, ts: time.Now()}
 	atrCacheMu.Unlock()
 
+	return atr, nil
+}
+
+// GetOKXATR calculates ATR from completed OKX mark-price candles. The open candle is deliberately
+// excluded so stop placement is deterministic across repeated calls in the same interval.
+func GetOKXATR(symbol, timeframe string, period int) (float64, error) {
+	if symbol == "" {
+		return 0, fmt.Errorf("symbol is empty")
+	}
+	if period <= 0 {
+		period = 14
+	}
+	if timeframe == "" {
+		timeframe = "1h"
+	}
+	bar := map[string]string{"15m": "15m", "1h": "1H", "4h": "4H"}[strings.ToLower(timeframe)]
+	if bar == "" {
+		return 0, fmt.Errorf("unsupported OKX ATR timeframe: %s", timeframe)
+	}
+	key := fmt.Sprintf("okx|%s|%s|%d", symbol, bar, period)
+	atrCacheMu.RLock()
+	cached, ok := atrCache[key]
+	atrCacheMu.RUnlock()
+	if ok && time.Since(cached.ts) < atrCacheTTL {
+		return cached.value, nil
+	}
+	instID := strings.TrimSuffix(strings.ToUpper(symbol), "USDT") + "-USDT-SWAP"
+	limit := period * 3
+	if limit < 50 {
+		limit = 50
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	req, err := http.NewRequest(http.MethodGet, "https://www.okx.com/api/v5/market/mark-price-candles", nil)
+	if err != nil {
+		return 0, err
+	}
+	q := req.URL.Query()
+	q.Set("instId", instID)
+	q.Set("bar", bar)
+	q.Set("limit", strconv.Itoa(limit))
+	req.URL.RawQuery = q.Encode()
+	resp, err := getSharedAPIClient().client.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("get OKX mark candles: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, err
+	}
+	if resp.StatusCode/100 != 2 {
+		return 0, fmt.Errorf("OKX mark candles HTTP %d", resp.StatusCode)
+	}
+	var envelope struct {
+		Code string     `json:"code"`
+		Msg  string     `json:"msg"`
+		Data [][]string `json:"data"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return 0, err
+	}
+	if envelope.Code != "0" {
+		return 0, fmt.Errorf("OKX mark candles: %s", envelope.Msg)
+	}
+	klines := make([]Kline, 0, len(envelope.Data))
+	now := time.Now().UnixMilli()
+	for _, row := range envelope.Data {
+		if len(row) < 5 {
+			continue
+		}
+		// OKX may append confirm at index 5 or later depending on endpoint version. Timestamp-based
+		// exclusion below is authoritative; confirm=0 is also excluded when present.
+		if len(row) > 5 && row[len(row)-1] == "0" {
+			continue
+		}
+		ts, _ := strconv.ParseInt(row[0], 10, 64)
+		if ts <= 0 || ts >= now {
+			continue
+		}
+		o, _ := strconv.ParseFloat(row[1], 64)
+		h, _ := strconv.ParseFloat(row[2], 64)
+		l, _ := strconv.ParseFloat(row[3], 64)
+		c, _ := strconv.ParseFloat(row[4], 64)
+		if h <= 0 || l <= 0 || c <= 0 {
+			continue
+		}
+		klines = append(klines, Kline{OpenTime: ts, Open: o, High: h, Low: l, Close: c})
+	}
+	sort.Slice(klines, func(i, j int) bool { return klines[i].OpenTime < klines[j].OpenTime })
+	if len(klines) <= period {
+		return 0, fmt.Errorf("insufficient completed OKX candles: %d", len(klines))
+	}
+	atr := calculateATR(klines, period)
+	if atr <= 0 {
+		return 0, fmt.Errorf("calculated OKX ATR is zero")
+	}
+	atrCacheMu.Lock()
+	atrCache[key] = atrCacheEntry{value: atr, ts: time.Now()}
+	atrCacheMu.Unlock()
 	return atr, nil
 }

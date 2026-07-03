@@ -4,19 +4,22 @@ import "time"
 
 // ClosedPnLRecord represents a single closed position record from exchange
 type ClosedPnLRecord struct {
-	Symbol       string    // Trading pair (e.g., "BTCUSDT")
-	Side         string    // "long" or "short"
-	EntryPrice   float64   // Entry price
-	ExitPrice    float64   // Exit/close price
-	Quantity     float64   // Position size
-	RealizedPnL  float64   // Realized profit/loss
-	Fee          float64   // Trading fee/commission
-	Leverage     int       // Leverage used
-	EntryTime    time.Time // Position open time
-	ExitTime     time.Time // Position close time
-	OrderID      string    // Close order ID
-	CloseType    string    // "manual", "stop_loss", "take_profit", "liquidation", "unknown"
-	ExchangeID   string    // Exchange-specific position ID
+	Symbol             string  // Trading pair (e.g., "BTCUSDT")
+	Side               string  // "long" or "short"
+	EntryPrice         float64 // Entry price
+	ExitPrice          float64 // Exit/close price
+	Quantity           float64 // Position size
+	RealizedPnL        float64 // Realized profit/loss
+	Fee                float64 // Trading fee/commission
+	FundingFee         float64
+	LiquidationPenalty float64
+	GrossPnL           float64
+	Leverage           int       // Leverage used
+	EntryTime          time.Time // Position open time
+	ExitTime           time.Time // Position close time
+	OrderID            string    // Close order ID
+	CloseType          string    // "manual", "stop_loss", "take_profit", "liquidation", "unknown"
+	ExchangeID         string    // Exchange-specific position ID
 }
 
 // TradeRecord represents a single trade/fill from exchange
@@ -31,6 +34,37 @@ type TradeRecord struct {
 	RealizedPnL  float64   // Realized PnL (non-zero for closing trades)
 	Fee          float64   // Trading fee/commission
 	Time         time.Time // Trade execution time
+}
+
+type ProtectiveStopRequest struct {
+	Symbol       string
+	PositionSide string
+	MarginMode   string
+	Quantity     float64
+	TriggerPrice float64
+	TriggerType  string
+	ClientID     string
+}
+
+type ProtectiveStopOrder struct {
+	AlgoID        string
+	ClientID      string
+	Symbol        string
+	PositionSide  string
+	MarginMode    string
+	Quantity      float64
+	TriggerPrice  float64
+	TriggerType   string
+	State         string
+	ActualOrderID string
+}
+
+// ProtectiveStopManager is intentionally separate from Trader so non-OKX implementations remain unchanged.
+type ProtectiveStopManager interface {
+	PlaceProtectiveStop(req ProtectiveStopRequest) (*ProtectiveStopOrder, error)
+	AmendProtectiveStop(algoID string, req ProtectiveStopRequest) error
+	GetProtectiveStop(algoID, symbol string) (*ProtectiveStopOrder, error)
+	CancelProtectiveStop(algoID, symbol string) error
 }
 
 // Trader Unified trader interface

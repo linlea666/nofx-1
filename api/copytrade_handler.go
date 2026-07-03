@@ -1,9 +1,13 @@
 package api
 
 import (
+	"encoding/csv"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -39,6 +43,10 @@ func (h *CopyTradeHandler) RegisterRoutes(group *gin.RouterGroup) {
 		copyTrade.POST("/stop/:trader_id", h.Stop)
 		copyTrade.GET("/stats/:trader_id", h.GetStats)
 		copyTrade.GET("/logs/:trader_id", h.GetLogs)
+		copyTrade.GET("/risk/summary", h.GetRiskSummary)
+		copyTrade.GET("/risk/cycles", h.GetRiskCycles)
+		copyTrade.GET("/risk/cycles/:id", h.GetRiskCycle)
+		copyTrade.GET("/risk/export", h.ExportRiskCycles)
 
 		// Binance 全局共享凭证管理（v2 凭证全局化）
 		// 所有 Binance 跟单交易员共享同一份凭证（p20t / csrftoken），
@@ -52,6 +60,136 @@ func (h *CopyTradeHandler) RegisterRoutes(group *gin.RouterGroup) {
 			creds.DELETE("/:label", h.DeleteBinanceCredentials)
 		}
 	}
+}
+
+func (h *CopyTradeHandler) ownedTraderIDs(c *gin.Context) ([]string, map[string]bool, error) {
+	list, err := h.store.Trader().List(c.GetString("user_id"))
+	if err != nil {
+		return nil, nil, err
+	}
+	ids := make([]string, 0, len(list))
+	set := map[string]bool{}
+	filter := strings.TrimSpace(c.Query("trader_id"))
+	for _, t := range list {
+		if filter != "" && t.ID != filter {
+			continue
+		}
+		ids = append(ids, t.ID)
+		set[t.ID] = true
+	}
+	return ids, set, nil
+}
+func riskTimeRange(c *gin.Context) (time.Time, time.Time) {
+	to := time.Now().UTC().Add(time.Second)
+	from := to.AddDate(0, 0, -30)
+	if v := c.Query("from"); v != "" {
+		if x, e := time.Parse(time.RFC3339, v); e == nil {
+			from = x
+		}
+	}
+	if v := c.Query("to"); v != "" {
+		if x, e := time.Parse(time.RFC3339, v); e == nil {
+			to = x
+		}
+	}
+	return from, to
+}
+func riskFilter(c *gin.Context) store.CopyGuardFilter {
+	return store.CopyGuardFilter{LeaderID: strings.TrimSpace(c.Query("leader_id")), Symbol: strings.TrimSpace(c.Query("symbol")), Status: strings.TrimSpace(c.Query("status"))}
+}
+
+func (h *CopyTradeHandler) GetRiskSummary(c *gin.Context) {
+	ids, _, err := h.ownedTraderIDs(c)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	from, to := riskTimeRange(c)
+	x, err := h.store.CopyTrade().CopyGuardSummary(ids, from, to, riskFilter(c))
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"summary": x, "from": from, "to": to})
+}
+func (h *CopyTradeHandler) GetRiskCycles(c *gin.Context) {
+	ids, _, err := h.ownedTraderIDs(c)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	from, to := riskTimeRange(c)
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
+	offset, _ := strconv.Atoi(c.DefaultQuery("offset", "0"))
+	rows, err := h.store.CopyTrade().ListCopyGuardCycles(ids, from, to, limit, offset, riskFilter(c))
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"cycles": rows, "count": len(rows)})
+}
+func (h *CopyTradeHandler) GetRiskCycle(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(400, gin.H{"error": "invalid cycle id"})
+		return
+	}
+	_, owned, err := h.ownedTraderIDs(c)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	cycle, err := h.store.CopyTrade().GetCopyGuardCycle(id)
+	if err != nil {
+		c.JSON(404, gin.H{"error": "cycle not found"})
+		return
+	}
+	if !owned[cycle.TraderID] {
+		c.JSON(403, gin.H{"error": "forbidden"})
+		return
+	}
+	events, err := h.store.CopyTrade().ListCopyGuardEvents(id)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"cycle": cycle, "events": events})
+}
+func (h *CopyTradeHandler) ExportRiskCycles(c *gin.Context) {
+	ids, _, err := h.ownedTraderIDs(c)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	from, to := riskTimeRange(c)
+	rows, err := h.store.CopyTrade().ListCopyGuardCycles(ids, from, to, 500, 0, riskFilter(c))
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	format := strings.ToLower(c.DefaultQuery("format", "csv"))
+	if format == "jsonl" {
+		c.Header("Content-Type", "application/x-ndjson")
+		c.Header("Content-Disposition", "attachment; filename=copy-guard.jsonl")
+		enc := json.NewEncoder(c.Writer)
+		for _, cycle := range rows {
+			events, _ := h.store.CopyTrade().ListCopyGuardEvents(cycle.ID)
+			_ = enc.Encode(gin.H{"cycle": cycle, "events": events})
+		}
+		return
+	}
+	c.Header("Content-Type", "text/csv; charset=utf-8")
+	c.Header("Content-Disposition", "attachment; filename=copy-guard.csv")
+	w := csv.NewWriter(c.Writer)
+	_ = w.Write([]string{"cycle_id", "trader_id", "leader_id", "leader_pos_id", "symbol", "side", "status", "stop_count", "reentry_count", "actual_pnl", "baseline_no_guard_pnl", "net_guard_effect", "fees", "funding_fee", "slippage", "opened_at", "closed_at"})
+	for _, x := range rows {
+		closed := ""
+		if x.ClosedAt != nil {
+			closed = x.ClosedAt.Format(time.RFC3339)
+		}
+		_ = w.Write([]string{strconv.FormatInt(x.ID, 10), x.TraderID, x.LeaderID, x.LeaderPosID, x.Symbol, x.Side, x.Status, strconv.Itoa(x.StopCount), strconv.Itoa(x.ReentryCount), fmt.Sprint(x.ActualPnL), fmt.Sprint(x.BaselinePnL), fmt.Sprint(x.NetGuardEffect), fmt.Sprint(x.Fees), fmt.Sprint(x.FundingFee), fmt.Sprint(x.Slippage), x.OpenedAt.Format(time.RFC3339), closed})
+	}
+	w.Flush()
 }
 
 // CopyTradeConfigRequest 跟单配置请求
@@ -88,6 +226,20 @@ type CopyTradeConfigRequest struct {
 	// risk_reentry_addback_tolerance 合法范围：[1.0, +∞)，<= 0 时会被 FillRiskDefaults 兜底为 1.20
 	RiskReentryBlockAddback     *bool    `json:"risk_reentry_block_addback,omitempty"`
 	RiskReentryAddbackTolerance *float64 `json:"risk_reentry_addback_tolerance,omitempty"`
+	RiskPolicyVersion           *int     `json:"risk_policy_version,omitempty"`
+	RiskStopMode                *string  `json:"risk_stop_mode,omitempty"`
+	RiskATRPeriod               *int     `json:"risk_atr_period,omitempty"`
+	RiskATRFallbackPct          *float64 `json:"risk_atr_fallback_pct,omitempty"`
+	RiskTriggerPriceType        *string  `json:"risk_trigger_price_type,omitempty"`
+	RiskSlippageBufferBPS       *float64 `json:"risk_slippage_buffer_bps,omitempty"`
+	RiskLiquidationBufferATR    *float64 `json:"risk_liquidation_buffer_atr,omitempty"`
+	RiskMaxReentries            *int     `json:"risk_max_reentries,omitempty"`
+	RiskReentryBandATR          *float64 `json:"risk_reentry_band_atr,omitempty"`
+	RiskReentryCooldownSeconds  *int     `json:"risk_reentry_cooldown_seconds,omitempty"`
+	RiskReentryMaxChaseATR      *float64 `json:"risk_reentry_max_chase_atr,omitempty"`
+	RiskReentryMaxATRExpansion  *float64 `json:"risk_reentry_max_atr_expansion,omitempty"`
+	RiskWatchTimeoutMinutes     *int     `json:"risk_watch_timeout_minutes,omitempty"`
+	RiskMigrationConfirmed      *bool    `json:"risk_migration_confirmed,omitempty"`
 }
 
 // GetConfig 获取跟单配置
@@ -218,6 +370,11 @@ func (h *CopyTradeHandler) SaveConfig(c *gin.Context) {
 	} else if existing != nil {
 		config.RiskReentryAddbackTolerance = existing.RiskReentryAddbackTolerance
 	}
+	applyCopyGuardV4Request(config, existing, &req)
+	if err := copytrade.ValidateStoredRiskPolicy(config); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 
 	// 保存配置（store.Upsert 内部会调 FillRiskDefaults 做最后兜底）
 	if err := h.store.CopyTrade().Upsert(config); err != nil {
@@ -240,6 +397,82 @@ func (h *CopyTradeHandler) SaveConfig(c *gin.Context) {
 		"message": "config saved",
 		"config":  config,
 	})
+}
+
+func applyCopyGuardV4Request(c, old *store.CopyTradeConfig, r *CopyTradeConfigRequest) {
+	if r.RiskPolicyVersion != nil {
+		c.RiskPolicyVersion = *r.RiskPolicyVersion
+	} else if old != nil {
+		c.RiskPolicyVersion = old.RiskPolicyVersion
+	}
+	if r.RiskStopMode != nil {
+		c.RiskStopMode = *r.RiskStopMode
+	} else if old != nil {
+		c.RiskStopMode = old.RiskStopMode
+	}
+	if r.RiskATRPeriod != nil {
+		c.RiskATRPeriod = *r.RiskATRPeriod
+	} else if old != nil {
+		c.RiskATRPeriod = old.RiskATRPeriod
+	}
+	if r.RiskATRFallbackPct != nil {
+		c.RiskATRFallbackPct = *r.RiskATRFallbackPct
+	} else if old != nil {
+		c.RiskATRFallbackPct = old.RiskATRFallbackPct
+	}
+	if r.RiskTriggerPriceType != nil {
+		c.RiskTriggerPriceType = *r.RiskTriggerPriceType
+	} else if old != nil {
+		c.RiskTriggerPriceType = old.RiskTriggerPriceType
+	}
+	if r.RiskSlippageBufferBPS != nil {
+		c.RiskSlippageBufferBPS = *r.RiskSlippageBufferBPS
+	} else if old != nil {
+		c.RiskSlippageBufferBPS = old.RiskSlippageBufferBPS
+	}
+	if r.RiskLiquidationBufferATR != nil {
+		c.RiskLiquidationBufferATR = *r.RiskLiquidationBufferATR
+	} else if old != nil {
+		c.RiskLiquidationBufferATR = old.RiskLiquidationBufferATR
+	}
+	if r.RiskMaxReentries != nil {
+		c.RiskMaxReentries = *r.RiskMaxReentries
+	} else if old != nil {
+		c.RiskMaxReentries = old.RiskMaxReentries
+	}
+	if r.RiskReentryBandATR != nil {
+		c.RiskReentryBandATR = *r.RiskReentryBandATR
+	} else if old != nil {
+		c.RiskReentryBandATR = old.RiskReentryBandATR
+	}
+	if r.RiskReentryCooldownSeconds != nil {
+		c.RiskReentryCooldownSeconds = *r.RiskReentryCooldownSeconds
+	} else if old != nil {
+		c.RiskReentryCooldownSeconds = old.RiskReentryCooldownSeconds
+	}
+	if r.RiskReentryMaxChaseATR != nil {
+		c.RiskReentryMaxChaseATR = *r.RiskReentryMaxChaseATR
+	} else if old != nil {
+		c.RiskReentryMaxChaseATR = old.RiskReentryMaxChaseATR
+	}
+	if r.RiskReentryMaxATRExpansion != nil {
+		c.RiskReentryMaxATRExpansion = *r.RiskReentryMaxATRExpansion
+	} else if old != nil {
+		c.RiskReentryMaxATRExpansion = old.RiskReentryMaxATRExpansion
+	}
+	if r.RiskWatchTimeoutMinutes != nil {
+		c.RiskWatchTimeoutMinutes = *r.RiskWatchTimeoutMinutes
+	} else if old != nil {
+		c.RiskWatchTimeoutMinutes = old.RiskWatchTimeoutMinutes
+	}
+	if r.RiskMigrationConfirmed != nil {
+		c.RiskMigrationConfirmed = *r.RiskMigrationConfirmed
+	} else if old != nil {
+		c.RiskMigrationConfirmed = old.RiskMigrationConfirmed
+	}
+	if c.RiskPolicyVersion >= 4 {
+		c.FillRiskDefaults()
+	}
 }
 
 // DeleteConfig 删除跟单配置
@@ -306,7 +539,6 @@ func (h *CopyTradeHandler) Start(c *gin.Context) {
 		"status":  "running",
 	})
 }
-
 
 // Stop 停止跟单
 // @Summary 停止跟单
@@ -624,4 +856,3 @@ func extractBinanceCredentialsFromCurl(curl string) (p20t, csrfToken string) {
 	}
 	return p20t, csrfToken
 }
-

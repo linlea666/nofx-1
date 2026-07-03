@@ -114,7 +114,10 @@ export const api = {
     if (!result.success) throw new Error('停止交易员失败')
   },
 
-  async toggleCompetition(traderId: string, showInCompetition: boolean): Promise<void> {
+  async toggleCompetition(
+    traderId: string,
+    showInCompetition: boolean
+  ): Promise<void> {
     const result = await httpClient.put(
       `${API_BASE}/traders/${traderId}/competition`,
       { show_in_competition: showInCompetition }
@@ -122,7 +125,11 @@ export const api = {
     if (!result.success) throw new Error('更新竞技场显示设置失败')
   },
 
-  async closePosition(traderId: string, symbol: string, side: string): Promise<{ message: string }> {
+  async closePosition(
+    traderId: string,
+    symbol: string,
+    side: string
+  ): Promise<{ message: string }> {
     const result = await httpClient.post<{ message: string }>(
       `${API_BASE}/traders/${traderId}/close-position`,
       { symbol, side }
@@ -245,20 +252,30 @@ export const api = {
   },
 
   // 创建新的交易所账户
-  async createExchange(request: CreateExchangeRequest): Promise<{ id: string }> {
-    const result = await httpClient.post<{ id: string }>(`${API_BASE}/exchanges`, request)
+  async createExchange(
+    request: CreateExchangeRequest
+  ): Promise<{ id: string }> {
+    const result = await httpClient.post<{ id: string }>(
+      `${API_BASE}/exchanges`,
+      request
+    )
     if (!result.success) throw new Error('创建交易所账户失败')
     return result.data!
   },
 
   // 创建新的交易所账户（加密传输）
-  async createExchangeEncrypted(request: CreateExchangeRequest): Promise<{ id: string }> {
+  async createExchangeEncrypted(
+    request: CreateExchangeRequest
+  ): Promise<{ id: string }> {
     // 检查是否启用了传输加密
     const config = await CryptoService.fetchCryptoConfig()
 
     if (!config.transport_encryption) {
       // 传输加密禁用时，直接发送明文
-      const result = await httpClient.post<{ id: string }>(`${API_BASE}/exchanges`, request)
+      const result = await httpClient.post<{ id: string }>(
+        `${API_BASE}/exchanges`,
+        request
+      )
       if (!result.success) throw new Error('创建交易所账户失败')
       return result.data!
     }
@@ -291,7 +308,9 @@ export const api = {
 
   // 删除交易所账户
   async deleteExchange(exchangeId: string): Promise<void> {
-    const result = await httpClient.delete(`${API_BASE}/exchanges/${exchangeId}`)
+    const result = await httpClient.delete(
+      `${API_BASE}/exchanges/${exchangeId}`
+    )
     if (!result.success) throw new Error('删除交易所账户失败')
   },
 
@@ -482,7 +501,9 @@ export const api = {
     return handleJSONResponse<BacktestRunsResponse>(res)
   },
 
-  async startBacktest(config: BacktestStartConfig): Promise<BacktestRunMetadata> {
+  async startBacktest(
+    config: BacktestStartConfig
+  ): Promise<BacktestRunMetadata> {
     const res = await fetch(`${API_BASE}/backtest/start`, {
       method: 'POST',
       headers: getAuthHeaders(),
@@ -634,26 +655,34 @@ export const api = {
 
   // Strategy APIs
   async getStrategies(): Promise<Strategy[]> {
-    const result = await httpClient.get<{ strategies: Strategy[] }>(`${API_BASE}/strategies`)
+    const result = await httpClient.get<{ strategies: Strategy[] }>(
+      `${API_BASE}/strategies`
+    )
     if (!result.success) throw new Error('获取策略列表失败')
     const strategies = result.data?.strategies
     return Array.isArray(strategies) ? strategies : []
   },
 
   async getStrategy(strategyId: string): Promise<Strategy> {
-    const result = await httpClient.get<Strategy>(`${API_BASE}/strategies/${strategyId}`)
+    const result = await httpClient.get<Strategy>(
+      `${API_BASE}/strategies/${strategyId}`
+    )
     if (!result.success) throw new Error('获取策略失败')
     return result.data!
   },
 
   async getActiveStrategy(): Promise<Strategy> {
-    const result = await httpClient.get<Strategy>(`${API_BASE}/strategies/active`)
+    const result = await httpClient.get<Strategy>(
+      `${API_BASE}/strategies/active`
+    )
     if (!result.success) throw new Error('获取激活策略失败')
     return result.data!
   },
 
   async getDefaultStrategyConfig(): Promise<StrategyConfig> {
-    const result = await httpClient.get<StrategyConfig>(`${API_BASE}/strategies/default-config`)
+    const result = await httpClient.get<StrategyConfig>(
+      `${API_BASE}/strategies/default-config`
+    )
     if (!result.success) throw new Error('获取默认策略配置失败')
     return result.data!
   },
@@ -663,7 +692,10 @@ export const api = {
     description: string
     config: StrategyConfig
   }): Promise<Strategy> {
-    const result = await httpClient.post<Strategy>(`${API_BASE}/strategies`, data)
+    const result = await httpClient.post<Strategy>(
+      `${API_BASE}/strategies`,
+      data
+    )
     if (!result.success) throw new Error('创建策略失败')
     return result.data!
   },
@@ -676,24 +708,33 @@ export const api = {
       config?: StrategyConfig
     }
   ): Promise<Strategy> {
-    const result = await httpClient.put<Strategy>(`${API_BASE}/strategies/${strategyId}`, data)
+    const result = await httpClient.put<Strategy>(
+      `${API_BASE}/strategies/${strategyId}`,
+      data
+    )
     if (!result.success) throw new Error('更新策略失败')
     return result.data!
   },
 
   async deleteStrategy(strategyId: string): Promise<void> {
-    const result = await httpClient.delete(`${API_BASE}/strategies/${strategyId}`)
+    const result = await httpClient.delete(
+      `${API_BASE}/strategies/${strategyId}`
+    )
     if (!result.success) throw new Error('删除策略失败')
   },
 
   async activateStrategy(strategyId: string): Promise<Strategy> {
-    const result = await httpClient.post<Strategy>(`${API_BASE}/strategies/${strategyId}/activate`)
+    const result = await httpClient.post<Strategy>(
+      `${API_BASE}/strategies/${strategyId}/activate`
+    )
     if (!result.success) throw new Error('激活策略失败')
     return result.data!
   },
 
   async duplicateStrategy(strategyId: string): Promise<Strategy> {
-    const result = await httpClient.post<Strategy>(`${API_BASE}/strategies/${strategyId}/duplicate`)
+    const result = await httpClient.post<Strategy>(
+      `${API_BASE}/strategies/${strategyId}/duplicate`
+    )
     if (!result.success) throw new Error('复制策略失败')
     return result.data!
   },
@@ -706,32 +747,46 @@ export const api = {
   },
 
   async getDebate(debateId: string): Promise<DebateSessionWithDetails> {
-    const result = await httpClient.get<DebateSessionWithDetails>(`${API_BASE}/debates/${debateId}`)
+    const result = await httpClient.get<DebateSessionWithDetails>(
+      `${API_BASE}/debates/${debateId}`
+    )
     if (!result.success) throw new Error('获取辩论详情失败')
     return result.data!
   },
 
-  async createDebate(request: CreateDebateRequest): Promise<DebateSessionWithDetails> {
-    const result = await httpClient.post<DebateSessionWithDetails>(`${API_BASE}/debates`, request)
+  async createDebate(
+    request: CreateDebateRequest
+  ): Promise<DebateSessionWithDetails> {
+    const result = await httpClient.post<DebateSessionWithDetails>(
+      `${API_BASE}/debates`,
+      request
+    )
     if (!result.success) throw new Error('创建辩论失败')
     return result.data!
   },
 
   async startDebate(debateId: string): Promise<void> {
-    const result = await httpClient.post(`${API_BASE}/debates/${debateId}/start`)
+    const result = await httpClient.post(
+      `${API_BASE}/debates/${debateId}/start`
+    )
     if (!result.success) throw new Error('启动辩论失败')
   },
 
   async cancelDebate(debateId: string): Promise<void> {
-    const result = await httpClient.post(`${API_BASE}/debates/${debateId}/cancel`)
+    const result = await httpClient.post(
+      `${API_BASE}/debates/${debateId}/cancel`
+    )
     if (!result.success) throw new Error('取消辩论失败')
   },
 
-  async executeDebate(debateId: string, traderId: string): Promise<DebateSessionWithDetails> {
-    const result = await httpClient.post<{ message: string; session: DebateSessionWithDetails }>(
-      `${API_BASE}/debates/${debateId}/execute`,
-      { trader_id: traderId }
-    )
+  async executeDebate(
+    debateId: string,
+    traderId: string
+  ): Promise<DebateSessionWithDetails> {
+    const result = await httpClient.post<{
+      message: string
+      session: DebateSessionWithDetails
+    }>(`${API_BASE}/debates/${debateId}/execute`, { trader_id: traderId })
     if (!result.success) throw new Error('执行交易失败')
     return result.data!.session
   },
@@ -742,19 +797,25 @@ export const api = {
   },
 
   async getDebateMessages(debateId: string): Promise<DebateMessage[]> {
-    const result = await httpClient.get<DebateMessage[]>(`${API_BASE}/debates/${debateId}/messages`)
+    const result = await httpClient.get<DebateMessage[]>(
+      `${API_BASE}/debates/${debateId}/messages`
+    )
     if (!result.success) throw new Error('获取辩论消息失败')
     return result.data!
   },
 
   async getDebateVotes(debateId: string): Promise<DebateVote[]> {
-    const result = await httpClient.get<DebateVote[]>(`${API_BASE}/debates/${debateId}/votes`)
+    const result = await httpClient.get<DebateVote[]>(
+      `${API_BASE}/debates/${debateId}/votes`
+    )
     if (!result.success) throw new Error('获取辩论投票失败')
     return result.data!
   },
 
   async getDebatePersonalities(): Promise<DebatePersonalityInfo[]> {
-    const result = await httpClient.get<DebatePersonalityInfo[]>(`${API_BASE}/debates/personalities`)
+    const result = await httpClient.get<DebatePersonalityInfo[]>(
+      `${API_BASE}/debates/personalities`
+    )
     if (!result.success) throw new Error('获取AI性格列表失败')
     return result.data!
   },
@@ -762,7 +823,9 @@ export const api = {
   // SSE stream for live debate updates
   createDebateStream(debateId: string): EventSource {
     const token = localStorage.getItem('auth_token')
-    return new EventSource(`${API_BASE}/debates/${debateId}/stream?token=${token}`)
+    return new EventSource(
+      `${API_BASE}/debates/${debateId}/stream?token=${token}`
+    )
   },
 
   // ==========================================================================
@@ -774,25 +837,32 @@ export const api = {
     const result = await httpClient.get<BinanceCredentialsListResponse>(
       `${API_BASE}/copytrade/binance-credentials`
     )
-    if (!result.success) throw new Error(result.message || '获取 Binance 凭证失败')
+    if (!result.success)
+      throw new Error(result.message || '获取 Binance 凭证失败')
     return result.data?.credentials ?? []
   },
 
-  async setBinanceCredentials(req: BinanceCredentialsSetRequest): Promise<BinanceCredentialsView | null> {
-    const result = await httpClient.post<{ message: string; credentials: BinanceCredentialsView }>(
-      `${API_BASE}/copytrade/binance-credentials`,
-      req
-    )
-    if (!result.success) throw new Error(result.message || '保存 Binance 凭证失败')
+  async setBinanceCredentials(
+    req: BinanceCredentialsSetRequest
+  ): Promise<BinanceCredentialsView | null> {
+    const result = await httpClient.post<{
+      message: string
+      credentials: BinanceCredentialsView
+    }>(`${API_BASE}/copytrade/binance-credentials`, req)
+    if (!result.success)
+      throw new Error(result.message || '保存 Binance 凭证失败')
     return result.data?.credentials ?? null
   },
 
-  async testBinanceCredentials(label?: string): Promise<BinanceCredentialsTestResponse> {
+  async testBinanceCredentials(
+    label?: string
+  ): Promise<BinanceCredentialsTestResponse> {
     const url = label
       ? `${API_BASE}/copytrade/binance-credentials/test?label=${encodeURIComponent(label)}`
       : `${API_BASE}/copytrade/binance-credentials/test`
     const result = await httpClient.post<BinanceCredentialsTestResponse>(url)
-    if (!result.success) throw new Error(result.message || '测试 Binance 凭证失败')
+    if (!result.success)
+      throw new Error(result.message || '测试 Binance 凭证失败')
     return result.data!
   },
 
@@ -800,14 +870,50 @@ export const api = {
     const result = await httpClient.delete(
       `${API_BASE}/copytrade/binance-credentials/${encodeURIComponent(label)}`
     )
-    if (!result.success) throw new Error(result.message || '删除 Binance 凭证失败')
+    if (!result.success)
+      throw new Error(result.message || '删除 Binance 凭证失败')
   },
 
   async getBinanceCredentialsAffectedTraders(): Promise<string[]> {
     const result = await httpClient.get<BinanceCredentialsAffectedResponse>(
       `${API_BASE}/copytrade/binance-credentials/affected`
     )
-    if (!result.success) throw new Error(result.message || '获取受影响交易员失败')
+    if (!result.success)
+      throw new Error(result.message || '获取受影响交易员失败')
     return result.data?.trader_ids ?? []
+  },
+
+  async getCopyGuardSummary(params = '') {
+    const result = await httpClient.get<{
+      summary: import('../types').CopyGuardSummary
+    }>(`${API_BASE}/copytrade/risk/summary${params}`)
+    if (!result.success)
+      throw new Error(result.message || '获取 Copy Guard 统计失败')
+    return result.data!.summary
+  },
+
+  async getCopyGuardCycles(params = '') {
+    const result = await httpClient.get<{
+      cycles: import('../types').CopyGuardCycle[]
+    }>(`${API_BASE}/copytrade/risk/cycles${params}`)
+    if (!result.success)
+      throw new Error(result.message || '获取 Copy Guard 明细失败')
+    return result.data!.cycles
+  },
+  async getCopyGuardCycle(id: number) {
+    const result = await httpClient.get<{
+      cycle: import('../types').CopyGuardCycle
+      events: Array<{
+        id: number
+        type: string
+        price: number
+        pnl: number
+        fee: number
+        created_at: string
+      }>
+    }>(`${API_BASE}/copytrade/risk/cycles/${id}`)
+    if (!result.success)
+      throw new Error(result.message || '获取 Copy Guard 生命周期失败')
+    return result.data!
   },
 }

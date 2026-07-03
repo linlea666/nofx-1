@@ -32,8 +32,102 @@ const (
 	okxAlgoOrderPath     = "/api/v5/trade/order-algo"
 	okxCancelAlgoPath    = "/api/v5/trade/cancel-algos"
 	okxAlgoPendingPath   = "/api/v5/trade/orders-algo-pending"
+	okxAlgoHistoryPath   = "/api/v5/trade/orders-algo-history"
+	okxAmendAlgoPath     = "/api/v5/trade/amend-algos"
 	okxPositionModePath  = "/api/v5/account/set-position-mode"
 )
+
+func normalizeOKXTriggerType(v string) string {
+	switch strings.ToLower(v) {
+	case "mark":
+		return "mark"
+	case "index":
+		return "index"
+	default:
+		return "last"
+	}
+}
+
+func (t *OKXTrader) PlaceProtectiveStop(req ProtectiveStopRequest) (*ProtectiveStopOrder, error) {
+	inst, err := t.getInstrument(req.Symbol)
+	if err != nil {
+		return nil, err
+	}
+	sz := t.formatSize(req.Quantity/inst.CtVal, inst)
+	side, posSide := "sell", "long"
+	if strings.EqualFold(req.PositionSide, "short") {
+		side, posSide = "buy", "short"
+	}
+	mode := req.MarginMode
+	if mode == "" {
+		mode = t.getMgnMode()
+	}
+	clientID := req.ClientID
+	if clientID == "" {
+		clientID = genOkxClOrdID()
+	}
+	body := map[string]interface{}{"instId": t.convertSymbol(req.Symbol), "tdMode": mode, "side": side, "posSide": posSide, "ordType": "conditional", "sz": sz, "slTriggerPx": strconv.FormatFloat(req.TriggerPrice, 'f', -1, 64), "slTriggerPxType": normalizeOKXTriggerType(req.TriggerType), "slOrdPx": "-1", "algoClOrdId": clientID, "tag": okxTag}
+	data, err := t.doRequest("POST", okxAlgoOrderPath, body)
+	if err != nil {
+		return nil, err
+	}
+	var out []struct {
+		AlgoID      string `json:"algoId"`
+		AlgoClOrdID string `json:"algoClOrdId"`
+		SCode       string `json:"sCode"`
+		SMsg        string `json:"sMsg"`
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil, err
+	}
+	if len(out) == 0 || out[0].AlgoID == "" || out[0].SCode != "0" {
+		return nil, fmt.Errorf("OKX protective stop rejected: %v", out)
+	}
+	return &ProtectiveStopOrder{AlgoID: out[0].AlgoID, ClientID: out[0].AlgoClOrdID, Symbol: req.Symbol, PositionSide: posSide, MarginMode: mode, Quantity: req.Quantity, TriggerPrice: req.TriggerPrice, TriggerType: req.TriggerType, State: "live"}, nil
+}
+
+func (t *OKXTrader) AmendProtectiveStop(algoID string, req ProtectiveStopRequest) error {
+	inst, err := t.getInstrument(req.Symbol)
+	if err != nil {
+		return err
+	}
+	body := []map[string]interface{}{{"instId": t.convertSymbol(req.Symbol), "algoId": algoID, "newSz": t.formatSize(req.Quantity/inst.CtVal, inst), "newSlTriggerPx": strconv.FormatFloat(req.TriggerPrice, 'f', -1, 64), "newSlOrdPx": "-1"}}
+	_, err = t.doRequest("POST", okxAmendAlgoPath, body)
+	return err
+}
+
+func (t *OKXTrader) GetProtectiveStop(algoID, symbol string) (*ProtectiveStopOrder, error) {
+	paths := []string{fmt.Sprintf("%s?algoId=%s&instType=SWAP", okxAlgoPendingPath, algoID), fmt.Sprintf("%s?algoId=%s&ordType=conditional&instType=SWAP", okxAlgoHistoryPath, algoID)}
+	for _, path := range paths {
+		data, err := t.doRequest("GET", path, nil)
+		if err != nil {
+			continue
+		}
+		var rows []struct {
+			AlgoID          string `json:"algoId"`
+			AlgoClOrdID     string `json:"algoClOrdId"`
+			InstID          string `json:"instId"`
+			PosSide         string `json:"posSide"`
+			TdMode          string `json:"tdMode"`
+			Sz              string `json:"sz"`
+			SlTriggerPx     string `json:"slTriggerPx"`
+			SlTriggerPxType string `json:"slTriggerPxType"`
+			State           string `json:"state"`
+			OrdID           string `json:"ordId"`
+		}
+		if json.Unmarshal(data, &rows) == nil && len(rows) > 0 {
+			q, _ := strconv.ParseFloat(rows[0].Sz, 64)
+			px, _ := strconv.ParseFloat(rows[0].SlTriggerPx, 64)
+			return &ProtectiveStopOrder{AlgoID: rows[0].AlgoID, ClientID: rows[0].AlgoClOrdID, Symbol: symbol, PositionSide: rows[0].PosSide, MarginMode: rows[0].TdMode, Quantity: q, TriggerPrice: px, TriggerType: rows[0].SlTriggerPxType, State: rows[0].State, ActualOrderID: rows[0].OrdID}, nil
+		}
+	}
+	return nil, fmt.Errorf("protective stop %s not found", algoID)
+}
+
+func (t *OKXTrader) CancelProtectiveStop(algoID, symbol string) error {
+	_, err := t.doRequest("POST", okxCancelAlgoPath, []map[string]interface{}{{"algoId": algoID, "instId": t.convertSymbol(symbol)}})
+	return err
+}
 
 // OKXTrader OKX futures trader
 type OKXTrader struct {
@@ -1132,8 +1226,10 @@ func (t *OKXTrader) cancelAlgoOrders(symbol string, orderType string) error {
 	}
 
 	var orders []struct {
-		AlgoId string `json:"algoId"`
-		InstId string `json:"instId"`
+		AlgoId      string `json:"algoId"`
+		InstId      string `json:"instId"`
+		SlTriggerPx string `json:"slTriggerPx"`
+		TpTriggerPx string `json:"tpTriggerPx"`
 	}
 
 	if err := json.Unmarshal(data, &orders); err != nil {
@@ -1142,6 +1238,12 @@ func (t *OKXTrader) cancelAlgoOrders(symbol string, orderType string) error {
 
 	canceledCount := 0
 	for _, order := range orders {
+		if orderType == "sl" && order.SlTriggerPx == "" {
+			continue
+		}
+		if orderType == "tp" && order.TpTriggerPx == "" {
+			continue
+		}
 		body := []map[string]interface{}{
 			{
 				"algoId": order.AlgoId,
@@ -1357,19 +1459,21 @@ func (t *OKXTrader) GetClosedPnL(startTime time.Time, limit int) ([]ClosedPnLRec
 
 	// doRequest 已解包外层 {code, msg, data}，这里直接解析 data 数组
 	var positions []struct {
-			InstID        string `json:"instId"`        // Instrument ID (e.g., "BTC-USDT-SWAP")
-			Direction     string `json:"direction"`     // Position direction: "long" or "short"
-			OpenAvgPx     string `json:"openAvgPx"`     // Average open price
-			CloseAvgPx    string `json:"closeAvgPx"`    // Average close price
-			CloseTotalPos string `json:"closeTotalPos"` // Closed position quantity
-			RealizedPnl   string `json:"realizedPnl"`   // Realized PnL
-			Fee           string `json:"fee"`           // Total fee
-			FundingFee    string `json:"fundingFee"`    // Funding fee
-			Lever         string `json:"lever"`         // Leverage
-			CTime         string `json:"cTime"`         // Position open time
-			UTime         string `json:"uTime"`         // Position close time
-			Type          string `json:"type"`          // Close type: 1=close position, 2=partial close, 3=liquidation, 4=partial liquidation
-			PosId         string `json:"posId"`         // Position ID
+		InstID        string `json:"instId"`        // Instrument ID (e.g., "BTC-USDT-SWAP")
+		Direction     string `json:"direction"`     // Position direction: "long" or "short"
+		OpenAvgPx     string `json:"openAvgPx"`     // Average open price
+		CloseAvgPx    string `json:"closeAvgPx"`    // Average close price
+		CloseTotalPos string `json:"closeTotalPos"` // Closed position quantity
+		RealizedPnl   string `json:"realizedPnl"`   // Realized PnL
+		Pnl           string `json:"pnl"`
+		Fee           string `json:"fee"`        // Total fee
+		FundingFee    string `json:"fundingFee"` // Funding fee
+		LiqPenalty    string `json:"liqPenalty"`
+		Lever         string `json:"lever"` // Leverage
+		CTime         string `json:"cTime"` // Position open time
+		UTime         string `json:"uTime"` // Position close time
+		Type          string `json:"type"`  // Close type: 1=close position, 2=partial close, 3=liquidation, 4=partial liquidation
+		PosId         string `json:"posId"` // Position ID
 	}
 
 	if err := json.Unmarshal(data, &positions); err != nil {
@@ -1405,7 +1509,10 @@ func (t *OKXTrader) GetClosedPnL(startTime time.Time, limit int) ([]ClosedPnLRec
 		// Fee
 		fee, _ := strconv.ParseFloat(pos.Fee, 64)
 		fundingFee, _ := strconv.ParseFloat(pos.FundingFee, 64)
-		record.Fee = -fee + fundingFee // Fee is negative in OKX
+		record.Fee = fee // negative means paid; RealizedPnL already includes fee and funding
+		record.FundingFee = fundingFee
+		record.LiquidationPenalty, _ = strconv.ParseFloat(pos.LiqPenalty, 64)
+		record.GrossPnL, _ = strconv.ParseFloat(pos.Pnl, 64)
 
 		// Leverage
 		lev, _ := strconv.ParseFloat(pos.Lever, 64)

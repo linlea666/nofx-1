@@ -36,6 +36,7 @@ type Engine struct {
 
 	// 跟随者账户信息（由外部注入）
 	getFollowerBalance   func() float64
+	getFollowerEquity    func() float64
 	getFollowerPositions func() map[string]*Position
 
 	// 数据库存储（用于仓位映射）
@@ -82,6 +83,10 @@ type Engine struct {
 // EngineOption 引擎配置选项
 type EngineOption func(*Engine)
 
+func WithFollowerEquity(getEquity func() float64) EngineOption {
+	return func(e *Engine) { e.getFollowerEquity = getEquity }
+}
+
 // WithStreamingMode 启用流式模式（WebSocket 事件驱动）
 func WithStreamingMode() EngineOption {
 	return func(e *Engine) {
@@ -111,6 +116,7 @@ func NewEngine(
 		traderID:             traderID,
 		config:               config,
 		getFollowerBalance:   getBalance,
+		getFollowerEquity:    getBalance,
 		getFollowerPositions: getPositions,
 		seenFills:            make(map[string]time.Time),
 		seenTTL:              1 * time.Hour,
@@ -515,7 +521,7 @@ func (e *Engine) poll() {
 		}
 	} else {
 		// 无新成交时，保持原有的定时同步作为兜底（防止长时间无交易时数据过旧）
-		if time.Since(e.lastStateSync) > e.stateSyncInterval {
+		if (e.config.ProviderType == ProviderOKX && e.config.RiskPolicyVersion >= 4) || time.Since(e.lastStateSync) > e.stateSyncInterval {
 			if err := e.syncLeaderState(); err != nil {
 				logger.Warnf("⚠️ [%s] 定时状态同步失败: %v", e.traderID, err)
 			}
@@ -1320,15 +1326,21 @@ func (e *Engine) buildDecisionV2(signal *TradeSignal, match *SignalMatchResult, 
 				Side:           fill.PositionSide,
 				EntryPrice:     fill.Price,
 				Leverage:       dec.Leverage,
-				PositionValue:  copySize * float64(dec.Leverage), // 仓位价值 = 保证金 × 杠杆
-				FollowerEquity: e.getFollowerBalance(),
+				PositionValue:  copySize, // PositionSizeUSD 已是名义价值，不能重复乘杠杆
+				FollowerEquity: e.getFollowerEquity(),
 			}
 			if slResult, err := calcStopLossPrice(e.config, slInput); err == nil && slResult.SLPrice > 0 {
-				dec.StopLoss = slResult.SLPrice
+				// v4 precise manager records algoId after execution; do not create an untracked symbol-level order.
+				if e.config.RiskPolicyVersion < 4 {
+					dec.StopLoss = slResult.SLPrice
+				}
 				logger.Infof("🛑 [%s] SL 估算（开仓即挂） | %s %s | SL=%.4f 距离=%.4f(%.2f%%) 控线=%s ATR=%.4f tickSz=%.6f",
 					e.traderID, fill.Symbol, fill.PositionSide,
 					slResult.SLPrice, slResult.SLDistance,
 					(slResult.SLDistance/fill.Price)*100, slResult.GovernedBy, slResult.ATRValue, slResult.TickSize)
+				if e.config.RiskPolicyVersion >= 4 && e.config.RiskStopMode == "volatility_priority" && slResult.ExpectedLossPct > e.config.RiskAccountPct {
+					e.logWarning(Warning{Timestamp: time.Now(), Symbol: fill.Symbol, Type: "copy_guard_risk_warning", Message: fmt.Sprintf("预计止损损失 %.2f%% 超过警戒 %.2f%%", slResult.ExpectedLossPct*100, e.config.RiskAccountPct*100), SignalAction: string(match.Action), SignalValue: fill.Value, CopyValue: copySize, Executed: true})
+				}
 			} else if err != nil {
 				logger.Warnf("⚠️ [%s] SL 估算失败（仅记录，integration 层会用实际成交价重算）: %v", e.traderID, err)
 			} else if slResult != nil && slResult.OpenImmediateHit {
@@ -1986,6 +1998,20 @@ func (e *Engine) checkIgnoredPositionsClosed() {
 			} else {
 				logger.Infof("✅ [%s] 风控熔断解除 | posId=%s %s %s → stopped_by_risk→closed（领航员已平掉旧仓）",
 					e.traderID, mapping.LeaderPosID, mapping.Symbol, mapping.Side)
+				if e.config.RiskPolicyVersion >= 4 {
+					if cycle, cerr := e.store.CopyTrade().GetOpenCopyGuardCycle(e.traderID, mapping.LeaderPosID); cerr == nil {
+						baseline := cycle.BaselinePnL
+						if cycle.LeaderEntryPrice > 0 && cycle.LastObservedPrice > 0 {
+							move := (cycle.LastObservedPrice - cycle.LeaderEntryPrice) / cycle.LeaderEntryPrice
+							if cycle.Side == "short" {
+								move = -move
+							}
+							baseline = cycle.BaselineNotional * move
+						}
+						_ = e.store.CopyTrade().CloseCopyGuardCycle(cycle.ID, store.CopyGuardLeaderClosed, cycle.ActualPnL, baseline, cycle.Fees, cycle.FundingFee, cycle.Slippage)
+						_ = e.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: e.traderID, Type: "LEADER_CLOSED", Price: cycle.LastObservedPrice, Metadata: map[string]interface{}{"baseline_estimated": true}})
+					}
+				}
 			}
 		}
 	}

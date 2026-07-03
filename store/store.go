@@ -16,17 +16,17 @@ type Store struct {
 	db *sql.DB
 
 	// Sub-stores (lazy initialization)
-	user           *UserStore
-	aiModel        *AIModelStore
-	exchange       *ExchangeStore
-	trader         *TraderStore
-	decision       *DecisionStore
-	backtest       *BacktestStore
-	position       *PositionStore
-	strategy       *StrategyStore
-	equity         *EquityStore
-	copyTrade      *CopyTradeStore
-	binanceCreds   *BinanceCredentialsStore
+	user         *UserStore
+	aiModel      *AIModelStore
+	exchange     *ExchangeStore
+	trader       *TraderStore
+	decision     *DecisionStore
+	backtest     *BacktestStore
+	position     *PositionStore
+	strategy     *StrategyStore
+	equity       *EquityStore
+	copyTrade    *CopyTradeStore
+	binanceCreds *BinanceCredentialsStore
 
 	// Encryption functions
 	encryptFunc func(string) string
@@ -153,6 +153,9 @@ func (s *Store) initTables() error {
 	}
 	if err := s.CopyTrade().initPositionMappingTable(); err != nil {
 		return fmt.Errorf("failed to initialize copy trade position mapping table: %w", err)
+	}
+	if err := s.CopyTrade().initCopyGuardTables(); err != nil {
+		return fmt.Errorf("failed to initialize copy guard tables: %w", err)
 	}
 	if err := s.BinanceCreds().initTables(); err != nil {
 		return fmt.Errorf("failed to initialize binance credentials tables: %w", err)

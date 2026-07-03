@@ -1,6 +1,6 @@
 // Decision mode types (defined early for use throughout the file)
-export type DecisionMode = 'ai' | 'copy_trade';
-export type CopyTradeProvider = 'hyperliquid' | 'okx' | 'binance';
+export type DecisionMode = 'ai' | 'copy_trade'
+export type CopyTradeProvider = 'hyperliquid' | 'okx' | 'binance'
 
 export interface SystemStatus {
   trader_id: string
@@ -50,10 +50,10 @@ export interface DecisionAction {
   quantity: number
   leverage: number
   price: number
-  stop_loss?: number      // Stop loss price
-  take_profit?: number    // Take profit price
-  confidence?: number     // AI confidence (0-100)
-  reasoning?: string      // Brief reasoning
+  stop_loss?: number // Stop loss price
+  take_profit?: number // Take profit price
+  confidence?: number // AI confidence (0-100)
+  reasoning?: string // Brief reasoning
   order_id: number
   timestamp: string
   success: boolean
@@ -105,7 +105,7 @@ export interface TraderInfo {
   use_coin_pool?: boolean
   use_oi_top?: boolean
   system_prompt_template?: string
-  decision_mode?: DecisionMode  // "ai" or "copy_trade"
+  decision_mode?: DecisionMode // "ai" or "copy_trade"
 }
 
 export interface AIModel {
@@ -119,15 +119,15 @@ export interface AIModel {
 }
 
 export interface Exchange {
-  id: string                     // UUID (empty for supported exchange templates)
-  exchange_type: string          // "binance", "bybit", "okx", "hyperliquid", "aster", "lighter"
-  account_name: string           // User-defined account name
-  name: string                   // Display name
+  id: string // UUID (empty for supported exchange templates)
+  exchange_type: string // "binance", "bybit", "okx", "hyperliquid", "aster", "lighter"
+  account_name: string // User-defined account name
+  name: string // Display name
   type: 'cex' | 'dex'
   enabled: boolean
   apiKey?: string
   secretKey?: string
-  passphrase?: string            // OKX specific
+  passphrase?: string // OKX specific
   testnet?: boolean
   // Hyperliquid specific
   hyperliquidWalletAddr?: string
@@ -143,8 +143,8 @@ export interface Exchange {
 }
 
 export interface CreateExchangeRequest {
-  exchange_type: string          // "binance", "bybit", "okx", "hyperliquid", "aster", "lighter"
-  account_name: string           // User-defined account name
+  exchange_type: string // "binance", "bybit", "okx", "hyperliquid", "aster", "lighter"
+  account_name: string // User-defined account name
   enabled: boolean
   api_key?: string
   secret_key?: string
@@ -189,29 +189,44 @@ export interface CopyConfigRequest {
   leader_id: string
   copy_ratio: number
   sync_leverage: boolean
-  sync_margin_mode?: boolean  // 同步保证金模式（OKX 区分全仓/逐仓）
+  sync_margin_mode?: boolean // 同步保证金模式（OKX 区分全仓/逐仓）
   // Binance Web 凭证（仅 provider_type=binance 时使用）
-  binance_p20t?: string       // 登录 cookie p20t
+  binance_p20t?: string // 登录 cookie p20t
   binance_csrf_token?: string // CSRF header csrftoken
 
   // ============================================================
   // 账户保护 / 止损兜底（v3 风控）—— 仅 OKX 路径生效
   // 所有字段可选，未传走后端默认值
   // ============================================================
-  risk_stop_loss_enabled?: boolean    // 默认 true：启用账户保护硬止损
-  risk_account_pct?: number           // 默认 0.005 (0.5%)：单笔最多亏账户的百分比
-  risk_atr_enabled?: boolean          // 默认 true：启用 ATR 噪音防护下界
-  risk_atr_multiplier?: number        // 默认 1.5：SL 距离 ≥ k×ATR14（1.0-3.0）
-  risk_atr_timeframe?: string         // 默认 "1h"：ATR 时间周期（"15m" / "1h" / "4h"）
-  risk_leverage_fallback?: boolean    // 默认 true：启用杠杆兜底 cap
-  risk_leverage_max_loss?: number     // 默认 0.5：保证金最大亏损封顶（0-1）
-  risk_reentry_enabled?: boolean      // 默认 false：启用二次进场（判据 E 双门控）
-  risk_reentry_ratio?: number         // 默认 0.5：重入仓位系数（×copy_ratio）
-  risk_reentry_tolerance?: number     // 默认 0.02 (2%)：价格回归容差（v3.3 单边严格区间，仅允许等价或优于领航员入场价时重入）
+  risk_stop_loss_enabled?: boolean // 默认 true：启用账户保护硬止损
+  risk_account_pct?: number // 默认 0.005 (0.5%)：单笔最多亏账户的百分比
+  risk_atr_enabled?: boolean // 默认 true：启用 ATR 噪音防护下界
+  risk_atr_multiplier?: number // 默认 1.5：SL 距离 ≥ k×ATR14（1.0-3.0）
+  risk_atr_timeframe?: string // 默认 "1h"：ATR 时间周期（"15m" / "1h" / "4h"）
+  risk_leverage_fallback?: boolean // 默认 true：启用杠杆兜底 cap
+  risk_leverage_max_loss?: number // 默认 0.5：保证金最大亏损封顶（0-1）
+  risk_reentry_enabled?: boolean // 默认 false：启用二次进场（判据 E 双门控）
+  risk_reentry_ratio?: number // 默认 0.5：重入仓位系数（×copy_ratio）
+  risk_reentry_tolerance?: number // 默认 0.02 (2%)：价格回归容差（v3.3 单边严格区间，仅允许等价或优于领航员入场价时重入）
 
   // v3.2 反加仓铁律
-  risk_reentry_block_addback?: boolean        // 默认 true：阻止领航员止损后加仓时的重入
-  risk_reentry_addback_tolerance?: number     // 默认 1.20：允许加仓的倍数上限（1.0=严格，1.20=允许20%）
+  risk_reentry_block_addback?: boolean // 默认 true：阻止领航员止损后加仓时的重入
+  risk_reentry_addback_tolerance?: number // 默认 1.20：允许加仓的倍数上限（1.0=严格，1.20=允许20%）
+
+  risk_policy_version?: number
+  risk_stop_mode?: 'volatility_priority' | 'account_hard_limit'
+  risk_atr_period?: number
+  risk_atr_fallback_pct?: number
+  risk_trigger_price_type?: 'mark' | 'last' | 'index'
+  risk_slippage_buffer_bps?: number
+  risk_liquidation_buffer_atr?: number
+  risk_max_reentries?: number
+  risk_reentry_band_atr?: number
+  risk_reentry_cooldown_seconds?: number
+  risk_reentry_max_chase_atr?: number
+  risk_reentry_max_atr_expansion?: number
+  risk_watch_timeout_minutes?: number
+  risk_migration_confirmed?: boolean
 }
 
 export interface UpdateModelConfigRequest {
@@ -273,14 +288,14 @@ export interface TraderConfigData {
   trader_name: string
   ai_model: string
   exchange_id: string
-  strategy_id?: string  // 策略ID
-  strategy_name?: string  // 策略名称
+  strategy_id?: string // 策略ID
+  strategy_name?: string // 策略名称
   is_cross_margin: boolean
-  show_in_competition: boolean  // 是否在竞技场显示
+  show_in_competition: boolean // 是否在竞技场显示
   scan_interval_minutes: number
   initial_balance: number
   is_running: boolean
-  decision_mode?: DecisionMode  // "ai" or "copy_trade"
+  decision_mode?: DecisionMode // "ai" or "copy_trade"
   // 以下为旧版字段（向后兼容）
   btc_eth_leverage?: number
   altcoin_leverage?: number
@@ -294,433 +309,492 @@ export interface TraderConfigData {
 
 // Backtest types
 export interface BacktestRunSummary {
-  symbol_count: number;
-  decision_tf: string;
-  processed_bars: number;
-  progress_pct: number;
-  equity_last: number;
-  max_drawdown_pct: number;
-  liquidated: boolean;
-  liquidation_note?: string;
+  symbol_count: number
+  decision_tf: string
+  processed_bars: number
+  progress_pct: number
+  equity_last: number
+  max_drawdown_pct: number
+  liquidated: boolean
+  liquidation_note?: string
 }
 
 export interface BacktestRunMetadata {
-  run_id: string;
-  label?: string;
-  user_id?: string;
-  last_error?: string;
-  version: number;
-  state: string;
-  created_at: string;
-  updated_at: string;
-  summary: BacktestRunSummary;
+  run_id: string
+  label?: string
+  user_id?: string
+  last_error?: string
+  version: number
+  state: string
+  created_at: string
+  updated_at: string
+  summary: BacktestRunSummary
 }
 
 export interface BacktestRunsResponse {
-  total: number;
-  items: BacktestRunMetadata[];
+  total: number
+  items: BacktestRunMetadata[]
 }
 
 export interface BacktestStatusPayload {
-  run_id: string;
-  state: string;
-  progress_pct: number;
-  processed_bars: number;
-  current_time: number;
-  decision_cycle: number;
-  equity: number;
-  unrealized_pnl: number;
-  realized_pnl: number;
-  note?: string;
-  last_error?: string;
-  last_updated_iso: string;
+  run_id: string
+  state: string
+  progress_pct: number
+  processed_bars: number
+  current_time: number
+  decision_cycle: number
+  equity: number
+  unrealized_pnl: number
+  realized_pnl: number
+  note?: string
+  last_error?: string
+  last_updated_iso: string
 }
 
 export interface BacktestEquityPoint {
-  ts: number;
-  equity: number;
-  available: number;
-  pnl: number;
-  pnl_pct: number;
-  dd_pct: number;
-  cycle: number;
+  ts: number
+  equity: number
+  available: number
+  pnl: number
+  pnl_pct: number
+  dd_pct: number
+  cycle: number
 }
 
 export interface BacktestTradeEvent {
-  ts: number;
-  symbol: string;
-  action: string;
-  side?: string;
-  qty: number;
-  price: number;
-  fee: number;
-  slippage: number;
-  order_value: number;
-  realized_pnl: number;
-  leverage?: number;
-  cycle: number;
-  position_after: number;
-  liquidation: boolean;
-  note?: string;
+  ts: number
+  symbol: string
+  action: string
+  side?: string
+  qty: number
+  price: number
+  fee: number
+  slippage: number
+  order_value: number
+  realized_pnl: number
+  leverage?: number
+  cycle: number
+  position_after: number
+  liquidation: boolean
+  note?: string
 }
 
 export interface BacktestMetrics {
-  total_return_pct: number;
-  max_drawdown_pct: number;
-  sharpe_ratio: number;
-  profit_factor: number;
-  win_rate: number;
-  trades: number;
-  avg_win: number;
-  avg_loss: number;
-  best_symbol: string;
-  worst_symbol: string;
-  liquidated: boolean;
+  total_return_pct: number
+  max_drawdown_pct: number
+  sharpe_ratio: number
+  profit_factor: number
+  win_rate: number
+  trades: number
+  avg_win: number
+  avg_loss: number
+  best_symbol: string
+  worst_symbol: string
+  liquidated: boolean
   symbol_stats?: Record<
     string,
     {
-      total_trades: number;
-      winning_trades: number;
-      losing_trades: number;
-      total_pnl: number;
-      avg_pnl: number;
-      win_rate: number;
+      total_trades: number
+      winning_trades: number
+      losing_trades: number
+      total_pnl: number
+      avg_pnl: number
+      win_rate: number
     }
-  >;
+  >
 }
 
 export interface BacktestStartConfig {
-  run_id?: string;
-  ai_model_id?: string;
-  symbols: string[];
-  timeframes: string[];
-  decision_timeframe: string;
-  decision_cadence_nbars: number;
-  start_ts: number;
-  end_ts: number;
-  initial_balance: number;
-  fee_bps: number;
-  slippage_bps: number;
-  fill_policy: string;
-  prompt_variant?: string;
-  prompt_template?: string;
-  custom_prompt?: string;
-  override_prompt?: boolean;
-  cache_ai?: boolean;
-  replay_only?: boolean;
-  checkpoint_interval_bars?: number;
-  checkpoint_interval_seconds?: number;
-  replay_decision_dir?: string;
-  shared_ai_cache_path?: string;
+  run_id?: string
+  ai_model_id?: string
+  symbols: string[]
+  timeframes: string[]
+  decision_timeframe: string
+  decision_cadence_nbars: number
+  start_ts: number
+  end_ts: number
+  initial_balance: number
+  fee_bps: number
+  slippage_bps: number
+  fill_policy: string
+  prompt_variant?: string
+  prompt_template?: string
+  custom_prompt?: string
+  override_prompt?: boolean
+  cache_ai?: boolean
+  replay_only?: boolean
+  checkpoint_interval_bars?: number
+  checkpoint_interval_seconds?: number
+  replay_decision_dir?: string
+  shared_ai_cache_path?: string
   ai?: {
-    provider?: string;
-    model?: string;
-    key?: string;
-    secret_key?: string;
-    base_url?: string;
-  };
+    provider?: string
+    model?: string
+    key?: string
+    secret_key?: string
+    base_url?: string
+  }
   leverage?: {
-    btc_eth_leverage?: number;
-    altcoin_leverage?: number;
-  };
+    btc_eth_leverage?: number
+    altcoin_leverage?: number
+  }
 }
 
 // Strategy Studio Types
 export interface Strategy {
-  id: string;
-  name: string;
-  description: string;
-  is_active: boolean;
-  is_default: boolean;
-  config: StrategyConfig;
-  created_at: string;
-  updated_at: string;
+  id: string
+  name: string
+  description: string
+  is_active: boolean
+  is_default: boolean
+  config: StrategyConfig
+  created_at: string
+  updated_at: string
 }
 
 export interface PromptSectionsConfig {
-  role_definition?: string;
-  trading_frequency?: string;
-  entry_standards?: string;
-  decision_process?: string;
+  role_definition?: string
+  trading_frequency?: string
+  entry_standards?: string
+  decision_process?: string
 }
 
 export interface StrategyConfig {
-  coin_source: CoinSourceConfig;
-  indicators: IndicatorConfig;
-  custom_prompt?: string;
-  risk_control: RiskControlConfig;
-  prompt_sections?: PromptSectionsConfig;
+  coin_source: CoinSourceConfig
+  indicators: IndicatorConfig
+  custom_prompt?: string
+  risk_control: RiskControlConfig
+  prompt_sections?: PromptSectionsConfig
 }
 
 export interface CoinSourceConfig {
-  source_type: 'static' | 'coinpool' | 'oi_top' | 'mixed';
-  static_coins?: string[];
-  use_coin_pool: boolean;
-  coin_pool_limit?: number;
-  coin_pool_api_url?: string;  // AI500 币种池 API URL
-  use_oi_top: boolean;
-  oi_top_limit?: number;
-  oi_top_api_url?: string;     // OI Top API URL
+  source_type: 'static' | 'coinpool' | 'oi_top' | 'mixed'
+  static_coins?: string[]
+  use_coin_pool: boolean
+  coin_pool_limit?: number
+  coin_pool_api_url?: string // AI500 币种池 API URL
+  use_oi_top: boolean
+  oi_top_limit?: number
+  oi_top_api_url?: string // OI Top API URL
 }
 
 export interface IndicatorConfig {
-  klines: KlineConfig;
+  klines: KlineConfig
   // Raw OHLCV kline data - required for AI analysis
-  enable_raw_klines: boolean;
+  enable_raw_klines: boolean
   // Technical indicators (optional)
-  enable_ema: boolean;
-  enable_macd: boolean;
-  enable_rsi: boolean;
-  enable_atr: boolean;
-  enable_volume: boolean;
-  enable_oi: boolean;
-  enable_funding_rate: boolean;
-  ema_periods?: number[];
-  rsi_periods?: number[];
-  atr_periods?: number[];
-  external_data_sources?: ExternalDataSource[];
+  enable_ema: boolean
+  enable_macd: boolean
+  enable_rsi: boolean
+  enable_atr: boolean
+  enable_volume: boolean
+  enable_oi: boolean
+  enable_funding_rate: boolean
+  ema_periods?: number[]
+  rsi_periods?: number[]
+  atr_periods?: number[]
+  external_data_sources?: ExternalDataSource[]
   // 量化数据源（资金流向、持仓变化、价格变化）
-  enable_quant_data?: boolean;
-  quant_data_api_url?: string;
-  enable_quant_oi?: boolean;
-  enable_quant_netflow?: boolean;
+  enable_quant_data?: boolean
+  quant_data_api_url?: string
+  enable_quant_oi?: boolean
+  enable_quant_netflow?: boolean
   // OI 排行数据（市场持仓量增减排行）
-  enable_oi_ranking?: boolean;
-  oi_ranking_api_url?: string;
-  oi_ranking_duration?: string;  // "1h", "4h", "24h"
-  oi_ranking_limit?: number;
+  enable_oi_ranking?: boolean
+  oi_ranking_api_url?: string
+  oi_ranking_duration?: string // "1h", "4h", "24h"
+  oi_ranking_limit?: number
 }
 
 export interface KlineConfig {
-  primary_timeframe: string;
-  primary_count: number;
-  longer_timeframe?: string;
-  longer_count?: number;
-  enable_multi_timeframe: boolean;
+  primary_timeframe: string
+  primary_count: number
+  longer_timeframe?: string
+  longer_count?: number
+  enable_multi_timeframe: boolean
   // 新增：支持选择多个时间周期
-  selected_timeframes?: string[];
+  selected_timeframes?: string[]
 }
 
 export interface ExternalDataSource {
-  name: string;
-  type: 'api' | 'webhook';
-  url: string;
-  method: string;
-  headers?: Record<string, string>;
-  data_path?: string;
-  refresh_secs?: number;
+  name: string
+  type: 'api' | 'webhook'
+  url: string
+  method: string
+  headers?: Record<string, string>
+  data_path?: string
+  refresh_secs?: number
 }
 
 export interface RiskControlConfig {
   // Max number of coins held simultaneously (CODE ENFORCED)
-  max_positions: number;
+  max_positions: number
 
   // Trading Leverage - exchange leverage for opening positions (AI guided)
-  btc_eth_max_leverage: number;    // BTC/ETH max exchange leverage
-  altcoin_max_leverage: number;    // Altcoin max exchange leverage
+  btc_eth_max_leverage: number // BTC/ETH max exchange leverage
+  altcoin_max_leverage: number // Altcoin max exchange leverage
 
   // Position Value Ratio - single position notional value / account equity (CODE ENFORCED)
   // Max position value = equity × this ratio
-  btc_eth_max_position_value_ratio?: number;     // default: 5 (BTC/ETH max position = 5x equity)
-  altcoin_max_position_value_ratio?: number;     // default: 1 (Altcoin max position = 1x equity)
+  btc_eth_max_position_value_ratio?: number // default: 5 (BTC/ETH max position = 5x equity)
+  altcoin_max_position_value_ratio?: number // default: 1 (Altcoin max position = 1x equity)
 
   // Risk Parameters
-  max_margin_usage: number;        // Max margin utilization, e.g. 0.9 = 90% (CODE ENFORCED)
-  min_position_size: number;       // Min position size in USDT (CODE ENFORCED)
-  min_risk_reward_ratio: number;   // Min take_profit / stop_loss ratio (AI guided)
-  min_confidence: number;          // Min AI confidence to open position (AI guided)
+  max_margin_usage: number // Max margin utilization, e.g. 0.9 = 90% (CODE ENFORCED)
+  min_position_size: number // Min position size in USDT (CODE ENFORCED)
+  min_risk_reward_ratio: number // Min take_profit / stop_loss ratio (AI guided)
+  min_confidence: number // Min AI confidence to open position (AI guided)
 }
 
 // Debate Arena Types
-export type DebateStatus = 'pending' | 'running' | 'voting' | 'completed' | 'cancelled';
-export type DebatePersonality = 'bull' | 'bear' | 'analyst' | 'contrarian' | 'risk_manager';
+export type DebateStatus =
+  | 'pending'
+  | 'running'
+  | 'voting'
+  | 'completed'
+  | 'cancelled'
+export type DebatePersonality =
+  | 'bull'
+  | 'bear'
+  | 'analyst'
+  | 'contrarian'
+  | 'risk_manager'
 
 export interface DebateDecision {
-  action: string;
-  symbol: string;
-  confidence: number;
-  leverage?: number;
-  position_pct?: number;
-  position_size_usd?: number;
-  stop_loss?: number;
-  take_profit?: number;
-  reasoning: string;
+  action: string
+  symbol: string
+  confidence: number
+  leverage?: number
+  position_pct?: number
+  position_size_usd?: number
+  stop_loss?: number
+  take_profit?: number
+  reasoning: string
   // Execution tracking
-  executed?: boolean;
-  executed_at?: string;
-  order_id?: string;
-  error?: string;
+  executed?: boolean
+  executed_at?: string
+  order_id?: string
+  error?: string
 }
 
 export interface DebateSession {
-  id: string;
-  user_id: string;
-  name: string;
-  strategy_id: string;
-  status: DebateStatus;
-  symbol: string;
-  interval_minutes: number;
-  prompt_variant: string;
-  trader_id?: string;
-  max_rounds: number;
-  current_round: number;
-  final_decision?: DebateDecision;
-  final_decisions?: DebateDecision[];  // Multi-coin decisions
-  auto_execute: boolean;
-  created_at: string;
-  updated_at: string;
+  id: string
+  user_id: string
+  name: string
+  strategy_id: string
+  status: DebateStatus
+  symbol: string
+  interval_minutes: number
+  prompt_variant: string
+  trader_id?: string
+  max_rounds: number
+  current_round: number
+  final_decision?: DebateDecision
+  final_decisions?: DebateDecision[] // Multi-coin decisions
+  auto_execute: boolean
+  created_at: string
+  updated_at: string
 }
 
 export interface DebateParticipant {
-  id: string;
-  session_id: string;
-  ai_model_id: string;
-  ai_model_name: string;
-  provider: string;
-  personality: DebatePersonality;
-  color: string;
-  speak_order: number;
-  created_at: string;
+  id: string
+  session_id: string
+  ai_model_id: string
+  ai_model_name: string
+  provider: string
+  personality: DebatePersonality
+  color: string
+  speak_order: number
+  created_at: string
 }
 
 export interface DebateMessage {
-  id: string;
-  session_id: string;
-  round: number;
-  ai_model_id: string;
-  ai_model_name: string;
-  provider: string;
-  personality: DebatePersonality;
-  message_type: string;
-  content: string;
-  decision?: DebateDecision;
-  decisions?: DebateDecision[];  // Multi-coin decisions
-  confidence: number;
-  created_at: string;
+  id: string
+  session_id: string
+  round: number
+  ai_model_id: string
+  ai_model_name: string
+  provider: string
+  personality: DebatePersonality
+  message_type: string
+  content: string
+  decision?: DebateDecision
+  decisions?: DebateDecision[] // Multi-coin decisions
+  confidence: number
+  created_at: string
 }
 
 export interface DebateVote {
-  id: string;
-  session_id: string;
-  ai_model_id: string;
-  ai_model_name: string;
-  action: string;
-  symbol: string;
-  confidence: number;
-  leverage?: number;
-  position_pct?: number;
-  stop_loss_pct?: number;
-  take_profit_pct?: number;
-  reasoning: string;
-  created_at: string;
+  id: string
+  session_id: string
+  ai_model_id: string
+  ai_model_name: string
+  action: string
+  symbol: string
+  confidence: number
+  leverage?: number
+  position_pct?: number
+  stop_loss_pct?: number
+  take_profit_pct?: number
+  reasoning: string
+  created_at: string
 }
 
 export interface DebateSessionWithDetails extends DebateSession {
-  participants: DebateParticipant[];
-  messages: DebateMessage[];
-  votes: DebateVote[];
+  participants: DebateParticipant[]
+  messages: DebateMessage[]
+  votes: DebateVote[]
 }
 
 export interface CreateDebateRequest {
-  name: string;
-  strategy_id: string;
-  symbol: string;
-  max_rounds?: number;
-  interval_minutes?: number;  // 5, 15, 30, 60 minutes
-  prompt_variant?: string;    // balanced, aggressive, conservative, scalping
-  auto_execute?: boolean;
-  trader_id?: string;         // Trader to use for auto-execute
+  name: string
+  strategy_id: string
+  symbol: string
+  max_rounds?: number
+  interval_minutes?: number // 5, 15, 30, 60 minutes
+  prompt_variant?: string // balanced, aggressive, conservative, scalping
+  auto_execute?: boolean
+  trader_id?: string // Trader to use for auto-execute
   // OI Ranking data options
-  enable_oi_ranking?: boolean;  // Whether to include OI ranking data
-  oi_ranking_limit?: number;    // Number of OI ranking entries (default 10)
-  oi_duration?: string;         // Duration for OI data (1h, 4h, 24h, etc.)
+  enable_oi_ranking?: boolean // Whether to include OI ranking data
+  oi_ranking_limit?: number // Number of OI ranking entries (default 10)
+  oi_duration?: string // Duration for OI data (1h, 4h, 24h, etc.)
   participants: {
-    ai_model_id: string;
-    personality: DebatePersonality;
-  }[];
+    ai_model_id: string
+    personality: DebatePersonality
+  }[]
 }
 
 export interface DebatePersonalityInfo {
-  id: DebatePersonality;
-  name: string;
-  emoji: string;
-  color: string;
-  description: string;
+  id: DebatePersonality
+  name: string
+  emoji: string
+  color: string
+  description: string
 }
 
 // Copy Trading Types
 export interface CopyTradeConfig {
-  trader_id: string;
-  provider_type: CopyTradeProvider;
-  leader_id: string;
-  copy_ratio: number;
-  sync_leverage: boolean;
-  sync_margin_mode: boolean;
-  min_trade_warn: number;
-  max_trade_warn: number;
-  enabled: boolean;
+  trader_id: string
+  provider_type: CopyTradeProvider
+  leader_id: string
+  copy_ratio: number
+  sync_leverage: boolean
+  sync_margin_mode: boolean
+  min_trade_warn: number
+  max_trade_warn: number
+  enabled: boolean
   // Binance Web 凭证（仅 provider_type=binance 时使用，明文返回，用于编辑表单回填）
-  binance_p20t?: string;
-  binance_csrf_token?: string;
+  binance_p20t?: string
+  binance_csrf_token?: string
   // 账户保护 / 止损兜底（v3 风控）—— 仅 OKX 路径生效，详见 CopyConfigRequest
-  risk_stop_loss_enabled?: boolean;
-  risk_account_pct?: number;
-  risk_atr_enabled?: boolean;
-  risk_atr_multiplier?: number;
-  risk_atr_timeframe?: string;
-  risk_leverage_fallback?: boolean;
-  risk_leverage_max_loss?: number;
-  risk_reentry_enabled?: boolean;
-  risk_reentry_ratio?: number;
-  risk_reentry_tolerance?: number;
-  risk_reentry_block_addback?: boolean;
-  risk_reentry_addback_tolerance?: number;
-  created_at?: string;
-  updated_at?: string;
+  risk_stop_loss_enabled?: boolean
+  risk_account_pct?: number
+  risk_atr_enabled?: boolean
+  risk_atr_multiplier?: number
+  risk_atr_timeframe?: string
+  risk_leverage_fallback?: boolean
+  risk_leverage_max_loss?: number
+  risk_reentry_enabled?: boolean
+  risk_reentry_ratio?: number
+  risk_reentry_tolerance?: number
+  risk_reentry_block_addback?: boolean
+  risk_reentry_addback_tolerance?: number
+  risk_policy_version?: number
+  risk_stop_mode?: 'volatility_priority' | 'account_hard_limit'
+  risk_atr_period?: number
+  risk_atr_fallback_pct?: number
+  risk_trigger_price_type?: 'mark' | 'last' | 'index'
+  risk_slippage_buffer_bps?: number
+  risk_liquidation_buffer_atr?: number
+  risk_max_reentries?: number
+  risk_reentry_band_atr?: number
+  risk_reentry_cooldown_seconds?: number
+  risk_reentry_max_chase_atr?: number
+  risk_reentry_max_atr_expansion?: number
+  risk_watch_timeout_minutes?: number
+  risk_migration_confirmed?: boolean
+  created_at?: string
+  updated_at?: string
+}
+
+export interface CopyGuardSummary {
+  follower_count: number
+  cycle_count: number
+  stop_count: number
+  reentry_count: number
+  actual_pnl: number
+  baseline_pnl: number
+  avoided_loss: number
+  opportunity_cost: number
+  net_guard_effect: number
+  fees: number
+  funding_fee: number
+  slippage: number
+}
+export interface CopyGuardCycle {
+  id: number
+  trader_id: string
+  leader_id: string
+  leader_pos_id: string
+  symbol: string
+  side: string
+  margin_mode: string
+  status: string
+  stop_count: number
+  reentry_count: number
+  actual_pnl: number
+  baseline_pnl: number
+  net_guard_effect: number
+  fees: number
+  funding_fee: number
+  slippage: number
+  opened_at: string
+  closed_at?: string
 }
 
 export interface CopyTradeStats {
-  signals_received: number;
-  signals_followed: number;
-  signals_skipped: number;
-  decisions_generated: number;
-  warnings_count: number;
-  last_signal_time: string;
-  start_time: string;
+  signals_received: number
+  signals_followed: number
+  signals_skipped: number
+  decisions_generated: number
+  warnings_count: number
+  last_signal_time: string
+  start_time: string
 }
 
 export interface CopyTradeSignalLog {
-  id: number;
-  trader_id: string;
-  leader_id: string;
-  provider_type: string;
-  signal_id: string;
-  symbol: string;
-  action: string;
-  position_side: string;
-  leader_price: number;
-  leader_value: number;
-  copy_size: number;
-  followed: boolean;
-  follow_reason: string;
-  warnings_json: string;
-  status: string;
-  error_message: string;
-  created_at: string;
+  id: number
+  trader_id: string
+  leader_id: string
+  provider_type: string
+  signal_id: string
+  symbol: string
+  action: string
+  position_side: string
+  leader_price: number
+  leader_value: number
+  copy_size: number
+  followed: boolean
+  follow_reason: string
+  warnings_json: string
+  status: string
+  error_message: string
+  created_at: string
 }
 
 export interface CopyTradeConfigRequest {
-  provider_type: CopyTradeProvider;
-  leader_id: string;
-  copy_ratio: number;
-  sync_leverage: boolean;
-  sync_margin_mode: boolean;
-  min_trade_warn: number;
-  max_trade_warn: number;
-  enabled: boolean;
+  provider_type: CopyTradeProvider
+  leader_id: string
+  copy_ratio: number
+  sync_leverage: boolean
+  sync_margin_mode: boolean
+  min_trade_warn: number
+  max_trade_warn: number
+  enabled: boolean
   // Binance Web 凭证（仅 provider_type=binance 时使用）
-  binance_p20t?: string;
-  binance_csrf_token?: string;
+  binance_p20t?: string
+  binance_csrf_token?: string
 }
 
 // ============================================================================
@@ -728,41 +802,41 @@ export interface CopyTradeConfigRequest {
 // ============================================================================
 // 所有 Binance 跟单 trader 共享同一份凭证，避免逐个交易员维护
 
-export type BinanceCredsStatus = 'valid' | 'expired' | 'unknown' | 'error';
+export type BinanceCredsStatus = 'valid' | 'expired' | 'unknown' | 'error'
 
 // 凭证视图（脱敏后；对应后端 BinanceCredentialsView）
 export interface BinanceCredentialsView {
-  label: string;
-  binance_user_id: string;
-  masked_p20t: string;
-  masked_csrf_token: string;
-  last_validated_at: string;
-  last_status: BinanceCredsStatus;
-  last_error: string;
-  created_at: string;
-  updated_at: string;
+  label: string
+  binance_user_id: string
+  masked_p20t: string
+  masked_csrf_token: string
+  last_validated_at: string
+  last_status: BinanceCredsStatus
+  last_error: string
+  created_at: string
+  updated_at: string
 }
 
 export interface BinanceCredentialsListResponse {
-  credentials: BinanceCredentialsView[];
-  count: number;
+  credentials: BinanceCredentialsView[]
+  count: number
 }
 
 export interface BinanceCredentialsSetRequest {
-  label?: string;       // 默认 'default'
-  p20t?: string;
-  csrftoken?: string;
-  curl?: string;        // 任选其一：直接填字段，或粘贴整段 cURL
+  label?: string // 默认 'default'
+  p20t?: string
+  csrftoken?: string
+  curl?: string // 任选其一：直接填字段，或粘贴整段 cURL
 }
 
 export interface BinanceCredentialsTestResponse {
-  label: string;
-  status: BinanceCredsStatus;
-  binance_user_id: string;
-  error: string;
+  label: string
+  status: BinanceCredsStatus
+  binance_user_id: string
+  error: string
 }
 
 export interface BinanceCredentialsAffectedResponse {
-  trader_ids: string[];
-  count: number;
+  trader_ids: string[]
+  count: number
 }

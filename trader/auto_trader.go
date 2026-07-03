@@ -842,6 +842,42 @@ func (at *AutoTrader) GetMarketPrice(symbol string) (float64, error) {
 	return at.trader.GetMarketPrice(symbol)
 }
 
+func (at *AutoTrader) PlaceProtectiveStop(req ProtectiveStopRequest) (*ProtectiveStopOrder, error) {
+	mgr, ok := at.trader.(ProtectiveStopManager)
+	if !ok {
+		return nil, fmt.Errorf("exchange does not support precise protective stops")
+	}
+	return mgr.PlaceProtectiveStop(req)
+}
+func (at *AutoTrader) AmendProtectiveStop(algoID string, req ProtectiveStopRequest) error {
+	mgr, ok := at.trader.(ProtectiveStopManager)
+	if !ok {
+		return fmt.Errorf("exchange does not support precise protective stops")
+	}
+	return mgr.AmendProtectiveStop(algoID, req)
+}
+func (at *AutoTrader) GetProtectiveStop(algoID, symbol string) (*ProtectiveStopOrder, error) {
+	mgr, ok := at.trader.(ProtectiveStopManager)
+	if !ok {
+		return nil, fmt.Errorf("exchange does not support precise protective stops")
+	}
+	return mgr.GetProtectiveStop(algoID, symbol)
+}
+func (at *AutoTrader) CancelProtectiveStop(algoID, symbol string) error {
+	mgr, ok := at.trader.(ProtectiveStopManager)
+	if !ok {
+		return fmt.Errorf("exchange does not support precise protective stops")
+	}
+	return mgr.CancelProtectiveStop(algoID, symbol)
+}
+
+func (at *AutoTrader) GetClosedPnL(start time.Time, limit int) ([]ClosedPnLRecord, error) {
+	return at.trader.GetClosedPnL(start, limit)
+}
+func (at *AutoTrader) GetOrderStatus(symbol, orderID string) (map[string]interface{}, error) {
+	return at.trader.GetOrderStatus(symbol, orderID)
+}
+
 // ExecuteDecision executes a trading decision from external sources (e.g., debate consensus)
 // This is a public method that can be called by other modules
 func (at *AutoTrader) ExecuteDecision(d *decision.Decision) error {
