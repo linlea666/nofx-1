@@ -907,8 +907,10 @@ export const api = {
         id: number
         type: string
         price: number
+        quantity: number
         pnl: number
         fee: number
+        metadata?: Record<string, unknown>
         created_at: string
       }>
       attempts: Array<{
@@ -921,6 +923,9 @@ export const api = {
         pnl: number
         fee: number
         funding_fee: number
+        follower_pos_id: string
+        entry_order_id: string
+        exit_order_id: string
         opened_at: string
         closed_at?: string
       }>

@@ -14,6 +14,70 @@ import type { CopyGuardCycle } from '../types'
 
 const money = (v: number) => `${v >= 0 ? '+' : ''}${v.toFixed(2)} USDT`
 
+const statusLabels: Record<string, string> = {
+  FOLLOWING: '正常跟随',
+  STOP_TRIGGERED: '止损已触发',
+  STOPPED_WATCHING: '止损后观察',
+  REENTRY_PENDING: '等待重入成交',
+  FOLLOWING_REENTRY: '重入后跟随',
+  LEADER_CLOSED: '领航员已平仓',
+  LEADER_REVERSED: '领航员已反手',
+  ATTEMPTS_EXHAUSTED: '重入次数已用完',
+  WATCH_TIMEOUT: '观察超时',
+}
+const protectionLabels: Record<string, string> = {
+  PENDING: '待建立',
+  VERIFIED: '保护有效',
+  UNKNOWN: '状态未知',
+  DEGRADED: '保护异常',
+  TRIGGERED: '已触发',
+  CANCELED: '已撤销',
+}
+const accountingLabels: Record<string, string> = {
+  OPEN: '交易进行中',
+  PENDING: '对账中',
+  RECONCILED: '已对账',
+  NEEDS_REVIEW: '需人工核对',
+  LEGACY_UNVERIFIED: '历史未验证',
+}
+const attemptLabels: Record<string, string> = {
+  OPEN: '持仓中',
+  STOPPED: '已止损',
+  CLOSED: '已平仓',
+}
+const eventLabels: Record<string, string> = {
+  INITIAL_ENTRY_FILLED: '首次跟随成交',
+  PROTECTIVE_STOP_ACTIVE: '保护单已生效',
+  PROTECTION_RETRY: '重试建立保护',
+  PROTECTION_CREATE_FAILED: '保护单创建失败',
+  PROTECTION_VERIFY_UNKNOWN: '保护单无法验证',
+  PROTECTION_DEGRADED: '保护已降级',
+  PROTECTION_COVERAGE_LOW: '保护覆盖不足',
+  PROTECTION_RECOVERED: '保护已恢复',
+  STOP_TRIGGERED: '保护止损触发',
+  REENTRY_FILLED: '重入成交',
+  LEADER_CLOSED: '领航员平仓',
+  LEADER_REVERSED: '领航员反手',
+  ACCOUNTING_IDENTITY_CAPTURED: '已记录跟单仓位',
+  ACCOUNTING_IDENTITY_CAPTURE_FAILED: '跟单仓位识别失败',
+  ACCOUNTING_RECONCILED: '实际盈亏已对账',
+  ACCOUNTING_NEEDS_REVIEW: '对账需人工核对',
+}
+
+const localized = (labels: Record<string, string>, value: string) =>
+  labels[value] ?? value
+const sideLabel = (side: string) =>
+  side.toLowerCase() === 'long'
+    ? '多'
+    : side.toLowerCase() === 'short'
+      ? '空'
+      : side
+const dateLabel = (value?: string) => {
+  if (!value) return '-'
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? '-' : date.toLocaleString()
+}
+
 export function CopyGuardPage() {
   const [days, setDays] = useState(30)
   const [queryNow] = useState(() => Date.now())
@@ -53,6 +117,35 @@ export function CopyGuardPage() {
     selected ? `copy-guard-cycle-${selected}` : null,
     () => api.getCopyGuardCycle(selected!)
   )
+  const timeline = useMemo(() => {
+    if (!detail) return []
+    return detail.events.reduce<
+      Array<{
+        event: (typeof detail.events)[number]
+        count: number
+        firstAt: string
+        lastAt: string
+      }>
+    >((items, event) => {
+      const previous = items[items.length - 1]
+      if (
+        previous &&
+        event.type === 'PROTECTION_RETRY' &&
+        previous.event.type === event.type
+      ) {
+        previous.count += 1
+        previous.lastAt = event.created_at
+        return items
+      }
+      items.push({
+        event,
+        count: 1,
+        firstAt: event.created_at,
+        lastAt: event.created_at,
+      })
+      return items
+    }, [])
+  }, [detail])
   const trend = useMemo(() => {
     return (summary?.trend ?? []).reduce<{
       total: number
@@ -89,6 +182,20 @@ export function CopyGuardPage() {
     const a = document.createElement('a')
     a.href = url
     a.download = `copy-guard.${format}`
+    a.click()
+    URL.revokeObjectURL(url)
+  }
+  const exportCycle = async (id: number) => {
+    const token = localStorage.getItem('auth_token')
+    const res = await fetch(`/api/copytrade/risk/cycles/${id}/export`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    })
+    if (!res.ok) throw new Error('单个仓位日志导出失败')
+    const blob = await res.blob()
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `copy-guard-cycle-${id}.jsonl`
     a.click()
     URL.revokeObjectURL(url)
   }
@@ -152,10 +259,14 @@ export function CopyGuardPage() {
         >
           <option value="">全部状态</option>
           <option value="FOLLOWING">正常跟随</option>
+          <option value="STOP_TRIGGERED">止损已触发</option>
           <option value="STOPPED_WATCHING">保护观察</option>
+          <option value="REENTRY_PENDING">等待重入成交</option>
           <option value="FOLLOWING_REENTRY">重入跟随</option>
           <option value="LEADER_CLOSED">领航员平仓</option>
+          <option value="LEADER_REVERSED">领航员反手</option>
           <option value="ATTEMPTS_EXHAUSTED">次数耗尽</option>
+          <option value="WATCH_TIMEOUT">观察超时</option>
         </select>
         <select
           value={resultType}
@@ -186,12 +297,26 @@ export function CopyGuardPage() {
           color={(summary?.net_guard_effect ?? 0) >= 0 ? '#0ECB81' : '#F6465D'}
         />
       </div>
-      {(summary?.unknown_count ?? 0) + (summary?.degraded_count ?? 0) > 0 && (
+      {(summary?.pending_protection_count ?? 0) +
+        (summary?.unknown_count ?? 0) +
+        (summary?.degraded_count ?? 0) >
+        0 && (
         <div className="border border-[#F6465D] bg-[#F6465D]/10 rounded-lg p-4 text-sm text-[#F6465D]">
           当前有{' '}
-          {(summary?.unknown_count ?? 0) + (summary?.degraded_count ?? 0)}{' '}
-          个仓位的保护单未知或降级，仓位可能没有有效止损，请人工检查
+          {(summary?.pending_protection_count ?? 0) +
+            (summary?.unknown_count ?? 0) +
+            (summary?.degraded_count ?? 0)}{' '}
+          个活跃仓位的保护单待建立、未知或降级，仓位可能没有有效止损，请人工检查
           OKX。系统仍会继续跟随并重试。
+        </div>
+      )}
+      {(summary?.accounting_pending_count ?? 0) +
+        (summary?.accounting_review_count ?? 0) >
+        0 && (
+        <div className="border border-[#F0B90B] bg-[#F0B90B]/10 rounded-lg p-4 text-sm text-[#F0B90B]">
+          当前有 {summary?.accounting_pending_count ?? 0} 个周期正在等待 OKX
+          最终对账，{summary?.accounting_review_count ?? 0}{' '}
+          个周期需人工核对。这些周期暂不计入保护效果。
         </div>
       )}
       {(summary?.ignored_count ?? 0) > 0 && (
@@ -212,6 +337,10 @@ export function CopyGuardPage() {
         />
         <Metric label="滑点" value={(summary?.slippage ?? 0).toFixed(2)} />
         <Metric label="保护有效" value={summary?.protected_count ?? 0} />
+        <Metric
+          label="保护待建立"
+          value={summary?.pending_protection_count ?? 0}
+        />
         <Metric label="保护未知" value={summary?.unknown_count ?? 0} />
         <Metric label="保护降级" value={summary?.degraded_count ?? 0} />
         <Metric
@@ -232,6 +361,15 @@ export function CopyGuardPage() {
         <Metric
           label="误杀率"
           value={`${((summary?.false_kill_rate ?? 0) * 100).toFixed(1)}%`}
+        />
+        <Metric label="对账中" value={summary?.accounting_pending_count ?? 0} />
+        <Metric
+          label="需人工核对"
+          value={summary?.accounting_review_count ?? 0}
+        />
+        <Metric
+          label="历史未验证"
+          value={summary?.legacy_unverified_count ?? 0}
         />
       </div>
       {trend.length > 0 && (
@@ -286,11 +424,14 @@ export function CopyGuardPage() {
                 '交易对',
                 '方向',
                 '状态',
+                '对账',
                 '保护健康',
                 '止损/重入',
                 '实际盈亏',
                 '未兜底估算',
+                '跟单偏差',
                 '净效果',
+                '操作',
               ].map((x) => (
                 <th key={x} className="p-3 text-left">
                   {x}
@@ -305,29 +446,54 @@ export function CopyGuardPage() {
                 onClick={() => setSelected(selected === c.id ? null : c.id)}
                 className="border-t border-[#2B3139] cursor-pointer hover:bg-[#181A20]"
               >
-                <td className="p-3">
-                  {new Date(c.opened_at).toLocaleString()}
+                <td className="p-3">{dateLabel(c.opened_at)}</td>
+                <td className="p-3" title={c.trader_id}>
+                  {c.trader_name || c.trader_id}
                 </td>
-                <td className="p-3">{c.trader_id}</td>
                 <td className="p-3">{c.leader_id}</td>
                 <td className="p-3">{c.symbol}</td>
-                <td className="p-3">{c.side}</td>
-                <td className="p-3">{c.status}</td>
+                <td className="p-3">{sideLabel(c.side)}</td>
+                <td className="p-3">{localized(statusLabels, c.status)}</td>
+                <td className="p-3">
+                  {localized(accountingLabels, c.accounting_status)}
+                </td>
                 <td
                   className={`p-3 ${c.protection_status === 'VERIFIED' ? 'text-[#0ECB81]' : c.protection_status === 'UNKNOWN' || c.protection_status === 'DEGRADED' ? 'text-[#F6465D]' : 'text-[#F0B90B]'}`}
                 >
-                  {c.protection_status} ·{' '}
+                  {localized(protectionLabels, c.protection_status)} ·{' '}
                   {(c.protection_coverage * 100).toFixed(0)}%
                 </td>
                 <td className="p-3">
                   {c.stop_count}/{c.reentry_count}
                 </td>
-                <td className="p-3">{money(c.actual_pnl)}</td>
+                <td className="p-3">
+                  {c.accounting_status === 'RECONCILED'
+                    ? money(c.actual_pnl)
+                    : localized(accountingLabels, c.accounting_status)}
+                </td>
                 <td className="p-3">{money(c.baseline_pnl)}</td>
+                <td className="p-3">
+                  {c.accounting_status === 'RECONCILED'
+                    ? money(c.tracking_difference)
+                    : '-'}
+                </td>
                 <td
                   className={`p-3 ${c.net_guard_effect >= 0 ? 'text-[#0ECB81]' : 'text-[#F6465D]'}`}
                 >
-                  {money(c.net_guard_effect)}
+                  {c.accounting_status === 'RECONCILED'
+                    ? money(c.net_guard_effect)
+                    : '不计入'}
+                </td>
+                <td className="p-3">
+                  <button
+                    onClick={(event) => {
+                      event.stopPropagation()
+                      void exportCycle(c.id)
+                    }}
+                    className="whitespace-nowrap rounded bg-[#2B3139] px-2 py-1 hover:bg-[#3B424C]"
+                  >
+                    导出日志
+                  </button>
                 </td>
               </tr>
             ))}
@@ -361,38 +527,92 @@ export function CopyGuardPage() {
       </div>
       {detail && (
         <div className="border border-[#2B3139] rounded-lg p-4">
-          <h2 className="font-bold mb-3">生命周期 #{detail.cycle.id} 时间线</h2>
+          <div className="mb-3 flex items-center justify-between gap-3">
+            <div>
+              <h2 className="font-bold">
+                {detail.cycle.trader_name || detail.cycle.trader_id} ·{' '}
+                {detail.cycle.symbol} {sideLabel(detail.cycle.side)}单
+              </h2>
+              <div
+                className="text-xs text-[#848E9C]"
+                title={detail.cycle.trader_id}
+              >
+                生命周期 #{detail.cycle.id} · 跟单员ID {detail.cycle.trader_id}
+              </div>
+            </div>
+            <button
+              onClick={() => void exportCycle(detail.cycle.id)}
+              className="rounded bg-[#2B3139] px-3 py-2 text-sm"
+            >
+              导出本仓位JSONL
+            </button>
+          </div>
           <div className="grid md:grid-cols-3 gap-3 mb-4 text-sm">
             <Metric
               label="保护状态"
-              value={`${detail.cycle.protection_status} / ${(detail.cycle.protection_coverage * 100).toFixed(0)}%`}
+              value={`${localized(protectionLabels, detail.cycle.protection_status)} / ${(detail.cycle.protection_coverage * 100).toFixed(0)}%`}
             />
             <Metric
               label="保护单"
               value={detail.protection?.algo_id || '尚未确认'}
             />
             <Metric label="重试次数" value={detail.cycle.protection_retries} />
+            <Metric
+              label="生命周期状态"
+              value={localized(statusLabels, detail.cycle.status)}
+            />
+            <Metric
+              label="对账状态"
+              value={localized(
+                accountingLabels,
+                detail.cycle.accounting_status
+              )}
+            />
+            <Metric
+              label="跟单执行偏差"
+              value={
+                detail.cycle.accounting_status === 'RECONCILED'
+                  ? money(detail.cycle.tracking_difference)
+                  : '-'
+              }
+            />
           </div>
           {detail.cycle.protection_error && (
             <div className="mb-4 text-sm text-[#F6465D]">
               最后错误：{detail.cycle.protection_error}
             </div>
           )}
+          {detail.cycle.accounting_error && (
+            <div className="mb-4 text-sm text-[#F0B90B]">
+              对账说明：{detail.cycle.accounting_error}
+            </div>
+          )}
           <div className="mb-4 text-xs text-[#848E9C] break-all">
             策略快照：{detail.cycle.policy_snapshot}
           </div>
           <div className="mb-4 rounded bg-[#181A20] p-3 text-sm text-[#848E9C]">
-            公式：实际净盈亏 {detail.cycle.actual_pnl.toFixed(2)} − 未兜底估算{' '}
-            {detail.cycle.baseline_pnl.toFixed(2)} = 净保护效果{' '}
-            <span
-              className={
-                detail.cycle.net_guard_effect >= 0
-                  ? 'text-[#0ECB81]'
-                  : 'text-[#F6465D]'
-              }
-            >
-              {detail.cycle.net_guard_effect.toFixed(2)} USDT
-            </span>
+            {detail.cycle.stop_count === 0 ? (
+              <>
+                本周期未触发 Copy Guard，保护效果记为
+                0。实际盈亏与估算基线的差额仅作为跟单执行偏差。
+              </>
+            ) : detail.cycle.accounting_status === 'RECONCILED' ? (
+              <>
+                公式：实际净盈亏 {detail.cycle.actual_pnl.toFixed(2)} −
+                未兜底估算 {detail.cycle.baseline_pnl.toFixed(2)} = 净保护效果{' '}
+                <span
+                  className={
+                    detail.cycle.net_guard_effect >= 0
+                      ? 'text-[#0ECB81]'
+                      : 'text-[#F6465D]'
+                  }
+                >
+                  {detail.cycle.net_guard_effect.toFixed(2)} USDT
+                </span>
+              </>
+            ) : (
+              <>本周期尚未完成对账，暂不计入保护效果。</>
+            )}
           </div>
           {detail.attempts.length > 0 && (
             <div className="space-y-2 mb-4">
@@ -402,7 +622,7 @@ export function CopyGuardPage() {
                   className="grid grid-cols-5 gap-3 text-sm bg-[#181A20] rounded p-3"
                 >
                   <span>尝试 #{a.attempt_no}</span>
-                  <span>{a.status}</span>
+                  <span>{localized(attemptLabels, a.status)}</span>
                   <span>入场 {a.entry_price || '-'}</span>
                   <span>离场 {a.exit_price || '-'}</span>
                   <span>净盈亏 {a.pnl.toFixed(2)}</span>
@@ -411,13 +631,24 @@ export function CopyGuardPage() {
             </div>
           )}
           <div className="space-y-2">
-            {detail.events.map((e) => (
+            {timeline.map(({ event: e, count, firstAt, lastAt }) => (
               <div
                 key={e.id}
                 className="grid grid-cols-5 gap-3 text-sm bg-[#181A20] rounded p-3"
               >
-                <span>{new Date(e.created_at).toLocaleString()}</span>
-                <span className="font-medium">{e.type}</span>
+                <span
+                  title={
+                    count > 1
+                      ? `${dateLabel(firstAt)} - ${dateLabel(lastAt)}`
+                      : undefined
+                  }
+                >
+                  {dateLabel(firstAt)}
+                </span>
+                <span className="font-medium">
+                  {localized(eventLabels, e.type)}
+                  {count > 1 ? ` ×${count}` : ''}
+                </span>
                 <span>价格 {e.price || '-'}</span>
                 <span>盈亏 {e.pnl?.toFixed(2) ?? '0.00'}</span>
                 <span>费用 {e.fee?.toFixed(2) ?? '0.00'}</span>

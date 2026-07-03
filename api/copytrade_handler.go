@@ -46,6 +46,7 @@ func (h *CopyTradeHandler) RegisterRoutes(group *gin.RouterGroup) {
 		copyTrade.GET("/risk/summary", h.GetRiskSummary)
 		copyTrade.GET("/risk/cycles", h.GetRiskCycles)
 		copyTrade.GET("/risk/cycles/:id", h.GetRiskCycle)
+		copyTrade.GET("/risk/cycles/:id/export", h.ExportRiskCycle)
 		copyTrade.GET("/risk/export", h.ExportRiskCycles)
 
 		// Binance 全局共享凭证管理（v2 凭证全局化）
@@ -62,13 +63,14 @@ func (h *CopyTradeHandler) RegisterRoutes(group *gin.RouterGroup) {
 	}
 }
 
-func (h *CopyTradeHandler) ownedTraderIDs(c *gin.Context) ([]string, map[string]bool, error) {
+func (h *CopyTradeHandler) ownedTraderIDs(c *gin.Context) ([]string, map[string]bool, map[string]string, error) {
 	list, err := h.store.Trader().List(c.GetString("user_id"))
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	ids := make([]string, 0, len(list))
 	set := map[string]bool{}
+	names := map[string]string{}
 	filter := strings.TrimSpace(c.Query("trader_id"))
 	for _, t := range list {
 		if filter != "" && t.ID != filter {
@@ -76,8 +78,9 @@ func (h *CopyTradeHandler) ownedTraderIDs(c *gin.Context) ([]string, map[string]
 		}
 		ids = append(ids, t.ID)
 		set[t.ID] = true
+		names[t.ID] = t.Name
 	}
-	return ids, set, nil
+	return ids, set, names, nil
 }
 func riskTimeRange(c *gin.Context) (time.Time, time.Time) {
 	to := time.Now().UTC().Add(time.Second)
@@ -99,7 +102,7 @@ func riskFilter(c *gin.Context) store.CopyGuardFilter {
 }
 
 func (h *CopyTradeHandler) GetRiskSummary(c *gin.Context) {
-	ids, _, err := h.ownedTraderIDs(c)
+	ids, _, _, err := h.ownedTraderIDs(c)
 	if err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
@@ -113,7 +116,7 @@ func (h *CopyTradeHandler) GetRiskSummary(c *gin.Context) {
 	c.JSON(200, gin.H{"summary": x, "from": from, "to": to})
 }
 func (h *CopyTradeHandler) GetRiskCycles(c *gin.Context) {
-	ids, _, err := h.ownedTraderIDs(c)
+	ids, _, names, err := h.ownedTraderIDs(c)
 	if err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
@@ -126,6 +129,9 @@ func (h *CopyTradeHandler) GetRiskCycles(c *gin.Context) {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
+	for _, cycle := range rows {
+		cycle.TraderName = names[cycle.TraderID]
+	}
 	c.JSON(200, gin.H{"cycles": rows, "count": len(rows)})
 }
 func (h *CopyTradeHandler) GetRiskCycle(c *gin.Context) {
@@ -134,7 +140,7 @@ func (h *CopyTradeHandler) GetRiskCycle(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "invalid cycle id"})
 		return
 	}
-	_, owned, err := h.ownedTraderIDs(c)
+	_, owned, names, err := h.ownedTraderIDs(c)
 	if err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
@@ -148,6 +154,7 @@ func (h *CopyTradeHandler) GetRiskCycle(c *gin.Context) {
 		c.JSON(403, gin.H{"error": "forbidden"})
 		return
 	}
+	cycle.TraderName = names[cycle.TraderID]
 	events, err := h.store.CopyTrade().ListCopyGuardEvents(id)
 	if err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
@@ -158,11 +165,54 @@ func (h *CopyTradeHandler) GetRiskCycle(c *gin.Context) {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
-	protection, _ := h.store.CopyTrade().GetCopyGuardProtectiveOrder(id)
+	protection, protectionErr := h.store.CopyTrade().GetCopyGuardProtectiveOrder(id)
+	if protectionErr != nil {
+		protection = nil
+	}
 	c.JSON(200, gin.H{"cycle": cycle, "events": events, "attempts": attempts, "protection": protection})
 }
+
+func (h *CopyTradeHandler) ExportRiskCycle(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid cycle id"})
+		return
+	}
+	_, owned, names, err := h.ownedTraderIDs(c)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	cycle, err := h.store.CopyTrade().GetCopyGuardCycle(id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "cycle not found"})
+		return
+	}
+	if !owned[cycle.TraderID] {
+		c.JSON(http.StatusForbidden, gin.H{"error": "forbidden"})
+		return
+	}
+	cycle.TraderName = names[cycle.TraderID]
+	events, err := h.store.CopyTrade().ListCopyGuardEvents(id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	attempts, err := h.store.CopyTrade().ListCopyGuardAttempts(id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	protection, protectionErr := h.store.CopyTrade().GetCopyGuardProtectiveOrder(id)
+	if protectionErr != nil {
+		protection = nil
+	}
+	c.Header("Content-Type", "application/x-ndjson")
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=copy-guard-cycle-%d.jsonl", id))
+	_ = json.NewEncoder(c.Writer).Encode(gin.H{"schema_version": 2, "exported_at": time.Now().UTC(), "cycle": cycle, "attempts": attempts, "events": events, "protection": protection})
+}
 func (h *CopyTradeHandler) ExportRiskCycles(c *gin.Context) {
-	ids, _, err := h.ownedTraderIDs(c)
+	ids, _, names, err := h.ownedTraderIDs(c)
 	if err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
@@ -183,9 +233,13 @@ func (h *CopyTradeHandler) ExportRiskCycles(c *gin.Context) {
 				return
 			}
 			for _, cycle := range rows {
+				cycle.TraderName = names[cycle.TraderID]
 				events, _ := h.store.CopyTrade().ListCopyGuardEvents(cycle.ID)
 				attempts, _ := h.store.CopyTrade().ListCopyGuardAttempts(cycle.ID)
-				protection, _ := h.store.CopyTrade().GetCopyGuardProtectiveOrder(cycle.ID)
+				protection, protectionErr := h.store.CopyTrade().GetCopyGuardProtectiveOrder(cycle.ID)
+				if protectionErr != nil {
+					protection = nil
+				}
 				_ = enc.Encode(gin.H{"cycle": cycle, "attempts": attempts, "events": events, "protection": protection})
 			}
 			if len(rows) < 500 {
@@ -197,18 +251,19 @@ func (h *CopyTradeHandler) ExportRiskCycles(c *gin.Context) {
 	c.Header("Content-Type", "text/csv; charset=utf-8")
 	c.Header("Content-Disposition", "attachment; filename=copy-guard.csv")
 	w := csv.NewWriter(c.Writer)
-	_ = w.Write([]string{"cycle_id", "trader_id", "leader_id", "leader_pos_id", "symbol", "side", "margin_mode", "status", "protection_status", "protection_coverage", "protection_retries", "protection_missing_seconds", "protection_error", "stop_count", "reentry_count", "actual_pnl", "baseline_no_guard_pnl", "net_guard_effect", "fees", "funding_fee", "liquidation_penalty", "slippage", "opened_at", "closed_at"})
+	_ = w.Write([]string{"cycle_id", "trader_id", "trader_name", "leader_id", "leader_pos_id", "symbol", "side", "margin_mode", "status", "accounting_status", "accounting_error", "tracking_difference", "protection_status", "protection_coverage", "protection_retries", "protection_missing_seconds", "protection_error", "stop_count", "reentry_count", "actual_pnl", "baseline_no_guard_pnl", "net_guard_effect", "fees", "funding_fee", "liquidation_penalty", "slippage", "opened_at", "closed_at"})
 	for offset := 0; ; offset += 500 {
 		rows, err := h.store.CopyTrade().ListCopyGuardCycles(ids, from, to, 500, offset, riskFilter(c))
 		if err != nil {
 			return
 		}
 		for _, x := range rows {
+			x.TraderName = names[x.TraderID]
 			closed := ""
 			if x.ClosedAt != nil {
 				closed = x.ClosedAt.Format(time.RFC3339)
 			}
-			_ = w.Write([]string{strconv.FormatInt(x.ID, 10), x.TraderID, x.LeaderID, x.LeaderPosID, x.Symbol, x.Side, x.MarginMode, x.Status, x.ProtectionStatus, fmt.Sprint(x.ProtectionCoverage), strconv.Itoa(x.ProtectionRetries), fmt.Sprint(x.ProtectionMissingSeconds), x.ProtectionError, strconv.Itoa(x.StopCount), strconv.Itoa(x.ReentryCount), fmt.Sprint(x.ActualPnL), fmt.Sprint(x.BaselinePnL), fmt.Sprint(x.NetGuardEffect), fmt.Sprint(x.Fees), fmt.Sprint(x.FundingFee), fmt.Sprint(x.LiquidationPenalty), fmt.Sprint(x.Slippage), x.OpenedAt.Format(time.RFC3339), closed})
+			_ = w.Write([]string{strconv.FormatInt(x.ID, 10), x.TraderID, x.TraderName, x.LeaderID, x.LeaderPosID, x.Symbol, x.Side, x.MarginMode, x.Status, x.AccountingStatus, x.AccountingError, fmt.Sprint(x.TrackingDifference), x.ProtectionStatus, fmt.Sprint(x.ProtectionCoverage), strconv.Itoa(x.ProtectionRetries), fmt.Sprint(x.ProtectionMissingSeconds), x.ProtectionError, strconv.Itoa(x.StopCount), strconv.Itoa(x.ReentryCount), fmt.Sprint(x.ActualPnL), fmt.Sprint(x.BaselinePnL), fmt.Sprint(x.NetGuardEffect), fmt.Sprint(x.Fees), fmt.Sprint(x.FundingFee), fmt.Sprint(x.LiquidationPenalty), fmt.Sprint(x.Slippage), x.OpenedAt.Format(time.RFC3339), closed})
 		}
 		w.Flush()
 		if len(rows) < 500 {

@@ -35,26 +35,6 @@ func (a *TraderExecutorAdapter) GetBalance() (map[string]interface{}, error) {
 	return info, nil
 }
 
-// CopyTradeExecutorAdapter wraps AutoTrader to implement copytrade.DecisionExecutor
-type CopyTradeExecutorAdapter struct {
-	autoTrader *trader.AutoTrader
-}
-
-// ExecuteDecision executes a trading decision (implements copytrade.DecisionExecutor)
-func (a *CopyTradeExecutorAdapter) ExecuteDecision(d *decision.Decision) error {
-	return a.autoTrader.ExecuteDecision(d)
-}
-
-// GetAccountInfo returns account info (implements copytrade.DecisionExecutor)
-func (a *CopyTradeExecutorAdapter) GetAccountInfo() (map[string]interface{}, error) {
-	return a.autoTrader.GetAccountInfo()
-}
-
-// GetPositions returns positions (implements copytrade.DecisionExecutor)
-func (a *CopyTradeExecutorAdapter) GetPositions() ([]map[string]interface{}, error) {
-	return a.autoTrader.GetPositions()
-}
-
 // CompetitionCache competition data cache
 type CompetitionCache struct {
 	data      map[string]interface{}
@@ -154,9 +134,8 @@ func (tm *TraderManager) StartTraderWithMode(traderID string, st *store.Store) e
 	if decisionMode == "copy_trade" {
 		// Start in copy trade mode
 		logger.Infof("🎯 [%s] Copy trade mode, starting copy trading engine...", at.GetName())
-		executor := &CopyTradeExecutorAdapter{autoTrader: at}
 		go func() {
-			if err := copytrade.StartCopyTradingForTrader(traderID, executor, st); err != nil {
+			if err := copytrade.StartCopyTradingForTrader(traderID, at, st); err != nil {
 				logger.Warnf("⚠️ Trader '%s' copy trade stopped with error: %v", at.GetName(), err)
 			}
 		}()
@@ -221,19 +200,18 @@ func (tm *TraderManager) AutoStartRunningTraders(st *store.Store) {
 				// Start in copy trade mode
 				go func(traderID string, at *trader.AutoTrader) {
 					logger.Infof("▶️  Auto-restoring %s (copy trade mode)...", at.GetName())
-					executor := &CopyTradeExecutorAdapter{autoTrader: at}
-					if err := copytrade.StartCopyTradingForTrader(traderID, executor, st); err != nil {
+					if err := copytrade.StartCopyTradingForTrader(traderID, at, st); err != nil {
 						logger.Infof("❌ %s copy trade runtime error: %v", at.GetName(), err)
 					}
 				}(id, t)
 			} else {
 				// Start in AI mode (default)
-			go func(traderID string, at *trader.AutoTrader) {
+				go func(traderID string, at *trader.AutoTrader) {
 					logger.Infof("▶️  Auto-restoring %s (AI mode)...", at.GetName())
-				if err := at.Run(); err != nil {
-					logger.Infof("❌ %s runtime error: %v", at.GetName(), err)
-				}
-			}(id, t)
+					if err := at.Run(); err != nil {
+						logger.Infof("❌ %s runtime error: %v", at.GetName(), err)
+					}
+				}(id, t)
 			}
 			startedCount++
 		}
@@ -807,8 +785,7 @@ func (tm *TraderManager) addTraderFromStore(traderCfg *store.Trader, aiModelCfg 
 			// Start in copy trade mode
 			logger.Infof("🎯 [%s] Copy trade mode detected, starting copy trading engine...", traderCfg.Name)
 			go func(autoTrader *trader.AutoTrader, traderName, traderID, userID string) {
-				executor := &CopyTradeExecutorAdapter{autoTrader: autoTrader}
-				if err := copytrade.StartCopyTradingForTrader(traderID, executor, st); err != nil {
+				if err := copytrade.StartCopyTradingForTrader(traderID, autoTrader, st); err != nil {
 					logger.Warnf("⚠️ Trader '%s' copy trade stopped with error: %v", traderName, err)
 					if st != nil {
 						_ = st.Trader().UpdateStatus(userID, traderID, false)
@@ -820,12 +797,12 @@ func (tm *TraderManager) addTraderFromStore(traderCfg *store.Trader, aiModelCfg 
 			// Start in AI mode (default)
 			go func(autoTrader *trader.AutoTrader, traderName, traderID, userID string) {
 				if err := autoTrader.Run(); err != nil {
-				logger.Warnf("⚠️ Trader '%s' stopped with error: %v", traderName, err)
-				if st != nil {
-					_ = st.Trader().UpdateStatus(userID, traderID, false)
+					logger.Warnf("⚠️ Trader '%s' stopped with error: %v", traderName, err)
+					if st != nil {
+						_ = st.Trader().UpdateStatus(userID, traderID, false)
+					}
 				}
-			}
-		}(at, traderCfg.Name, traderCfg.ID, traderCfg.UserID)
+			}(at, traderCfg.Name, traderCfg.ID, traderCfg.UserID)
 			logger.Infof("✅ Trader '%s' auto-started in AI mode", traderCfg.Name)
 		}
 	}

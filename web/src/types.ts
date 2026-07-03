@@ -736,8 +736,12 @@ export interface CopyGuardSummary {
   liquidation_penalty: number
   slippage: number
   protected_count: number
+  pending_protection_count: number
   unknown_count: number
   degraded_count: number
+  accounting_pending_count: number
+  accounting_review_count: number
+  legacy_unverified_count: number
   average_coverage: number
   ignored_count: number
   reentry_first: number
@@ -758,6 +762,7 @@ export interface CopyGuardSummary {
 export interface CopyGuardCycle {
   id: number
   trader_id: string
+  trader_name?: string
   leader_id: string
   leader_pos_id: string
   symbol: string
@@ -769,6 +774,14 @@ export interface CopyGuardCycle {
   actual_pnl: number
   baseline_pnl: number
   net_guard_effect: number
+  tracking_difference: number
+  accounting_status:
+    | 'OPEN'
+    | 'PENDING'
+    | 'RECONCILED'
+    | 'NEEDS_REVIEW'
+    | 'LEGACY_UNVERIFIED'
+  accounting_error: string
   fees: number
   funding_fee: number
   liquidation_penalty: number
@@ -787,6 +800,7 @@ export interface CopyGuardCycle {
   policy_snapshot: string
   opened_at: string
   closed_at?: string
+  reconciled_at?: string
 }
 
 export interface CopyTradeStats {

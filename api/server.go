@@ -11,7 +11,6 @@ import (
 	"nofx/config"
 	"nofx/copytrade"
 	"nofx/crypto"
-	"nofx/decision"
 	"nofx/logger"
 	"nofx/manager"
 	"nofx/store"
@@ -23,23 +22,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
-
-// CopyTradeExecutorAdapter wraps AutoTrader to implement copytrade.DecisionExecutor
-type CopyTradeExecutorAdapter struct {
-	trader *trader.AutoTrader
-}
-
-func (a *CopyTradeExecutorAdapter) ExecuteDecision(d *decision.Decision) error {
-	return a.trader.ExecuteDecision(d)
-}
-
-func (a *CopyTradeExecutorAdapter) GetAccountInfo() (map[string]interface{}, error) {
-	return a.trader.GetAccountInfo()
-}
-
-func (a *CopyTradeExecutorAdapter) GetPositions() ([]map[string]interface{}, error) {
-	return a.trader.GetPositions()
-}
 
 // isTraderRunning checks if a trader is running (unified for both AI and copy trade modes)
 // This is the single source of truth for trader running status
@@ -1245,8 +1227,7 @@ func (s *Server) handleStartTrader(c *gin.Context) {
 		}
 
 		go func() {
-			executor := &CopyTradeExecutorAdapter{trader: trader}
-			if err := copytrade.StartCopyTradingForTrader(traderID, executor, s.store); err != nil {
+			if err := copytrade.StartCopyTradingForTrader(traderID, trader, s.store); err != nil {
 				logger.Errorf("❌ Trader %s copy trade runtime error: %v", trader.GetName(), err)
 				// Disable copy trade on error
 				s.store.CopyTrade().SetEnabled(traderID, false)

@@ -21,6 +21,14 @@ const (
 )
 
 const (
+	CopyGuardAccountingOpen             = "OPEN"
+	CopyGuardAccountingPending          = "PENDING"
+	CopyGuardAccountingReconciled       = "RECONCILED"
+	CopyGuardAccountingNeedsReview      = "NEEDS_REVIEW"
+	CopyGuardAccountingLegacyUnverified = "LEGACY_UNVERIFIED"
+)
+
+const (
 	CopyGuardProtectionPending   = "PENDING"
 	CopyGuardProtectionVerified  = "VERIFIED"
 	CopyGuardProtectionUnknown   = "UNKNOWN"
@@ -51,6 +59,7 @@ type CopyGuardPolicy struct {
 type CopyGuardCycle struct {
 	ID                       int64      `json:"id"`
 	TraderID                 string     `json:"trader_id"`
+	TraderName               string     `json:"trader_name,omitempty"`
 	LeaderID                 string     `json:"leader_id"`
 	LeaderPosID              string     `json:"leader_pos_id"`
 	Symbol                   string     `json:"symbol"`
@@ -77,6 +86,9 @@ type CopyGuardCycle struct {
 	LiquidationPenalty       float64    `json:"liquidation_penalty"`
 	Slippage                 float64    `json:"slippage"`
 	NetGuardEffect           float64    `json:"net_guard_effect"`
+	TrackingDifference       float64    `json:"tracking_difference"`
+	AccountingStatus         string     `json:"accounting_status"`
+	AccountingError          string     `json:"accounting_error"`
 	ProtectionStatus         string     `json:"protection_status"`
 	ProtectionRetries        int        `json:"protection_retries"`
 	ProtectionCoverage       float64    `json:"protection_coverage"`
@@ -86,7 +98,9 @@ type CopyGuardCycle struct {
 	EntryOrderID             string     `json:"entry_order_id"`
 	ExitOrderID              string     `json:"exit_order_id"`
 	ProtectionMissingAt      *time.Time `json:"protection_missing_at,omitempty"`
+	ProtectionLastRetryAt    *time.Time `json:"protection_last_retry_at,omitempty"`
 	PendingSince             *time.Time `json:"pending_since,omitempty"`
+	ReconciledAt             *time.Time `json:"reconciled_at,omitempty"`
 	OpenedAt                 time.Time  `json:"opened_at"`
 	StoppedAt                *time.Time `json:"stopped_at,omitempty"`
 	ClosedAt                 *time.Time `json:"closed_at,omitempty"`
@@ -119,6 +133,9 @@ type CopyGuardAttempt struct {
 	StopTriggerPrice   float64    `json:"stop_trigger_price"`
 	StopFillPrice      float64    `json:"stop_fill_price"`
 	StopAlgoID         string     `json:"stop_algo_id"`
+	FollowerPosID      string     `json:"follower_pos_id"`
+	EntryOrderID       string     `json:"entry_order_id"`
+	ExitOrderID        string     `json:"exit_order_id"`
 	PnL                float64    `json:"pnl"`
 	Fee                float64    `json:"fee"`
 	FundingFee         float64    `json:"funding_fee"`
@@ -148,10 +165,11 @@ func (s *CopyTradeStore) initCopyGuardTables() error {
 			reentry_count INTEGER DEFAULT 0, stop_count INTEGER DEFAULT 0,
 			actual_pnl REAL DEFAULT 0, baseline_pnl REAL DEFAULT 0, fees REAL DEFAULT 0,
 			funding_fee REAL DEFAULT 0, liquidation_penalty REAL DEFAULT 0, slippage REAL DEFAULT 0, net_guard_effect REAL DEFAULT 0,
+			tracking_difference REAL DEFAULT 0, accounting_status TEXT DEFAULT 'OPEN', accounting_error TEXT DEFAULT '', reconciled_at DATETIME,
 			protection_status TEXT DEFAULT 'PENDING', protection_retries INTEGER DEFAULT 0,
 			protection_coverage REAL DEFAULT 0, protection_error TEXT DEFAULT '',
 			follower_pos_id TEXT DEFAULT '', entry_order_id TEXT DEFAULT '', exit_order_id TEXT DEFAULT '',
-			protection_missing_at DATETIME, protection_missing_seconds REAL DEFAULT 0, pending_since DATETIME,
+			protection_missing_at DATETIME, protection_missing_seconds REAL DEFAULT 0, protection_last_retry_at DATETIME, pending_since DATETIME,
 			opened_at DATETIME DEFAULT CURRENT_TIMESTAMP, stopped_at DATETIME, closed_at DATETIME,
 			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 			UNIQUE(trader_id, leader_pos_id, opened_at)
@@ -161,7 +179,7 @@ func (s *CopyTradeStore) initCopyGuardTables() error {
 			id INTEGER PRIMARY KEY AUTOINCREMENT, cycle_id INTEGER NOT NULL, attempt_no INTEGER NOT NULL,
 			status TEXT NOT NULL, entry_price REAL DEFAULT 0, exit_price REAL DEFAULT 0,
 			quantity REAL DEFAULT 0, notional REAL DEFAULT 0, stop_trigger_price REAL DEFAULT 0,
-			stop_fill_price REAL DEFAULT 0, stop_algo_id TEXT DEFAULT '', pnl REAL DEFAULT 0,
+			stop_fill_price REAL DEFAULT 0, stop_algo_id TEXT DEFAULT '', follower_pos_id TEXT DEFAULT '', entry_order_id TEXT DEFAULT '', exit_order_id TEXT DEFAULT '', pnl REAL DEFAULT 0,
 			fee REAL DEFAULT 0, funding_fee REAL DEFAULT 0, liquidation_penalty REAL DEFAULT 0, reconciled BOOLEAN DEFAULT 0, atr REAL DEFAULT 0,
 			opened_at DATETIME DEFAULT CURRENT_TIMESTAMP, closed_at DATETIME,
 			UNIQUE(cycle_id, attempt_no)
@@ -196,12 +214,23 @@ func (s *CopyTradeStore) initCopyGuardTables() error {
 			`ALTER TABLE copy_guard_cycles ADD COLUMN pending_since DATETIME`,
 			`ALTER TABLE copy_guard_cycles ADD COLUMN liquidation_penalty REAL DEFAULT 0`,
 			`ALTER TABLE copy_guard_cycles ADD COLUMN protection_missing_seconds REAL DEFAULT 0`,
+			`ALTER TABLE copy_guard_cycles ADD COLUMN protection_last_retry_at DATETIME`,
+			`ALTER TABLE copy_guard_cycles ADD COLUMN tracking_difference REAL DEFAULT 0`,
+			`ALTER TABLE copy_guard_cycles ADD COLUMN accounting_status TEXT DEFAULT 'OPEN'`,
+			`ALTER TABLE copy_guard_cycles ADD COLUMN accounting_error TEXT DEFAULT ''`,
+			`ALTER TABLE copy_guard_cycles ADD COLUMN reconciled_at DATETIME`,
 			`ALTER TABLE copy_guard_attempts ADD COLUMN liquidation_penalty REAL DEFAULT 0`,
 			`ALTER TABLE copy_guard_attempts ADD COLUMN reconciled BOOLEAN DEFAULT 0`,
+			`ALTER TABLE copy_guard_attempts ADD COLUMN follower_pos_id TEXT DEFAULT ''`,
+			`ALTER TABLE copy_guard_attempts ADD COLUMN entry_order_id TEXT DEFAULT ''`,
+			`ALTER TABLE copy_guard_attempts ADD COLUMN exit_order_id TEXT DEFAULT ''`,
 		}
 		for _, migration := range migrations {
 			_, _ = s.db.Exec(migration)
 		}
+		// Existing closed cycles were produced before deterministic settlement was
+		// available. Preserve their raw values but never present them as verified.
+		_, _ = s.db.Exec(`UPDATE copy_guard_cycles SET accounting_status=?,accounting_error=CASE WHEN COALESCE(accounting_error,'')='' THEN 'created before deterministic OKX settlement; raw values preserved' ELSE accounting_error END WHERE closed_at IS NOT NULL AND COALESCE(accounting_status,'OPEN')='OPEN'`, CopyGuardAccountingLegacyUnverified)
 	}
 	return err
 }
@@ -329,35 +358,71 @@ func (s *CopyTradeStore) GetOpenCopyGuardCycle(traderID, leaderPosID string) (*C
 
 type rowScanner interface{ Scan(...interface{}) error }
 
-const copyGuardCycleSelect = `SELECT id,trader_id,leader_id,leader_pos_id,symbol,side,margin_mode,status,policy_snapshot,leader_entry_price,follower_entry_price,follower_notional,baseline_notional,baseline_realized_pnl,baseline_leader_size,account_equity,atr_at_entry,atr_at_stop,last_observed_price,reentry_count,stop_count,actual_pnl,baseline_pnl,fees,funding_fee,liquidation_penalty,slippage,net_guard_effect,protection_status,protection_retries,protection_coverage,protection_error,protection_missing_seconds,follower_pos_id,entry_order_id,exit_order_id,protection_missing_at,pending_since,opened_at,stopped_at,closed_at,updated_at FROM copy_guard_cycles`
+const copyGuardCycleSelect = `SELECT id,trader_id,leader_id,leader_pos_id,symbol,side,margin_mode,status,policy_snapshot,leader_entry_price,follower_entry_price,follower_notional,baseline_notional,baseline_realized_pnl,baseline_leader_size,account_equity,atr_at_entry,atr_at_stop,last_observed_price,reentry_count,stop_count,actual_pnl,baseline_pnl,fees,funding_fee,liquidation_penalty,slippage,net_guard_effect,tracking_difference,accounting_status,accounting_error,protection_status,protection_retries,protection_coverage,protection_error,protection_missing_seconds,follower_pos_id,entry_order_id,exit_order_id,protection_missing_at,protection_last_retry_at,pending_since,reconciled_at,opened_at,stopped_at,closed_at,updated_at FROM copy_guard_cycles`
 
 func scanCopyGuardCycle(row rowScanner) (*CopyGuardCycle, error) {
 	var c CopyGuardCycle
 	var opened, updated string
-	var stopped, closed, missing, pending sql.NullString
-	err := row.Scan(&c.ID, &c.TraderID, &c.LeaderID, &c.LeaderPosID, &c.Symbol, &c.Side, &c.MarginMode, &c.Status, &c.PolicySnapshot, &c.LeaderEntryPrice, &c.FollowerEntryPrice, &c.FollowerNotional, &c.BaselineNotional, &c.BaselineRealizedPnL, &c.BaselineLeaderSize, &c.AccountEquity, &c.ATRAtEntry, &c.ATRAtStop, &c.LastObservedPrice, &c.ReentryCount, &c.StopCount, &c.ActualPnL, &c.BaselinePnL, &c.Fees, &c.FundingFee, &c.LiquidationPenalty, &c.Slippage, &c.NetGuardEffect, &c.ProtectionStatus, &c.ProtectionRetries, &c.ProtectionCoverage, &c.ProtectionError, &c.ProtectionMissingSeconds, &c.FollowerPosID, &c.EntryOrderID, &c.ExitOrderID, &missing, &pending, &opened, &stopped, &closed, &updated)
+	var stopped, closed, missing, lastRetry, pending, reconciled sql.NullString
+	err := row.Scan(&c.ID, &c.TraderID, &c.LeaderID, &c.LeaderPosID, &c.Symbol, &c.Side, &c.MarginMode, &c.Status, &c.PolicySnapshot, &c.LeaderEntryPrice, &c.FollowerEntryPrice, &c.FollowerNotional, &c.BaselineNotional, &c.BaselineRealizedPnL, &c.BaselineLeaderSize, &c.AccountEquity, &c.ATRAtEntry, &c.ATRAtStop, &c.LastObservedPrice, &c.ReentryCount, &c.StopCount, &c.ActualPnL, &c.BaselinePnL, &c.Fees, &c.FundingFee, &c.LiquidationPenalty, &c.Slippage, &c.NetGuardEffect, &c.TrackingDifference, &c.AccountingStatus, &c.AccountingError, &c.ProtectionStatus, &c.ProtectionRetries, &c.ProtectionCoverage, &c.ProtectionError, &c.ProtectionMissingSeconds, &c.FollowerPosID, &c.EntryOrderID, &c.ExitOrderID, &missing, &lastRetry, &pending, &reconciled, &opened, &stopped, &closed, &updated)
 	if err != nil {
 		return nil, err
 	}
-	c.OpenedAt, _ = time.Parse("2006-01-02 15:04:05", opened)
-	c.UpdatedAt, _ = time.Parse("2006-01-02 15:04:05", updated)
-	if stopped.Valid {
-		t, _ := time.Parse("2006-01-02 15:04:05", stopped.String)
-		c.StoppedAt = &t
+	if c.OpenedAt, err = parseDBTime(opened); err != nil {
+		return nil, fmt.Errorf("copy guard cycle %d opened_at: %w", c.ID, err)
 	}
-	if closed.Valid {
-		t, _ := time.Parse("2006-01-02 15:04:05", closed.String)
-		c.ClosedAt = &t
+	if c.UpdatedAt, err = parseDBTime(updated); err != nil {
+		return nil, fmt.Errorf("copy guard cycle %d updated_at: %w", c.ID, err)
 	}
-	if missing.Valid {
-		t, _ := time.Parse("2006-01-02 15:04:05", missing.String)
-		c.ProtectionMissingAt = &t
+	if c.StoppedAt, err = parseNullableDBTime(stopped); err != nil {
+		return nil, fmt.Errorf("copy guard cycle %d stopped_at: %w", c.ID, err)
 	}
-	if pending.Valid {
-		t, _ := time.Parse("2006-01-02 15:04:05", pending.String)
-		c.PendingSince = &t
+	if c.ClosedAt, err = parseNullableDBTime(closed); err != nil {
+		return nil, fmt.Errorf("copy guard cycle %d closed_at: %w", c.ID, err)
+	}
+	if c.ProtectionMissingAt, err = parseNullableDBTime(missing); err != nil {
+		return nil, fmt.Errorf("copy guard cycle %d protection_missing_at: %w", c.ID, err)
+	}
+	if c.ProtectionLastRetryAt, err = parseNullableDBTime(lastRetry); err != nil {
+		return nil, fmt.Errorf("copy guard cycle %d protection_last_retry_at: %w", c.ID, err)
+	}
+	if c.PendingSince, err = parseNullableDBTime(pending); err != nil {
+		return nil, fmt.Errorf("copy guard cycle %d pending_since: %w", c.ID, err)
+	}
+	if c.ReconciledAt, err = parseNullableDBTime(reconciled); err != nil {
+		return nil, fmt.Errorf("copy guard cycle %d reconciled_at: %w", c.ID, err)
 	}
 	return &c, nil
+}
+
+func parseDBTime(value string) (time.Time, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Time{}, fmt.Errorf("empty timestamp")
+	}
+	layouts := []string{
+		time.RFC3339Nano,
+		"2006-01-02 15:04:05.999999999-07:00",
+		"2006-01-02 15:04:05.999999999",
+		"2006-01-02 15:04:05",
+	}
+	for _, layout := range layouts {
+		if parsed, err := time.Parse(layout, value); err == nil {
+			return parsed.UTC(), nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("unsupported timestamp %q", value)
+}
+
+func parseNullableDBTime(value sql.NullString) (*time.Time, error) {
+	if !value.Valid || strings.TrimSpace(value.String) == "" {
+		return nil, nil
+	}
+	parsed, err := parseDBTime(value.String)
+	if err != nil {
+		return nil, err
+	}
+	return &parsed, nil
 }
 
 func (s *CopyTradeStore) UpdateCopyGuardProtectionHealth(id int64, status string, coverage float64, lastError, followerPosID, entryOrderID string, incrementRetry bool) error {
@@ -367,6 +432,45 @@ func (s *CopyTradeStore) UpdateCopyGuardProtectionHealth(id int64, status string
 	}
 	_, err := s.db.Exec(`UPDATE copy_guard_cycles SET protection_status=?,protection_coverage=?,protection_error=?,follower_pos_id=CASE WHEN ?<>'' THEN ? ELSE follower_pos_id END,entry_order_id=CASE WHEN ?<>'' THEN ? ELSE entry_order_id END,protection_retries=protection_retries+?,protection_missing_seconds=protection_missing_seconds+CASE WHEN ? NOT IN ('UNKNOWN','DEGRADED') AND protection_missing_at IS NOT NULL THEN MAX(0,(julianday(CURRENT_TIMESTAMP)-julianday(protection_missing_at))*86400) ELSE 0 END,protection_missing_at=CASE WHEN ? IN ('UNKNOWN','DEGRADED') THEN COALESCE(protection_missing_at,CURRENT_TIMESTAMP) ELSE NULL END,pending_since=CASE WHEN ?='PENDING' THEN COALESCE(pending_since,CURRENT_TIMESTAMP) ELSE NULL END,updated_at=CURRENT_TIMESTAMP WHERE id=?`, status, coverage, lastError, followerPosID, followerPosID, entryOrderID, entryOrderID, retry, status, status, status, id)
 	return err
+}
+
+// BeginCopyGuardProtectionRetry atomically claims one retry slot and records
+// the event. Multiple monitors or fast ticks cannot create duplicate retries.
+func (s *CopyTradeStore) BeginCopyGuardProtectionRetry(cycle *CopyGuardCycle, delay time.Duration) (bool, error) {
+	if cycle == nil {
+		return false, fmt.Errorf("nil copy guard cycle")
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	delaySeconds := delay.Seconds()
+	message := cycle.ProtectionError
+	status := cycle.ProtectionStatus
+	if status == CopyGuardProtectionPending && cycle.PendingSince != nil && time.Since(*cycle.PendingSince) >= 10*time.Second {
+		status = CopyGuardProtectionUnknown
+		if message == "" {
+			message = "protective stop was not established within 10 seconds"
+		}
+	}
+	res, err := tx.Exec(`UPDATE copy_guard_cycles SET protection_status=?,protection_error=?,protection_retries=protection_retries+1,protection_last_retry_at=CURRENT_TIMESTAMP,protection_missing_at=CASE WHEN ? IN ('UNKNOWN','DEGRADED') THEN COALESCE(protection_missing_at,CURRENT_TIMESTAMP) ELSE protection_missing_at END,updated_at=CURRENT_TIMESTAMP WHERE id=? AND protection_retries=? AND (protection_last_retry_at IS NULL OR (julianday(CURRENT_TIMESTAMP)-julianday(protection_last_retry_at))*86400>=?)`, status, message, status, cycle.ID, cycle.ProtectionRetries, delaySeconds)
+	if err != nil {
+		return false, err
+	}
+	changed, err := res.RowsAffected()
+	if err != nil || changed == 0 {
+		return false, err
+	}
+	metadata, _ := json.Marshal(map[string]interface{}{
+		"retry":      cycle.ProtectionRetries + 1,
+		"last_error": message,
+		"coverage":   cycle.ProtectionCoverage,
+	})
+	if _, err = tx.Exec(`INSERT INTO copy_guard_events(cycle_id,trader_id,type,metadata_json) VALUES(?,?,?,?)`, cycle.ID, cycle.TraderID, "PROTECTION_RETRY", string(metadata)); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
 }
 
 func (s *CopyTradeStore) ListOpenCopyGuardCycles(traderID string) ([]*CopyGuardCycle, error) {
@@ -446,7 +550,7 @@ func (s *CopyTradeStore) RecordCopyGuardStop(cycle *CopyGuardCycle, atr, exitPri
 	if _, err = tx.Exec(`UPDATE copy_guard_cycles SET status=?,atr_at_stop=?,stop_count=stop_count+1,actual_pnl=actual_pnl+?,fees=fees+?,slippage=slippage+?,stopped_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?`, CopyGuardStoppedWatching, atr, pnl, fee, slippage, cycle.ID); err != nil {
 		return err
 	}
-	if _, err = tx.Exec(`UPDATE copy_guard_attempts SET status='STOPPED',exit_price=?,stop_fill_price=?,pnl=?,fee=?,stop_algo_id=?,closed_at=CURRENT_TIMESTAMP WHERE cycle_id=? AND attempt_no=?`, exitPrice, exitPrice, pnl, fee, algoID, cycle.ID, cycle.ReentryCount); err != nil {
+	if _, err = tx.Exec(`UPDATE copy_guard_attempts SET status='STOPPED',exit_price=?,stop_fill_price=?,pnl=?,fee=?,stop_algo_id=?,exit_order_id=CASE WHEN ?<>'' THEN ? ELSE exit_order_id END,closed_at=CURRENT_TIMESTAMP WHERE cycle_id=? AND attempt_no=?`, exitPrice, exitPrice, pnl, fee, algoID, metadataString(metadata, "actual_order_id"), metadataString(metadata, "actual_order_id"), cycle.ID, cycle.ReentryCount); err != nil {
 		return err
 	}
 	raw, _ := json.Marshal(metadata)
@@ -497,6 +601,14 @@ func metadataFloat(metadata map[string]interface{}, key string) float64 {
 	}
 }
 
+func metadataString(metadata map[string]interface{}, key string) string {
+	if metadata == nil {
+		return ""
+	}
+	value, _ := metadata[key].(string)
+	return value
+}
+
 func (s *CopyTradeStore) RecordCopyGuardStopObserved(cycleID int64, traderID string, atr, price, quantity, pnl float64, metadata map[string]interface{}) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -541,8 +653,173 @@ func (s *CopyTradeStore) RecordCopyGuardReentryFilled(cycle *CopyGuardCycle, ent
 }
 
 func (s *CopyTradeStore) CloseCopyGuardCycle(id int64, status string, actual, baseline, fees, funding, penalty, slippage float64) error {
-	_, err := s.db.Exec(`UPDATE copy_guard_cycles SET status=?,actual_pnl=?,baseline_pnl=?,fees=?,funding_fee=?,liquidation_penalty=?,slippage=?,net_guard_effect=?-?,closed_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?`, status, actual, baseline, fees, funding, penalty, slippage, actual, baseline, id)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var pending int
+	if err = tx.QueryRow(`SELECT COUNT(*) FROM copy_guard_attempts WHERE cycle_id=? AND (reconciled=0 OR status='OPEN')`, id).Scan(&pending); err != nil {
+		return err
+	}
+	accountingStatus := CopyGuardAccountingReconciled
+	tracking, guardEffect := actual-baseline, 0.0
+	if pending > 0 {
+		accountingStatus = CopyGuardAccountingPending
+		tracking = 0
+	} else {
+		var stopCount int
+		if err = tx.QueryRow(`SELECT stop_count FROM copy_guard_cycles WHERE id=?`, id).Scan(&stopCount); err != nil {
+			return err
+		}
+		if stopCount > 0 {
+			guardEffect = actual - baseline
+		}
+	}
+	_, err = tx.Exec(`UPDATE copy_guard_cycles SET status=?,actual_pnl=?,baseline_pnl=?,fees=?,funding_fee=?,liquidation_penalty=?,slippage=?,tracking_difference=?,net_guard_effect=?,accounting_status=?,accounting_error='',reconciled_at=CASE WHEN ?=? THEN CURRENT_TIMESTAMP ELSE NULL END,closed_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?`, status, actual, baseline, fees, funding, penalty, slippage, tracking, guardEffect, accountingStatus, accountingStatus, CopyGuardAccountingReconciled, id)
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// BeginCopyGuardAccounting closes the trading lifecycle while keeping financial
+// settlement pending until OKX returns a terminal fill and position history.
+func (s *CopyTradeStore) BeginCopyGuardAccounting(id int64, status, exitOrderID string, baseline float64) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.Exec(`UPDATE copy_guard_cycles SET status=?,exit_order_id=CASE WHEN ?<>'' THEN ? ELSE exit_order_id END,baseline_pnl=?,net_guard_effect=0,tracking_difference=0,accounting_status=?,accounting_error='',closed_at=COALESCE(closed_at,CURRENT_TIMESTAMP),updated_at=CURRENT_TIMESTAMP WHERE id=?`, status, exitOrderID, exitOrderID, baseline, CopyGuardAccountingPending, id); err != nil {
+		return err
+	}
+	if exitOrderID != "" {
+		if _, err = tx.Exec(`UPDATE copy_guard_attempts SET exit_order_id=? WHERE cycle_id=? AND attempt_no=(SELECT reentry_count FROM copy_guard_cycles WHERE id=?)`, exitOrderID, id, id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (s *CopyTradeStore) MarkCopyGuardAccountingNeedsReview(id int64, message string) error {
+	_, err := s.db.Exec(`UPDATE copy_guard_cycles SET accounting_status=?,accounting_error=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND accounting_status IN (?,?)`, CopyGuardAccountingNeedsReview, message, id, CopyGuardAccountingPending, CopyGuardAccountingNeedsReview)
 	return err
+}
+
+// CompleteCopyGuardAccounting applies one authoritative OKX position-history
+// record exactly once and only then exposes the cycle to aggregate metrics.
+func (s *CopyTradeStore) CompleteCopyGuardAccounting(cycleID int64, attemptNo int, exitPrice, pnl, fee, funding, penalty float64) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var actual, fees, fundingTotal, penaltyTotal, baseline float64
+	var stopCount int
+	var accountingStatus string
+	if err = tx.QueryRow(`SELECT actual_pnl,fees,funding_fee,liquidation_penalty,baseline_pnl,stop_count,accounting_status FROM copy_guard_cycles WHERE id=?`, cycleID).Scan(&actual, &fees, &fundingTotal, &penaltyTotal, &baseline, &stopCount, &accountingStatus); err != nil {
+		return err
+	}
+	if accountingStatus == CopyGuardAccountingReconciled {
+		return tx.Commit()
+	}
+	var oldPnL, oldFee, oldFunding, oldPenalty float64
+	var reconciled bool
+	if err = tx.QueryRow(`SELECT pnl,fee,funding_fee,liquidation_penalty,reconciled FROM copy_guard_attempts WHERE cycle_id=? AND attempt_no=?`, cycleID, attemptNo).Scan(&oldPnL, &oldFee, &oldFunding, &oldPenalty, &reconciled); err != nil {
+		return err
+	}
+	if !reconciled {
+		actual += pnl - oldPnL
+		fees += fee - oldFee
+		fundingTotal += funding - oldFunding
+		penaltyTotal += penalty - oldPenalty
+	}
+	if _, err = tx.Exec(`UPDATE copy_guard_attempts SET status='CLOSED',exit_price=?,pnl=?,fee=?,funding_fee=?,liquidation_penalty=?,reconciled=1,closed_at=COALESCE(closed_at,CURRENT_TIMESTAMP) WHERE cycle_id=? AND attempt_no=?`, exitPrice, pnl, fee, funding, penalty, cycleID, attemptNo); err != nil {
+		return err
+	}
+	tracking := actual - baseline
+	guardEffect := 0.0
+	if stopCount > 0 {
+		guardEffect = tracking
+	}
+	if _, err = tx.Exec(`UPDATE copy_guard_cycles SET actual_pnl=?,fees=?,funding_fee=?,liquidation_penalty=?,tracking_difference=?,net_guard_effect=?,accounting_status=?,accounting_error='',reconciled_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?`, actual, fees, fundingTotal, penaltyTotal, tracking, guardEffect, CopyGuardAccountingReconciled, cycleID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *CopyTradeStore) ListCopyGuardCyclesPendingAccounting(traderID string) ([]*CopyGuardCycle, error) {
+	rows, err := s.db.Query(copyGuardCycleSelect+` WHERE trader_id=? AND accounting_status IN (?,?) ORDER BY closed_at,id`, traderID, CopyGuardAccountingPending, CopyGuardAccountingNeedsReview)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*CopyGuardCycle
+	for rows.Next() {
+		cycle, scanErr := scanCopyGuardCycle(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		out = append(out, cycle)
+	}
+	return out, rows.Err()
+}
+
+func (s *CopyTradeStore) ListCopyGuardCyclesWithUnreconciledStops(traderID string) ([]*CopyGuardCycle, error) {
+	rows, err := s.db.Query(`SELECT DISTINCT c.id FROM copy_guard_cycles c JOIN copy_guard_attempts a ON a.cycle_id=c.id WHERE c.trader_id=? AND a.status='STOPPED' AND a.reconciled=0 ORDER BY c.id`, traderID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	out := make([]*CopyGuardCycle, 0, len(ids))
+	for _, id := range ids {
+		cycle, err := s.GetCopyGuardCycle(id)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, cycle)
+	}
+	return out, nil
+}
+
+func (s *CopyTradeStore) FinalizeCopyGuardAccountingFromAttempts(cycleID int64) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var pending int
+	if err = tx.QueryRow(`SELECT COUNT(*) FROM copy_guard_attempts WHERE cycle_id=? AND (reconciled=0 OR status='OPEN')`, cycleID).Scan(&pending); err != nil {
+		return err
+	}
+	if pending > 0 {
+		return tx.Commit()
+	}
+	var actual, baseline float64
+	var stopCount int
+	if err = tx.QueryRow(`SELECT actual_pnl,baseline_pnl,stop_count FROM copy_guard_cycles WHERE id=?`, cycleID).Scan(&actual, &baseline, &stopCount); err != nil {
+		return err
+	}
+	tracking, guardEffect := actual-baseline, 0.0
+	if stopCount > 0 {
+		guardEffect = tracking
+	}
+	if _, err = tx.Exec(`UPDATE copy_guard_cycles SET tracking_difference=?,net_guard_effect=?,accounting_status=?,accounting_error='',reconciled_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?`, tracking, guardEffect, CopyGuardAccountingReconciled, cycleID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *CopyTradeStore) SaveCopyGuardEvent(e *CopyGuardEvent) error {
@@ -563,8 +840,13 @@ func (s *CopyTradeStore) UpdateCopyGuardAttemptPosition(cycleID int64, attempt i
 	_, err := s.db.Exec(`UPDATE copy_guard_attempts SET entry_price=?,notional=?,quantity=?,atr=CASE WHEN ?>0 THEN ? ELSE atr END WHERE cycle_id=? AND attempt_no=? AND status='OPEN'`, entryPrice, notional, quantity, atr, atr, cycleID, attempt)
 	return err
 }
+
+func (s *CopyTradeStore) UpdateCopyGuardAttemptIdentity(cycleID int64, attempt int, followerPosID, entryOrderID, exitOrderID string) error {
+	_, err := s.db.Exec(`UPDATE copy_guard_attempts SET follower_pos_id=CASE WHEN ?<>'' THEN ? ELSE follower_pos_id END,entry_order_id=CASE WHEN ?<>'' THEN ? ELSE entry_order_id END,exit_order_id=CASE WHEN ?<>'' THEN ? ELSE exit_order_id END WHERE cycle_id=? AND attempt_no=?`, followerPosID, followerPosID, entryOrderID, entryOrderID, exitOrderID, exitOrderID, cycleID, attempt)
+	return err
+}
 func (s *CopyTradeStore) ListCopyGuardAttempts(cycleID int64) ([]*CopyGuardAttempt, error) {
-	rows, err := s.db.Query(`SELECT id,cycle_id,attempt_no,status,entry_price,exit_price,quantity,notional,stop_trigger_price,stop_fill_price,stop_algo_id,pnl,fee,funding_fee,liquidation_penalty,reconciled,atr,opened_at,closed_at FROM copy_guard_attempts WHERE cycle_id=? ORDER BY attempt_no,id`, cycleID)
+	rows, err := s.db.Query(`SELECT id,cycle_id,attempt_no,status,entry_price,exit_price,quantity,notional,stop_trigger_price,stop_fill_price,stop_algo_id,follower_pos_id,entry_order_id,exit_order_id,pnl,fee,funding_fee,liquidation_penalty,reconciled,atr,opened_at,closed_at FROM copy_guard_attempts WHERE cycle_id=? ORDER BY attempt_no,id`, cycleID)
 	if err != nil {
 		return nil, err
 	}
@@ -574,13 +856,14 @@ func (s *CopyTradeStore) ListCopyGuardAttempts(cycleID int64) ([]*CopyGuardAttem
 		var a CopyGuardAttempt
 		var opened string
 		var closed sql.NullString
-		if err := rows.Scan(&a.ID, &a.CycleID, &a.AttemptNo, &a.Status, &a.EntryPrice, &a.ExitPrice, &a.Quantity, &a.Notional, &a.StopTriggerPrice, &a.StopFillPrice, &a.StopAlgoID, &a.PnL, &a.Fee, &a.FundingFee, &a.LiquidationPenalty, &a.Reconciled, &a.ATR, &opened, &closed); err != nil {
+		if err := rows.Scan(&a.ID, &a.CycleID, &a.AttemptNo, &a.Status, &a.EntryPrice, &a.ExitPrice, &a.Quantity, &a.Notional, &a.StopTriggerPrice, &a.StopFillPrice, &a.StopAlgoID, &a.FollowerPosID, &a.EntryOrderID, &a.ExitOrderID, &a.PnL, &a.Fee, &a.FundingFee, &a.LiquidationPenalty, &a.Reconciled, &a.ATR, &opened, &closed); err != nil {
 			return nil, err
 		}
-		a.OpenedAt, _ = time.Parse("2006-01-02 15:04:05", opened)
-		if closed.Valid {
-			t, _ := time.Parse("2006-01-02 15:04:05", closed.String)
-			a.ClosedAt = &t
+		if a.OpenedAt, err = parseDBTime(opened); err != nil {
+			return nil, fmt.Errorf("copy guard attempt %d opened_at: %w", a.ID, err)
+		}
+		if a.ClosedAt, err = parseNullableDBTime(closed); err != nil {
+			return nil, fmt.Errorf("copy guard attempt %d closed_at: %w", a.ID, err)
 		}
 		out = append(out, &a)
 	}
@@ -602,8 +885,12 @@ type CopyGuardSummary struct {
 	LiquidationPenalty       float64               `json:"liquidation_penalty"`
 	Slippage                 float64               `json:"slippage"`
 	ProtectedCount           int                   `json:"protected_count"`
+	PendingProtectionCount   int                   `json:"pending_protection_count"`
 	UnknownCount             int                   `json:"unknown_count"`
 	DegradedCount            int                   `json:"degraded_count"`
+	AccountingPendingCount   int                   `json:"accounting_pending_count"`
+	AccountingReviewCount    int                   `json:"accounting_review_count"`
+	LegacyUnverifiedCount    int                   `json:"legacy_unverified_count"`
 	AverageCoverage          float64               `json:"average_coverage"`
 	IgnoredCount             int                   `json:"ignored_count"`
 	ReentryFirst             int                   `json:"reentry_first"`
@@ -646,11 +933,11 @@ func appendCopyGuardFilter(q string, args []interface{}, f CopyGuardFilter) (str
 	}
 	switch f.ResultType {
 	case "improved":
-		q += " AND closed_at IS NOT NULL AND net_guard_effect>0"
+		q += " AND accounting_status='RECONCILED' AND stop_count>0 AND net_guard_effect>0"
 	case "cost":
-		q += " AND closed_at IS NOT NULL AND net_guard_effect<0"
+		q += " AND accounting_status='RECONCILED' AND stop_count>0 AND net_guard_effect<0"
 	case "neutral":
-		q += " AND closed_at IS NOT NULL AND net_guard_effect=0"
+		q += " AND accounting_status='RECONCILED' AND net_guard_effect=0"
 	case "open":
 		q += " AND closed_at IS NULL"
 	}
@@ -667,10 +954,10 @@ func (s *CopyTradeStore) CopyGuardSummary(traderIDs []string, from, to time.Time
 		args = append(args, id)
 	}
 	args = append(args, from.UTC().Format("2006-01-02 15:04:05"), to.UTC().Format("2006-01-02 15:04:05"))
-	q := `SELECT COUNT(DISTINCT trader_id),COUNT(*),COALESCE(SUM(stop_count),0),COALESCE(SUM(reentry_count),0),COALESCE(SUM(actual_pnl),0),COALESCE(SUM(baseline_pnl),0),COALESCE(SUM(CASE WHEN net_guard_effect>0 THEN net_guard_effect ELSE 0 END),0),COALESCE(SUM(CASE WHEN net_guard_effect<0 THEN -net_guard_effect ELSE 0 END),0),COALESCE(SUM(net_guard_effect),0),COALESCE(SUM(fees),0),COALESCE(SUM(funding_fee),0),COALESCE(SUM(liquidation_penalty),0),COALESCE(SUM(slippage),0),COALESCE(SUM(CASE WHEN protection_status='VERIFIED' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN protection_status='UNKNOWN' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN protection_status='DEGRADED' THEN 1 ELSE 0 END),0),COALESCE(AVG(protection_coverage),0),COALESCE(SUM(CASE WHEN reentry_count>=1 THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN reentry_count>=2 THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN reentry_count>=3 THEN 1 ELSE 0 END),0),COALESCE(MAX(CASE WHEN net_guard_effect>0 THEN net_guard_effect ELSE 0 END),0),COALESCE(MAX(CASE WHEN net_guard_effect<0 THEN -net_guard_effect ELSE 0 END),0),COALESCE(SUM(protection_missing_seconds+CASE WHEN protection_missing_at IS NOT NULL THEN MAX(0,(julianday(COALESCE(closed_at,CURRENT_TIMESTAMP))-julianday(protection_missing_at))*86400) ELSE 0 END),0) FROM copy_guard_cycles WHERE trader_id IN (` + marks + `) AND opened_at>=? AND opened_at<?`
+	q := `SELECT COUNT(DISTINCT trader_id),COUNT(*),COALESCE(SUM(stop_count),0),COALESCE(SUM(reentry_count),0),COALESCE(SUM(CASE WHEN accounting_status='RECONCILED' THEN actual_pnl ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='RECONCILED' THEN baseline_pnl ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='RECONCILED' AND stop_count>0 AND net_guard_effect>0 THEN net_guard_effect ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='RECONCILED' AND stop_count>0 AND net_guard_effect<0 THEN -net_guard_effect ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='RECONCILED' AND stop_count>0 THEN net_guard_effect ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='RECONCILED' THEN fees ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='RECONCILED' THEN funding_fee ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='RECONCILED' THEN liquidation_penalty ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='RECONCILED' THEN slippage ELSE 0 END),0),COALESCE(SUM(CASE WHEN closed_at IS NULL AND protection_status='VERIFIED' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN closed_at IS NULL AND protection_status='PENDING' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN closed_at IS NULL AND protection_status='UNKNOWN' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN closed_at IS NULL AND protection_status='DEGRADED' THEN 1 ELSE 0 END),0),COALESCE(AVG(CASE WHEN closed_at IS NULL THEN protection_coverage END),0),COALESCE(SUM(CASE WHEN accounting_status='PENDING' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='NEEDS_REVIEW' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='LEGACY_UNVERIFIED' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN reentry_count>=1 THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN reentry_count>=2 THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN reentry_count>=3 THEN 1 ELSE 0 END),0),COALESCE(MAX(CASE WHEN accounting_status='RECONCILED' AND stop_count>0 AND net_guard_effect>0 THEN net_guard_effect ELSE 0 END),0),COALESCE(MAX(CASE WHEN accounting_status='RECONCILED' AND stop_count>0 AND net_guard_effect<0 THEN -net_guard_effect ELSE 0 END),0),COALESCE(SUM(protection_missing_seconds+CASE WHEN protection_missing_at IS NOT NULL THEN MAX(0,(julianday(COALESCE(closed_at,CURRENT_TIMESTAMP))-julianday(protection_missing_at))*86400) ELSE 0 END),0) FROM copy_guard_cycles WHERE trader_id IN (` + marks + `) AND opened_at>=? AND opened_at<?`
 	q, args = appendCopyGuardFilter(q, args, filter)
 	var x CopyGuardSummary
-	err := s.db.QueryRow(q, args...).Scan(&x.FollowerCount, &x.CycleCount, &x.StopCount, &x.ReentryCount, &x.ActualPnL, &x.BaselinePnL, &x.AvoidedLoss, &x.OpportunityCost, &x.NetGuardEffect, &x.Fees, &x.FundingFee, &x.LiquidationPenalty, &x.Slippage, &x.ProtectedCount, &x.UnknownCount, &x.DegradedCount, &x.AverageCoverage, &x.ReentryFirst, &x.ReentrySecond, &x.ReentryThirdPlus, &x.MaxAvoidedLoss, &x.MaxOpportunityCost, &x.ProtectionMissingSeconds)
+	err := s.db.QueryRow(q, args...).Scan(&x.FollowerCount, &x.CycleCount, &x.StopCount, &x.ReentryCount, &x.ActualPnL, &x.BaselinePnL, &x.AvoidedLoss, &x.OpportunityCost, &x.NetGuardEffect, &x.Fees, &x.FundingFee, &x.LiquidationPenalty, &x.Slippage, &x.ProtectedCount, &x.PendingProtectionCount, &x.UnknownCount, &x.DegradedCount, &x.AverageCoverage, &x.AccountingPendingCount, &x.AccountingReviewCount, &x.LegacyUnverifiedCount, &x.ReentryFirst, &x.ReentrySecond, &x.ReentryThirdPlus, &x.MaxAvoidedLoss, &x.MaxOpportunityCost, &x.ProtectionMissingSeconds)
 	if err != nil {
 		return &x, err
 	}
@@ -684,7 +971,7 @@ func (s *CopyTradeStore) CopyGuardSummary(traderIDs []string, from, to time.Time
 	filteredCycleQuery, rateArgs = appendCopyGuardFilter(filteredCycleQuery, rateArgs, filter)
 	var endedReentries, winningReentries, stoppedCycles, falseKills int
 	_ = s.db.QueryRow(`SELECT COUNT(*),COALESCE(SUM(CASE WHEN pnl>0 THEN 1 ELSE 0 END),0) FROM copy_guard_attempts WHERE cycle_id IN (`+filteredCycleQuery+`) AND attempt_no>0 AND closed_at IS NOT NULL`, rateArgs...).Scan(&endedReentries, &winningReentries)
-	_ = s.db.QueryRow(`SELECT COALESCE(SUM(CASE WHEN stop_count>0 THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN stop_count>0 AND closed_at IS NOT NULL AND baseline_pnl>0 AND net_guard_effect<0 THEN 1 ELSE 0 END),0) FROM copy_guard_cycles WHERE id IN (`+filteredCycleQuery+`)`, rateArgs...).Scan(&stoppedCycles, &falseKills)
+	_ = s.db.QueryRow(`SELECT COALESCE(SUM(CASE WHEN stop_count>0 AND accounting_status='RECONCILED' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN stop_count>0 AND accounting_status='RECONCILED' AND baseline_pnl>0 AND net_guard_effect<0 THEN 1 ELSE 0 END),0) FROM copy_guard_cycles WHERE id IN (`+filteredCycleQuery+`)`, rateArgs...).Scan(&stoppedCycles, &falseKills)
 	if endedReentries > 0 {
 		x.ReentrySuccessRate = float64(winningReentries) / float64(endedReentries)
 	}
@@ -696,7 +983,7 @@ func (s *CopyTradeStore) CopyGuardSummary(traderIDs []string, from, to time.Time
 		trendArgs = append(trendArgs, id)
 	}
 	trendArgs = append(trendArgs, from.UTC().Format("2006-01-02 15:04:05"), to.UTC().Format("2006-01-02 15:04:05"))
-	trendQuery := `SELECT date(opened_at),COALESCE(SUM(actual_pnl),0),COALESCE(SUM(baseline_pnl),0),COALESCE(SUM(net_guard_effect),0) FROM copy_guard_cycles WHERE trader_id IN (` + marks + `) AND opened_at>=? AND opened_at<?`
+	trendQuery := `SELECT date(opened_at),COALESCE(SUM(actual_pnl),0),COALESCE(SUM(baseline_pnl),0),COALESCE(SUM(CASE WHEN stop_count>0 THEN net_guard_effect ELSE 0 END),0) FROM copy_guard_cycles WHERE trader_id IN (` + marks + `) AND opened_at>=? AND opened_at<? AND accounting_status='RECONCILED'`
 	trendQuery, trendArgs = appendCopyGuardFilter(trendQuery, trendArgs, filter)
 	trendQuery += ` GROUP BY date(opened_at) ORDER BY date(opened_at)`
 	if rows, queryErr := s.db.Query(trendQuery, trendArgs...); queryErr == nil {
@@ -758,7 +1045,9 @@ func (s *CopyTradeStore) ListCopyGuardEvents(cycleID int64) ([]*CopyGuardEvent, 
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(raw), &e.Metadata)
-		e.CreatedAt, _ = time.Parse("2006-01-02 15:04:05", created)
+		if e.CreatedAt, err = parseDBTime(created); err != nil {
+			return nil, fmt.Errorf("copy guard event %d created_at: %w", e.ID, err)
+		}
 		out = append(out, &e)
 	}
 	return out, rows.Err()
