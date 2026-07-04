@@ -157,6 +157,9 @@ type CopyConfig struct {
 	RiskReentryMaxATRExpansion  float64 `json:"risk_reentry_max_atr_expansion"`
 	RiskWatchTimeoutMinutes     int     `json:"risk_watch_timeout_minutes"`
 	RiskMigrationConfirmed      bool    `json:"risk_migration_confirmed"`
+	// RiskAddonBudgetPct: 加仓账户风险预算（v4）。加仓后总敞口按当前止损距离
+	// 的预期损失超过账户权益的该比例时，拒绝跟随本次加仓。1.0 = 实际不限制。
+	RiskAddonBudgetPct float64 `json:"risk_addon_budget_pct"`
 }
 
 // FillRiskDefaults 兜底默认值（与 store.CopyTradeConfig.FillRiskDefaults 保持一致）
@@ -210,6 +213,9 @@ func (c *CopyConfig) FillRiskDefaults() {
 		}
 		if c.RiskReentryMaxATRExpansion == 0 {
 			c.RiskReentryMaxATRExpansion = 2
+		}
+		if c.RiskAddonBudgetPct == 0 {
+			c.RiskAddonBudgetPct = 0.15
 		}
 	}
 }

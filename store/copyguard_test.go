@@ -236,3 +236,45 @@ func TestCopyGuardProtectionHealthAndShadowLedger(t *testing.T) {
 		t.Fatalf("unexpected summary: %+v", summary)
 	}
 }
+
+// 观察更新与周期关闭存在竞态（止损与领航员平仓同一轮发生）：
+// 已关闭的周期绝不能被 UpdateCopyGuardObservation 改回 STOPPED_WATCHING，
+// 也不能被 UpdateCopyGuardObservedPrice 改写观测价。
+func TestObservationUpdatesGuardClosedCycle(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "observation.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cs := st.CopyTrade()
+	cycle, err := cs.EnsureCopyGuardCycle(&CopyGuardCycle{TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "pos-obs", Symbol: "BTCUSDT", Side: "long", MarginMode: "cross", Status: CopyGuardFollowing, PolicySnapshot: "{}", LeaderEntryPrice: 100, FollowerEntryPrice: 100, FollowerNotional: 1000, AccountEquity: 5000, LastObservedPrice: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 跟随期轻量刷新：开放周期允许更新观测价
+	if err := cs.UpdateCopyGuardObservedPrice("trader-1", "pos-obs", 105); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := cs.GetCopyGuardCycle(cycle.ID)
+	if got.LastObservedPrice != 105 {
+		t.Fatalf("open cycle must accept observed price refresh, got %.2f", got.LastObservedPrice)
+	}
+
+	if err := cs.CloseCopyGuardCycle(cycle.ID, CopyGuardLeaderClosed, -2, -3, 0, 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := cs.UpdateCopyGuardObservation(cycle.ID, CopyGuardStoppedWatching, 100, 111, 5); err != nil {
+		t.Fatal(err)
+	}
+	if err := cs.UpdateCopyGuardObservedPrice("trader-1", "pos-obs", 120); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = cs.GetCopyGuardCycle(cycle.ID)
+	if got.Status != CopyGuardLeaderClosed {
+		t.Fatalf("closed cycle status must not be overwritten, got %s", got.Status)
+	}
+	if got.LastObservedPrice != 105 {
+		t.Fatalf("closed cycle observed price must stay frozen, got %.2f", got.LastObservedPrice)
+	}
+}

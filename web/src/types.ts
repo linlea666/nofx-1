@@ -228,6 +228,7 @@ export interface CopyConfigRequest {
   risk_reentry_max_atr_expansion?: number
   risk_watch_timeout_minutes?: number
   risk_migration_confirmed?: boolean
+  risk_addon_budget_pct?: number // 默认 0.15：加仓账户风险预算（加仓后预期止损损失超此比例则拒绝加仓；1.0=不限制）
   risk_high_risk_confirmed?: boolean
 }
 
@@ -717,6 +718,7 @@ export interface CopyTradeConfig {
   risk_reentry_max_atr_expansion?: number
   risk_watch_timeout_minutes?: number
   risk_migration_confirmed?: boolean
+  risk_addon_budget_pct?: number
   created_at?: string
   updated_at?: string
 }

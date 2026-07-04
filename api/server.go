@@ -471,6 +471,7 @@ type CopyConfigReq struct {
 	RiskReentryMaxATRExpansion  float64  `json:"risk_reentry_max_atr_expansion,omitempty"`
 	RiskWatchTimeoutMinutes     *int     `json:"risk_watch_timeout_minutes,omitempty"`
 	RiskMigrationConfirmed      bool     `json:"risk_migration_confirmed,omitempty"`
+	RiskAddonBudgetPct          float64  `json:"risk_addon_budget_pct,omitempty"`
 	RiskHighRiskConfirmed       bool     `json:"risk_high_risk_confirmed,omitempty"`
 }
 
@@ -514,6 +515,7 @@ func applyCopyConfigRiskFields(copyConfig *store.CopyTradeConfig, req *CopyConfi
 	copyConfig.RiskReentryMaxATRExpansion = req.RiskReentryMaxATRExpansion
 	copyConfig.RiskWatchTimeoutMinutes = derefIntDefault(req.RiskWatchTimeoutMinutes, 0)
 	copyConfig.RiskMigrationConfirmed = req.RiskMigrationConfirmed
+	copyConfig.RiskAddonBudgetPct = req.RiskAddonBudgetPct
 }
 
 // derefBoolDefault 安全解引用 *bool：nil 返回 def，非 nil 返回 *p

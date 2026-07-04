@@ -115,6 +115,7 @@ interface FormState {
   risk_reentry_max_atr_expansion: number
   risk_watch_timeout_minutes: number
   risk_migration_confirmed: boolean
+  risk_addon_budget_pct: number // 默认 15%（提交时 /100 转 0.15）：加仓账户风险预算，100 = 不限制
 }
 
 interface TraderConfigModalProps {
@@ -181,6 +182,7 @@ export function TraderConfigModal({
     risk_reentry_max_atr_expansion: 2,
     risk_watch_timeout_minutes: 0,
     risk_migration_confirmed: true,
+    risk_addon_budget_pct: 15,
   })
   const [, setCopyTradeConfig] = useState<CopyTradeConfig | null>(null)
   const [isSaving, setIsSaving] = useState(false)
@@ -323,6 +325,10 @@ export function TraderConfigModal({
               cfg.risk_reentry_max_atr_expansion ?? 2,
             risk_watch_timeout_minutes: cfg.risk_watch_timeout_minutes ?? 0,
             risk_migration_confirmed: cfg.risk_migration_confirmed ?? false,
+            risk_addon_budget_pct:
+              cfg.risk_addon_budget_pct != null && cfg.risk_addon_budget_pct > 0
+                ? cfg.risk_addon_budget_pct * 100
+                : 15,
           }))
         }
       } catch (error) {
@@ -390,6 +396,7 @@ export function TraderConfigModal({
         risk_reentry_max_atr_expansion: 2,
         risk_watch_timeout_minutes: 0,
         risk_migration_confirmed: true,
+        risk_addon_budget_pct: 15,
       })
     }
   }, [traderData, isEditMode, availableModels, availableExchanges])
@@ -514,6 +521,7 @@ export function TraderConfigModal({
             formData.risk_reentry_max_atr_expansion,
           risk_watch_timeout_minutes: formData.risk_watch_timeout_minutes,
           risk_migration_confirmed: formData.risk_migration_confirmed,
+          risk_addon_budget_pct: formData.risk_addon_budget_pct / 100,
           risk_high_risk_confirmed: highRiskConfirmed,
         }
         // Binance 数据源额外携带 Web 私有接口凭证
@@ -1323,6 +1331,35 @@ export function TraderConfigModal({
                                   className="mt-1 w-full px-2 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF]"
                                 />
                               </label>
+                              <div className="col-span-2">
+                                <label className="text-xs text-[#848E9C] block">
+                                  加仓风险预算（% 账户权益）{' '}
+                                  <span className="text-[#F0B90B]">
+                                    {formData.risk_addon_budget_pct.toFixed(0)}%
+                                  </span>
+                                </label>
+                                <input
+                                  type="number"
+                                  min="1"
+                                  max="100"
+                                  step="1"
+                                  value={formData.risk_addon_budget_pct}
+                                  onChange={(e) => {
+                                    const v = Number(e.target.value)
+                                    handleInputChange(
+                                      'risk_addon_budget_pct',
+                                      isFinite(v) && v > 0
+                                        ? Math.min(v, 100)
+                                        : 15
+                                    )
+                                  }}
+                                  className="mt-1 w-full px-2 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF]"
+                                />
+                                <p className="text-xs text-[#848E9C] mt-1">
+                                  领航员加仓时，若加仓后总敞口的预期止损损失超过账户权益的此比例，则拒绝跟随本次加仓（已有仓位与止损单不动）。100
+                                  = 不限制
+                                </p>
+                              </div>
                             </div>
                           )}
                           {/* 单笔账户风险 % —— v3.1：无上限 + 默认 50%（激进） */}
@@ -1454,16 +1491,20 @@ export function TraderConfigModal({
                             )}
                           </div>
 
-                          {/* 杠杆兜底 */}
-                          {formData.risk_policy_version < 4 && (
+                          {/* 杠杆兜底 / 保证金止损上限（v3 与 v4 共用 risk_leverage_max_loss） */}
+                          {
                             <div className="border-t border-[#2B3139] pt-3">
                               <div className="flex items-center justify-between mb-2">
                                 <div>
                                   <label className="text-sm text-[#EAECEF]">
-                                    杠杆兜底封顶
+                                    {formData.risk_policy_version >= 4
+                                      ? '仓位保证金止损上限'
+                                      : '杠杆兜底封顶'}
                                   </label>
                                   <p className="text-xs text-[#848E9C]">
-                                    保证金亏损达此比例时强制平仓（高杠杆兜底）
+                                    {formData.risk_policy_version >= 4
+                                      ? '亏损达到仓位保证金的此比例即止损（与 OKX 收益率同口径，和 ATR 距离取更紧者）。设得越低越早止损，但更容易被正常波动扫出，靠二次进场弥补'
+                                      : '保证金亏损达此比例时强制平仓（高杠杆兜底）'}
                                   </p>
                                 </div>
                                 <button
@@ -1506,10 +1547,16 @@ export function TraderConfigModal({
                                     }
                                     className="w-full accent-[#F0B90B]"
                                   />
+                                  {formData.risk_policy_version >= 4 && (
+                                    <p className="text-xs text-[#848E9C] mt-1">
+                                      示例：20x 杠杆、上限 30% → 价格反向 1.5%
+                                      即止损（OKX 收益率约 -30%）
+                                    </p>
+                                  )}
                                 </div>
                               )}
                             </div>
-                          )}
+                          }
 
                           {/* 二次进场（高级） */}
                           <div className="border-t border-[#2B3139] pt-3">

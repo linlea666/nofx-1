@@ -112,13 +112,16 @@ func calcStopLossPrice(cfg *CopyConfig, input *StopLossCalcInput) (*StopLossCalc
 		if result.ATRDistance <= 0 {
 			return nil, fmt.Errorf("no valid ATR or fallback distance")
 		}
-		computed, err := ComputeRiskDistanceV4(cfg, input.EntryPrice, input.PositionValue, input.FollowerEquity, result.ATRDistance)
+		computed, err := ComputeRiskDistanceV4(cfg, input.EntryPrice, input.PositionValue, input.FollowerEquity, result.ATRDistance, input.Leverage)
 		if err != nil {
 			return nil, err
 		}
 		finalDist = computed.Distance
 		result.GovernedBy = computed.GovernedBy
 		result.NoiseConflict = computed.NoiseConflict
+		if computed.GovernedBy == "margin_cap" {
+			result.LeverageCapDist = finalDist
+		}
 		result.SLDistance = finalDist
 		result.ExpectedLossUSD = computed.ExpectedLossUSD
 		result.ExpectedLossPct = computed.ExpectedLossPct
@@ -206,6 +209,99 @@ func calcStopLossPrice(cfg *CopyConfig, input *StopLossCalcInput) (*StopLossCalc
 
 	result.SLPrice = slPrice
 	return result, nil
+}
+
+// ============================================================================
+// 加仓账户风险预算（Copy Guard v4）
+//
+// 背景：volatility_priority 模式下 RiskAccountPct 只是告警，领航员连续加仓时
+// 单笔预期止损损失可以无界增长（WLD 实盘：5.2% → 28.4%）。这里在跟随加仓前
+// 预估「加仓后总敞口按当前止损距离全损」占账户权益的比例，超过
+// RiskAddonBudgetPct 预算则拒绝跟随本次加仓；已有仓位与止损单不动。
+// ============================================================================
+
+// addonBudgetEventInterval：同一仓位 ADDON_SKIPPED_BUDGET 事件/告警的最小间隔。
+// 被拒绝的加仓信号不消费 last_known_size，每个 poll 周期都会重新评估
+// （权益增长或 ATR 收窄后可能放行），限频避免事件与日志刷屏。
+const addonBudgetEventInterval = 60 * time.Second
+
+// addonExceedsRiskBudget 返回 true 表示本次加仓应被拒绝（超出账户风险预算）。
+// 任何数据不可得（无周期记录、权益为零、ATR 失败且无降级）时不拦截，
+// 维持既有跟随行为（保守修改：预算检查只做增量防护，不改变原有路径）。
+func (e *Engine) addonExceedsRiskBudget(signal *TradeSignal, posID string, copySize float64) bool {
+	cfg := e.config
+	if cfg == nil || cfg.RiskPolicyVersion < 4 || cfg.ProviderType != ProviderOKX || !cfg.RiskStopLossEnabled {
+		return false
+	}
+	budget := cfg.RiskAddonBudgetPct
+	if budget <= 0 || budget >= 1 {
+		return false
+	}
+	if e.store == nil || e.getFollowerEquity == nil || signal == nil || signal.Fill == nil || copySize <= 0 {
+		return false
+	}
+	cycle, err := e.store.CopyTrade().GetOpenCopyGuardCycle(e.traderID, posID)
+	if err != nil || cycle == nil {
+		return false
+	}
+	equity := e.getFollowerEquity()
+	entryPrice := signal.Fill.Price
+	if equity <= 0 || entryPrice <= 0 {
+		return false
+	}
+	period := cfg.RiskATRPeriod
+	if period <= 0 {
+		period = 14
+	}
+	var atrDistance float64
+	if atr, atrErr := market.GetOKXATRWithMaxAge(signal.Fill.Symbol, cfg.RiskATRTimeframe, period, riskATRCacheMaxAge(cfg)); atrErr == nil && atr > 0 {
+		atrDistance = atr * cfg.RiskATRMultiplier
+	} else {
+		atrDistance = entryPrice * cfg.RiskATRFallbackPct
+	}
+	if atrDistance <= 0 {
+		return false
+	}
+	totalNotional := cycle.FollowerNotional + copySize
+	computed, err := ComputeRiskDistanceV4(cfg, entryPrice, totalNotional, equity, atrDistance, e.getLeaderLeverage(signal))
+	if err != nil || computed.ExpectedLossPct <= budget {
+		return false
+	}
+
+	now := time.Now()
+	if last, ok := e.lastAddonBudgetEvent[posID]; !ok || now.Sub(last) >= addonBudgetEventInterval {
+		e.lastAddonBudgetEvent[posID] = now
+		msg := fmt.Sprintf("加仓被拒：预期止损损失 %.1f%% 超账户预算 %.1f%%（现有名义 %.2f + 加仓 %.2f）",
+			computed.ExpectedLossPct*100, budget*100, cycle.FollowerNotional, copySize)
+		logger.Warnf("🚧 [%s] %s | %s posId=%s", e.traderID, msg, signal.Fill.Symbol, posID)
+		e.logWarning(Warning{
+			Timestamp:    now,
+			Symbol:       signal.Fill.Symbol,
+			Type:         "addon_budget_exceeded",
+			Message:      msg,
+			SignalAction: string(ActionAdd),
+			SignalValue:  copySize,
+			CopyValue:    0,
+			Executed:     false,
+		})
+		if err := e.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{
+			CycleID:  cycle.ID,
+			TraderID: e.traderID,
+			Type:     "ADDON_SKIPPED_BUDGET",
+			Price:    entryPrice,
+			Notional: copySize,
+			Metadata: map[string]interface{}{
+				"expected_loss_pct": computed.ExpectedLossPct,
+				"budget_pct":        budget,
+				"current_notional":  cycle.FollowerNotional,
+				"addon_notional":    copySize,
+				"governed_by":       computed.GovernedBy,
+			},
+		}); err != nil {
+			logger.Warnf("⚠️ [%s] ADDON_SKIPPED_BUDGET 事件写入失败: %v", e.traderID, err)
+		}
+	}
+	return true
 }
 
 // isLiquidationPriceDirectionValid checks the liquidation price is on the
@@ -360,6 +456,14 @@ func (e *Engine) checkStoppedByRisk() {
 		if e.findLocalPositionForMapping(localPositions, mapping) {
 			// 本地仓位还在，重置该 mapping 的疑似计数（如果之前累积过）
 			delete(e.stopRiskSuspectCount, mapping.LeaderPosID)
+			// v4：跟随期也保持 last_observed_price 新鲜。周期若在跟随期直接
+			// 结束（止损与领航员平仓同轮发生），估算基线才不会用到开仓时的
+			// 陈旧价格（HMSTR 周期 31 基线被错记为 0 的根因）。
+			if e.config.RiskPolicyVersion >= 4 {
+				if lp := leaderPosMap[mapping.LeaderPosID]; lp != nil && lp.MarkPrice > 0 {
+					_ = e.store.CopyTrade().UpdateCopyGuardObservedPrice(e.traderID, mapping.LeaderPosID, lp.MarkPrice)
+				}
+			}
 			continue
 		}
 
@@ -522,15 +626,13 @@ func (e *Engine) checkReentryConditions() {
 			if mark <= 0 {
 				mark = leaderPos.EntryPrice
 			}
-			leaderEquity := float64(0)
-			e.leaderStateMu.RLock()
-			if e.leaderState != nil {
-				leaderEquity = e.leaderState.TotalEquity
-			}
-			e.leaderStateMu.RUnlock()
-			shadow := v4Cycle.BaselineNotional
-			if leaderEquity > 0 {
-				shadow = leaderPos.Size * leaderPos.EntryPrice / leaderEquity * v4Cycle.AccountEquity * e.config.CopyRatio
+			// own-path 口径：影子名义按自身被止损时的仓位名义记账，不再按
+			// 领航员比例折算（领航员加仓会把影子名义放大到自身开不出的规模，
+			// 导致净保护效果虚高）。领航员减仓的 realized 逻辑保留（store 内
+			// 按该名义等比例结算）。
+			shadow := v4Cycle.FollowerNotional
+			if shadow <= 0 {
+				shadow = v4Cycle.BaselineNotional
 			}
 			_ = e.store.CopyTrade().UpdateCopyGuardShadow(v4Cycle.ID, leaderPos.EntryPrice, mark, shadow, leaderPos.Size)
 			atr, _ := market.GetOKXATRWithMaxAge(mapping.Symbol, e.config.RiskATRTimeframe, e.config.RiskATRPeriod, riskATRCacheMaxAge(e.config))
@@ -597,15 +699,10 @@ func (e *Engine) checkReentryConditions() {
 			continue // 拿不到当前价，无法判断
 		}
 		if e.config.RiskPolicyVersion >= 4 {
-			leaderEquity := float64(0)
-			e.leaderStateMu.RLock()
-			if e.leaderState != nil {
-				leaderEquity = e.leaderState.TotalEquity
-			}
-			e.leaderStateMu.RUnlock()
-			shadow := v4Cycle.BaselineNotional
-			if leaderEquity > 0 {
-				shadow = leaderPos.Size * leaderPos.EntryPrice / leaderEquity * v4Cycle.AccountEquity * e.config.CopyRatio
+			// own-path 口径：同上，影子名义按自身仓位名义记账
+			shadow := v4Cycle.FollowerNotional
+			if shadow <= 0 {
+				shadow = v4Cycle.BaselineNotional
 			}
 			_ = e.store.CopyTrade().UpdateCopyGuardShadow(v4Cycle.ID, entryRef, markPrice, shadow, leaderPos.Size)
 			if coolingDown {

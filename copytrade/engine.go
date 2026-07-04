@@ -81,6 +81,10 @@ type Engine struct {
 	// 达到 stopRiskSuspectThreshold 后才正式标 stopped_by_risk
 	// 仅 OKX 路径使用；checkStoppedByRisk 内部访问，与 poll 串行执行无需额外锁
 	stopRiskSuspectCount map[string]int
+
+	// v4 加仓预算：ADDON_SKIPPED_BUDGET 事件/告警限频（key = leaderPosID）
+	// 与 poll 串行执行，无需额外锁
+	lastAddonBudgetEvent map[string]time.Time
 }
 
 // EngineOption 引擎配置选项
@@ -133,6 +137,7 @@ func NewEngine(
 		stopCh:               make(chan struct{}),
 		stats:                &EngineStats{StartTime: time.Now()},
 		stopRiskSuspectCount: make(map[string]int),
+		lastAddonBudgetEvent: make(map[string]time.Time),
 	}
 
 	// 应用选项
@@ -1266,6 +1271,13 @@ func (e *Engine) processSignal(signal *TradeSignal) {
 		return
 	}
 
+	// 🚧 v4 加仓账户风险预算：加仓后总敞口的预期止损损失超预算 → 拒绝本次加仓。
+	// 同样不更新 last_known_size：权益增长或波动收窄后，下一轮 poll 可重新评估放行。
+	if matchResult.Action == ActionAdd && e.addonExceedsRiskBudget(signal, matchResult.PosID, copySize) {
+		e.stats.SignalsSkipped++
+		return
+	}
+
 	// ========================================
 	// Step 4: 构造 Decision
 	// ========================================
@@ -1985,7 +1997,8 @@ func matchLeaderHistoryRecord(records []OKXLeaderPositionHistoryRecord, leaderPo
 
 // refreshEstimatedBaselines 用领航员公共历史仓位补全"最后观测价估算"的基线。
 // 周期关闭时如果公共历史还没出记录，先按估算关闭；这里每分钟重试一次，
-// 命中后校准 baseline_pnl 并重算保护效果（最长回看 6 小时）。
+// 命中后校准 baseline_pnl 并重算保护效果（最长回看 24 小时，覆盖公共
+// 历史接口延迟出记录/程序重启错过窗口的场景）。
 func (e *Engine) refreshEstimatedBaselines() {
 	if time.Since(e.lastBaselineRefresh) < time.Minute {
 		return
@@ -1995,7 +2008,7 @@ func (e *Engine) refreshEstimatedBaselines() {
 	if !ok || e.store == nil {
 		return
 	}
-	cycles, err := e.store.CopyTrade().ListCopyGuardCyclesWithEstimatedBaseline(e.traderID, 6*time.Hour)
+	cycles, err := e.store.CopyTrade().ListCopyGuardCyclesWithEstimatedBaseline(e.traderID, 24*time.Hour)
 	if err != nil || len(cycles) == 0 {
 		return
 	}
@@ -2008,13 +2021,18 @@ func (e *Engine) refreshEstimatedBaselines() {
 		if rec == nil || rec.ExitPrice <= 0 {
 			continue
 		}
-		baseline := cycle.BaselineRealizedPnL
-		if cycle.LeaderEntryPrice > 0 {
-			move := (rec.ExitPrice - cycle.LeaderEntryPrice) / cycle.LeaderEntryPrice
-			if cycle.Side == "short" {
-				move = -move
+		// own-path 口径；attempt 数据不完整时回退旧口径（影子名义）
+		attempts, _ := e.store.CopyTrade().ListCopyGuardAttempts(cycle.ID)
+		baseline, ok := ComputeOwnPathBaseline(cycle, attempts, rec.ExitPrice)
+		if !ok {
+			baseline = cycle.BaselineRealizedPnL
+			if cycle.LeaderEntryPrice > 0 {
+				move := (rec.ExitPrice - cycle.LeaderEntryPrice) / cycle.LeaderEntryPrice
+				if cycle.Side == "short" {
+					move = -move
+				}
+				baseline += cycle.BaselineNotional * move
 			}
-			baseline += cycle.BaselineNotional * move
 		}
 		if err := e.store.CopyTrade().UpdateCopyGuardBaselineOutcome(cycle.ID, baseline, "leader_history"); err != nil {
 			continue
@@ -2090,13 +2108,18 @@ func (e *Engine) checkIgnoredPositionsClosed() {
 						if rec := e.lookupLeaderHistory(mapping.LeaderPosID, cycle.Symbol, cycle.Side); rec != nil && rec.ExitPrice > 0 {
 							closePrice, baselineSource = rec.ExitPrice, "leader_history"
 						}
-						baseline := cycle.BaselineRealizedPnL
-						if cycle.LeaderEntryPrice > 0 && closePrice > 0 {
-							move := (closePrice - cycle.LeaderEntryPrice) / cycle.LeaderEntryPrice
-							if cycle.Side == "short" {
-								move = -move
+						// own-path 口径；attempt 数据不完整时回退旧口径（影子名义）
+						attempts, _ := e.store.CopyTrade().ListCopyGuardAttempts(cycle.ID)
+						baseline, baselineOK := ComputeOwnPathBaseline(cycle, attempts, closePrice)
+						if !baselineOK {
+							baseline = cycle.BaselineRealizedPnL
+							if cycle.LeaderEntryPrice > 0 && closePrice > 0 {
+								move := (closePrice - cycle.LeaderEntryPrice) / cycle.LeaderEntryPrice
+								if cycle.Side == "short" {
+									move = -move
+								}
+								baseline += cycle.BaselineNotional * move
 							}
-							baseline += cycle.BaselineNotional * move
 						}
 						_ = e.store.CopyTrade().CloseCopyGuardCycle(cycle.ID, store.CopyGuardLeaderClosed, cycle.ActualPnL, baseline, cycle.Fees, cycle.FundingFee, cycle.LiquidationPenalty, cycle.Slippage)
 						_ = e.store.CopyTrade().SetCopyGuardBaselineSource(cycle.ID, baselineSource)

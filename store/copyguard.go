@@ -60,6 +60,7 @@ type CopyGuardPolicy struct {
 	MaxATRExpansion       float64 `json:"max_atr_expansion"`
 	WatchTimeoutMinutes   int     `json:"watch_timeout_minutes"`
 	MigrationConfirmed    bool    `json:"migration_confirmed"`
+	AddonBudgetPct        float64 `json:"addon_budget_pct"`
 }
 
 type CopyGuardCycle struct {
@@ -235,6 +236,10 @@ func (s *CopyTradeStore) initCopyGuardTables() error {
 			`ALTER TABLE copy_guard_attempts ADD COLUMN entry_order_id TEXT DEFAULT ''`,
 			`ALTER TABLE copy_guard_attempts ADD COLUMN exit_order_id TEXT DEFAULT ''`,
 			`ALTER TABLE copy_guard_cycles ADD COLUMN baseline_source TEXT DEFAULT ''`,
+			// baseline_version: 1 = 旧口径（领航员比例折算的影子名义），
+			// 2 = own-path 口径（每个 attempt 按自身名义持有到领航员平仓价）。
+			// 仅作启动一次性重算的书签，业务逻辑不读取。
+			`ALTER TABLE copy_guard_cycles ADD COLUMN baseline_version INTEGER DEFAULT 1`,
 		}
 		for _, migration := range migrations {
 			_, _ = s.db.Exec(migration)
@@ -300,7 +305,7 @@ func (s *CopyTradeStore) ListActiveCopyGuardProtectiveOrders(traderID string) ([
 }
 
 func policyFromConfig(c *CopyTradeConfig) CopyGuardPolicy {
-	return CopyGuardPolicy{Version: c.RiskPolicyVersion, StopMode: c.RiskStopMode, ATRPeriod: c.RiskATRPeriod, ATRCacheMaxAgeMinutes: c.RiskATRCacheMaxAgeMinutes, ATRFallbackPct: c.RiskATRFallbackPct, TriggerPriceType: c.RiskTriggerPriceType, SlippageBufferBPS: c.RiskSlippageBufferBPS, LiquidationBufferATR: c.RiskLiquidationBufferATR, MaxReentries: c.RiskMaxReentries, ReentryBandATR: c.RiskReentryBandATR, ReentryCooldownSec: c.RiskReentryCooldownSeconds, ReentryMaxChaseATR: c.RiskReentryMaxChaseATR, MaxATRExpansion: c.RiskReentryMaxATRExpansion, WatchTimeoutMinutes: c.RiskWatchTimeoutMinutes, MigrationConfirmed: c.RiskMigrationConfirmed}
+	return CopyGuardPolicy{Version: c.RiskPolicyVersion, StopMode: c.RiskStopMode, ATRPeriod: c.RiskATRPeriod, ATRCacheMaxAgeMinutes: c.RiskATRCacheMaxAgeMinutes, ATRFallbackPct: c.RiskATRFallbackPct, TriggerPriceType: c.RiskTriggerPriceType, SlippageBufferBPS: c.RiskSlippageBufferBPS, LiquidationBufferATR: c.RiskLiquidationBufferATR, MaxReentries: c.RiskMaxReentries, ReentryBandATR: c.RiskReentryBandATR, ReentryCooldownSec: c.RiskReentryCooldownSeconds, ReentryMaxChaseATR: c.RiskReentryMaxChaseATR, MaxATRExpansion: c.RiskReentryMaxATRExpansion, WatchTimeoutMinutes: c.RiskWatchTimeoutMinutes, MigrationConfirmed: c.RiskMigrationConfirmed, AddonBudgetPct: c.RiskAddonBudgetPct}
 }
 
 func (s *CopyTradeStore) saveCopyGuardPolicy(c *CopyTradeConfig) error {
@@ -333,6 +338,7 @@ func (s *CopyTradeStore) loadCopyGuardPolicy(c *CopyTradeConfig) error {
 	c.RiskReentryCooldownSeconds, c.RiskReentryMaxChaseATR = p.ReentryCooldownSec, p.ReentryMaxChaseATR
 	c.RiskReentryMaxATRExpansion, c.RiskWatchTimeoutMinutes = p.MaxATRExpansion, p.WatchTimeoutMinutes
 	c.RiskMigrationConfirmed = p.MigrationConfirmed
+	c.RiskAddonBudgetPct = p.AddonBudgetPct
 	return nil
 }
 
@@ -351,7 +357,7 @@ func (s *CopyTradeStore) EnsureCopyGuardCycle(c *CopyGuardCycle) (*CopyGuardCycl
 	if c.ProtectionStatus == "" {
 		c.ProtectionStatus = CopyGuardProtectionPending
 	}
-	res, err := s.db.Exec(`INSERT INTO copy_guard_cycles(trader_id,leader_id,leader_pos_id,symbol,side,margin_mode,status,policy_snapshot,leader_entry_price,follower_entry_price,follower_notional,baseline_notional,account_equity,atr_at_entry,last_observed_price,protection_status,pending_since) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)`,
+	res, err := s.db.Exec(`INSERT INTO copy_guard_cycles(trader_id,leader_id,leader_pos_id,symbol,side,margin_mode,status,policy_snapshot,leader_entry_price,follower_entry_price,follower_notional,baseline_notional,account_equity,atr_at_entry,last_observed_price,protection_status,baseline_version,pending_since) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,2,CURRENT_TIMESTAMP)`,
 		c.TraderID, c.LeaderID, c.LeaderPosID, c.Symbol, c.Side, c.MarginMode, c.Status, c.PolicySnapshot, c.LeaderEntryPrice, c.FollowerEntryPrice, c.FollowerNotional, c.FollowerNotional, c.AccountEquity, c.ATRAtEntry, c.LastObservedPrice, c.ProtectionStatus)
 	if err != nil {
 		return nil, err
@@ -504,8 +510,24 @@ func (s *CopyTradeStore) ListOpenCopyGuardCycles(traderID string) ([]*CopyGuardC
 	return out, rows.Err()
 }
 
+// UpdateCopyGuardObservation 更新观察期状态与观测价。closed_at 防护：周期关闭
+// 与观察轮询存在竞态（如止损触发与领航员平仓同一轮发生），已关闭的周期绝不能
+// 被观察更新改回 STOPPED_WATCHING。
 func (s *CopyTradeStore) UpdateCopyGuardObservation(id int64, status string, leaderEntry, lastPrice, atr float64) error {
-	_, err := s.db.Exec(`UPDATE copy_guard_cycles SET status=?,leader_entry_price=?,last_observed_price=?,atr_at_stop=CASE WHEN ? > 0 THEN ? ELSE atr_at_stop END,updated_at=CURRENT_TIMESTAMP WHERE id=?`, status, leaderEntry, lastPrice, atr, atr, id)
+	_, err := s.db.Exec(`UPDATE copy_guard_cycles SET status=?,leader_entry_price=?,last_observed_price=?,atr_at_stop=CASE WHEN ? > 0 THEN ? ELSE atr_at_stop END,updated_at=CURRENT_TIMESTAMP WHERE id=? AND closed_at IS NULL`, status, leaderEntry, lastPrice, atr, atr, id)
+	return err
+}
+
+// UpdateCopyGuardObservedPrice 只刷新最后观测价（FOLLOWING 阶段轻量更新）。
+// 背景：last_observed_price 原来只在观察期更新，跟随期一直停留在开仓价；
+// 一旦周期在跟随期直接结束（止损与领航员平仓同轮发生），估算基线会用到
+// 陈旧价格。该方法在跟随期轮询时保持观测价新鲜，不改动状态与其他列。
+// 按 trader+leaderPosID 定位，省去每轮先读周期的开销。
+func (s *CopyTradeStore) UpdateCopyGuardObservedPrice(traderID, leaderPosID string, lastPrice float64) error {
+	if lastPrice <= 0 {
+		return nil
+	}
+	_, err := s.db.Exec(`UPDATE copy_guard_cycles SET last_observed_price=?,updated_at=CURRENT_TIMESTAMP WHERE trader_id=? AND leader_pos_id=? AND closed_at IS NULL`, lastPrice, traderID, leaderPosID)
 	return err
 }
 
@@ -779,6 +801,59 @@ func (s *CopyTradeStore) UpdateCopyGuardBaselineOutcome(id int64, baseline float
 		}
 	}
 	return tx.Commit()
+}
+
+// ListCopyGuardCyclesNeedingBaselineMigration returns closed cycles still on
+// the v1 baseline (leader-scaled shadow notional) that are eligible for the
+// one-time own-path recomputation: reconciled and at least one stop fired
+// (cycles without stops have net_guard_effect fixed at 0, nothing to fix).
+func (s *CopyTradeStore) ListCopyGuardCyclesNeedingBaselineMigration() ([]*CopyGuardCycle, error) {
+	rows, err := s.db.Query(copyGuardCycleSelect+` WHERE COALESCE(baseline_version,1)<2 AND closed_at IS NOT NULL AND accounting_status=? AND stop_count>0 ORDER BY id`, CopyGuardAccountingReconciled)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*CopyGuardCycle{}
+	for rows.Next() {
+		c, scanErr := scanCopyGuardCycle(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// ApplyCopyGuardBaselineMigration overwrites a reconciled cycle's baseline with
+// the own-path recomputation and refreshes the derived metrics. baseline_source
+// is preserved (the close price origin did not change, only the notional basis).
+func (s *CopyTradeStore) ApplyCopyGuardBaselineMigration(id int64, baseline float64) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var actual float64
+	var stopCount int
+	if err = tx.QueryRow(`SELECT actual_pnl,stop_count FROM copy_guard_cycles WHERE id=? AND accounting_status=?`, id, CopyGuardAccountingReconciled).Scan(&actual, &stopCount); err != nil {
+		return err
+	}
+	tracking, guardEffect := actual-baseline, 0.0
+	if stopCount > 0 {
+		guardEffect = tracking
+	}
+	if _, err = tx.Exec(`UPDATE copy_guard_cycles SET baseline_pnl=?,tracking_difference=?,net_guard_effect=?,baseline_version=2,updated_at=CURRENT_TIMESTAMP WHERE id=?`, baseline, tracking, guardEffect, id); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// FinishCopyGuardBaselineMigration bumps every remaining v1 row to v2 so the
+// startup migration never rescans them: rows we could not recompute keep their
+// original values, and rows still open will close under the new formula.
+func (s *CopyTradeStore) FinishCopyGuardBaselineMigration() error {
+	_, err := s.db.Exec(`UPDATE copy_guard_cycles SET baseline_version=2 WHERE COALESCE(baseline_version,1)<2`)
+	return err
 }
 
 // ListCopyGuardCyclesWithEstimatedBaseline returns recently closed cycles

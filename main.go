@@ -5,6 +5,7 @@ import (
 	"nofx/auth"
 	"nofx/backtest"
 	"nofx/config"
+	"nofx/copytrade"
 	"nofx/crypto"
 	"nofx/logger"
 	"nofx/manager"
@@ -66,6 +67,9 @@ func main() {
 	retention.VacuumIfNeeded()
 	retention.Start()
 	defer retention.Stop()
+
+	// Copy Guard 基线口径迁移（v1 影子名义 → v2 own-path），幂等、只跑一次
+	copytrade.MigrateCopyGuardBaselinesV2(st)
 
 	// Initialize encryption service
 	logger.Info("🔐 Initializing encryption service...")

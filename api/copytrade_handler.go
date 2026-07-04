@@ -322,6 +322,7 @@ type CopyTradeConfigRequest struct {
 	RiskReentryMaxATRExpansion  *float64 `json:"risk_reentry_max_atr_expansion,omitempty"`
 	RiskWatchTimeoutMinutes     *int     `json:"risk_watch_timeout_minutes,omitempty"`
 	RiskMigrationConfirmed      *bool    `json:"risk_migration_confirmed,omitempty"`
+	RiskAddonBudgetPct          *float64 `json:"risk_addon_budget_pct,omitempty"`
 	RiskHighRiskConfirmed       bool     `json:"risk_high_risk_confirmed,omitempty"`
 }
 
@@ -569,6 +570,11 @@ func applyCopyGuardV4Request(c, old *store.CopyTradeConfig, r *CopyTradeConfigRe
 		c.RiskMigrationConfirmed = *r.RiskMigrationConfirmed
 	} else if old != nil {
 		c.RiskMigrationConfirmed = old.RiskMigrationConfirmed
+	}
+	if r.RiskAddonBudgetPct != nil {
+		c.RiskAddonBudgetPct = *r.RiskAddonBudgetPct
+	} else if old != nil {
+		c.RiskAddonBudgetPct = old.RiskAddonBudgetPct
 	}
 	if c.RiskPolicyVersion >= 4 {
 		// Only missing fields on a brand-new v4 config receive balanced defaults.

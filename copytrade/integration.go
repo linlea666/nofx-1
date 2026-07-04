@@ -196,6 +196,7 @@ func (ti *TraderIntegration) StartCopyTrading() error {
 		RiskReentryMaxATRExpansion:  copyConfig.RiskReentryMaxATRExpansion,
 		RiskWatchTimeoutMinutes:     copyConfig.RiskWatchTimeoutMinutes,
 		RiskMigrationConfirmed:      copyConfig.RiskMigrationConfirmed,
+		RiskAddonBudgetPct:          copyConfig.RiskAddonBudgetPct,
 	}
 	engineConfig.FillRiskDefaults() // 兜底默认值（旧库迁移 / 前端未传时）
 	if err := ValidateRiskPolicyV4(engineConfig); err != nil {
@@ -1675,13 +1676,19 @@ func (ti *TraderIntegration) finalizeCopyGuardCycle(dec *decision.Decision) {
 			}
 		}
 	}
-	baseline := cycle.BaselineRealizedPnL
-	if cycle.LeaderEntryPrice > 0 {
-		move := (dec.EntryPrice - cycle.LeaderEntryPrice) / cycle.LeaderEntryPrice
-		if cycle.Side == "short" {
-			move = -move
+	// own-path 口径：每个 attempt 按自身名义持有到领航员平仓价的反事实盈亏。
+	// attempt 数据不完整时回退旧口径（影子名义），保证基线始终有值。
+	attempts, _ := ti.store.CopyTrade().ListCopyGuardAttempts(cycle.ID)
+	baseline, ok := ComputeOwnPathBaseline(cycle, attempts, dec.EntryPrice)
+	if !ok {
+		baseline = cycle.BaselineRealizedPnL
+		if cycle.LeaderEntryPrice > 0 {
+			move := (dec.EntryPrice - cycle.LeaderEntryPrice) / cycle.LeaderEntryPrice
+			if cycle.Side == "short" {
+				move = -move
+			}
+			baseline += cycle.BaselineNotional * move
 		}
-		baseline += cycle.BaselineNotional * move
 	}
 	if err := ti.store.CopyTrade().BeginCopyGuardAccounting(cycle.ID, store.CopyGuardLeaderClosed, dec.ExchangeOrderID, baseline); err != nil {
 		logger.Errorf("❌ [%s] failed to begin Copy Guard accounting cycle=%d: %v", ti.traderID, cycle.ID, err)
