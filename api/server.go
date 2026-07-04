@@ -519,7 +519,7 @@ func applyCopyConfigRiskFields(copyConfig *store.CopyTradeConfig, req *CopyConfi
 	copyConfig.RiskReentryBandATR = derefFloatDefault(req.RiskReentryBandATR, 0.5)
 	// v4.1：默认冷却 300s（旧默认 60s 在高杠杆震荡下重入过快）
 	copyConfig.RiskReentryCooldownSeconds = derefIntDefault(req.RiskReentryCooldownSeconds, 300)
-	copyConfig.RiskReentryMaxChaseATR = derefFloatDefault(req.RiskReentryMaxChaseATR, 0)
+	copyConfig.RiskReentryMaxChaseATR = derefFloatDefault(req.RiskReentryMaxChaseATR, 0.5)
 	copyConfig.RiskReentryMaxATRExpansion = req.RiskReentryMaxATRExpansion
 	copyConfig.RiskWatchTimeoutMinutes = derefIntDefault(req.RiskWatchTimeoutMinutes, 0)
 	copyConfig.RiskMigrationConfirmed = req.RiskMigrationConfirmed

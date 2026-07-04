@@ -98,7 +98,8 @@ type CopyTradeConfig struct {
 	// 实际要求 = min_recovery_atr × escalation^已重入次数。默认 1.5。
 	RiskReentryRecoveryEscalation float64 `json:"risk_reentry_recovery_escalation"`
 	// RiskCycleMaxLossPct: 周期累计亏损熔断（v4）。同一周期已实现亏损达到
-	// 账户权益的该比例后不再重入，只观察至领航员平仓。默认 0.10；1.0 = 不限制。
+	// 账户权益的该比例后不再重入，只观察至领航员平仓。默认 1.0（不限制）；
+	// 仓位止损与账户兜底已承担主要风控，此项供需要额外封顶的用户选用。
 	RiskCycleMaxLossPct float64 `json:"risk_cycle_max_loss_pct"`
 
 	CreatedAt time.Time `json:"created_at"`
@@ -187,7 +188,7 @@ func (c *CopyTradeConfig) FillRiskDefaults() {
 			c.RiskReentryRecoveryEscalation = 1.5
 		}
 		if c.RiskCycleMaxLossPct == 0 {
-			c.RiskCycleMaxLossPct = 0.10
+			c.RiskCycleMaxLossPct = 1.0
 		}
 	}
 }

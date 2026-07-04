@@ -242,7 +242,7 @@ func (c *CopyConfig) FillRiskDefaults() {
 			c.RiskReentryRecoveryEscalation = 1.5
 		}
 		if c.RiskCycleMaxLossPct == 0 {
-			c.RiskCycleMaxLossPct = 0.10
+			c.RiskCycleMaxLossPct = 1.0
 		}
 	}
 }

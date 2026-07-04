@@ -121,7 +121,7 @@ interface FormState {
   risk_reentry_min_recovery_atr: number // 默认 0.5：重入最小恢复幅度（ATR 倍数）
   risk_reentry_cooldown_escalation: number // 默认 3：第 N 次重入冷却倍率
   risk_reentry_recovery_escalation: number // 默认 1.5：第 N 次重入恢复幅度倍率
-  risk_cycle_max_loss_pct: number // 默认 10%（提交时 /100 转 0.10）：周期累计亏损熔断，100 = 不限制
+  risk_cycle_max_loss_pct: number // 默认 100%（提交时 /100 转 1.0）：周期累计亏损熔断，100 = 不限制
 }
 
 interface TraderConfigModalProps {
@@ -184,7 +184,7 @@ export function TraderConfigModal({
     risk_max_reentries: 2,
     risk_reentry_band_atr: 0.5,
     risk_reentry_cooldown_seconds: 300, // v4.1：默认冷却 300s
-    risk_reentry_max_chase_atr: 0,
+    risk_reentry_max_chase_atr: 0.5,
     risk_reentry_max_atr_expansion: 2,
     risk_watch_timeout_minutes: 0,
     risk_migration_confirmed: true,
@@ -194,7 +194,7 @@ export function TraderConfigModal({
     risk_reentry_min_recovery_atr: 0.5,
     risk_reentry_cooldown_escalation: 3,
     risk_reentry_recovery_escalation: 1.5,
-    risk_cycle_max_loss_pct: 10,
+    risk_cycle_max_loss_pct: 100,
   })
   const [, setCopyTradeConfig] = useState<CopyTradeConfig | null>(null)
   const [isSaving, setIsSaving] = useState(false)
@@ -334,7 +334,7 @@ export function TraderConfigModal({
             risk_reentry_band_atr: cfg.risk_reentry_band_atr ?? 0.5,
             risk_reentry_cooldown_seconds:
               cfg.risk_reentry_cooldown_seconds ?? 300,
-            risk_reentry_max_chase_atr: cfg.risk_reentry_max_chase_atr ?? 0,
+            risk_reentry_max_chase_atr: cfg.risk_reentry_max_chase_atr ?? 0.5,
             risk_reentry_max_atr_expansion:
               cfg.risk_reentry_max_atr_expansion ?? 2,
             risk_watch_timeout_minutes: cfg.risk_watch_timeout_minutes ?? 0,
@@ -355,7 +355,7 @@ export function TraderConfigModal({
               cfg.risk_cycle_max_loss_pct != null &&
               cfg.risk_cycle_max_loss_pct > 0
                 ? cfg.risk_cycle_max_loss_pct * 100
-                : 10,
+                : 100,
           }))
         }
       } catch (error) {
@@ -419,7 +419,7 @@ export function TraderConfigModal({
         risk_max_reentries: 2,
         risk_reentry_band_atr: 0.5,
         risk_reentry_cooldown_seconds: 300,
-        risk_reentry_max_chase_atr: 0,
+        risk_reentry_max_chase_atr: 0.5,
         risk_reentry_max_atr_expansion: 2,
         risk_watch_timeout_minutes: 0,
         risk_migration_confirmed: true,
@@ -428,7 +428,7 @@ export function TraderConfigModal({
         risk_reentry_min_recovery_atr: 0.5,
         risk_reentry_cooldown_escalation: 3,
         risk_reentry_recovery_escalation: 1.5,
-        risk_cycle_max_loss_pct: 10,
+        risk_cycle_max_loss_pct: 100,
       })
     }
   }, [traderData, isEditMode, availableModels, availableExchanges])
@@ -1245,14 +1245,14 @@ export function TraderConfigModal({
                                       risk_max_reentries: 2,
                                       risk_reentry_band_atr: 0.5,
                                       risk_reentry_cooldown_seconds: 300,
-                                      risk_reentry_max_chase_atr: 0,
+                                      risk_reentry_max_chase_atr: 0.5,
                                       risk_reentry_max_atr_expansion: 2,
                                       risk_watch_timeout_minutes: 0,
                                       risk_stop_noise_floor_atr: 1.0,
                                       risk_reentry_min_recovery_atr: 0.5,
                                       risk_reentry_cooldown_escalation: 3,
                                       risk_reentry_recovery_escalation: 1.5,
-                                      risk_cycle_max_loss_pct: 10,
+                                      risk_cycle_max_loss_pct: 100,
                                     }))
                                   }
                                 >

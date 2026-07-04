@@ -630,6 +630,9 @@ func applyCopyGuardV4Request(c, old *store.CopyTradeConfig, r *CopyTradeConfigRe
 				// v4.1：默认冷却 300s（旧默认 60s 在高杠杆震荡下重入过快）
 				c.RiskReentryCooldownSeconds = 300
 			}
+			if r.RiskReentryMaxChaseATR == nil {
+				c.RiskReentryMaxChaseATR = 0.5
+			}
 			if r.RiskReentryMaxATRExpansion == nil {
 				c.RiskReentryMaxATRExpansion = 2
 			}

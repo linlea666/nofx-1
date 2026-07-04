@@ -236,7 +236,7 @@ export interface CopyConfigRequest {
   risk_reentry_min_recovery_atr?: number // 默认 0.5：重入前价格须从止损价恢复的最小幅度（ATR 倍数）
   risk_reentry_cooldown_escalation?: number // 默认 3：第 N 次重入冷却时间倍率（cooldown × 倍率^N）
   risk_reentry_recovery_escalation?: number // 默认 1.5：第 N 次重入恢复幅度倍率
-  risk_cycle_max_loss_pct?: number // 默认 0.10：周期累计亏损熔断（占账户权益比例；1.0=不限制）
+  risk_cycle_max_loss_pct?: number // 默认 1.0：周期累计亏损熔断（占账户权益比例；1.0=不限制）
 }
 
 export interface UpdateModelConfigRequest {
