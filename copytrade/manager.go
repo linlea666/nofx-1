@@ -178,4 +178,3 @@ func GetGlobalManager() *Manager {
 	})
 	return globalManager
 }
-

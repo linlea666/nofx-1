@@ -33,9 +33,9 @@ func newReentryTestEngine(t *testing.T) (*Engine, *store.Store) {
 	e := &Engine{
 		traderID: "trader-1",
 		config: &CopyConfig{
-			ProviderType:      ProviderOKX,
-			LeaderID:          "leader",
-			CopyRatio:         1,
+			ProviderType:       ProviderOKX,
+			LeaderID:           "leader",
+			CopyRatio:          1,
 			RiskPolicyVersion:  4,
 			RiskReentryEnabled: true,
 			RiskReentryRatio:   0.5,

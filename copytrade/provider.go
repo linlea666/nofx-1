@@ -575,9 +575,9 @@ type HLClearinghouseState struct {
 	AssetPositions []struct {
 		Type     string `json:"type"`
 		Position struct {
-			Coin          string `json:"coin"`
-			Szi           string `json:"szi"`
-			Leverage      struct {
+			Coin     string `json:"coin"`
+			Szi      string `json:"szi"`
+			Leverage struct {
 				Type  string `json:"type"`
 				Value int    `json:"value"`
 			} `json:"leverage"`
@@ -746,4 +746,3 @@ func parseInt64(s string) int64 {
 	}
 	return i
 }
-

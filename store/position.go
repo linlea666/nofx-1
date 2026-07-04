@@ -602,10 +602,10 @@ func (s *PositionStore) GetSymbolStats(traderID string, limit int) ([]SymbolStat
 
 // HoldingTimeStats holding duration analysis
 type HoldingTimeStats struct {
-	Range       string  `json:"range"`        // e.g., "<1h", "1-4h", "4-24h", ">24h"
-	TradeCount  int     `json:"trade_count"`
-	WinRate     float64 `json:"win_rate"`
-	AvgPnL      float64 `json:"avg_pnl"`
+	Range      string  `json:"range"` // e.g., "<1h", "1-4h", "4-24h", ">24h"
+	TradeCount int     `json:"trade_count"`
+	WinRate    float64 `json:"win_rate"`
+	AvgPnL     float64 `json:"avg_pnl"`
 }
 
 // GetHoldingTimeStats analyzes performance by holding duration
@@ -721,9 +721,9 @@ type HistorySummary struct {
 	RecentPnL     float64 `json:"recent_pnl"`
 
 	// Streak info
-	CurrentStreak     int    `json:"current_streak"`      // Positive = wins, negative = losses
-	MaxWinStreak      int    `json:"max_win_streak"`
-	MaxLoseStreak     int    `json:"max_lose_streak"`
+	CurrentStreak int `json:"current_streak"` // Positive = wins, negative = losses
+	MaxWinStreak  int `json:"max_win_streak"`
+	MaxLoseStreak int `json:"max_lose_streak"`
 }
 
 // GetHistorySummary generates comprehensive AI context summary

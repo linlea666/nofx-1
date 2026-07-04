@@ -38,8 +38,8 @@ type okxInstrumentCacheEntry struct {
 }
 
 var (
-	okxInstrumentCache   = make(map[string]okxInstrumentCacheEntry)
-	okxInstrumentCacheMu sync.RWMutex
+	okxInstrumentCache    = make(map[string]okxInstrumentCacheEntry)
+	okxInstrumentCacheMu  sync.RWMutex
 	okxInstrumentCacheTTL = 5 * time.Minute
 
 	okxInstrumentHTTPClient = &http.Client{Timeout: 5 * time.Second}

@@ -167,6 +167,7 @@ func TestIsBenignCloseErrorHandlesNilInputs(t *testing.T) {
 //   - 本地存在 active mapping
 //   - 收到良性 close 失败
 //   - handleBenignCloseFailure 后 mapping 状态变为 closed
+//
 // 这是阻断"大爷的弟弟"那种死循环的关键链路。
 func TestHandleBenignCloseFailureClosesMappingAndAvoidsDeadlock(t *testing.T) {
 	st, err := store.New(filepath.Join(t.TempDir(), "nofx-benign-close.db"))

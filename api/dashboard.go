@@ -17,11 +17,11 @@ import (
 // dashboardCache 大屏数据缓存
 type dashboardCache struct {
 	sync.RWMutex
-	summary        *DashboardSummary
-	summaryTime    time.Time
-	traders        []TraderDashboardStats
-	tradersTime    time.Time
-	cacheDuration  time.Duration
+	summary       *DashboardSummary
+	summaryTime   time.Time
+	traders       []TraderDashboardStats
+	tradersTime   time.Time
+	cacheDuration time.Duration
 }
 
 // 全局缓存实例
@@ -76,49 +76,49 @@ func (c *dashboardCache) setTraders(t []TraderDashboardStats) {
 
 // DashboardSummary 全局汇总统计
 type DashboardSummary struct {
-	TotalPnL      float64 `json:"total_pnl"`       // 总盈亏
-	TotalTrades   int     `json:"total_trades"`    // 总交易数
-	AvgWinRate    float64 `json:"avg_win_rate"`    // 平均胜率
-	ActiveTraders int     `json:"active_traders"`  // 活跃交易员数
-	TotalEquity   float64 `json:"total_equity"`    // 总净值
-	TotalFees     float64 `json:"total_fees"`      // 总手续费
-	TodayPnL      float64 `json:"today_pnl"`       // 今日盈亏
-	WeekPnL       float64 `json:"week_pnl"`        // 本周盈亏
-	MonthPnL      float64 `json:"month_pnl"`       // 本月盈亏
-	UpdatedAt     string  `json:"updated_at"`      // 更新时间
+	TotalPnL      float64 `json:"total_pnl"`      // 总盈亏
+	TotalTrades   int     `json:"total_trades"`   // 总交易数
+	AvgWinRate    float64 `json:"avg_win_rate"`   // 平均胜率
+	ActiveTraders int     `json:"active_traders"` // 活跃交易员数
+	TotalEquity   float64 `json:"total_equity"`   // 总净值
+	TotalFees     float64 `json:"total_fees"`     // 总手续费
+	TodayPnL      float64 `json:"today_pnl"`      // 今日盈亏
+	WeekPnL       float64 `json:"week_pnl"`       // 本周盈亏
+	MonthPnL      float64 `json:"month_pnl"`      // 本月盈亏
+	UpdatedAt     string  `json:"updated_at"`     // 更新时间
 }
 
 // TraderDashboardStats 交易员大屏统计
 type TraderDashboardStats struct {
-	TraderID       string  `json:"trader_id"`
-	TraderName     string  `json:"trader_name"`
-	Mode           string  `json:"mode"`            // ai | copy_trade
-	Exchange       string  `json:"exchange"`        // 交易所
-	IsRunning      bool    `json:"is_running"`      // 是否运行中
-	
+	TraderID   string `json:"trader_id"`
+	TraderName string `json:"trader_name"`
+	Mode       string `json:"mode"`       // ai | copy_trade
+	Exchange   string `json:"exchange"`   // 交易所
+	IsRunning  bool   `json:"is_running"` // 是否运行中
+
 	// 分时段统计
-	TodayPnL       float64 `json:"today_pnl"`
-	TodayTrades    int     `json:"today_trades"`
-	WeekPnL        float64 `json:"week_pnl"`
-	WeekTrades     int     `json:"week_trades"`
-	MonthPnL       float64 `json:"month_pnl"`
-	MonthTrades    int     `json:"month_trades"`
-	TotalPnL       float64 `json:"total_pnl"`
-	
+	TodayPnL    float64 `json:"today_pnl"`
+	TodayTrades int     `json:"today_trades"`
+	WeekPnL     float64 `json:"week_pnl"`
+	WeekTrades  int     `json:"week_trades"`
+	MonthPnL    float64 `json:"month_pnl"`
+	MonthTrades int     `json:"month_trades"`
+	TotalPnL    float64 `json:"total_pnl"`
+
 	// 核心指标
-	TotalTrades    int     `json:"total_trades"`
-	WinRate        float64 `json:"win_rate"`
-	WinTrades      int     `json:"win_trades"`
-	LossTrades     int     `json:"loss_trades"`
-	ProfitFactor   float64 `json:"profit_factor"`   // 盈亏比
-	MaxDrawdown    float64 `json:"max_drawdown"`    // 最大回撤 %
-	TotalFees      float64 `json:"total_fees"`      // 总手续费
-	
+	TotalTrades  int     `json:"total_trades"`
+	WinRate      float64 `json:"win_rate"`
+	WinTrades    int     `json:"win_trades"`
+	LossTrades   int     `json:"loss_trades"`
+	ProfitFactor float64 `json:"profit_factor"` // 盈亏比
+	MaxDrawdown  float64 `json:"max_drawdown"`  // 最大回撤 %
+	TotalFees    float64 `json:"total_fees"`    // 总手续费
+
 	// 当前状态
 	CurrentEquity  float64 `json:"current_equity"`
 	InitialBalance float64 `json:"initial_balance"`
-	ReturnRate     float64 `json:"return_rate"`     // 收益率 %
-	PositionCount  int     `json:"position_count"`  // 当前持仓数
+	ReturnRate     float64 `json:"return_rate"`    // 收益率 %
+	PositionCount  int     `json:"position_count"` // 当前持仓数
 }
 
 // PnLTrendPoint 盈亏趋势数据点
@@ -132,35 +132,35 @@ type PnLTrendPoint struct {
 // SystemMonitor 系统监控统计
 type SystemMonitor struct {
 	// 跟单统计 (今日)
-	TodaySignals    int     `json:"today_signals"`     // 今日信号总数
-	TodayExecuted   int     `json:"today_executed"`    // 执行成功
-	TodaySkipped    int     `json:"today_skipped"`     // 跳过
-	TodayFailed     int     `json:"today_failed"`      // 失败
-	ExecutionRate   float64 `json:"execution_rate"`    // 执行率 %
-	
+	TodaySignals  int     `json:"today_signals"`  // 今日信号总数
+	TodayExecuted int     `json:"today_executed"` // 执行成功
+	TodaySkipped  int     `json:"today_skipped"`  // 跳过
+	TodayFailed   int     `json:"today_failed"`   // 失败
+	ExecutionRate float64 `json:"execution_rate"` // 执行率 %
+
 	// API 错误统计 (最近24小时)
-	RateLimitErrors int     `json:"rate_limit_errors"` // 频率限制 (429)
-	NetworkErrors   int     `json:"network_errors"`    // 网络错误
-	AuthErrors      int     `json:"auth_errors"`       // 认证错误
-	OtherErrors     int     `json:"other_errors"`      // 其他错误
-	
+	RateLimitErrors int `json:"rate_limit_errors"` // 频率限制 (429)
+	NetworkErrors   int `json:"network_errors"`    // 网络错误
+	AuthErrors      int `json:"auth_errors"`       // 认证错误
+	OtherErrors     int `json:"other_errors"`      // 其他错误
+
 	// 系统健康
-	HealthScore     int     `json:"health_score"`      // 健康度 0-100
-	
+	HealthScore int `json:"health_score"` // 健康度 0-100
+
 	// 风险预警
-	Alerts          []RiskAlert `json:"alerts"`        // 风险预警列表
-	
-	UpdatedAt       string  `json:"updated_at"`
+	Alerts []RiskAlert `json:"alerts"` // 风险预警列表
+
+	UpdatedAt string `json:"updated_at"`
 }
 
 // RiskAlert 风险预警
 type RiskAlert struct {
-	Level      string  `json:"level"`       // critical | warning | info
-	Type       string  `json:"type"`        // consecutive_loss | max_drawdown | api_error | low_win_rate
+	Level      string  `json:"level"` // critical | warning | info
+	Type       string  `json:"type"`  // consecutive_loss | max_drawdown | api_error | low_win_rate
 	TraderID   string  `json:"trader_id"`
 	TraderName string  `json:"trader_name"`
 	Message    string  `json:"message"`
-	Value      float64 `json:"value"`       // 相关数值
+	Value      float64 `json:"value"` // 相关数值
 	Timestamp  string  `json:"timestamp"`
 }
 
@@ -193,9 +193,9 @@ func (s *Server) getDashboardSummary() (*DashboardSummary, error) {
 	summary := &DashboardSummary{
 		UpdatedAt: time.Now().Format("2006-01-02 15:04:05"),
 	}
-	
+
 	db := s.store.DB()
-	
+
 	// 全局统计
 	err := db.QueryRow(`
 		SELECT 
@@ -208,7 +208,7 @@ func (s *Server) getDashboardSummary() (*DashboardSummary, error) {
 	if err != nil && err != sql.ErrNoRows {
 		logger.Warnf("Dashboard: 查询全局统计失败: %v", err)
 	}
-	
+
 	// 计算胜率
 	var winTrades int
 	err = db.QueryRow(`
@@ -218,7 +218,7 @@ func (s *Server) getDashboardSummary() (*DashboardSummary, error) {
 	if err == nil && summary.TotalTrades > 0 {
 		summary.AvgWinRate = float64(winTrades) / float64(summary.TotalTrades) * 100
 	}
-	
+
 	// 活跃交易员数（有持仓的）
 	err = db.QueryRow(`
 		SELECT COUNT(DISTINCT trader_id) FROM trader_positions WHERE status = 'OPEN'
@@ -226,7 +226,7 @@ func (s *Server) getDashboardSummary() (*DashboardSummary, error) {
 	if err != nil && err != sql.ErrNoRows {
 		logger.Warnf("Dashboard: 查询活跃交易员失败: %v", err)
 	}
-	
+
 	// 今日盈亏
 	todayStart := getTimeRangeStart("today")
 	err = db.QueryRow(`
@@ -236,7 +236,7 @@ func (s *Server) getDashboardSummary() (*DashboardSummary, error) {
 	if err != nil && err != sql.ErrNoRows {
 		logger.Warnf("Dashboard: 查询今日盈亏失败: %v", err)
 	}
-	
+
 	// 本周盈亏
 	weekStart := getTimeRangeStart("week")
 	err = db.QueryRow(`
@@ -246,7 +246,7 @@ func (s *Server) getDashboardSummary() (*DashboardSummary, error) {
 	if err != nil && err != sql.ErrNoRows {
 		logger.Warnf("Dashboard: 查询本周盈亏失败: %v", err)
 	}
-	
+
 	// 本月盈亏
 	monthStart := getTimeRangeStart("month")
 	err = db.QueryRow(`
@@ -256,7 +256,7 @@ func (s *Server) getDashboardSummary() (*DashboardSummary, error) {
 	if err != nil && err != sql.ErrNoRows {
 		logger.Warnf("Dashboard: 查询本月盈亏失败: %v", err)
 	}
-	
+
 	// 获取总净值（从 equity snapshots）
 	err = db.QueryRow(`
 		SELECT COALESCE(SUM(total_equity), 0) FROM (
@@ -268,7 +268,7 @@ func (s *Server) getDashboardSummary() (*DashboardSummary, error) {
 	if err != nil && err != sql.ErrNoRows {
 		logger.Warnf("Dashboard: 查询总净值失败: %v", err)
 	}
-	
+
 	return summary, nil
 }
 
@@ -277,9 +277,9 @@ func (s *Server) getTraderDashboardStats(traderID string) (*TraderDashboardStats
 	stats := &TraderDashboardStats{
 		TraderID: traderID,
 	}
-	
+
 	db := s.store.DB()
-	
+
 	// 获取交易员基本信息
 	var name, exchange, decisionMode, aiModel sql.NullString
 	var initialBalance sql.NullFloat64
@@ -308,10 +308,10 @@ func (s *Server) getTraderDashboardStats(traderID string) (*TraderDashboardStats
 		}
 		stats.InitialBalance = initialBalance.Float64
 	}
-	
+
 	// 检查是否运行中
 	stats.IsRunning = s.isTraderRunning(traderID)
-	
+
 	// 全部统计
 	var totalWin, totalLoss float64
 	err = db.QueryRow(`
@@ -332,7 +332,7 @@ func (s *Server) getTraderDashboardStats(traderID string) (*TraderDashboardStats
 	if err != nil && err != sql.ErrNoRows {
 		logger.Warnf("Dashboard: 查询交易员统计失败: %v", err)
 	}
-	
+
 	// 计算胜率和盈亏比
 	if stats.TotalTrades > 0 {
 		stats.WinRate = float64(stats.WinTrades) / float64(stats.TotalTrades) * 100
@@ -340,7 +340,7 @@ func (s *Server) getTraderDashboardStats(traderID string) (*TraderDashboardStats
 	if totalLoss > 0 {
 		stats.ProfitFactor = totalWin / totalLoss
 	}
-	
+
 	// 今日统计
 	todayStart := getTimeRangeStart("today")
 	err = db.QueryRow(`
@@ -351,7 +351,7 @@ func (s *Server) getTraderDashboardStats(traderID string) (*TraderDashboardStats
 	if err != nil && err != sql.ErrNoRows {
 		logger.Warnf("Dashboard: 查询今日统计失败: %v", err)
 	}
-	
+
 	// 本周统计
 	weekStart := getTimeRangeStart("week")
 	err = db.QueryRow(`
@@ -362,7 +362,7 @@ func (s *Server) getTraderDashboardStats(traderID string) (*TraderDashboardStats
 	if err != nil && err != sql.ErrNoRows {
 		logger.Warnf("Dashboard: 查询本周统计失败: %v", err)
 	}
-	
+
 	// 本月统计
 	monthStart := getTimeRangeStart("month")
 	err = db.QueryRow(`
@@ -373,7 +373,7 @@ func (s *Server) getTraderDashboardStats(traderID string) (*TraderDashboardStats
 	if err != nil && err != sql.ErrNoRows {
 		logger.Warnf("Dashboard: 查询本月统计失败: %v", err)
 	}
-	
+
 	// 当前持仓数
 	err = db.QueryRow(`
 		SELECT COUNT(*) FROM trader_positions WHERE trader_id = ? AND status = 'OPEN'
@@ -381,7 +381,7 @@ func (s *Server) getTraderDashboardStats(traderID string) (*TraderDashboardStats
 	if err != nil && err != sql.ErrNoRows {
 		logger.Warnf("Dashboard: 查询持仓数失败: %v", err)
 	}
-	
+
 	// 当前净值（最新快照）
 	err = db.QueryRow(`
 		SELECT total_equity FROM trader_equity_snapshots
@@ -390,22 +390,22 @@ func (s *Server) getTraderDashboardStats(traderID string) (*TraderDashboardStats
 	if err != nil && err != sql.ErrNoRows {
 		logger.Warnf("Dashboard: 查询净值失败: %v", err)
 	}
-	
+
 	// 计算收益率
 	if stats.InitialBalance > 0 {
 		stats.ReturnRate = (stats.CurrentEquity - stats.InitialBalance) / stats.InitialBalance * 100
 	}
-	
+
 	// 计算最大回撤（简化版：使用累计 PnL）
 	stats.MaxDrawdown = s.calculateMaxDrawdown(traderID)
-	
+
 	return stats, nil
 }
 
 // calculateMaxDrawdown 计算最大回撤
 func (s *Server) calculateMaxDrawdown(traderID string) float64 {
 	db := s.store.DB()
-	
+
 	rows, err := db.Query(`
 		SELECT realized_pnl FROM trader_positions
 		WHERE trader_id = ? AND status = 'CLOSED'
@@ -415,7 +415,7 @@ func (s *Server) calculateMaxDrawdown(traderID string) float64 {
 		return 0
 	}
 	defer rows.Close()
-	
+
 	var cumPnL, peak, maxDrawdown float64
 	for rows.Next() {
 		var pnl float64
@@ -431,7 +431,7 @@ func (s *Server) calculateMaxDrawdown(traderID string) float64 {
 			maxDrawdown = drawdown
 		}
 	}
-	
+
 	if peak > 0 {
 		return maxDrawdown / peak * 100
 	}
@@ -441,14 +441,14 @@ func (s *Server) calculateMaxDrawdown(traderID string) float64 {
 // getAllTradersDashboardStats 获取所有交易员统计
 func (s *Server) getAllTradersDashboardStats() ([]TraderDashboardStats, error) {
 	db := s.store.DB()
-	
+
 	// 获取所有交易员 ID
 	rows, err := db.Query(`SELECT DISTINCT id FROM traders`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	
+
 	var traderIDs []string
 	for rows.Next() {
 		var id string
@@ -457,7 +457,7 @@ func (s *Server) getAllTradersDashboardStats() ([]TraderDashboardStats, error) {
 		}
 		traderIDs = append(traderIDs, id)
 	}
-	
+
 	// 获取每个交易员的统计
 	var result []TraderDashboardStats
 	for _, id := range traderIDs {
@@ -468,7 +468,7 @@ func (s *Server) getAllTradersDashboardStats() ([]TraderDashboardStats, error) {
 		}
 		result = append(result, *stats)
 	}
-	
+
 	return result, nil
 }
 
@@ -478,43 +478,43 @@ func (s *Server) getSystemMonitor() (*SystemMonitor, error) {
 		UpdatedAt: time.Now().Format("2006-01-02 15:04:05"),
 		Alerts:    []RiskAlert{},
 	}
-	
+
 	db := s.store.DB()
 	todayStart := getTimeRangeStart("today")
 	todayStr := todayStart.Format("2006-01-02 15:04:05")
-	
+
 	// ========== 跟单信号统计 (今日) ==========
 	// 总信号数
 	db.QueryRow(`
 		SELECT COUNT(*) FROM copy_trade_signal_logs WHERE created_at >= ?
 	`, todayStr).Scan(&monitor.TodaySignals)
-	
+
 	// 执行成功
 	db.QueryRow(`
 		SELECT COUNT(*) FROM copy_trade_signal_logs 
 		WHERE created_at >= ? AND status = 'executed'
 	`, todayStr).Scan(&monitor.TodayExecuted)
-	
+
 	// 跳过
 	db.QueryRow(`
 		SELECT COUNT(*) FROM copy_trade_signal_logs 
 		WHERE created_at >= ? AND status = 'skipped'
 	`, todayStr).Scan(&monitor.TodaySkipped)
-	
+
 	// 失败
 	db.QueryRow(`
 		SELECT COUNT(*) FROM copy_trade_signal_logs 
 		WHERE created_at >= ? AND status = 'failed'
 	`, todayStr).Scan(&monitor.TodayFailed)
-	
+
 	// 执行率
 	if monitor.TodaySignals > 0 {
 		monitor.ExecutionRate = float64(monitor.TodayExecuted) / float64(monitor.TodaySignals) * 100
 	}
-	
+
 	// ========== API 错误统计 (最近24小时) ==========
 	last24h := time.Now().Add(-24 * time.Hour).Format("2006-01-02 15:04:05")
-	
+
 	// 从 copy_trade_signal_logs 和 decision_records 提取错误
 	rows, err := db.Query(`
 		SELECT error_message FROM copy_trade_signal_logs 
@@ -543,7 +543,7 @@ func (s *Server) getSystemMonitor() (*SystemMonitor, error) {
 			}
 		}
 	}
-	
+
 	// ========== 计算健康度 ==========
 	monitor.HealthScore = 100
 	totalErrors := monitor.RateLimitErrors + monitor.NetworkErrors + monitor.AuthErrors + monitor.OtherErrors
@@ -556,10 +556,10 @@ func (s *Server) getSystemMonitor() (*SystemMonitor, error) {
 	if monitor.HealthScore < 0 {
 		monitor.HealthScore = 0
 	}
-	
+
 	// ========== 风险预警计算 ==========
 	monitor.Alerts = s.calculateRiskAlerts()
-	
+
 	// 根据预警调整健康度
 	for _, alert := range monitor.Alerts {
 		if alert.Level == "critical" {
@@ -571,7 +571,7 @@ func (s *Server) getSystemMonitor() (*SystemMonitor, error) {
 	if monitor.HealthScore < 0 {
 		monitor.HealthScore = 0
 	}
-	
+
 	return monitor, nil
 }
 
@@ -579,14 +579,14 @@ func (s *Server) getSystemMonitor() (*SystemMonitor, error) {
 func (s *Server) calculateRiskAlerts() []RiskAlert {
 	var alerts []RiskAlert
 	db := s.store.DB()
-	
+
 	// 获取所有交易员
 	rows, err := db.Query(`SELECT DISTINCT id FROM traders`)
 	if err != nil {
 		return alerts
 	}
 	defer rows.Close()
-	
+
 	var traderIDs []string
 	for rows.Next() {
 		var id string
@@ -594,7 +594,7 @@ func (s *Server) calculateRiskAlerts() []RiskAlert {
 			traderIDs = append(traderIDs, id)
 		}
 	}
-	
+
 	for _, traderID := range traderIDs {
 		// 获取交易员名称
 		var traderName string
@@ -609,7 +609,7 @@ func (s *Server) calculateRiskAlerts() []RiskAlert {
 		} else {
 			traderName = traderID
 		}
-		
+
 		// 1. 检查连续亏损 (最近5笔交易)
 		recentPnLs := []float64{}
 		pnlRows, err := db.Query(`
@@ -626,7 +626,7 @@ func (s *Server) calculateRiskAlerts() []RiskAlert {
 			}
 			pnlRows.Close()
 		}
-		
+
 		// 计算连续亏损次数
 		consecutiveLosses := 0
 		for _, pnl := range recentPnLs {
@@ -636,7 +636,7 @@ func (s *Server) calculateRiskAlerts() []RiskAlert {
 				break
 			}
 		}
-		
+
 		if consecutiveLosses >= 3 {
 			level := "warning"
 			if consecutiveLosses >= 5 {
@@ -652,14 +652,14 @@ func (s *Server) calculateRiskAlerts() []RiskAlert {
 				Timestamp:  time.Now().Format("2006-01-02 15:04:05"),
 			})
 		}
-		
+
 		// 2. 检查胜率过低 (至少10笔交易)
 		var totalTrades, winTrades int
 		db.QueryRow(`
 			SELECT COUNT(*), COALESCE(SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END), 0)
 			FROM trader_positions WHERE trader_id = ? AND status = 'CLOSED'
 		`, traderID).Scan(&totalTrades, &winTrades)
-		
+
 		if totalTrades >= 10 {
 			winRate := float64(winTrades) / float64(totalTrades) * 100
 			if winRate < 30 {
@@ -674,7 +674,7 @@ func (s *Server) calculateRiskAlerts() []RiskAlert {
 				})
 			}
 		}
-		
+
 		// 3. 检查最大回撤
 		maxDrawdown := s.calculateMaxDrawdown(traderID)
 		if maxDrawdown > 20 {
@@ -693,7 +693,7 @@ func (s *Server) calculateRiskAlerts() []RiskAlert {
 			})
 		}
 	}
-	
+
 	// 4. 检查 API 错误频繁
 	var recentErrors int
 	last1h := time.Now().Add(-1 * time.Hour).Format("2006-01-02 15:04:05")
@@ -701,7 +701,7 @@ func (s *Server) calculateRiskAlerts() []RiskAlert {
 		SELECT COUNT(*) FROM copy_trade_signal_logs 
 		WHERE created_at >= ? AND status = 'failed'
 	`, last1h).Scan(&recentErrors)
-	
+
 	if recentErrors >= 5 {
 		alerts = append(alerts, RiskAlert{
 			Level:      "warning",
@@ -713,14 +713,14 @@ func (s *Server) calculateRiskAlerts() []RiskAlert {
 			Timestamp:  time.Now().Format("2006-01-02 15:04:05"),
 		})
 	}
-	
+
 	return alerts
 }
 
 // getPnLTrend 获取盈亏趋势（按天）
 func (s *Server) getPnLTrend(traderID string, days int) ([]PnLTrendPoint, error) {
 	db := s.store.DB()
-	
+
 	// 构建查询
 	query := `
 		SELECT 
@@ -731,29 +731,29 @@ func (s *Server) getPnLTrend(traderID string, days int) ([]PnLTrendPoint, error)
 		WHERE status = 'CLOSED'
 	`
 	args := []interface{}{}
-	
+
 	if traderID != "" {
 		query += " AND trader_id = ?"
 		args = append(args, traderID)
 	}
-	
+
 	if days > 0 {
 		startDate := time.Now().AddDate(0, 0, -days).Format("2006-01-02")
 		query += " AND DATE(exit_time) >= ?"
 		args = append(args, startDate)
 	}
-	
+
 	query += " GROUP BY DATE(exit_time) ORDER BY date ASC"
-	
+
 	rows, err := db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	
+
 	var result []PnLTrendPoint
 	var cumPnL float64
-	
+
 	for rows.Next() {
 		var point PnLTrendPoint
 		if err := rows.Scan(&point.Date, &point.PnL, &point.Trades); err != nil {
@@ -763,7 +763,7 @@ func (s *Server) getPnLTrend(traderID string, days int) ([]PnLTrendPoint, error)
 		point.CumPnL = cumPnL
 		result = append(result, point)
 	}
-	
+
 	return result, nil
 }
 
@@ -777,7 +777,7 @@ func (s *Server) handleDashboardSummary(c *gin.Context) {
 		c.JSON(http.StatusOK, dbCache.getSummary())
 		return
 	}
-	
+
 	// 缓存失效，重新查询
 	summary, err := s.getDashboardSummary()
 	if err != nil {
@@ -786,11 +786,11 @@ func (s *Server) handleDashboardSummary(c *gin.Context) {
 		})
 		return
 	}
-	
+
 	// 更新缓存
 	dbCache.setSummary(summary)
 	logger.Debugf("📊 Dashboard: 更新汇总数据缓存")
-	
+
 	c.JSON(http.StatusOK, summary)
 }
 
@@ -802,7 +802,7 @@ func (s *Server) handleDashboardTraders(c *gin.Context) {
 		c.JSON(http.StatusOK, dbCache.getTraders())
 		return
 	}
-	
+
 	// 缓存失效，重新查询
 	traders, err := s.getAllTradersDashboardStats()
 	if err != nil {
@@ -811,11 +811,11 @@ func (s *Server) handleDashboardTraders(c *gin.Context) {
 		})
 		return
 	}
-	
+
 	// 更新缓存
 	dbCache.setTraders(traders)
 	logger.Debugf("📊 Dashboard: 更新交易员数据缓存，共 %d 位", len(traders))
-	
+
 	c.JSON(http.StatusOK, traders)
 }
 
@@ -828,7 +828,7 @@ func (s *Server) handleDashboardTrader(c *gin.Context) {
 		})
 		return
 	}
-	
+
 	stats, err := s.getTraderDashboardStats(traderID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -842,13 +842,13 @@ func (s *Server) handleDashboardTrader(c *gin.Context) {
 // handleDashboardTrend 处理盈亏趋势请求
 func (s *Server) handleDashboardTrend(c *gin.Context) {
 	traderID := c.Query("trader_id") // 可选，为空则全局
-	days := 30 // 默认30天
+	days := 30                       // 默认30天
 	if d := c.Query("days"); d != "" {
 		if parsed, err := time.ParseDuration(d + "h"); err == nil {
 			days = int(parsed.Hours() / 24)
 		}
 	}
-	
+
 	trend, err := s.getPnLTrend(traderID, days)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -883,7 +883,7 @@ func (s *Server) RegisterDashboardRoutes(api *gin.RouterGroup) {
 		dashboard.GET("/trend", s.handleDashboardTrend)
 		dashboard.GET("/monitor", s.handleDashboardMonitor)
 	}
-	
+
 	logger.Infof("📊 Dashboard API 路由已注册:")
 	logger.Infof("  • GET /api/dashboard/summary   - 全局汇总统计")
 	logger.Infof("  • GET /api/dashboard/traders   - 所有交易员统计")
@@ -891,4 +891,3 @@ func (s *Server) RegisterDashboardRoutes(api *gin.RouterGroup) {
 	logger.Infof("  • GET /api/dashboard/trend     - 盈亏趋势数据")
 	logger.Infof("  • GET /api/dashboard/monitor   - 系统监控与风险预警")
 }
-
