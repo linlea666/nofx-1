@@ -70,14 +70,16 @@ type CopyGuardPolicy struct {
 	ReentryCooldownEscalation float64 `json:"reentry_cooldown_escalation"`
 	ReentryRecoveryEscalation float64 `json:"reentry_recovery_escalation"`
 	CycleMaxLossPct           float64 `json:"cycle_max_loss_pct"`
-	// DefaultsVersion: 默认值代次书签。2 = 已应用 v4.1 默认值迁移
-	// （risk_account_pct 0.02→0.20、cooldown 60→300、leverage_max_loss 0.5→0.3）。
+	// DefaultsVersion: 默认值代次书签。
+	//   2 = v4.1 默认值迁移（risk_account_pct 0.02→0.20、cooldown 60→300、
+	//       leverage_max_loss 0.5→0.3）
+	//   3 = 重入默认放宽（max_chase 0→0.5、cycle_max_loss 0.10→1.0）
 	DefaultsVersion int `json:"defaults_version"`
 }
 
 // copyGuardPolicyDefaultsVersion 当前默认值代次；migrateCopyGuardPolicyDefaults
 // 只处理低于该值的存量策略。
-const copyGuardPolicyDefaultsVersion = 2
+const copyGuardPolicyDefaultsVersion = 3
 
 type CopyGuardCycle struct {
 	ID                  int64   `json:"id"`
@@ -370,13 +372,20 @@ func (s *CopyTradeStore) loadCopyGuardPolicy(c *CopyTradeConfig) error {
 	return nil
 }
 
-// migrateCopyGuardPolicyDefaults 一次性把存量 v4 策略从旧默认值迁移到 v4.1 默认值：
+// migrateCopyGuardPolicyDefaults 一次性把存量 v4 策略从旧默认值迁移到新默认值。
+// 代次 2（v4.1）：
 //   - risk_account_pct：0.02（旧默认，太紧、易被波动触发）→ 0.20（灾难硬兜底语义）
 //   - risk_leverage_max_loss：0.5（旧默认）→ 0.3（仓位保证金默认止损 30%）
 //   - reentry_cooldown_seconds：60（旧默认）→ 300
 //
-// 仅当存量值等于旧默认值时才替换（用户显式改过的值保留）；处理后写入
-// defaults_version=2，幂等且不会覆盖之后用户再设回旧值的选择。
+// 代次 3（重入默认放宽）：
+//   - reentry_max_chase_atr：0（旧默认，完全不追价、易错过恢复）→ 0.5
+//   - cycle_max_loss_pct：0.10（旧默认）→ 1.0（默认关闭熔断，仓位止损 +
+//     账户兜底已承担主要风控）
+//
+// 仅当存量值等于旧默认值时才替换（用户显式改过的值保留）；处理后写入当前
+// defaults_version 书签，幂等且不会覆盖之后用户再设回旧值的选择。
+// 各代次规则按存量值判断可安全叠加：低代次策略一次跑齐全部规则。
 func (s *CopyTradeStore) migrateCopyGuardPolicyDefaults() {
 	rows, err := s.db.Query(`SELECT trader_id, policy_json FROM copy_guard_policies`)
 	if err != nil {
@@ -406,6 +415,12 @@ func (s *CopyTradeStore) migrateCopyGuardPolicyDefaults() {
 		p := item.policy
 		if p.ReentryCooldownSec == 60 {
 			p.ReentryCooldownSec = 300
+		}
+		if p.ReentryMaxChaseATR == 0 {
+			p.ReentryMaxChaseATR = 0.5
+		}
+		if p.CycleMaxLossPct == 0.10 {
+			p.CycleMaxLossPct = 1.0
 		}
 		p.DefaultsVersion = copyGuardPolicyDefaultsVersion
 		b, err := json.Marshal(p)

@@ -872,8 +872,10 @@ func (s *Server) handleCreateTrader(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "copy guard v4 is only supported for OKX"})
 			return
 		}
-		if copyConfig.RiskPolicyVersion >= 4 && copyConfig.RiskAccountPct >= 0.10 && !req.CopyConfig.RiskHighRiskConfirmed {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "risk_account_pct >= 10% requires risk_high_risk_confirmed"})
+		// v4.1：账户线语义为"灾难硬兜底"（默认 20%），确认阈值 50%（与
+		// copytrade_handler.SaveConfig 及前端 TraderConfigModal 保持一致）
+		if copyConfig.RiskPolicyVersion >= 4 && copyConfig.RiskAccountPct >= 0.50 && !req.CopyConfig.RiskHighRiskConfirmed {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "risk_account_pct >= 50% requires risk_high_risk_confirmed"})
 			return
 		}
 
@@ -1078,8 +1080,10 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 				c.JSON(http.StatusBadRequest, gin.H{"error": "copy guard v4 is only supported for OKX"})
 				return
 			}
-			if copyConfig.RiskPolicyVersion >= 4 && copyConfig.RiskAccountPct >= 0.10 && !req.CopyConfig.RiskHighRiskConfirmed {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "risk_account_pct >= 10% requires risk_high_risk_confirmed"})
+			// v4.1：账户线语义为"灾难硬兜底"（默认 20%），确认阈值 50%（与
+			// copytrade_handler.SaveConfig 及前端 TraderConfigModal 保持一致）
+			if copyConfig.RiskPolicyVersion >= 4 && copyConfig.RiskAccountPct >= 0.50 && !req.CopyConfig.RiskHighRiskConfirmed {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "risk_account_pct >= 50% requires risk_high_risk_confirmed"})
 				return
 			}
 
