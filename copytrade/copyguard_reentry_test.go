@@ -311,6 +311,143 @@ func TestReentryBlockedByCooldownAndExhaustion(t *testing.T) {
 }
 
 // ============================================================================
+// v4.1 重入最小恢复幅度：穿越带宽但未从止损价恢复足够幅度时不得重入
+// ============================================================================
+
+func TestReentryMinRecoveryRaisesBoundary(t *testing.T) {
+	e, st := newReentryTestEngine(t)
+	e.config.RiskReentryMinRecoveryATR = 1.0 // 要求从止损价恢复 1×ATR
+	// seedStoppedCycle: entry=1700, 止损成交价 = 1700×0.98 = 1666
+	// ATR fallback = 1700×0.02 = 34 → 带宽边界 1700−17=1683，
+	// 恢复下限 1666+34=1700 → 有效边界抬高到 1700
+	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700)
+	_ = st.CopyTrade().UpdateCopyGuardObservation(cycle.ID, store.CopyGuardStoppedWatching, 1700, 1660, 34)
+	e.leaderState.Positions["ETHUSDT_long"] = &Position{Symbol: "ETHUSDT", Side: SideLong, Size: 1, EntryPrice: 1700, MarkPrice: 1690, MarginMode: "cross", PosID: "leader-pos"}
+
+	// 1690 穿越了旧带宽边界 1683，但未达到恢复下限 1700 → 不得重入
+	e.checkReentryConditions()
+	select {
+	case <-e.decisionCh:
+		t.Fatal("crossing the band without min recovery must not trigger reentry")
+	default:
+	}
+
+	// 恢复到 1705（≥1700 且 ≤ 追价上限 1700+68）→ 触发
+	e.leaderState.Positions["ETHUSDT_long"].MarkPrice = 1705
+	e.checkReentryConditions()
+	select {
+	case <-e.decisionCh:
+	default:
+		t.Fatal("crossing the recovery-raised boundary must trigger reentry")
+	}
+}
+
+// ============================================================================
+// v4.1 保守锚点：领航员止损后摊均价（实时均价变低）不得放松重入门槛
+// ============================================================================
+
+func TestReentryConservativeAnchorIgnoresAveragedDownEntry(t *testing.T) {
+	e, st := newReentryTestEngine(t)
+	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700)
+	// 止损时快照领航员均价 1700；随后领航员加仓摊均价到 1650
+	if err := st.CopyTrade().SnapshotCopyGuardLeaderEntryAtStop(cycle.ID, 1700); err != nil {
+		t.Fatal(err)
+	}
+	_ = st.CopyTrade().UpdateCopyGuardObservation(cycle.ID, store.CopyGuardStoppedWatching, 1700, 1620, 34)
+	e.leaderState.Positions["ETHUSDT_long"] = &Position{Symbol: "ETHUSDT", Side: SideLong, Size: 2, EntryPrice: 1650, MarkPrice: 1640, MarginMode: "cross", PosID: "leader-pos"}
+
+	// 按摊低后的实时均价算边界是 1650−17=1633（1620→1640 会穿越）；
+	// 保守锚点必须用快照 1700 → 边界 1683，1640 不得触发
+	e.checkReentryConditions()
+	select {
+	case <-e.decisionCh:
+		t.Fatal("averaged-down live entry must not loosen the reentry boundary")
+	default:
+	}
+
+	// 真实恢复到 1690（穿越 1683，≤ 锚点 1700+68）→ 触发
+	e.leaderState.Positions["ETHUSDT_long"].MarkPrice = 1690
+	e.checkReentryConditions()
+	select {
+	case <-e.decisionCh:
+	default:
+		t.Fatal("crossing the snapshot-anchored boundary must trigger reentry")
+	}
+}
+
+// ============================================================================
+// v4.1 周期累计亏损熔断：已实现亏损触达权益比例后不再重入
+// ============================================================================
+
+func TestCycleLossBreakerBlocksReentry(t *testing.T) {
+	e, st := newReentryTestEngine(t)
+	e.config.RiskCycleMaxLossPct = 0.10 // 权益 100 → 熔断线 −10
+	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700)
+	if _, err := st.DB().Exec(`UPDATE copy_guard_cycles SET actual_pnl=-12 WHERE id=?`, cycle.ID); err != nil {
+		t.Fatal(err)
+	}
+	_ = st.CopyTrade().UpdateCopyGuardObservation(cycle.ID, store.CopyGuardStoppedWatching, 1700, 1660, 34)
+	e.leaderState.Positions["ETHUSDT_long"] = &Position{Symbol: "ETHUSDT", Side: SideLong, Size: 1, EntryPrice: 1700, MarkPrice: 1690, MarginMode: "cross", PosID: "leader-pos"}
+
+	e.checkReentryConditions()
+	select {
+	case <-e.decisionCh:
+		t.Fatal("cycle loss breaker must block reentry even when the price condition holds")
+	default:
+	}
+	got, _ := st.CopyTrade().GetCopyGuardCycle(cycle.ID)
+	if got.Status != store.CopyGuardCycleLossCapped {
+		t.Fatalf("cycle must be flagged CYCLE_LOSS_CAPPED: %+v", got)
+	}
+	if got.ClosedAt != nil {
+		t.Fatalf("capped cycle stays open until the leader closes: %+v", got)
+	}
+	events, err := st.CopyTrade().ListCopyGuardEvents(cycle.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, ev := range events {
+		if ev.Type == "CYCLE_LOSS_BREAKER" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("CYCLE_LOSS_BREAKER event must be recorded")
+	}
+}
+
+// ============================================================================
+// v4.1 冷却递增上限：高倍率 × 高重入次数不得溢出为负冷却（等于绕过冷却）
+// ============================================================================
+
+func TestReentryCooldownEscalationClampsInsteadOfOverflow(t *testing.T) {
+	e, st := newReentryTestEngine(t)
+	e.config.RiskMaxReentries = 10
+	e.config.RiskReentryCooldownSeconds = 86400
+	e.config.RiskReentryCooldownEscalation = 10
+	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700) // stopped_at = 刚刚
+	// 86400s × 10^9 转 time.Duration 会越过 int64 纳秒上限；未钳制时溢出为
+	// 负值 → coolingDown 恒 false → 冷却被绕过
+	if _, err := st.DB().Exec(`UPDATE copy_guard_cycles SET reentry_count=9 WHERE id=?`, cycle.ID); err != nil {
+		t.Fatal(err)
+	}
+	_ = st.CopyTrade().UpdateCopyGuardObservation(cycle.ID, store.CopyGuardStoppedWatching, 1700, 1660, 34)
+	e.leaderState.Positions["ETHUSDT_long"] = &Position{Symbol: "ETHUSDT", Side: SideLong, Size: 1, EntryPrice: 1700, MarkPrice: 1690, MarginMode: "cross", PosID: "leader-pos"}
+
+	e.checkReentryConditions()
+	select {
+	case <-e.decisionCh:
+		t.Fatal("escalated cooldown must clamp to a large positive value, not overflow and bypass")
+	default:
+	}
+	got, _ := st.CopyTrade().GetCopyGuardCycle(cycle.ID)
+	if got.Status != store.CopyGuardStoppedWatching {
+		t.Fatalf("cooling cycle keeps watching: %+v", got)
+	}
+}
+
+// ============================================================================
 // 观察期领航员反手 → 周期以 LEADER_REVERSED 闭合（L3）
 // ============================================================================
 

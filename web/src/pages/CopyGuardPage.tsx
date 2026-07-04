@@ -24,6 +24,7 @@ const statusLabels: Record<string, string> = {
   LEADER_REVERSED: '领航员已反手',
   ATTEMPTS_EXHAUSTED: '重入次数用尽·等待领航员平仓',
   WATCH_TIMEOUT: '观察超时·等待领航员平仓',
+  CYCLE_LOSS_CAPPED: '周期亏损熔断·等待领航员平仓',
 }
 const protectionLabels: Record<string, string> = {
   PENDING: '待建立',
@@ -75,6 +76,9 @@ const eventLabels: Record<string, string> = {
   REENTRY_REQUESTED: '重入条件满足，已请求下单',
   REENTRY_RECOVERED_AFTER_RESTART: '重启后重入状态已恢复',
   REENTRY_RECOVERY_PENDING: '重启后重入状态待确认',
+  ADDON_RISK_WARNING: '加仓风险告警（仍跟随）',
+  ADDON_SKIPPED_BUDGET: '加仓超预算被拦截（旧版）',
+  CYCLE_LOSS_BREAKER: '周期亏损熔断触发',
 }
 
 const baselineSourceLabels: Record<string, string> = {
@@ -286,6 +290,7 @@ export function CopyGuardPage() {
           <option value="LEADER_REVERSED">领航员反手</option>
           <option value="ATTEMPTS_EXHAUSTED">次数耗尽</option>
           <option value="WATCH_TIMEOUT">观察超时</option>
+          <option value="CYCLE_LOSS_CAPPED">周期亏损熔断</option>
         </select>
         <select
           value={resultType}

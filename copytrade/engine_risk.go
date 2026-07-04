@@ -637,14 +637,22 @@ func (e *Engine) checkReentryConditions() {
 					terminalWatchStatus = store.CopyGuardCycleLossCapped
 				}
 			}
-			// v4.1 冷却时间逐次加严：第 N 次重入的冷却 = 基础冷却 × 倍率^N
+			// v4.1 冷却时间逐次加严：第 N 次重入的冷却 = 基础冷却 × 倍率^N。
+			// 上限 7 天：无界指数（86400s × 10^10）转 time.Duration 会越过
+			// int64 纳秒上限，Go 中越界 float→int 转换结果未定义（amd64 上
+			// 变负数），负冷却等于冷却被绕过；7 天在实践上已等价于本周期
+			// 不再重入（观察超时 / 领航员平仓会先结束周期）。
 			cooldown := time.Duration(e.config.RiskReentryCooldownSeconds) * time.Second
 			if v4Cycle.ReentryCount > 0 {
 				esc := e.config.RiskReentryCooldownEscalation
 				if esc < 1 {
 					esc = 1
 				}
-				cooldown = time.Duration(float64(cooldown) * math.Pow(esc, float64(v4Cycle.ReentryCount)))
+				scaled := float64(cooldown) * math.Pow(esc, float64(v4Cycle.ReentryCount))
+				if max := float64(7 * 24 * time.Hour); scaled > max {
+					scaled = max
+				}
+				cooldown = time.Duration(scaled)
 			}
 			coolingDown = v4Cycle.StoppedAt != nil && time.Since(*v4Cycle.StoppedAt) < cooldown
 		}
