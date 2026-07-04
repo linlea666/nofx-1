@@ -77,10 +77,29 @@ type CopyTradeConfig struct {
 	RiskReentryMaxATRExpansion float64 `json:"risk_reentry_max_atr_expansion"`
 	RiskWatchTimeoutMinutes    int     `json:"risk_watch_timeout_minutes"`
 	RiskMigrationConfirmed     bool    `json:"risk_migration_confirmed"`
-	// RiskAddonBudgetPct: 加仓账户风险预算（v4）。跟随领航员加仓前预估
-	// "加仓后总敞口按当前止损距离全损"占账户权益的比例，超过该预算则拒绝
-	// 跟随本次加仓（已有仓位与止损单不动）。默认 0.15 (=15%)；1.0 = 实际不限制。
+	// RiskAddonBudgetPct: 加仓账户风险预算（v4）。跟随领航员加仓时预估
+	// "加仓后总敞口按当前止损距离全损"占账户权益的比例，超过该预算则记录
+	// ADDON_RISK_WARNING 告警事件。仅告警不拦截（兜底风控不干扰领航员的
+	// 开/加/减/平动作）。默认 0.15 (=15%)；1.0 = 不告警。
 	RiskAddonBudgetPct float64 `json:"risk_addon_budget_pct"`
+	// RiskStopNoiseFloorATR: 止损距离噪音下限（v4，单位 ATR 倍数）。保证金
+	// cap / ATR 线取最紧后，止损距离不得低于该下限——防止高杠杆（如 100x）
+	// 下"保证金 30%"折算成 0.3% 价格距离、被正常波动反复扫损（ETH cycle
+	// 40/50 churn 的根因）。账户硬兜底线不受此下限约束。默认 1.0。
+	RiskStopNoiseFloorATR float64 `json:"risk_stop_noise_floor_atr"`
+	// RiskReentryMinRecoveryATR: 重入最小恢复幅度（v4，单位 ATR 倍数）。
+	// 止损后价格必须从止损成交价向有利方向恢复至少该幅度才允许重入，
+	// 防止"刚止损又原地接回"。默认 0.5。
+	RiskReentryMinRecoveryATR float64 `json:"risk_reentry_min_recovery_atr"`
+	// RiskReentryCooldownEscalation: 第 N 次重入冷却时间倍率（v4）。
+	// 实际冷却 = cooldown_seconds × escalation^已重入次数。默认 3。
+	RiskReentryCooldownEscalation float64 `json:"risk_reentry_cooldown_escalation"`
+	// RiskReentryRecoveryEscalation: 第 N 次重入最小恢复幅度倍率（v4）。
+	// 实际要求 = min_recovery_atr × escalation^已重入次数。默认 1.5。
+	RiskReentryRecoveryEscalation float64 `json:"risk_reentry_recovery_escalation"`
+	// RiskCycleMaxLossPct: 周期累计亏损熔断（v4）。同一周期已实现亏损达到
+	// 账户权益的该比例后不再重入，只观察至领航员平仓。默认 0.10；1.0 = 不限制。
+	RiskCycleMaxLossPct float64 `json:"risk_cycle_max_loss_pct"`
 
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
@@ -98,7 +117,9 @@ type CopyTradeConfig struct {
 func (c *CopyTradeConfig) FillRiskDefaults() {
 	if c.RiskAccountPct == 0 {
 		if c.RiskPolicyVersion >= 4 {
-			c.RiskAccountPct = 0.02
+			// v4.1：账户线语义为"灾难硬兜底"（任何模式下止损距离的最终封顶），
+			// 默认 20%。日常止损由仓位保证金 30% + ATR 噪音下限主导。
+			c.RiskAccountPct = 0.20
 		} else {
 			c.RiskAccountPct = 0.5
 		}
@@ -110,7 +131,12 @@ func (c *CopyTradeConfig) FillRiskDefaults() {
 		c.RiskATRTimeframe = "1h"
 	}
 	if c.RiskLeverageMaxLoss == 0 {
-		c.RiskLeverageMaxLoss = 0.5
+		if c.RiskPolicyVersion >= 4 {
+			// v4.1：仓位保证金默认止损 30%（默认值而非上限，前端可调更高）
+			c.RiskLeverageMaxLoss = 0.3
+		} else {
+			c.RiskLeverageMaxLoss = 0.5
+		}
 	}
 	if c.RiskReentryRatio == 0 {
 		c.RiskReentryRatio = 0.5
@@ -147,6 +173,21 @@ func (c *CopyTradeConfig) FillRiskDefaults() {
 		}
 		if c.RiskAddonBudgetPct == 0 {
 			c.RiskAddonBudgetPct = 0.15
+		}
+		if c.RiskStopNoiseFloorATR == 0 {
+			c.RiskStopNoiseFloorATR = 1.0
+		}
+		if c.RiskReentryMinRecoveryATR == 0 {
+			c.RiskReentryMinRecoveryATR = 0.5
+		}
+		if c.RiskReentryCooldownEscalation == 0 {
+			c.RiskReentryCooldownEscalation = 3
+		}
+		if c.RiskReentryRecoveryEscalation == 0 {
+			c.RiskReentryRecoveryEscalation = 1.5
+		}
+		if c.RiskCycleMaxLossPct == 0 {
+			c.RiskCycleMaxLossPct = 0.10
 		}
 	}
 }

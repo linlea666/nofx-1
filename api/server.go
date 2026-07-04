@@ -473,6 +473,13 @@ type CopyConfigReq struct {
 	RiskMigrationConfirmed      bool     `json:"risk_migration_confirmed,omitempty"`
 	RiskAddonBudgetPct          float64  `json:"risk_addon_budget_pct,omitempty"`
 	RiskHighRiskConfirmed       bool     `json:"risk_high_risk_confirmed,omitempty"`
+
+	// v4.1 止损噪音下限 / 重入加严（零值由 store.FillRiskDefaults 兜底）
+	RiskStopNoiseFloorATR         float64 `json:"risk_stop_noise_floor_atr,omitempty"`
+	RiskReentryMinRecoveryATR     float64 `json:"risk_reentry_min_recovery_atr,omitempty"`
+	RiskReentryCooldownEscalation float64 `json:"risk_reentry_cooldown_escalation,omitempty"`
+	RiskReentryRecoveryEscalation float64 `json:"risk_reentry_recovery_escalation,omitempty"`
+	RiskCycleMaxLossPct           float64 `json:"risk_cycle_max_loss_pct,omitempty"`
 }
 
 // applyCopyConfigRiskFields 把 CopyConfigReq 中的 v3 风控字段透传到 store.CopyTradeConfig
@@ -510,12 +517,19 @@ func applyCopyConfigRiskFields(copyConfig *store.CopyTradeConfig, req *CopyConfi
 	copyConfig.RiskLiquidationBufferATR = derefFloatDefault(req.RiskLiquidationBufferATR, 0.5)
 	copyConfig.RiskMaxReentries = derefIntDefault(req.RiskMaxReentries, 2)
 	copyConfig.RiskReentryBandATR = derefFloatDefault(req.RiskReentryBandATR, 0.5)
-	copyConfig.RiskReentryCooldownSeconds = derefIntDefault(req.RiskReentryCooldownSeconds, 60)
+	// v4.1：默认冷却 300s（旧默认 60s 在高杠杆震荡下重入过快）
+	copyConfig.RiskReentryCooldownSeconds = derefIntDefault(req.RiskReentryCooldownSeconds, 300)
 	copyConfig.RiskReentryMaxChaseATR = derefFloatDefault(req.RiskReentryMaxChaseATR, 0)
 	copyConfig.RiskReentryMaxATRExpansion = req.RiskReentryMaxATRExpansion
 	copyConfig.RiskWatchTimeoutMinutes = derefIntDefault(req.RiskWatchTimeoutMinutes, 0)
 	copyConfig.RiskMigrationConfirmed = req.RiskMigrationConfirmed
 	copyConfig.RiskAddonBudgetPct = req.RiskAddonBudgetPct
+	// v4.1 止损噪音下限 / 重入加严：零值由 store.FillRiskDefaults 兜底
+	copyConfig.RiskStopNoiseFloorATR = req.RiskStopNoiseFloorATR
+	copyConfig.RiskReentryMinRecoveryATR = req.RiskReentryMinRecoveryATR
+	copyConfig.RiskReentryCooldownEscalation = req.RiskReentryCooldownEscalation
+	copyConfig.RiskReentryRecoveryEscalation = req.RiskReentryRecoveryEscalation
+	copyConfig.RiskCycleMaxLossPct = req.RiskCycleMaxLossPct
 }
 
 // derefBoolDefault 安全解引用 *bool：nil 返回 def，非 nil 返回 *p

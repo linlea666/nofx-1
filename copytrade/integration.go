@@ -197,6 +197,13 @@ func (ti *TraderIntegration) StartCopyTrading() error {
 		RiskWatchTimeoutMinutes:     copyConfig.RiskWatchTimeoutMinutes,
 		RiskMigrationConfirmed:      copyConfig.RiskMigrationConfirmed,
 		RiskAddonBudgetPct:          copyConfig.RiskAddonBudgetPct,
+
+		// v4.1 止损噪音下限 / 重入加严
+		RiskStopNoiseFloorATR:         copyConfig.RiskStopNoiseFloorATR,
+		RiskReentryMinRecoveryATR:     copyConfig.RiskReentryMinRecoveryATR,
+		RiskReentryCooldownEscalation: copyConfig.RiskReentryCooldownEscalation,
+		RiskReentryRecoveryEscalation: copyConfig.RiskReentryRecoveryEscalation,
+		RiskCycleMaxLossPct:           copyConfig.RiskCycleMaxLossPct,
 	}
 	engineConfig.FillRiskDefaults() // 兜底默认值（旧库迁移 / 前端未传时）
 	if err := ValidateRiskPolicyV4(engineConfig); err != nil {
@@ -736,6 +743,11 @@ func (ti *TraderIntegration) pollV4ProtectiveStops() {
 		slippage := cycle.FollowerNotional * math.Abs(fillPrice-stored.TriggerPrice) / stored.TriggerPrice
 		stopPnL := cycle.FollowerNotional*move - fee
 		_ = ti.store.CopyTrade().RecordCopyGuardStop(cycle, atr, fillPrice, stopPnL, fee, slippage, stored.AlgoID, map[string]interface{}{"algo_id": stored.AlgoID, "state": state, "actual_order_id": live.ActualOrderID, "trigger_price": stored.TriggerPrice, "slippage": slippage, "quantity": stored.Quantity})
+		// 快照止损时的领航员均价，供重入保守锚点使用（领航员数据不可得时跳过，
+		// checkReentryConditions 会退回实时均价）
+		if leader != nil && leader.EntryPrice > 0 {
+			_ = ti.store.CopyTrade().SnapshotCopyGuardLeaderEntryAtStop(cycle.ID, leader.EntryPrice)
+		}
 		_ = ti.store.CopyTrade().UpdateCopyGuardProtectiveOrderStatus(cycle.ID, state)
 		_ = ti.store.CopyTrade().UpdateCopyGuardProtectionHealth(cycle.ID, store.CopyGuardProtectionTriggered, 0, "", cycle.FollowerPosID, cycle.EntryOrderID, false)
 	}
@@ -2231,6 +2243,15 @@ func (ti *TraderIntegration) upsertV4Protection(dec *decision.Decision, side str
 		logger.Errorf("❌ [%s] Copy Guard lifecycle missing: %v", ti.traderID, err)
 		return
 	}
+	// 回填开仓时因 API 限流缺失的权益快照（account_equity=0 会让账户级
+	// 保护与周期熔断判定失效）
+	if cycle.AccountEquity <= 0 {
+		if equity := ti.getEquityFunc()(); equity > 0 {
+			if ti.store.CopyTrade().BackfillCopyGuardAccountEquity(cycle.ID, equity) == nil {
+				cycle.AccountEquity = equity
+			}
+		}
+	}
 	followerPosID := ""
 	if positions, posErr := ti.getFreshPositions(); posErr == nil {
 		for _, pos := range positions {
@@ -2339,7 +2360,24 @@ func (ti *TraderIntegration) upsertV4Protection(dec *decision.Decision, side str
 	}
 	_ = ti.store.CopyTrade().UpsertCopyGuardProtectiveOrder(&store.CopyGuardProtectiveOrder{CycleID: cycle.ID, TraderID: ti.traderID, AlgoID: verified.AlgoID, AlgoClientID: verified.ClientID, Symbol: dec.Symbol, Side: side, MarginMode: dec.MarginMode, Quantity: verified.Quantity, TriggerPrice: result.SLPrice, TriggerType: ti.engine.config.RiskTriggerPriceType, Status: "live"})
 	_ = ti.store.CopyTrade().UpdateCopyGuardProtectionHealth(cycle.ID, store.CopyGuardProtectionVerified, coverage, "", followerPosID, "", false)
-	_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "PROTECTIVE_STOP_ACTIVE", Price: result.SLPrice, Quantity: quantity, Metadata: map[string]interface{}{"algo_id": live.AlgoID, "expected_loss_pct": result.ExpectedLossPct, "governed_by": result.GovernedBy}})
+	slDistancePct := float64(0)
+	if entryPrice > 0 {
+		slDistancePct = result.SLDistance / entryPrice
+	}
+	_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "PROTECTIVE_STOP_ACTIVE", Price: result.SLPrice, Quantity: quantity, Metadata: map[string]interface{}{
+		"algo_id":           live.AlgoID,
+		"expected_loss_pct": result.ExpectedLossPct,
+		"expected_loss_usd": result.ExpectedLossUSD,
+		"governed_by":       result.GovernedBy,
+		"noise_conflict":    result.NoiseConflict,
+		"entry_price":       entryPrice,
+		"sl_distance":       result.SLDistance,
+		"sl_distance_pct":   slDistancePct,
+		"atr_value":         result.ATRValue,
+		"atr_distance":      result.ATRDistance,
+		"leverage":          dec.Leverage,
+		"account_equity":    cycle.AccountEquity,
+	}})
 }
 
 // isProtectiveStopFired reports whether the OKX algo state means the stop has

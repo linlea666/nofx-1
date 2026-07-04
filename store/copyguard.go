@@ -18,6 +18,9 @@ const (
 	CopyGuardLeaderReversed    = "LEADER_REVERSED"
 	CopyGuardAttemptsExhausted = "ATTEMPTS_EXHAUSTED"
 	CopyGuardWatchTimeout      = "WATCH_TIMEOUT"
+	// CYCLE_LOSS_CAPPED: 周期累计已实现亏损触达 risk_cycle_max_loss_pct 熔断线，
+	// 不再重入，仅观察至领航员平仓（与 ATTEMPTS_EXHAUSTED 同为终态观察）。
+	CopyGuardCycleLossCapped = "CYCLE_LOSS_CAPPED"
 )
 
 const (
@@ -61,45 +64,62 @@ type CopyGuardPolicy struct {
 	WatchTimeoutMinutes   int     `json:"watch_timeout_minutes"`
 	MigrationConfirmed    bool    `json:"migration_confirmed"`
 	AddonBudgetPct        float64 `json:"addon_budget_pct"`
+	// v4.1 止损噪音下限 / 重入加严（字段含义见 store.CopyTradeConfig 同名注释）
+	StopNoiseFloorATR         float64 `json:"stop_noise_floor_atr"`
+	ReentryMinRecoveryATR     float64 `json:"reentry_min_recovery_atr"`
+	ReentryCooldownEscalation float64 `json:"reentry_cooldown_escalation"`
+	ReentryRecoveryEscalation float64 `json:"reentry_recovery_escalation"`
+	CycleMaxLossPct           float64 `json:"cycle_max_loss_pct"`
+	// DefaultsVersion: 默认值代次书签。2 = 已应用 v4.1 默认值迁移
+	// （risk_account_pct 0.02→0.20、cooldown 60→300、leverage_max_loss 0.5→0.3）。
+	DefaultsVersion int `json:"defaults_version"`
 }
 
+// copyGuardPolicyDefaultsVersion 当前默认值代次；migrateCopyGuardPolicyDefaults
+// 只处理低于该值的存量策略。
+const copyGuardPolicyDefaultsVersion = 2
+
 type CopyGuardCycle struct {
-	ID                       int64      `json:"id"`
-	TraderID                 string     `json:"trader_id"`
-	TraderName               string     `json:"trader_name,omitempty"`
-	LeaderID                 string     `json:"leader_id"`
-	LeaderPosID              string     `json:"leader_pos_id"`
-	Symbol                   string     `json:"symbol"`
-	Side                     string     `json:"side"`
-	MarginMode               string     `json:"margin_mode"`
-	Status                   string     `json:"status"`
-	PolicySnapshot           string     `json:"policy_snapshot"`
-	LeaderEntryPrice         float64    `json:"leader_entry_price"`
-	FollowerEntryPrice       float64    `json:"follower_entry_price"`
-	FollowerNotional         float64    `json:"follower_notional"`
-	BaselineNotional         float64    `json:"baseline_notional"`
-	BaselineRealizedPnL      float64    `json:"baseline_realized_pnl"`
-	BaselineLeaderSize       float64    `json:"baseline_leader_size"`
-	AccountEquity            float64    `json:"account_equity"`
-	ATRAtEntry               float64    `json:"atr_at_entry"`
-	ATRAtStop                float64    `json:"atr_at_stop"`
-	LastObservedPrice        float64    `json:"last_observed_price"`
-	ReentryCount             int        `json:"reentry_count"`
-	StopCount                int        `json:"stop_count"`
-	ActualPnL                float64    `json:"actual_pnl"`
-	BaselinePnL              float64    `json:"baseline_pnl"`
-	Fees                     float64    `json:"fees"`
-	FundingFee               float64    `json:"funding_fee"`
-	LiquidationPenalty       float64    `json:"liquidation_penalty"`
-	Slippage                 float64    `json:"slippage"`
-	NetGuardEffect           float64    `json:"net_guard_effect"`
-	TrackingDifference       float64    `json:"tracking_difference"`
-	AccountingStatus         string     `json:"accounting_status"`
-	AccountingError          string     `json:"accounting_error"`
+	ID                  int64   `json:"id"`
+	TraderID            string  `json:"trader_id"`
+	TraderName          string  `json:"trader_name,omitempty"`
+	LeaderID            string  `json:"leader_id"`
+	LeaderPosID         string  `json:"leader_pos_id"`
+	Symbol              string  `json:"symbol"`
+	Side                string  `json:"side"`
+	MarginMode          string  `json:"margin_mode"`
+	Status              string  `json:"status"`
+	PolicySnapshot      string  `json:"policy_snapshot"`
+	LeaderEntryPrice    float64 `json:"leader_entry_price"`
+	FollowerEntryPrice  float64 `json:"follower_entry_price"`
+	FollowerNotional    float64 `json:"follower_notional"`
+	BaselineNotional    float64 `json:"baseline_notional"`
+	BaselineRealizedPnL float64 `json:"baseline_realized_pnl"`
+	BaselineLeaderSize  float64 `json:"baseline_leader_size"`
+	AccountEquity       float64 `json:"account_equity"`
+	ATRAtEntry          float64 `json:"atr_at_entry"`
+	ATRAtStop           float64 `json:"atr_at_stop"`
+	// LeaderEntryAtStop: 最近一次止损触发时领航员的持仓均价快照。重入锚点用
+	// 保守值（多单取 max、空单取 min(live, snapshot)），防止领航员止损后摊低
+	// 均价把重入边界拖向更差的位置。
+	LeaderEntryAtStop  float64 `json:"leader_entry_at_stop"`
+	LastObservedPrice  float64 `json:"last_observed_price"`
+	ReentryCount       int     `json:"reentry_count"`
+	StopCount          int     `json:"stop_count"`
+	ActualPnL          float64 `json:"actual_pnl"`
+	BaselinePnL        float64 `json:"baseline_pnl"`
+	Fees               float64 `json:"fees"`
+	FundingFee         float64 `json:"funding_fee"`
+	LiquidationPenalty float64 `json:"liquidation_penalty"`
+	Slippage           float64 `json:"slippage"`
+	NetGuardEffect     float64 `json:"net_guard_effect"`
+	TrackingDifference float64 `json:"tracking_difference"`
+	AccountingStatus   string  `json:"accounting_status"`
+	AccountingError    string  `json:"accounting_error"`
 	// BaselineSource: 未兜底基线的最终价格来源。
 	// "" = 非估算基线；"last_observed" = 最后观测 mark price 估算（待补全）；
 	// "leader_history" = 已用领航员公共历史仓位的 closeAvgPx 校准。
-	BaselineSource string `json:"baseline_source"`
+	BaselineSource           string     `json:"baseline_source"`
 	ProtectionStatus         string     `json:"protection_status"`
 	ProtectionRetries        int        `json:"protection_retries"`
 	ProtectionCoverage       float64    `json:"protection_coverage"`
@@ -240,6 +260,7 @@ func (s *CopyTradeStore) initCopyGuardTables() error {
 			// 2 = own-path 口径（每个 attempt 按自身名义持有到领航员平仓价）。
 			// 仅作启动一次性重算的书签，业务逻辑不读取。
 			`ALTER TABLE copy_guard_cycles ADD COLUMN baseline_version INTEGER DEFAULT 1`,
+			`ALTER TABLE copy_guard_cycles ADD COLUMN leader_entry_at_stop REAL DEFAULT 0`,
 		}
 		for _, migration := range migrations {
 			_, _ = s.db.Exec(migration)
@@ -250,6 +271,8 @@ func (s *CopyTradeStore) initCopyGuardTables() error {
 		// NEEDS_REVIEW was renamed to DELAYED (automatic retry continues);
 		// idempotent so it can run on every startup.
 		_, _ = s.db.Exec(`UPDATE copy_guard_cycles SET accounting_status=? WHERE accounting_status='NEEDS_REVIEW'`, CopyGuardAccountingDelayed)
+		// v4.1 默认值代次迁移（幂等，defaults_version 书签控制）
+		s.migrateCopyGuardPolicyDefaults()
 	}
 	return err
 }
@@ -305,7 +328,7 @@ func (s *CopyTradeStore) ListActiveCopyGuardProtectiveOrders(traderID string) ([
 }
 
 func policyFromConfig(c *CopyTradeConfig) CopyGuardPolicy {
-	return CopyGuardPolicy{Version: c.RiskPolicyVersion, StopMode: c.RiskStopMode, ATRPeriod: c.RiskATRPeriod, ATRCacheMaxAgeMinutes: c.RiskATRCacheMaxAgeMinutes, ATRFallbackPct: c.RiskATRFallbackPct, TriggerPriceType: c.RiskTriggerPriceType, SlippageBufferBPS: c.RiskSlippageBufferBPS, LiquidationBufferATR: c.RiskLiquidationBufferATR, MaxReentries: c.RiskMaxReentries, ReentryBandATR: c.RiskReentryBandATR, ReentryCooldownSec: c.RiskReentryCooldownSeconds, ReentryMaxChaseATR: c.RiskReentryMaxChaseATR, MaxATRExpansion: c.RiskReentryMaxATRExpansion, WatchTimeoutMinutes: c.RiskWatchTimeoutMinutes, MigrationConfirmed: c.RiskMigrationConfirmed, AddonBudgetPct: c.RiskAddonBudgetPct}
+	return CopyGuardPolicy{Version: c.RiskPolicyVersion, StopMode: c.RiskStopMode, ATRPeriod: c.RiskATRPeriod, ATRCacheMaxAgeMinutes: c.RiskATRCacheMaxAgeMinutes, ATRFallbackPct: c.RiskATRFallbackPct, TriggerPriceType: c.RiskTriggerPriceType, SlippageBufferBPS: c.RiskSlippageBufferBPS, LiquidationBufferATR: c.RiskLiquidationBufferATR, MaxReentries: c.RiskMaxReentries, ReentryBandATR: c.RiskReentryBandATR, ReentryCooldownSec: c.RiskReentryCooldownSeconds, ReentryMaxChaseATR: c.RiskReentryMaxChaseATR, MaxATRExpansion: c.RiskReentryMaxATRExpansion, WatchTimeoutMinutes: c.RiskWatchTimeoutMinutes, MigrationConfirmed: c.RiskMigrationConfirmed, AddonBudgetPct: c.RiskAddonBudgetPct, StopNoiseFloorATR: c.RiskStopNoiseFloorATR, ReentryMinRecoveryATR: c.RiskReentryMinRecoveryATR, ReentryCooldownEscalation: c.RiskReentryCooldownEscalation, ReentryRecoveryEscalation: c.RiskReentryRecoveryEscalation, CycleMaxLossPct: c.RiskCycleMaxLossPct, DefaultsVersion: copyGuardPolicyDefaultsVersion}
 }
 
 func (s *CopyTradeStore) saveCopyGuardPolicy(c *CopyTradeConfig) error {
@@ -339,7 +362,63 @@ func (s *CopyTradeStore) loadCopyGuardPolicy(c *CopyTradeConfig) error {
 	c.RiskReentryMaxATRExpansion, c.RiskWatchTimeoutMinutes = p.MaxATRExpansion, p.WatchTimeoutMinutes
 	c.RiskMigrationConfirmed = p.MigrationConfirmed
 	c.RiskAddonBudgetPct = p.AddonBudgetPct
+	c.RiskStopNoiseFloorATR = p.StopNoiseFloorATR
+	c.RiskReentryMinRecoveryATR = p.ReentryMinRecoveryATR
+	c.RiskReentryCooldownEscalation = p.ReentryCooldownEscalation
+	c.RiskReentryRecoveryEscalation = p.ReentryRecoveryEscalation
+	c.RiskCycleMaxLossPct = p.CycleMaxLossPct
 	return nil
+}
+
+// migrateCopyGuardPolicyDefaults 一次性把存量 v4 策略从旧默认值迁移到 v4.1 默认值：
+//   - risk_account_pct：0.02（旧默认，太紧、易被波动触发）→ 0.20（灾难硬兜底语义）
+//   - risk_leverage_max_loss：0.5（旧默认）→ 0.3（仓位保证金默认止损 30%）
+//   - reentry_cooldown_seconds：60（旧默认）→ 300
+//
+// 仅当存量值等于旧默认值时才替换（用户显式改过的值保留）；处理后写入
+// defaults_version=2，幂等且不会覆盖之后用户再设回旧值的选择。
+func (s *CopyTradeStore) migrateCopyGuardPolicyDefaults() {
+	rows, err := s.db.Query(`SELECT trader_id, policy_json FROM copy_guard_policies`)
+	if err != nil {
+		return
+	}
+	type pendingPolicy struct {
+		traderID string
+		policy   CopyGuardPolicy
+	}
+	var pending []pendingPolicy
+	for rows.Next() {
+		var traderID, raw string
+		if err := rows.Scan(&traderID, &raw); err != nil {
+			continue
+		}
+		var p CopyGuardPolicy
+		if err := json.Unmarshal([]byte(raw), &p); err != nil {
+			continue
+		}
+		if p.Version < 4 || p.DefaultsVersion >= copyGuardPolicyDefaultsVersion {
+			continue
+		}
+		pending = append(pending, pendingPolicy{traderID: traderID, policy: p})
+	}
+	rows.Close()
+	for _, item := range pending {
+		p := item.policy
+		if p.ReentryCooldownSec == 60 {
+			p.ReentryCooldownSec = 300
+		}
+		p.DefaultsVersion = copyGuardPolicyDefaultsVersion
+		b, err := json.Marshal(p)
+		if err != nil {
+			continue
+		}
+		if _, err := s.db.Exec(`UPDATE copy_guard_policies SET policy_json=?, updated_at=CURRENT_TIMESTAMP WHERE trader_id=?`, string(b), item.traderID); err != nil {
+			continue
+		}
+		// 主表列：仅把等于旧默认值的行替换为新默认值
+		_, _ = s.db.Exec(`UPDATE copy_trade_configs SET risk_account_pct=0.20 WHERE trader_id=? AND risk_account_pct=0.02`, item.traderID)
+		_, _ = s.db.Exec(`UPDATE copy_trade_configs SET risk_leverage_max_loss=0.30 WHERE trader_id=? AND risk_leverage_max_loss=0.50`, item.traderID)
+	}
 }
 
 func (s *CopyTradeStore) EnsureCopyGuardCycle(c *CopyGuardCycle) (*CopyGuardCycle, error) {
@@ -378,13 +457,13 @@ func (s *CopyTradeStore) GetOpenCopyGuardCycle(traderID, leaderPosID string) (*C
 
 type rowScanner interface{ Scan(...interface{}) error }
 
-const copyGuardCycleSelect = `SELECT id,trader_id,leader_id,leader_pos_id,symbol,side,margin_mode,status,policy_snapshot,leader_entry_price,follower_entry_price,follower_notional,baseline_notional,baseline_realized_pnl,baseline_leader_size,account_equity,atr_at_entry,atr_at_stop,last_observed_price,reentry_count,stop_count,actual_pnl,baseline_pnl,fees,funding_fee,liquidation_penalty,slippage,net_guard_effect,tracking_difference,accounting_status,accounting_error,baseline_source,protection_status,protection_retries,protection_coverage,protection_error,protection_missing_seconds,follower_pos_id,entry_order_id,exit_order_id,protection_missing_at,protection_last_retry_at,pending_since,reconciled_at,opened_at,stopped_at,closed_at,updated_at FROM copy_guard_cycles`
+const copyGuardCycleSelect = `SELECT id,trader_id,leader_id,leader_pos_id,symbol,side,margin_mode,status,policy_snapshot,leader_entry_price,follower_entry_price,follower_notional,baseline_notional,baseline_realized_pnl,baseline_leader_size,account_equity,atr_at_entry,atr_at_stop,leader_entry_at_stop,last_observed_price,reentry_count,stop_count,actual_pnl,baseline_pnl,fees,funding_fee,liquidation_penalty,slippage,net_guard_effect,tracking_difference,accounting_status,accounting_error,baseline_source,protection_status,protection_retries,protection_coverage,protection_error,protection_missing_seconds,follower_pos_id,entry_order_id,exit_order_id,protection_missing_at,protection_last_retry_at,pending_since,reconciled_at,opened_at,stopped_at,closed_at,updated_at FROM copy_guard_cycles`
 
 func scanCopyGuardCycle(row rowScanner) (*CopyGuardCycle, error) {
 	var c CopyGuardCycle
 	var opened, updated string
 	var stopped, closed, missing, lastRetry, pending, reconciled sql.NullString
-	err := row.Scan(&c.ID, &c.TraderID, &c.LeaderID, &c.LeaderPosID, &c.Symbol, &c.Side, &c.MarginMode, &c.Status, &c.PolicySnapshot, &c.LeaderEntryPrice, &c.FollowerEntryPrice, &c.FollowerNotional, &c.BaselineNotional, &c.BaselineRealizedPnL, &c.BaselineLeaderSize, &c.AccountEquity, &c.ATRAtEntry, &c.ATRAtStop, &c.LastObservedPrice, &c.ReentryCount, &c.StopCount, &c.ActualPnL, &c.BaselinePnL, &c.Fees, &c.FundingFee, &c.LiquidationPenalty, &c.Slippage, &c.NetGuardEffect, &c.TrackingDifference, &c.AccountingStatus, &c.AccountingError, &c.BaselineSource, &c.ProtectionStatus, &c.ProtectionRetries, &c.ProtectionCoverage, &c.ProtectionError, &c.ProtectionMissingSeconds, &c.FollowerPosID, &c.EntryOrderID, &c.ExitOrderID, &missing, &lastRetry, &pending, &reconciled, &opened, &stopped, &closed, &updated)
+	err := row.Scan(&c.ID, &c.TraderID, &c.LeaderID, &c.LeaderPosID, &c.Symbol, &c.Side, &c.MarginMode, &c.Status, &c.PolicySnapshot, &c.LeaderEntryPrice, &c.FollowerEntryPrice, &c.FollowerNotional, &c.BaselineNotional, &c.BaselineRealizedPnL, &c.BaselineLeaderSize, &c.AccountEquity, &c.ATRAtEntry, &c.ATRAtStop, &c.LeaderEntryAtStop, &c.LastObservedPrice, &c.ReentryCount, &c.StopCount, &c.ActualPnL, &c.BaselinePnL, &c.Fees, &c.FundingFee, &c.LiquidationPenalty, &c.Slippage, &c.NetGuardEffect, &c.TrackingDifference, &c.AccountingStatus, &c.AccountingError, &c.BaselineSource, &c.ProtectionStatus, &c.ProtectionRetries, &c.ProtectionCoverage, &c.ProtectionError, &c.ProtectionMissingSeconds, &c.FollowerPosID, &c.EntryOrderID, &c.ExitOrderID, &missing, &lastRetry, &pending, &reconciled, &opened, &stopped, &closed, &updated)
 	if err != nil {
 		return nil, err
 	}
@@ -528,6 +607,26 @@ func (s *CopyTradeStore) UpdateCopyGuardObservedPrice(traderID, leaderPosID stri
 		return nil
 	}
 	_, err := s.db.Exec(`UPDATE copy_guard_cycles SET last_observed_price=?,updated_at=CURRENT_TIMESTAMP WHERE trader_id=? AND leader_pos_id=? AND closed_at IS NULL`, lastPrice, traderID, leaderPosID)
+	return err
+}
+
+// SnapshotCopyGuardLeaderEntryAtStop 记录止损触发时的领航员持仓均价快照，
+// 供重入锚点取保守值（见 CopyGuardCycle.LeaderEntryAtStop）。
+func (s *CopyTradeStore) SnapshotCopyGuardLeaderEntryAtStop(id int64, price float64) error {
+	if price <= 0 {
+		return nil
+	}
+	_, err := s.db.Exec(`UPDATE copy_guard_cycles SET leader_entry_at_stop=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND closed_at IS NULL`, price, id)
+	return err
+}
+
+// BackfillCopyGuardAccountEquity 回填开仓时因 API 限流（OKX 50011）等原因
+// 未取到的账户权益快照；仅在当前值为 0 时写入，不覆盖真实快照。
+func (s *CopyTradeStore) BackfillCopyGuardAccountEquity(id int64, equity float64) error {
+	if equity <= 0 {
+		return nil
+	}
+	_, err := s.db.Exec(`UPDATE copy_guard_cycles SET account_equity=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND account_equity<=0`, equity, id)
 	return err
 }
 
@@ -1039,40 +1138,40 @@ func (s *CopyTradeStore) ListCopyGuardAttempts(cycleID int64) ([]*CopyGuardAttem
 }
 
 type CopyGuardSummary struct {
-	FollowerCount            int                   `json:"follower_count"`
-	CycleCount               int                   `json:"cycle_count"`
-	StopCount                int                   `json:"stop_count"`
-	ReentryCount             int                   `json:"reentry_count"`
-	ActualPnL                float64               `json:"actual_pnl"`
-	BaselinePnL              float64               `json:"baseline_pnl"`
-	AvoidedLoss              float64               `json:"avoided_loss"`
-	OpportunityCost          float64               `json:"opportunity_cost"`
-	NetGuardEffect           float64               `json:"net_guard_effect"`
-	Fees                     float64               `json:"fees"`
-	FundingFee               float64               `json:"funding_fee"`
-	LiquidationPenalty       float64               `json:"liquidation_penalty"`
-	Slippage                 float64               `json:"slippage"`
-	ProtectedCount           int                   `json:"protected_count"`
-	PendingProtectionCount   int                   `json:"pending_protection_count"`
-	UnknownCount             int                   `json:"unknown_count"`
-	DegradedCount            int                   `json:"degraded_count"`
-	AccountingPendingCount   int                   `json:"accounting_pending_count"`
+	FollowerCount          int     `json:"follower_count"`
+	CycleCount             int     `json:"cycle_count"`
+	StopCount              int     `json:"stop_count"`
+	ReentryCount           int     `json:"reentry_count"`
+	ActualPnL              float64 `json:"actual_pnl"`
+	BaselinePnL            float64 `json:"baseline_pnl"`
+	AvoidedLoss            float64 `json:"avoided_loss"`
+	OpportunityCost        float64 `json:"opportunity_cost"`
+	NetGuardEffect         float64 `json:"net_guard_effect"`
+	Fees                   float64 `json:"fees"`
+	FundingFee             float64 `json:"funding_fee"`
+	LiquidationPenalty     float64 `json:"liquidation_penalty"`
+	Slippage               float64 `json:"slippage"`
+	ProtectedCount         int     `json:"protected_count"`
+	PendingProtectionCount int     `json:"pending_protection_count"`
+	UnknownCount           int     `json:"unknown_count"`
+	DegradedCount          int     `json:"degraded_count"`
+	AccountingPendingCount int     `json:"accounting_pending_count"`
 	// AccountingDelayedCount: cycles whose OKX settlement data is late; the
 	// system keeps retrying automatically (formerly "needs review").
-	AccountingDelayedCount       int `json:"accounting_delayed_count"`
-	AccountingUnrecoverableCount int `json:"accounting_unrecoverable_count"`
-	LegacyUnverifiedCount        int `json:"legacy_unverified_count"`
-	AverageCoverage          float64               `json:"average_coverage"`
-	IgnoredCount             int                   `json:"ignored_count"`
-	ReentryFirst             int                   `json:"reentry_first"`
-	ReentrySecond            int                   `json:"reentry_second"`
-	ReentryThirdPlus         int                   `json:"reentry_third_plus"`
-	MaxAvoidedLoss           float64               `json:"max_avoided_loss"`
-	MaxOpportunityCost       float64               `json:"max_opportunity_cost"`
-	ProtectionMissingSeconds float64               `json:"protection_missing_seconds"`
-	ReentrySuccessRate       float64               `json:"reentry_success_rate"`
-	FalseKillRate            float64               `json:"false_kill_rate"`
-	Trend                    []CopyGuardTrendPoint `json:"trend"`
+	AccountingDelayedCount       int                   `json:"accounting_delayed_count"`
+	AccountingUnrecoverableCount int                   `json:"accounting_unrecoverable_count"`
+	LegacyUnverifiedCount        int                   `json:"legacy_unverified_count"`
+	AverageCoverage              float64               `json:"average_coverage"`
+	IgnoredCount                 int                   `json:"ignored_count"`
+	ReentryFirst                 int                   `json:"reentry_first"`
+	ReentrySecond                int                   `json:"reentry_second"`
+	ReentryThirdPlus             int                   `json:"reentry_third_plus"`
+	MaxAvoidedLoss               float64               `json:"max_avoided_loss"`
+	MaxOpportunityCost           float64               `json:"max_opportunity_cost"`
+	ProtectionMissingSeconds     float64               `json:"protection_missing_seconds"`
+	ReentrySuccessRate           float64               `json:"reentry_success_rate"`
+	FalseKillRate                float64               `json:"false_kill_rate"`
+	Trend                        []CopyGuardTrendPoint `json:"trend"`
 }
 
 type CopyGuardTrendPoint struct {

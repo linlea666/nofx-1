@@ -115,7 +115,13 @@ interface FormState {
   risk_reentry_max_atr_expansion: number
   risk_watch_timeout_minutes: number
   risk_migration_confirmed: boolean
-  risk_addon_budget_pct: number // 默认 15%（提交时 /100 转 0.15）：加仓账户风险预算，100 = 不限制
+  risk_addon_budget_pct: number // 默认 15%（提交时 /100 转 0.15）：加仓账户风险预算（v4.1 起仅告警不拦截），100 = 不告警
+  // v4.1 止损噪音下限 / 重入加严
+  risk_stop_noise_floor_atr: number // 默认 1.0：止损距离噪音下限（ATR 倍数）
+  risk_reentry_min_recovery_atr: number // 默认 0.5：重入最小恢复幅度（ATR 倍数）
+  risk_reentry_cooldown_escalation: number // 默认 3：第 N 次重入冷却倍率
+  risk_reentry_recovery_escalation: number // 默认 1.5：第 N 次重入恢复幅度倍率
+  risk_cycle_max_loss_pct: number // 默认 10%（提交时 /100 转 0.10）：周期累计亏损熔断，100 = 不限制
 }
 
 interface TraderConfigModalProps {
@@ -154,14 +160,14 @@ export function TraderConfigModal({
     copy_sync_margin_mode: true, // 默认同步保证金模式
     copy_binance_p20t: '',
     copy_binance_csrf_token: '',
-    // 账户保护 v3 风控默认值（与后端 store.FillRiskDefaults 保持一致）
+    // 账户保护 v4.1 风控默认值（与后端 store.FillRiskDefaults 保持一致）
     risk_stop_loss_enabled: true,
-    risk_account_pct: 2,
+    risk_account_pct: 20, // v4.1：灾难硬兜底默认 20%
     risk_atr_enabled: true,
     risk_atr_multiplier: 1.5,
     risk_atr_timeframe: '1h',
     risk_leverage_fallback: true,
-    risk_leverage_max_loss: 50, // %（提交时 /100 转 0.5）
+    risk_leverage_max_loss: 30, // %（提交时 /100 转 0.3）—— v4.1 默认 30%，可调更高
     risk_reentry_enabled: true,
     risk_reentry_ratio: 50, // %（提交时 /100 转 0.5）
     risk_reentry_tolerance: 2, // %（提交时 /100 转 0.02）—— v3.3 单边严格区间需更宽容差
@@ -177,12 +183,18 @@ export function TraderConfigModal({
     risk_liquidation_buffer_atr: 0.5,
     risk_max_reentries: 2,
     risk_reentry_band_atr: 0.5,
-    risk_reentry_cooldown_seconds: 60,
+    risk_reentry_cooldown_seconds: 300, // v4.1：默认冷却 300s
     risk_reentry_max_chase_atr: 0,
     risk_reentry_max_atr_expansion: 2,
     risk_watch_timeout_minutes: 0,
     risk_migration_confirmed: true,
     risk_addon_budget_pct: 15,
+    // v4.1 止损噪音下限 / 重入加严
+    risk_stop_noise_floor_atr: 1.0,
+    risk_reentry_min_recovery_atr: 0.5,
+    risk_reentry_cooldown_escalation: 3,
+    risk_reentry_recovery_escalation: 1.5,
+    risk_cycle_max_loss_pct: 10,
   })
   const [, setCopyTradeConfig] = useState<CopyTradeConfig | null>(null)
   const [isSaving, setIsSaving] = useState(false)
@@ -280,7 +292,7 @@ export function TraderConfigModal({
               cfg.risk_account_pct != null
                 ? cfg.risk_account_pct * 100
                 : (cfg.risk_policy_version ?? 3) >= 4
-                  ? 2
+                  ? 20
                   : 50,
             risk_atr_enabled: cfg.risk_atr_enabled ?? true,
             risk_atr_multiplier: cfg.risk_atr_multiplier ?? 1.5,
@@ -289,7 +301,9 @@ export function TraderConfigModal({
             risk_leverage_max_loss:
               cfg.risk_leverage_max_loss != null
                 ? cfg.risk_leverage_max_loss * 100
-                : 50,
+                : (cfg.risk_policy_version ?? 3) >= 4
+                  ? 30
+                  : 50,
             risk_reentry_enabled:
               cfg.risk_reentry_enabled ?? (cfg.risk_policy_version ?? 3) >= 4,
             risk_reentry_ratio:
@@ -319,7 +333,7 @@ export function TraderConfigModal({
             risk_max_reentries: cfg.risk_max_reentries ?? 2,
             risk_reentry_band_atr: cfg.risk_reentry_band_atr ?? 0.5,
             risk_reentry_cooldown_seconds:
-              cfg.risk_reentry_cooldown_seconds ?? 60,
+              cfg.risk_reentry_cooldown_seconds ?? 300,
             risk_reentry_max_chase_atr: cfg.risk_reentry_max_chase_atr ?? 0,
             risk_reentry_max_atr_expansion:
               cfg.risk_reentry_max_atr_expansion ?? 2,
@@ -329,6 +343,19 @@ export function TraderConfigModal({
               cfg.risk_addon_budget_pct != null && cfg.risk_addon_budget_pct > 0
                 ? cfg.risk_addon_budget_pct * 100
                 : 15,
+            // v4.1 止损噪音下限 / 重入加严
+            risk_stop_noise_floor_atr: cfg.risk_stop_noise_floor_atr ?? 1.0,
+            risk_reentry_min_recovery_atr:
+              cfg.risk_reentry_min_recovery_atr ?? 0.5,
+            risk_reentry_cooldown_escalation:
+              cfg.risk_reentry_cooldown_escalation ?? 3,
+            risk_reentry_recovery_escalation:
+              cfg.risk_reentry_recovery_escalation ?? 1.5,
+            risk_cycle_max_loss_pct:
+              cfg.risk_cycle_max_loss_pct != null &&
+              cfg.risk_cycle_max_loss_pct > 0
+                ? cfg.risk_cycle_max_loss_pct * 100
+                : 10,
           }))
         }
       } catch (error) {
@@ -370,12 +397,12 @@ export function TraderConfigModal({
         copy_binance_csrf_token: '',
         // 风控默认值（与 useState 初始值保持一致）
         risk_stop_loss_enabled: true,
-        risk_account_pct: 2,
+        risk_account_pct: 20,
         risk_atr_enabled: true,
         risk_atr_multiplier: 1.5,
         risk_atr_timeframe: '1h',
         risk_leverage_fallback: true,
-        risk_leverage_max_loss: 50,
+        risk_leverage_max_loss: 30,
         risk_reentry_enabled: true,
         risk_reentry_ratio: 50,
         risk_reentry_tolerance: 2,
@@ -391,12 +418,17 @@ export function TraderConfigModal({
         risk_liquidation_buffer_atr: 0.5,
         risk_max_reentries: 2,
         risk_reentry_band_atr: 0.5,
-        risk_reentry_cooldown_seconds: 60,
+        risk_reentry_cooldown_seconds: 300,
         risk_reentry_max_chase_atr: 0,
         risk_reentry_max_atr_expansion: 2,
         risk_watch_timeout_minutes: 0,
         risk_migration_confirmed: true,
         risk_addon_budget_pct: 15,
+        risk_stop_noise_floor_atr: 1.0,
+        risk_reentry_min_recovery_atr: 0.5,
+        risk_reentry_cooldown_escalation: 3,
+        risk_reentry_recovery_escalation: 1.5,
+        risk_cycle_max_loss_pct: 10,
       })
     }
   }, [traderData, isEditMode, availableModels, availableExchanges])
@@ -441,18 +473,19 @@ export function TraderConfigModal({
   const handleSave = async () => {
     if (!onSave) return
 
+    // v4.1：账户线语义为"灾难硬兜底"（默认 20%），确认阈值相应上调到 50%
     let highRiskConfirmed = false
     if (
       formData.decision_mode === 'copy_trade' &&
       formData.risk_policy_version >= 4 &&
-      formData.risk_account_pct >= 10 &&
+      formData.risk_account_pct >= 50 &&
       !window.confirm(
-        `预计账户风险警戒为 ${formData.risk_account_pct.toFixed(2)}%，属于极高风险配置。确认仍要保存吗？`
+        `账户灾难兜底线为 ${formData.risk_account_pct.toFixed(2)}%，属于极高风险配置。确认仍要保存吗？`
       )
     ) {
       return
     }
-    if (formData.risk_policy_version >= 4 && formData.risk_account_pct >= 10) {
+    if (formData.risk_policy_version >= 4 && formData.risk_account_pct >= 50) {
       highRiskConfirmed = true
     }
 
@@ -523,6 +556,15 @@ export function TraderConfigModal({
           risk_migration_confirmed: formData.risk_migration_confirmed,
           risk_addon_budget_pct: formData.risk_addon_budget_pct / 100,
           risk_high_risk_confirmed: highRiskConfirmed,
+          // v4.1 止损噪音下限 / 重入加严
+          risk_stop_noise_floor_atr: formData.risk_stop_noise_floor_atr,
+          risk_reentry_min_recovery_atr:
+            formData.risk_reentry_min_recovery_atr,
+          risk_reentry_cooldown_escalation:
+            formData.risk_reentry_cooldown_escalation,
+          risk_reentry_recovery_escalation:
+            formData.risk_reentry_recovery_escalation,
+          risk_cycle_max_loss_pct: formData.risk_cycle_max_loss_pct / 100,
         }
         // Binance 数据源额外携带 Web 私有接口凭证
         if (formData.copy_provider_type === 'binance') {
@@ -1177,8 +1219,8 @@ export function TraderConfigModal({
                             <div className="grid grid-cols-2 gap-3">
                               <div className="col-span-2 flex items-center justify-between rounded border border-[#F0B90B44] bg-[#F0B90B0D] p-3 text-xs">
                                 <span className="text-[#848E9C]">
-                                  推荐：ATR14 / 1小时 /
-                                  1.5倍，风险警戒2%，重入50%×2次
+                                  推荐：ATR14 / 1小时 / 1.5倍，仓位止损30% +
+                                  噪音下限1×ATR，账户兜底20%，重入50%×2次（冷却300s）
                                 </span>
                                 <button
                                   type="button"
@@ -1193,17 +1235,24 @@ export function TraderConfigModal({
                                       risk_atr_multiplier: 1.5,
                                       risk_atr_timeframe: '1h',
                                       risk_atr_fallback_pct: 2,
-                                      risk_account_pct: 2,
+                                      risk_account_pct: 20,
+                                      risk_leverage_fallback: true,
+                                      risk_leverage_max_loss: 30,
                                       risk_slippage_buffer_bps: 10,
                                       risk_liquidation_buffer_atr: 0.5,
                                       risk_reentry_enabled: true,
                                       risk_reentry_ratio: 50,
                                       risk_max_reentries: 2,
                                       risk_reentry_band_atr: 0.5,
-                                      risk_reentry_cooldown_seconds: 60,
+                                      risk_reentry_cooldown_seconds: 300,
                                       risk_reentry_max_chase_atr: 0,
                                       risk_reentry_max_atr_expansion: 2,
                                       risk_watch_timeout_minutes: 0,
+                                      risk_stop_noise_floor_atr: 1.0,
+                                      risk_reentry_min_recovery_atr: 0.5,
+                                      risk_reentry_cooldown_escalation: 3,
+                                      risk_reentry_recovery_escalation: 1.5,
+                                      risk_cycle_max_loss_pct: 10,
                                     }))
                                   }
                                 >
@@ -1356,18 +1405,21 @@ export function TraderConfigModal({
                                   className="mt-1 w-full px-2 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF]"
                                 />
                                 <p className="text-xs text-[#848E9C] mt-1">
-                                  领航员加仓时，若加仓后总敞口的预期止损损失超过账户权益的此比例，则拒绝跟随本次加仓（已有仓位与止损单不动）。100
-                                  = 不限制
+                                  领航员加仓时，若加仓后总敞口的预期止损损失超过账户权益的此比例，仍会跟随加仓，但记录风险告警事件（不拦截，保证与领航员动作一致）。100
+                                  = 不告警
                                 </p>
                               </div>
                             </div>
                           )}
-                          {/* 单笔账户风险 % —— v3.1：无上限 + 默认 50%（激进） */}
+                          {/* 单笔账户风险 % —— v4.1：灾难硬兜底默认 20%；v3.1：无上限 + 默认 50%（激进） */}
                           <div>
                             <label className="text-sm text-[#EAECEF] block mb-2">
-                              {formData.risk_stop_mode === 'account_hard_limit'
-                                ? '账户风险硬限制'
-                                : '预计账户风险警戒'}{' '}
+                              {formData.risk_policy_version >= 4
+                                ? '账户灾难兜底线'
+                                : formData.risk_stop_mode ===
+                                    'account_hard_limit'
+                                  ? '账户风险硬限制'
+                                  : '预计账户风险警戒'}{' '}
                               <span className="text-[#F0B90B] font-bold">
                                 {formData.risk_account_pct.toFixed(2)}%
                               </span>
@@ -1381,16 +1433,23 @@ export function TraderConfigModal({
                                 const v = parseFloat(e.target.value)
                                 handleInputChange(
                                   'risk_account_pct',
-                                  isFinite(v) && v > 0 ? v : 0.5
+                                  isFinite(v) && v > 0
+                                    ? v
+                                    : formData.risk_policy_version >= 4
+                                      ? 20
+                                      : 0.5
                                 )
                               }}
                               className="w-full px-3 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF] focus:border-[#F0B90B] focus:outline-none text-sm"
                             />
                             <p className="text-xs text-[#848E9C] mt-1">
-                              波动优先模式下这是告警阈值，不承诺为最大损失；账户硬限制模式才会收紧止损。
+                              {formData.risk_policy_version >= 4
+                                ? '最终防线：单仓预期止损损失超过账户权益的此比例时强制收紧止损（对所有模式生效）。日常止损由仓位保证金上限与 ATR 决定，此线只在灾难场景兜底，默认 20%'
+                                : '波动优先模式下这是告警阈值，不承诺为最大损失；账户硬限制模式才会收紧止损。'}
                             </p>
-                            {/* 激进配置警告：≥ 5% 时显示 */}
-                            {formData.risk_account_pct >= 5 && (
+                            {/* 激进配置警告：v4 兜底线 ≥ 50%、v3 单笔风险 ≥ 5% 时显示 */}
+                            {formData.risk_account_pct >=
+                              (formData.risk_policy_version >= 4 ? 50 : 5) && (
                               <div className="mt-2 p-2 bg-[#F6465D11] border border-[#F6465D44] rounded flex items-start gap-2">
                                 <svg
                                   xmlns="http://www.w3.org/2000/svg"
@@ -1406,11 +1465,13 @@ export function TraderConfigModal({
                                   <span className="font-bold">
                                     高风险设置：
                                   </span>
-                                  单笔风险 ≥ 5% 时，
-                                  {formData.risk_account_pct >= 50
-                                    ? '2-3 笔失败就可能造成账户严重亏损'
-                                    : '建议仅在领航员经过严格筛选时使用'}
-                                  。新手强烈建议调到 0.5-1%。
+                                  {formData.risk_policy_version >= 4
+                                    ? '兜底线 ≥ 50% 意味着单仓最多可亏掉一半账户权益才强制止损，仅建议在充分理解风险后使用。'
+                                    : `单笔风险 ≥ 5% 时，${
+                                        formData.risk_account_pct >= 50
+                                          ? '2-3 笔失败就可能造成账户严重亏损'
+                                          : '建议仅在领航员经过严格筛选时使用'
+                                      }。新手强烈建议调到 0.5-1%。`}
                                 </span>
                               </div>
                             )}
@@ -1535,8 +1596,8 @@ export function TraderConfigModal({
                                   </label>
                                   <input
                                     type="range"
-                                    min="20"
-                                    max="80"
+                                    min="10"
+                                    max="100"
                                     step="5"
                                     value={formData.risk_leverage_max_loss}
                                     onChange={(e) =>
@@ -1549,9 +1610,45 @@ export function TraderConfigModal({
                                   />
                                   {formData.risk_policy_version >= 4 && (
                                     <p className="text-xs text-[#848E9C] mt-1">
-                                      示例：20x 杠杆、上限 30% → 价格反向 1.5%
-                                      即止损（OKX 收益率约 -30%）
+                                      默认 30%（可调更高）。示例：20x 杠杆、上限
+                                      30% → 价格反向 1.5% 即止损（OKX 收益率约
+                                      -30%）
                                     </p>
+                                  )}
+                                  {formData.risk_policy_version >= 4 && (
+                                    <div className="mt-3">
+                                      <label className="text-xs text-[#848E9C] block mb-1">
+                                        止损噪音下限（ATR 倍数）{' '}
+                                        <span className="text-[#F0B90B]">
+                                          {formData.risk_stop_noise_floor_atr.toFixed(
+                                            1
+                                          )}
+                                          ×
+                                        </span>
+                                      </label>
+                                      <input
+                                        type="range"
+                                        min="0"
+                                        max="3"
+                                        step="0.1"
+                                        value={
+                                          formData.risk_stop_noise_floor_atr
+                                        }
+                                        onChange={(e) =>
+                                          handleInputChange(
+                                            'risk_stop_noise_floor_atr',
+                                            parseFloat(e.target.value)
+                                          )
+                                        }
+                                        className="w-full accent-[#F0B90B]"
+                                      />
+                                      <p className="text-xs text-[#848E9C] mt-1">
+                                        高杠杆下保证金上限算出的止损距离可能小于市场噪音（如
+                                        100x 时仅
+                                        0.3%），此下限保证止损距离至少为 N×ATR
+                                        避免被正常波动扫损。0 = 关闭
+                                      </p>
+                                    </div>
                                   )}
                                 </div>
                               )}
@@ -1748,7 +1845,95 @@ export function TraderConfigModal({
                                         className="mt-1 w-full px-2 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF]"
                                       />
                                     </label>
+                                    <label className="text-xs text-[#848E9C]">
+                                      最小恢复幅度（ATR，0=关闭）
+                                      <input
+                                        type="number"
+                                        min="0"
+                                        max="3"
+                                        step="0.1"
+                                        value={
+                                          formData.risk_reentry_min_recovery_atr
+                                        }
+                                        onChange={(e) =>
+                                          handleInputChange(
+                                            'risk_reentry_min_recovery_atr',
+                                            Number(e.target.value)
+                                          )
+                                        }
+                                        className="mt-1 w-full px-2 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF]"
+                                      />
+                                    </label>
+                                    <label className="text-xs text-[#848E9C]">
+                                      冷却递增倍率（第N次×倍率^N）
+                                      <input
+                                        type="number"
+                                        min="1"
+                                        max="10"
+                                        step="0.5"
+                                        value={
+                                          formData.risk_reentry_cooldown_escalation
+                                        }
+                                        onChange={(e) =>
+                                          handleInputChange(
+                                            'risk_reentry_cooldown_escalation',
+                                            Number(e.target.value)
+                                          )
+                                        }
+                                        className="mt-1 w-full px-2 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF]"
+                                      />
+                                    </label>
+                                    <label className="text-xs text-[#848E9C]">
+                                      恢复幅度递增倍率
+                                      <input
+                                        type="number"
+                                        min="1"
+                                        max="10"
+                                        step="0.1"
+                                        value={
+                                          formData.risk_reentry_recovery_escalation
+                                        }
+                                        onChange={(e) =>
+                                          handleInputChange(
+                                            'risk_reentry_recovery_escalation',
+                                            Number(e.target.value)
+                                          )
+                                        }
+                                        className="mt-1 w-full px-2 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF]"
+                                      />
+                                    </label>
+                                    <label className="text-xs text-[#848E9C]">
+                                      周期亏损熔断（%权益，100=不限）
+                                      <input
+                                        type="number"
+                                        min="1"
+                                        max="100"
+                                        step="1"
+                                        value={formData.risk_cycle_max_loss_pct}
+                                        onChange={(e) => {
+                                          const v = Number(e.target.value)
+                                          handleInputChange(
+                                            'risk_cycle_max_loss_pct',
+                                            isFinite(v) && v > 0
+                                              ? Math.min(v, 100)
+                                              : 10
+                                          )
+                                        }}
+                                        className="mt-1 w-full px-2 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF]"
+                                      />
+                                    </label>
                                   </div>
+                                )}
+                                {formData.risk_policy_version >= 4 && (
+                                  <p className="text-xs text-[#848E9C] mt-2 leading-relaxed">
+                                    <span className="text-[#F0B90B]">
+                                      ⚙ v4.1 重入加严：
+                                    </span>
+                                    重入前价格须从止损价恢复至少 N×ATR
+                                    并越过保守锚点（止损时刻与当前领航员均价的较优者）；
+                                    第二次及之后的重入冷却时间与恢复幅度按倍率递增；
+                                    周期内累计亏损达到账户权益的熔断比例后，本周期不再重入。
+                                  </p>
                                 )}
                                 {/* v3.3 单边严格语义说明 */}
                                 {formData.risk_policy_version < 4 && (

@@ -9,7 +9,8 @@ import (
 func TestApplyCopyConfigRiskFieldsV4DefaultsAndExplicitZero(t *testing.T) {
 	cfg := &store.CopyTradeConfig{}
 	applyCopyConfigRiskFields(cfg, &CopyConfigReq{RiskPolicyVersion: 4})
-	if !cfg.RiskReentryEnabled || cfg.RiskMaxReentries != 2 || cfg.RiskReentryBandATR != 0.5 || cfg.RiskReentryCooldownSeconds != 60 || cfg.RiskSlippageBufferBPS != 10 {
+	// v4.1：默认冷却 300s
+	if !cfg.RiskReentryEnabled || cfg.RiskMaxReentries != 2 || cfg.RiskReentryBandATR != 0.5 || cfg.RiskReentryCooldownSeconds != 300 || cfg.RiskSlippageBufferBPS != 10 {
 		t.Fatalf("unexpected v4 defaults: %+v", cfg)
 	}
 	zeroInt := 0

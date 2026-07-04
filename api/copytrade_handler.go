@@ -324,6 +324,13 @@ type CopyTradeConfigRequest struct {
 	RiskMigrationConfirmed      *bool    `json:"risk_migration_confirmed,omitempty"`
 	RiskAddonBudgetPct          *float64 `json:"risk_addon_budget_pct,omitempty"`
 	RiskHighRiskConfirmed       bool     `json:"risk_high_risk_confirmed,omitempty"`
+
+	// v4.1 止损噪音下限 / 重入加严（字段含义见 store.CopyTradeConfig 注释）
+	RiskStopNoiseFloorATR         *float64 `json:"risk_stop_noise_floor_atr,omitempty"`
+	RiskReentryMinRecoveryATR     *float64 `json:"risk_reentry_min_recovery_atr,omitempty"`
+	RiskReentryCooldownEscalation *float64 `json:"risk_reentry_cooldown_escalation,omitempty"`
+	RiskReentryRecoveryEscalation *float64 `json:"risk_reentry_recovery_escalation,omitempty"`
+	RiskCycleMaxLossPct           *float64 `json:"risk_cycle_max_loss_pct,omitempty"`
 }
 
 // GetConfig 获取跟单配置
@@ -463,8 +470,10 @@ func (h *CopyTradeHandler) SaveConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "copy guard v4 migration confirmation is required"})
 		return
 	}
-	if config.RiskPolicyVersion >= 4 && config.RiskAccountPct >= 0.10 && !req.RiskHighRiskConfirmed {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "risk_account_pct >= 10% requires risk_high_risk_confirmed"})
+	// v4.1：账户线语义改为"灾难硬兜底"（默认 20%），高风险确认阈值相应
+	// 上调到 50%（旧阈值 10% 会让默认配置每次保存都要求确认）
+	if config.RiskPolicyVersion >= 4 && config.RiskAccountPct >= 0.50 && !req.RiskHighRiskConfirmed {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "risk_account_pct >= 50% requires risk_high_risk_confirmed"})
 		return
 	}
 	if err := copytrade.ValidateStoredRiskPolicy(config); err != nil {
@@ -576,6 +585,31 @@ func applyCopyGuardV4Request(c, old *store.CopyTradeConfig, r *CopyTradeConfigRe
 	} else if old != nil {
 		c.RiskAddonBudgetPct = old.RiskAddonBudgetPct
 	}
+	if r.RiskStopNoiseFloorATR != nil {
+		c.RiskStopNoiseFloorATR = *r.RiskStopNoiseFloorATR
+	} else if old != nil {
+		c.RiskStopNoiseFloorATR = old.RiskStopNoiseFloorATR
+	}
+	if r.RiskReentryMinRecoveryATR != nil {
+		c.RiskReentryMinRecoveryATR = *r.RiskReentryMinRecoveryATR
+	} else if old != nil {
+		c.RiskReentryMinRecoveryATR = old.RiskReentryMinRecoveryATR
+	}
+	if r.RiskReentryCooldownEscalation != nil {
+		c.RiskReentryCooldownEscalation = *r.RiskReentryCooldownEscalation
+	} else if old != nil {
+		c.RiskReentryCooldownEscalation = old.RiskReentryCooldownEscalation
+	}
+	if r.RiskReentryRecoveryEscalation != nil {
+		c.RiskReentryRecoveryEscalation = *r.RiskReentryRecoveryEscalation
+	} else if old != nil {
+		c.RiskReentryRecoveryEscalation = old.RiskReentryRecoveryEscalation
+	}
+	if r.RiskCycleMaxLossPct != nil {
+		c.RiskCycleMaxLossPct = *r.RiskCycleMaxLossPct
+	} else if old != nil {
+		c.RiskCycleMaxLossPct = old.RiskCycleMaxLossPct
+	}
 	if c.RiskPolicyVersion >= 4 {
 		// Only missing fields on a brand-new v4 config receive balanced defaults.
 		// Existing values, including valid explicit zero values, are preserved.
@@ -593,7 +627,8 @@ func applyCopyGuardV4Request(c, old *store.CopyTradeConfig, r *CopyTradeConfigRe
 				c.RiskReentryBandATR = 0.5
 			}
 			if r.RiskReentryCooldownSeconds == nil {
-				c.RiskReentryCooldownSeconds = 60
+				// v4.1：默认冷却 300s（旧默认 60s 在高杠杆震荡下重入过快）
+				c.RiskReentryCooldownSeconds = 300
 			}
 			if r.RiskReentryMaxATRExpansion == nil {
 				c.RiskReentryMaxATRExpansion = 2

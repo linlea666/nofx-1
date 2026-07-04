@@ -228,8 +228,15 @@ export interface CopyConfigRequest {
   risk_reentry_max_atr_expansion?: number
   risk_watch_timeout_minutes?: number
   risk_migration_confirmed?: boolean
-  risk_addon_budget_pct?: number // 默认 0.15：加仓账户风险预算（加仓后预期止损损失超此比例则拒绝加仓；1.0=不限制）
+  risk_addon_budget_pct?: number // 默认 0.15：加仓账户风险预算（v4.1 起仅告警不拦截；1.0=不告警）
   risk_high_risk_confirmed?: boolean
+
+  // v4.1 止损噪音下限 / 重入加严
+  risk_stop_noise_floor_atr?: number // 默认 1.0：止损距离噪音下限（ATR 倍数，防高杠杆保证金 cap 被噪音扫损）
+  risk_reentry_min_recovery_atr?: number // 默认 0.5：重入前价格须从止损价恢复的最小幅度（ATR 倍数）
+  risk_reentry_cooldown_escalation?: number // 默认 3：第 N 次重入冷却时间倍率（cooldown × 倍率^N）
+  risk_reentry_recovery_escalation?: number // 默认 1.5：第 N 次重入恢复幅度倍率
+  risk_cycle_max_loss_pct?: number // 默认 0.10：周期累计亏损熔断（占账户权益比例；1.0=不限制）
 }
 
 export interface UpdateModelConfigRequest {
@@ -719,6 +726,12 @@ export interface CopyTradeConfig {
   risk_watch_timeout_minutes?: number
   risk_migration_confirmed?: boolean
   risk_addon_budget_pct?: number
+  // v4.1 止损噪音下限 / 重入加严
+  risk_stop_noise_floor_atr?: number
+  risk_reentry_min_recovery_atr?: number
+  risk_reentry_cooldown_escalation?: number
+  risk_reentry_recovery_escalation?: number
+  risk_cycle_max_loss_pct?: number
   created_at?: string
   updated_at?: string
 }

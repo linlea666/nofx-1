@@ -212,42 +212,45 @@ func calcStopLossPrice(cfg *CopyConfig, input *StopLossCalcInput) (*StopLossCalc
 }
 
 // ============================================================================
-// 加仓账户风险预算（Copy Guard v4）
+// 加仓账户风险预算（Copy Guard v4，v4.1 起仅告警不拦截）
 //
-// 背景：volatility_priority 模式下 RiskAccountPct 只是告警，领航员连续加仓时
-// 单笔预期止损损失可以无界增长（WLD 实盘：5.2% → 28.4%）。这里在跟随加仓前
-// 预估「加仓后总敞口按当前止损距离全损」占账户权益的比例，超过
-// RiskAddonBudgetPct 预算则拒绝跟随本次加仓；已有仓位与止损单不动。
+// 背景：volatility_priority 模式下 RiskAccountPct 只是软性提示，领航员连续
+// 加仓时单笔预期止损损失可以增长（WLD 实盘：5.2% → 28.4%）。这里在跟随加仓
+// 时预估「加仓后总敞口按当前止损距离全损」占账户权益的比例，超过
+// RiskAddonBudgetPct 时记录 ADDON_RISK_WARNING 告警。
+//
+// v4.1 设计修正：兜底风控不干扰领航员的开/加/减/平动作——拦截加仓会让跟随
+// 仓位结构偏离领航员（实际保护由止损噪音下限 + 账户 20% 硬兜底承担），
+// 因此从"拒绝加仓"降级为"仅告警"。
 // ============================================================================
 
-// addonBudgetEventInterval：同一仓位 ADDON_SKIPPED_BUDGET 事件/告警的最小间隔。
-// 被拒绝的加仓信号不消费 last_known_size，每个 poll 周期都会重新评估
-// （权益增长或 ATR 收窄后可能放行），限频避免事件与日志刷屏。
+// addonBudgetEventInterval：同一仓位 ADDON_RISK_WARNING 事件/告警的最小间隔，
+// 限频避免事件与日志刷屏。
 const addonBudgetEventInterval = 60 * time.Second
 
-// addonExceedsRiskBudget 返回 true 表示本次加仓应被拒绝（超出账户风险预算）。
-// 任何数据不可得（无周期记录、权益为零、ATR 失败且无降级）时不拦截，
-// 维持既有跟随行为（保守修改：预算检查只做增量防护，不改变原有路径）。
-func (e *Engine) addonExceedsRiskBudget(signal *TradeSignal, posID string, copySize float64) bool {
+// warnAddonRiskBudget 检查本次加仓是否超出账户风险预算，超出时仅记录告警
+// 事件（不拦截）。任何数据不可得（无周期记录、权益为零、ATR 失败且无降级）
+// 时静默跳过。
+func (e *Engine) warnAddonRiskBudget(signal *TradeSignal, posID string, copySize float64) {
 	cfg := e.config
 	if cfg == nil || cfg.RiskPolicyVersion < 4 || cfg.ProviderType != ProviderOKX || !cfg.RiskStopLossEnabled {
-		return false
+		return
 	}
 	budget := cfg.RiskAddonBudgetPct
 	if budget <= 0 || budget >= 1 {
-		return false
+		return
 	}
 	if e.store == nil || e.getFollowerEquity == nil || signal == nil || signal.Fill == nil || copySize <= 0 {
-		return false
+		return
 	}
 	cycle, err := e.store.CopyTrade().GetOpenCopyGuardCycle(e.traderID, posID)
 	if err != nil || cycle == nil {
-		return false
+		return
 	}
 	equity := e.getFollowerEquity()
 	entryPrice := signal.Fill.Price
 	if equity <= 0 || entryPrice <= 0 {
-		return false
+		return
 	}
 	period := cfg.RiskATRPeriod
 	if period <= 0 {
@@ -260,34 +263,34 @@ func (e *Engine) addonExceedsRiskBudget(signal *TradeSignal, posID string, copyS
 		atrDistance = entryPrice * cfg.RiskATRFallbackPct
 	}
 	if atrDistance <= 0 {
-		return false
+		return
 	}
 	totalNotional := cycle.FollowerNotional + copySize
 	computed, err := ComputeRiskDistanceV4(cfg, entryPrice, totalNotional, equity, atrDistance, e.getLeaderLeverage(signal))
 	if err != nil || computed.ExpectedLossPct <= budget {
-		return false
+		return
 	}
 
 	now := time.Now()
 	if last, ok := e.lastAddonBudgetEvent[posID]; !ok || now.Sub(last) >= addonBudgetEventInterval {
 		e.lastAddonBudgetEvent[posID] = now
-		msg := fmt.Sprintf("加仓被拒：预期止损损失 %.1f%% 超账户预算 %.1f%%（现有名义 %.2f + 加仓 %.2f）",
+		msg := fmt.Sprintf("加仓风险告警：预期止损损失 %.1f%% 超账户预算 %.1f%%（现有名义 %.2f + 加仓 %.2f，仍跟随）",
 			computed.ExpectedLossPct*100, budget*100, cycle.FollowerNotional, copySize)
 		logger.Warnf("🚧 [%s] %s | %s posId=%s", e.traderID, msg, signal.Fill.Symbol, posID)
 		e.logWarning(Warning{
 			Timestamp:    now,
 			Symbol:       signal.Fill.Symbol,
-			Type:         "addon_budget_exceeded",
+			Type:         "addon_risk_warning",
 			Message:      msg,
 			SignalAction: string(ActionAdd),
 			SignalValue:  copySize,
-			CopyValue:    0,
-			Executed:     false,
+			CopyValue:    copySize,
+			Executed:     true,
 		})
 		if err := e.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{
 			CycleID:  cycle.ID,
 			TraderID: e.traderID,
-			Type:     "ADDON_SKIPPED_BUDGET",
+			Type:     "ADDON_RISK_WARNING",
 			Price:    entryPrice,
 			Notional: copySize,
 			Metadata: map[string]interface{}{
@@ -296,12 +299,12 @@ func (e *Engine) addonExceedsRiskBudget(signal *TradeSignal, posID string, copyS
 				"current_notional":  cycle.FollowerNotional,
 				"addon_notional":    copySize,
 				"governed_by":       computed.GovernedBy,
+				"blocked":           false,
 			},
 		}); err != nil {
-			logger.Warnf("⚠️ [%s] ADDON_SKIPPED_BUDGET 事件写入失败: %v", e.traderID, err)
+			logger.Warnf("⚠️ [%s] ADDON_RISK_WARNING 事件写入失败: %v", e.traderID, err)
 		}
 	}
-	return true
 }
 
 // isLiquidationPriceDirectionValid checks the liquidation price is on the
@@ -512,6 +515,8 @@ func (e *Engine) checkStoppedByRisk() {
 			if cerr == nil {
 				atr, _ := market.GetOKXATRWithMaxAge(mapping.Symbol, e.config.RiskATRTimeframe, e.config.RiskATRPeriod, riskATRCacheMaxAge(e.config))
 				_ = e.store.CopyTrade().RecordCopyGuardStopObserved(cycle.ID, e.traderID, cycle.ReentryCount, atr, leaderPos.MarkPrice, leaderSize, leaderPnL, map[string]interface{}{"confirmation": "position_absent_fallback"})
+				// 快照止损时的领航员均价，供重入保守锚点使用
+				_ = e.store.CopyTrade().SnapshotCopyGuardLeaderEntryAtStop(cycle.ID, leaderPos.EntryPrice)
 			}
 		}
 
@@ -591,13 +596,57 @@ func (e *Engine) checkReentryConditions() {
 			if v4Cycle.Status == store.CopyGuardReentryPending {
 				continue
 			}
+			// 回填开仓时因 API 限流缺失的权益快照（account_equity=0 会让
+			// 账户级保护与熔断判定失效）
+			if v4Cycle.AccountEquity <= 0 && followerEquity > 0 {
+				if e.store.CopyTrade().BackfillCopyGuardAccountEquity(v4Cycle.ID, followerEquity) == nil {
+					v4Cycle.AccountEquity = followerEquity
+				}
+			}
 			if e.config.RiskReentryEnabled && v4Cycle.ReentryCount >= e.config.RiskMaxReentries {
 				terminalWatchStatus = store.CopyGuardAttemptsExhausted
 			}
 			if e.config.RiskWatchTimeoutMinutes > 0 && v4Cycle.StoppedAt != nil && time.Since(*v4Cycle.StoppedAt) > time.Duration(e.config.RiskWatchTimeoutMinutes)*time.Minute {
 				terminalWatchStatus = store.CopyGuardWatchTimeout
 			}
-			coolingDown = v4Cycle.StoppedAt != nil && time.Since(*v4Cycle.StoppedAt) < time.Duration(e.config.RiskReentryCooldownSeconds)*time.Second
+			// v4.1 周期累计亏损熔断：同一周期已实现亏损触达权益 ×
+			// RiskCycleMaxLossPct 后不再重入，只观察至领航员平仓
+			if e.config.RiskCycleMaxLossPct > 0 && e.config.RiskCycleMaxLossPct < 1 {
+				breakerEquity := v4Cycle.AccountEquity
+				if breakerEquity <= 0 {
+					breakerEquity = followerEquity
+				}
+				if breakerEquity > 0 && v4Cycle.ActualPnL <= -breakerEquity*e.config.RiskCycleMaxLossPct {
+					if v4Cycle.Status != store.CopyGuardCycleLossCapped {
+						logger.Warnf("⛔ [%s] 周期累计亏损熔断 | cycle=%d %s | 已亏 %.2f ≥ 权益 %.2f × %.0f%%，本周期不再重入",
+							e.traderID, v4Cycle.ID, mapping.Symbol, -v4Cycle.ActualPnL, breakerEquity, e.config.RiskCycleMaxLossPct*100)
+						_ = e.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{
+							CycleID:  v4Cycle.ID,
+							TraderID: e.traderID,
+							Type:     "CYCLE_LOSS_BREAKER",
+							PnL:      v4Cycle.ActualPnL,
+							Metadata: map[string]interface{}{
+								"cycle_loss":     v4Cycle.ActualPnL,
+								"account_equity": breakerEquity,
+								"max_loss_pct":   e.config.RiskCycleMaxLossPct,
+								"stop_count":     v4Cycle.StopCount,
+								"reentry_count":  v4Cycle.ReentryCount,
+							},
+						})
+					}
+					terminalWatchStatus = store.CopyGuardCycleLossCapped
+				}
+			}
+			// v4.1 冷却时间逐次加严：第 N 次重入的冷却 = 基础冷却 × 倍率^N
+			cooldown := time.Duration(e.config.RiskReentryCooldownSeconds) * time.Second
+			if v4Cycle.ReentryCount > 0 {
+				esc := e.config.RiskReentryCooldownEscalation
+				if esc < 1 {
+					esc = 1
+				}
+				cooldown = time.Duration(float64(cooldown) * math.Pow(esc, float64(v4Cycle.ReentryCount)))
+			}
+			coolingDown = v4Cycle.StoppedAt != nil && time.Since(*v4Cycle.StoppedAt) < cooldown
 		}
 		// 安全阀：同 posId 重入限 1 次（硬阀）
 		if e.config.RiskPolicyVersion < 4 && mapping.ReentryUsed {
@@ -691,6 +740,31 @@ func (e *Engine) checkReentryConditions() {
 		if entryRef <= 0 {
 			continue
 		}
+		// v4.1 保守锚点：领航员止损后加仓摊均价会把实时均价拖向不利方向
+		// （多单变低、空单变高），使重入边界在没有真实恢复时就被穿越。
+		// 锚点取 max/min(实时均价, 止损时快照)，保证重入门槛不因领航员
+		// 摊均价而变松；快照缺失（旧数据）时退回实时均价。
+		reentryAnchor := entryRef
+		if e.config.RiskPolicyVersion >= 4 && v4Cycle != nil && v4Cycle.LeaderEntryAtStop > 0 {
+			if mapping.Side == string(SideLong) {
+				reentryAnchor = math.Max(entryRef, v4Cycle.LeaderEntryAtStop)
+			} else {
+				reentryAnchor = math.Min(entryRef, v4Cycle.LeaderEntryAtStop)
+			}
+		}
+		// v4.1 最小恢复幅度判据需要最近一次止损的成交价；顺带为重入定 size
+		// 复用（避免二次查询）
+		var stoppedAttempt *store.CopyGuardAttempt
+		if e.config.RiskPolicyVersion >= 4 && v4Cycle != nil {
+			if attempts, attemptErr := e.store.CopyTrade().ListCopyGuardAttempts(v4Cycle.ID); attemptErr == nil {
+				for _, attempt := range attempts {
+					if attempt.AttemptNo == v4Cycle.ReentryCount && attempt.Status == "STOPPED" {
+						stoppedAttempt = attempt
+						break
+					}
+				}
+			}
+		}
 		markPrice := leaderPos.MarkPrice
 		if markPrice <= 0 {
 			markPrice = leaderPos.EntryPrice
@@ -736,14 +810,35 @@ func (e *Engine) checkReentryConditions() {
 			}
 			// 首轮观察（尚无上一 tick 价格）只记录观测、不判穿越：
 			// LastObservedPrice=0 会让多单的 "0 < boundary" 恒真，造成误触发。
+			// 边界与追价上限均以保守锚点为基准（见 reentryAnchor 注释）。
+			//
+			// v4.1 最小恢复幅度：把"止损成交价 ± minRecovery × ATR（第 N 次
+			// 重入按倍率^N 加严）"并入穿越边界，价格必须从止损价真实恢复该
+			// 幅度才算穿越——防止"刚止损又原地接回"的震荡循环。并入边界
+			// （而非事后否决）保证边界抬高后穿越判定仍是单次边沿触发。
+			// 止损成交价缺失（旧数据）时降级为纯带宽边界。
 			if v4Cycle.LastObservedPrice > 0 {
-				boundary := entryRef
+				boundary := reentryAnchor
+				requiredRecovery := float64(0)
+				if e.config.RiskReentryMinRecoveryATR > 0 && stoppedAttempt != nil && stoppedAttempt.ExitPrice > 0 {
+					recoveryEsc := e.config.RiskReentryRecoveryEscalation
+					if recoveryEsc < 1 {
+						recoveryEsc = 1
+					}
+					requiredRecovery = currentATR * e.config.RiskReentryMinRecoveryATR * math.Pow(recoveryEsc, float64(v4Cycle.ReentryCount))
+				}
 				if mapping.Side == string(SideLong) {
 					boundary -= currentATR * e.config.RiskReentryBandATR
-					priceReturned = v4Cycle.LastObservedPrice < boundary && markPrice >= boundary && markPrice <= entryRef+currentATR*e.config.RiskReentryMaxChaseATR
+					if requiredRecovery > 0 {
+						boundary = math.Max(boundary, stoppedAttempt.ExitPrice+requiredRecovery)
+					}
+					priceReturned = v4Cycle.LastObservedPrice < boundary && markPrice >= boundary && markPrice <= reentryAnchor+currentATR*e.config.RiskReentryMaxChaseATR
 				} else {
 					boundary += currentATR * e.config.RiskReentryBandATR
-					priceReturned = v4Cycle.LastObservedPrice > boundary && markPrice <= boundary && markPrice >= entryRef-currentATR*e.config.RiskReentryMaxChaseATR
+					if requiredRecovery > 0 {
+						boundary = math.Min(boundary, stoppedAttempt.ExitPrice-requiredRecovery)
+					}
+					priceReturned = v4Cycle.LastObservedPrice > boundary && markPrice <= boundary && markPrice >= reentryAnchor-currentATR*e.config.RiskReentryMaxChaseATR
 				}
 			}
 			_ = e.store.CopyTrade().UpdateCopyGuardObservation(v4Cycle.ID, store.CopyGuardStoppedWatching, entryRef, markPrice, currentATR)
@@ -788,15 +883,10 @@ func (e *Engine) checkReentryConditions() {
 		// 首仓、57 倍杠杆、止损价落入强平区导致保护单挂不上的事故（cycle 15）。
 		// 被止损仓位基准让重入风险严格有界：永远不超过上一段仓位的名义 × 系数。
 		var reentrySize float64
+		stoppedNotional := float64(0)
 		if e.config.RiskPolicyVersion >= 4 && v4Cycle != nil {
-			stoppedNotional := float64(0)
-			if attempts, attemptErr := e.store.CopyTrade().ListCopyGuardAttempts(v4Cycle.ID); attemptErr == nil {
-				for _, attempt := range attempts {
-					if attempt.AttemptNo == v4Cycle.ReentryCount && attempt.Status == "STOPPED" {
-						stoppedNotional = attempt.Notional
-						break
-					}
-				}
+			if stoppedAttempt != nil {
+				stoppedNotional = stoppedAttempt.Notional
 			}
 			if stoppedNotional <= 0 {
 				// 旧数据/回填周期可能没有 attempt 名义，用周期跟随名义兜底
@@ -843,7 +933,22 @@ func (e *Engine) checkReentryConditions() {
 			}
 		} else {
 			_ = e.store.CopyTrade().UpdateCopyGuardObservation(v4Cycle.ID, store.CopyGuardReentryPending, entryRef, markPrice, currentATR)
-			_ = e.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: v4Cycle.ID, TraderID: e.traderID, Type: "REENTRY_REQUESTED", Price: markPrice, Notional: reentrySize})
+			stopFillPrice := float64(0)
+			if stoppedAttempt != nil {
+				stopFillPrice = stoppedAttempt.ExitPrice
+			}
+			_ = e.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: v4Cycle.ID, TraderID: e.traderID, Type: "REENTRY_REQUESTED", Price: markPrice, Notional: reentrySize, Metadata: map[string]interface{}{
+				"reentry_no":           v4Cycle.ReentryCount + 1,
+				"reentry_ratio":        e.config.RiskReentryRatio,
+				"stopped_notional":     stoppedNotional,
+				"stop_fill_price":      stopFillPrice,
+				"anchor_price":         reentryAnchor,
+				"leader_entry_live":    entryRef,
+				"leader_entry_at_stop": v4Cycle.LeaderEntryAtStop,
+				"current_atr":          currentATR,
+				"min_recovery_atr":     e.config.RiskReentryMinRecoveryATR,
+				"cooldown_seconds":     e.config.RiskReentryCooldownSeconds,
+			}})
 		}
 
 		// 统计：重入也是一次"信号驱动"的决策

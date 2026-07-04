@@ -51,7 +51,8 @@ func TestComputeOwnPathBaselineReproducesWLD(t *testing.T) {
 }
 
 // ============================================================================
-// 加仓账户风险预算：超预算拒绝 + 事件限频，预算内放行
+// 加仓账户风险预算（v4.1 仅告警不拦截）：超预算记录 ADDON_RISK_WARNING +
+// 事件限频；预算内不产生事件
 // ============================================================================
 
 func newAddonBudgetEngine(t *testing.T) (*Engine, *store.Store) {
@@ -84,7 +85,7 @@ func newAddonBudgetEngine(t *testing.T) (*Engine, *store.Store) {
 	return e, st
 }
 
-func TestAddonBudgetRejectsOversizedAdd(t *testing.T) {
+func TestAddonBudgetWarnsWithoutBlocking(t *testing.T) {
 	e, st := newAddonBudgetEngine(t)
 	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "pos-add", Symbol: "WLDUSDT", Side: "long", MarginMode: "cross", Status: store.CopyGuardFollowing, PolicySnapshot: "{}", LeaderEntryPrice: 1, FollowerEntryPrice: 1, FollowerNotional: 100, AccountEquity: 100})
 	if err != nil {
@@ -92,44 +93,53 @@ func TestAddonBudgetRejectsOversizedAdd(t *testing.T) {
 	}
 	signal := &TradeSignal{ProviderType: ProviderOKX, LeaderID: "leader", LeaderPosID: "pos-add", Fill: &Fill{Symbol: "WLDUSDT", Price: 1, PositionSide: "long", Action: ActionAdd}}
 
-	// 现有名义 100 + 加仓 700 = 800，预期损失 800×2% = 16 USD = 16% > 预算 15% → 拒绝
-	if !e.addonExceedsRiskBudget(signal, "pos-add", 700) {
-		t.Fatal("oversized add must be rejected by the account risk budget")
-	}
-	events, err := st.CopyTrade().ListCopyGuardEvents(cycle.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
 	countBudgetEvents := func() int {
+		events, err := st.CopyTrade().ListCopyGuardEvents(cycle.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
 		n := 0
 		for _, ev := range events {
-			if ev.Type == "ADDON_SKIPPED_BUDGET" {
+			if ev.Type == "ADDON_RISK_WARNING" {
 				n++
 			}
 		}
 		return n
 	}
+
+	// 现有名义 100 + 加仓 700 = 800，预期损失 800×2% = 16 USD = 16% > 预算 15% → 告警
+	e.warnAddonRiskBudget(signal, "pos-add", 700)
 	if countBudgetEvents() != 1 {
-		t.Fatalf("expected exactly 1 ADDON_SKIPPED_BUDGET event, got %d", countBudgetEvents())
+		t.Fatalf("expected exactly 1 ADDON_RISK_WARNING event, got %d", countBudgetEvents())
 	}
 
-	// 60 秒限频窗口内重复拒绝：仍然拒绝，但不重复写事件
-	if !e.addonExceedsRiskBudget(signal, "pos-add", 700) {
-		t.Fatal("repeated oversized add must still be rejected")
-	}
-	events, _ = st.CopyTrade().ListCopyGuardEvents(cycle.ID)
+	// 60 秒限频窗口内重复超预算：不重复写事件
+	e.warnAddonRiskBudget(signal, "pos-add", 700)
 	if countBudgetEvents() != 1 {
-		t.Fatalf("rate-limited rejection must not write a duplicate event, got %d", countBudgetEvents())
+		t.Fatalf("rate-limited warning must not write a duplicate event, got %d", countBudgetEvents())
 	}
 
-	// 100 + 500 = 600，预期损失 12% ≤ 15% → 放行
-	if e.addonExceedsRiskBudget(signal, "pos-add", 500) {
-		t.Fatal("an add within the budget must not be rejected")
+	// 100 + 500 = 600，预期损失 12% ≤ 15% → 不告警
+	e2, st2 := newAddonBudgetEngine(t)
+	cycle2, err := st2.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "pos-add", Symbol: "WLDUSDT", Side: "long", MarginMode: "cross", Status: store.CopyGuardFollowing, PolicySnapshot: "{}", LeaderEntryPrice: 1, FollowerEntryPrice: 1, FollowerNotional: 100, AccountEquity: 100})
+	if err != nil {
+		t.Fatal(err)
 	}
-	// 预算设 0（禁用）→ 不拦截
-	e.config.RiskAddonBudgetPct = 0
-	if e.addonExceedsRiskBudget(signal, "pos-add", 10000) {
-		t.Fatal("budget=0 disables the check entirely")
+	e2.warnAddonRiskBudget(signal, "pos-add", 500)
+	events2, _ := st2.CopyTrade().ListCopyGuardEvents(cycle2.ID)
+	for _, ev := range events2 {
+		if ev.Type == "ADDON_RISK_WARNING" {
+			t.Fatal("an add within the budget must not produce a warning event")
+		}
+	}
+	// 预算设 0（禁用）→ 完全不检查
+	e2.config.RiskAddonBudgetPct = 0
+	e2.warnAddonRiskBudget(signal, "pos-add", 10000)
+	events2, _ = st2.CopyTrade().ListCopyGuardEvents(cycle2.ID)
+	for _, ev := range events2 {
+		if ev.Type == "ADDON_RISK_WARNING" {
+			t.Fatal("budget=0 disables the check entirely")
+		}
 	}
 }
 

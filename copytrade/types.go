@@ -158,8 +158,15 @@ type CopyConfig struct {
 	RiskWatchTimeoutMinutes     int     `json:"risk_watch_timeout_minutes"`
 	RiskMigrationConfirmed      bool    `json:"risk_migration_confirmed"`
 	// RiskAddonBudgetPct: 加仓账户风险预算（v4）。加仓后总敞口按当前止损距离
-	// 的预期损失超过账户权益的该比例时，拒绝跟随本次加仓。1.0 = 实际不限制。
+	// 的预期损失超过账户权益的该比例时记录 ADDON_RISK_WARNING 告警（仅告警
+	// 不拦截，兜底风控不干扰领航员动作）。1.0 = 不告警。
 	RiskAddonBudgetPct float64 `json:"risk_addon_budget_pct"`
+	// v4.1 止损噪音下限 / 重入加严（字段含义见 store.CopyTradeConfig 同名注释）
+	RiskStopNoiseFloorATR         float64 `json:"risk_stop_noise_floor_atr"`
+	RiskReentryMinRecoveryATR     float64 `json:"risk_reentry_min_recovery_atr"`
+	RiskReentryCooldownEscalation float64 `json:"risk_reentry_cooldown_escalation"`
+	RiskReentryRecoveryEscalation float64 `json:"risk_reentry_recovery_escalation"`
+	RiskCycleMaxLossPct           float64 `json:"risk_cycle_max_loss_pct"`
 }
 
 // FillRiskDefaults 兜底默认值（与 store.CopyTradeConfig.FillRiskDefaults 保持一致）
@@ -170,7 +177,8 @@ type CopyConfig struct {
 func (c *CopyConfig) FillRiskDefaults() {
 	if c.RiskAccountPct == 0 {
 		if c.RiskPolicyVersion >= 4 {
-			c.RiskAccountPct = 0.02
+			// v4.1：账户线 = 灾难硬兜底，默认 20%（详见 store 同名注释）
+			c.RiskAccountPct = 0.20
 		} else {
 			c.RiskAccountPct = 0.5
 		}
@@ -182,7 +190,11 @@ func (c *CopyConfig) FillRiskDefaults() {
 		c.RiskATRTimeframe = "1h"
 	}
 	if c.RiskLeverageMaxLoss == 0 {
-		c.RiskLeverageMaxLoss = 0.5
+		if c.RiskPolicyVersion >= 4 {
+			c.RiskLeverageMaxLoss = 0.3
+		} else {
+			c.RiskLeverageMaxLoss = 0.5
+		}
 	}
 	if c.RiskReentryRatio == 0 {
 		c.RiskReentryRatio = 0.5
@@ -216,6 +228,21 @@ func (c *CopyConfig) FillRiskDefaults() {
 		}
 		if c.RiskAddonBudgetPct == 0 {
 			c.RiskAddonBudgetPct = 0.15
+		}
+		if c.RiskStopNoiseFloorATR == 0 {
+			c.RiskStopNoiseFloorATR = 1.0
+		}
+		if c.RiskReentryMinRecoveryATR == 0 {
+			c.RiskReentryMinRecoveryATR = 0.5
+		}
+		if c.RiskReentryCooldownEscalation == 0 {
+			c.RiskReentryCooldownEscalation = 3
+		}
+		if c.RiskReentryRecoveryEscalation == 0 {
+			c.RiskReentryRecoveryEscalation = 1.5
+		}
+		if c.RiskCycleMaxLossPct == 0 {
+			c.RiskCycleMaxLossPct = 0.10
 		}
 	}
 }

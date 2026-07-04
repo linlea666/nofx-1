@@ -82,7 +82,7 @@ type Engine struct {
 	// 仅 OKX 路径使用；checkStoppedByRisk 内部访问，与 poll 串行执行无需额外锁
 	stopRiskSuspectCount map[string]int
 
-	// v4 加仓预算：ADDON_SKIPPED_BUDGET 事件/告警限频（key = leaderPosID）
+	// v4 加仓预算：ADDON_RISK_WARNING 事件/告警限频（key = leaderPosID）
 	// 与 poll 串行执行，无需额外锁
 	lastAddonBudgetEvent map[string]time.Time
 }
@@ -1271,11 +1271,10 @@ func (e *Engine) processSignal(signal *TradeSignal) {
 		return
 	}
 
-	// 🚧 v4 加仓账户风险预算：加仓后总敞口的预期止损损失超预算 → 拒绝本次加仓。
-	// 同样不更新 last_known_size：权益增长或波动收窄后，下一轮 poll 可重新评估放行。
-	if matchResult.Action == ActionAdd && e.addonExceedsRiskBudget(signal, matchResult.PosID, copySize) {
-		e.stats.SignalsSkipped++
-		return
+	// 🚧 v4.1 加仓账户风险预算：超预算时仅记录 ADDON_RISK_WARNING 告警，
+	// 不再拦截（兜底风控不干扰领航员的加仓动作；实际保护由止损层承担）。
+	if matchResult.Action == ActionAdd {
+		e.warnAddonRiskBudget(signal, matchResult.PosID, copySize)
 	}
 
 	// ========================================

@@ -20,8 +20,20 @@ type RiskDistanceResult struct {
 // ComputeRiskDistanceV4 is pure and unit-explicit; exchange/network concerns stay outside it.
 // leverage participates only in the margin-loss cap (RiskLeverageFallback / RiskLeverageMaxLoss):
 // distance = entryPrice × maxLoss / leverage means "stop where the margin loss equals maxLoss".
-// A cap tighter than the ATR distance intentionally trades noise protection for a bounded,
-// user-visible margin loss (the OKX PnL% view), so NoiseConflict is reported.
+//
+// 层次（自内向外）：
+//  1. ATR 基线：distance = atrDistance（噪音优先）
+//  2. account_hard_limit 模式：账户线更紧时收紧（用户显式选择的严格模式）
+//  3. 保证金 cap：entry × maxLoss / leverage 更紧时收紧（NoiseConflict 上报）
+//  4. 噪音下限：margin_cap 收紧结果不得低于 rawATR × RiskStopNoiseFloorATR。
+//     100x 杠杆下"保证金 30%"折算 0.3% 价格距离小于正常波动，反复扫损
+//     （ETH cycle 40/50 churn 根因）；下限把止损放宽回噪音安全距离。
+//     account_hard_limit 模式的账户线不被下限放宽（显式模式语义优先）。
+//  5. 账户硬兜底：无论何种模式，distance 不得超过账户线（RiskAccountPct，
+//     v4 默认 20%）——灾难场景的最终封顶，优先级高于噪音下限。
+//
+// 原始 ATR 由 atrDistance / RiskATRMultiplier 反推（ATR 获取失败走 fallback 时
+// 该比值是等效近似），避免扩散函数签名。
 func ComputeRiskDistanceV4(c *CopyConfig, entryPrice, positionNotional, accountEquity, atrDistance float64, leverage int) (RiskDistanceResult, error) {
 	if c == nil || entryPrice <= 0 || positionNotional <= 0 || accountEquity <= 0 || atrDistance <= 0 {
 		return RiskDistanceResult{}, fmt.Errorf("invalid v4 risk calculation input")
@@ -43,6 +55,31 @@ func ComputeRiskDistanceV4(c *CopyConfig, entryPrice, positionNotional, accountE
 			r.GovernedBy = "margin_cap"
 			r.NoiseConflict = true
 		}
+	}
+	// 噪音下限只放宽 margin_cap 的收紧结果；ATR 基线本身（multiplier ≥ floor 时）
+	// 与 account_hard_limit 模式的账户线不受影响。
+	if r.GovernedBy == "margin_cap" && c.RiskStopNoiseFloorATR > 0 && c.RiskATRMultiplier > 0 {
+		noiseFloor := atrDistance / c.RiskATRMultiplier * c.RiskStopNoiseFloorATR
+		if noiseFloor > atrDistance {
+			noiseFloor = atrDistance // 下限不得放宽到 ATR 基线之外
+		}
+		if r.Distance < noiseFloor {
+			r.Distance = noiseFloor
+			r.GovernedBy = "noise_floor"
+			r.NoiseConflict = false
+		}
+		if c.RiskStopMode == "account_hard_limit" && r.Distance > accountDistance {
+			r.Distance = accountDistance
+			r.GovernedBy = "account"
+			r.NoiseConflict = true
+		}
+	}
+	// 账户硬兜底（v4 默认 20%）：任何模式下的最终封顶，优先级高于噪音下限。
+	// RiskAccountPct 未配置（0）时跳过，避免把距离塌缩为 0。
+	if c.RiskAccountPct > 0 && r.Distance > accountDistance {
+		r.Distance = accountDistance
+		r.GovernedBy = "account_hard"
+		r.NoiseConflict = true
 	}
 	r.ExpectedLossUSD = positionNotional*r.Distance/entryPrice + positionNotional*c.RiskSlippageBufferBPS/10000
 	r.ExpectedLossPct = r.ExpectedLossUSD / accountEquity
@@ -205,6 +242,21 @@ func ValidateRiskPolicyV4(c *CopyConfig) error {
 	if c.RiskAddonBudgetPct != 0 && invalidRange(c.RiskAddonBudgetPct, 0.01, 1) {
 		return fmt.Errorf("risk_addon_budget_pct must be 1%%..100%%")
 	}
+	if invalidRange(c.RiskStopNoiseFloorATR, 0, 5) {
+		return fmt.Errorf("risk_stop_noise_floor_atr must be 0..5")
+	}
+	if invalidRange(c.RiskReentryMinRecoveryATR, 0, 5) {
+		return fmt.Errorf("risk_reentry_min_recovery_atr must be 0..5")
+	}
+	if c.RiskReentryCooldownEscalation != 0 && invalidRange(c.RiskReentryCooldownEscalation, 1, 10) {
+		return fmt.Errorf("risk_reentry_cooldown_escalation must be 1..10")
+	}
+	if c.RiskReentryRecoveryEscalation != 0 && invalidRange(c.RiskReentryRecoveryEscalation, 1, 10) {
+		return fmt.Errorf("risk_reentry_recovery_escalation must be 1..10")
+	}
+	if c.RiskCycleMaxLossPct != 0 && invalidRange(c.RiskCycleMaxLossPct, 0.01, 1) {
+		return fmt.Errorf("risk_cycle_max_loss_pct must be 1%%..100%%")
+	}
 	return nil
 }
 
@@ -217,5 +269,5 @@ func ValidateStoredRiskPolicy(c *store.CopyTradeConfig) error {
 		return nil
 	}
 	c.FillRiskDefaults()
-	return ValidateRiskPolicyV4(&CopyConfig{ProviderType: ProviderType(c.ProviderType), RiskPolicyVersion: c.RiskPolicyVersion, RiskStopMode: c.RiskStopMode, RiskATRPeriod: c.RiskATRPeriod, RiskATRCacheMaxAgeMinutes: c.RiskATRCacheMaxAgeMinutes, RiskATRMultiplier: c.RiskATRMultiplier, RiskATRFallbackPct: c.RiskATRFallbackPct, RiskTriggerPriceType: c.RiskTriggerPriceType, RiskAccountPct: c.RiskAccountPct, RiskSlippageBufferBPS: c.RiskSlippageBufferBPS, RiskLiquidationBufferATR: c.RiskLiquidationBufferATR, RiskMaxReentries: c.RiskMaxReentries, RiskReentryRatio: c.RiskReentryRatio, RiskReentryBandATR: c.RiskReentryBandATR, RiskReentryCooldownSeconds: c.RiskReentryCooldownSeconds, RiskReentryMaxChaseATR: c.RiskReentryMaxChaseATR, RiskReentryMaxATRExpansion: c.RiskReentryMaxATRExpansion, RiskWatchTimeoutMinutes: c.RiskWatchTimeoutMinutes, RiskAddonBudgetPct: c.RiskAddonBudgetPct})
+	return ValidateRiskPolicyV4(&CopyConfig{ProviderType: ProviderType(c.ProviderType), RiskPolicyVersion: c.RiskPolicyVersion, RiskStopMode: c.RiskStopMode, RiskATRPeriod: c.RiskATRPeriod, RiskATRCacheMaxAgeMinutes: c.RiskATRCacheMaxAgeMinutes, RiskATRMultiplier: c.RiskATRMultiplier, RiskATRFallbackPct: c.RiskATRFallbackPct, RiskTriggerPriceType: c.RiskTriggerPriceType, RiskAccountPct: c.RiskAccountPct, RiskSlippageBufferBPS: c.RiskSlippageBufferBPS, RiskLiquidationBufferATR: c.RiskLiquidationBufferATR, RiskMaxReentries: c.RiskMaxReentries, RiskReentryRatio: c.RiskReentryRatio, RiskReentryBandATR: c.RiskReentryBandATR, RiskReentryCooldownSeconds: c.RiskReentryCooldownSeconds, RiskReentryMaxChaseATR: c.RiskReentryMaxChaseATR, RiskReentryMaxATRExpansion: c.RiskReentryMaxATRExpansion, RiskWatchTimeoutMinutes: c.RiskWatchTimeoutMinutes, RiskAddonBudgetPct: c.RiskAddonBudgetPct, RiskStopNoiseFloorATR: c.RiskStopNoiseFloorATR, RiskReentryMinRecoveryATR: c.RiskReentryMinRecoveryATR, RiskReentryCooldownEscalation: c.RiskReentryCooldownEscalation, RiskReentryRecoveryEscalation: c.RiskReentryRecoveryEscalation, RiskCycleMaxLossPct: c.RiskCycleMaxLossPct})
 }
