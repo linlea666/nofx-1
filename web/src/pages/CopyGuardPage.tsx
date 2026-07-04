@@ -79,6 +79,23 @@ const eventLabels: Record<string, string> = {
   ADDON_RISK_WARNING: '加仓风险告警（仍跟随）',
   ADDON_SKIPPED_BUDGET: '加仓超预算被拦截（旧版）',
   CYCLE_LOSS_BREAKER: '周期亏损熔断触发',
+  REENTRY_GATE_CHANGED: '重入门控条件变化',
+  WATCH_RESUMED: '观察采样断档后恢复',
+  WATCH_SUMMARY: '观察期收尾统计',
+}
+
+// 观察期采样的门控原因（copy_guard_watch_samples.gate / REENTRY_GATE_CHANGED metadata）
+const gateLabels: Record<string, string> = {
+  REENTRY_DISABLED: '重入未启用',
+  COOLDOWN: '冷却中',
+  ATR_EXPANSION: '波动扩张超限',
+  CHASE_EXCEEDED: '超出追价上限',
+  PRICE_NOT_RETURNED: '价格未回归',
+  MIN_NOTIONAL: '金额低于阈值',
+  REENTRY_TRIGGERED: '已触发重入',
+  ATTEMPTS_EXHAUSTED: '重入次数用尽',
+  WATCH_TIMEOUT: '观察超时',
+  CYCLE_LOSS_CAPPED: '周期亏损熔断',
 }
 
 const baselineSourceLabels: Record<string, string> = {
@@ -168,6 +185,41 @@ export function CopyGuardPage() {
       })
       return items
     }, [])
+  }, [detail])
+  const watchSummary = useMemo(() => {
+    const ev = detail?.events.find((e) => e.type === 'WATCH_SUMMARY')
+    return ev?.metadata as
+      | {
+          price_saved_usd?: number
+          last_stop_price?: number
+          leader_close_price?: number
+          watch_seconds?: number
+          sample_count?: number
+          first_recovery_seconds?: number
+          max_favorable_excursion?: number
+          max_adverse_excursion?: number
+          blocked_when_recovered?: Record<string, number>
+          leader_addons?: number
+          leader_reductions?: number
+        }
+      | undefined
+  }, [detail])
+  const watchChart = useMemo(
+    () =>
+      (detail?.watch_samples ?? []).map((w) => ({
+        time: new Date(w.created_at).toLocaleTimeString(),
+        标记价: w.mark_price || null,
+        重入边界: w.reentry_boundary > 0 ? w.reentry_boundary : null,
+        追价上限: w.chase_limit > 0 ? w.chase_limit : null,
+      })),
+    [detail]
+  )
+  const gateCounts = useMemo(() => {
+    const counts: Record<string, number> = {}
+    for (const w of detail?.watch_samples ?? []) {
+      counts[w.gate] = (counts[w.gate] ?? 0) + 1
+    }
+    return Object.entries(counts).sort((a, b) => b[1] - a[1])
   }, [detail])
   const trend = useMemo(() => {
     return (summary?.trend ?? []).reduce<{
@@ -647,6 +699,121 @@ export function CopyGuardPage() {
           <div className="mb-4 text-xs text-[#848E9C] break-all">
             策略快照：{detail.cycle.policy_snapshot}
           </div>
+          {watchSummary && (
+            <div className="mb-4 rounded border border-[#2B3139] bg-[#181A20] p-4 text-sm">
+              <div className="mb-2 font-medium">
+                观察期复盘（止损出局 → 领航员离场）
+              </div>
+              <div className="grid md:grid-cols-3 gap-3">
+                <Metric
+                  label="价格口径挽回/错过"
+                  value={
+                    watchSummary.price_saved_usd != null
+                      ? `${money(watchSummary.price_saved_usd)}${watchSummary.price_saved_usd >= 0 ? '（止损帮忙少亏）' : '（错过恢复）'}`
+                      : '-'
+                  }
+                />
+                <Metric
+                  label="止损价 → 领航员离场价"
+                  value={`${watchSummary.last_stop_price ?? '-'} → ${watchSummary.leader_close_price ?? '-'}`}
+                />
+                <Metric
+                  label="观察时长 / 采样数"
+                  value={`${Math.round((watchSummary.watch_seconds ?? 0) / 60)} 分钟 / ${watchSummary.sample_count ?? 0} 条`}
+                />
+                <Metric
+                  label="价格首次回归边界"
+                  value={
+                    (watchSummary.first_recovery_seconds ?? -1) >= 0
+                      ? `${Math.round((watchSummary.first_recovery_seconds ?? 0) / 60)} 分钟后`
+                      : '从未回归'
+                  }
+                />
+                <Metric
+                  label="最大有利/不利偏移"
+                  value={`+${(watchSummary.max_favorable_excursion ?? 0).toFixed(4)} / -${(watchSummary.max_adverse_excursion ?? 0).toFixed(4)}`}
+                />
+                <Metric
+                  label="领航员观察期加/减仓"
+                  value={`${watchSummary.leader_addons ?? 0} / ${watchSummary.leader_reductions ?? 0} 次`}
+                />
+              </div>
+              {watchSummary.blocked_when_recovered &&
+                Object.keys(watchSummary.blocked_when_recovered).length > 0 && (
+                  <div className="mt-3 text-xs text-[#F0B90B]">
+                    价格已回归但被其他条件挡住的采样：
+                    {Object.entries(watchSummary.blocked_when_recovered)
+                      .map(
+                        ([gate, count]) =>
+                          `${localized(gateLabels, gate)} ×${count}`
+                      )
+                      .join('、')}
+                    （提示：这些门控参数可能设置过紧）
+                  </div>
+                )}
+            </div>
+          )}
+          {watchChart.length > 1 && (
+            <div className="mb-4 rounded border border-[#2B3139] bg-[#181A20] p-4">
+              <div className="mb-2 text-sm font-medium">
+                观察期价格轨迹（标记价 / 重入边界 / 追价上限）
+              </div>
+              <div className="h-56">
+                <ResponsiveContainer width="100%" height="100%">
+                  <LineChart data={watchChart}>
+                    <XAxis dataKey="time" stroke="#848E9C" minTickGap={40} />
+                    <YAxis
+                      stroke="#848E9C"
+                      domain={['auto', 'auto']}
+                      tickFormatter={(v: number) => v.toPrecision(6)}
+                      width={90}
+                    />
+                    <Tooltip
+                      contentStyle={{
+                        background: '#181A20',
+                        border: '1px solid #2B3139',
+                      }}
+                    />
+                    <Legend />
+                    <Line
+                      type="monotone"
+                      dataKey="标记价"
+                      stroke="#EAECEF"
+                      dot={false}
+                      connectNulls
+                    />
+                    <Line
+                      type="monotone"
+                      dataKey="重入边界"
+                      stroke="#0ECB81"
+                      dot={false}
+                      connectNulls
+                      strokeDasharray="4 2"
+                    />
+                    <Line
+                      type="monotone"
+                      dataKey="追价上限"
+                      stroke="#F6465D"
+                      dot={false}
+                      connectNulls
+                      strokeDasharray="4 2"
+                    />
+                  </LineChart>
+                </ResponsiveContainer>
+              </div>
+              {gateCounts.length > 0 && (
+                <div className="mt-2 text-xs text-[#848E9C]">
+                  未重入原因分布：
+                  {gateCounts
+                    .map(
+                      ([gate, count]) =>
+                        `${localized(gateLabels, gate)} ×${count}`
+                    )
+                    .join('、')}
+                </div>
+              )}
+            </div>
+          )}
           <div className="mb-4 rounded bg-[#181A20] p-3 text-sm text-[#848E9C]">
             {detail.cycle.stop_count === 0 ? (
               <>
@@ -704,6 +871,9 @@ export function CopyGuardPage() {
                 </span>
                 <span className="font-medium">
                   {localized(eventLabels, e.type)}
+                  {e.type === 'REENTRY_GATE_CHANGED' && e.metadata
+                    ? `：${localized(gateLabels, String(e.metadata.from ?? ''))} → ${localized(gateLabels, String(e.metadata.to ?? ''))}`
+                    : ''}
                   {count > 1 ? ` ×${count}` : ''}
                 </span>
                 <span>价格 {e.price || '-'}</span>

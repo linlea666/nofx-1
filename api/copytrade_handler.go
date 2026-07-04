@@ -169,7 +169,12 @@ func (h *CopyTradeHandler) GetRiskCycle(c *gin.Context) {
 	if protectionErr != nil {
 		protection = nil
 	}
-	c.JSON(200, gin.H{"cycle": cycle, "events": events, "attempts": attempts, "protection": protection})
+	// 观察期采样时间线（v4.1）：出局后每个 tick 的价格/边界/门控轨迹
+	watchSamples, samplesErr := h.store.CopyTrade().ListCopyGuardWatchSamples(id)
+	if samplesErr != nil {
+		watchSamples = nil
+	}
+	c.JSON(200, gin.H{"cycle": cycle, "events": events, "attempts": attempts, "protection": protection, "watch_samples": watchSamples})
 }
 
 func (h *CopyTradeHandler) ExportRiskCycle(c *gin.Context) {
@@ -207,9 +212,14 @@ func (h *CopyTradeHandler) ExportRiskCycle(c *gin.Context) {
 	if protectionErr != nil {
 		protection = nil
 	}
+	watchSamples, samplesErr := h.store.CopyTrade().ListCopyGuardWatchSamples(id)
+	if samplesErr != nil {
+		watchSamples = nil
+	}
 	c.Header("Content-Type", "application/x-ndjson")
 	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=copy-guard-cycle-%d.jsonl", id))
-	_ = json.NewEncoder(c.Writer).Encode(gin.H{"schema_version": 2, "exported_at": time.Now().UTC(), "cycle": cycle, "attempts": attempts, "events": events, "protection": protection})
+	// schema_version 3：新增 watch_samples（观察期采样时间线，离线回测输入）
+	_ = json.NewEncoder(c.Writer).Encode(gin.H{"schema_version": 3, "exported_at": time.Now().UTC(), "cycle": cycle, "attempts": attempts, "events": events, "protection": protection, "watch_samples": watchSamples})
 }
 func (h *CopyTradeHandler) ExportRiskCycles(c *gin.Context) {
 	ids, _, names, err := h.ownedTraderIDs(c)
@@ -240,7 +250,11 @@ func (h *CopyTradeHandler) ExportRiskCycles(c *gin.Context) {
 				if protectionErr != nil {
 					protection = nil
 				}
-				_ = enc.Encode(gin.H{"cycle": cycle, "attempts": attempts, "events": events, "protection": protection})
+				watchSamples, samplesErr := h.store.CopyTrade().ListCopyGuardWatchSamples(cycle.ID)
+				if samplesErr != nil {
+					watchSamples = nil
+				}
+				_ = enc.Encode(gin.H{"cycle": cycle, "attempts": attempts, "events": events, "protection": protection, "watch_samples": watchSamples})
 			}
 			if len(rows) < 500 {
 				break

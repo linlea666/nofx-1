@@ -937,6 +937,19 @@ export const api = {
         trigger_type: string
         status: string
       }
+      // v4.1 观察期采样时间线（出局后每个 tick 的价格/边界/门控轨迹）
+      watch_samples?: Array<{
+        id: number
+        cycle_id: number
+        mark_price: number
+        atr: number
+        leader_entry_price: number
+        leader_size: number
+        reentry_boundary: number
+        chase_limit: number
+        gate: string
+        created_at: string
+      }>
     }>(`${API_BASE}/copytrade/risk/cycles/${id}`)
     if (!result.success)
       throw new Error(result.message || '获取 Copy Guard 生命周期失败')

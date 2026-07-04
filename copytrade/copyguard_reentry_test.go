@@ -531,6 +531,115 @@ func TestBackfillV4Cycles(t *testing.T) {
 }
 
 // ============================================================================
+// 观察期采样：gate 时间线 + 变化沿事件 + 同 gate 间隔内降噪（v4.1）
+// ============================================================================
+
+func TestWatchSamplesRecordGateTimeline(t *testing.T) {
+	e, st := newReentryTestEngine(t)
+	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700)
+
+	// tick 1：首轮观察（last=0）不判穿越 → PRICE_NOT_RETURNED，且必须记录边界/追价上限
+	// ATR fallback = 1700×0.02 = 34；boundary = 1700 − 17 = 1683；chase = 1700 + 68 = 1768
+	e.leaderState.Positions["ETHUSDT_long"] = &Position{Symbol: "ETHUSDT", Side: SideLong, Size: 1, EntryPrice: 1700, MarkPrice: 1690, MarginMode: "cross", PosID: "leader-pos"}
+	e.checkReentryConditions()
+	// tick 2：跌出带外，gate 不变且距上一条采样 < 固定间隔 → 必须降噪跳过
+	e.leaderState.Positions["ETHUSDT_long"].MarkPrice = 1660
+	e.checkReentryConditions()
+
+	samples, err := st.CopyTrade().ListCopyGuardWatchSamples(cycle.ID)
+	if err != nil || len(samples) != 1 {
+		t.Fatalf("same-gate ticks within the interval must dedupe to one sample: %d %v", len(samples), err)
+	}
+	if samples[0].Gate != watchGatePriceNotReturned || samples[0].ReentryBoundary != 1683 || samples[0].ChaseLimit != 1768 {
+		t.Fatalf("first sample must record gate/boundary/chase: %+v", samples[0])
+	}
+
+	// tick 3：穿回带内触发重入 → REENTRY_TRIGGERED 采样 + REENTRY_GATE_CHANGED 事件
+	e.leaderState.Positions["ETHUSDT_long"].MarkPrice = 1690
+	e.checkReentryConditions()
+	select {
+	case <-e.decisionCh:
+	default:
+		t.Fatal("crossing tick must emit a reentry decision")
+	}
+	samples, _ = st.CopyTrade().ListCopyGuardWatchSamples(cycle.ID)
+	if len(samples) != 2 || samples[1].Gate != watchGateReentryTriggered {
+		t.Fatalf("gate change must append a sample immediately: %+v", samples)
+	}
+	events, _ := st.CopyTrade().ListCopyGuardEvents(cycle.ID)
+	gateChanges := 0
+	for _, ev := range events {
+		if ev.Type == "REENTRY_GATE_CHANGED" {
+			gateChanges++
+			if ev.Metadata["from"] != watchGatePriceNotReturned || ev.Metadata["to"] != watchGateReentryTriggered {
+				t.Fatalf("gate change event must carry from/to: %+v", ev.Metadata)
+			}
+		}
+	}
+	if gateChanges != 1 {
+		t.Fatalf("exactly one REENTRY_GATE_CHANGED expected, got %d", gateChanges)
+	}
+}
+
+// ============================================================================
+// 观察期收尾统计：价格口径挽回/错过 + 已回归但被门控挡住的采样（v4.1）
+// ============================================================================
+
+func TestWatchSummaryPriceSavedAndBlockedGates(t *testing.T) {
+	_, st := newReentryTestEngine(t)
+	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700) // 止损成交价 1700×0.98=1666，qty=100/1700
+
+	// 观察期采样：一条价格已回归边界但被冷却挡住；一条未回归
+	if err := st.CopyTrade().SaveCopyGuardWatchSample(&store.CopyGuardWatchSample{CycleID: cycle.ID, TraderID: "trader-1", MarkPrice: 1690, ATR: 34, ReentryBoundary: 1683, ChaseLimit: 1768, Gate: watchGateCooldown}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CopyTrade().SaveCopyGuardWatchSample(&store.CopyGuardWatchSample{CycleID: cycle.ID, TraderID: "trader-1", MarkPrice: 1660, ATR: 34, ReentryBoundary: 1683, ChaseLimit: 1768, Gate: watchGatePriceNotReturned}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 领航员最终 1600 平仓：多单止损在 1666 离场帮忙少亏 (1666−1600)×qty > 0
+	emitWatchSummary(st.CopyTrade(), "trader-1", cycle, 1600)
+
+	events, err := st.CopyTrade().ListCopyGuardEvents(cycle.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var summary *store.CopyGuardEvent
+	for _, ev := range events {
+		if ev.Type == "WATCH_SUMMARY" {
+			summary = ev
+		}
+	}
+	if summary == nil {
+		t.Fatal("WATCH_SUMMARY event must be recorded for stopped cycles")
+	}
+	wantSaved := (1700*0.98 - 1600) * (100.0 / 1700.0)
+	if diff := summary.PnL - wantSaved; diff > 1e-6 || diff < -1e-6 {
+		t.Fatalf("price_saved must be (stopPrice-closePrice)×qty=%.4f, got %.4f", wantSaved, summary.PnL)
+	}
+	blocked, ok := summary.Metadata["blocked_when_recovered"].(map[string]interface{})
+	if !ok || blocked[watchGateCooldown] == nil {
+		t.Fatalf("recovered-but-blocked gates must be reported: %+v", summary.Metadata)
+	}
+	if summary.Metadata["first_recovery_seconds"].(float64) < 0 {
+		t.Fatalf("price recovered in samples, first_recovery_seconds must be >= 0: %+v", summary.Metadata)
+	}
+
+	// 未触发过止损的周期不产生 WATCH_SUMMARY
+	fresh, err := st.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "pos-2", Symbol: "BTCUSDT", Side: "long", MarginMode: "cross", Status: store.CopyGuardFollowing, PolicySnapshot: "{}", LeaderEntryPrice: 60000, FollowerEntryPrice: 60000, FollowerNotional: 100, AccountEquity: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	emitWatchSummary(st.CopyTrade(), "trader-1", fresh, 61000)
+	events2, _ := st.CopyTrade().ListCopyGuardEvents(fresh.ID)
+	for _, ev := range events2 {
+		if ev.Type == "WATCH_SUMMARY" {
+			t.Fatal("cycles without stops must not emit WATCH_SUMMARY")
+		}
+	}
+}
+
+// ============================================================================
 // 已关闭周期的孤儿保护单：poll 撤销且不再告警（B4/B5）
 // ============================================================================
 

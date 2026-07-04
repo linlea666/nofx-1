@@ -28,6 +28,10 @@ type RetentionPolicy struct {
 	// CopyGuardEventDays: copy_guard_events belonging to CLOSED cycles.
 	// Events of active cycles are kept regardless of age.
 	CopyGuardEventDays int
+	// CopyGuardWatchSampleDays: copy_guard_watch_samples of CLOSED cycles
+	// (per-tick observation telemetry, the highest-volume Copy Guard table).
+	// Samples of active cycles are kept regardless of age.
+	CopyGuardWatchSampleDays int
 	// CopyGuardCycleDays: closed copy_guard_cycles together with their
 	// attempts / events / protective orders. Cycles whose accounting is
 	// still PENDING/DELAYED get a doubled grace period before removal.
@@ -47,10 +51,13 @@ func DefaultRetentionPolicy() RetentionPolicy {
 		DecisionDays:       30,
 		EquityFullDays:     90,
 		CopyGuardEventDays: 30,
-		CopyGuardCycleDays: 180,
-		SignalLogDays:      30,
-		DebateDays:         30,
-		LogFileDays:        30,
+		// 采样密度 ≈ 1 条/分钟/观察中周期，30 天窗口对回测已足够；
+		// 更长历史请用 JSONL 导出离线归档。
+		CopyGuardWatchSampleDays: 30,
+		CopyGuardCycleDays:       180,
+		SignalLogDays:            30,
+		DebateDays:               30,
+		LogFileDays:              30,
 	}
 }
 
@@ -69,6 +76,7 @@ func LoadRetentionPolicyFromEnv() RetentionPolicy {
 	overrideDays("RETENTION_DECISION_DAYS", &p.DecisionDays)
 	overrideDays("RETENTION_EQUITY_FULL_DAYS", &p.EquityFullDays)
 	overrideDays("RETENTION_COPYGUARD_EVENT_DAYS", &p.CopyGuardEventDays)
+	overrideDays("RETENTION_COPYGUARD_WATCH_SAMPLE_DAYS", &p.CopyGuardWatchSampleDays)
 	overrideDays("RETENTION_COPYGUARD_CYCLE_DAYS", &p.CopyGuardCycleDays)
 	overrideDays("RETENTION_SIGNAL_LOG_DAYS", &p.SignalLogDays)
 	overrideDays("RETENTION_DEBATE_DAYS", &p.DebateDays)
@@ -147,6 +155,7 @@ func (r *RetentionService) RunOnce() {
 	total += r.cleanDecisions()
 	total += r.downsampleEquity()
 	total += r.cleanCopyGuardEvents()
+	total += r.cleanCopyGuardWatchSamples()
 	total += r.cleanCopyGuardCycles()
 	total += r.cleanSignalLogs()
 	total += r.cleanDebates()
@@ -240,6 +249,21 @@ func (r *RetentionService) cleanCopyGuardEvents() int64 {
 		cutoff(r.policy.CopyGuardEventDays))
 }
 
+// cleanCopyGuardWatchSamples removes old observation samples of CLOSED cycles.
+// Samples of active cycles are always kept so live diagnosis is unaffected.
+func (r *RetentionService) cleanCopyGuardWatchSamples() int64 {
+	if r.policy.CopyGuardWatchSampleDays <= 0 {
+		return 0
+	}
+	return r.batchDelete("copy_guard_watch_samples", fmt.Sprintf(`
+		DELETE FROM copy_guard_watch_samples WHERE id IN (
+			SELECT w.id FROM copy_guard_watch_samples w
+			JOIN copy_guard_cycles c ON c.id = w.cycle_id
+			WHERE c.closed_at IS NOT NULL AND datetime(w.created_at) < ?
+			LIMIT %d)`, retentionBatchSize),
+		cutoff(r.policy.CopyGuardWatchSampleDays))
+}
+
 // copyGuardCycleCond selects closed cycles eligible for deletion: accounting
 // must be settled (not PENDING/DELAYED) past the normal window; unresolved
 // cycles get a doubled grace period so reconciliation evidence is preserved.
@@ -261,6 +285,7 @@ func (r *RetentionService) cleanCopyGuardCycles() int64 {
 	for _, child := range []struct{ table, key string }{
 		{"copy_guard_attempts", "id"},
 		{"copy_guard_events", "id"},
+		{"copy_guard_watch_samples", "id"},
 		{"copy_guard_protective_orders", "cycle_id"},
 	} {
 		total += r.batchDelete(child.table, fmt.Sprintf(`

@@ -1580,6 +1580,7 @@ func (ti *TraderIntegration) updatePositionMapping(dec *decision.Decision) {
 							}
 						}
 					}
+					emitWatchSummary(copyTradeStore, ti.traderID, oldCycle, dec.EntryPrice)
 					_ = copyTradeStore.CloseCopyGuardCycle(oldCycle.ID, store.CopyGuardLeaderReversed, oldCycle.ActualPnL, oldCycle.BaselinePnL, oldCycle.Fees, oldCycle.FundingFee, oldCycle.LiquidationPenalty, oldCycle.Slippage)
 					_ = copyTradeStore.SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: oldCycle.ID, TraderID: ti.traderID, Type: "LEADER_REVERSED", Price: dec.EntryPrice, Metadata: map[string]interface{}{"old_side": oldCycle.Side, "new_side": expectedSide}})
 				}
@@ -1702,6 +1703,9 @@ func (ti *TraderIntegration) finalizeCopyGuardCycle(dec *decision.Decision) {
 			baseline += cycle.BaselineNotional * move
 		}
 	}
+	// 观察期收尾统计（挽回/错过、门控占比等）须在周期关闭前写入；
+	// 领航员平仓价即 dec.EntryPrice（close 信号的成交价）
+	emitWatchSummary(ti.store.CopyTrade(), ti.traderID, cycle, dec.EntryPrice)
 	if err := ti.store.CopyTrade().BeginCopyGuardAccounting(cycle.ID, store.CopyGuardLeaderClosed, dec.ExchangeOrderID, baseline); err != nil {
 		logger.Errorf("❌ [%s] failed to begin Copy Guard accounting cycle=%d: %v", ti.traderID, cycle.ID, err)
 		return

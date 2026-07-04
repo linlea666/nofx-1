@@ -140,6 +140,29 @@ type CopyGuardCycle struct {
 	UpdatedAt                time.Time  `json:"updated_at"`
 }
 
+// CopyGuardWatchSample 观察期采样：止损出局后（STOPPED_WATCHING 及终态观察）
+// 每个轮询 tick 按"固定间隔必采 + 门控原因变化立即补采"记录一条，用于复盘
+// "出局后价格如何演化、每个时刻为什么没有重入"，以及离线回测/参数调优。
+// Gate 取值见 copytrade 包 watch gate 常量（COOLDOWN / PRICE_NOT_RETURNED /
+// CHASE_EXCEEDED / ATR_EXPANSION / MIN_NOTIONAL / REENTRY_TRIGGERED / 终态状态等）。
+type CopyGuardWatchSample struct {
+	ID       int64  `json:"id"`
+	CycleID  int64  `json:"cycle_id"`
+	TraderID string `json:"trader_id"`
+	// MarkPrice/ATR: 采样时的标记价与 ATR（ATR=0 表示当时不可得）
+	MarkPrice float64 `json:"mark_price"`
+	ATR       float64 `json:"atr"`
+	// LeaderEntryPrice/LeaderSize: 领航员实时均价与仓位数量（观察期加减仓轨迹）
+	LeaderEntryPrice float64 `json:"leader_entry_price"`
+	LeaderSize       float64 `json:"leader_size"`
+	// ReentryBoundary/ChaseLimit: 当时的重入穿越边界与追价上限（0 = 该 tick 未计算到）
+	ReentryBoundary float64 `json:"reentry_boundary"`
+	ChaseLimit      float64 `json:"chase_limit"`
+	// Gate: 该 tick 未重入的主导原因（或 REENTRY_TRIGGERED）
+	Gate      string    `json:"gate"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
 type CopyGuardEvent struct {
 	ID        int64                  `json:"id"`
 	CycleID   int64                  `json:"cycle_id"`
@@ -230,6 +253,15 @@ func (s *CopyTradeStore) initCopyGuardTables() error {
 			quantity REAL NOT NULL, trigger_price REAL NOT NULL, trigger_type TEXT NOT NULL,
 			status TEXT NOT NULL, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		);
+		CREATE TABLE IF NOT EXISTS copy_guard_watch_samples (
+			id INTEGER PRIMARY KEY AUTOINCREMENT, cycle_id INTEGER NOT NULL, trader_id TEXT NOT NULL,
+			mark_price REAL DEFAULT 0, atr REAL DEFAULT 0,
+			leader_entry_price REAL DEFAULT 0, leader_size REAL DEFAULT 0,
+			reentry_boundary REAL DEFAULT 0, chase_limit REAL DEFAULT 0,
+			gate TEXT NOT NULL DEFAULT '',
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);
+		CREATE INDEX IF NOT EXISTS idx_copy_guard_watch_samples_cycle ON copy_guard_watch_samples(cycle_id, created_at);
 	`)
 	if err == nil {
 		migrations := []string{
@@ -327,6 +359,54 @@ func (s *CopyTradeStore) ListActiveCopyGuardProtectiveOrders(traderID string) ([
 		out = append(out, &o)
 	}
 	return out, rows.Err()
+}
+
+// SaveCopyGuardWatchSample 追加一条观察期采样。
+func (s *CopyTradeStore) SaveCopyGuardWatchSample(w *CopyGuardWatchSample) error {
+	if w == nil {
+		return fmt.Errorf("nil copy guard watch sample")
+	}
+	_, err := s.db.Exec(`INSERT INTO copy_guard_watch_samples(cycle_id,trader_id,mark_price,atr,leader_entry_price,leader_size,reentry_boundary,chase_limit,gate) VALUES(?,?,?,?,?,?,?,?,?)`,
+		w.CycleID, w.TraderID, w.MarkPrice, w.ATR, w.LeaderEntryPrice, w.LeaderSize, w.ReentryBoundary, w.ChaseLimit, w.Gate)
+	return err
+}
+
+// GetLatestCopyGuardWatchSample 取周期最近一条采样（无采样返回 sql.ErrNoRows）。
+// 引擎用它做降噪：固定间隔未到且门控原因未变时跳过写入；跨重启依然成立。
+func (s *CopyTradeStore) GetLatestCopyGuardWatchSample(cycleID int64) (*CopyGuardWatchSample, error) {
+	row := s.db.QueryRow(`SELECT id,cycle_id,trader_id,mark_price,atr,leader_entry_price,leader_size,reentry_boundary,chase_limit,gate,created_at FROM copy_guard_watch_samples WHERE cycle_id=? ORDER BY id DESC LIMIT 1`, cycleID)
+	return scanCopyGuardWatchSample(row.Scan)
+}
+
+// ListCopyGuardWatchSamples 按时间序返回周期全部采样（timeline API / 导出用）。
+func (s *CopyTradeStore) ListCopyGuardWatchSamples(cycleID int64) ([]*CopyGuardWatchSample, error) {
+	rows, err := s.db.Query(`SELECT id,cycle_id,trader_id,mark_price,atr,leader_entry_price,leader_size,reentry_boundary,chase_limit,gate,created_at FROM copy_guard_watch_samples WHERE cycle_id=? ORDER BY id`, cycleID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*CopyGuardWatchSample{}
+	for rows.Next() {
+		w, err := scanCopyGuardWatchSample(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, w)
+	}
+	return out, rows.Err()
+}
+
+func scanCopyGuardWatchSample(scan func(dest ...interface{}) error) (*CopyGuardWatchSample, error) {
+	var w CopyGuardWatchSample
+	var created string
+	if err := scan(&w.ID, &w.CycleID, &w.TraderID, &w.MarkPrice, &w.ATR, &w.LeaderEntryPrice, &w.LeaderSize, &w.ReentryBoundary, &w.ChaseLimit, &w.Gate, &created); err != nil {
+		return nil, err
+	}
+	var err error
+	if w.CreatedAt, err = parseDBTime(created); err != nil {
+		return nil, fmt.Errorf("copy guard watch sample %d created_at: %w", w.ID, err)
+	}
+	return &w, nil
 }
 
 func policyFromConfig(c *CopyTradeConfig) CopyGuardPolicy {

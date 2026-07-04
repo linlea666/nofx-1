@@ -2120,6 +2120,8 @@ func (e *Engine) checkIgnoredPositionsClosed() {
 								baseline += cycle.BaselineNotional * move
 							}
 						}
+						// 观察期收尾统计（挽回/错过、门控占比等）须在周期关闭前写入
+						emitWatchSummary(e.store.CopyTrade(), e.traderID, cycle, closePrice)
 						_ = e.store.CopyTrade().CloseCopyGuardCycle(cycle.ID, store.CopyGuardLeaderClosed, cycle.ActualPnL, baseline, cycle.Fees, cycle.FundingFee, cycle.LiquidationPenalty, cycle.Slippage)
 						_ = e.store.CopyTrade().SetCopyGuardBaselineSource(cycle.ID, baselineSource)
 						_ = e.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: e.traderID, Type: "LEADER_CLOSED", Price: closePrice, Metadata: map[string]interface{}{"baseline_estimated": true, "baseline_source": baselineSource}})

@@ -670,6 +670,8 @@ func (e *Engine) checkReentryConditions() {
 		// 观察期领航员反手（OKX net 模式同 posId 换向）：本周期不可能再重入，
 		// 直接以 LEADER_REVERSED 闭合，否则周期与 mapping 会永远停在观察态。
 		if e.config.RiskPolicyVersion >= 4 && leaderPos.Side != "" && string(leaderPos.Side) != mapping.Side {
+			// 观察期以反手价（当前标记价）作为"领航员离场价"汇总观察期数据
+			emitWatchSummary(e.store.CopyTrade(), e.traderID, v4Cycle, leaderPos.MarkPrice)
 			_ = e.store.CopyTrade().CloseCopyGuardCycle(v4Cycle.ID, store.CopyGuardLeaderReversed, v4Cycle.ActualPnL, v4Cycle.BaselinePnL, v4Cycle.Fees, v4Cycle.FundingFee, v4Cycle.LiquidationPenalty, v4Cycle.Slippage)
 			_ = e.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: v4Cycle.ID, TraderID: e.traderID, Type: "LEADER_REVERSED", Price: leaderPos.MarkPrice, Metadata: map[string]interface{}{"old_side": mapping.Side, "new_side": string(leaderPos.Side), "phase": "watch"}})
 			if err := e.store.CopyTrade().MarkStoppedByRiskAsClosed(e.traderID, mapping.LeaderPosID); err != nil {
@@ -698,6 +700,12 @@ func (e *Engine) checkReentryConditions() {
 				status = terminalWatchStatus
 			}
 			_ = e.store.CopyTrade().UpdateCopyGuardObservation(v4Cycle.ID, status, leaderPos.EntryPrice, mark, atr)
+			// 采样：终态观察（次数用尽/超时/熔断）或重入未启用，gate 直接用状态名
+			gate := watchGateReentryDisabled
+			if terminalWatchStatus != "" {
+				gate = terminalWatchStatus
+			}
+			e.recordWatchSample(v4Cycle, leaderPos, mark, atr, 0, 0, gate)
 			continue
 		}
 
@@ -790,6 +798,7 @@ func (e *Engine) checkReentryConditions() {
 			if coolingDown {
 				atr, _ := market.GetOKXATRWithMaxAge(mapping.Symbol, e.config.RiskATRTimeframe, e.config.RiskATRPeriod, riskATRCacheMaxAge(e.config))
 				_ = e.store.CopyTrade().UpdateCopyGuardObservation(v4Cycle.ID, store.CopyGuardStoppedWatching, entryRef, markPrice, atr)
+				e.recordWatchSample(v4Cycle, leaderPos, markPrice, atr, 0, 0, watchGateCooldown)
 				continue
 			}
 		}
@@ -807,6 +816,7 @@ func (e *Engine) checkReentryConditions() {
 		// 导致价格大幅超出入场价时（如 SL 触发 @63 后涨到 80）仍会重入，等于在更差的位置追单。
 		priceReturned := false
 		currentATR := float64(0)
+		reentryBoundary, chaseLimit := float64(0), float64(0)
 		if e.config.RiskPolicyVersion >= 4 {
 			currentATR, _ = market.GetOKXATRWithMaxAge(mapping.Symbol, e.config.RiskATRTimeframe, e.config.RiskATRPeriod, riskATRCacheMaxAge(e.config))
 			if currentATR <= 0 {
@@ -814,42 +824,59 @@ func (e *Engine) checkReentryConditions() {
 			}
 			if v4Cycle.ATRAtStop > 0 && currentATR > v4Cycle.ATRAtStop*e.config.RiskReentryMaxATRExpansion {
 				_ = e.store.CopyTrade().UpdateCopyGuardObservation(v4Cycle.ID, store.CopyGuardStoppedWatching, entryRef, markPrice, currentATR)
+				e.recordWatchSample(v4Cycle, leaderPos, markPrice, currentATR, 0, 0, watchGateATRExpansion)
 				continue
 			}
 			// 首轮观察（尚无上一 tick 价格）只记录观测、不判穿越：
 			// LastObservedPrice=0 会让多单的 "0 < boundary" 恒真，造成误触发。
 			// 边界与追价上限均以保守锚点为基准（见 reentryAnchor 注释）。
+			// 边界/追价上限每个 tick 都计算（观察期采样要记录），穿越判定
+			// 仍要求已有上一 tick 价格。
 			//
 			// v4.1 最小恢复幅度：把"止损成交价 ± minRecovery × ATR（第 N 次
 			// 重入按倍率^N 加严）"并入穿越边界，价格必须从止损价真实恢复该
 			// 幅度才算穿越——防止"刚止损又原地接回"的震荡循环。并入边界
 			// （而非事后否决）保证边界抬高后穿越判定仍是单次边沿触发。
 			// 止损成交价缺失（旧数据）时降级为纯带宽边界。
-			if v4Cycle.LastObservedPrice > 0 {
-				boundary := reentryAnchor
-				requiredRecovery := float64(0)
-				if e.config.RiskReentryMinRecoveryATR > 0 && stoppedAttempt != nil && stoppedAttempt.ExitPrice > 0 {
-					recoveryEsc := e.config.RiskReentryRecoveryEscalation
-					if recoveryEsc < 1 {
-						recoveryEsc = 1
-					}
-					requiredRecovery = currentATR * e.config.RiskReentryMinRecoveryATR * math.Pow(recoveryEsc, float64(v4Cycle.ReentryCount))
+			reentryBoundary = reentryAnchor
+			requiredRecovery := float64(0)
+			beyondChase := false
+			if e.config.RiskReentryMinRecoveryATR > 0 && stoppedAttempt != nil && stoppedAttempt.ExitPrice > 0 {
+				recoveryEsc := e.config.RiskReentryRecoveryEscalation
+				if recoveryEsc < 1 {
+					recoveryEsc = 1
 				}
-				if mapping.Side == string(SideLong) {
-					boundary -= currentATR * e.config.RiskReentryBandATR
-					if requiredRecovery > 0 {
-						boundary = math.Max(boundary, stoppedAttempt.ExitPrice+requiredRecovery)
-					}
-					priceReturned = v4Cycle.LastObservedPrice < boundary && markPrice >= boundary && markPrice <= reentryAnchor+currentATR*e.config.RiskReentryMaxChaseATR
-				} else {
-					boundary += currentATR * e.config.RiskReentryBandATR
-					if requiredRecovery > 0 {
-						boundary = math.Min(boundary, stoppedAttempt.ExitPrice-requiredRecovery)
-					}
-					priceReturned = v4Cycle.LastObservedPrice > boundary && markPrice <= boundary && markPrice >= reentryAnchor-currentATR*e.config.RiskReentryMaxChaseATR
+				requiredRecovery = currentATR * e.config.RiskReentryMinRecoveryATR * math.Pow(recoveryEsc, float64(v4Cycle.ReentryCount))
+			}
+			if mapping.Side == string(SideLong) {
+				reentryBoundary -= currentATR * e.config.RiskReentryBandATR
+				if requiredRecovery > 0 {
+					reentryBoundary = math.Max(reentryBoundary, stoppedAttempt.ExitPrice+requiredRecovery)
+				}
+				chaseLimit = reentryAnchor + currentATR*e.config.RiskReentryMaxChaseATR
+				beyondChase = markPrice > chaseLimit
+				if v4Cycle.LastObservedPrice > 0 {
+					priceReturned = v4Cycle.LastObservedPrice < reentryBoundary && markPrice >= reentryBoundary && !beyondChase
+				}
+			} else {
+				reentryBoundary += currentATR * e.config.RiskReentryBandATR
+				if requiredRecovery > 0 {
+					reentryBoundary = math.Min(reentryBoundary, stoppedAttempt.ExitPrice-requiredRecovery)
+				}
+				chaseLimit = reentryAnchor - currentATR*e.config.RiskReentryMaxChaseATR
+				beyondChase = markPrice < chaseLimit
+				if v4Cycle.LastObservedPrice > 0 {
+					priceReturned = v4Cycle.LastObservedPrice > reentryBoundary && markPrice <= reentryBoundary && !beyondChase
 				}
 			}
 			_ = e.store.CopyTrade().UpdateCopyGuardObservation(v4Cycle.ID, store.CopyGuardStoppedWatching, entryRef, markPrice, currentATR)
+			if !priceReturned {
+				gate := watchGatePriceNotReturned
+				if beyondChase {
+					gate = watchGateChaseExceeded
+				}
+				e.recordWatchSample(v4Cycle, leaderPos, markPrice, currentATR, reentryBoundary, chaseLimit, gate)
+			}
 		} else if mapping.Side == string(SideLong) {
 			priceReturned = markPrice >= entryRef*(1-tolerance) && markPrice <= entryRef
 		} else {
@@ -916,6 +943,9 @@ func (e *Engine) checkReentryConditions() {
 		}
 		if reentrySize <= 0 {
 			logger.Warnf("⚠️ [%s] 重入金额非正(%.4f)，跳过 | posId=%s", e.traderID, reentrySize, mapping.LeaderPosID)
+			if e.config.RiskPolicyVersion >= 4 {
+				e.recordWatchSample(v4Cycle, leaderPos, markPrice, currentATR, reentryBoundary, chaseLimit, watchGateMinNotional)
+			}
 			continue
 		}
 		// 最小金额防御：低于交易所最小订单价值会导致下单失败 → 触发熔断；
@@ -927,6 +957,9 @@ func (e *Engine) checkReentryConditions() {
 		if reentrySize < minReentry {
 			logger.Infof("⏭️ [%s] 重入金额 %.2f < 阈值 %.2f，跳过本次（条件保持，下轮再判） | posId=%s",
 				e.traderID, reentrySize, minReentry, mapping.LeaderPosID)
+			if e.config.RiskPolicyVersion >= 4 {
+				e.recordWatchSample(v4Cycle, leaderPos, markPrice, currentATR, reentryBoundary, chaseLimit, watchGateMinNotional)
+			}
 			continue
 		}
 
@@ -941,6 +974,7 @@ func (e *Engine) checkReentryConditions() {
 			}
 		} else {
 			_ = e.store.CopyTrade().UpdateCopyGuardObservation(v4Cycle.ID, store.CopyGuardReentryPending, entryRef, markPrice, currentATR)
+			e.recordWatchSample(v4Cycle, leaderPos, markPrice, currentATR, reentryBoundary, chaseLimit, watchGateReentryTriggered)
 			stopFillPrice := float64(0)
 			if stoppedAttempt != nil {
 				stopFillPrice = stoppedAttempt.ExitPrice
@@ -976,6 +1010,188 @@ func (e *Engine) checkReentryConditions() {
 			_ = e.store.CopyTrade().UpdateCopyGuardObservation(v4Cycle.ID, store.CopyGuardStoppedWatching, entryRef, markPrice, currentATR)
 		}
 	}
+}
+
+// ============================================================================
+// 观察期采样（v4.1）
+//
+// 目的：止损出局进入观察后，UpdateCopyGuardObservation 只覆盖最新价，没有
+// 历史轨迹，也不知道每个时刻"为什么没有重入"。采样表记录价格/ATR/领航员
+// 仓位/重入边界/追价上限/主导门控原因的时间序列，供复盘（出局后是挽回了
+// 损失还是错过了行情）、参数调优（哪个 gate 挡住了本可盈利的重入）与离线
+// 回测（重放不同参数）。
+// ============================================================================
+
+// 观察期未重入的主导门控原因（写入 copy_guard_watch_samples.gate）。
+// 判定优先级从上到下：终态 > 冷却 > 波动扩张 > 追价超限 > 价格未回归 >
+// 金额过小 > 全部通过（REENTRY_TRIGGERED）。
+const (
+	watchGateReentryDisabled  = "REENTRY_DISABLED"   // 重入功能未启用，观察至领航员平仓
+	watchGateCooldown         = "COOLDOWN"           // 冷却期内（含逐次加严）
+	watchGateATRExpansion     = "ATR_EXPANSION"      // 波动扩张超上限，市场环境已变
+	watchGateChaseExceeded    = "CHASE_EXCEEDED"     // 价格超出追价上限（行情跑远）
+	watchGatePriceNotReturned = "PRICE_NOT_RETURNED" // 价格尚未回归重入边界
+	watchGateMinNotional      = "MIN_NOTIONAL"       // 重入金额低于最小阈值
+	watchGateReentryTriggered = "REENTRY_TRIGGERED"  // 全部条件满足，已请求重入
+	watchSampleInterval       = 60 * time.Second     // 固定间隔采样（gate 不变时）
+	watchResumeGapMultiplier  = 5                    // 采样断档 > 间隔×该倍数 → 记 WATCH_RESUMED
+)
+
+// recordWatchSample 观察期采样：固定间隔必采 + 门控原因变化立即补采。
+// 门控变化时写 REENTRY_GATE_CHANGED 事件（只在变化沿写入，事件流保持可读）；
+// 采样断档远超间隔时写 WATCH_RESUMED（引擎重启/停摆标记）。
+// 降噪基于表内最近一条采样判断，跨引擎重启依然成立。
+func (e *Engine) recordWatchSample(cycle *store.CopyGuardCycle, leaderPos *Position, markPrice, atr, boundary, chaseLimit float64, gate string) {
+	if cycle == nil || e.store == nil {
+		return
+	}
+	leaderEntry, leaderSize := float64(0), float64(0)
+	if leaderPos != nil {
+		leaderEntry, leaderSize = leaderPos.EntryPrice, leaderPos.Size
+	}
+	last, err := e.store.CopyTrade().GetLatestCopyGuardWatchSample(cycle.ID)
+	if err == nil && last != nil {
+		gap := time.Since(last.CreatedAt)
+		if last.Gate == gate && gap < watchSampleInterval {
+			return
+		}
+		if gap > watchSampleInterval*watchResumeGapMultiplier {
+			_ = e.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{
+				CycleID: cycle.ID, TraderID: e.traderID, Type: "WATCH_RESUMED", Price: markPrice,
+				Metadata: map[string]interface{}{"gap_seconds": gap.Seconds(), "last_gate": last.Gate},
+			})
+		}
+		if last.Gate != gate {
+			_ = e.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{
+				CycleID: cycle.ID, TraderID: e.traderID, Type: "REENTRY_GATE_CHANGED", Price: markPrice,
+				Metadata: map[string]interface{}{
+					"from": last.Gate, "to": gate, "atr": atr,
+					"reentry_boundary": boundary, "chase_limit": chaseLimit,
+					"leader_size": leaderSize, "reentry_count": cycle.ReentryCount,
+				},
+			})
+		}
+	}
+	_ = e.store.CopyTrade().SaveCopyGuardWatchSample(&store.CopyGuardWatchSample{
+		CycleID: cycle.ID, TraderID: e.traderID, MarkPrice: markPrice, ATR: atr,
+		LeaderEntryPrice: leaderEntry, LeaderSize: leaderSize,
+		ReentryBoundary: boundary, ChaseLimit: chaseLimit, Gate: gate,
+	})
+}
+
+// emitWatchSummary 周期关闭（领航员平仓/反手）时汇总观察期数据 → WATCH_SUMMARY 事件。
+// 只对触发过止损的周期有意义（stop_count=0 直接跳过）。
+//
+// 关键结论字段：
+//   - price_saved_usd：以价格口径回答"出局后是挽回了损失还是错过了行情"——
+//     对每段被止损的 attempt 按 (止损成交价 vs 领航员最终平仓价) × 数量求和，
+//     >0 = 止损帮忙少亏（价格继续恶化），<0 = 错过（价格后来恢复）。
+//     与 net_guard_effect（含费用/滑点的记账口径）互补。
+//   - max_favorable/adverse_excursion：观察期内价格相对止损价的最大有利/不利
+//     偏移（有利 = 朝原持仓方向恢复），衡量观察期错过的最大幅度。
+//   - first_recovery_seconds：止损后价格首次触及重入边界的耗时（-1 = 从未）。
+//   - blocked_when_recovered：价格已回归边界但被其他 gate 挡住的采样计数
+//     （按 gate 分组）——直接指出哪个参数太紧。
+//   - gate_seconds：各 gate 占用的观察时长（按相邻采样间隔近似）。
+//   - leader_addons/reductions：观察期领航员加/减仓次数（按相邻采样 size 变化 >1%）。
+func emitWatchSummary(cs *store.CopyTradeStore, traderID string, cycle *store.CopyGuardCycle, closePrice float64) {
+	if cs == nil || cycle == nil || cycle.StopCount == 0 {
+		return
+	}
+	long := cycle.Side == "long"
+	attempts, _ := cs.ListCopyGuardAttempts(cycle.ID)
+	samples, _ := cs.ListCopyGuardWatchSamples(cycle.ID)
+
+	// 价格口径的挽回/错过：Σ (止损成交价 − 领航员平仓价) × 数量（多单；空单取反）
+	priceSaved, lastStopPrice := float64(0), float64(0)
+	for _, a := range attempts {
+		if a.Status != "STOPPED" || a.ExitPrice <= 0 {
+			continue
+		}
+		lastStopPrice = a.ExitPrice
+		if closePrice > 0 && a.Quantity > 0 {
+			if long {
+				priceSaved += (a.ExitPrice - closePrice) * a.Quantity
+			} else {
+				priceSaved += (closePrice - a.ExitPrice) * a.Quantity
+			}
+		}
+	}
+
+	// 观察期价格轨迹统计（相对最后一次止损成交价；有利 = 朝原持仓方向恢复）
+	var maxFavorable, maxAdverse float64
+	firstRecoverySec := float64(-1)
+	blockedWhenRecovered := map[string]int{}
+	gateSeconds := map[string]float64{}
+	leaderAddons, leaderReductions := 0, 0
+	var prev *store.CopyGuardWatchSample
+	for _, w := range samples {
+		if lastStopPrice > 0 && w.MarkPrice > 0 {
+			diff := w.MarkPrice - lastStopPrice
+			if !long {
+				diff = -diff
+			}
+			if diff > maxFavorable {
+				maxFavorable = diff
+			}
+			if -diff > maxAdverse {
+				maxAdverse = -diff
+			}
+		}
+		recovered := w.ReentryBoundary > 0 && w.MarkPrice > 0 &&
+			((long && w.MarkPrice >= w.ReentryBoundary) || (!long && w.MarkPrice <= w.ReentryBoundary))
+		if recovered {
+			if firstRecoverySec < 0 && cycle.StoppedAt != nil {
+				firstRecoverySec = w.CreatedAt.Sub(*cycle.StoppedAt).Seconds()
+			}
+			if w.Gate != watchGateReentryTriggered && w.Gate != watchGatePriceNotReturned {
+				blockedWhenRecovered[w.Gate]++
+			}
+		}
+		if prev != nil {
+			if dt := w.CreatedAt.Sub(prev.CreatedAt).Seconds(); dt > 0 {
+				gateSeconds[prev.Gate] += dt
+			}
+			if prev.LeaderSize > 0 && w.LeaderSize > prev.LeaderSize*1.01 {
+				leaderAddons++
+			}
+			if prev.LeaderSize > 0 && w.LeaderSize < prev.LeaderSize*0.99 {
+				leaderReductions++
+			}
+		}
+		prev = w
+	}
+
+	watchSeconds := float64(0)
+	if cycle.StoppedAt != nil {
+		watchSeconds = time.Since(*cycle.StoppedAt).Seconds()
+	}
+	meta := map[string]interface{}{
+		"stop_count":              cycle.StopCount,
+		"reentry_count":           cycle.ReentryCount,
+		"last_stop_price":         lastStopPrice,
+		"leader_close_price":      closePrice,
+		"price_saved_usd":         priceSaved,
+		"watch_seconds":           watchSeconds,
+		"sample_count":            len(samples),
+		"max_favorable_excursion": maxFavorable,
+		"max_adverse_excursion":   maxAdverse,
+		"first_recovery_seconds":  firstRecoverySec,
+	}
+	if len(blockedWhenRecovered) > 0 {
+		meta["blocked_when_recovered"] = blockedWhenRecovered
+	}
+	if len(gateSeconds) > 0 {
+		meta["gate_seconds"] = gateSeconds
+	}
+	if leaderAddons+leaderReductions > 0 {
+		meta["leader_addons"] = leaderAddons
+		meta["leader_reductions"] = leaderReductions
+	}
+	_ = cs.SaveCopyGuardEvent(&store.CopyGuardEvent{
+		CycleID: cycle.ID, TraderID: traderID, Type: "WATCH_SUMMARY",
+		Price: closePrice, PnL: priceSaved, Metadata: meta,
+	})
 }
 
 // emitReentryDecision 构造并推送一个二次进场的 Open 决策
