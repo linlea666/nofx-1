@@ -59,6 +59,14 @@ func main() {
 	defer st.Close()
 	backtest.UseDatabase(st.DB())
 
+	// Data retention: reclaim disk space at startup (before traders run),
+	// then clean expired history periodically in the background.
+	// Log files live in "data" (hardcoded in logger.Init).
+	retention := store.NewRetentionService(st, store.LoadRetentionPolicyFromEnv(), "data")
+	retention.VacuumIfNeeded()
+	retention.Start()
+	defer retention.Stop()
+
 	// Initialize encryption service
 	logger.Info("🔐 Initializing encryption service...")
 	cryptoService, err := crypto.NewCryptoService()
