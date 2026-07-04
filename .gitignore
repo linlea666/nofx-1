@@ -124,3 +124,6 @@ dmypy.json
 # Pyre type checker
 .pyre/
 PR_DESCRIPTION.md
+
+# Copy Guard 周期诊断导出（从 UI 下载的日志，不入库）
+copy-guard-cycle-*.jsonl

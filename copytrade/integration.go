@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"sync"
 	"time"
 
 	"nofx/decision"
@@ -104,7 +105,13 @@ type TraderIntegration struct {
 	// lastV4Backfill rate-limits the lifecycle backfill sweep for positions
 	// followed before Copy Guard v4 was enabled.
 	lastV4Backfill time.Time
-	cycleNumber    int // 跟单周期计数器
+	// lastProtectionEvent rate-limits repeated identical protection-issue
+	// events (poll runs every 3s; a stuck failure used to write thousands of
+	// duplicate rows per cycle). Guarded by protectionEventMu because
+	// markProtectionIssue runs from both the monitor and executor goroutines.
+	protectionEventMu   sync.Mutex
+	lastProtectionEvent map[string]time.Time
+	cycleNumber         int // 跟单周期计数器
 }
 
 // NewTraderIntegration 创建交易集成
@@ -122,6 +129,7 @@ func NewTraderIntegration(
 		cancel:                  cancel,
 		lastAttemptReconcile:    make(map[int64]time.Time),
 		protectiveQueryFailures: make(map[int64]int),
+		lastProtectionEvent:     make(map[string]time.Time),
 	}
 }
 
@@ -443,6 +451,12 @@ func (ti *TraderIntegration) reconcileV4CycleAccounting(cycle *store.CopyGuardCy
 	}
 	followerPosID, exitOrderID := cycle.FollowerPosID, cycle.ExitOrderID
 	attemptQty := 0.0
+	// notBefore 必须用最后一个 attempt 的开仓时间，不能用 cycle.OpenedAt：
+	// OKX 净持仓模式下 posId 跨 attempt 复用，用周期起点做下限会在新平仓记录
+	// 尚未生成时误匹配上一个 attempt 的止损平仓记录（实盘 cycle 15：-1.82 被
+	// 计了两次）。refTime 保持 nil（取最新记录）：跟随者平仓单延迟成交时记录
+	// ExitTime 可能远晚于 ClosedAt，就近窗口会让对账永远失败。
+	notBefore := cycle.OpenedAt.Add(-time.Minute)
 	if attempts, err := ti.store.CopyTrade().ListCopyGuardAttempts(cycle.ID); err == nil {
 		for _, attempt := range attempts {
 			if attempt.AttemptNo == cycle.ReentryCount {
@@ -453,6 +467,9 @@ func (ti *TraderIntegration) reconcileV4CycleAccounting(cycle *store.CopyGuardCy
 					exitOrderID = attempt.ExitOrderID
 				}
 				attemptQty = attempt.Quantity
+				if !attempt.OpenedAt.IsZero() {
+					notBefore = attempt.OpenedAt.Add(-time.Minute)
+				}
 				break
 			}
 		}
@@ -479,7 +496,7 @@ func (ti *TraderIntegration) reconcileV4CycleAccounting(cycle *store.CopyGuardCy
 		}
 		exitPrice = getFloatField(order, "avgPrice")
 	}
-	matched, err := ti.lookupClosedPnLRecord(cycle.Symbol, cycle.Side, cycle.MarginMode, followerPosID, cycle.OpenedAt.Add(-time.Minute), nil, attemptQty)
+	matched, err := ti.lookupClosedPnLRecord(cycle.Symbol, cycle.Side, cycle.MarginMode, followerPosID, notBefore, nil, attemptQty)
 	if err != nil {
 		markFailure(err.Error())
 		return
@@ -546,7 +563,13 @@ func (ti *TraderIntegration) lookupClosedPnLRecord(symbol, side, marginMode, pos
 			if marginMode != "" && r.MarginMode != "" && r.MarginMode != marginMode {
 				continue
 			}
-			if quantityHint > 0 && r.Quantity > 0 && (r.Quantity < quantityHint*0.8 || r.Quantity > quantityHint*1.2) {
+			// quantityHint 是币数量；OKX 的 r.Quantity 是合约张数，必须用换算
+			// 后的 QuantityCoins 对比，否则会差 ctVal 倍导致误过滤/误匹配。
+			recordQty := r.QuantityCoins
+			if recordQty <= 0 {
+				recordQty = r.Quantity
+			}
+			if quantityHint > 0 && recordQty > 0 && (recordQty < quantityHint*0.8 || recordQty > quantityHint*1.2) {
 				continue
 			}
 		}
@@ -2508,11 +2531,41 @@ func (ti *TraderIntegration) markProtectionIssue(cycle *store.CopyGuardCycle, st
 		metadata["protected_quantity"] = order.Quantity
 		metadata["trigger_price"] = order.TriggerPrice
 	}
-	_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: eventType, Metadata: metadata})
+	// 事件限频：poll 每 3 秒跑一轮，同一错误持续期间会把事件表刷爆
+	// （实盘 cycle 27 积累了 3000+ 条重复 PROTECTION_COVERAGE_LOW）。
+	// 健康状态照常每轮更新，只有"同 cycle + 同事件类型 + 同错误"的重复
+	// 事件在 60 秒内只落一条；错误内容变化时立即记录。
+	if ti.shouldRecordProtectionEvent(cycle.ID, eventType, message) {
+		_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: eventType, Metadata: metadata})
+	}
 	logger.Errorf("❌ [%s] Copy Guard protection %s | cycle=%d posId=%s %s %s coverage=%.2f%% error=%s", ti.traderID, status, cycle.ID, cycle.LeaderPosID, cycle.Symbol, cycle.Side, coverage*100, message)
 	// 首次失败只记日志+事件，不发邮件：自动重试大多能在数轮内自愈；
 	// 邮件只保留两类——持续缺失超过 10 分钟的升级告警（retryDegradedV4Protections）
 	// 与恢复通知（pollV4ProtectiveStops），避免瞬时故障刷屏。
+}
+
+// protectionEventDedupeWindow: minimum interval between two identical
+// protection-issue events for the same cycle.
+const protectionEventDedupeWindow = time.Minute
+
+func (ti *TraderIntegration) shouldRecordProtectionEvent(cycleID int64, eventType, message string) bool {
+	key := fmt.Sprintf("%d|%s|%s", cycleID, eventType, message)
+	now := time.Now()
+	ti.protectionEventMu.Lock()
+	defer ti.protectionEventMu.Unlock()
+	if last, ok := ti.lastProtectionEvent[key]; ok && now.Sub(last) < protectionEventDedupeWindow {
+		return false
+	}
+	// Opportunistic pruning keeps the map bounded across long uptimes.
+	if len(ti.lastProtectionEvent) > 512 {
+		for k, v := range ti.lastProtectionEvent {
+			if now.Sub(v) > 10*protectionEventDedupeWindow {
+				delete(ti.lastProtectionEvent, k)
+			}
+		}
+	}
+	ti.lastProtectionEvent[key] = now
+	return true
 }
 
 func (ti *TraderIntegration) notifyProtection(cycle *store.CopyGuardCycle, title, body, kind string) {

@@ -241,6 +241,33 @@ func TestReentryFirstTickGuardAndCrossing(t *testing.T) {
 }
 
 // ============================================================================
+// 重入定 size：以被止损 attempt 的名义价值为基准，与领航员当前仓位规模解耦
+// （实盘事故：领航员跟随期间加仓后，按领航员占比折算的重入是首仓的 8 倍、
+//  57 倍杠杆，止损价落入强平区导致保护单永远挂不上）
+// ============================================================================
+
+func TestReentrySizeUsesStoppedAttemptNotional(t *testing.T) {
+	e, st := newReentryTestEngine(t)
+	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700) // attempt 0 notional=100 被止损
+	_ = st.CopyTrade().UpdateCopyGuardObservation(cycle.ID, store.CopyGuardStoppedWatching, 1700, 1660, 34)
+	// 领航员当前持仓极大（加仓后）：旧公式会算出 1×0.5×(2500×1690/1000)×100 ≈ 21 万
+	e.leaderState.Positions["ETHUSDT_long"] = &Position{Symbol: "ETHUSDT", Side: SideLong, Size: 2500, EntryPrice: 1700, MarkPrice: 1690, MarginMode: "cross", PosID: "leader-pos"}
+	e.checkReentryConditions()
+	select {
+	case full := <-e.decisionCh:
+		if len(full.Decisions) != 1 {
+			t.Fatalf("unexpected decisions: %+v", full.Decisions)
+		}
+		got := full.Decisions[0].PositionSizeUSD
+		if got != 50 { // 被止损名义 100 × 重入系数 0.5
+			t.Fatalf("reentry size must be stopped-attempt notional × ratio (want 50), got %v", got)
+		}
+	default:
+		t.Fatal("band crossing must emit a reentry decision")
+	}
+}
+
+// ============================================================================
 // 重入拦截条件：冷却期 / 次数耗尽
 // ============================================================================
 

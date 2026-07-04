@@ -684,15 +684,41 @@ func (e *Engine) checkReentryConditions() {
 			markPrice, entryRef, leaderPos.UnrealizedPnL)
 
 		// 计算重入仓位大小（USD）
-		leaderTradeValue := leaderPos.Size * markPrice
-		leaderEquity := float64(1)
-		e.leaderStateMu.RLock()
-		if e.leaderState != nil && e.leaderState.TotalEquity > 0 {
-			leaderEquity = e.leaderState.TotalEquity
+		//
+		// v4：以"被止损时自己的仓位名义价值"为基准（× 重入系数）。
+		// 旧逻辑按领航员当前总仓位占比折算，当领航员在跟随期间加过仓（跟随者
+		// 未等比例跟进）时，重入会远大于被止损的仓位——实盘出现过重入 8 倍于
+		// 首仓、57 倍杠杆、止损价落入强平区导致保护单挂不上的事故（cycle 15）。
+		// 被止损仓位基准让重入风险严格有界：永远不超过上一段仓位的名义 × 系数。
+		var reentrySize float64
+		if e.config.RiskPolicyVersion >= 4 && v4Cycle != nil {
+			stoppedNotional := float64(0)
+			if attempts, attemptErr := e.store.CopyTrade().ListCopyGuardAttempts(v4Cycle.ID); attemptErr == nil {
+				for _, attempt := range attempts {
+					if attempt.AttemptNo == v4Cycle.ReentryCount && attempt.Status == "STOPPED" {
+						stoppedNotional = attempt.Notional
+						break
+					}
+				}
+			}
+			if stoppedNotional <= 0 {
+				// 旧数据/回填周期可能没有 attempt 名义，用周期跟随名义兜底
+				stoppedNotional = v4Cycle.FollowerNotional
+			}
+			reentrySize = stoppedNotional * e.config.RiskReentryRatio
 		}
-		e.leaderStateMu.RUnlock()
-		leaderRatio := leaderTradeValue / leaderEquity
-		reentrySize := e.config.CopyRatio * e.config.RiskReentryRatio * leaderRatio * followerEquity
+		if reentrySize <= 0 {
+			// v3 及无名义快照的兜底：按领航员当前仓位占比折算（原有公式）
+			leaderTradeValue := leaderPos.Size * markPrice
+			leaderEquity := float64(1)
+			e.leaderStateMu.RLock()
+			if e.leaderState != nil && e.leaderState.TotalEquity > 0 {
+				leaderEquity = e.leaderState.TotalEquity
+			}
+			e.leaderStateMu.RUnlock()
+			leaderRatio := leaderTradeValue / leaderEquity
+			reentrySize = e.config.CopyRatio * e.config.RiskReentryRatio * leaderRatio * followerEquity
+		}
 		if reentrySize <= 0 {
 			logger.Warnf("⚠️ [%s] 重入金额非正(%.4f)，跳过 | posId=%s", e.traderID, reentrySize, mapping.LeaderPosID)
 			continue

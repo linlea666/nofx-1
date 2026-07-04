@@ -17,7 +17,8 @@ type ClosedPnLRecord struct {
 	Side               string  // "long" or "short"
 	EntryPrice         float64 // Entry price
 	ExitPrice          float64 // Exit/close price
-	Quantity           float64 // Position size
+	Quantity           float64 // Position size in the exchange's native unit (OKX: contracts)
+	QuantityCoins      float64 // Position size in coins (OKX: contracts × ctVal); 0 when the exchange already reports coins or ctVal is unavailable
 	RealizedPnL        float64 // Realized profit/loss
 	Fee                float64 // Trading fee/commission
 	FundingFee         float64

@@ -1544,7 +1544,7 @@ export function TraderConfigModal({
                                 <div className="grid grid-cols-2 gap-3">
                                   <div>
                                     <label className="text-xs text-[#848E9C] block mb-1">
-                                      重入仓位系数{' '}
+                                      重入仓位系数（× 被止损仓位名义）{' '}
                                       <span className="text-[#F0B90B]">
                                         {formData.risk_reentry_ratio.toFixed(0)}
                                         %

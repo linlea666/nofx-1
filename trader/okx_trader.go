@@ -96,7 +96,10 @@ func (t *OKXTrader) AmendProtectiveStop(algoID string, req ProtectiveStopRequest
 	if err != nil {
 		return err
 	}
-	body := []map[string]interface{}{{"instId": t.convertSymbol(req.Symbol), "algoId": algoID, "newSz": t.formatSize(req.Quantity/inst.CtVal, inst), "newSlTriggerPx": strconv.FormatFloat(req.TriggerPrice, 'f', -1, 64), "newSlOrdPx": "-1"}}
+	// amend-algos takes a single JSON object (unlike cancel-algos, which takes
+	// an array); sending an array is rejected with 50002 "Incorrect json data
+	// format" and the amend never succeeds.
+	body := map[string]interface{}{"instId": t.convertSymbol(req.Symbol), "algoId": algoID, "newSz": t.formatSize(req.Quantity/inst.CtVal, inst), "newSlTriggerPx": strconv.FormatFloat(req.TriggerPrice, 'f', -1, 64), "newSlOrdPx": "-1"}
 	data, err := t.doRequest("POST", okxAmendAlgoPath, body)
 	if err != nil {
 		return err
@@ -1714,8 +1717,13 @@ func (t *OKXTrader) getClosedPnLFromPath(path string) ([]ClosedPnLRecord, error)
 		record.EntryPrice, _ = strconv.ParseFloat(pos.OpenAvgPx, 64)
 		record.ExitPrice, _ = strconv.ParseFloat(pos.CloseAvgPx, 64)
 
-		// Quantity
+		// Quantity: closeTotalPos is in contracts; also expose the coin
+		// amount so callers comparing against coin-denominated sizes
+		// (e.g. Copy Guard attempts) do not mismatch by a ctVal factor.
 		record.Quantity, _ = strconv.ParseFloat(pos.CloseTotalPos, 64)
+		if inst, instErr := t.getInstrument(record.Symbol); instErr == nil && inst.CtVal > 0 {
+			record.QuantityCoins = record.Quantity * inst.CtVal
+		}
 
 		// PnL
 		record.RealizedPnL, _ = strconv.ParseFloat(pos.RealizedPnl, 64)

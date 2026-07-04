@@ -136,7 +136,7 @@ type CopyConfig struct {
 	RiskLeverageFallback bool    `json:"risk_leverage_fallback"`
 	RiskLeverageMaxLoss  float64 `json:"risk_leverage_max_loss"`
 	RiskReentryEnabled   bool    `json:"risk_reentry_enabled"`
-	RiskReentryRatio     float64 `json:"risk_reentry_ratio"`
+	RiskReentryRatio     float64 `json:"risk_reentry_ratio"` // v4: × 被止损仓位名义；v3: ×copy_ratio×领航员占比
 	RiskReentryTolerance float64 `json:"risk_reentry_tolerance"`
 
 	// v3.2 反加仓铁律（详见 store.CopyTradeConfig 同名字段注释）

@@ -1,8 +1,10 @@
 package trader
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -175,6 +177,66 @@ func TestGetClosedPnLQueryDirection(t *testing.T) {
 	}
 	if len(captured) != 1 || !strings.Contains(captured[0], "posId=pos-1") {
 		t.Fatalf("position id query must filter by posId, got %v", captured)
+	}
+}
+
+// TestAlgoRequestBodyShapes reproduces the live failure where every amend was
+// rejected with 50002 "Incorrect json data format": OKX amend-algos takes a
+// single JSON object while cancel-algos takes an array. Position adds could
+// never widen the protective stop (cycles 25/27/30, coverage stuck at 37-50%).
+func TestAlgoRequestBodyShapes(t *testing.T) {
+	bodies := map[string][]byte{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		if r.Method == http.MethodPost && strings.Contains(path, "/trade/") {
+			raw, _ := io.ReadAll(r.Body)
+			bodies[path] = raw
+		}
+		w.WriteHeader(200)
+		switch {
+		case strings.Contains(path, "instruments"):
+			_, _ = w.Write([]byte(`{"code":"0","msg":"","data":[{"instId":"ETH-USDT-SWAP","ctVal":"0.1","ctMult":"1","lotSz":"1","minSz":"1","maxMktSz":"100000","tickSz":"0.01","ctType":"linear"}]}`))
+		case strings.Contains(path, "amend-algos"), strings.Contains(path, "cancel-algos"):
+			_, _ = w.Write([]byte(`{"code":"0","msg":"","data":[{"algoId":"1","sCode":"0","sMsg":""}]}`))
+		default:
+			_, _ = w.Write([]byte(`{"code":"0","msg":"","data":[]}`))
+		}
+	}))
+	old := okxBaseURL
+	okxBaseURL = srv.URL
+	t.Cleanup(func() {
+		okxBaseURL = old
+		srv.Close()
+	})
+	trader := NewOKXTrader("k", "s", "p")
+
+	if err := trader.AmendProtectiveStop("algo-1", ProtectiveStopRequest{Symbol: "ETHUSDT", PositionSide: "short", Quantity: 0.082, TriggerPrice: 1765.77, TriggerType: "mark"}); err != nil {
+		t.Fatalf("AmendProtectiveStop: %v", err)
+	}
+	amendBody := bodies["/api/v5/trade/amend-algos"]
+	if len(amendBody) == 0 {
+		t.Fatal("amend-algos request body was not captured")
+	}
+	var amendObj map[string]interface{}
+	if err := json.Unmarshal(amendBody, &amendObj); err != nil {
+		t.Fatalf("amend-algos body must be a single JSON object (OKX 50002 otherwise), got: %s", amendBody)
+	}
+	for _, field := range []string{"instId", "algoId", "newSz", "newSlTriggerPx"} {
+		if _, ok := amendObj[field]; !ok {
+			t.Fatalf("amend-algos body missing %s: %s", field, amendBody)
+		}
+	}
+
+	if err := trader.CancelProtectiveStop("algo-1", "ETHUSDT"); err != nil {
+		t.Fatalf("CancelProtectiveStop: %v", err)
+	}
+	cancelBody := bodies["/api/v5/trade/cancel-algos"]
+	if len(cancelBody) == 0 {
+		t.Fatal("cancel-algos request body was not captured")
+	}
+	var cancelArr []map[string]interface{}
+	if err := json.Unmarshal(cancelBody, &cancelArr); err != nil || len(cancelArr) == 0 {
+		t.Fatalf("cancel-algos body must stay a JSON array, got: %s", cancelBody)
 	}
 }
 
