@@ -280,9 +280,10 @@ func TestObservationUpdatesGuardClosedCycle(t *testing.T) {
 	}
 }
 
-// 默认值代次迁移（当前代次 4）：仅把等于旧默认值的 max_chase(0)/cooldown(60)/
-// max_reentries(2) 替换为新默认值；用户显式配置的其他值保留；已达当前代次
-// 的策略不再重扫。
+// 默认值代次迁移（当前代次 5）：低代次行仅把等于旧默认值的 max_chase(0)/
+// cooldown(60) 替换为新默认值；代次 5 回补只针对被代次 4 规则降为 1 的
+// max_reentries（fromVersion==4 且值==1）；用户显式配置的其他值保留；
+// 已达当前代次的策略不再重扫。
 func TestMigratePolicyDefaults(t *testing.T) {
 	st, err := New(filepath.Join(t.TempDir(), "defaults-v4.db"))
 	if err != nil {
@@ -318,22 +319,29 @@ func TestMigratePolicyDefaults(t *testing.T) {
 		return p
 	}
 
-	// 低代次存量策略：max_chase/cooldown/max_reentries 仍是旧默认值 → 应迁移
+	// 低代次存量策略：max_chase/cooldown 仍是旧默认值 → 应迁移；
+	// max_reentries==2 不再被代次 4 规则降为 1（代次 5 已回退该规则）
 	seed("t-old-defaults", CopyGuardPolicy{Version: 4, ReentryMaxChaseATR: 0, ReentryCooldownSec: 60, MaxReentries: 2, DefaultsVersion: 2})
 	// 低代次存量策略：用户显式改过 → 应保留
 	seed("t-custom", CopyGuardPolicy{Version: 4, ReentryMaxChaseATR: 1.2, ReentryCooldownSec: 900, MaxReentries: 3, DefaultsVersion: 2})
+	// 代次 4 行：被代次 4 规则降为 1 的 max_reentries → 代次 5 回补为 2；
+	// 已迁移过的 cooldown/chase 不得再动（fromVersion 守卫）
+	seed("t-gen4-reduced", CopyGuardPolicy{Version: 4, ReentryMaxChaseATR: 0, ReentryCooldownSec: 60, MaxReentries: 1, DefaultsVersion: 4})
 	// 已是当前代次：即使值等于旧默认也不得再动（用户设回旧值的选择）
-	seed("t-current", CopyGuardPolicy{Version: 4, ReentryMaxChaseATR: 0, ReentryCooldownSec: 60, MaxReentries: 2, DefaultsVersion: copyGuardPolicyDefaultsVersion})
+	seed("t-current", CopyGuardPolicy{Version: 4, ReentryMaxChaseATR: 0, ReentryCooldownSec: 60, MaxReentries: 1, DefaultsVersion: copyGuardPolicyDefaultsVersion})
 
 	cs.migrateCopyGuardPolicyDefaults()
 
-	if p := load("t-old-defaults"); p.ReentryMaxChaseATR != 0.5 || p.ReentryCooldownSec != 300 || p.MaxReentries != 1 || p.DefaultsVersion != copyGuardPolicyDefaultsVersion {
-		t.Fatalf("old defaults must migrate to 0.5/300s/1 with version bump: %+v", p)
+	if p := load("t-old-defaults"); p.ReentryMaxChaseATR != 0.5 || p.ReentryCooldownSec != 300 || p.MaxReentries != 2 || p.DefaultsVersion != copyGuardPolicyDefaultsVersion {
+		t.Fatalf("old defaults must migrate to 0.5/300s with max_reentries kept at 2: %+v", p)
 	}
 	if p := load("t-custom"); p.ReentryMaxChaseATR != 1.2 || p.ReentryCooldownSec != 900 || p.MaxReentries != 3 || p.DefaultsVersion != copyGuardPolicyDefaultsVersion {
 		t.Fatalf("explicit values must be preserved: %+v", p)
 	}
-	if p := load("t-current"); p.ReentryMaxChaseATR != 0 || p.ReentryCooldownSec != 60 || p.MaxReentries != 2 {
+	if p := load("t-gen4-reduced"); p.MaxReentries != 2 || p.ReentryMaxChaseATR != 0 || p.ReentryCooldownSec != 60 || p.DefaultsVersion != copyGuardPolicyDefaultsVersion {
+		t.Fatalf("gen4-reduced max_reentries must be restored to 2 without re-running older rules: %+v", p)
+	}
+	if p := load("t-current"); p.ReentryMaxChaseATR != 0 || p.ReentryCooldownSec != 60 || p.MaxReentries != 1 {
 		t.Fatalf("policies at the current version must not be rescanned: %+v", p)
 	}
 }

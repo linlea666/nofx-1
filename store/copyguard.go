@@ -22,10 +22,9 @@ const (
 	// 账户硬兜底 + max_reentries 已完整覆盖其职能。常量仅保留用于历史数据
 	// 的展示与清理，引擎不再产生该状态。
 	CopyGuardCycleLossCapped = "CYCLE_LOSS_CAPPED"
-	// GUARD_UNPROTECTABLE: v5 可保护性状态机终态之一——保护单确认不可建立
-	// （clamp 后仍不可行）且处置模式为 follow（裸跑），周期继续跟随但 UI 标红。
-	// close 模式下仓位被立即平掉，周期进入 STOPPED_WATCHING 观察。
-	CopyGuardUnprotectable = "GUARD_UNPROTECTABLE"
+	// v5 注：不可保护（裸跑）不是周期状态——follow 模式下周期保持 FOLLOWING
+	// （否则保护重试链会跳过它、无法自动复检恢复），信号载体是
+	// protection_status=UNPROTECTABLE + GUARD_UNPROTECTABLE 事件。
 )
 
 const (
@@ -92,12 +91,14 @@ type CopyGuardPolicy struct {
 	//   3 = 重入默认放宽（max_chase 0→0.5、cycle_max_loss 0.10→1.0）
 	//   4 = v5 两层硬止损（leverage_max_loss 0.3→0.2、account_pct 0.20→0.10、
 	//       max_reentries 2→1；均只替换等于旧默认值的行）
+	//   5 = 重入默认回调（max_reentries 1→2，仅回补被代次 4 降过的行——
+	//       确认式重入的结构性门槛已足够约束坏重入）
 	DefaultsVersion int `json:"defaults_version"`
 }
 
 // copyGuardPolicyDefaultsVersion 当前默认值代次；migrateCopyGuardPolicyDefaults
 // 只处理低于该值的存量策略。
-const copyGuardPolicyDefaultsVersion = 4
+const copyGuardPolicyDefaultsVersion = 5
 
 type CopyGuardCycle struct {
 	ID                  int64   `json:"id"`
@@ -482,11 +483,16 @@ func (s *CopyTradeStore) loadCopyGuardPolicy(c *CopyTradeConfig) error {
 // 代次 4（v5 两层硬止损 + 确认式重入）：
 //   - risk_leverage_max_loss：0.30（v4.1 默认）→ 0.20（用户确认的 v5 仓位止损）
 //   - risk_account_pct：0.20（v4.1 默认）→ 0.10（账户硬兜底只锁灾难敞口）
-//   - max_reentries：2（旧默认）→ 1（确认式重入下默认只重入一次）
+//   - max_reentries：2 → 1（已于代次 5 回退，规则删除）
+//
+// 代次 5（重入默认回调）：确认式重入的结构性门槛（连续确认/恢复幅度递增/
+// 冷却递增/噪音档禁入/可保护性预检）已足够约束坏重入，默认次数恢复为 2。
+//   - 仅回补被代次 4 规则降为 1 的行（defaults_version==4 且 max_reentries==1）；
+//     从未跑过代次 4 的行本来就是 2 或用户显式值，不动。
 //
 // 仅当存量值等于旧默认值时才替换（用户显式改过的值保留）；处理后写入当前
 // defaults_version 书签，幂等且不会覆盖之后用户再设回旧值的选择。
-// 各代次规则按存量值判断可安全叠加：低代次策略一次跑齐全部规则。
+// 各代次规则以来源代次为守卫，避免对已迁移过的行重复执行。
 func (s *CopyTradeStore) migrateCopyGuardPolicyDefaults() {
 	rows, err := s.db.Query(`SELECT trader_id, policy_json FROM copy_guard_policies`)
 	if err != nil {
@@ -514,14 +520,18 @@ func (s *CopyTradeStore) migrateCopyGuardPolicyDefaults() {
 	rows.Close()
 	for _, item := range pending {
 		p := item.policy
-		if p.ReentryCooldownSec == 60 {
-			p.ReentryCooldownSec = 300
+		fromVersion := p.DefaultsVersion
+		if fromVersion < 4 {
+			if p.ReentryCooldownSec == 60 {
+				p.ReentryCooldownSec = 300
+			}
+			if p.ReentryMaxChaseATR == 0 {
+				p.ReentryMaxChaseATR = 0.5
+			}
 		}
-		if p.ReentryMaxChaseATR == 0 {
-			p.ReentryMaxChaseATR = 0.5
-		}
-		if p.DefaultsVersion < 4 && p.MaxReentries == 2 {
-			p.MaxReentries = 1
+		// 代次 5 回补：只针对被代次 4 规则（2→1）改过的行
+		if fromVersion == 4 && p.MaxReentries == 1 {
+			p.MaxReentries = 2
 		}
 		p.DefaultsVersion = copyGuardPolicyDefaultsVersion
 		b, err := json.Marshal(p)
@@ -531,12 +541,14 @@ func (s *CopyTradeStore) migrateCopyGuardPolicyDefaults() {
 		if _, err := s.db.Exec(`UPDATE copy_guard_policies SET policy_json=?, updated_at=CURRENT_TIMESTAMP WHERE trader_id=?`, string(b), item.traderID); err != nil {
 			continue
 		}
-		// 主表列：仅把等于旧默认值的行替换为新默认值（代次 2 与代次 4 规则
-		// 级联：0.02→0.20→0.10 / 0.50→0.30→0.20，一次跑齐）
-		_, _ = s.db.Exec(`UPDATE copy_trade_configs SET risk_account_pct=0.20 WHERE trader_id=? AND risk_account_pct=0.02`, item.traderID)
-		_, _ = s.db.Exec(`UPDATE copy_trade_configs SET risk_leverage_max_loss=0.30 WHERE trader_id=? AND risk_leverage_max_loss=0.50`, item.traderID)
-		_, _ = s.db.Exec(`UPDATE copy_trade_configs SET risk_account_pct=0.10 WHERE trader_id=? AND risk_account_pct=0.20`, item.traderID)
-		_, _ = s.db.Exec(`UPDATE copy_trade_configs SET risk_leverage_max_loss=0.20 WHERE trader_id=? AND risk_leverage_max_loss=0.30`, item.traderID)
+		if fromVersion < 4 {
+			// 主表列：仅把等于旧默认值的行替换为新默认值（代次 2 与代次 4 规则
+			// 级联：0.02→0.20→0.10 / 0.50→0.30→0.20，一次跑齐）
+			_, _ = s.db.Exec(`UPDATE copy_trade_configs SET risk_account_pct=0.20 WHERE trader_id=? AND risk_account_pct=0.02`, item.traderID)
+			_, _ = s.db.Exec(`UPDATE copy_trade_configs SET risk_leverage_max_loss=0.30 WHERE trader_id=? AND risk_leverage_max_loss=0.50`, item.traderID)
+			_, _ = s.db.Exec(`UPDATE copy_trade_configs SET risk_account_pct=0.10 WHERE trader_id=? AND risk_account_pct=0.20`, item.traderID)
+			_, _ = s.db.Exec(`UPDATE copy_trade_configs SET risk_leverage_max_loss=0.20 WHERE trader_id=? AND risk_leverage_max_loss=0.30`, item.traderID)
+		}
 	}
 }
 
@@ -643,12 +655,19 @@ func parseNullableDBTime(value sql.NullString) (*time.Time, error) {
 	return &parsed, nil
 }
 
+// UpdateCopyGuardProtectionHealth 更新周期保护健康状态。
+//   - protection_retries：进入健康态（VERIFIED/CLAMPED）时清零——重试封顶
+//     （protectionRetryMaxAttempts）的语义是"本次故障连续重试用尽"，不清零
+//     会让长生命周期仓位把多次瞬时故障的重试累计起来，之后任何一次轻微
+//     降级都直接越过封顶触发 GUARD_UNPROTECTABLE 强制离场。
+//   - 保护缺失窗口（missing_at/missing_seconds）：UNKNOWN/DEGRADED 之外，
+//     UNPROTECTABLE（follow 模式裸跑）也是"没有有效保护"，同样计入。
 func (s *CopyTradeStore) UpdateCopyGuardProtectionHealth(id int64, status string, coverage float64, lastError, followerPosID, entryOrderID string, incrementRetry bool) error {
 	retry := 0
 	if incrementRetry {
 		retry = 1
 	}
-	_, err := s.db.Exec(`UPDATE copy_guard_cycles SET protection_status=?,protection_coverage=?,protection_error=?,follower_pos_id=CASE WHEN ?<>'' THEN ? ELSE follower_pos_id END,entry_order_id=CASE WHEN ?<>'' THEN ? ELSE entry_order_id END,protection_retries=protection_retries+?,protection_missing_seconds=protection_missing_seconds+CASE WHEN ? NOT IN ('UNKNOWN','DEGRADED') AND protection_missing_at IS NOT NULL THEN MAX(0,(julianday(CURRENT_TIMESTAMP)-julianday(protection_missing_at))*86400) ELSE 0 END,protection_missing_at=CASE WHEN ? IN ('UNKNOWN','DEGRADED') THEN COALESCE(protection_missing_at,CURRENT_TIMESTAMP) ELSE NULL END,pending_since=CASE WHEN ?='PENDING' THEN COALESCE(pending_since,CURRENT_TIMESTAMP) ELSE NULL END,updated_at=CURRENT_TIMESTAMP WHERE id=?`, status, coverage, lastError, followerPosID, followerPosID, entryOrderID, entryOrderID, retry, status, status, status, id)
+	_, err := s.db.Exec(`UPDATE copy_guard_cycles SET protection_status=?,protection_coverage=?,protection_error=?,follower_pos_id=CASE WHEN ?<>'' THEN ? ELSE follower_pos_id END,entry_order_id=CASE WHEN ?<>'' THEN ? ELSE entry_order_id END,protection_retries=CASE WHEN ? IN ('VERIFIED','CLAMPED') THEN 0 ELSE protection_retries+? END,protection_missing_seconds=protection_missing_seconds+CASE WHEN ? NOT IN ('UNKNOWN','DEGRADED','UNPROTECTABLE') AND protection_missing_at IS NOT NULL THEN MAX(0,(julianday(CURRENT_TIMESTAMP)-julianday(protection_missing_at))*86400) ELSE 0 END,protection_missing_at=CASE WHEN ? IN ('UNKNOWN','DEGRADED','UNPROTECTABLE') THEN COALESCE(protection_missing_at,CURRENT_TIMESTAMP) ELSE NULL END,pending_since=CASE WHEN ?='PENDING' THEN COALESCE(pending_since,CURRENT_TIMESTAMP) ELSE NULL END,updated_at=CURRENT_TIMESTAMP WHERE id=?`, status, coverage, lastError, followerPosID, followerPosID, entryOrderID, entryOrderID, status, retry, status, status, status, id)
 	return err
 }
 
@@ -672,7 +691,7 @@ func (s *CopyTradeStore) BeginCopyGuardProtectionRetry(cycle *CopyGuardCycle, de
 			message = "protective stop was not established within 10 seconds"
 		}
 	}
-	res, err := tx.Exec(`UPDATE copy_guard_cycles SET protection_status=?,protection_error=?,protection_retries=protection_retries+1,protection_last_retry_at=CURRENT_TIMESTAMP,protection_missing_at=CASE WHEN ? IN ('UNKNOWN','DEGRADED') THEN COALESCE(protection_missing_at,CURRENT_TIMESTAMP) ELSE protection_missing_at END,updated_at=CURRENT_TIMESTAMP WHERE id=? AND protection_retries=? AND (protection_last_retry_at IS NULL OR (julianday(CURRENT_TIMESTAMP)-julianday(protection_last_retry_at))*86400>=?)`, status, message, status, cycle.ID, cycle.ProtectionRetries, delaySeconds)
+	res, err := tx.Exec(`UPDATE copy_guard_cycles SET protection_status=?,protection_error=?,protection_retries=protection_retries+1,protection_last_retry_at=CURRENT_TIMESTAMP,protection_missing_at=CASE WHEN ? IN ('UNKNOWN','DEGRADED','UNPROTECTABLE') THEN COALESCE(protection_missing_at,CURRENT_TIMESTAMP) ELSE protection_missing_at END,updated_at=CURRENT_TIMESTAMP WHERE id=? AND protection_retries=? AND (protection_last_retry_at IS NULL OR (julianday(CURRENT_TIMESTAMP)-julianday(protection_last_retry_at))*86400>=?)`, status, message, status, cycle.ID, cycle.ProtectionRetries, delaySeconds)
 	if err != nil {
 		return false, err
 	}
@@ -1388,7 +1407,8 @@ func (s *CopyTradeStore) CopyGuardSummary(traderIDs []string, from, to time.Time
 	}
 	// v5 统计分层：估算基线（最后观测价，领航员真实离场价未获得）的周期
 	// 单列，避免估算值混入 headline 后误导（实测口径 = 总值 − 估算部分）。
-	_ = s.db.QueryRow(`SELECT COUNT(*),COALESCE(SUM(CASE WHEN stop_count>0 THEN net_guard_effect ELSE 0 END),0) FROM copy_guard_cycles WHERE id IN (`+filteredCycleQuery+`) AND accounting_status='RECONCILED' AND baseline_source='last_observed'`, rateArgs...).Scan(&x.EstimatedBaselineCycles, &x.EstimatedNetGuardEffect)
+	// 计数与求和口径一致：都只统计 stop_count>0（headline 净效果的组成部分）
+	_ = s.db.QueryRow(`SELECT COUNT(*),COALESCE(SUM(net_guard_effect),0) FROM copy_guard_cycles WHERE id IN (`+filteredCycleQuery+`) AND accounting_status='RECONCILED' AND baseline_source='last_observed' AND stop_count>0`, rateArgs...).Scan(&x.EstimatedBaselineCycles, &x.EstimatedNetGuardEffect)
 	trendArgs := make([]interface{}, 0, len(traderIDs)+2)
 	for _, id := range traderIDs {
 		trendArgs = append(trendArgs, id)

@@ -98,6 +98,7 @@ interface FormState {
   risk_reentry_enabled: boolean // 默认 true：确认式重入
   risk_reentry_ratio: number // 默认 50%（前端用百分比，提交时转 0.5）
   risk_policy_version: number
+  // v5：不再影响止损计算（账户线在任何模式下都是硬 cap），仅作兼容透传，无 UI
   risk_stop_mode: 'volatility_priority' | 'account_hard_limit'
   risk_atr_period: number
   risk_atr_cache_max_age_minutes: number
@@ -119,7 +120,7 @@ interface FormState {
   risk_reentry_recovery_escalation: number // 默认 1.5：第 N 次重入恢复幅度倍率
   // v5 可保护性状态机 / 噪音档重入
   risk_unprotectable_action: 'close' | 'follow' // 默认 close：确认不可保护时立即离场
-  risk_reentry_noise_override: boolean // 默认 false：噪音档（距离/ATR<1）仍允许重入
+  risk_reentry_noise_override: boolean // 默认 false：噪音档（止损距离/ATR<0.3）仍允许重入
 }
 
 interface TraderConfigModalProps {
@@ -175,7 +176,7 @@ export function TraderConfigModal({
     risk_trigger_price_type: 'mark',
     risk_slippage_buffer_bps: 10,
     risk_liquidation_buffer_atr: 0.5,
-    risk_max_reentries: 1, // v5：确认式重入默认 1 次
+    risk_max_reentries: 2, // v5 代次 5：确认式重入门槛已足够严，默认 2 次
     risk_reentry_band_atr: 0.5,
     risk_reentry_cooldown_seconds: 300, // v4.1：默认冷却 300s
     risk_reentry_max_chase_atr: 0.5,
@@ -305,7 +306,7 @@ export function TraderConfigModal({
             risk_trigger_price_type: cfg.risk_trigger_price_type ?? 'mark',
             risk_slippage_buffer_bps: cfg.risk_slippage_buffer_bps ?? 10,
             risk_liquidation_buffer_atr: cfg.risk_liquidation_buffer_atr ?? 0.5,
-            risk_max_reentries: cfg.risk_max_reentries ?? 1,
+            risk_max_reentries: cfg.risk_max_reentries ?? 2,
             risk_reentry_band_atr: cfg.risk_reentry_band_atr ?? 0.5,
             risk_reentry_cooldown_seconds:
               cfg.risk_reentry_cooldown_seconds ?? 300,
@@ -386,7 +387,7 @@ export function TraderConfigModal({
         risk_trigger_price_type: 'mark',
         risk_slippage_buffer_bps: 10,
         risk_liquidation_buffer_atr: 0.5,
-        risk_max_reentries: 1,
+        risk_max_reentries: 2,
         risk_reentry_band_atr: 0.5,
         risk_reentry_cooldown_seconds: 300,
         risk_reentry_max_chase_atr: 0.5,
@@ -1166,7 +1167,7 @@ export function TraderConfigModal({
                               <div className="col-span-2 flex items-center justify-between rounded border border-[#F0B90B44] bg-[#F0B90B0D] p-3 text-xs">
                                 <span className="text-[#848E9C]">
                                   推荐（v5）：ATR14 / 1小时 /
-                                  1.5倍，仓位保证金硬止损20%，账户兜底10%，确认式重入50%×1次（冷却300s），不可保护时立即离场
+                                  1.5倍，仓位保证金硬止损20%，账户兜底10%，确认式重入50%×2次（冷却300s逐次加严），不可保护时立即离场
                                 </span>
                                 <button
                                   type="button"
@@ -1188,7 +1189,7 @@ export function TraderConfigModal({
                                       risk_liquidation_buffer_atr: 0.5,
                                       risk_reentry_enabled: true,
                                       risk_reentry_ratio: 50,
-                                      risk_max_reentries: 1,
+                                      risk_max_reentries: 2,
                                       risk_reentry_band_atr: 0.5,
                                       risk_reentry_cooldown_seconds: 300,
                                       risk_reentry_max_chase_atr: 0.5,
@@ -1205,26 +1206,9 @@ export function TraderConfigModal({
                                   应用推荐值
                                 </button>
                               </div>
-                              <label className="text-xs text-[#848E9C]">
-                                止损模式
-                                <select
-                                  value={formData.risk_stop_mode}
-                                  onChange={(e) =>
-                                    handleInputChange(
-                                      'risk_stop_mode',
-                                      e.target.value
-                                    )
-                                  }
-                                  className="mt-1 w-full px-2 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF]"
-                                >
-                                  <option value="volatility_priority">
-                                    波动优先
-                                  </option>
-                                  <option value="account_hard_limit">
-                                    账户硬限制
-                                  </option>
-                                </select>
-                              </label>
+                              {/* v5：止损模式（risk_stop_mode）不再影响计算——
+                                  账户线在任何模式下都是硬 cap，字段仅作兼容保留，
+                                  故不再提供选择器（避免 UI 暗示不存在的行为差异） */}
                               <label className="text-xs text-[#848E9C]">
                                 触发价格
                                 <select
@@ -1360,12 +1344,7 @@ export function TraderConfigModal({
                           {/* 单笔账户风险 % —— v5：账户兜底线默认 10% */}
                           <div>
                             <label className="text-sm text-[#EAECEF] block mb-2">
-                              {formData.risk_policy_version >= 4
-                                ? '账户灾难兜底线'
-                                : formData.risk_stop_mode ===
-                                    'account_hard_limit'
-                                  ? '账户风险硬限制'
-                                  : '预计账户风险警戒'}{' '}
+                              账户灾难兜底线{' '}
                               <span className="text-[#F0B90B] font-bold">
                                 {formData.risk_account_pct.toFixed(2)}%
                               </span>
@@ -1798,8 +1777,9 @@ export function TraderConfigModal({
                                       <span>
                                         噪音档仍允许重入
                                         <span className="block text-[#5E6673]">
-                                          止损距离/ATR &lt; 1
-                                          的高杠杆窄止损档默认禁止重入（易被噪音反复扫损）；打开表示接受该风险
+                                          止损距离/ATR &lt; 0.3
+                                          的高杠杆窄止损档默认禁止重入（易被噪音反复扫损，0.3~0.5
+                                          为谨慎档自动加严确认）；打开表示接受该风险、按谨慎档放行
                                         </span>
                                       </span>
                                       <button

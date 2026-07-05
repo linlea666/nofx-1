@@ -511,8 +511,10 @@ func applyCopyConfigRiskFields(copyConfig *store.CopyTradeConfig, req *CopyConfi
 	copyConfig.RiskTriggerPriceType = req.RiskTriggerPriceType
 	copyConfig.RiskSlippageBufferBPS = derefFloatDefault(req.RiskSlippageBufferBPS, 10)
 	copyConfig.RiskLiquidationBufferATR = derefFloatDefault(req.RiskLiquidationBufferATR, 0.5)
-	// v5：默认单周期最多重入 1 次
-	copyConfig.RiskMaxReentries = derefIntDefault(req.RiskMaxReentries, 1)
+	// v5 代次 5：默认单周期最多重入 2 次（确认式重入的结构性门槛——连续确认/
+	// 恢复幅度与冷却逐次加严/噪音档禁入/可保护性预检——已足够约束坏重入，
+	// 名义按 ratio 几何衰减保证累计风险有界）
+	copyConfig.RiskMaxReentries = derefIntDefault(req.RiskMaxReentries, 2)
 	copyConfig.RiskReentryBandATR = derefFloatDefault(req.RiskReentryBandATR, 0.5)
 	// v4.1：默认冷却 300s（旧默认 60s 在高杠杆震荡下重入过快）
 	copyConfig.RiskReentryCooldownSeconds = derefIntDefault(req.RiskReentryCooldownSeconds, 300)

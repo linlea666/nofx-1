@@ -25,7 +25,8 @@ const statusLabels: Record<string, string> = {
   ATTEMPTS_EXHAUSTED: '重入次数用尽·等待领航员平仓',
   WATCH_TIMEOUT: '观察超时·等待领航员平仓',
   CYCLE_LOSS_CAPPED: '周期亏损熔断·等待领航员平仓（v5 前历史）',
-  GUARD_UNPROTECTABLE: '无法保护·裸跟中（高危）',
+  // 注：不可保护（裸跑）不是周期状态——follow 模式下周期保持 FOLLOWING，
+  // 信号载体是 protection_status=UNPROTECTABLE（下方保护状态标红）
 }
 const protectionLabels: Record<string, string> = {
   PENDING: '待建立',
@@ -354,7 +355,6 @@ export function CopyGuardPage() {
           <option value="LEADER_REVERSED">领航员反手</option>
           <option value="ATTEMPTS_EXHAUSTED">次数耗尽</option>
           <option value="WATCH_TIMEOUT">观察超时</option>
-          <option value="GUARD_UNPROTECTABLE">无法保护·裸跟</option>
           <option value="CYCLE_LOSS_CAPPED">周期亏损熔断（历史）</option>
         </select>
         <select

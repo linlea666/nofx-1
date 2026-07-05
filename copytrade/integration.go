@@ -882,6 +882,15 @@ func (ti *TraderIntegration) handleUnprotectableCycle(cycle *store.CopyGuardCycl
 	if ti.engine != nil && ti.engine.config != nil && ti.engine.config.RiskUnprotectableAction == "follow" {
 		action = "follow"
 	}
+	// follow 模式下每 unprotectableRecheckDelay 复检一次会重复进入本函数；
+	// 已处于 UNPROTECTABLE 的周期复检未恢复属于常态，不再重复写事件/告警
+	// （否则一天 288 条 GUARD_UNPROTECTABLE 污染时间线），只在状态迁入沿记录。
+	alreadyUnprotectable := cycle.ProtectionStatus == store.CopyGuardProtectionUnprotectable
+	if action == "follow" && alreadyUnprotectable {
+		_ = ti.store.CopyTrade().UpdateCopyGuardProtectionHealth(cycle.ID, store.CopyGuardProtectionUnprotectable, 0, message, cycle.FollowerPosID, cycle.EntryOrderID, false)
+		logger.Debugf("🔁 [%s] Copy Guard 不可保护复检未恢复 | cycle=%d %s %s | %s", ti.traderID, cycle.ID, cycle.Symbol, cycle.Side, message)
+		return
+	}
 	logger.Errorf("🚨 [%s] Copy Guard 仓位不可保护 | cycle=%d %s %s | 处置=%s | %s", ti.traderID, cycle.ID, cycle.Symbol, cycle.Side, action, message)
 	_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "GUARD_UNPROTECTABLE", Metadata: map[string]interface{}{
 		"action": action, "error": message, "leader_pos_id": cycle.LeaderPosID, "symbol": cycle.Symbol, "side": cycle.Side, "retries": cycle.ProtectionRetries,
