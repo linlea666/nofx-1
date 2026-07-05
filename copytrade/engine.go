@@ -1357,10 +1357,22 @@ func (e *Engine) buildDecisionV2(signal *TradeSignal, match *SignalMatchResult, 
 				FollowerEquity: e.getFollowerEquity(),
 			}
 			if slResult, err := calcStopLossPrice(e.config, slInput); err == nil && slResult.SLPrice > 0 {
-				logger.Infof("🛑 [%s] SL 估算 | %s %s | SL=%.4f 距离=%.4f(%.2f%%) 控线=%s ATR=%.4f 距离/ATR=%.2f tickSz=%.6f",
-					e.traderID, fill.Symbol, fill.PositionSide,
-					slResult.SLPrice, slResult.SLDistance,
-					(slResult.SLDistance/fill.Price)*100, slResult.GovernedBy, slResult.ATRValue, slResult.DistanceATRRatio, slResult.TickSize)
+				// C 观测（仅日志，不改止损计算）：margin_cap/clamp 主控且止损距离
+				// < 0.5×ATR（噪音区，易被行情波动扫掉）时升为 WARN，供实盘早发现。
+				const slLogFmt = "SL 估算 | %s %s | SL=%.4f 距离=%.4f(%.2f%%) 控线=%s ATR=%.4f 距离/ATR=%.2f tickSz=%.6f"
+				noiseTight := (slResult.GovernedBy == "margin_cap" || slResult.GovernedBy == "clamp") &&
+					slResult.DistanceATRRatio > 0 && slResult.DistanceATRRatio < reentryNoiseCautiousRatio
+				if noiseTight {
+					logger.Warnf("⚠️ [%s] 止损偏紧·易扫损 "+slLogFmt,
+						e.traderID, fill.Symbol, fill.PositionSide,
+						slResult.SLPrice, slResult.SLDistance,
+						(slResult.SLDistance/fill.Price)*100, slResult.GovernedBy, slResult.ATRValue, slResult.DistanceATRRatio, slResult.TickSize)
+				} else {
+					logger.Infof("🛑 [%s] "+slLogFmt,
+						e.traderID, fill.Symbol, fill.PositionSide,
+						slResult.SLPrice, slResult.SLDistance,
+						(slResult.SLDistance/fill.Price)*100, slResult.GovernedBy, slResult.ATRValue, slResult.DistanceATRRatio, slResult.TickSize)
+				}
 			} else if err != nil {
 				logger.Warnf("⚠️ [%s] SL 估算失败（仅记录，integration 层会用实际成交价重算）: %v", e.traderID, err)
 			} else if slResult != nil && slResult.OpenImmediateHit {

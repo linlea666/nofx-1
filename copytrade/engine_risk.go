@@ -593,6 +593,13 @@ func (e *Engine) checkReentryConditions() {
 		if e.config.RiskReentryEnabled && v4Cycle.ReentryCount >= e.config.RiskMaxReentries {
 			terminalWatchStatus = store.CopyGuardAttemptsExhausted
 		}
+		// 窗口空集时自动路径已把周期持久化为 ATTEMPTS_EXHAUSTED（见
+		// checkReentryConditions A 层）。此处让持久化终态回灌内存态，否则下一
+		// tick 内存不认、manualMode 永远进不来——自动重入次数虽未达上限，但可行
+		// 窗口已不存在=实质用尽，同样应交人工确认接管。
+		if e.config.RiskReentryEnabled && v4Cycle.Status == store.CopyGuardAttemptsExhausted {
+			terminalWatchStatus = store.CopyGuardAttemptsExhausted
+		}
 		if e.config.RiskWatchTimeoutMinutes > 0 && v4Cycle.StoppedAt != nil && time.Since(*v4Cycle.StoppedAt) > time.Duration(e.config.RiskWatchTimeoutMinutes)*time.Minute {
 			terminalWatchStatus = store.CopyGuardWatchTimeout
 		}
@@ -762,7 +769,7 @@ func (e *Engine) checkReentryConditions() {
 				requiredRecovery *= 1.5
 			}
 		}
-		conditionsMet := false
+		priceReturned := false
 		if mapping.Side == string(SideLong) {
 			reentryBoundary -= currentATR * e.config.RiskReentryBandATR
 			if requiredRecovery > 0 {
@@ -770,7 +777,7 @@ func (e *Engine) checkReentryConditions() {
 			}
 			chaseLimit = reentryAnchor + currentATR*e.config.RiskReentryMaxChaseATR
 			beyondChase = markPrice > chaseLimit
-			conditionsMet = markPrice >= reentryBoundary && !beyondChase
+			priceReturned = markPrice >= reentryBoundary
 		} else {
 			reentryBoundary += currentATR * e.config.RiskReentryBandATR
 			if requiredRecovery > 0 {
@@ -778,8 +785,36 @@ func (e *Engine) checkReentryConditions() {
 			}
 			chaseLimit = reentryAnchor - currentATR*e.config.RiskReentryMaxChaseATR
 			beyondChase = markPrice < chaseLimit
-			conditionsMet = markPrice <= reentryBoundary && !beyondChase
+			priceReturned = markPrice <= reentryBoundary
 		}
+		// A 层——自动重入窗口可行性不变量：恢复下界越过追价上限时可行区间为空集
+		// （多单 下界>上界；空单 下界<上界；epsilon 相对容差避免裸浮点误判）。
+		// 自动路径下窗口空集意味着自动重入永远打不出，判定为"实质用尽"→ 持久化
+		// ATTEMPTS_EXHAUSTED 交 v5.1 人工确认接管，杜绝死锁在观察态错过反转。
+		// leader 平仓/反手、冷却期（chaseLimit=0）、noiseDisabled 均已在前面提前
+		// continue；到此必为"应继续自动观察但可行区间不存在"。
+		windowInfeasible := reentryWindowInfeasible(mapping.Side, reentryBoundary, chaseLimit, reentryAnchor)
+		if windowInfeasible && !manualMode {
+			_ = e.store.CopyTrade().UpdateCopyGuardObservation(v4Cycle.ID, store.CopyGuardAttemptsExhausted, entryRef, markPrice, currentATR)
+			e.recordWatchSample(v4Cycle, leaderPos, markPrice, currentATR, reentryBoundary, chaseLimit, watchGateReentryWindowInfeasible)
+			_ = e.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: v4Cycle.ID, TraderID: e.traderID, Type: "REENTRY_WINDOW_COLLAPSED", Price: markPrice, Metadata: map[string]interface{}{
+				"reentry_boundary":  reentryBoundary,
+				"chase_limit":       chaseLimit,
+				"required_recovery": requiredRecovery,
+				"reentry_count":     v4Cycle.ReentryCount,
+				"stop_count":        v4Cycle.StopCount,
+				"atr":               currentATR,
+				"mark_price":        markPrice,
+			}})
+			logger.Warnf("🚫 [%s] 自动重入窗口塌缩为空集（下界=%.4f 上界=%.4f），判定自动重入用尽→转人工确认 | cycle=%d %s %s",
+				e.traderID, reentryBoundary, chaseLimit, v4Cycle.ID, mapping.Symbol, mapping.Side)
+			delete(e.reentryCandidateTicks, mapping.LeaderPosID)
+			continue
+		}
+		// 人工路径：chase 是自动路径专用护栏（防机器人追太远）；人工路径的价值恰
+		// 是"价格强反转越过追价上限时提醒人来判断"，故 manualMode 下 chase 不阻断
+		// 信号，但价格回归/连续确认/金额/可保护性提示等其余门槛一律不降。
+		conditionsMet := priceReturned && !(beyondChase && !manualMode)
 		// 首轮观察（尚无上一 tick 价格）只记录观测、不计确认：重启后的第一
 		// 个 tick 状态不完整，直接计数会把重启前的行情当作已确认。
 		if v4Cycle.LastObservedPrice <= 0 {
@@ -886,7 +921,8 @@ func (e *Engine) checkReentryConditions() {
 				markPrice: markPrice, atr: currentATR, noiseRatio: noiseRatio,
 				reentryBoundary: reentryBoundary, reentrySize: reentrySize,
 				stopFillPrice: attemptStopFillPrice(stoppedAttempt), protectable: protectable,
-				estStopDistance: estStopDistance,
+				estStopDistance: estStopDistance, chaseLimit: chaseLimit,
+				requiredRecovery: requiredRecovery, windowInfeasible: windowInfeasible,
 			})
 			e.recordWatchSample(v4Cycle, leaderPos, markPrice, currentATR, reentryBoundary, chaseLimit, watchGateManualReentrySignal)
 			delete(e.reentryCandidateTicks, mapping.LeaderPosID)
@@ -969,6 +1005,24 @@ func attemptStopFillPrice(attempt *store.CopyGuardAttempt) float64 {
 	return attempt.ExitPrice
 }
 
+// reentryWindowEpsilonRatio 窗口可行性判定的相对价格容差（锚点×该比例），
+// 避免边界差极小的浮点误差被误判为空集。
+const reentryWindowEpsilonRatio = 1e-6
+
+// reentryWindowInfeasible 判定自动重入的价格窗口是否为空集：恢复下界越过追价
+// 上限（多单 下界>上界；空单 下界<上界）。chaseLimit<=0（冷却期/降级边界，尚
+// 未计算追价上限）时不判定。用相对 epsilon 容差避免裸浮点比较误判。
+func reentryWindowInfeasible(side string, reentryBoundary, chaseLimit, anchor float64) bool {
+	if chaseLimit <= 0 {
+		return false
+	}
+	eps := math.Abs(anchor) * reentryWindowEpsilonRatio
+	if side == string(SideLong) {
+		return reentryBoundary > chaseLimit+eps
+	}
+	return reentryBoundary < chaseLimit-eps
+}
+
 // manualSignalParams 人工重入信号的市场快照参数（emitManualReentrySignal 入参）
 type manualSignalParams struct {
 	markPrice       float64 // 信号触发时标记价
@@ -979,6 +1033,11 @@ type manualSignalParams struct {
 	stopFillPrice   float64 // 最近一次止损成交价（0=数据缺失）
 	estStopDistance float64 // 预算止损距离（0=未预检/预检失败）
 	protectable     bool    // 可保护性预检结果
+	// 追价上限与窗口可行性：人工路径忽略 chase，但需向用户明示"价格已超出自动
+	// 追价上限、属强反转追入"，便于知情决策。
+	chaseLimit       float64 // 自动路径追价上限（0=未计算）
+	requiredRecovery float64 // 本次要求的价格恢复幅度（价格单位）
+	windowInfeasible bool    // 自动重入窗口是否已塌缩为空集
 }
 
 // emitManualReentrySignal v5.1 人工重入信号触发点：门控链全部通过后落库
@@ -1032,6 +1091,18 @@ func (e *Engine) emitManualReentrySignal(mapping *store.CopyTradePositionMapping
 	if err := e.store.CopyTrade().MarkManualReentrySignalAlerted(sig.ID); err != nil {
 		logger.Warnf("⚠️ [%s] 人工重入信号提醒时间落库失败: %v | signal=%d", e.traderID, err, sig.ID)
 	}
+	// chase 超限幅度：人工路径忽略追价上限，但记录"超出多少"供前端/邮件明示
+	chaseExceededBy := float64(0)
+	if p.chaseLimit > 0 {
+		if mapping.Side == "short" {
+			chaseExceededBy = p.chaseLimit - p.markPrice
+		} else {
+			chaseExceededBy = p.markPrice - p.chaseLimit
+		}
+		if chaseExceededBy < 0 {
+			chaseExceededBy = 0
+		}
+	}
 	_ = e.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: e.traderID, Type: "GUARD_MANUAL_REENTRY_SIGNAL", Price: p.markPrice, Notional: p.reentrySize, Metadata: map[string]interface{}{
 		"signal_id":         sig.ID,
 		"stop_count":        cycle.StopCount,
@@ -1042,6 +1113,10 @@ func (e *Engine) emitManualReentrySignal(mapping *store.CopyTradePositionMapping
 		"est_stop_distance": p.estStopDistance,
 		"last_stop_price":   p.stopFillPrice,
 		"current_atr":       p.atr,
+		"chase_limit":       p.chaseLimit,
+		"chase_exceeded_by": chaseExceededBy,
+		"window_infeasible": p.windowInfeasible,
+		"required_recovery": p.requiredRecovery,
 	}})
 	logger.Infof("📣 [%s] 人工重入信号已生成，等待用户确认 | cycle=%d signal=%d %s %s 价格=%.4f 建议金额=%.2f 可保护=%v",
 		e.traderID, cycle.ID, sig.ID, mapping.Symbol, mapping.Side, p.markPrice, p.reentrySize, p.protectable)
@@ -1064,6 +1139,9 @@ func (e *Engine) emitManualReentrySignal(mapping *store.CopyTradePositionMapping
 		CurrentATR:        p.atr,
 		LastStopPrice:     p.stopFillPrice,
 		EstStopDistance:   p.estStopDistance,
+		ChaseLimit:        p.chaseLimit,
+		ChaseExceededBy:   chaseExceededBy,
+		WindowInfeasible:  p.windowInfeasible,
 	})
 }
 
@@ -1106,6 +1184,8 @@ const (
 	watchGateReentryTriggered = "REENTRY_TRIGGERED"      // 全部条件满足，已请求重入
 	// v5.1：自动重入用尽后门控链全部通过，已落人工重入信号（等待用户确认）
 	watchGateManualReentrySignal = "MANUAL_REENTRY_SIGNAL"
+	// 自动重入价格窗口塌缩为空集（恢复下界越过追价上限）→ 自动重入实质用尽
+	watchGateReentryWindowInfeasible = "REENTRY_WINDOW_INFEASIBLE"
 	watchSampleInterval       = 60 * time.Second         // 固定间隔采样（gate 不变时）
 	watchResumeGapMultiplier  = 5                        // 采样断档 > 间隔×该倍数 → 记 WATCH_RESUMED
 )

@@ -13,6 +13,7 @@
 | [PR_REVIEW_GUIDE.md](PR_REVIEW_GUIDE.md) | PR 审核指南 |
 | [PROJECT_MANAGEMENT.md](PROJECT_MANAGEMENT.md) | 项目管理工作流程和流程 |
 | [SETUP_GUIDE.md](SETUP_GUIDE.md) | PR 管理系统设置指南 |
+| [COPY_GUARD_HANDOFF.zh-CN.md](COPY_GUARD_HANDOFF.zh-CN.md) | Copy Guard v5/v5.1 模块接手说明（AI / 维护者） |
 
 **可用语言：** 🇬🇧 English | 🇨🇳 中文
 

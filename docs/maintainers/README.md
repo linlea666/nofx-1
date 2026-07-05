@@ -13,6 +13,7 @@ This directory contains documentation for NOFX project maintainers and contribut
 | [PR_REVIEW_GUIDE.md](PR_REVIEW_GUIDE.md) | Guide for reviewing pull requests |
 | [PROJECT_MANAGEMENT.md](PROJECT_MANAGEMENT.md) | Project management workflow and processes |
 | [SETUP_GUIDE.md](SETUP_GUIDE.md) | Setup guide for the PR management system |
+| [COPY_GUARD_HANDOFF.zh-CN.md](COPY_GUARD_HANDOFF.zh-CN.md) | Copy Guard v5/v5.1 module handoff (Chinese; for AI / maintainers) |
 
 **Available in:** 🇬🇧 English | 🇨🇳 中文
 

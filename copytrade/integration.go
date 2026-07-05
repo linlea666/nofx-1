@@ -3096,6 +3096,16 @@ func (ti *TraderIntegration) sendManualReentrySignalAlert(event *RiskEvent) {
 			noiseHint += "（偏小，止损较容易被行情噪音扫到，请谨慎）"
 		}
 	}
+	// chase 超限提示：价格已越过自动追价上限（强反转），自动重入不会在此追高，
+	// 由人工判断是否追入。窗口塌缩（window_infeasible）时也在此明示。
+	chaseNote := ""
+	if event.ChaseExceededBy > 0 {
+		chaseNote = fmt.Sprintf(
+			"\n⚠️ 价格提示:\n"+
+				"  当前价已超出自动追价上限约 %.4f（上限 %.4f）。这属于强反转追入区间，\n"+
+				"  自动重入不会在此追高，是否追入完全由您人工判断，请谨慎确认。\n",
+			event.ChaseExceededBy, event.ChaseLimit)
+	}
 
 	body := fmt.Sprintf(
 		"📣 出现合格重入信号，需要您确认（系统不会自动下单）\n\n"+
@@ -3117,7 +3127,7 @@ func (ti *TraderIntegration) sendManualReentrySignalAlert(event *RiskEvent) {
 			"  预计止损价:    %s\n"+
 			"  止损距离/ATR:  %s\n"+
 			"  保护单预检:    %s\n"+
-			"%s\n"+
+			"%s%s\n"+
 			"🖱️ 如何操作:\n"+
 			"  打开系统「止损保护统计」页面，在顶部「人工重入待确认」中点击【确认重入】或【忽略】。\n"+
 			"  确认后系统会实时复核（领航员是否仍持仓、方向是否一致、本地是否已有仓位），\n"+
@@ -3129,7 +3139,7 @@ func (ti *TraderIntegration) sendManualReentrySignalAlert(event *RiskEvent) {
 		traderName, leaderID, event.Symbol, sideZH(event.Side), event.MarginMode,
 		event.StopCount, event.ReentryCount,
 		event.ReentryEntryPrice, lastStopHint, event.LeaderSize, event.ReentrySize,
-		stopPriceHint, noiseHint, protectHint, protectNote)
+		stopPriceHint, noiseHint, protectHint, protectNote, chaseNote)
 
 	// 小时分桶：engine 冷却（≥1h）后再次提醒时 key 变化，不被 notifier 永久去重
 	alertKey := fmt.Sprintf("manual_reentry|%s|%d|%d", ti.traderID, event.ManualSignalID, event.Timestamp.Unix()/3600)

@@ -741,3 +741,204 @@ func TestUpsertRecordsVerifiedQuantityOnMismatch(t *testing.T) {
 		t.Fatalf("half coverage must be flagged DEGRADED: %+v", got)
 	}
 }
+
+// ============================================================================
+// A. 重入窗口塌缩死锁修复（cycle 71）：恢复下界越过追价上限=空集 →
+//    自动重入实质用尽 → 持久化 ATTEMPTS_EXHAUSTED 交 v5.1 人工确认接管
+// ============================================================================
+
+// makeWindowInfeasibleConfig 让首个止损后的重入窗口即为空集：恢复门槛 3×ATR
+// 远大于 0.5×ATR 的追价带宽，reentryBoundary 必然越过 chaseLimit（复刻 cycle
+// 71 高恢复门槛 + 窄追价上限导致的空集，无需真的连续两次止损即可确定性触发）。
+func makeWindowInfeasibleConfig(e *Engine) {
+	e.config.RiskReentryMinRecoveryATR = 3.0
+	e.config.RiskReentryRecoveryEscalation = 1.5
+	e.config.RiskReentryMaxChaseATR = 0.5
+	e.config.RiskReentryBandATR = 0.5
+}
+
+func countGuardEvents(t *testing.T, st *store.Store, cycleID int64, typ string) int {
+	t.Helper()
+	events, err := st.CopyTrade().ListCopyGuardEvents(cycleID)
+	if err != nil {
+		t.Fatalf("list events: %v", err)
+	}
+	n := 0
+	for _, ev := range events {
+		if ev.Type == typ {
+			n++
+		}
+	}
+	return n
+}
+
+// long 窗口空集 → ATTEMPTS_EXHAUSTED + 一次性 collapsed 事件 + manual 关闭时不发信号
+func TestReentryWindowInfeasibleLongExhausts(t *testing.T) {
+	e, st := newReentryTestEngine(t)
+	makeWindowInfeasibleConfig(e) // 默认 RiskManualReentryEnabled=false
+	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700)
+	_ = st.CopyTrade().UpdateCopyGuardObservation(cycle.ID, store.CopyGuardStoppedWatching, 1700, 1690, 34)
+	e.leaderState.Positions["ETHUSDT_long"] = &Position{Symbol: "ETHUSDT", Side: SideLong, Size: 1, EntryPrice: 1700, MarkPrice: 1690, MarginMode: "cross", PosID: "leader-pos"}
+
+	// 连续两个 tick：第一 tick 判空集转终态并写一次 collapsed；第二 tick 已是终态
+	// 且 manual 关闭 → 走终态观察分支，不得重复刷 collapsed 事件。
+	e.checkReentryConditions()
+	e.checkReentryConditions()
+
+	select {
+	case <-e.decisionCh:
+		t.Fatal("infeasible window must not emit an auto reentry decision")
+	default:
+	}
+	got, _ := st.CopyTrade().GetCopyGuardCycle(cycle.ID)
+	if got.Status != store.CopyGuardAttemptsExhausted {
+		t.Fatalf("infeasible window must flag ATTEMPTS_EXHAUSTED, got %s", got.Status)
+	}
+	if got.ClosedAt != nil {
+		t.Fatal("exhausted cycle must stay open for manual takeover / accounting chain")
+	}
+	if n := countGuardEvents(t, st, cycle.ID, "REENTRY_WINDOW_COLLAPSED"); n != 1 {
+		t.Fatalf("exactly one REENTRY_WINDOW_COLLAPSED audit event expected (idempotent), got %d", n)
+	}
+	if n, _ := st.CopyTrade().CountManualReentrySignalsForCycle(cycle.ID); n != 0 {
+		t.Fatalf("manual reentry disabled: no manual signal must be generated, got %d", n)
+	}
+}
+
+// short 窗口空集：镜像逻辑（下界 < 上界）同样判定为用尽
+func TestReentryWindowInfeasibleShortMirror(t *testing.T) {
+	e, st := newReentryTestEngine(t)
+	makeWindowInfeasibleConfig(e)
+	cycle := seedStoppedCycle(t, st, "trader-1", "short", 1700)
+	_ = st.CopyTrade().UpdateCopyGuardObservation(cycle.ID, store.CopyGuardStoppedWatching, 1700, 1710, 34)
+	e.leaderState.Positions["ETHUSDT_short"] = &Position{Symbol: "ETHUSDT", Side: SideShort, Size: 1, EntryPrice: 1700, MarkPrice: 1710, MarginMode: "cross", PosID: "leader-pos"}
+
+	e.checkReentryConditions()
+
+	select {
+	case <-e.decisionCh:
+		t.Fatal("short infeasible window must not emit an auto reentry decision")
+	default:
+	}
+	got, _ := st.CopyTrade().GetCopyGuardCycle(cycle.ID)
+	if got.Status != store.CopyGuardAttemptsExhausted {
+		t.Fatalf("short infeasible window must flag ATTEMPTS_EXHAUSTED, got %s", got.Status)
+	}
+}
+
+// 窗口非空：自动重入旧行为不变（不误判用尽、正常触发决策）
+func TestReentryWindowFeasibleKeepsAutoReentry(t *testing.T) {
+	e, st := newReentryTestEngine(t)
+	e.config.RiskReentryMinRecoveryATR = 0.5
+	e.config.RiskReentryMaxChaseATR = 0.5 // 窗口 [1683,1717] 非空
+	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700)
+	_ = st.CopyTrade().UpdateCopyGuardObservation(cycle.ID, store.CopyGuardStoppedWatching, 1700, 1690, 34)
+	e.leaderState.Positions["ETHUSDT_long"] = &Position{Symbol: "ETHUSDT", Side: SideLong, Size: 1, EntryPrice: 1700, MarkPrice: 1690, MarginMode: "cross", PosID: "leader-pos"}
+
+	e.checkReentryConditions()
+	e.checkReentryConditions()
+	e.checkReentryConditions()
+
+	got, _ := st.CopyTrade().GetCopyGuardCycle(cycle.ID)
+	if got.Status == store.CopyGuardAttemptsExhausted {
+		t.Fatal("feasible window must not be flagged exhausted")
+	}
+	if n := countGuardEvents(t, st, cycle.ID, "REENTRY_WINDOW_COLLAPSED"); n != 0 {
+		t.Fatalf("feasible window must not emit collapsed event, got %d", n)
+	}
+	select {
+	case <-e.decisionCh:
+	default:
+		t.Fatal("feasible in-band confirmed ticks must emit a reentry decision")
+	}
+}
+
+// 冷却期 chaseLimit=0：提前 continue，绝不进入窗口空集判定（避免误转终态）
+func TestReentryWindowNotJudgedDuringCooldown(t *testing.T) {
+	e, st := newReentryTestEngine(t)
+	makeWindowInfeasibleConfig(e)
+	e.config.RiskReentryCooldownSeconds = 3600
+	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700)
+	_ = st.CopyTrade().UpdateCopyGuardObservation(cycle.ID, store.CopyGuardStoppedWatching, 1700, 1690, 34)
+	e.leaderState.Positions["ETHUSDT_long"] = &Position{Symbol: "ETHUSDT", Side: SideLong, Size: 1, EntryPrice: 1700, MarkPrice: 1690, MarginMode: "cross", PosID: "leader-pos"}
+
+	e.checkReentryConditions()
+
+	got, _ := st.CopyTrade().GetCopyGuardCycle(cycle.ID)
+	if got.Status != store.CopyGuardStoppedWatching {
+		t.Fatalf("during cooldown window must not be judged infeasible; want STOPPED_WATCHING got %s", got.Status)
+	}
+	if n := countGuardEvents(t, st, cycle.ID, "REENTRY_WINDOW_COLLAPSED"); n != 0 {
+		t.Fatalf("no collapsed event during cooldown, got %d", n)
+	}
+}
+
+// manualMode + 价格越过追价上限但已回归下界：忽略 chase，连续确认后生成 PENDING
+func TestManualModeIgnoresChaseAndSignalsOnRecovery(t *testing.T) {
+	e, st := newReentryTestEngine(t)
+	e.config.RiskManualReentryEnabled = true
+	e.config.RiskMaxReentries = 0 // ReentryCount(0)>=0 → 直接 ATTEMPTS_EXHAUSTED → manualMode
+	e.config.RiskReentryMinRecoveryATR = 0.5
+	e.config.RiskReentryMaxChaseATR = 0.5 // 窗口 [1683,1717]
+	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700)
+	_ = st.CopyTrade().UpdateCopyGuardObservation(cycle.ID, store.CopyGuardAttemptsExhausted, 1700, 1690, 34)
+	// markPrice 1750：越过 chase 上限 1717，但已回归下界 1683
+	e.leaderState.Positions["ETHUSDT_long"] = &Position{Symbol: "ETHUSDT", Side: SideLong, Size: 1, EntryPrice: 1700, MarkPrice: 1750, MarginMode: "cross", PosID: "leader-pos"}
+
+	e.checkReentryConditions()
+	e.checkReentryConditions()
+	e.checkReentryConditions()
+
+	if n, _ := st.CopyTrade().CountManualReentrySignalsForCycle(cycle.ID); n < 1 {
+		t.Fatalf("manualMode must generate a PENDING signal when price recovered past boundary even beyond chase, got %d", n)
+	}
+	select {
+	case <-e.decisionCh:
+		t.Fatal("manualMode must not emit an auto reentry decision (only a human signal)")
+	default:
+	}
+}
+
+// manualMode + 价格未回归下界：即便忽略 chase，仍不得生成人工信号
+func TestManualModeNoSignalWhenPriceNotReturned(t *testing.T) {
+	e, st := newReentryTestEngine(t)
+	e.config.RiskManualReentryEnabled = true
+	e.config.RiskMaxReentries = 0
+	e.config.RiskReentryMinRecoveryATR = 0.5
+	e.config.RiskReentryMaxChaseATR = 0.5
+	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700)
+	_ = st.CopyTrade().UpdateCopyGuardObservation(cycle.ID, store.CopyGuardAttemptsExhausted, 1700, 1670, 34)
+	// markPrice 1670 < 下界 1683 → 未回归
+	e.leaderState.Positions["ETHUSDT_long"] = &Position{Symbol: "ETHUSDT", Side: SideLong, Size: 1, EntryPrice: 1700, MarkPrice: 1670, MarginMode: "cross", PosID: "leader-pos"}
+
+	e.checkReentryConditions()
+	e.checkReentryConditions()
+	e.checkReentryConditions()
+
+	if n, _ := st.CopyTrade().CountManualReentrySignalsForCycle(cycle.ID); n != 0 {
+		t.Fatalf("manualMode must not signal before price returns to boundary, got %d", n)
+	}
+}
+
+// 纯函数：窗口可行性判定（long/short 镜像 + chaseLimit<=0 不判定 + epsilon 容差）
+func TestReentryWindowInfeasibleHelper(t *testing.T) {
+	cases := []struct {
+		name             string
+		side             string
+		boundary, chase  float64
+		anchor           float64
+		want             bool
+	}{
+		{"long empty set", "long", 1790, 1784, 1779, true},
+		{"long feasible", "long", 1683, 1717, 1700, false},
+		{"short empty set", "short", 1564, 1683, 1700, true},
+		{"short feasible", "short", 1717, 1564, 1700, false},
+		{"cooldown no chase", "long", 1790, 0, 1700, false},
+		{"within epsilon not infeasible", "long", 1700.0000001, 1700, 1700, false},
+	}
+	for _, c := range cases {
+		if got := reentryWindowInfeasible(c.side, c.boundary, c.chase, c.anchor); got != c.want {
+			t.Fatalf("%s: reentryWindowInfeasible=%v want %v", c.name, got, c.want)
+		}
+	}
+}

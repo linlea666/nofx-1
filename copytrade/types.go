@@ -309,6 +309,9 @@ type RiskEvent struct {
 	CurrentATR      float64 // 信号触发时 ATR
 	LastStopPrice   float64 // 最近一次止损成交价（0=数据缺失）
 	EstStopDistance float64 // 预算止损距离（供邮件展示建议止损价，0=未预检）
+	ChaseLimit      float64 // 自动路径追价上限（0=未计算；人工路径忽略但用于提示）
+	ChaseExceededBy float64 // 当前价超出追价上限的幅度（>0 表示强反转追入）
+	WindowInfeasible bool   // 自动重入窗口是否已塌缩为空集
 }
 
 // PositionKey 生成仓位的唯一键 (不含保证金模式，向后兼容)

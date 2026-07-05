@@ -90,6 +90,7 @@ const eventLabels: Record<string, string> = {
   ADDON_SKIPPED_BUDGET: '加仓超预算被拦截（旧版）',
   CYCLE_LOSS_BREAKER: '周期亏损熔断触发',
   REENTRY_GATE_CHANGED: '重入门控条件变化',
+  REENTRY_WINDOW_COLLAPSED: '自动重入窗口不可行·转人工确认',
   WATCH_RESUMED: '观察采样断档后恢复',
   WATCH_SUMMARY: '观察期收尾统计',
   // v5.1 人工重入
@@ -111,6 +112,7 @@ const gateLabels: Record<string, string> = {
   REENTRY_UNPROTECTABLE: '重入后无法建立止损·放弃',
   REENTRY_TRIGGERED: '已触发重入',
   MANUAL_REENTRY_SIGNAL: '人工重入信号已生成（等待确认）',
+  REENTRY_WINDOW_INFEASIBLE: '自动重入窗口不可行（恢复门槛越过追价上限）',
   ATTEMPTS_EXHAUSTED: '重入次数用尽',
   WATCH_TIMEOUT: '观察超时',
   CYCLE_LOSS_CAPPED: '周期亏损熔断（v5 前历史）',
@@ -411,6 +413,19 @@ export function CopyGuardPage() {
           leader_reductions?: number
         }
       | undefined
+  }, [detail])
+  // 从策略快照解析人工重入开关：ATTEMPTS_EXHAUSTED 时用于区分"可人工重入"
+  // 与"窗口不可行但人工提醒未开启"两种情形（含窗口塌缩转终态的场景）。
+  const manualReentryEnabled = useMemo(() => {
+    if (!detail?.cycle.policy_snapshot) return true
+    try {
+      const p = JSON.parse(detail.cycle.policy_snapshot) as {
+        risk_manual_reentry_enabled?: boolean
+      }
+      return p.risk_manual_reentry_enabled !== false
+    } catch {
+      return true
+    }
   }, [detail])
   const watchChart = useMemo(
     () =>
@@ -899,7 +914,13 @@ export function CopyGuardPage() {
             />
             <Metric
               label="生命周期状态"
-              value={localized(statusLabels, detail.cycle.status)}
+              value={
+                localized(statusLabels, detail.cycle.status) +
+                (detail.cycle.status === 'ATTEMPTS_EXHAUSTED' &&
+                !manualReentryEnabled
+                  ? '（自动重入窗口不可行，人工提醒未开启）'
+                  : '')
+              }
             />
             <Metric
               label="对账状态"
@@ -1113,6 +1134,19 @@ export function CopyGuardPage() {
                     ? `：${localized(gateLabels, String(e.metadata.from ?? ''))} → ${localized(gateLabels, String(e.metadata.to ?? ''))}`
                     : ''}
                   {count > 1 ? ` ×${count}` : ''}
+                  {e.type === 'PROTECTIVE_STOP_ACTIVE' &&
+                  e.metadata &&
+                  (e.metadata.governed_by === 'margin_cap' ||
+                    e.metadata.governed_by === 'clamp') &&
+                  typeof e.metadata.distance_atr_ratio === 'number' &&
+                  e.metadata.distance_atr_ratio < 0.5 ? (
+                    <span
+                      className="ml-2 text-xs text-yellow-500"
+                      title={`止损距离仅 ${(e.metadata.distance_atr_ratio as number).toFixed(2)}×ATR（控线=${String(e.metadata.governed_by)}），易被行情噪音扫到`}
+                    >
+                      ⚠️ 止损偏紧·易扫损
+                    </span>
+                  ) : null}
                 </span>
                 <span>价格 {e.price || '-'}</span>
                 <span>盈亏 {e.pnl?.toFixed(2) ?? '0.00'}</span>
