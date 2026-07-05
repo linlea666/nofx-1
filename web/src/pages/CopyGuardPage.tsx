@@ -10,7 +10,7 @@ import {
   YAxis,
 } from 'recharts'
 import { api } from '../lib/api'
-import type { CopyGuardCycle } from '../types'
+import type { CopyGuardCycle, CopyGuardManualSignal } from '../types'
 
 const money = (v: number) => `${v >= 0 ? '+' : ''}${v.toFixed(2)} USDT`
 
@@ -22,7 +22,7 @@ const statusLabels: Record<string, string> = {
   FOLLOWING_REENTRY: '重入后跟随',
   LEADER_CLOSED: '领航员已平仓',
   LEADER_REVERSED: '领航员已反手',
-  ATTEMPTS_EXHAUSTED: '重入次数用尽·等待领航员平仓',
+  ATTEMPTS_EXHAUSTED: '自动重入次数用尽·继续观察（可人工重入）',
   WATCH_TIMEOUT: '观察超时·等待领航员平仓',
   CYCLE_LOSS_CAPPED: '周期亏损熔断·等待领航员平仓（v5 前历史）',
   // 注：不可保护（裸跑）不是周期状态——follow 模式下周期保持 FOLLOWING，
@@ -92,6 +92,10 @@ const eventLabels: Record<string, string> = {
   REENTRY_GATE_CHANGED: '重入门控条件变化',
   WATCH_RESUMED: '观察采样断档后恢复',
   WATCH_SUMMARY: '观察期收尾统计',
+  // v5.1 人工重入
+  GUARD_MANUAL_REENTRY_SIGNAL: '人工重入信号（等待确认）',
+  GUARD_MANUAL_REENTRY_CONFIRMED: '人工重入已确认（系统代执行）',
+  GUARD_MANUAL_REENTRY_DISMISSED: '人工重入信号已忽略',
 }
 
 // 观察期采样的门控原因（copy_guard_watch_samples.gate / REENTRY_GATE_CHANGED metadata）
@@ -106,6 +110,7 @@ const gateLabels: Record<string, string> = {
   MIN_NOTIONAL: '金额低于阈值',
   REENTRY_UNPROTECTABLE: '重入后无法建立止损·放弃',
   REENTRY_TRIGGERED: '已触发重入',
+  MANUAL_REENTRY_SIGNAL: '人工重入信号已生成（等待确认）',
   ATTEMPTS_EXHAUSTED: '重入次数用尽',
   WATCH_TIMEOUT: '观察超时',
   CYCLE_LOSS_CAPPED: '周期亏损熔断（v5 前历史）',
@@ -129,6 +134,196 @@ const dateLabel = (value?: string) => {
   if (!value) return '-'
   const date = new Date(value)
   return Number.isNaN(date.getTime()) ? '-' : date.toLocaleString()
+}
+
+// v5.1 人工重入待确认横幅：自动重入次数用尽后出现合格信号时（邮件同步提醒），
+// 用户在此确认（系统代执行）或忽略。30 秒轮询，无待处理信号时不渲染。
+function ManualSignalsBanner() {
+  const { data: signals = [], mutate } = useSWR<CopyGuardManualSignal[]>(
+    'copy-guard-manual-signals',
+    () => api.getCopyGuardManualSignals('?status=PENDING,EXECUTING'),
+    { refreshInterval: 30000 }
+  )
+  const [confirming, setConfirming] = useState<CopyGuardManualSignal | null>(
+    null
+  )
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const [notice, setNotice] = useState('')
+  const [bannerError, setBannerError] = useState('')
+
+  const doConfirm = async () => {
+    if (!confirming) return
+    setBusy(true)
+    setError('')
+    try {
+      await api.confirmCopyGuardManualSignal(confirming.id)
+      setNotice(
+        `已确认重入 ${confirming.symbol} ${sideLabel(confirming.side)}单，系统正在执行；执行结果稍后可在周期明细的事件流中查看`
+      )
+      setConfirming(null)
+      void mutate()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+      void mutate()
+    } finally {
+      setBusy(false)
+    }
+  }
+  const doDismiss = async (sig: CopyGuardManualSignal) => {
+    if (!window.confirm(`忽略 ${sig.symbol} ${sideLabel(sig.side)}单的人工重入信号？忽略后本条信号不再提示（后续行情再次满足条件会生成新信号）。`))
+      return
+    setBannerError('')
+    try {
+      await api.dismissCopyGuardManualSignal(sig.id)
+      void mutate()
+    } catch (e) {
+      setBannerError(e instanceof Error ? e.message : String(e))
+      void mutate()
+    }
+  }
+
+  if (signals.length === 0 && !notice && !bannerError) return null
+  return (
+    <>
+      {notice && (
+        <div className="flex items-center justify-between border border-[#0ECB81] bg-[#0ECB81]/10 rounded-lg p-4 text-sm text-[#0ECB81]">
+          <span>{notice}</span>
+          <button onClick={() => setNotice('')} className="ml-3 text-xs underline">
+            关闭
+          </button>
+        </div>
+      )}
+      {bannerError && (
+        <div className="flex items-center justify-between border border-[#F6465D] bg-[#F6465D]/10 rounded-lg p-4 text-sm text-[#F6465D]">
+          <span>{bannerError}</span>
+          <button
+            onClick={() => setBannerError('')}
+            className="ml-3 text-xs underline"
+          >
+            关闭
+          </button>
+        </div>
+      )}
+      {signals.length > 0 && (
+        <div className="border border-[#F0B90B] bg-[#F0B90B]/10 rounded-lg p-4 space-y-3">
+          <div className="text-sm font-medium text-[#F0B90B]">
+            📣 人工重入待确认（{signals.length}
+            ）：自动重入次数已用尽，出现了合格的重入信号。确认后系统将实时复核并代为执行；不需要可忽略。
+          </div>
+          {signals.map((sig) => (
+            <div
+              key={sig.id}
+              className="flex flex-wrap items-center gap-x-4 gap-y-2 rounded bg-[#181A20] p-3 text-sm"
+            >
+              <span className="font-medium" title={sig.trader_id}>
+                {sig.trader_name || sig.trader_id}
+              </span>
+              <span>
+                {sig.symbol} {sideLabel(sig.side)}单
+                {sig.margin_mode ? ` · ${sig.margin_mode}` : ''}
+              </span>
+              <span>信号价 {sig.trigger_price}</span>
+              <span>建议金额 {sig.recommended_notional.toFixed(2)} USDT</span>
+              <span>
+                已止损 {sig.stop_count} 次 / 已自动重入 {sig.reentry_count} 次
+              </span>
+              <span
+                className={sig.protectable ? 'text-[#0ECB81]' : 'text-[#F6465D]'}
+              >
+                {sig.protectable
+                  ? '✓ 预计可挂保护止损'
+                  : '⚠️ 预计难以挂保护止损'}
+              </span>
+              <span className="text-xs text-[#848E9C]">
+                {dateLabel(sig.created_at)}
+              </span>
+              <span className="ml-auto flex gap-2">
+                {sig.status === 'EXECUTING' ? (
+                  <span className="px-3 py-1 text-[#F0B90B]">执行中…</span>
+                ) : (
+                  <>
+                    <button
+                      onClick={() => {
+                        setError('')
+                        setConfirming(sig)
+                      }}
+                      className="rounded bg-[#0ECB81] px-3 py-1 font-medium text-black hover:opacity-90"
+                    >
+                      确认重入
+                    </button>
+                    <button
+                      onClick={() => void doDismiss(sig)}
+                      className="rounded bg-[#2B3139] px-3 py-1 hover:bg-[#3B424C]"
+                    >
+                      忽略
+                    </button>
+                  </>
+                )}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+      {confirming && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+          <div className="w-full max-w-lg space-y-4 rounded-lg border border-[#2B3139] bg-[#181A20] p-6 text-sm">
+            <div className="text-base font-bold">
+              确认人工重入：{confirming.symbol} {sideLabel(confirming.side)}单
+            </div>
+            <div className="grid grid-cols-2 gap-2 text-[#EAECEF]">
+              <span className="text-[#848E9C]">交易员</span>
+              <span>{confirming.trader_name || confirming.trader_id}</span>
+              <span className="text-[#848E9C]">信号价格</span>
+              <span>{confirming.trigger_price}</span>
+              <span className="text-[#848E9C]">建议重入金额</span>
+              <span>{confirming.recommended_notional.toFixed(2)} USDT</span>
+              <span className="text-[#848E9C]">本周期已止损</span>
+              <span>{confirming.stop_count} 次</span>
+              <span className="text-[#848E9C]">保护单预检</span>
+              <span
+                className={
+                  confirming.protectable ? 'text-[#0ECB81]' : 'text-[#F6465D]'
+                }
+              >
+                {confirming.protectable
+                  ? '预计可挂出保护止损'
+                  : '预计难以挂出保护止损'}
+              </span>
+            </div>
+            <div className="rounded bg-[#0B0E11] p-3 text-xs leading-relaxed text-[#848E9C]">
+              确认后系统会实时复核：领航员是否仍持有该仓位、方向是否一致、您本地是否已有同向仓位、金额是否达到最小下单额。复核通过将
+              <span className="text-[#EAECEF]">立即按当前市价下单</span>
+              （即使价格与信号价有偏移），并自动挂出保护止损。
+              {!confirming.protectable && (
+                <span className="text-[#F6465D]">
+                  {' '}
+                  注意：预检显示重入后可能无法建立有效保护止损；若成交后确实无法保护，系统将按您配置的「不可保护处置」（默认：立即平仓）自动兜底。
+                </span>
+              )}
+            </div>
+            {error && <div className="text-[#F6465D]">{error}</div>}
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={() => setConfirming(null)}
+                disabled={busy}
+                className="rounded bg-[#2B3139] px-4 py-2 disabled:opacity-40"
+              >
+                取消
+              </button>
+              <button
+                onClick={() => void doConfirm()}
+                disabled={busy}
+                className="rounded bg-[#0ECB81] px-4 py-2 font-medium text-black disabled:opacity-40"
+              >
+                {busy ? '执行中…' : '确认执行'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  )
 }
 
 export function CopyGuardPage() {
@@ -321,6 +516,7 @@ export function CopyGuardPage() {
           </button>
         </div>
       </div>
+      <ManualSignalsBanner />
       <div className="grid md:grid-cols-5 gap-3">
         <input
           value={traderID}

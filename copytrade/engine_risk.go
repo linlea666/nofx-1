@@ -643,7 +643,23 @@ func (e *Engine) checkReentryConditions() {
 		noiseDisabled := noiseRatio > 0 && noiseRatio < reentryNoiseDisableRatio && !e.config.RiskReentryNoiseOverride
 		cautious := noiseRatio > 0 && noiseRatio < reentryNoiseCautiousRatio
 
-		if !e.config.RiskReentryEnabled || terminalWatchStatus != "" || noiseDisabled {
+		// v5.1 人工重入模式：自动重入次数用尽（ATTEMPTS_EXHAUSTED）且开关开启
+		// 时，不终止观察，继续复用下方完整门控链（冷却/边界/连续确认/金额），
+		// 只把触发点从 emitReentryDecision 换成"落信号 + 邮件提醒人工确认"。
+		// WATCH_TIMEOUT 与噪音档禁入的短路保持不变（人工重入同样尊重这两个
+		// 根本性约束）。
+		manualMode := e.config.RiskManualReentryEnabled &&
+			e.config.RiskReentryEnabled &&
+			terminalWatchStatus == store.CopyGuardAttemptsExhausted &&
+			!noiseDisabled
+		// 门控链里的观察态写库：人工模式下周期保持 ATTEMPTS_EXHAUSTED（自动
+		// 重入确已用尽，是对 UI 的真实呈现），非人工模式沿用 STOPPED_WATCHING
+		watchStatus := store.CopyGuardStoppedWatching
+		if manualMode {
+			watchStatus = store.CopyGuardAttemptsExhausted
+		}
+
+		if !e.config.RiskReentryEnabled || (terminalWatchStatus != "" && !manualMode) || noiseDisabled {
 			mark := leaderPos.MarkPrice
 			if mark <= 0 {
 				mark = leaderPos.EntryPrice
@@ -709,7 +725,7 @@ func (e *Engine) checkReentryConditions() {
 		_ = e.store.CopyTrade().UpdateCopyGuardShadow(v4Cycle.ID, entryRef, markPrice, shadow, leaderPos.Size)
 		if coolingDown {
 			atr, _ := market.GetOKXATRWithMaxAge(mapping.Symbol, e.config.RiskATRTimeframe, e.config.RiskATRPeriod, riskATRCacheMaxAge(e.config))
-			_ = e.store.CopyTrade().UpdateCopyGuardObservation(v4Cycle.ID, store.CopyGuardStoppedWatching, entryRef, markPrice, atr)
+			_ = e.store.CopyTrade().UpdateCopyGuardObservation(v4Cycle.ID, watchStatus, entryRef, markPrice, atr)
 			e.recordWatchSample(v4Cycle, leaderPos, markPrice, atr, 0, 0, watchGateCooldown)
 			delete(e.reentryCandidateTicks, mapping.LeaderPosID)
 			continue
@@ -720,7 +736,7 @@ func (e *Engine) checkReentryConditions() {
 			currentATR = entryRef * e.config.RiskATRFallbackPct
 		}
 		if v4Cycle.ATRAtStop > 0 && currentATR > v4Cycle.ATRAtStop*e.config.RiskReentryMaxATRExpansion {
-			_ = e.store.CopyTrade().UpdateCopyGuardObservation(v4Cycle.ID, store.CopyGuardStoppedWatching, entryRef, markPrice, currentATR)
+			_ = e.store.CopyTrade().UpdateCopyGuardObservation(v4Cycle.ID, watchStatus, entryRef, markPrice, currentATR)
 			e.recordWatchSample(v4Cycle, leaderPos, markPrice, currentATR, 0, 0, watchGateATRExpansion)
 			delete(e.reentryCandidateTicks, mapping.LeaderPosID)
 			continue
@@ -769,7 +785,7 @@ func (e *Engine) checkReentryConditions() {
 		if v4Cycle.LastObservedPrice <= 0 {
 			conditionsMet = false
 		}
-		_ = e.store.CopyTrade().UpdateCopyGuardObservation(v4Cycle.ID, store.CopyGuardStoppedWatching, entryRef, markPrice, currentATR)
+		_ = e.store.CopyTrade().UpdateCopyGuardObservation(v4Cycle.ID, watchStatus, entryRef, markPrice, currentATR)
 		if !conditionsMet {
 			// 条件破坏 → 确认计数清零重来（v5 确认式重入的核心：单 tick
 			// 触碰边界不再直接重入，杜绝"止损 @1773 → 单 tick 回归重入
@@ -839,17 +855,42 @@ func (e *Engine) checkReentryConditions() {
 		if equityForCheck <= 0 {
 			equityForCheck = v4Cycle.AccountEquity
 		}
+		protectable := true
+		estStopDistance := float64(0)
 		if equityForCheck > 0 {
 			atrBaseline := currentATR
 			if e.config.RiskATRMultiplier > 0 {
 				atrBaseline = currentATR * e.config.RiskATRMultiplier
 			}
-			if precheck, precheckErr := ComputeRiskDistanceV4(e.config, markPrice, reentrySize, equityForCheck, atrBaseline, leaderPos.Leverage); precheckErr != nil || precheck.Distance/markPrice < 0.001 {
-				logger.Warnf("⚠️ [%s] 重入可保护性预检未通过（预算止损距离过近/计算失败），本轮不重入 | posId=%s err=%v", e.traderID, mapping.LeaderPosID, precheckErr)
-				e.recordWatchSample(v4Cycle, leaderPos, markPrice, currentATR, reentryBoundary, chaseLimit, watchGateUnprotectable)
-				delete(e.reentryCandidateTicks, mapping.LeaderPosID)
-				continue
+			precheck, precheckErr := ComputeRiskDistanceV4(e.config, markPrice, reentrySize, equityForCheck, atrBaseline, leaderPos.Leverage)
+			if precheckErr != nil || precheck.Distance/markPrice < 0.001 {
+				protectable = false
+				if !manualMode {
+					logger.Warnf("⚠️ [%s] 重入可保护性预检未通过（预算止损距离过近/计算失败），本轮不重入 | posId=%s err=%v", e.traderID, mapping.LeaderPosID, precheckErr)
+					e.recordWatchSample(v4Cycle, leaderPos, markPrice, currentATR, reentryBoundary, chaseLimit, watchGateUnprotectable)
+					delete(e.reentryCandidateTicks, mapping.LeaderPosID)
+					continue
+				}
+				// 人工模式：可保护性只提示不拦截（用户已被告知风险且人工确认
+				// 最高优先；成交后若确实不可保护，v5 状态机按
+				// risk_unprotectable_action 兜底处置）
+			} else {
+				estStopDistance = precheck.Distance
 			}
+		}
+
+		// v5.1 人工模式触发点：门控链全部通过 → 落信号 + 邮件提醒，
+		// 不自动下单（等待用户在前端确认后由 integration 层代执行）
+		if manualMode {
+			e.emitManualReentrySignal(mapping, leaderPos, v4Cycle, manualSignalParams{
+				markPrice: markPrice, atr: currentATR, noiseRatio: noiseRatio,
+				reentryBoundary: reentryBoundary, reentrySize: reentrySize,
+				stopFillPrice: attemptStopFillPrice(stoppedAttempt), protectable: protectable,
+				estStopDistance: estStopDistance,
+			})
+			e.recordWatchSample(v4Cycle, leaderPos, markPrice, currentATR, reentryBoundary, chaseLimit, watchGateManualReentrySignal)
+			delete(e.reentryCandidateTicks, mapping.LeaderPosID)
+			continue
 		}
 
 		// ============================================================
@@ -920,6 +961,112 @@ func (e *Engine) findStoppedAttempt(cycle *store.CopyGuardCycle) *store.CopyGuar
 	return nil
 }
 
+// attemptStopFillPrice 被止损 attempt 的止损成交价（数据缺失返回 0）
+func attemptStopFillPrice(attempt *store.CopyGuardAttempt) float64 {
+	if attempt == nil {
+		return 0
+	}
+	return attempt.ExitPrice
+}
+
+// manualSignalParams 人工重入信号的市场快照参数（emitManualReentrySignal 入参）
+type manualSignalParams struct {
+	markPrice       float64 // 信号触发时标记价
+	atr             float64 // 当前 ATR
+	noiseRatio      float64 // 止损距离/ATR（0=数据缺失）
+	reentryBoundary float64 // 重入穿越边界
+	reentrySize     float64 // 建议重入名义（USDT）
+	stopFillPrice   float64 // 最近一次止损成交价（0=数据缺失）
+	estStopDistance float64 // 预算止损距离（0=未预检/预检失败）
+	protectable     bool    // 可保护性预检结果
+}
+
+// emitManualReentrySignal v5.1 人工重入信号触发点：门控链全部通过后落库
+// PENDING 信号（同周期已有 PENDING 时幂等刷新市场快照），并按邮件冷却
+// （store.ManualReentryAlertCooldown）推 RiskEvent 给 integration 层发提醒。
+// 事件 GUARD_MANUAL_REENTRY_SIGNAL 与邮件同步写入（只在提醒沿写，避免
+// 每 N tick 重触发刷屏事件流）。
+func (e *Engine) emitManualReentrySignal(mapping *store.CopyTradePositionMapping, leaderPos *Position, cycle *store.CopyGuardCycle, p manualSignalParams) {
+	// 配额护栏：同周期信号总量上限（正常同周期只滚动维护一条 PENDING，
+	// 达到上限说明信号被反复忽略/执行失败，防御性停止生成）
+	n, err := e.store.CopyTrade().CountManualReentrySignalsForCycle(cycle.ID)
+	if err != nil {
+		logger.Warnf("⚠️ [%s] 人工重入信号配额查询失败: %v | cycle=%d", e.traderID, err, cycle.ID)
+		return
+	}
+	if n >= store.ManualReentryMaxSignalsPerCycle {
+		logger.Warnf("⚠️ [%s] 人工重入信号达单周期上限(%d)，不再生成 | cycle=%d", e.traderID, store.ManualReentryMaxSignalsPerCycle, cycle.ID)
+		return
+	}
+
+	sig, err := e.store.CopyTrade().SaveManualReentrySignal(&store.CopyGuardManualReentrySignal{
+		CycleID:             cycle.ID,
+		TraderID:            e.traderID,
+		LeaderPosID:         mapping.LeaderPosID,
+		Symbol:              mapping.Symbol,
+		Side:                mapping.Side,
+		MarginMode:          mapping.MarginMode,
+		TriggerPrice:        p.markPrice,
+		ATR:                 p.atr,
+		DistanceATRRatio:    p.noiseRatio,
+		ReentryBoundary:     p.reentryBoundary,
+		RecommendedNotional: p.reentrySize,
+		StopCount:           cycle.StopCount,
+		ReentryCount:        cycle.ReentryCount,
+		LeaderSize:          leaderPos.Size,
+		LeaderEntryPrice:    leaderPos.EntryPrice,
+		Protectable:         p.protectable,
+		Reason: fmt.Sprintf("自动重入次数已用尽(%d/%d)，价格回归重入边界并通过连续确认",
+			cycle.ReentryCount, e.config.RiskMaxReentries),
+	})
+	if err != nil {
+		logger.Warnf("⚠️ [%s] 人工重入信号落库失败: %v | cycle=%d", e.traderID, err, cycle.ID)
+		return
+	}
+
+	// 邮件冷却：新信号（从未提醒过）立即提醒；既有信号距上次提醒不足冷却
+	// 时间则只刷新快照不重复提醒
+	if sig.LastAlertAt != nil && time.Since(*sig.LastAlertAt) < store.ManualReentryAlertCooldown {
+		return
+	}
+	if err := e.store.CopyTrade().MarkManualReentrySignalAlerted(sig.ID); err != nil {
+		logger.Warnf("⚠️ [%s] 人工重入信号提醒时间落库失败: %v | signal=%d", e.traderID, err, sig.ID)
+	}
+	_ = e.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: e.traderID, Type: "GUARD_MANUAL_REENTRY_SIGNAL", Price: p.markPrice, Notional: p.reentrySize, Metadata: map[string]interface{}{
+		"signal_id":         sig.ID,
+		"stop_count":        cycle.StopCount,
+		"reentry_count":     cycle.ReentryCount,
+		"noise_ratio":       p.noiseRatio,
+		"protectable":       p.protectable,
+		"reentry_boundary":  p.reentryBoundary,
+		"est_stop_distance": p.estStopDistance,
+		"last_stop_price":   p.stopFillPrice,
+		"current_atr":       p.atr,
+	}})
+	logger.Infof("📣 [%s] 人工重入信号已生成，等待用户确认 | cycle=%d signal=%d %s %s 价格=%.4f 建议金额=%.2f 可保护=%v",
+		e.traderID, cycle.ID, sig.ID, mapping.Symbol, mapping.Side, p.markPrice, p.reentrySize, p.protectable)
+	e.emitRiskEvent(&RiskEvent{
+		Type:              RiskEventManualReentrySignal,
+		Timestamp:         time.Now(),
+		Symbol:            mapping.Symbol,
+		Side:              mapping.Side,
+		MarginMode:        mapping.MarginMode,
+		LeaderPosID:       mapping.LeaderPosID,
+		LeaderSize:        leaderPos.Size,
+		ReentryEntryPrice: p.markPrice,
+		ReentrySize:       p.reentrySize,
+		ManualSignalID:    sig.ID,
+		CycleID:           cycle.ID,
+		StopCount:         cycle.StopCount,
+		ReentryCount:      cycle.ReentryCount,
+		Protectable:       p.protectable,
+		NoiseRatio:        p.noiseRatio,
+		CurrentATR:        p.atr,
+		LastStopPrice:     p.stopFillPrice,
+		EstStopDistance:   p.estStopDistance,
+	})
+}
+
 // stopDistanceATRRatio 止损时的实际止损距离 / 当时 ATR（v5 重入自适应加严的
 // 输入）。< 0.5 说明该配置的止损落在正常噪音区内（易扫损），< 0.3 说明极易
 // 扫损。数据缺失（旧周期无 attempt 快照或 ATR）时返回 0（按正常档处理）。
@@ -957,6 +1104,8 @@ const (
 	watchGateMinNotional      = "MIN_NOTIONAL"           // 重入金额低于最小阈值
 	watchGateUnprotectable    = "REENTRY_UNPROTECTABLE"  // v5：预算重入后止损不可行，不重入
 	watchGateReentryTriggered = "REENTRY_TRIGGERED"      // 全部条件满足，已请求重入
+	// v5.1：自动重入用尽后门控链全部通过，已落人工重入信号（等待用户确认）
+	watchGateManualReentrySignal = "MANUAL_REENTRY_SIGNAL"
 	watchSampleInterval       = 60 * time.Second         // 固定间隔采样（gate 不变时）
 	watchResumeGapMultiplier  = 5                        // 采样断档 > 间隔×该倍数 → 记 WATCH_RESUMED
 )

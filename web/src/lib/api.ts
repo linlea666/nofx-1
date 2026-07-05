@@ -955,4 +955,29 @@ export const api = {
       throw new Error(result.message || '获取 Copy Guard 生命周期失败')
     return result.data!
   },
+
+  // v5.1 人工重入信号
+  async getCopyGuardManualSignals(params = '') {
+    const result = await httpClient.get<{
+      signals: import('../types').CopyGuardManualSignal[]
+    }>(`${API_BASE}/copytrade/risk/manual-signals${params}`)
+    if (!result.success)
+      throw new Error(result.message || '获取人工重入信号失败')
+    return result.data!.signals
+  },
+  async confirmCopyGuardManualSignal(id: number) {
+    const result = await httpClient.post<{
+      message: string
+      signal: import('../types').CopyGuardManualSignal
+    }>(`${API_BASE}/copytrade/risk/manual-signals/${id}/confirm`)
+    if (!result.success) throw new Error(result.message || '确认人工重入失败')
+    return result.data!
+  },
+  async dismissCopyGuardManualSignal(id: number) {
+    const result = await httpClient.post<{ message: string }>(
+      `${API_BASE}/copytrade/risk/manual-signals/${id}/dismiss`
+    )
+    if (!result.success) throw new Error(result.message || '忽略信号失败')
+    return result.data!
+  },
 }

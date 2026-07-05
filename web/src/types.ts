@@ -208,6 +208,8 @@ export interface CopyConfigRequest {
   risk_leverage_max_loss?: number // 默认 0.2：保证金最大亏损封顶（0-1，硬上限）
   risk_reentry_enabled?: boolean // 默认 true（v4+）：止损后确认式重入
   risk_reentry_ratio?: number // 默认 0.5：重入仓位系数（× 被止损仓位名义）
+  // v5.1 默认 true：自动重入次数用尽后，出现合格重入信号时邮件提醒人工确认（系统代执行）
+  risk_manual_reentry_enabled?: boolean
 
   risk_policy_version?: number
   risk_stop_mode?: 'volatility_priority' | 'account_hard_limit'
@@ -704,6 +706,7 @@ export interface CopyTradeConfig {
   risk_leverage_max_loss?: number
   risk_reentry_enabled?: boolean
   risk_reentry_ratio?: number
+  risk_manual_reentry_enabled?: boolean // v5.1 默认 true：自动重入用尽后人工重入提醒
   risk_policy_version?: number
   risk_stop_mode?: 'volatility_priority' | 'account_hard_limit'
   risk_atr_period?: number
@@ -825,6 +828,37 @@ export interface CopyGuardCycle {
   opened_at: string
   closed_at?: string
   reconciled_at?: string
+}
+
+// v5.1 人工重入信号（自动重入次数用尽后，合格信号等待用户确认）
+export interface CopyGuardManualSignal {
+  id: number
+  cycle_id: number
+  trader_id: string
+  trader_name?: string
+  leader_pos_id: string
+  symbol: string
+  side: string
+  margin_mode: string
+  status: 'PENDING' | 'EXECUTING' | 'EXECUTED' | 'FAILED' | 'DISMISSED' | 'INVALIDATED'
+  trigger_price: number // 信号触发时标记价
+  atr: number
+  distance_atr_ratio: number // 止损距离/ATR（噪音档参考，0=数据缺失）
+  reentry_boundary: number
+  recommended_notional: number // 建议重入金额（USDT）
+  stop_count: number
+  reentry_count: number
+  leader_size: number
+  leader_entry_price: number
+  protectable: boolean // 可保护性预检（仅提示，不拦截确认）
+  reason: string
+  operator: string
+  confirm_price: number
+  error: string
+  created_at: string
+  last_alert_at?: string
+  confirmed_at?: string
+  executed_at?: string
 }
 
 export interface CopyTradeStats {

@@ -326,6 +326,10 @@ func (s *CopyTradeStore) initCopyGuardTables() error {
 		_, _ = s.db.Exec(`UPDATE copy_guard_cycles SET accounting_status=? WHERE accounting_status='NEEDS_REVIEW'`, CopyGuardAccountingDelayed)
 		// v4.1 默认值代次迁移（幂等，defaults_version 书签控制）
 		s.migrateCopyGuardPolicyDefaults()
+		// v5.1 人工重入信号表
+		if merr := s.initManualReentryTables(); merr != nil {
+			return merr
+		}
 	}
 	return err
 }
@@ -964,6 +968,12 @@ func (s *CopyTradeStore) CloseCopyGuardCycle(id int64, status string, actual, ba
 	if err != nil {
 		return err
 	}
+	// v5.1：周期终结（领航员平仓/反手等）时人工重入信号根本性失效。
+	// 放在闭合事务内保证所有闭合路径（engine 观察期反手 / integration
+	// 反向开仓 / 领航员消失）都覆盖，不必在各调用点散布钩子。
+	if _, err = tx.Exec(`UPDATE copy_guard_manual_reentry_signals SET status=?, error='周期已结束: '||? WHERE cycle_id=? AND status=?`, ManualReentryStatusInvalidated, status, id, ManualReentryStatusPending); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
@@ -976,6 +986,10 @@ func (s *CopyTradeStore) BeginCopyGuardAccounting(id int64, status, exitOrderID 
 	}
 	defer tx.Rollback()
 	if _, err = tx.Exec(`UPDATE copy_guard_cycles SET status=?,exit_order_id=CASE WHEN ?<>'' THEN ? ELSE exit_order_id END,baseline_pnl=?,net_guard_effect=0,tracking_difference=0,accounting_status=?,accounting_error='',closed_at=COALESCE(closed_at,CURRENT_TIMESTAMP),updated_at=CURRENT_TIMESTAMP WHERE id=?`, status, exitOrderID, exitOrderID, baseline, CopyGuardAccountingPending, id); err != nil {
+		return err
+	}
+	// v5.1：周期终结时人工重入信号根本性失效（同 CloseCopyGuardCycle）
+	if _, err = tx.Exec(`UPDATE copy_guard_manual_reentry_signals SET status=?, error='周期已结束: '||? WHERE cycle_id=? AND status=?`, ManualReentryStatusInvalidated, status, id, ManualReentryStatusPending); err != nil {
 		return err
 	}
 	if exitOrderID != "" {

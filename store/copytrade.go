@@ -55,6 +55,12 @@ type CopyTradeConfig struct {
 	RiskReentryEnabled bool    `json:"risk_reentry_enabled"`
 	RiskReentryRatio   float64 `json:"risk_reentry_ratio"` // × 被止损仓位名义，默认 0.5
 
+	// 人工重入（v5.1）：自动重入次数用尽（ATTEMPTS_EXHAUSTED）后，继续观察
+	// 合格重入信号；出现时落信号 + 邮件提醒，由用户在前端确认后系统代执行。
+	// 直接列存储（DEFAULT 1），新旧库均默认开启；区别于 policy JSON 字段
+	// （JSON 缺省反序列化为 false，无法表达"默认开"语义）。
+	RiskManualReentryEnabled bool `json:"risk_manual_reentry_enabled"`
+
 	// Copy Guard v4+。独立存储于 copy_guard_policies，避免破坏 v3 配置表和旧版回滚。
 	RiskPolicyVersion          int     `json:"risk_policy_version"`
 	RiskStopMode               string  `json:"risk_stop_mode"`
@@ -232,6 +238,8 @@ func (s *CopyTradeStore) initTables() error {
 	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_leverage_max_loss REAL DEFAULT 0`)
 	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_reentry_enabled INTEGER DEFAULT 0`)
 	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_reentry_ratio REAL DEFAULT 0.5`)
+	// v5.1 人工重入：DEFAULT 1 = 新旧配置默认开启（ALTER 对存量行生效 DEFAULT）
+	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_manual_reentry_enabled INTEGER DEFAULT 1`)
 
 	return nil
 }
@@ -245,14 +253,14 @@ func (s *CopyTradeStore) Create(config *CopyTradeConfig) error {
 			 min_trade_warn, max_trade_warn, enabled, binance_p20t, binance_csrf_token,
 			 risk_stop_loss_enabled, risk_account_pct, risk_atr_multiplier,
 			 risk_atr_timeframe, risk_leverage_fallback, risk_leverage_max_loss,
-			 risk_reentry_enabled, risk_reentry_ratio)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			 risk_reentry_enabled, risk_reentry_ratio, risk_manual_reentry_enabled)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, config.TraderID, config.ProviderType, config.LeaderID, config.CopyRatio,
 		config.SyncLeverage, config.SyncMarginMode, config.MinTradeWarn, config.MaxTradeWarn, config.Enabled,
 		config.BinanceP20T, config.BinanceCSRFToken,
 		config.RiskStopLossEnabled, config.RiskAccountPct, config.RiskATRMultiplier,
 		config.RiskATRTimeframe, config.RiskLeverageFallback, config.RiskLeverageMaxLoss,
-		config.RiskReentryEnabled, config.RiskReentryRatio)
+		config.RiskReentryEnabled, config.RiskReentryRatio, config.RiskManualReentryEnabled)
 	if err != nil {
 		return err
 	}
@@ -281,14 +289,15 @@ func (s *CopyTradeStore) Update(config *CopyTradeConfig) error {
 			risk_leverage_fallback = ?,
 			risk_leverage_max_loss = ?,
 			risk_reentry_enabled = ?,
-			risk_reentry_ratio = ?
+			risk_reentry_ratio = ?,
+			risk_manual_reentry_enabled = ?
 		WHERE trader_id = ?
 	`, config.ProviderType, config.LeaderID, config.CopyRatio,
 		config.SyncLeverage, config.SyncMarginMode, config.MinTradeWarn, config.MaxTradeWarn,
 		config.Enabled, config.BinanceP20T, config.BinanceCSRFToken,
 		config.RiskStopLossEnabled, config.RiskAccountPct, config.RiskATRMultiplier,
 		config.RiskATRTimeframe, config.RiskLeverageFallback, config.RiskLeverageMaxLoss,
-		config.RiskReentryEnabled, config.RiskReentryRatio,
+		config.RiskReentryEnabled, config.RiskReentryRatio, config.RiskManualReentryEnabled,
 		config.TraderID)
 	if err != nil {
 		return err
@@ -305,8 +314,8 @@ func (s *CopyTradeStore) Upsert(config *CopyTradeConfig) error {
 			 min_trade_warn, max_trade_warn, enabled, binance_p20t, binance_csrf_token,
 			 risk_stop_loss_enabled, risk_account_pct, risk_atr_multiplier,
 			 risk_atr_timeframe, risk_leverage_fallback, risk_leverage_max_loss,
-			 risk_reentry_enabled, risk_reentry_ratio)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			 risk_reentry_enabled, risk_reentry_ratio, risk_manual_reentry_enabled)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(trader_id) DO UPDATE SET
 			provider_type = excluded.provider_type,
 			leader_id = excluded.leader_id,
@@ -325,13 +334,14 @@ func (s *CopyTradeStore) Upsert(config *CopyTradeConfig) error {
 			risk_leverage_fallback = excluded.risk_leverage_fallback,
 			risk_leverage_max_loss = excluded.risk_leverage_max_loss,
 			risk_reentry_enabled = excluded.risk_reentry_enabled,
-			risk_reentry_ratio = excluded.risk_reentry_ratio
+			risk_reentry_ratio = excluded.risk_reentry_ratio,
+			risk_manual_reentry_enabled = excluded.risk_manual_reentry_enabled
 	`, config.TraderID, config.ProviderType, config.LeaderID, config.CopyRatio,
 		config.SyncLeverage, config.SyncMarginMode, config.MinTradeWarn, config.MaxTradeWarn, config.Enabled,
 		config.BinanceP20T, config.BinanceCSRFToken,
 		config.RiskStopLossEnabled, config.RiskAccountPct, config.RiskATRMultiplier,
 		config.RiskATRTimeframe, config.RiskLeverageFallback, config.RiskLeverageMaxLoss,
-		config.RiskReentryEnabled, config.RiskReentryRatio)
+		config.RiskReentryEnabled, config.RiskReentryRatio, config.RiskManualReentryEnabled)
 	if err != nil {
 		return err
 	}
@@ -359,6 +369,7 @@ const copyTradeConfigSelectColumns = `
 	COALESCE(risk_leverage_max_loss, 0) AS risk_leverage_max_loss,
 	COALESCE(risk_reentry_enabled, 0) AS risk_reentry_enabled,
 	COALESCE(risk_reentry_ratio, 0.5) AS risk_reentry_ratio,
+	COALESCE(risk_manual_reentry_enabled, 1) AS risk_manual_reentry_enabled,
 	created_at, updated_at`
 
 // scanCopyTradeConfig 共用 Scan 逻辑（避免 GetByTraderID 与 ListEnabled 重复实现）
@@ -377,6 +388,7 @@ func scanCopyTradeConfig(scanner interface {
 		&config.RiskStopLossEnabled, &config.RiskAccountPct, &config.RiskATRMultiplier,
 		&config.RiskATRTimeframe, &config.RiskLeverageFallback, &config.RiskLeverageMaxLoss,
 		&config.RiskReentryEnabled, &config.RiskReentryRatio,
+		&config.RiskManualReentryEnabled,
 		&createdAt, &updatedAt,
 	)
 	if err != nil {

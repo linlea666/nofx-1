@@ -138,6 +138,10 @@ type CopyConfig struct {
 	RiskReentryEnabled   bool    `json:"risk_reentry_enabled"`
 	RiskReentryRatio     float64 `json:"risk_reentry_ratio"` // × 被止损仓位名义
 
+	// 人工重入（v5.1）：自动重入次数用尽后继续观察合格信号，
+	// 落信号 + 邮件提醒，由用户确认后系统代执行。默认开（store 列 DEFAULT 1）
+	RiskManualReentryEnabled bool `json:"risk_manual_reentry_enabled"`
+
 	RiskPolicyVersion          int     `json:"risk_policy_version"` // >=4 = Copy Guard 启用标记（v3 行为已下线）
 	RiskStopMode               string  `json:"risk_stop_mode"`
 	RiskATRPeriod              int     `json:"risk_atr_period"`
@@ -272,6 +276,9 @@ const (
 	// RiskEventReentryInitiated 二次进场决策已生成（判据 E 满足后）
 	// 注意：仅"决策生成"事件，不代表"执行成功"。实际执行成功的告警由 integration 在 executeFullDecision 内发
 	RiskEventReentryInitiated RiskEventType = "reentry_initiated"
+	// RiskEventManualReentrySignal 人工重入信号（v5.1）：自动重入次数用尽后
+	// 出现合格重入信号，已落库等待用户确认；integration 层发邮件提醒
+	RiskEventManualReentrySignal RiskEventType = "manual_reentry_signal"
 )
 
 // RiskEvent 风控事件（用于 engine → integration 的告警通知）
@@ -288,9 +295,20 @@ type RiskEvent struct {
 	LeaderSize float64 // SL 触发时领航员持仓数量
 	AddCount   int     // SL 触发时跟单系统已跟随的加仓次数（审计用）
 
-	// 重入快照（仅 Type=RiskEventReentryInitiated 有效）
-	ReentryEntryPrice float64 // 重入入场价基准
-	ReentrySize       float64 // 重入金额（USDT）
+	// 重入快照（Type=RiskEventReentryInitiated / RiskEventManualReentrySignal 有效）
+	ReentryEntryPrice float64 // 重入入场价基准（manual：信号触发价）
+	ReentrySize       float64 // 重入金额（USDT）（manual：建议重入名义）
+
+	// 人工重入信号快照（仅 Type=RiskEventManualReentrySignal 有效）
+	ManualSignalID  int64   // copy_guard_manual_reentry_signals.id
+	CycleID         int64   // 所属 Copy Guard 周期
+	StopCount       int     // 周期累计止损次数
+	ReentryCount    int     // 周期已自动重入次数
+	Protectable     bool    // 可保护性预检（仅提示，不拦截人工确认）
+	NoiseRatio      float64 // 止损距离/ATR（噪音档参考，0=数据缺失）
+	CurrentATR      float64 // 信号触发时 ATR
+	LastStopPrice   float64 // 最近一次止损成交价（0=数据缺失）
+	EstStopDistance float64 // 预算止损距离（供邮件展示建议止损价，0=未预检）
 }
 
 // PositionKey 生成仓位的唯一键 (不含保证金模式，向后兼容)

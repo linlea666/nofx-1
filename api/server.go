@@ -452,6 +452,8 @@ type CopyConfigReq struct {
 	RiskLeverageMaxLoss  float64 `json:"risk_leverage_max_loss,omitempty"`
 	RiskReentryEnabled   *bool   `json:"risk_reentry_enabled,omitempty"`
 	RiskReentryRatio     float64 `json:"risk_reentry_ratio,omitempty"`
+	// v5.1 人工重入（自动重入用尽后邮件提醒+人工确认代执行），默认 true
+	RiskManualReentryEnabled *bool `json:"risk_manual_reentry_enabled,omitempty"`
 
 	RiskPolicyVersion          int      `json:"risk_policy_version,omitempty"`
 	RiskStopMode               string   `json:"risk_stop_mode,omitempty"`
@@ -496,6 +498,7 @@ func applyCopyConfigRiskFields(copyConfig *store.CopyTradeConfig, req *CopyConfi
 	copyConfig.RiskStopLossEnabled = derefBoolDefault(req.RiskStopLossEnabled, true)
 	copyConfig.RiskLeverageFallback = derefBoolDefault(req.RiskLeverageFallback, true)
 	copyConfig.RiskReentryEnabled = derefBoolDefault(req.RiskReentryEnabled, req.RiskPolicyVersion >= 4)
+	copyConfig.RiskManualReentryEnabled = derefBoolDefault(req.RiskManualReentryEnabled, true)
 	copyConfig.RiskReentryNoiseOverride = derefBoolDefault(req.RiskReentryNoiseOverride, false)
 	// 数值字段：直接透传，零值由 store.FillRiskDefaults 兜底
 	copyConfig.RiskAccountPct = req.RiskAccountPct

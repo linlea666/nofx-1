@@ -176,6 +176,8 @@ func (ti *TraderIntegration) StartCopyTrading() error {
 		RiskReentryEnabled:   copyConfig.RiskReentryEnabled,
 		RiskReentryRatio:     copyConfig.RiskReentryRatio,
 
+		RiskManualReentryEnabled: copyConfig.RiskManualReentryEnabled,
+
 		RiskPolicyVersion:          copyConfig.RiskPolicyVersion,
 		RiskStopMode:               copyConfig.RiskStopMode,
 		RiskATRPeriod:              copyConfig.RiskATRPeriod,
@@ -965,6 +967,10 @@ func (ti *TraderIntegration) recoverV4PendingStates() {
 			if cycle.EntryOrderID == "" {
 				_ = ti.store.CopyTrade().UpdateCopyGuardObservation(cycle.ID, store.CopyGuardStoppedWatching, cycle.LeaderEntryPrice, cycle.LastObservedPrice, 0)
 				_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "REENTRY_RECOVERED_AFTER_RESTART", Metadata: map[string]interface{}{"result": "returned_to_watching", "reason": "legacy pending order identity unavailable"}})
+				// v5.1：人工确认后决策入队但重启丢失（尚未落 entry_order_id）→
+				// 回写孤儿 EXECUTING 信号为 FAILED，避免前端永久卡在"执行中…"。
+				// 周期已回退 STOPPED_WATCHING，下轮观察会重新生成 PENDING 信号。
+				ti.markManualReentryOutcome(cycle.ID, store.ManualReentryStatusFailed, "重启后未确认下单，已回退观察期")
 				continue
 			}
 			provider, ok := ti.executor.(ClientOrderStatusProvider)
@@ -990,9 +996,13 @@ func (ti *TraderIntegration) recoverV4PendingStates() {
 				}
 				_ = ti.store.CopyTrade().ActivateMappingAfterReentry(ti.traderID, cycle.LeaderPosID, entry, notional, 0)
 				_ = ti.store.CopyTrade().RecordCopyGuardReentryFilled(cycle, entry, notional, qty, 0, map[string]interface{}{"result": "filled", "client_order_id": cycle.EntryOrderID, "recovered_after_restart": true})
+				// v5.1：重启期间人工重入订单实际已成交 → 回写信号 EXECUTED
+				ti.markManualReentryOutcome(cycle.ID, store.ManualReentryStatusExecuted, "")
 			case "CANCELED", "REJECTED", "FAILED":
 				_ = ti.store.CopyTrade().UpdateCopyGuardObservation(cycle.ID, store.CopyGuardStoppedWatching, cycle.LeaderEntryPrice, cycle.LastObservedPrice, 0)
 				_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "REENTRY_RECOVERED_AFTER_RESTART", Metadata: map[string]interface{}{"result": "failed", "state": state, "client_order_id": cycle.EntryOrderID}})
+				// v5.1：重启期间人工重入订单被取消/拒绝 → 回写信号 FAILED
+				ti.markManualReentryOutcome(cycle.ID, store.ManualReentryStatusFailed, "重启后确认订单为"+state)
 			}
 		}
 	}
@@ -1085,6 +1095,9 @@ func (ti *TraderIntegration) executeFullDecision(fullDec *decision.FullDecision)
 				if cycle, cerr := ti.store.CopyTrade().GetOpenCopyGuardCycle(ti.traderID, dec.LeaderPosID); cerr == nil {
 					_ = ti.store.CopyTrade().UpdateCopyGuardObservation(cycle.ID, store.CopyGuardStoppedWatching, cycle.LeaderEntryPrice, cycle.LastObservedPrice, 0)
 					_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "REENTRY_FAILED", Metadata: map[string]interface{}{"error": err.Error()}})
+					// v5.1：人工重入执行失败 → 信号回写 FAILED（周期无 EXECUTING
+					// 信号时为 no-op，自动重入路径零影响）
+					ti.markManualReentryOutcome(cycle.ID, store.ManualReentryStatusFailed, err.Error())
 				}
 			}
 			// 🔑 良性失败识别：close/reduce 类决策遇到"本地无对应仓位"错误时，
@@ -1667,6 +1680,9 @@ func (ti *TraderIntegration) updatePositionMapping(dec *decision.Decision) {
 			_ = copyTradeStore.UpdateCopyGuardExecutionOrder(cycle.ID, dec.ExchangeOrderID, "")
 			_ = copyTradeStore.RecordCopyGuardReentryFilled(cycle, dec.EntryPrice, dec.PositionSizeUSD, 0, 0, map[string]interface{}{"leader_size": dec.LeaderPosSize, "client_order_id": dec.ClientOrderID})
 			_ = copyTradeStore.UpdateCopyGuardAttemptIdentity(cycle.ID, cycle.ReentryCount+1, "", dec.ExchangeOrderID, "")
+			// v5.1：人工重入执行成功 → 信号回写 EXECUTED（无 EXECUTING 信号
+			// 时为 no-op，自动重入路径零影响）
+			ti.markManualReentryOutcome(cycle.ID, store.ManualReentryStatusExecuted, "")
 		}
 		return
 	}
@@ -2663,7 +2679,10 @@ func (ti *TraderIntegration) shouldRecordProtectionEvent(cycleID int64, eventTyp
 
 func (ti *TraderIntegration) notifyProtection(cycle *store.CopyGuardCycle, title, body, kind string) {
 	key := fmt.Sprintf("copy_guard_protection|%s|%d|%s", ti.traderID, cycle.ID, kind)
-	notifier.Notify(notifier.Alert{Category: "copy_trade", TraderID: ti.traderID, Title: fmt.Sprintf("%s | %s %s", title, cycle.Symbol, cycle.Side), Body: body, RateKey: key, DedupKey: key, Fields: map[string]string{"CycleID": fmt.Sprint(cycle.ID), "LeaderPosID": cycle.LeaderPosID, "Symbol": cycle.Symbol, "Side": cycle.Side, "MarginMode": cycle.MarginMode}})
+	// 标题与字段带交易员显示名：保护类邮件此前只有 TraderID，多交易员场景
+	// 下用户无法直接判断是哪个账户出的问题（小白可读性缺陷，全局修复）
+	traderName := ti.traderDisplayName()
+	notifier.Notify(notifier.Alert{Category: "copy_trade", TraderID: ti.traderID, Title: fmt.Sprintf("%s | %s | %s %s", traderName, title, cycle.Symbol, cycle.Side), Body: fmt.Sprintf("Trader Name: %s\nTrader ID:   %s\n\n%s", traderName, ti.traderID, body), RateKey: key, DedupKey: key, Fields: map[string]string{"TraderName": traderName, "CycleID": fmt.Sprint(cycle.ID), "LeaderPosID": cycle.LeaderPosID, "Symbol": cycle.Symbol, "Side": cycle.Side, "MarginMode": cycle.MarginMode}})
 }
 
 // ============================================================================
@@ -2702,6 +2721,8 @@ func (ti *TraderIntegration) consumeRiskEvents() {
 				ti.sendStopLossTriggerAlert(event)
 			case RiskEventReentryInitiated:
 				ti.sendReentryInitiatedAlert(event)
+			case RiskEventManualReentrySignal:
+				ti.sendManualReentrySignalAlert(event)
 			default:
 				logger.Debugf("[%s] 未知风控事件类型: %s", ti.traderID, event.Type)
 			}
@@ -2879,6 +2900,274 @@ func (ti *TraderIntegration) sendReentryInitiatedAlert(event *RiskEvent) {
 	})
 
 	logger.Infof("📧 [%s] 已发送二次进场触发告警邮件 | posId=%s", ti.traderID, event.LeaderPosID)
+}
+
+// ============================================================================
+// v5.1 人工重入：确认执行 / 邮件提醒 / 结果回写
+//
+// 流程：engine 落信号+推 RiskEvent → 本层发小白可读邮件 → 用户在前端
+// 「止损保护统计」页确认 → ConfirmManualReentry 做幂等抢占+硬校验 →
+// 复用 emitReentryDecision 走标准执行链（映射激活/attempt 记账/保护单
+// 状态机全部继承）→ executeFullDecision 成败分支回写信号 EXECUTED/FAILED
+// ============================================================================
+
+// sideZH 方向的小白可读中文
+func sideZH(side string) string {
+	switch side {
+	case "long":
+		return "做多"
+	case "short":
+		return "做空"
+	}
+	return side
+}
+
+// markManualReentryOutcome 重入执行成败后回写人工信号状态。
+// 周期没有 EXECUTING 信号时（自动重入路径）静默跳过，零影响。
+func (ti *TraderIntegration) markManualReentryOutcome(cycleID int64, status, errMsg string) {
+	sig, err := ti.store.CopyTrade().GetExecutingManualReentrySignalByCycle(cycleID)
+	if err != nil || sig == nil {
+		return // 无 EXECUTING 信号 = 自动重入，无需回写
+	}
+	if err := ti.store.CopyTrade().MarkManualReentrySignalOutcome(sig.ID, status, errMsg); err != nil {
+		logger.Warnf("⚠️ [%s] 人工重入信号结果回写失败: %v | signal=%d status=%s", ti.traderID, err, sig.ID, status)
+		return
+	}
+	logger.Infof("✅ [%s] 人工重入信号结果已回写 | signal=%d cycle=%d status=%s", ti.traderID, sig.ID, cycleID, status)
+}
+
+// ConfirmManualReentry 用户确认人工重入信号 → 系统代执行。
+//
+// 人工确认最高优先：仅四项硬校验可拦截（领航员已平仓 / 领航员已反向 /
+// 本地已有同向仓位 / 金额低于最小下单额），价格偏移、可保护性预检等一律
+// 不拦截（可保护性风险已在邮件与前端确认框中告知，成交后不可保护时由
+// v5 状态机按 risk_unprotectable_action 兜底）。
+//
+// 幂等：ClaimManualReentrySignal 原子抢占（PENDING→EXECUTING），重复点击/
+// 并发确认只有一次生效。硬校验失败时回退 PENDING（可再次确认）或
+// INVALIDATED（根本性失效）。
+func (ti *TraderIntegration) ConfirmManualReentry(signalID int64, operator string) error {
+	if ti.engine == nil || ti.engine.config == nil {
+		return fmt.Errorf("跟单引擎未运行")
+	}
+	cs := ti.store.CopyTrade()
+	sig, err := cs.GetManualReentrySignal(signalID)
+	if err != nil {
+		return fmt.Errorf("信号不存在: %w", err)
+	}
+	if sig.TraderID != ti.traderID {
+		return fmt.Errorf("信号不属于该交易员")
+	}
+	if sig.Status != store.ManualReentryStatusPending {
+		return fmt.Errorf("信号当前状态为 %s，无法确认（可能已执行、已忽略或已失效）", sig.Status)
+	}
+
+	// 硬校验 3（先查，无副作用）：金额 ≥ 最小下单额
+	minReentry := ti.engine.config.MinTradeWarn
+	if minReentry <= 0 {
+		minReentry = 10.0
+	}
+	if sig.RecommendedNotional < minReentry {
+		return fmt.Errorf("建议重入金额 %.2f USDT 低于最小下单阈值 %.2f USDT，无法执行", sig.RecommendedNotional, minReentry)
+	}
+
+	// 周期一致性：信号绑定的周期必须仍是打开的观察周期
+	cycle, err := cs.GetOpenCopyGuardCycle(ti.traderID, sig.LeaderPosID)
+	if err != nil || cycle == nil || cycle.ID != sig.CycleID {
+		_ = cs.InvalidateManualReentrySignalsForCycle(sig.CycleID, "确认时周期已结束或已推进")
+		return fmt.Errorf("该信号所属的保护周期已结束，信号已失效")
+	}
+	if cycle.Status == store.CopyGuardReentryPending {
+		return fmt.Errorf("该周期已有重入执行中，请勿重复操作")
+	}
+
+	// 硬校验 1：领航员仍持有该 posId 且方向一致
+	leaderPos := ti.engine.buildLeaderPosMap()[sig.LeaderPosID]
+	if leaderPos == nil || leaderPos.Size <= 0 {
+		_ = cs.InvalidateManualReentrySignalsForCycle(sig.CycleID, "确认时领航员已平掉该仓位")
+		return fmt.Errorf("领航员已平掉该仓位，信号已失效")
+	}
+	if leaderPos.Side != "" && string(leaderPos.Side) != sig.Side {
+		_ = cs.InvalidateManualReentrySignalsForCycle(sig.CycleID, "确认时领航员已反向")
+		return fmt.Errorf("领航员已反向（%s → %s），信号已失效", sideZH(sig.Side), sideZH(string(leaderPos.Side)))
+	}
+
+	// 硬校验 2：本地无同 symbol+side（+marginMode）持仓，防重复建仓
+	exchangePositions, err := ti.executor.GetPositions()
+	if err != nil {
+		return fmt.Errorf("查询本地持仓失败，请稍后重试: %w", err)
+	}
+	for _, pos := range convertFollowerPositions(exchangePositions) {
+		if pos.Symbol != sig.Symbol || string(pos.Side) != sig.Side || pos.Size <= 0 {
+			continue
+		}
+		// marginMode 任一侧缺失时按同仓处理（保守防重）
+		if sig.MarginMode != "" && pos.MarginMode != "" && pos.MarginMode != sig.MarginMode {
+			continue
+		}
+		return fmt.Errorf("本地已持有 %s %s 仓位（数量 %.6f），为防止重复建仓已拒绝执行", sig.Symbol, sideZH(sig.Side), pos.Size)
+	}
+
+	// mapping 必须仍处于 stopped_by_risk（emitReentryDecision 的执行链前提）
+	mapping, err := cs.GetMapping(ti.traderID, sig.LeaderPosID)
+	if err != nil || mapping == nil || mapping.Status != "stopped_by_risk" {
+		mappingStatus := "缺失"
+		if mapping != nil {
+			mappingStatus = mapping.Status
+		}
+		return fmt.Errorf("仓位映射状态异常（%s），无法执行重入", mappingStatus)
+	}
+
+	// 幂等抢占：PENDING → EXECUTING（并发确认只有一次成功）
+	confirmPrice := leaderPos.MarkPrice
+	if confirmPrice <= 0 {
+		confirmPrice = leaderPos.EntryPrice
+	}
+	claimed, err := cs.ClaimManualReentrySignal(signalID, operator, confirmPrice)
+	if err != nil {
+		return fmt.Errorf("信号抢占失败: %w", err)
+	}
+	if !claimed {
+		return fmt.Errorf("信号已被处理（重复点击或并发确认），请刷新页面查看最新状态")
+	}
+
+	// 审计事件：确认动作（含操作者、确认价与信号价的偏移）
+	priceDriftPct := float64(0)
+	if sig.TriggerPrice > 0 && confirmPrice > 0 {
+		priceDriftPct = (confirmPrice - sig.TriggerPrice) / sig.TriggerPrice * 100
+	}
+	_ = cs.SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "GUARD_MANUAL_REENTRY_CONFIRMED", Price: confirmPrice, Notional: sig.RecommendedNotional, Metadata: map[string]interface{}{
+		"signal_id":       sig.ID,
+		"operator":        operator,
+		"signal_price":    sig.TriggerPrice,
+		"confirm_price":   confirmPrice,
+		"price_drift_pct": priceDriftPct,
+		"protectable":     sig.Protectable,
+	}})
+	logger.Infof("🧑‍💻 [%s] 人工重入已确认，开始执行 | signal=%d cycle=%d %s %s 金额=%.2f 确认价=%.4f（信号价 %.4f，偏移 %.2f%%）",
+		ti.traderID, sig.ID, cycle.ID, sig.Symbol, sig.Side, sig.RecommendedNotional, confirmPrice, sig.TriggerPrice, priceDriftPct)
+
+	// 复用自动重入执行链：状态推进 REENTRY_PENDING → emitReentryDecision →
+	// consumeDecisions/executeFullDecision（映射激活、attempt 记账、保护单
+	// 状态机全部继承）。ATR 传 0（UpdateCopyGuardObservation 对 0 保留原值）。
+	_ = cs.UpdateCopyGuardObservation(cycle.ID, store.CopyGuardReentryPending, leaderPos.EntryPrice, confirmPrice, 0)
+	if !ti.engine.emitReentryDecision(mapping, leaderPos, sig.RecommendedNotional, confirmPrice) {
+		// 决策通道满：回退周期与信号状态，让用户可稍后重试
+		_ = cs.UpdateCopyGuardObservation(cycle.ID, store.CopyGuardAttemptsExhausted, leaderPos.EntryPrice, confirmPrice, 0)
+		_ = cs.ReleaseManualReentrySignal(signalID, store.ManualReentryStatusPending, "决策通道繁忙，未能提交执行")
+		return fmt.Errorf("执行通道繁忙，本次未提交，请稍后重试")
+	}
+	return nil
+}
+
+// sendManualReentrySignalAlert 人工重入信号邮件（小白可读）。
+// 限流：engine 侧已按信号做 1 小时冷却（LastAlertAt），此处的
+// RateKey/DedupKey 按小时分桶兜底，保证冷却后的再次提醒不被 notifier 去重。
+func (ti *TraderIntegration) sendManualReentrySignalAlert(event *RiskEvent) {
+	traderName := ti.traderDisplayName()
+	leaderID := ""
+	if ti.engine != nil && ti.engine.config != nil {
+		leaderID = ti.engine.config.LeaderID
+	}
+
+	protectHint := "✓ 预计可挂出保护止损"
+	protectNote := ""
+	if !event.Protectable {
+		protectHint = "⚠️ 预检显示可能难以挂出保护止损"
+		protectNote = "\n⚠️ 重要提示:\n  预检显示重入后可能无法建立有效的保护止损单。若确认执行且成交后确实无法保护，\n  系统将按您配置的「不可保护处置」（默认：立即平仓）自动兜底，可能产生小额损耗。\n"
+	}
+
+	stopPriceHint := "（数据缺失）"
+	if event.EstStopDistance > 0 && event.ReentryEntryPrice > 0 {
+		suggestedStop := event.ReentryEntryPrice - event.EstStopDistance
+		if event.Side == "short" {
+			suggestedStop = event.ReentryEntryPrice + event.EstStopDistance
+		}
+		stopPriceHint = fmt.Sprintf("%.4f（距当前价 %.2f%%）", suggestedStop, event.EstStopDistance/event.ReentryEntryPrice*100)
+	}
+	lastStopHint := "（数据缺失）"
+	if event.LastStopPrice > 0 {
+		lastStopHint = fmt.Sprintf("%.4f", event.LastStopPrice)
+	}
+	noiseHint := "（数据缺失）"
+	if event.NoiseRatio > 0 {
+		noiseHint = fmt.Sprintf("%.2f", event.NoiseRatio)
+		if event.NoiseRatio < 0.5 {
+			noiseHint += "（偏小，止损较容易被行情噪音扫到，请谨慎）"
+		}
+	}
+
+	body := fmt.Sprintf(
+		"📣 出现合格重入信号，需要您确认（系统不会自动下单）\n\n"+
+			"您跟随的领航员仓位此前触发保护止损出局，本周期自动重入次数已用完。\n"+
+			"现在行情重新满足了重入条件，系统已生成一条「人工重入信号」等待您确认。\n\n"+
+			"👤 基本信息:\n"+
+			"  交易员:        %s\n"+
+			"  领航员:        %s\n"+
+			"  交易对:        %s\n"+
+			"  方向:          %s\n"+
+			"  保证金模式:    %s\n"+
+			"  本周期已止损:  %d 次\n"+
+			"  已自动重入:    %d 次（上限已用尽）\n\n"+
+			"📊 信号详情:\n"+
+			"  当前价格:      %.4f\n"+
+			"  最近止损价:    %s\n"+
+			"  领航员持仓:    %.6f\n"+
+			"  建议重入金额:  %.2f USDT\n"+
+			"  预计止损价:    %s\n"+
+			"  止损距离/ATR:  %s\n"+
+			"  保护单预检:    %s\n"+
+			"%s\n"+
+			"🖱️ 如何操作:\n"+
+			"  打开系统「止损保护统计」页面，在顶部「人工重入待确认」中点击【确认重入】或【忽略】。\n"+
+			"  确认后系统会实时复核（领航员是否仍持仓、方向是否一致、本地是否已有仓位），\n"+
+			"  复核通过立即按建议金额下单，并自动挂出保护止损。\n\n"+
+			"💡 说明:\n"+
+			"  - 信号不会过期；但领航员平仓或反向后会自动失效\n"+
+			"  - 同一信号的邮件提醒最多每小时一次；信号持续有效期间可随时到页面确认\n"+
+			"  - 不想重入直接忽略即可，不影响后续跟单",
+		traderName, leaderID, event.Symbol, sideZH(event.Side), event.MarginMode,
+		event.StopCount, event.ReentryCount,
+		event.ReentryEntryPrice, lastStopHint, event.LeaderSize, event.ReentrySize,
+		stopPriceHint, noiseHint, protectHint, protectNote)
+
+	// 小时分桶：engine 冷却（≥1h）后再次提醒时 key 变化，不被 notifier 永久去重
+	alertKey := fmt.Sprintf("manual_reentry|%s|%d|%d", ti.traderID, event.ManualSignalID, event.Timestamp.Unix()/3600)
+	notifier.Notify(notifier.Alert{
+		Time:     event.Timestamp,
+		Category: "copy_trade",
+		TraderID: ti.traderID,
+		Title:    fmt.Sprintf("%s | 人工重入待确认 %s %s", traderName, event.Symbol, sideZH(event.Side)),
+		Body:     body,
+		RateKey:  alertKey,
+		DedupKey: alertKey,
+		Fields: map[string]string{
+			"TraderName":   traderName,
+			"Leader":       leaderID,
+			"Symbol":       event.Symbol,
+			"Side":         event.Side,
+			"MarginMode":   event.MarginMode,
+			"SignalID":     fmt.Sprint(event.ManualSignalID),
+			"CycleID":      fmt.Sprint(event.CycleID),
+			"SignalPrice":  fmt.Sprintf("%.4f", event.ReentryEntryPrice),
+			"ReentrySize":  fmt.Sprintf("%.2f", event.ReentrySize),
+			"StopCount":    fmt.Sprint(event.StopCount),
+			"ReentryCount": fmt.Sprint(event.ReentryCount),
+			"Protectable":  fmt.Sprint(event.Protectable),
+		},
+	})
+
+	logger.Infof("📧 [%s] 已发送人工重入信号提醒邮件 | signal=%d posId=%s", ti.traderID, event.ManualSignalID, event.LeaderPosID)
+}
+
+// ConfirmManualReentryForTrader 包级导出：API 层确认人工重入信号。
+// 需要运行中的跟单引擎（实时复核领航员持仓 + 复用决策执行链）。
+func ConfirmManualReentryForTrader(traderID string, signalID int64, operator string) error {
+	integration, exists := integrations[traderID]
+	if !exists || !integration.IsRunning() {
+		return fmt.Errorf("该交易员跟单未运行，无法执行人工重入（请先启动跟单）")
+	}
+	return integration.ConfirmManualReentry(signalID, operator)
 }
 
 // ============================================================================

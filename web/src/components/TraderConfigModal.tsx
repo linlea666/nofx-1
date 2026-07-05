@@ -97,6 +97,7 @@ interface FormState {
   risk_leverage_max_loss: number // 默认 20%（前端用百分比展示，提交时转 0.2）：保证金硬 cap
   risk_reentry_enabled: boolean // 默认 true：确认式重入
   risk_reentry_ratio: number // 默认 50%（前端用百分比，提交时转 0.5）
+  risk_manual_reentry_enabled: boolean // 默认 true：自动重入用尽后邮件提醒人工确认（系统代执行）
   risk_policy_version: number
   // v5：不再影响止损计算（账户线在任何模式下都是硬 cap），仅作兼容透传，无 UI
   risk_stop_mode: 'volatility_priority' | 'account_hard_limit'
@@ -168,6 +169,7 @@ export function TraderConfigModal({
     risk_leverage_max_loss: 20, // %（提交时 /100 转 0.2）—— v5 默认 20% 硬 cap
     risk_reentry_enabled: true,
     risk_reentry_ratio: 50, // %（提交时 /100 转 0.5）
+    risk_manual_reentry_enabled: true, // v5.1 默认开
     risk_policy_version: 4,
     risk_stop_mode: 'volatility_priority',
     risk_atr_period: 14,
@@ -297,6 +299,8 @@ export function TraderConfigModal({
               cfg.risk_reentry_ratio != null
                 ? cfg.risk_reentry_ratio * 100
                 : 50,
+            risk_manual_reentry_enabled:
+              cfg.risk_manual_reentry_enabled ?? true,
             risk_policy_version: cfg.risk_policy_version ?? 4,
             risk_stop_mode: cfg.risk_stop_mode ?? 'volatility_priority',
             risk_atr_period: cfg.risk_atr_period ?? 14,
@@ -379,6 +383,7 @@ export function TraderConfigModal({
         risk_leverage_max_loss: 20,
         risk_reentry_enabled: true,
         risk_reentry_ratio: 50,
+        risk_manual_reentry_enabled: true,
         risk_policy_version: 4,
         risk_stop_mode: 'volatility_priority',
         risk_atr_period: 14,
@@ -502,6 +507,7 @@ export function TraderConfigModal({
           risk_leverage_max_loss: formData.risk_leverage_max_loss / 100,
           risk_reentry_enabled: formData.risk_reentry_enabled,
           risk_reentry_ratio: formData.risk_reentry_ratio / 100,
+          risk_manual_reentry_enabled: formData.risk_manual_reentry_enabled,
           risk_policy_version: formData.risk_policy_version,
           risk_stop_mode: formData.risk_stop_mode,
           risk_atr_period: formData.risk_atr_period,
@@ -1189,6 +1195,7 @@ export function TraderConfigModal({
                                       risk_liquidation_buffer_atr: 0.5,
                                       risk_reentry_enabled: true,
                                       risk_reentry_ratio: 50,
+                                      risk_manual_reentry_enabled: true,
                                       risk_max_reentries: 2,
                                       risk_reentry_band_atr: 0.5,
                                       risk_reentry_cooldown_seconds: 300,
@@ -1794,6 +1801,28 @@ export function TraderConfigModal({
                                       >
                                         <div
                                           className={`w-5 h-5 rounded-full bg-white shadow transition-transform ${formData.risk_reentry_noise_override ? 'translate-x-6' : 'translate-x-0.5'}`}
+                                        />
+                                      </button>
+                                    </label>
+                                    <label className="text-xs text-[#848E9C] flex items-center justify-between col-span-2 pt-1">
+                                      <span>
+                                        次数用尽后人工重入提醒
+                                        <span className="block text-[#5E6673]">
+                                          自动重入次数用尽后继续观察；再次出现合格重入信号时发邮件提醒，您在「止损保护统计」页点击确认后由系统代为执行（不确认则不下单）
+                                        </span>
+                                      </span>
+                                      <button
+                                        type="button"
+                                        onClick={() =>
+                                          handleInputChange(
+                                            'risk_manual_reentry_enabled',
+                                            !formData.risk_manual_reentry_enabled
+                                          )
+                                        }
+                                        className={`w-12 h-6 rounded-full transition-colors flex-shrink-0 ml-3 ${formData.risk_manual_reentry_enabled ? 'bg-[#F0B90B]' : 'bg-[#2B3139]'}`}
+                                      >
+                                        <div
+                                          className={`w-5 h-5 rounded-full bg-white shadow transition-transform ${formData.risk_manual_reentry_enabled ? 'translate-x-6' : 'translate-x-0.5'}`}
                                         />
                                       </button>
                                     </label>

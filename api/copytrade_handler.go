@@ -49,6 +49,11 @@ func (h *CopyTradeHandler) RegisterRoutes(group *gin.RouterGroup) {
 		copyTrade.GET("/risk/cycles/:id/export", h.ExportRiskCycle)
 		copyTrade.GET("/risk/export", h.ExportRiskCycles)
 
+		// v5.1 人工重入信号：列表 / 确认（系统代执行）/ 忽略
+		copyTrade.GET("/risk/manual-signals", h.ListManualSignals)
+		copyTrade.POST("/risk/manual-signals/:id/confirm", h.ConfirmManualSignal)
+		copyTrade.POST("/risk/manual-signals/:id/dismiss", h.DismissManualSignal)
+
 		// Binance 全局共享凭证管理（v2 凭证全局化）
 		// 所有 Binance 跟单交易员共享同一份凭证（p20t / csrftoken），
 		// 一处更新全局生效，无需逐个交易员维护。
@@ -287,6 +292,117 @@ func (h *CopyTradeHandler) ExportRiskCycles(c *gin.Context) {
 	w.Flush()
 }
 
+// ============================================================================
+// v5.1 人工重入信号 API
+// ============================================================================
+
+// ListManualSignals 列出当前用户所属交易员的人工重入信号
+// @Summary 人工重入信号列表
+// @Tags CopyTrade
+// @Param trader_id query string false "只看某个交易员"
+// @Param status query string false "状态过滤，逗号分隔（如 PENDING,EXECUTED）；空=全部"
+// @Router /api/copytrade/risk/manual-signals [get]
+func (h *CopyTradeHandler) ListManualSignals(c *gin.Context) {
+	ids, _, names, err := h.ownedTraderIDs(c)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	var statuses []string
+	if raw := strings.TrimSpace(c.Query("status")); raw != "" {
+		for _, s := range strings.Split(raw, ",") {
+			if s = strings.TrimSpace(strings.ToUpper(s)); s != "" {
+				statuses = append(statuses, s)
+			}
+		}
+	}
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "100"))
+	signals, err := h.store.CopyTrade().ListManualReentrySignals(ids, statuses, limit)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	for _, sig := range signals {
+		sig.TraderName = names[sig.TraderID]
+	}
+	c.JSON(200, gin.H{"signals": signals, "count": len(signals)})
+}
+
+// getOwnedManualSignal 解析 :id 并校验信号归属当前用户，失败时已写响应
+func (h *CopyTradeHandler) getOwnedManualSignal(c *gin.Context) *store.CopyGuardManualReentrySignal {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(400, gin.H{"error": "invalid signal id"})
+		return nil
+	}
+	_, owned, _, err := h.ownedTraderIDs(c)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return nil
+	}
+	sig, err := h.store.CopyTrade().GetManualReentrySignal(id)
+	if err != nil {
+		c.JSON(404, gin.H{"error": "signal not found"})
+		return nil
+	}
+	if !owned[sig.TraderID] {
+		c.JSON(403, gin.H{"error": "signal not owned by current user"})
+		return nil
+	}
+	return sig
+}
+
+// ConfirmManualSignal 确认人工重入信号（系统代执行）
+// @Summary 确认人工重入
+// @Tags CopyTrade
+// @Param id path int true "Signal ID"
+// @Router /api/copytrade/risk/manual-signals/{id}/confirm [post]
+func (h *CopyTradeHandler) ConfirmManualSignal(c *gin.Context) {
+	sig := h.getOwnedManualSignal(c)
+	if sig == nil {
+		return
+	}
+	operator := c.GetString("user_id")
+	if err := copytrade.ConfirmManualReentryForTrader(sig.TraderID, sig.ID, operator); err != nil {
+		// 硬校验失败/状态冲突等都是用户可读错误，直接透传
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+	latest, err := h.store.CopyTrade().GetManualReentrySignal(sig.ID)
+	if err != nil {
+		latest = sig
+	}
+	c.JSON(200, gin.H{"message": "重入已确认，系统正在执行", "signal": latest})
+}
+
+// DismissManualSignal 忽略人工重入信号
+// @Summary 忽略人工重入信号
+// @Tags CopyTrade
+// @Param id path int true "Signal ID"
+// @Router /api/copytrade/risk/manual-signals/{id}/dismiss [post]
+func (h *CopyTradeHandler) DismissManualSignal(c *gin.Context) {
+	sig := h.getOwnedManualSignal(c)
+	if sig == nil {
+		return
+	}
+	operator := c.GetString("user_id")
+	ok, err := h.store.CopyTrade().DismissManualReentrySignal(sig.ID, operator)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	if !ok {
+		c.JSON(409, gin.H{"error": fmt.Sprintf("信号当前状态为 %s，无法忽略", sig.Status)})
+		return
+	}
+	// 审计事件：忽略动作落周期事件流
+	_ = h.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: sig.CycleID, TraderID: sig.TraderID, Type: "GUARD_MANUAL_REENTRY_DISMISSED", Price: sig.TriggerPrice, Notional: sig.RecommendedNotional, Metadata: map[string]interface{}{
+		"signal_id": sig.ID,
+		"operator":  operator,
+	}})
+	c.JSON(200, gin.H{"message": "信号已忽略"})
+}
+
 // CopyTradeConfigRequest 跟单配置请求
 type CopyTradeConfigRequest struct {
 	ProviderType   string  `json:"provider_type" binding:"required,oneof=hyperliquid okx binance"`
@@ -317,6 +433,8 @@ type CopyTradeConfigRequest struct {
 	RiskLeverageMaxLoss  *float64 `json:"risk_leverage_max_loss,omitempty"`
 	RiskReentryEnabled   *bool    `json:"risk_reentry_enabled,omitempty"`
 	RiskReentryRatio     *float64 `json:"risk_reentry_ratio,omitempty"`
+	// v5.1 人工重入（自动重入用尽后邮件提醒+人工确认代执行），默认 true
+	RiskManualReentryEnabled *bool `json:"risk_manual_reentry_enabled,omitempty"`
 
 	RiskPolicyVersion          *int     `json:"risk_policy_version,omitempty"`
 	RiskStopMode               *string  `json:"risk_stop_mode,omitempty"`
@@ -448,6 +566,13 @@ func (h *CopyTradeHandler) SaveConfig(c *gin.Context) {
 		config.RiskReentryRatio = *req.RiskReentryRatio
 	} else if existing != nil {
 		config.RiskReentryRatio = existing.RiskReentryRatio
+	}
+	if req.RiskManualReentryEnabled != nil {
+		config.RiskManualReentryEnabled = *req.RiskManualReentryEnabled
+	} else if existing != nil {
+		config.RiskManualReentryEnabled = existing.RiskManualReentryEnabled
+	} else {
+		config.RiskManualReentryEnabled = true // 默认 on
 	}
 	applyCopyGuardV4Request(config, existing, &req)
 	if config.RiskPolicyVersion >= 4 && config.ProviderType != "okx" {
