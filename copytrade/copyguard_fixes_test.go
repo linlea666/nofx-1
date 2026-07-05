@@ -135,10 +135,30 @@ func TestFinalizeStopLossIgnoresImplausibleLiquidation(t *testing.T) {
 	if out.SLPrice <= 0 {
 		t.Fatalf("stop price must be preserved, got %v", out.SLPrice)
 	}
-	// 方向合理时保持原校验：多单止损价低于强平价+缓冲必须拒绝
-	input.LiquidationPrice = 1715
-	if _, err := finalizeStopLossPrice(input, &StopLossCalcResult{SLPrice: 1711.63, SLDistance: 5.7, ATRValue: 7.59}, 0.5); err == nil {
-		t.Fatal("stop below a plausible liquidation price must still be rejected")
+	// 方向合理时：多单止损价落入强平缓冲区 → v5 不再拒单，而是钳到强平
+	// 安全线上（Clamped），保护真实存在。
+	// buffer = min(0.5×ATR=3.795, 0.15%×entry≈2.576) ≈ 2.58 → 安全线 ≈ 1712.6，
+	// 原 SL 1711.63 落在线下 → 钳到 1712.6 附近
+	input.LiquidationPrice = 1710
+	out, err = finalizeStopLossPrice(input, &StopLossCalcResult{SLPrice: 1711.63, SLDistance: 5.7, ATRValue: 7.59}, 0.5)
+	if err != nil {
+		t.Fatalf("stop inside the liquidation buffer must clamp, not error: %v", err)
+	}
+	if !out.Clamped || out.SLPrice <= 1710 || out.SLPrice >= input.EntryPrice || out.GovernedBy != "clamp" {
+		t.Fatalf("stop must be clamped above the liquidation safety line: %+v", out)
+	}
+}
+
+// v5 不可保护：clamp 后距离 < 0.1%（强平价紧贴入场价）→ Unprotectable，
+// 调用方必须走 GUARD_UNPROTECTABLE 处置
+func TestFinalizeStopLossUnprotectableWhenClampTooTight(t *testing.T) {
+	input := &StopLossCalcInput{Symbol: "ETHUSDT", Side: SideLong, EntryPrice: 1717.33, PositionValue: 110, FollowerEquity: 22.14, LiquidationPrice: 1716.9}
+	out, err := finalizeStopLossPrice(input, &StopLossCalcResult{SLPrice: 1711.63, SLDistance: 5.7, ATRValue: 7.59}, 0.5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !out.Unprotectable || out.SLPrice != 0 {
+		t.Fatalf("clamped distance below 0.1%% must be flagged unprotectable: %+v", out)
 	}
 }
 

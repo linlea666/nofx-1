@@ -24,7 +24,8 @@ const statusLabels: Record<string, string> = {
   LEADER_REVERSED: '领航员已反手',
   ATTEMPTS_EXHAUSTED: '重入次数用尽·等待领航员平仓',
   WATCH_TIMEOUT: '观察超时·等待领航员平仓',
-  CYCLE_LOSS_CAPPED: '周期亏损熔断·等待领航员平仓',
+  CYCLE_LOSS_CAPPED: '周期亏损熔断·等待领航员平仓（v5 前历史）',
+  GUARD_UNPROTECTABLE: '无法保护·裸跟中（高危）',
 }
 const protectionLabels: Record<string, string> = {
   PENDING: '待建立',
@@ -33,6 +34,8 @@ const protectionLabels: Record<string, string> = {
   DEGRADED: '保护异常',
   TRIGGERED: '已触发',
   CANCELED: '已撤销',
+  CLAMPED: '已保护·止损被强平价挤紧',
+  UNPROTECTABLE: '无法保护·裸跑（高危）',
 }
 const accountingLabels: Record<string, string> = {
   OPEN: '交易进行中',
@@ -73,6 +76,12 @@ const eventLabels: Record<string, string> = {
   BASELINE_CALIBRATED: '基线已用领航员历史校准',
   CYCLE_BACKFILLED: '存量仓位补建生命周期',
   STOP_CONFIRMED: '保护止损确认（间接检测）',
+  ATTEMPT_RECONCILED: '单次尝试盈亏已对账',
+  PROTECTIVE_STOP_GONE: '保护单消失（仓位已平）',
+  PROTECTION_CLAMPED: '止损价被强平价挤紧（保护降级）',
+  GUARD_UNPROTECTABLE: '确认无法建立保护',
+  GUARD_FORCED_EXIT: '无法保护·强制离场',
+  REENTRY_FAILED: '重入下单失败',
   REENTRY_REQUESTED: '重入条件满足，已请求下单',
   REENTRY_RECOVERED_AFTER_RESTART: '重启后重入状态已恢复',
   REENTRY_RECOVERY_PENDING: '重启后重入状态待确认',
@@ -87,15 +96,18 @@ const eventLabels: Record<string, string> = {
 // 观察期采样的门控原因（copy_guard_watch_samples.gate / REENTRY_GATE_CHANGED metadata）
 const gateLabels: Record<string, string> = {
   REENTRY_DISABLED: '重入未启用',
+  REENTRY_DISABLED_NOISE: '噪音档禁止重入（止损距离过窄）',
   COOLDOWN: '冷却中',
   ATR_EXPANSION: '波动扩张超限',
   CHASE_EXCEEDED: '超出追价上限',
   PRICE_NOT_RETURNED: '价格未回归',
+  REENTRY_CANDIDATE: '条件满足·连续确认中',
   MIN_NOTIONAL: '金额低于阈值',
+  REENTRY_UNPROTECTABLE: '重入后无法建立止损·放弃',
   REENTRY_TRIGGERED: '已触发重入',
   ATTEMPTS_EXHAUSTED: '重入次数用尽',
   WATCH_TIMEOUT: '观察超时',
-  CYCLE_LOSS_CAPPED: '周期亏损熔断',
+  CYCLE_LOSS_CAPPED: '周期亏损熔断（v5 前历史）',
 }
 
 const baselineSourceLabels: Record<string, string> = {
@@ -342,7 +354,8 @@ export function CopyGuardPage() {
           <option value="LEADER_REVERSED">领航员反手</option>
           <option value="ATTEMPTS_EXHAUSTED">次数耗尽</option>
           <option value="WATCH_TIMEOUT">观察超时</option>
-          <option value="CYCLE_LOSS_CAPPED">周期亏损熔断</option>
+          <option value="GUARD_UNPROTECTABLE">无法保护·裸跟</option>
+          <option value="CYCLE_LOSS_CAPPED">周期亏损熔断（历史）</option>
         </select>
         <select
           value={resultType}
@@ -371,8 +384,25 @@ export function CopyGuardPage() {
           title="综合净改善"
           value={money(summary?.net_guard_effect ?? 0)}
           color={(summary?.net_guard_effect ?? 0) >= 0 ? '#0ECB81' : '#F6465D'}
+          note={
+            (summary?.estimated_baseline_cycles ?? 0) > 0
+              ? `其中 ${money(summary?.estimated_net_guard_effect ?? 0)} 来自 ${summary?.estimated_baseline_cycles} 个估算基线周期（待领航员历史补全）；实测口径 ${money((summary?.net_guard_effect ?? 0) - (summary?.estimated_net_guard_effect ?? 0))}`
+              : undefined
+          }
         />
       </div>
+      {(summary?.unprotectable_count ?? 0) > 0 && (
+        <div className="border border-[#F6465D] bg-[#F6465D]/10 rounded-lg p-4 text-sm text-[#F6465D]">
+          高危：当前有 {summary?.unprotectable_count}{' '}
+          个活跃仓位确认无法建立有效止损保护，正在裸跟运行（仅受账户兜底线与交易所强平约束）。建议立即人工检查或手动平仓。
+        </div>
+      )}
+      {(summary?.clamped_count ?? 0) > 0 && (
+        <div className="border border-[#F0B90B] bg-[#F0B90B]/10 rounded-lg p-4 text-sm text-[#F0B90B]">
+          当前有 {summary?.clamped_count}{' '}
+          个活跃仓位的止损价被强平安全线钳紧（比策略目标更近），可能被正常波动提前扫损。这是高杠杆下的保护降级信号。
+        </div>
+      )}
       {(summary?.pending_protection_count ?? 0) +
         (summary?.unknown_count ?? 0) +
         (summary?.degraded_count ?? 0) >
@@ -425,6 +455,8 @@ export function CopyGuardPage() {
         />
         <Metric label="保护未知" value={summary?.unknown_count ?? 0} />
         <Metric label="保护降级" value={summary?.degraded_count ?? 0} />
+        <Metric label="止损被钳紧" value={summary?.clamped_count ?? 0} />
+        <Metric label="无法保护" value={summary?.unprotectable_count ?? 0} />
         <Metric
           label="平均覆盖率"
           value={`${((summary?.average_coverage ?? 0) * 100).toFixed(1)}%`}
@@ -438,11 +470,19 @@ export function CopyGuardPage() {
         <Metric label="第3次及以上" value={summary?.reentry_third_plus ?? 0} />
         <Metric
           label="重入成功率"
-          value={`${((summary?.reentry_success_rate ?? 0) * 100).toFixed(1)}%`}
+          value={
+            (summary?.reentry_sample_count ?? 0) > 0
+              ? `${((summary?.reentry_success_rate ?? 0) * 100).toFixed(1)}%（${summary?.reentry_sample_count} 样本${(summary?.reentry_sample_count ?? 0) < 10 ? '·样本过少仅供参考' : ''}）`
+              : '暂无样本'
+          }
         />
         <Metric
           label="误杀率"
-          value={`${((summary?.false_kill_rate ?? 0) * 100).toFixed(1)}%`}
+          value={
+            (summary?.stopped_cycle_count ?? 0) > 0
+              ? `${((summary?.false_kill_rate ?? 0) * 100).toFixed(1)}%（${summary?.false_kill_count}/${summary?.stopped_cycle_count}${(summary?.stopped_cycle_count ?? 0) < 10 ? '·样本过少仅供参考' : ''}）`
+              : '暂无样本'
+          }
         />
         <Metric label="对账中" value={summary?.accounting_pending_count ?? 0} />
         <Metric
@@ -550,15 +590,17 @@ export function CopyGuardPage() {
                       : c.protection_status === 'VERIFIED'
                         ? 'text-[#0ECB81]'
                         : c.protection_status === 'UNKNOWN' ||
-                            c.protection_status === 'DEGRADED'
-                          ? 'text-[#F6465D]'
+                            c.protection_status === 'DEGRADED' ||
+                            c.protection_status === 'UNPROTECTABLE'
+                          ? 'text-[#F6465D] font-bold'
                           : 'text-[#F0B90B]'
                   }`}
                 >
                   {c.closed_at &&
                   (c.protection_status === 'UNKNOWN' ||
                     c.protection_status === 'DEGRADED' ||
-                    c.protection_status === 'PENDING')
+                    c.protection_status === 'PENDING' ||
+                    c.protection_status === 'UNPROTECTABLE')
                     ? '已结束'
                     : `${localized(protectionLabels, c.protection_status)} · ${(c.protection_coverage * 100).toFixed(0)}%`}
                 </td>
@@ -891,10 +933,12 @@ function Card({
   title,
   value,
   color,
+  note,
 }: {
   title: string
   value: string
   color: string
+  note?: string
 }) {
   return (
     <div className="bg-[#181A20] border border-[#2B3139] rounded-lg p-5">
@@ -902,6 +946,7 @@ function Card({
       <div className="text-2xl font-bold mt-2" style={{ color }}>
         {value}
       </div>
+      {note && <div className="text-xs text-[#848E9C] mt-2">{note}</div>}
     </div>
   )
 }

@@ -195,23 +195,19 @@ export interface CopyConfigRequest {
   binance_csrf_token?: string // CSRF header csrftoken
 
   // ============================================================
-  // 账户保护 / 止损兜底（v3 风控）—— 仅 OKX 路径生效
-  // 所有字段可选，未传走后端默认值
+  // 账户保护 / 止损兜底（Copy Guard v5）—— 仅 OKX 路径生效
+  // 所有字段可选，未传走后端默认值。
+  // v3 遗留字段（risk_atr_enabled / risk_reentry_tolerance / 反加仓铁律 /
+  // risk_stop_noise_floor_atr / risk_cycle_max_loss_pct）已随 v5 下线。
   // ============================================================
   risk_stop_loss_enabled?: boolean // 默认 true：启用账户保护硬止损
-  risk_account_pct?: number // 默认 0.005 (0.5%)：单笔最多亏账户的百分比
-  risk_atr_enabled?: boolean // 默认 true：启用 ATR 噪音防护下界
-  risk_atr_multiplier?: number // 默认 1.5：SL 距离 ≥ k×ATR14（1.0-3.0）
+  risk_account_pct?: number // 默认 0.10 (10%)：单笔最多亏账户的百分比（账户兜底线）
+  risk_atr_multiplier?: number // 默认 1.5：SL 距离基线 = k×ATR（1.0-3.0）
   risk_atr_timeframe?: string // 默认 "1h"：ATR 时间周期（"15m" / "1h" / "4h"）
-  risk_leverage_fallback?: boolean // 默认 true：启用杠杆兜底 cap
-  risk_leverage_max_loss?: number // 默认 0.5：保证金最大亏损封顶（0-1）
-  risk_reentry_enabled?: boolean // 默认 false：启用二次进场（判据 E 双门控）
-  risk_reentry_ratio?: number // 默认 0.5：重入仓位系数（v4: × 被止损仓位名义；v3: ×copy_ratio×领航员占比）
-  risk_reentry_tolerance?: number // 默认 0.02 (2%)：价格回归容差（v3.3 单边严格区间，仅允许等价或优于领航员入场价时重入）
-
-  // v3.2 反加仓铁律
-  risk_reentry_block_addback?: boolean // 默认 true：阻止领航员止损后加仓时的重入
-  risk_reentry_addback_tolerance?: number // 默认 1.20：允许加仓的倍数上限（1.0=严格，1.20=允许20%）
+  risk_leverage_fallback?: boolean // 默认 true：启用保证金硬 cap
+  risk_leverage_max_loss?: number // 默认 0.2：保证金最大亏损封顶（0-1，硬上限）
+  risk_reentry_enabled?: boolean // 默认 true（v4+）：止损后确认式重入
+  risk_reentry_ratio?: number // 默认 0.5：重入仓位系数（× 被止损仓位名义）
 
   risk_policy_version?: number
   risk_stop_mode?: 'volatility_priority' | 'account_hard_limit'
@@ -231,12 +227,14 @@ export interface CopyConfigRequest {
   risk_addon_budget_pct?: number // 默认 0.15：加仓账户风险预算（v4.1 起仅告警不拦截；1.0=不告警）
   risk_high_risk_confirmed?: boolean
 
-  // v4.1 止损噪音下限 / 重入加严
-  risk_stop_noise_floor_atr?: number // 默认 1.0：止损距离噪音下限（ATR 倍数，防高杠杆保证金 cap 被噪音扫损）
+  // v4.1 重入加严
   risk_reentry_min_recovery_atr?: number // 默认 0.5：重入前价格须从止损价恢复的最小幅度（ATR 倍数）
   risk_reentry_cooldown_escalation?: number // 默认 3：第 N 次重入冷却时间倍率（cooldown × 倍率^N）
   risk_reentry_recovery_escalation?: number // 默认 1.5：第 N 次重入恢复幅度倍率
-  risk_cycle_max_loss_pct?: number // 默认 1.0：周期累计亏损熔断（占账户权益比例；1.0=不限制）
+
+  // v5 可保护性状态机 / 噪音档重入
+  risk_unprotectable_action?: 'close' | 'follow' // 默认 close：确认不可保护时立即离场；follow=标红裸跑并周期性复查
+  risk_reentry_noise_override?: boolean // 默认 false：距离/ATR<1 的噪音档仍允许重入（默认该档禁止重入）
 }
 
 export interface UpdateModelConfigRequest {
@@ -697,19 +695,15 @@ export interface CopyTradeConfig {
   // Binance Web 凭证（仅 provider_type=binance 时使用，明文返回，用于编辑表单回填）
   binance_p20t?: string
   binance_csrf_token?: string
-  // 账户保护 / 止损兜底（v3 风控）—— 仅 OKX 路径生效，详见 CopyConfigRequest
+  // 账户保护 / 止损兜底（Copy Guard v5）—— 仅 OKX 路径生效，详见 CopyConfigRequest
   risk_stop_loss_enabled?: boolean
   risk_account_pct?: number
-  risk_atr_enabled?: boolean
   risk_atr_multiplier?: number
   risk_atr_timeframe?: string
   risk_leverage_fallback?: boolean
   risk_leverage_max_loss?: number
   risk_reentry_enabled?: boolean
   risk_reentry_ratio?: number
-  risk_reentry_tolerance?: number
-  risk_reentry_block_addback?: boolean
-  risk_reentry_addback_tolerance?: number
   risk_policy_version?: number
   risk_stop_mode?: 'volatility_priority' | 'account_hard_limit'
   risk_atr_period?: number
@@ -726,12 +720,13 @@ export interface CopyTradeConfig {
   risk_watch_timeout_minutes?: number
   risk_migration_confirmed?: boolean
   risk_addon_budget_pct?: number
-  // v4.1 止损噪音下限 / 重入加严
-  risk_stop_noise_floor_atr?: number
+  // v4.1 重入加严
   risk_reentry_min_recovery_atr?: number
   risk_reentry_cooldown_escalation?: number
   risk_reentry_recovery_escalation?: number
-  risk_cycle_max_loss_pct?: number
+  // v5 可保护性状态机 / 噪音档重入
+  risk_unprotectable_action?: 'close' | 'follow'
+  risk_reentry_noise_override?: boolean
   created_at?: string
   updated_at?: string
 }
@@ -754,6 +749,8 @@ export interface CopyGuardSummary {
   pending_protection_count: number
   unknown_count: number
   degraded_count: number
+  clamped_count: number // v5：活跃仓位中止损被强平价钳紧的数量
+  unprotectable_count: number // v5：活跃仓位中无法保护、裸跑中的数量
   accounting_pending_count: number
   accounting_delayed_count: number
   accounting_unrecoverable_count: number
@@ -768,6 +765,12 @@ export interface CopyGuardSummary {
   protection_missing_seconds: number
   reentry_success_rate: number
   false_kill_rate: number
+  // v5 统计口径修正：比率带样本数；估算基线的净效果单独列示
+  reentry_sample_count: number // 重入成功率分母（已结束的重入 attempt 数）
+  stopped_cycle_count: number // 误杀率分母（已对账且发生过止损的周期数）
+  false_kill_count: number // 误杀次数（分子）
+  estimated_baseline_cycles: number // 基线仍为"最后观测价估算"的已对账周期数
+  estimated_net_guard_effect: number // 上述周期贡献的净效果（含在 net_guard_effect 内）
   trend: Array<{
     date: string
     actual: number
@@ -811,6 +814,8 @@ export interface CopyGuardCycle {
     | 'DEGRADED'
     | 'TRIGGERED'
     | 'CANCELED'
+    | 'CLAMPED' // v5：止损价被强平缓冲夹紧（比目标更紧），保护单有效
+    | 'UNPROTECTABLE' // v5：确认无法建立有效保护（终态，按 unprotectable_action 处理）
   protection_coverage: number
   protection_retries: number
   protection_error: string

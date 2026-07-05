@@ -303,48 +303,47 @@ type CopyTradeConfigRequest struct {
 	BinanceCSRFToken string `json:"binance_csrf_token"`
 
 	// ============================================================
-	// 账户保护 / 止损兜底（v3 风控）—— 仅 OKX 路径生效
+	// Copy Guard 账户保护 / 止损兜底（v5）—— 仅 OKX 路径生效
 	// 所有字段都是可选的（前端不传走 store 默认值，详见 store.CopyTradeConfig.FillRiskDefaults）
+	// v3 遗留字段（risk_atr_enabled / risk_reentry_tolerance / 反加仓铁律 /
+	// risk_stop_noise_floor_atr / risk_cycle_max_loss_pct）已随 v5 下线，
+	// 前端传入将被忽略。
 	// ============================================================
 	RiskStopLossEnabled  *bool    `json:"risk_stop_loss_enabled,omitempty"`
 	RiskAccountPct       *float64 `json:"risk_account_pct,omitempty"`
-	RiskATREnabled       *bool    `json:"risk_atr_enabled,omitempty"`
 	RiskATRMultiplier    *float64 `json:"risk_atr_multiplier,omitempty"`
 	RiskATRTimeframe     *string  `json:"risk_atr_timeframe,omitempty"`
 	RiskLeverageFallback *bool    `json:"risk_leverage_fallback,omitempty"`
 	RiskLeverageMaxLoss  *float64 `json:"risk_leverage_max_loss,omitempty"`
 	RiskReentryEnabled   *bool    `json:"risk_reentry_enabled,omitempty"`
 	RiskReentryRatio     *float64 `json:"risk_reentry_ratio,omitempty"`
-	RiskReentryTolerance *float64 `json:"risk_reentry_tolerance,omitempty"`
 
-	// v3.2 反加仓铁律（详见 store.CopyTradeConfig 注释）
-	// risk_reentry_addback_tolerance 合法范围：[1.0, +∞)，<= 0 时会被 FillRiskDefaults 兜底为 1.20
-	RiskReentryBlockAddback     *bool    `json:"risk_reentry_block_addback,omitempty"`
-	RiskReentryAddbackTolerance *float64 `json:"risk_reentry_addback_tolerance,omitempty"`
-	RiskPolicyVersion           *int     `json:"risk_policy_version,omitempty"`
-	RiskStopMode                *string  `json:"risk_stop_mode,omitempty"`
-	RiskATRPeriod               *int     `json:"risk_atr_period,omitempty"`
-	RiskATRCacheMaxAgeMinutes   *int     `json:"risk_atr_cache_max_age_minutes,omitempty"`
-	RiskATRFallbackPct          *float64 `json:"risk_atr_fallback_pct,omitempty"`
-	RiskTriggerPriceType        *string  `json:"risk_trigger_price_type,omitempty"`
-	RiskSlippageBufferBPS       *float64 `json:"risk_slippage_buffer_bps,omitempty"`
-	RiskLiquidationBufferATR    *float64 `json:"risk_liquidation_buffer_atr,omitempty"`
-	RiskMaxReentries            *int     `json:"risk_max_reentries,omitempty"`
-	RiskReentryBandATR          *float64 `json:"risk_reentry_band_atr,omitempty"`
-	RiskReentryCooldownSeconds  *int     `json:"risk_reentry_cooldown_seconds,omitempty"`
-	RiskReentryMaxChaseATR      *float64 `json:"risk_reentry_max_chase_atr,omitempty"`
-	RiskReentryMaxATRExpansion  *float64 `json:"risk_reentry_max_atr_expansion,omitempty"`
-	RiskWatchTimeoutMinutes     *int     `json:"risk_watch_timeout_minutes,omitempty"`
-	RiskMigrationConfirmed      *bool    `json:"risk_migration_confirmed,omitempty"`
-	RiskAddonBudgetPct          *float64 `json:"risk_addon_budget_pct,omitempty"`
-	RiskHighRiskConfirmed       bool     `json:"risk_high_risk_confirmed,omitempty"`
+	RiskPolicyVersion          *int     `json:"risk_policy_version,omitempty"`
+	RiskStopMode               *string  `json:"risk_stop_mode,omitempty"`
+	RiskATRPeriod              *int     `json:"risk_atr_period,omitempty"`
+	RiskATRCacheMaxAgeMinutes  *int     `json:"risk_atr_cache_max_age_minutes,omitempty"`
+	RiskATRFallbackPct         *float64 `json:"risk_atr_fallback_pct,omitempty"`
+	RiskTriggerPriceType       *string  `json:"risk_trigger_price_type,omitempty"`
+	RiskSlippageBufferBPS      *float64 `json:"risk_slippage_buffer_bps,omitempty"`
+	RiskLiquidationBufferATR   *float64 `json:"risk_liquidation_buffer_atr,omitempty"`
+	RiskMaxReentries           *int     `json:"risk_max_reentries,omitempty"`
+	RiskReentryBandATR         *float64 `json:"risk_reentry_band_atr,omitempty"`
+	RiskReentryCooldownSeconds *int     `json:"risk_reentry_cooldown_seconds,omitempty"`
+	RiskReentryMaxChaseATR     *float64 `json:"risk_reentry_max_chase_atr,omitempty"`
+	RiskReentryMaxATRExpansion *float64 `json:"risk_reentry_max_atr_expansion,omitempty"`
+	RiskWatchTimeoutMinutes    *int     `json:"risk_watch_timeout_minutes,omitempty"`
+	RiskMigrationConfirmed     *bool    `json:"risk_migration_confirmed,omitempty"`
+	RiskAddonBudgetPct         *float64 `json:"risk_addon_budget_pct,omitempty"`
+	RiskHighRiskConfirmed      bool     `json:"risk_high_risk_confirmed,omitempty"`
 
-	// v4.1 止损噪音下限 / 重入加严（字段含义见 store.CopyTradeConfig 注释）
-	RiskStopNoiseFloorATR         *float64 `json:"risk_stop_noise_floor_atr,omitempty"`
+	// v4.1 重入加严（字段含义见 store.CopyTradeConfig 注释）
 	RiskReentryMinRecoveryATR     *float64 `json:"risk_reentry_min_recovery_atr,omitempty"`
 	RiskReentryCooldownEscalation *float64 `json:"risk_reentry_cooldown_escalation,omitempty"`
 	RiskReentryRecoveryEscalation *float64 `json:"risk_reentry_recovery_escalation,omitempty"`
-	RiskCycleMaxLossPct           *float64 `json:"risk_cycle_max_loss_pct,omitempty"`
+
+	// v5 可保护性状态机 / 噪音档重入
+	RiskUnprotectableAction  *string `json:"risk_unprotectable_action,omitempty"`
+	RiskReentryNoiseOverride *bool   `json:"risk_reentry_noise_override,omitempty"`
 }
 
 // GetConfig 获取跟单配置
@@ -418,13 +417,6 @@ func (h *CopyTradeHandler) SaveConfig(c *gin.Context) {
 	} else if existing != nil {
 		config.RiskAccountPct = existing.RiskAccountPct
 	}
-	if req.RiskATREnabled != nil {
-		config.RiskATREnabled = *req.RiskATREnabled
-	} else if existing != nil {
-		config.RiskATREnabled = existing.RiskATREnabled
-	} else {
-		config.RiskATREnabled = true // 默认 on
-	}
 	if req.RiskATRMultiplier != nil {
 		config.RiskATRMultiplier = *req.RiskATRMultiplier
 	} else if existing != nil {
@@ -457,35 +449,13 @@ func (h *CopyTradeHandler) SaveConfig(c *gin.Context) {
 	} else if existing != nil {
 		config.RiskReentryRatio = existing.RiskReentryRatio
 	}
-	if req.RiskReentryTolerance != nil {
-		config.RiskReentryTolerance = *req.RiskReentryTolerance
-	} else if existing != nil {
-		config.RiskReentryTolerance = existing.RiskReentryTolerance
-	}
-	// v3.2 反加仓铁律配置（与 server.go 的 CopyConfigReq 字段透传逻辑保持对称）
-	if req.RiskReentryBlockAddback != nil {
-		config.RiskReentryBlockAddback = *req.RiskReentryBlockAddback
-	} else if existing != nil {
-		config.RiskReentryBlockAddback = existing.RiskReentryBlockAddback
-	} else {
-		config.RiskReentryBlockAddback = true // 默认启用（保护账户）
-	}
-	if req.RiskReentryAddbackTolerance != nil {
-		config.RiskReentryAddbackTolerance = *req.RiskReentryAddbackTolerance
-	} else if existing != nil {
-		config.RiskReentryAddbackTolerance = existing.RiskReentryAddbackTolerance
-	}
 	applyCopyGuardV4Request(config, existing, &req)
 	if config.RiskPolicyVersion >= 4 && config.ProviderType != "okx" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "copy guard v4 is only supported for OKX"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "copy guard is only supported for OKX"})
 		return
 	}
-	if config.RiskPolicyVersion >= 4 && existing != nil && existing.RiskPolicyVersion < 4 && !config.RiskMigrationConfirmed {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "copy guard v4 migration confirmation is required"})
-		return
-	}
-	// v4.1：账户线语义改为"灾难硬兜底"（默认 20%），高风险确认阈值相应
-	// 上调到 50%（旧阈值 10% 会让默认配置每次保存都要求确认）
+	// v5：账户线是硬兜底（默认 10%），>= 50% 属于极端配置需二次确认。
+	// v3→v4 迁移确认已下线：存量配置由 store 层在加载时强制升级。
 	if config.RiskPolicyVersion >= 4 && config.RiskAccountPct >= 0.50 && !req.RiskHighRiskConfirmed {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "risk_account_pct >= 50% requires risk_high_risk_confirmed"})
 		return
@@ -599,11 +569,6 @@ func applyCopyGuardV4Request(c, old *store.CopyTradeConfig, r *CopyTradeConfigRe
 	} else if old != nil {
 		c.RiskAddonBudgetPct = old.RiskAddonBudgetPct
 	}
-	if r.RiskStopNoiseFloorATR != nil {
-		c.RiskStopNoiseFloorATR = *r.RiskStopNoiseFloorATR
-	} else if old != nil {
-		c.RiskStopNoiseFloorATR = old.RiskStopNoiseFloorATR
-	}
 	if r.RiskReentryMinRecoveryATR != nil {
 		c.RiskReentryMinRecoveryATR = *r.RiskReentryMinRecoveryATR
 	} else if old != nil {
@@ -619,10 +584,15 @@ func applyCopyGuardV4Request(c, old *store.CopyTradeConfig, r *CopyTradeConfigRe
 	} else if old != nil {
 		c.RiskReentryRecoveryEscalation = old.RiskReentryRecoveryEscalation
 	}
-	if r.RiskCycleMaxLossPct != nil {
-		c.RiskCycleMaxLossPct = *r.RiskCycleMaxLossPct
+	if r.RiskUnprotectableAction != nil {
+		c.RiskUnprotectableAction = *r.RiskUnprotectableAction
 	} else if old != nil {
-		c.RiskCycleMaxLossPct = old.RiskCycleMaxLossPct
+		c.RiskUnprotectableAction = old.RiskUnprotectableAction
+	}
+	if r.RiskReentryNoiseOverride != nil {
+		c.RiskReentryNoiseOverride = *r.RiskReentryNoiseOverride
+	} else if old != nil {
+		c.RiskReentryNoiseOverride = old.RiskReentryNoiseOverride
 	}
 	if c.RiskPolicyVersion >= 4 {
 		// Only missing fields on a brand-new v4 config receive balanced defaults.
@@ -635,7 +605,8 @@ func applyCopyGuardV4Request(c, old *store.CopyTradeConfig, r *CopyTradeConfigRe
 				c.RiskLiquidationBufferATR = 0.5
 			}
 			if r.RiskMaxReentries == nil {
-				c.RiskMaxReentries = 2
+				// v5：默认单周期最多重入 1 次（whipsaw 磨损收敛）
+				c.RiskMaxReentries = 1
 			}
 			if r.RiskReentryBandATR == nil {
 				c.RiskReentryBandATR = 0.5

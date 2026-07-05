@@ -28,40 +28,34 @@ type CopyTradeConfig struct {
 	BinanceCSRFToken string `json:"binance_csrf_token,omitempty"` // CSRF header csrftoken
 
 	// ============================================================
-	// 账户保护 / 止损兜底配置（v3 风控）
+	// Copy Guard（账户保护止损，v5：两层硬止损 + 可保护性状态机 + 确认式重入）
 	// 仅 OKX 路径生效（OKX 的 algo 条件单提供交易所托管的硬止损）
 	// HL / Binance 路径下这些字段被忽略，零影响向后兼容
+	// v3 旧策略与噪音下限/周期熔断/反加仓铁律/价格容差等参数已于 v5 下线：
+	// 数据库旧列（risk_atr_enabled / risk_reentry_tolerance /
+	// risk_reentry_block_addback / risk_reentry_addback_tolerance）保留但
+	// 不再读写；存量 v3 配置在读取时强制升级 v4（见 upgradeLegacyRiskPolicy）
 	// ============================================================
 
 	// 主开关
 	RiskStopLossEnabled bool `json:"risk_stop_loss_enabled"` // 默认 true
 
-	// 账户风险线（硬上限：单笔最多亏账户的百分比）
-	RiskAccountPct float64 `json:"risk_account_pct"` // 默认 0.005 (0.5%)，范围 0.001-0.05
+	// 账户硬兜底（v5：单笔最多亏账户的百分比，任何模式下的最终封顶）
+	RiskAccountPct float64 `json:"risk_account_pct"` // 默认 0.10 (=10%)
 
-	// ATR 噪音防护（下界保护：避免被币种正常波动扫出）
-	RiskATREnabled    bool    `json:"risk_atr_enabled"`    // 默认 true
-	RiskATRMultiplier float64 `json:"risk_atr_multiplier"` // 默认 1.5，范围 1.0-3.0
+	// ATR 基线（噪音参考线：三项取严中的宽松项，不再放宽硬 cap）
+	RiskATRMultiplier float64 `json:"risk_atr_multiplier"` // 默认 1.5，范围 0.5-5
 	RiskATRTimeframe  string  `json:"risk_atr_timeframe"`  // 默认 "1h"，可选 "15m"/"1h"/"4h"
 
-	// 杠杆兜底 cap（最外层封顶：保证金最大亏损不超此比例）
+	// 仓位保证金止损（v5 日常主力线：保证金最大亏损不超此比例）
 	RiskLeverageFallback bool    `json:"risk_leverage_fallback"` // 默认 true
-	RiskLeverageMaxLoss  float64 `json:"risk_leverage_max_loss"` // 默认 0.5 (=50% 保证金)
+	RiskLeverageMaxLoss  float64 `json:"risk_leverage_max_loss"` // 默认 0.2 (=20% 保证金)
 
-	// 二次进场（判据 E 双门控）—— 默认 off，用户 opt-in
-	RiskReentryEnabled   bool    `json:"risk_reentry_enabled"`   // 默认 false
-	RiskReentryRatio     float64 `json:"risk_reentry_ratio"`     // 默认 0.5，范围 0.1-1.0
-	RiskReentryTolerance float64 `json:"risk_reentry_tolerance"` // 价格回归容差，默认 0.02 (2%)，v3.3 单边严格区间
+	// 二次进场（v5 确认式重入）
+	RiskReentryEnabled bool    `json:"risk_reentry_enabled"`
+	RiskReentryRatio   float64 `json:"risk_reentry_ratio"` // × 被止损仓位名义，默认 0.5
 
-	// 反加仓铁律（v3.2 可配置）—— 二次进场前是否拦截"领航员止损后加仓"的赌徒型行为
-	// RiskReentryBlockAddback: 是否启用反加仓拦截，默认 true（保护账户）
-	// RiskReentryAddbackTolerance: 允许加仓的倍数上限，默认 1.20（领航员加仓 ≤ 20% 仍允许重入）
-	//   1.0 = 完全不允许加仓（严格）；1.20 = 允许 20%（推荐）；>=99 = 实际等价于关闭
-	// 关闭策略（RiskReentryBlockAddback=false）：完全无视领航员加仓，仅看价格回归 + 浮亏收窄
-	RiskReentryBlockAddback     bool    `json:"risk_reentry_block_addback"`
-	RiskReentryAddbackTolerance float64 `json:"risk_reentry_addback_tolerance"`
-
-	// Copy Guard v4。独立存储于 copy_guard_policies，避免破坏 v3 配置表和旧版回滚。
+	// Copy Guard v4+。独立存储于 copy_guard_policies，避免破坏 v3 配置表和旧版回滚。
 	RiskPolicyVersion          int     `json:"risk_policy_version"`
 	RiskStopMode               string  `json:"risk_stop_mode"`
 	RiskATRPeriod              int     `json:"risk_atr_period"`
@@ -82,11 +76,6 @@ type CopyTradeConfig struct {
 	// ADDON_RISK_WARNING 告警事件。仅告警不拦截（兜底风控不干扰领航员的
 	// 开/加/减/平动作）。默认 0.15 (=15%)；1.0 = 不告警。
 	RiskAddonBudgetPct float64 `json:"risk_addon_budget_pct"`
-	// RiskStopNoiseFloorATR: 止损距离噪音下限（v4，单位 ATR 倍数）。保证金
-	// cap / ATR 线取最紧后，止损距离不得低于该下限——防止高杠杆（如 100x）
-	// 下"保证金 30%"折算成 0.3% 价格距离、被正常波动反复扫损（ETH cycle
-	// 40/50 churn 的根因）。账户硬兜底线不受此下限约束。默认 1.0。
-	RiskStopNoiseFloorATR float64 `json:"risk_stop_noise_floor_atr"`
 	// RiskReentryMinRecoveryATR: 重入最小恢复幅度（v4，单位 ATR 倍数）。
 	// 止损后价格必须从止损成交价向有利方向恢复至少该幅度才允许重入，
 	// 防止"刚止损又原地接回"。默认 0.5。
@@ -97,10 +86,14 @@ type CopyTradeConfig struct {
 	// RiskReentryRecoveryEscalation: 第 N 次重入最小恢复幅度倍率（v4）。
 	// 实际要求 = min_recovery_atr × escalation^已重入次数。默认 1.5。
 	RiskReentryRecoveryEscalation float64 `json:"risk_reentry_recovery_escalation"`
-	// RiskCycleMaxLossPct: 周期累计亏损熔断（v4）。同一周期已实现亏损达到
-	// 账户权益的该比例后不再重入，只观察至领航员平仓。默认 1.0（不限制）；
-	// 仓位止损与账户兜底已承担主要风控，此项供需要额外封顶的用户选用。
-	RiskCycleMaxLossPct float64 `json:"risk_cycle_max_loss_pct"`
+	// RiskUnprotectableAction: 保护单不可建立（clamp 到强平缓冲价也不可行）
+	// 时的处置模式（v5）。
+	//   "close"（默认）：保护优先——立即平掉跟单仓位，周期进入观察期
+	//   "follow"：跟单优先——继续裸跑，UI 标红 + 升级告警（用户显式选择）
+	RiskUnprotectableAction string `json:"risk_unprotectable_action"`
+	// RiskReentryNoiseOverride: 止损距离/ATR < 0.3（极易扫损档）时默认禁用
+	// 自动重入；置 true 可强制放行（按谨慎档执行）。
+	RiskReentryNoiseOverride bool `json:"risk_reentry_noise_override"`
 
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
@@ -110,20 +103,12 @@ type CopyTradeConfig struct {
 // 调用时机：从数据库读出后立即调用，或前端未传字段时
 // 设计目的：保证旧库（ALTER TABLE 后字段为 0/false/""）也能跑出合理默认行为
 //
-// 关键设计决策（v3.1）：
-//   - RiskAccountPct 默认 0.5 (=50%) 是用户明确选择的激进配置（参考方案确认）
-//     语义：单笔最多亏账户的 50%；用户在 UI 上自由调节（无上限）
-//     ⚠️ 这是高风险默认值，对应"领航员是预先严格筛选"的使用场景
-//     新手应在 UI 上手动调低到 0.5-1%
+// v5 默认值选型（与 copytrade.CopyConfig.FillRiskDefaults 保持一致）：
+//   - RiskAccountPct 0.10：账户硬兜底，只锁灾难敞口，正常跟单不干扰
+//   - RiskLeverageMaxLoss 0.20：仓位保证金止损，日常主力线
 func (c *CopyTradeConfig) FillRiskDefaults() {
 	if c.RiskAccountPct == 0 {
-		if c.RiskPolicyVersion >= 4 {
-			// v4.1：账户线语义为"灾难硬兜底"（任何模式下止损距离的最终封顶），
-			// 默认 20%。日常止损由仓位保证金 30% + ATR 噪音下限主导。
-			c.RiskAccountPct = 0.20
-		} else {
-			c.RiskAccountPct = 0.5
-		}
+		c.RiskAccountPct = 0.10
 	}
 	if c.RiskATRMultiplier == 0 {
 		c.RiskATRMultiplier = 1.5
@@ -132,26 +117,10 @@ func (c *CopyTradeConfig) FillRiskDefaults() {
 		c.RiskATRTimeframe = "1h"
 	}
 	if c.RiskLeverageMaxLoss == 0 {
-		if c.RiskPolicyVersion >= 4 {
-			// v4.1：仓位保证金默认止损 30%（默认值而非上限，前端可调更高）
-			c.RiskLeverageMaxLoss = 0.3
-		} else {
-			c.RiskLeverageMaxLoss = 0.5
-		}
+		c.RiskLeverageMaxLoss = 0.2
 	}
 	if c.RiskReentryRatio == 0 {
 		c.RiskReentryRatio = 0.5
-	}
-	// v3.3 默认 tolerance 从 0.5% 提升到 2%：判据 2 改为单边严格区间后触发窗口变窄，
-	// 需要更宽的容差保证可触发性。详见 engine_risk.go 判据 2 注释。
-	if c.RiskReentryTolerance == 0 {
-		c.RiskReentryTolerance = 0.02
-	}
-	// v3.2 反加仓铁律默认：开启 + 允许加仓 ≤ 20%
-	// 注：RiskReentryBlockAddback 是 bool，零值 false 与"用户显式关闭"不可区分，
-	// 此处不做兜底（由 API handler 的 *bool 透传机制处理"未传"语义）
-	if c.RiskReentryAddbackTolerance == 0 {
-		c.RiskReentryAddbackTolerance = 1.20
 	}
 	if c.RiskPolicyVersion >= 4 {
 		if c.RiskStopMode == "" {
@@ -175,9 +144,6 @@ func (c *CopyTradeConfig) FillRiskDefaults() {
 		if c.RiskAddonBudgetPct == 0 {
 			c.RiskAddonBudgetPct = 0.15
 		}
-		if c.RiskStopNoiseFloorATR == 0 {
-			c.RiskStopNoiseFloorATR = 1.0
-		}
 		if c.RiskReentryMinRecoveryATR == 0 {
 			c.RiskReentryMinRecoveryATR = 0.5
 		}
@@ -187,9 +153,28 @@ func (c *CopyTradeConfig) FillRiskDefaults() {
 		if c.RiskReentryRecoveryEscalation == 0 {
 			c.RiskReentryRecoveryEscalation = 1.5
 		}
-		if c.RiskCycleMaxLossPct == 0 {
-			c.RiskCycleMaxLossPct = 1.0
+		if c.RiskUnprotectableAction == "" {
+			c.RiskUnprotectableAction = "close"
 		}
+	}
+}
+
+// upgradeLegacyRiskPolicy v5：v3 旧止损策略已下线。存量 OKX + 启用止损但
+// 仍是 v3（version<4）的配置在读取时强制升级为 v4（Copy Guard 启用标记），
+// 并把 v3 时代的激进默认值（账户线 50%、保证金 50%）归零，交由
+// FillRiskDefaults 填充 v5 默认（0.10 / 0.20）；用户显式改过的其他值保留。
+// 只改内存值，下次保存时随 saveCopyGuardPolicy 持久化。
+func upgradeLegacyRiskPolicy(c *CopyTradeConfig) {
+	if c == nil || c.ProviderType != "okx" || !c.RiskStopLossEnabled || c.RiskPolicyVersion >= 4 {
+		return
+	}
+	c.RiskPolicyVersion = 4
+	c.RiskMigrationConfirmed = true
+	if c.RiskAccountPct == 0.5 {
+		c.RiskAccountPct = 0
+	}
+	if c.RiskLeverageMaxLoss == 0.5 {
+		c.RiskLeverageMaxLoss = 0
 	}
 }
 
@@ -234,24 +219,19 @@ func (s *CopyTradeStore) initTables() error {
 	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN binance_p20t TEXT DEFAULT ''`)
 	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN binance_csrf_token TEXT DEFAULT ''`)
 
-	// 给 copy_trade_configs 表添加风控字段（v3：账户保护 / 止损兜底）
+	// 给 copy_trade_configs 表添加风控字段（账户保护 / 止损兜底）
 	// 旧库 ALTER 失败说明已存在，忽略；新库随表创建即有这些列
-	// 默认值与 FillRiskDefaults 保持一致：启用 SL + ATR + 杠杆兜底；二次进场默认 off
+	// v5 注：v3 时代的 risk_atr_enabled / risk_reentry_tolerance /
+	// risk_reentry_block_addback / risk_reentry_addback_tolerance 列不再
+	// 创建也不再读写（旧库中的存量列保留为休眠数据）
 	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_stop_loss_enabled INTEGER DEFAULT 1`)
-	// risk_account_pct 默认 0.5 (=50%)：v3.1 用户明确选择的激进默认值（参考 FillRiskDefaults 注释）
-	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_account_pct REAL DEFAULT 0.5`)
-	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_atr_enabled INTEGER DEFAULT 1`)
+	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_account_pct REAL DEFAULT 0`)
 	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_atr_multiplier REAL DEFAULT 1.5`)
 	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_atr_timeframe TEXT DEFAULT '1h'`)
 	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_leverage_fallback INTEGER DEFAULT 1`)
-	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_leverage_max_loss REAL DEFAULT 0.5`)
+	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_leverage_max_loss REAL DEFAULT 0`)
 	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_reentry_enabled INTEGER DEFAULT 0`)
 	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_reentry_ratio REAL DEFAULT 0.5`)
-	// v3.3 默认 tolerance 提升到 2%（旧库已有数据的旧默认 0.005 仍保留；本 ALTER 仅对新建库 / 新行有效）
-	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_reentry_tolerance REAL DEFAULT 0.02`)
-	// v3.2 反加仓铁律配置
-	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_reentry_block_addback INTEGER DEFAULT 1`)
-	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_reentry_addback_tolerance REAL DEFAULT 1.20`)
 
 	return nil
 }
@@ -263,18 +243,16 @@ func (s *CopyTradeStore) Create(config *CopyTradeConfig) error {
 		INSERT INTO copy_trade_configs 
 			(trader_id, provider_type, leader_id, copy_ratio, sync_leverage, sync_margin_mode, 
 			 min_trade_warn, max_trade_warn, enabled, binance_p20t, binance_csrf_token,
-			 risk_stop_loss_enabled, risk_account_pct, risk_atr_enabled, risk_atr_multiplier,
+			 risk_stop_loss_enabled, risk_account_pct, risk_atr_multiplier,
 			 risk_atr_timeframe, risk_leverage_fallback, risk_leverage_max_loss,
-			 risk_reentry_enabled, risk_reentry_ratio, risk_reentry_tolerance,
-			 risk_reentry_block_addback, risk_reentry_addback_tolerance)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			 risk_reentry_enabled, risk_reentry_ratio)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, config.TraderID, config.ProviderType, config.LeaderID, config.CopyRatio,
 		config.SyncLeverage, config.SyncMarginMode, config.MinTradeWarn, config.MaxTradeWarn, config.Enabled,
 		config.BinanceP20T, config.BinanceCSRFToken,
-		config.RiskStopLossEnabled, config.RiskAccountPct, config.RiskATREnabled, config.RiskATRMultiplier,
+		config.RiskStopLossEnabled, config.RiskAccountPct, config.RiskATRMultiplier,
 		config.RiskATRTimeframe, config.RiskLeverageFallback, config.RiskLeverageMaxLoss,
-		config.RiskReentryEnabled, config.RiskReentryRatio, config.RiskReentryTolerance,
-		config.RiskReentryBlockAddback, config.RiskReentryAddbackTolerance)
+		config.RiskReentryEnabled, config.RiskReentryRatio)
 	if err != nil {
 		return err
 	}
@@ -298,24 +276,19 @@ func (s *CopyTradeStore) Update(config *CopyTradeConfig) error {
 			binance_csrf_token = ?,
 			risk_stop_loss_enabled = ?,
 			risk_account_pct = ?,
-			risk_atr_enabled = ?,
 			risk_atr_multiplier = ?,
 			risk_atr_timeframe = ?,
 			risk_leverage_fallback = ?,
 			risk_leverage_max_loss = ?,
 			risk_reentry_enabled = ?,
-			risk_reentry_ratio = ?,
-			risk_reentry_tolerance = ?,
-			risk_reentry_block_addback = ?,
-			risk_reentry_addback_tolerance = ?
+			risk_reentry_ratio = ?
 		WHERE trader_id = ?
 	`, config.ProviderType, config.LeaderID, config.CopyRatio,
 		config.SyncLeverage, config.SyncMarginMode, config.MinTradeWarn, config.MaxTradeWarn,
 		config.Enabled, config.BinanceP20T, config.BinanceCSRFToken,
-		config.RiskStopLossEnabled, config.RiskAccountPct, config.RiskATREnabled, config.RiskATRMultiplier,
+		config.RiskStopLossEnabled, config.RiskAccountPct, config.RiskATRMultiplier,
 		config.RiskATRTimeframe, config.RiskLeverageFallback, config.RiskLeverageMaxLoss,
-		config.RiskReentryEnabled, config.RiskReentryRatio, config.RiskReentryTolerance,
-		config.RiskReentryBlockAddback, config.RiskReentryAddbackTolerance,
+		config.RiskReentryEnabled, config.RiskReentryRatio,
 		config.TraderID)
 	if err != nil {
 		return err
@@ -330,11 +303,10 @@ func (s *CopyTradeStore) Upsert(config *CopyTradeConfig) error {
 		INSERT INTO copy_trade_configs 
 			(trader_id, provider_type, leader_id, copy_ratio, sync_leverage, sync_margin_mode, 
 			 min_trade_warn, max_trade_warn, enabled, binance_p20t, binance_csrf_token,
-			 risk_stop_loss_enabled, risk_account_pct, risk_atr_enabled, risk_atr_multiplier,
+			 risk_stop_loss_enabled, risk_account_pct, risk_atr_multiplier,
 			 risk_atr_timeframe, risk_leverage_fallback, risk_leverage_max_loss,
-			 risk_reentry_enabled, risk_reentry_ratio, risk_reentry_tolerance,
-			 risk_reentry_block_addback, risk_reentry_addback_tolerance)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			 risk_reentry_enabled, risk_reentry_ratio)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(trader_id) DO UPDATE SET
 			provider_type = excluded.provider_type,
 			leader_id = excluded.leader_id,
@@ -348,23 +320,18 @@ func (s *CopyTradeStore) Upsert(config *CopyTradeConfig) error {
 			binance_csrf_token = excluded.binance_csrf_token,
 			risk_stop_loss_enabled = excluded.risk_stop_loss_enabled,
 			risk_account_pct = excluded.risk_account_pct,
-			risk_atr_enabled = excluded.risk_atr_enabled,
 			risk_atr_multiplier = excluded.risk_atr_multiplier,
 			risk_atr_timeframe = excluded.risk_atr_timeframe,
 			risk_leverage_fallback = excluded.risk_leverage_fallback,
 			risk_leverage_max_loss = excluded.risk_leverage_max_loss,
 			risk_reentry_enabled = excluded.risk_reentry_enabled,
-			risk_reentry_ratio = excluded.risk_reentry_ratio,
-			risk_reentry_tolerance = excluded.risk_reentry_tolerance,
-			risk_reentry_block_addback = excluded.risk_reentry_block_addback,
-			risk_reentry_addback_tolerance = excluded.risk_reentry_addback_tolerance
+			risk_reentry_ratio = excluded.risk_reentry_ratio
 	`, config.TraderID, config.ProviderType, config.LeaderID, config.CopyRatio,
 		config.SyncLeverage, config.SyncMarginMode, config.MinTradeWarn, config.MaxTradeWarn, config.Enabled,
 		config.BinanceP20T, config.BinanceCSRFToken,
-		config.RiskStopLossEnabled, config.RiskAccountPct, config.RiskATREnabled, config.RiskATRMultiplier,
+		config.RiskStopLossEnabled, config.RiskAccountPct, config.RiskATRMultiplier,
 		config.RiskATRTimeframe, config.RiskLeverageFallback, config.RiskLeverageMaxLoss,
-		config.RiskReentryEnabled, config.RiskReentryRatio, config.RiskReentryTolerance,
-		config.RiskReentryBlockAddback, config.RiskReentryAddbackTolerance)
+		config.RiskReentryEnabled, config.RiskReentryRatio)
 	if err != nil {
 		return err
 	}
@@ -385,17 +352,13 @@ const copyTradeConfigSelectColumns = `
 	COALESCE(binance_p20t, '') AS binance_p20t,
 	COALESCE(binance_csrf_token, '') AS binance_csrf_token,
 	COALESCE(risk_stop_loss_enabled, 1) AS risk_stop_loss_enabled,
-	COALESCE(risk_account_pct, 0.5) AS risk_account_pct,
-	COALESCE(risk_atr_enabled, 1) AS risk_atr_enabled,
+	COALESCE(risk_account_pct, 0) AS risk_account_pct,
 	COALESCE(risk_atr_multiplier, 1.5) AS risk_atr_multiplier,
 	COALESCE(risk_atr_timeframe, '1h') AS risk_atr_timeframe,
 	COALESCE(risk_leverage_fallback, 1) AS risk_leverage_fallback,
-	COALESCE(risk_leverage_max_loss, 0.5) AS risk_leverage_max_loss,
+	COALESCE(risk_leverage_max_loss, 0) AS risk_leverage_max_loss,
 	COALESCE(risk_reentry_enabled, 0) AS risk_reentry_enabled,
 	COALESCE(risk_reentry_ratio, 0.5) AS risk_reentry_ratio,
-	COALESCE(risk_reentry_tolerance, 0.02) AS risk_reentry_tolerance,
-	COALESCE(risk_reentry_block_addback, 1) AS risk_reentry_block_addback,
-	COALESCE(risk_reentry_addback_tolerance, 1.20) AS risk_reentry_addback_tolerance,
 	created_at, updated_at`
 
 // scanCopyTradeConfig 共用 Scan 逻辑（避免 GetByTraderID 与 ListEnabled 重复实现）
@@ -411,10 +374,9 @@ func scanCopyTradeConfig(scanner interface {
 		&config.TraderID, &config.ProviderType, &config.LeaderID, &config.CopyRatio,
 		&config.SyncLeverage, &config.SyncMarginMode, &config.MinTradeWarn, &config.MaxTradeWarn,
 		&config.Enabled, &p20t, &csrf,
-		&config.RiskStopLossEnabled, &config.RiskAccountPct, &config.RiskATREnabled, &config.RiskATRMultiplier,
+		&config.RiskStopLossEnabled, &config.RiskAccountPct, &config.RiskATRMultiplier,
 		&config.RiskATRTimeframe, &config.RiskLeverageFallback, &config.RiskLeverageMaxLoss,
-		&config.RiskReentryEnabled, &config.RiskReentryRatio, &config.RiskReentryTolerance,
-		&config.RiskReentryBlockAddback, &config.RiskReentryAddbackTolerance,
+		&config.RiskReentryEnabled, &config.RiskReentryRatio,
 		&createdAt, &updatedAt,
 	)
 	if err != nil {
@@ -443,6 +405,7 @@ func (s *CopyTradeStore) GetByTraderID(traderID string) (*CopyTradeConfig, error
 	if err := s.loadCopyGuardPolicy(config); err != nil && err != sql.ErrNoRows {
 		return nil, err
 	}
+	upgradeLegacyRiskPolicy(config)
 	config.FillRiskDefaults()
 	return config, nil
 }
@@ -464,6 +427,7 @@ func (s *CopyTradeStore) ListEnabled() ([]*CopyTradeConfig, error) {
 		if err := s.loadCopyGuardPolicy(config); err != nil && err != sql.ErrNoRows {
 			return nil, err
 		}
+		upgradeLegacyRiskPolicy(config)
 		config.FillRiskDefaults()
 		configs = append(configs, config)
 	}
@@ -1104,34 +1068,6 @@ func (s *CopyTradeStore) MarkStoppedByRisk(traderID, leaderPosID string, leaderP
 		    updated_at = CURRENT_TIMESTAMP
 		WHERE trader_id = ? AND leader_pos_id = ? AND status = 'active'
 	`, leaderPnL, leaderSize, addCount, traderID, leaderPosID)
-	return err
-}
-
-// MarkReentryUsed 标记 stopped_by_risk 映射为已用过二次进场，并恢复 active 状态
-// 调用时机：二次进场判据满足且重入下单成功后
-//
-// 参数：
-//   - reentryOpenPrice: 重入时的入场价基准（领航员当前 markPrice 或重入决策时的价格）
-//   - reentryOpenSizeUSD: 重入仓位的目标 USDT 金额
-//
-// 设计：
-//   - reentry_used = true 永久保留（即使后续再次 stopped_by_risk 也保留）→ 同 posId 不会再触发判据 E
-//   - open_price / open_size_usd 用重入价刷新（语义上：「这是新的入场」），便于审计与日志
-//   - 清空 SL 触发快照字段（已用完）
-func (s *CopyTradeStore) MarkReentryUsed(traderID, leaderPosID string, reentryOpenPrice, reentryOpenSizeUSD float64) error {
-	_, err := s.db.Exec(`
-		UPDATE copy_trade_position_mappings
-		SET reentry_used = 1,
-		    status = 'active',
-		    open_price = ?,
-		    open_size_usd = ?,
-		    stopped_at = NULL,
-		    leader_pnl_at_stop = 0,
-		    leader_size_at_stop = 0,
-		    add_count_at_stop = 0,
-		    updated_at = CURRENT_TIMESTAMP
-		WHERE trader_id = ? AND leader_pos_id = ? AND status = 'stopped_by_risk'
-	`, reentryOpenPrice, reentryOpenSizeUSD, traderID, leaderPosID)
 	return err
 }
 

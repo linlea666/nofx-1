@@ -166,44 +166,39 @@ func (ti *TraderIntegration) StartCopyTrading() error {
 		BinanceP20T:      copyConfig.BinanceP20T,
 		BinanceCSRFToken: copyConfig.BinanceCSRFToken,
 
-		// v3 风控字段透传（账户保护止损）
+		// Copy Guard 风控字段透传（v5：两层硬止损 + 可保护性状态机 + 确认式重入）
 		RiskStopLossEnabled:  copyConfig.RiskStopLossEnabled,
 		RiskAccountPct:       copyConfig.RiskAccountPct,
-		RiskATREnabled:       copyConfig.RiskATREnabled,
 		RiskATRMultiplier:    copyConfig.RiskATRMultiplier,
 		RiskATRTimeframe:     copyConfig.RiskATRTimeframe,
 		RiskLeverageFallback: copyConfig.RiskLeverageFallback,
 		RiskLeverageMaxLoss:  copyConfig.RiskLeverageMaxLoss,
 		RiskReentryEnabled:   copyConfig.RiskReentryEnabled,
 		RiskReentryRatio:     copyConfig.RiskReentryRatio,
-		RiskReentryTolerance: copyConfig.RiskReentryTolerance,
 
-		// v3.2 反加仓铁律
-		RiskReentryBlockAddback:     copyConfig.RiskReentryBlockAddback,
-		RiskReentryAddbackTolerance: copyConfig.RiskReentryAddbackTolerance,
-		RiskPolicyVersion:           copyConfig.RiskPolicyVersion,
-		RiskStopMode:                copyConfig.RiskStopMode,
-		RiskATRPeriod:               copyConfig.RiskATRPeriod,
-		RiskATRCacheMaxAgeMinutes:   copyConfig.RiskATRCacheMaxAgeMinutes,
-		RiskATRFallbackPct:          copyConfig.RiskATRFallbackPct,
-		RiskTriggerPriceType:        copyConfig.RiskTriggerPriceType,
-		RiskSlippageBufferBPS:       copyConfig.RiskSlippageBufferBPS,
-		RiskLiquidationBufferATR:    copyConfig.RiskLiquidationBufferATR,
-		RiskMaxReentries:            copyConfig.RiskMaxReentries,
-		RiskReentryBandATR:          copyConfig.RiskReentryBandATR,
-		RiskReentryCooldownSeconds:  copyConfig.RiskReentryCooldownSeconds,
-		RiskReentryMaxChaseATR:      copyConfig.RiskReentryMaxChaseATR,
-		RiskReentryMaxATRExpansion:  copyConfig.RiskReentryMaxATRExpansion,
-		RiskWatchTimeoutMinutes:     copyConfig.RiskWatchTimeoutMinutes,
-		RiskMigrationConfirmed:      copyConfig.RiskMigrationConfirmed,
-		RiskAddonBudgetPct:          copyConfig.RiskAddonBudgetPct,
+		RiskPolicyVersion:          copyConfig.RiskPolicyVersion,
+		RiskStopMode:               copyConfig.RiskStopMode,
+		RiskATRPeriod:              copyConfig.RiskATRPeriod,
+		RiskATRCacheMaxAgeMinutes:  copyConfig.RiskATRCacheMaxAgeMinutes,
+		RiskATRFallbackPct:         copyConfig.RiskATRFallbackPct,
+		RiskTriggerPriceType:       copyConfig.RiskTriggerPriceType,
+		RiskSlippageBufferBPS:      copyConfig.RiskSlippageBufferBPS,
+		RiskLiquidationBufferATR:   copyConfig.RiskLiquidationBufferATR,
+		RiskMaxReentries:           copyConfig.RiskMaxReentries,
+		RiskReentryBandATR:         copyConfig.RiskReentryBandATR,
+		RiskReentryCooldownSeconds: copyConfig.RiskReentryCooldownSeconds,
+		RiskReentryMaxChaseATR:     copyConfig.RiskReentryMaxChaseATR,
+		RiskReentryMaxATRExpansion: copyConfig.RiskReentryMaxATRExpansion,
+		RiskWatchTimeoutMinutes:    copyConfig.RiskWatchTimeoutMinutes,
+		RiskMigrationConfirmed:     copyConfig.RiskMigrationConfirmed,
+		RiskAddonBudgetPct:         copyConfig.RiskAddonBudgetPct,
 
-		// v4.1 止损噪音下限 / 重入加严
-		RiskStopNoiseFloorATR:         copyConfig.RiskStopNoiseFloorATR,
+		// v4.1 重入加严 + v5 可保护性/噪音档
 		RiskReentryMinRecoveryATR:     copyConfig.RiskReentryMinRecoveryATR,
 		RiskReentryCooldownEscalation: copyConfig.RiskReentryCooldownEscalation,
 		RiskReentryRecoveryEscalation: copyConfig.RiskReentryRecoveryEscalation,
-		RiskCycleMaxLossPct:           copyConfig.RiskCycleMaxLossPct,
+		RiskUnprotectableAction:       copyConfig.RiskUnprotectableAction,
+		RiskReentryNoiseOverride:      copyConfig.RiskReentryNoiseOverride,
 	}
 	engineConfig.FillRiskDefaults() // 兜底默认值（旧库迁移 / 前端未传时）
 	if err := ValidateRiskPolicyV4(engineConfig); err != nil {
@@ -674,9 +669,18 @@ func (ti *TraderIntegration) pollV4ProtectiveStops() {
 		}
 		delete(ti.protectiveQueryFailures, stored.CycleID)
 		if live == nil {
-			// OKX confirmed the tracked order no longer exists: mark it invalid
-			// so retryDegradedV4Protections rebuilds it (poll drops the row).
+			// v5 误判修复：保护单在 OKX 上已不存在且本地仓位同时为空 →
+			// 大概率是保护单已触发成交、algo 记录被 OKX 清理（或仓位已被
+			// 其他路径平掉）。此时绝不能标 DEGRADED——那会让重试链在没有
+			// 仓位的情况下重建保护单。止损确认交给 checkStoppedByRisk 的
+			// position-absent 路径。
 			_ = ti.store.CopyTrade().UpdateCopyGuardProtectiveOrderStatus(stored.CycleID, "invalid")
+			if ti.isFollowerPositionFlat(cycle.Symbol, cycle.Side, cycle.MarginMode) {
+				logger.Infof("🛑 [%s] Copy Guard 保护单已消失且仓位为空（疑似已触发） | cycle=%d algoId=%s，交由止损确认路径处理", ti.traderID, cycle.ID, stored.AlgoID)
+				_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "PROTECTIVE_STOP_GONE", Metadata: map[string]interface{}{"algo_id": stored.AlgoID, "follower_flat": true}})
+				continue
+			}
+			// 仓位仍在但保护单没了：真降级，交给重试链重建。
 			ti.markProtectionIssue(cycle, store.CopyGuardProtectionDegraded, "PROTECTION_DEGRADED", fmt.Errorf("protective stop %s no longer exists on OKX", stored.AlgoID), 0, false)
 			continue
 		}
@@ -693,7 +697,10 @@ func (ti *TraderIntegration) pollV4ProtectiveStops() {
 		if state == "live" {
 			if ratio < 0.999 || ratio > 1.001 {
 				ti.markProtectionIssue(cycle, store.CopyGuardProtectionDegraded, "PROTECTION_COVERAGE_LOW", fmt.Errorf("protective quantity %.8f does not match position quantity %.8f", live.Quantity, baseQty), coverage, false)
-			} else if cycle.ProtectionStatus != store.CopyGuardProtectionVerified {
+			} else if cycle.ProtectionStatus != store.CopyGuardProtectionVerified && cycle.ProtectionStatus != store.CopyGuardProtectionClamped {
+				// CLAMPED 也是"已保护"的健康态（保护质量降级但单子有效），
+				// 不能被 poll 覆写成 VERIFIED，否则 clamp 提示丢失且反复
+				// 触发 PROTECTION_RECOVERED 邮件。
 				_ = ti.store.CopyTrade().UpdateCopyGuardProtectionHealth(cycle.ID, store.CopyGuardProtectionVerified, coverage, "", cycle.FollowerPosID, cycle.EntryOrderID, false)
 				_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "PROTECTION_RECOVERED", Price: live.TriggerPrice, Quantity: live.Quantity, Metadata: map[string]interface{}{"algo_id": live.AlgoID, "coverage": coverage}})
 				ti.notifyProtection(cycle, "Copy Guard 保护已恢复", "保护单已经重新验证有效。", "recovered")
@@ -788,6 +795,18 @@ const protectiveQueryFailureThreshold = 3
 // running; this is the safety valve replacing silent indefinite retrying).
 const protectionMissingEscalationAfter = 10 * time.Minute
 
+// protectionRetryMaxAttempts (v5): 重试退避封顶。PENDING/DEGRADED（确认无有效
+// 保护）连续重试到此次数后不再无限重挂，转入 GUARD_UNPROTECTABLE 处置
+// （按 risk_unprotectable_action 平仓或标红裸跑）。周期 65/66 曾在保护单
+// 反复被拒时空转 110 次重试、仓位全程裸跑，这里是对应的结构性修复。
+// UNKNOWN（状态未知，可能已有保护）不受封顶影响——状态未知时强制平仓
+// 比裸跑更危险。
+const protectionRetryMaxAttempts = 10
+
+// unprotectableRecheckDelay: follow 模式下 UNPROTECTABLE 周期的复检间隔。
+// 行情/保证金变化可能让仓位重新可保护，低频复检以便自动恢复。
+const unprotectableRecheckDelay = 5 * time.Minute
+
 func (ti *TraderIntegration) retryDegradedV4Protections() {
 	if ti.engine == nil || ti.engine.config == nil || !ti.engine.config.RiskStopLossEnabled {
 		return
@@ -800,21 +819,33 @@ func (ti *TraderIntegration) retryDegradedV4Protections() {
 		if cycle.Status != store.CopyGuardFollowing && cycle.Status != store.CopyGuardFollowingReentry {
 			continue
 		}
-		if cycle.ProtectionStatus != store.CopyGuardProtectionPending && cycle.ProtectionStatus != store.CopyGuardProtectionUnknown && cycle.ProtectionStatus != store.CopyGuardProtectionDegraded {
+		switch cycle.ProtectionStatus {
+		case store.CopyGuardProtectionPending, store.CopyGuardProtectionUnknown, store.CopyGuardProtectionDegraded, store.CopyGuardProtectionUnprotectable:
+		default:
 			continue
 		}
 		if cycle.ProtectionMissingAt != nil && time.Since(*cycle.ProtectionMissingAt) >= protectionMissingEscalationAfter {
 			ti.notifyProtection(cycle, "Copy Guard 保护缺失超时", fmt.Sprintf("该仓位已连续 %.0f 分钟没有完整有效的止损保护，系统仍在自动重试。\n建议人工检查 OKX，必要时手动挂止损或平仓。\n当前状态: %s\n最近错误: %s", time.Since(*cycle.ProtectionMissingAt).Minutes(), cycle.ProtectionStatus, cycle.ProtectionError), "missing_escalation")
 		}
-		if cycle.ProtectionLastRetryAt != nil && time.Since(*cycle.ProtectionLastRetryAt) < protectionRetryDelay(cycle.ProtectionRetries) {
+		retryDelay := protectionRetryDelay(cycle.ProtectionRetries)
+		if cycle.ProtectionStatus == store.CopyGuardProtectionUnprotectable {
+			retryDelay = unprotectableRecheckDelay
+		}
+		if cycle.ProtectionLastRetryAt != nil && time.Since(*cycle.ProtectionLastRetryAt) < retryDelay {
 			continue
 		}
-		claimed, claimErr := ti.store.CopyTrade().BeginCopyGuardProtectionRetry(cycle, protectionRetryDelay(cycle.ProtectionRetries))
+		claimed, claimErr := ti.store.CopyTrade().BeginCopyGuardProtectionRetry(cycle, retryDelay)
 		if claimErr != nil {
 			logger.Errorf("❌ [%s] failed to persist Copy Guard protection retry: %v", ti.traderID, claimErr)
 			continue
 		}
 		if !claimed {
+			continue
+		}
+		// v5 重试退避封顶：确认无有效保护且重试用尽 → GUARD_UNPROTECTABLE 处置
+		if cycle.ProtectionRetries >= protectionRetryMaxAttempts &&
+			(cycle.ProtectionStatus == store.CopyGuardProtectionPending || cycle.ProtectionStatus == store.CopyGuardProtectionDegraded) {
+			ti.handleUnprotectableCycle(cycle, fmt.Errorf("protection retries exhausted (%d attempts): %s", cycle.ProtectionRetries, cycle.ProtectionError))
 			continue
 		}
 		action := "open_long"
@@ -824,6 +855,92 @@ func (ti *TraderIntegration) retryDegradedV4Protections() {
 		dec := &decision.Decision{Symbol: cycle.Symbol, Action: action, LeaderPosID: cycle.LeaderPosID, MarginMode: cycle.MarginMode, EntryPrice: cycle.LeaderEntryPrice, Reasoning: "Copy Guard protection retry"}
 		ti.refreshStopLossAfterExecute(dec)
 	}
+}
+
+// handleUnprotectableForDecision 决策路径进入 GUARD_UNPROTECTABLE 处置
+// （calcStopLossPrice 判定 clamp 后仍不可保护 / 开仓即触发）。
+func (ti *TraderIntegration) handleUnprotectableForDecision(dec *decision.Decision, side string, quantity, entryPrice float64, cause error) {
+	cycle, err := ti.store.CopyTrade().GetOpenCopyGuardCycle(ti.traderID, dec.LeaderPosID)
+	if err != nil {
+		logger.Errorf("❌ [%s] Copy Guard 不可保护但生命周期缺失 | %s %s: %v (cause=%v)", ti.traderID, dec.Symbol, side, err, cause)
+		return
+	}
+	ti.handleUnprotectableCycle(cycle, cause)
+}
+
+// handleUnprotectableCycle GUARD_UNPROTECTABLE 处置（v5 可保护性状态机终点）：
+//   - close（默认）：立即市价平掉跟单仓位，周期进入 STOPPED_WATCHING 观察，
+//     记 GUARD_FORCED_EXIT；重入判据后续照常评估（含可保护性预检）。
+//   - follow：不平仓（跟随领航员硬扛），保护状态标 UNPROTECTABLE（UI 标红），
+//     升级告警一次，每 unprotectableRecheckDelay 复检一次是否恢复可保护。
+func (ti *TraderIntegration) handleUnprotectableCycle(cycle *store.CopyGuardCycle, cause error) {
+	message := "protection cannot be established"
+	if cause != nil {
+		message = cause.Error()
+	}
+	action := "close"
+	if ti.engine != nil && ti.engine.config != nil && ti.engine.config.RiskUnprotectableAction == "follow" {
+		action = "follow"
+	}
+	logger.Errorf("🚨 [%s] Copy Guard 仓位不可保护 | cycle=%d %s %s | 处置=%s | %s", ti.traderID, cycle.ID, cycle.Symbol, cycle.Side, action, message)
+	_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "GUARD_UNPROTECTABLE", Metadata: map[string]interface{}{
+		"action": action, "error": message, "leader_pos_id": cycle.LeaderPosID, "symbol": cycle.Symbol, "side": cycle.Side, "retries": cycle.ProtectionRetries,
+	}})
+
+	if action == "follow" {
+		_ = ti.store.CopyTrade().UpdateCopyGuardProtectionHealth(cycle.ID, store.CopyGuardProtectionUnprotectable, 0, message, cycle.FollowerPosID, cycle.EntryOrderID, false)
+		ti.notifyProtection(cycle, "Copy Guard 仓位不可保护（裸跑中）", fmt.Sprintf("该仓位无法建立任何有效止损保护（含极紧 clamp 止损）。\n处置模式为 follow：仓位继续跟随领航员，但当前没有交易所托管的止损单。\n原因: %s\n系统每 %.0f 分钟自动复检一次；建议人工评估是否手动平仓。", message, unprotectableRecheckDelay.Minutes()), "unprotectable")
+		return
+	}
+
+	// close 模式：强制离场
+	closeAction := "close_long"
+	if cycle.Side == "short" {
+		closeAction = "close_short"
+	}
+	dec := &decision.Decision{Symbol: cycle.Symbol, Action: closeAction, MarginMode: cycle.MarginMode, LeaderPosID: cycle.LeaderPosID, Reasoning: "Copy Guard forced exit: position unprotectable"}
+	ti.captureV4FollowerBeforeClose(dec)
+	if execErr := ti.executor.ExecuteDecision(dec); execErr != nil {
+		// 平仓失败：标 DEGRADED 留在重试链里（下一轮到封顶仍会再次进入本处置）
+		logger.Errorf("❌ [%s] Copy Guard 强制离场失败 | cycle=%d %s: %v", ti.traderID, cycle.ID, cycle.Symbol, execErr)
+		ti.markProtectionIssue(cycle, store.CopyGuardProtectionDegraded, "GUARD_FORCED_EXIT_FAILED", execErr, 0, false)
+		return
+	}
+	price := float64(0)
+	if slMgr, ok := ti.executor.(StopLossManager); ok {
+		if p, pErr := slMgr.GetMarketPrice(cycle.Symbol); pErr == nil {
+			price = p
+		}
+	}
+	if price <= 0 {
+		price = cycle.FollowerEntryPrice
+	}
+	quantity := float64(0)
+	if cycle.FollowerEntryPrice > 0 {
+		quantity = cycle.FollowerNotional / cycle.FollowerEntryPrice
+	}
+	// 领航员快照 → mapping 进观察态（重入判据照常运行）
+	pnl, size, addCount := float64(0), float64(0), 0
+	if leader := ti.engine.buildLeaderPosMap()[cycle.LeaderPosID]; leader != nil {
+		pnl, size = leader.UnrealizedPnL, leader.Size
+		if leader.EntryPrice > 0 {
+			_ = ti.store.CopyTrade().SnapshotCopyGuardLeaderEntryAtStop(cycle.ID, leader.EntryPrice)
+		}
+	}
+	if mapping, _ := ti.store.CopyTrade().GetMapping(ti.traderID, cycle.LeaderPosID); mapping != nil {
+		addCount = mapping.AddCount
+	}
+	_ = ti.store.CopyTrade().MarkStoppedByRisk(ti.traderID, cycle.LeaderPosID, pnl, size, addCount)
+	atr, _ := market.GetOKXATRWithMaxAge(cycle.Symbol, ti.engine.config.RiskATRTimeframe, ti.engine.config.RiskATRPeriod, riskATRCacheMaxAge(ti.engine.config))
+	_ = ti.store.CopyTrade().RecordCopyGuardStopObserved(cycle.ID, ti.traderID, cycle.ReentryCount, atr, price, quantity, map[string]interface{}{
+		"confirmation": "guard_forced_exit", "error": message, "leader_pnl": pnl,
+	})
+	_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "GUARD_FORCED_EXIT", Price: price, Quantity: quantity, Metadata: map[string]interface{}{
+		"error": message, "leader_pos_id": cycle.LeaderPosID,
+	}})
+	_ = ti.store.CopyTrade().UpdateCopyGuardProtectionHealth(cycle.ID, store.CopyGuardProtectionCanceled, 0, message, cycle.FollowerPosID, cycle.EntryOrderID, false)
+	logger.Warnf("🛑 [%s] Copy Guard 强制离场完成（不可保护） | cycle=%d %s %s price≈%.4f", ti.traderID, cycle.ID, cycle.Symbol, cycle.Side, price)
+	ti.notifyProtection(cycle, "Copy Guard 强制离场（仓位不可保护）", fmt.Sprintf("该仓位无法建立任何有效止损保护（含极紧 clamp 止损），已按处置模式 close 市价平仓。\n原因: %s\n周期进入观察期，满足重入条件且可保护时会再次进场。", message), "forced_exit")
 }
 
 func (ti *TraderIntegration) recoverV4PendingStates() {
@@ -938,10 +1055,6 @@ func (ti *TraderIntegration) executeFullDecision(fullDec *decision.FullDecision)
 		// 记录决策日志
 		ti.logDecision(fullDec, dec)
 
-		// 🛑 v3 风控：跟单 OKX 路径，执行前先撤旧 SL（避免加仓/减仓后挂出多个 SL）
-		// 不区分动作类型：开仓/加仓/减仓/平仓前都撤一次最简单可靠
-		// 节流：本函数本身是 channel 串行消费，同 trader 不会并发触发，无需额外节流
-		ti.cancelExistingStopLoss(dec, "before-execute")
 		ti.captureV4FollowerBeforeClose(dec)
 
 		// 执行交易
@@ -1971,15 +2084,15 @@ func getIntOrFloatField(m map[string]interface{}, key string) int {
 }
 
 // ============================================================================
-// v3 风控：账户保护止损（SL）管理钩子
+// Copy Guard 保护单管理钩子（v5）
 //
 // 设计原则：
 //  1. 仅 OKX 路径生效（HL/Binance 暂不支持账户保护 SL）
-//  2. executor 不实现 StopLossManager 接口时降级（不报错，仅记 Debug 日志）
-//  3. 任何 SL 操作失败都不阻断主交易流程（仅记日志 + 由 orphan_algo_sweep 兜底）
+//  2. 任何 SL 操作失败都不阻断主交易流程，但必须进入可保护性状态机
+//     （clamp → GUARD_UNPROTECTABLE → close/follow），禁止静默裸跑
 // ============================================================================
 
-// shouldManageStopLoss 判断当前决策是否走 v3 风控 SL 管理路径
+// shouldManageStopLoss 判断当前决策是否走 Copy Guard 保护单管理路径
 // 返回 false 时跳过所有 SL 钩子（透明降级）
 func (ti *TraderIntegration) shouldManageStopLoss(dec *decision.Decision) bool {
 	if ti.engine == nil || ti.engine.config == nil {
@@ -1997,70 +2110,35 @@ func (ti *TraderIntegration) shouldManageStopLoss(dec *decision.Decision) bool {
 	return true
 }
 
-// cancelExistingStopLoss 执行前撤旧 SL
-// 调用时机：跟单 OKX 开仓/加仓/减仓/平仓 → ExecuteDecision 之前
-// 设计：失败不阻断（只是没撤掉旧单），主流程继续；旧单触发可能比新单更紧，安全降级
-func (ti *TraderIntegration) cancelExistingStopLoss(dec *decision.Decision, where string) {
-	if !ti.shouldManageStopLoss(dec) {
-		return
-	}
-	if ti.engine.config.RiskPolicyVersion >= 4 {
-		return
-	}
-	slMgr, ok := ti.executor.(StopLossManager)
-	if !ok {
-		return
-	}
-	if err := slMgr.CancelStopLossOrders(dec.Symbol); err != nil {
-		logger.Debugf("[%s] 撤旧 SL 失败（%s，不阻断主流程）: %v | %s", ti.traderID, where, err, dec.Symbol)
-	} else {
-		logger.Debugf("🧹 [%s] 撤旧 SL 完成 | %s @%s", ti.traderID, dec.Symbol, where)
-	}
-}
-
-// refreshStopLossAfterExecute 执行成功后用实际成交均价精确重挂 SL
+// refreshStopLossAfterExecute 执行成功后用实际成交均价精确重挂保护单
 //
 // 调用时机：跟单 OKX 开仓/加仓/部分减仓执行成功 + mapping 更新完成后
-// 平仓（close_long/close_short）不重挂（仓位已清空）
+// 平仓（close_long/close_short）不重挂（仓位已清空，只撤本周期保护单）
 //
 // 实现细节：
-//  1. 通过 GetPositions() 拿到最新本地持仓的 EntryPrice / Quantity（实际成交均价）
-//  2. 用 calcStopLossPrice 算 SL 价
-//  3. 调 SetStopLoss 挂 algo 单
+//  1. 通过 GetPositionsFresh() 拿到最新本地持仓的 EntryPrice / Quantity
+//  2. 用 calcStopLossPrice 算 SL 价（含 clamp / 不可保护判定）
+//  3. 经 upsertV4Protection 状态机挂 algo 单并验证
 //
-// 失败处理：日志告警 + 由 engine.checkStoppedByRisk 的 orphan 兜底 + 估算版 dec.StopLoss 还在
+// 失败处理：进入可保护性状态机（重试退避 → 封顶后 GUARD_UNPROTECTABLE 处置），
+// 禁止静默裸跑
 func (ti *TraderIntegration) refreshStopLossAfterExecute(dec *decision.Decision) {
 	if !ti.shouldManageStopLoss(dec) {
 		return
 	}
 
-	// v4 close: cancel only the order belonging to this lifecycle, after close succeeds.
+	// close: cancel only the order belonging to this lifecycle, after close succeeds.
 	switch dec.Action {
 	case "close_long", "close_short":
-		if ti.engine.config.RiskPolicyVersion >= 4 {
-			ti.cancelV4Protection(dec)
-		}
-		return
-	}
-
-	slMgr, ok := ti.executor.(StopLossManager)
-	if !ok {
-		logger.Debugf("[%s] executor 未实现 StopLossManager，跳过精确重挂 SL", ti.traderID)
+		ti.cancelV4Protection(dec)
 		return
 	}
 
 	// 拿最新持仓
-	positions, err := ti.executor.GetPositions()
-	if ti.engine.config.RiskPolicyVersion >= 4 {
-		if fresh, ok := ti.executor.(FreshPositionsProvider); ok {
-			positions, err = fresh.GetPositionsFresh()
-		}
-	}
+	positions, err := ti.getFreshPositions()
 	if err != nil {
 		logger.Warnf("⚠️ [%s] 重挂 SL 失败（GetPositions 错误）: %v | %s", ti.traderID, err, dec.Symbol)
-		if ti.engine.config.RiskPolicyVersion >= 4 {
-			ti.markProtectionIssueForDecision(dec, store.CopyGuardProtectionUnknown, "PROTECTION_VERIFY_UNKNOWN", err, 0)
-		}
+		ti.markProtectionIssueForDecision(dec, store.CopyGuardProtectionUnknown, "PROTECTION_VERIFY_UNKNOWN", err, 0)
 		return
 	}
 
@@ -2103,9 +2181,7 @@ func (ti *TraderIntegration) refreshStopLossAfterExecute(dec *decision.Decision)
 
 	if matchedPos == nil {
 		logger.Warnf("⚠️ [%s] 重挂 SL：找不到本地仓位 | %s %s posId=%s", ti.traderID, dec.Symbol, expectedSide, dec.LeaderPosID)
-		if ti.engine.config.RiskPolicyVersion >= 4 {
-			ti.markProtectionIssueForDecision(dec, store.CopyGuardProtectionDegraded, "PROTECTION_DEGRADED", fmt.Errorf("fresh follower position not found"), 0)
-		}
+		ti.markProtectionIssueForDecision(dec, store.CopyGuardProtectionDegraded, "PROTECTION_DEGRADED", fmt.Errorf("fresh follower position not found"), 0)
 		return
 	}
 
@@ -2118,18 +2194,14 @@ func (ti *TraderIntegration) refreshStopLossAfterExecute(dec *decision.Decision)
 	}
 	if entryPrice <= 0 || quantity <= 0 {
 		logger.Warnf("⚠️ [%s] 重挂 SL：本地仓位数据异常 | entry=%.4f qty=%.4f", ti.traderID, entryPrice, quantity)
-		if ti.engine.config.RiskPolicyVersion >= 4 {
-			ti.markProtectionIssueForDecision(dec, store.CopyGuardProtectionDegraded, "PROTECTION_DEGRADED", fmt.Errorf("invalid fresh position entry or quantity"), 0)
-		}
+		ti.markProtectionIssueForDecision(dec, store.CopyGuardProtectionDegraded, "PROTECTION_DEGRADED", fmt.Errorf("invalid fresh position entry or quantity"), 0)
 		return
 	}
 
 	followerEquity := ti.getEquityFunc()()
 	if followerEquity <= 0 {
 		logger.Warnf("⚠️ [%s] 重挂 SL：跟随者权益为零", ti.traderID)
-		if ti.engine.config.RiskPolicyVersion >= 4 {
-			ti.markProtectionIssueForDecision(dec, store.CopyGuardProtectionUnknown, "PROTECTION_VERIFY_UNKNOWN", fmt.Errorf("account equity unavailable"), 0)
-		}
+		ti.markProtectionIssueForDecision(dec, store.CopyGuardProtectionUnknown, "PROTECTION_VERIFY_UNKNOWN", fmt.Errorf("account equity unavailable"), 0)
 		return
 	}
 
@@ -2151,88 +2223,32 @@ func (ti *TraderIntegration) refreshStopLossAfterExecute(dec *decision.Decision)
 	slResult, err := calcStopLossPrice(ti.engine.config, slInput)
 	if err != nil {
 		logger.Warnf("⚠️ [%s] 重挂 SL：算法失败: %v | %s", ti.traderID, err, dec.Symbol)
-		if ti.engine.config.RiskPolicyVersion >= 4 {
-			ti.markProtectionIssueForDecision(dec, store.CopyGuardProtectionDegraded, "PROTECTION_DEGRADED", err, 0)
-		}
+		ti.markProtectionIssueForDecision(dec, store.CopyGuardProtectionDegraded, "PROTECTION_DEGRADED", err, 0)
 		return
 	}
+	// v5 可保护性状态机：算不出可挂的止损价（clamp 后仍不可行 / 开仓即触发）
+	// → 不再无限重试，直接进入 GUARD_UNPROTECTABLE 处置（按配置平仓或标红裸跑）
 	if slResult.SLPrice <= 0 {
-		if slResult.OpenImmediateHit {
-			logger.Warnf("⚠️ [%s] 重挂 SL：SL 距离过近(<0.1%%)，跳过挂单 | %s entry=%.4f", ti.traderID, dec.Symbol, entryPrice)
+		cause := fmt.Errorf("no valid protective trigger price")
+		if slResult.Unprotectable {
+			cause = fmt.Errorf("stop price inside liquidation buffer even after clamp (liq=%.4f)", liquidationPrice)
+		} else if slResult.OpenImmediateHit {
+			cause = fmt.Errorf("stop distance below 0.1%% of entry (entry=%.4f)", entryPrice)
 		}
-		if ti.engine.config.RiskPolicyVersion >= 4 {
-			ti.markProtectionIssueForDecision(dec, store.CopyGuardProtectionDegraded, "PROTECTION_DEGRADED", fmt.Errorf("no valid protective trigger price"), 0)
+		if slResult.Unprotectable || slResult.OpenImmediateHit {
+			ti.handleUnprotectableForDecision(dec, expectedSide, quantity, entryPrice, cause)
+			return
 		}
+		ti.markProtectionIssueForDecision(dec, store.CopyGuardProtectionDegraded, "PROTECTION_DEGRADED", cause, 0)
 		return
 	}
-	if ti.engine.config.RiskPolicyVersion >= 4 {
-		if slResult.LiquidationPriceIgnored {
-			logger.Warnf("⚠️ [%s] 强平价方向异常已忽略 | %s %s entry=%.4f liq=%.4f（继续按 ATR 挂保护单）", ti.traderID, dec.Symbol, expectedSide, entryPrice, liquidationPrice)
-			if cycle, cycleErr := ti.store.CopyTrade().GetOpenCopyGuardCycle(ti.traderID, dec.LeaderPosID); cycleErr == nil {
-				_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "LIQ_PRICE_IGNORED", Price: entryPrice, Metadata: map[string]interface{}{"liquidation_price": liquidationPrice, "side": expectedSide, "reason": "direction implausible"}})
-			}
+	if slResult.LiquidationPriceIgnored {
+		logger.Warnf("⚠️ [%s] 强平价方向异常已忽略 | %s %s entry=%.4f liq=%.4f（继续按 ATR 挂保护单）", ti.traderID, dec.Symbol, expectedSide, entryPrice, liquidationPrice)
+		if cycle, cycleErr := ti.store.CopyTrade().GetOpenCopyGuardCycle(ti.traderID, dec.LeaderPosID); cycleErr == nil {
+			_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "LIQ_PRICE_IGNORED", Price: entryPrice, Metadata: map[string]interface{}{"liquidation_price": liquidationPrice, "side": expectedSide, "reason": "direction implausible"}})
 		}
-		ti.upsertV4Protection(dec, expectedSide, quantity, entryPrice, slResult)
-		return
 	}
-
-	// 先撤旧（双保险，覆盖 ExecuteDecision 内部自动挂的估算 SL）
-	if err := slMgr.CancelStopLossOrders(dec.Symbol); err != nil {
-		logger.Debugf("[%s] 重挂前撤旧 SL 失败（不阻断）: %v", ti.traderID, err)
-	}
-
-	// 挂新（用实际成交价计算）
-	positionSide := "LONG"
-	if expectedSide == "short" {
-		positionSide = "SHORT"
-	}
-	if err := slMgr.SetStopLoss(dec.Symbol, positionSide, quantity, slResult.SLPrice); err != nil {
-		logger.Errorf("❌ [%s] 重挂 SL 失败（账户保护可能失效）| %s %s SL=%.4f: %v",
-			ti.traderID, dec.Symbol, positionSide, slResult.SLPrice, err)
-
-		// 邮件告警：SL 挂单失败 = 账户保护可能失效，用户必须感知
-		// RateKey 按 trader+symbol+side 限流，避免同一仓位反复挂失败时邮件爆量
-		traderName := ti.traderDisplayName()
-		alertKey := fmt.Sprintf("sl_attach_failed|%s|%s|%s", ti.traderID, dec.Symbol, positionSide)
-		notifier.Notify(notifier.Alert{
-			Category: "copy_trade",
-			TraderID: ti.traderID,
-			Title:    fmt.Sprintf("%s | 账户保护 SL 挂单失败（%s %s）", traderName, dec.Symbol, positionSide),
-			Body: fmt.Sprintf(
-				"账户保护止损单挂单失败 (Stop Loss Attach Failed)\n\n"+
-					"Trader Name: %s\n"+
-					"Trader ID:   %s\n"+
-					"Symbol:      %s\n"+
-					"Side:        %s\n"+
-					"Entry Price: %.4f\n"+
-					"SL Price:    %.4f (距离 %.2f%%, 控线=%s)\n"+
-					"Quantity:    %.4f\n\n"+
-					"错误信息 (Error):\n%v\n\n"+
-					"⚠️ 该仓位当前没有交易所托管的止损单，账户保护可能失效。\n"+
-					"建议：手动在 OKX 上检查该仓位的 algo 条件单，或重启该交易员让对账逻辑重新挂单。",
-				traderName, ti.traderID, dec.Symbol, positionSide,
-				entryPrice, slResult.SLPrice, (slResult.SLDistance/entryPrice)*100, slResult.GovernedBy,
-				quantity, err),
-			RateKey:  alertKey,
-			DedupKey: alertKey,
-			Fields: map[string]string{
-				"TraderName": traderName,
-				"Symbol":     dec.Symbol,
-				"Side":       positionSide,
-				"EntryPrice": fmt.Sprintf("%.4f", entryPrice),
-				"SLPrice":    fmt.Sprintf("%.4f", slResult.SLPrice),
-				"Quantity":   fmt.Sprintf("%.4f", quantity),
-				"GovernedBy": slResult.GovernedBy,
-				"LastError":  err.Error(),
-			},
-		})
-		return
-	}
-
-	logger.Infof("🛑 [%s] SL 精确重挂 | %s %s | 入场=%.4f SL=%.4f 距离=%.4f(%.2f%%) 控线=%s qty=%.4f",
-		ti.traderID, dec.Symbol, positionSide,
-		entryPrice, slResult.SLPrice, slResult.SLDistance,
-		(slResult.SLDistance/entryPrice)*100, slResult.GovernedBy, quantity)
+	ti.upsertV4Protection(dec, expectedSide, quantity, entryPrice, slResult)
 }
 
 func (ti *TraderIntegration) upsertV4Protection(dec *decision.Decision, side string, quantity, entryPrice float64, result *StopLossCalcResult) {
@@ -2363,25 +2379,44 @@ func (ti *TraderIntegration) upsertV4Protection(dec *decision.Decision, side str
 		return
 	}
 	_ = ti.store.CopyTrade().UpsertCopyGuardProtectiveOrder(&store.CopyGuardProtectiveOrder{CycleID: cycle.ID, TraderID: ti.traderID, AlgoID: verified.AlgoID, AlgoClientID: verified.ClientID, Symbol: dec.Symbol, Side: side, MarginMode: dec.MarginMode, Quantity: verified.Quantity, TriggerPrice: result.SLPrice, TriggerType: ti.engine.config.RiskTriggerPriceType, Status: "live"})
-	_ = ti.store.CopyTrade().UpdateCopyGuardProtectionHealth(cycle.ID, store.CopyGuardProtectionVerified, coverage, "", followerPosID, "", false)
+	// v5 可保护性状态机：clamp 挂出的保护单是"已保护但降级"，健康状态记
+	// CLAMPED（UI 醒目提示随时可能被扫损），不算 VERIFIED。
+	healthStatus, healthMsg := store.CopyGuardProtectionVerified, ""
+	if result.Clamped {
+		healthStatus = store.CopyGuardProtectionClamped
+		healthMsg = fmt.Sprintf("trigger clamped to liquidation safety line (sl=%.4f, distance %.2f%%)", result.SLPrice, (result.SLDistance/entryPrice)*100)
+		logger.Warnf("⚠️ [%s] Copy Guard 保护单已 clamp 到强平安全线 | cycle=%d %s %s SL=%.4f 距离=%.4f", ti.traderID, cycle.ID, dec.Symbol, side, result.SLPrice, result.SLDistance)
+	}
+	_ = ti.store.CopyTrade().UpdateCopyGuardProtectionHealth(cycle.ID, healthStatus, coverage, healthMsg, followerPosID, "", false)
 	slDistancePct := float64(0)
 	if entryPrice > 0 {
 		slDistancePct = result.SLDistance / entryPrice
 	}
 	_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "PROTECTIVE_STOP_ACTIVE", Price: result.SLPrice, Quantity: quantity, Metadata: map[string]interface{}{
-		"algo_id":           live.AlgoID,
-		"expected_loss_pct": result.ExpectedLossPct,
-		"expected_loss_usd": result.ExpectedLossUSD,
-		"governed_by":       result.GovernedBy,
-		"noise_conflict":    result.NoiseConflict,
-		"entry_price":       entryPrice,
-		"sl_distance":       result.SLDistance,
-		"sl_distance_pct":   slDistancePct,
-		"atr_value":         result.ATRValue,
-		"atr_distance":      result.ATRDistance,
-		"leverage":          dec.Leverage,
-		"account_equity":    cycle.AccountEquity,
+		"algo_id":                  live.AlgoID,
+		"expected_loss_pct":        result.ExpectedLossPct,
+		"expected_loss_usd":        result.ExpectedLossUSD,
+		"expected_margin_loss_pct": result.ExpectedMarginLossPct,
+		"distance_atr_ratio":       result.DistanceATRRatio,
+		"governed_by":              result.GovernedBy,
+		"noise_conflict":           result.NoiseConflict,
+		"clamped":                  result.Clamped,
+		"entry_price":              entryPrice,
+		"sl_distance":              result.SLDistance,
+		"sl_distance_pct":          slDistancePct,
+		"atr_value":                result.ATRValue,
+		"atr_distance":             result.ATRDistance,
+		"leverage":                 dec.Leverage,
+		"account_equity":           cycle.AccountEquity,
 	}})
+	if result.Clamped {
+		_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "PROTECTION_CLAMPED", Price: result.SLPrice, Quantity: quantity, Metadata: map[string]interface{}{
+			"algo_id":         live.AlgoID,
+			"entry_price":     entryPrice,
+			"sl_distance_pct": slDistancePct,
+			"governed_by":     result.GovernedBy,
+		}})
+	}
 }
 
 // isProtectiveStopFired reports whether the OKX algo state means the stop has
@@ -2705,9 +2740,9 @@ func (ti *TraderIntegration) sendStopLossTriggerAlert(event *RiskEvent) {
 	recoveryHint := "等领航员完全平掉旧 posId 后，下次他重新开仓时跟单系统自动恢复跟随"
 	if ti.engine != nil && ti.engine.config != nil && ti.engine.config.RiskReentryEnabled {
 		recoveryHint = fmt.Sprintf(
-			"已启用二次进场：若价格回到入场价附近(±%.2f%%)、领航员浮亏收窄一半、未继续加仓 → 自动按 %.0f%% 系数重入；\n"+
+			"已启用确认式二次进场：价格回归重入边界并连续确认、冷却期结束且重入后仓位可保护 → 自动按 %.0f%% 系数重入；\n"+
 				"  或等领航员完全平掉旧 posId，下次他新开仓时自动恢复跟随",
-			ti.engine.config.RiskReentryTolerance*100, ti.engine.config.RiskReentryRatio*100)
+			ti.engine.config.RiskReentryRatio*100)
 	}
 
 	body := fmt.Sprintf(

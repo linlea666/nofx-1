@@ -280,10 +280,11 @@ func TestObservationUpdatesGuardClosedCycle(t *testing.T) {
 	}
 }
 
-// 默认值代次 3 迁移：仅把等于旧默认值的 max_chase(0)/cycle_max_loss(0.10)
-// 替换为新默认值；用户显式配置的其他值保留；已达当前代次的策略不再重扫。
-func TestMigratePolicyDefaultsV3(t *testing.T) {
-	st, err := New(filepath.Join(t.TempDir(), "defaults-v3.db"))
+// 默认值代次迁移（当前代次 4）：仅把等于旧默认值的 max_chase(0)/cooldown(60)/
+// max_reentries(2) 替换为新默认值；用户显式配置的其他值保留；已达当前代次
+// 的策略不再重扫。
+func TestMigratePolicyDefaults(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "defaults-v4.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -317,22 +318,22 @@ func TestMigratePolicyDefaultsV3(t *testing.T) {
 		return p
 	}
 
-	// 代次 2 存量策略：max_chase/cycle_max_loss 仍是旧默认值 → 应迁移
-	seed("t-old-defaults", CopyGuardPolicy{Version: 4, ReentryMaxChaseATR: 0, CycleMaxLossPct: 0.10, ReentryCooldownSec: 300, DefaultsVersion: 2})
-	// 代次 2 存量策略：用户显式改过 → 应保留
-	seed("t-custom", CopyGuardPolicy{Version: 4, ReentryMaxChaseATR: 1.2, CycleMaxLossPct: 0.30, ReentryCooldownSec: 300, DefaultsVersion: 2})
+	// 低代次存量策略：max_chase/cooldown/max_reentries 仍是旧默认值 → 应迁移
+	seed("t-old-defaults", CopyGuardPolicy{Version: 4, ReentryMaxChaseATR: 0, ReentryCooldownSec: 60, MaxReentries: 2, DefaultsVersion: 2})
+	// 低代次存量策略：用户显式改过 → 应保留
+	seed("t-custom", CopyGuardPolicy{Version: 4, ReentryMaxChaseATR: 1.2, ReentryCooldownSec: 900, MaxReentries: 3, DefaultsVersion: 2})
 	// 已是当前代次：即使值等于旧默认也不得再动（用户设回旧值的选择）
-	seed("t-current", CopyGuardPolicy{Version: 4, ReentryMaxChaseATR: 0, CycleMaxLossPct: 0.10, ReentryCooldownSec: 300, DefaultsVersion: copyGuardPolicyDefaultsVersion})
+	seed("t-current", CopyGuardPolicy{Version: 4, ReentryMaxChaseATR: 0, ReentryCooldownSec: 60, MaxReentries: 2, DefaultsVersion: copyGuardPolicyDefaultsVersion})
 
 	cs.migrateCopyGuardPolicyDefaults()
 
-	if p := load("t-old-defaults"); p.ReentryMaxChaseATR != 0.5 || p.CycleMaxLossPct != 1.0 || p.DefaultsVersion != copyGuardPolicyDefaultsVersion {
-		t.Fatalf("old defaults must migrate to 0.5/1.0 with version bump: %+v", p)
+	if p := load("t-old-defaults"); p.ReentryMaxChaseATR != 0.5 || p.ReentryCooldownSec != 300 || p.MaxReentries != 1 || p.DefaultsVersion != copyGuardPolicyDefaultsVersion {
+		t.Fatalf("old defaults must migrate to 0.5/300s/1 with version bump: %+v", p)
 	}
-	if p := load("t-custom"); p.ReentryMaxChaseATR != 1.2 || p.CycleMaxLossPct != 0.30 || p.DefaultsVersion != copyGuardPolicyDefaultsVersion {
+	if p := load("t-custom"); p.ReentryMaxChaseATR != 1.2 || p.ReentryCooldownSec != 900 || p.MaxReentries != 3 || p.DefaultsVersion != copyGuardPolicyDefaultsVersion {
 		t.Fatalf("explicit values must be preserved: %+v", p)
 	}
-	if p := load("t-current"); p.ReentryMaxChaseATR != 0 || p.CycleMaxLossPct != 0.10 {
+	if p := load("t-current"); p.ReentryMaxChaseATR != 0 || p.ReentryCooldownSec != 60 || p.MaxReentries != 2 {
 		t.Fatalf("policies at the current version must not be rescanned: %+v", p)
 	}
 }

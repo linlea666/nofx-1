@@ -18,9 +18,14 @@ const (
 	CopyGuardLeaderReversed    = "LEADER_REVERSED"
 	CopyGuardAttemptsExhausted = "ATTEMPTS_EXHAUSTED"
 	CopyGuardWatchTimeout      = "WATCH_TIMEOUT"
-	// CYCLE_LOSS_CAPPED: 周期累计已实现亏损触达 risk_cycle_max_loss_pct 熔断线，
-	// 不再重入，仅观察至领航员平仓（与 ATTEMPTS_EXHAUSTED 同为终态观察）。
+	// CYCLE_LOSS_CAPPED: 周期累计亏损熔断（v4.1），v5 已下线——仓位止损 +
+	// 账户硬兜底 + max_reentries 已完整覆盖其职能。常量仅保留用于历史数据
+	// 的展示与清理，引擎不再产生该状态。
 	CopyGuardCycleLossCapped = "CYCLE_LOSS_CAPPED"
+	// GUARD_UNPROTECTABLE: v5 可保护性状态机终态之一——保护单确认不可建立
+	// （clamp 后仍不可行）且处置模式为 follow（裸跑），周期继续跟随但 UI 标红。
+	// close 模式下仓位被立即平掉，周期进入 STOPPED_WATCHING 观察。
+	CopyGuardUnprotectable = "GUARD_UNPROTECTABLE"
 )
 
 const (
@@ -44,6 +49,14 @@ const (
 	CopyGuardProtectionDegraded  = "DEGRADED"
 	CopyGuardProtectionTriggered = "TRIGGERED"
 	CopyGuardProtectionCanceled  = "CANCELED"
+	// CLAMPED (v5): 保护单已挂出且交易所确认 live，但触发价被钳到强平
+	// 安全线（比策略期望价更紧）。属于"已保护但保护质量降级"，UI 需醒目
+	// 提示随时可能被扫损。
+	CopyGuardProtectionClamped = "CLAMPED"
+	// UNPROTECTABLE (v5): 保护单确认不可建立（clamp 后仍不可行），且处置
+	// 模式为 follow——仓位裸跑，UI 必须标红。close 模式不落此状态（仓位
+	// 已被强制平掉）。
+	CopyGuardProtectionUnprotectable = "UNPROTECTABLE"
 )
 
 // CopyGuardPolicy is persisted as JSON so v4 can evolve without widening the legacy v3 table.
@@ -64,22 +77,27 @@ type CopyGuardPolicy struct {
 	WatchTimeoutMinutes   int     `json:"watch_timeout_minutes"`
 	MigrationConfirmed    bool    `json:"migration_confirmed"`
 	AddonBudgetPct        float64 `json:"addon_budget_pct"`
-	// v4.1 止损噪音下限 / 重入加严（字段含义见 store.CopyTradeConfig 同名注释）
-	StopNoiseFloorATR         float64 `json:"stop_noise_floor_atr"`
+	// v4.1 重入加严（字段含义见 store.CopyTradeConfig 同名注释）
+	// v5 注：stop_noise_floor_atr / cycle_max_loss_pct 已下线，旧 JSON 中的
+	// 存量值在反序列化时被忽略。
 	ReentryMinRecoveryATR     float64 `json:"reentry_min_recovery_atr"`
 	ReentryCooldownEscalation float64 `json:"reentry_cooldown_escalation"`
 	ReentryRecoveryEscalation float64 `json:"reentry_recovery_escalation"`
-	CycleMaxLossPct           float64 `json:"cycle_max_loss_pct"`
+	// v5 可保护性状态机 / 重入噪音档（字段含义见 store.CopyTradeConfig 同名注释）
+	UnprotectableAction  string `json:"unprotectable_action"`
+	ReentryNoiseOverride bool   `json:"reentry_noise_override"`
 	// DefaultsVersion: 默认值代次书签。
 	//   2 = v4.1 默认值迁移（risk_account_pct 0.02→0.20、cooldown 60→300、
 	//       leverage_max_loss 0.5→0.3）
 	//   3 = 重入默认放宽（max_chase 0→0.5、cycle_max_loss 0.10→1.0）
+	//   4 = v5 两层硬止损（leverage_max_loss 0.3→0.2、account_pct 0.20→0.10、
+	//       max_reentries 2→1；均只替换等于旧默认值的行）
 	DefaultsVersion int `json:"defaults_version"`
 }
 
 // copyGuardPolicyDefaultsVersion 当前默认值代次；migrateCopyGuardPolicyDefaults
 // 只处理低于该值的存量策略。
-const copyGuardPolicyDefaultsVersion = 3
+const copyGuardPolicyDefaultsVersion = 4
 
 type CopyGuardCycle struct {
 	ID                  int64   `json:"id"`
@@ -410,7 +428,7 @@ func scanCopyGuardWatchSample(scan func(dest ...interface{}) error) (*CopyGuardW
 }
 
 func policyFromConfig(c *CopyTradeConfig) CopyGuardPolicy {
-	return CopyGuardPolicy{Version: c.RiskPolicyVersion, StopMode: c.RiskStopMode, ATRPeriod: c.RiskATRPeriod, ATRCacheMaxAgeMinutes: c.RiskATRCacheMaxAgeMinutes, ATRFallbackPct: c.RiskATRFallbackPct, TriggerPriceType: c.RiskTriggerPriceType, SlippageBufferBPS: c.RiskSlippageBufferBPS, LiquidationBufferATR: c.RiskLiquidationBufferATR, MaxReentries: c.RiskMaxReentries, ReentryBandATR: c.RiskReentryBandATR, ReentryCooldownSec: c.RiskReentryCooldownSeconds, ReentryMaxChaseATR: c.RiskReentryMaxChaseATR, MaxATRExpansion: c.RiskReentryMaxATRExpansion, WatchTimeoutMinutes: c.RiskWatchTimeoutMinutes, MigrationConfirmed: c.RiskMigrationConfirmed, AddonBudgetPct: c.RiskAddonBudgetPct, StopNoiseFloorATR: c.RiskStopNoiseFloorATR, ReentryMinRecoveryATR: c.RiskReentryMinRecoveryATR, ReentryCooldownEscalation: c.RiskReentryCooldownEscalation, ReentryRecoveryEscalation: c.RiskReentryRecoveryEscalation, CycleMaxLossPct: c.RiskCycleMaxLossPct, DefaultsVersion: copyGuardPolicyDefaultsVersion}
+	return CopyGuardPolicy{Version: c.RiskPolicyVersion, StopMode: c.RiskStopMode, ATRPeriod: c.RiskATRPeriod, ATRCacheMaxAgeMinutes: c.RiskATRCacheMaxAgeMinutes, ATRFallbackPct: c.RiskATRFallbackPct, TriggerPriceType: c.RiskTriggerPriceType, SlippageBufferBPS: c.RiskSlippageBufferBPS, LiquidationBufferATR: c.RiskLiquidationBufferATR, MaxReentries: c.RiskMaxReentries, ReentryBandATR: c.RiskReentryBandATR, ReentryCooldownSec: c.RiskReentryCooldownSeconds, ReentryMaxChaseATR: c.RiskReentryMaxChaseATR, MaxATRExpansion: c.RiskReentryMaxATRExpansion, WatchTimeoutMinutes: c.RiskWatchTimeoutMinutes, MigrationConfirmed: c.RiskMigrationConfirmed, AddonBudgetPct: c.RiskAddonBudgetPct, ReentryMinRecoveryATR: c.RiskReentryMinRecoveryATR, ReentryCooldownEscalation: c.RiskReentryCooldownEscalation, ReentryRecoveryEscalation: c.RiskReentryRecoveryEscalation, UnprotectableAction: c.RiskUnprotectableAction, ReentryNoiseOverride: c.RiskReentryNoiseOverride, DefaultsVersion: copyGuardPolicyDefaultsVersion}
 }
 
 func (s *CopyTradeStore) saveCopyGuardPolicy(c *CopyTradeConfig) error {
@@ -444,11 +462,11 @@ func (s *CopyTradeStore) loadCopyGuardPolicy(c *CopyTradeConfig) error {
 	c.RiskReentryMaxATRExpansion, c.RiskWatchTimeoutMinutes = p.MaxATRExpansion, p.WatchTimeoutMinutes
 	c.RiskMigrationConfirmed = p.MigrationConfirmed
 	c.RiskAddonBudgetPct = p.AddonBudgetPct
-	c.RiskStopNoiseFloorATR = p.StopNoiseFloorATR
 	c.RiskReentryMinRecoveryATR = p.ReentryMinRecoveryATR
 	c.RiskReentryCooldownEscalation = p.ReentryCooldownEscalation
 	c.RiskReentryRecoveryEscalation = p.ReentryRecoveryEscalation
-	c.RiskCycleMaxLossPct = p.CycleMaxLossPct
+	c.RiskUnprotectableAction = p.UnprotectableAction
+	c.RiskReentryNoiseOverride = p.ReentryNoiseOverride
 	return nil
 }
 
@@ -460,8 +478,11 @@ func (s *CopyTradeStore) loadCopyGuardPolicy(c *CopyTradeConfig) error {
 //
 // 代次 3（重入默认放宽）：
 //   - reentry_max_chase_atr：0（旧默认，完全不追价、易错过恢复）→ 0.5
-//   - cycle_max_loss_pct：0.10（旧默认）→ 1.0（默认关闭熔断，仓位止损 +
-//     账户兜底已承担主要风控）
+//
+// 代次 4（v5 两层硬止损 + 确认式重入）：
+//   - risk_leverage_max_loss：0.30（v4.1 默认）→ 0.20（用户确认的 v5 仓位止损）
+//   - risk_account_pct：0.20（v4.1 默认）→ 0.10（账户硬兜底只锁灾难敞口）
+//   - max_reentries：2（旧默认）→ 1（确认式重入下默认只重入一次）
 //
 // 仅当存量值等于旧默认值时才替换（用户显式改过的值保留）；处理后写入当前
 // defaults_version 书签，幂等且不会覆盖之后用户再设回旧值的选择。
@@ -499,8 +520,8 @@ func (s *CopyTradeStore) migrateCopyGuardPolicyDefaults() {
 		if p.ReentryMaxChaseATR == 0 {
 			p.ReentryMaxChaseATR = 0.5
 		}
-		if p.CycleMaxLossPct == 0.10 {
-			p.CycleMaxLossPct = 1.0
+		if p.DefaultsVersion < 4 && p.MaxReentries == 2 {
+			p.MaxReentries = 1
 		}
 		p.DefaultsVersion = copyGuardPolicyDefaultsVersion
 		b, err := json.Marshal(p)
@@ -510,9 +531,12 @@ func (s *CopyTradeStore) migrateCopyGuardPolicyDefaults() {
 		if _, err := s.db.Exec(`UPDATE copy_guard_policies SET policy_json=?, updated_at=CURRENT_TIMESTAMP WHERE trader_id=?`, string(b), item.traderID); err != nil {
 			continue
 		}
-		// 主表列：仅把等于旧默认值的行替换为新默认值
+		// 主表列：仅把等于旧默认值的行替换为新默认值（代次 2 与代次 4 规则
+		// 级联：0.02→0.20→0.10 / 0.50→0.30→0.20，一次跑齐）
 		_, _ = s.db.Exec(`UPDATE copy_trade_configs SET risk_account_pct=0.20 WHERE trader_id=? AND risk_account_pct=0.02`, item.traderID)
 		_, _ = s.db.Exec(`UPDATE copy_trade_configs SET risk_leverage_max_loss=0.30 WHERE trader_id=? AND risk_leverage_max_loss=0.50`, item.traderID)
+		_, _ = s.db.Exec(`UPDATE copy_trade_configs SET risk_account_pct=0.10 WHERE trader_id=? AND risk_account_pct=0.20`, item.traderID)
+		_, _ = s.db.Exec(`UPDATE copy_trade_configs SET risk_leverage_max_loss=0.20 WHERE trader_id=? AND risk_leverage_max_loss=0.30`, item.traderID)
 	}
 }
 
@@ -843,7 +867,11 @@ func metadataString(metadata map[string]interface{}, key string) string {
 // follower position vanished while the leader still holds): the cycle enters
 // STOPPED_WATCHING and the current attempt is closed with the observed price
 // so it can be reconciled later, mirroring RecordCopyGuardStop.
-func (s *CopyTradeStore) RecordCopyGuardStopObserved(cycleID int64, traderID string, attemptNo int, atr, price, quantity, pnl float64, metadata map[string]interface{}) error {
+//
+// 统计口径修正（v5）：事件 pnl 字段不再写入领航员浮亏（旧行为把领航员的
+// -358 记成了跟随者盈亏）；跟随者真实盈亏由 attempt 对账（ATTEMPT_RECONCILED）
+// 补全，领航员参考信息放 metadata。
+func (s *CopyTradeStore) RecordCopyGuardStopObserved(cycleID int64, traderID string, attemptNo int, atr, price, quantity float64, metadata map[string]interface{}) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -856,7 +884,7 @@ func (s *CopyTradeStore) RecordCopyGuardStopObserved(cycleID int64, traderID str
 		return err
 	}
 	raw, _ := json.Marshal(metadata)
-	if _, err = tx.Exec(`INSERT INTO copy_guard_events(cycle_id,trader_id,type,price,quantity,pnl,metadata_json) VALUES(?,?,?,?,?,?,?)`, cycleID, traderID, "STOP_CONFIRMED", price, quantity, pnl, string(raw)); err != nil {
+	if _, err = tx.Exec(`INSERT INTO copy_guard_events(cycle_id,trader_id,type,price,quantity,metadata_json) VALUES(?,?,?,?,?,?)`, cycleID, traderID, "STOP_CONFIRMED", price, quantity, string(raw)); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -1250,23 +1278,37 @@ type CopyGuardSummary struct {
 	PendingProtectionCount int     `json:"pending_protection_count"`
 	UnknownCount           int     `json:"unknown_count"`
 	DegradedCount          int     `json:"degraded_count"`
-	AccountingPendingCount int     `json:"accounting_pending_count"`
+	// v5 可保护性状态机：活跃仓位中止损被强平价钳紧 / 完全无法保护（裸跑）的数量
+	ClampedCount           int `json:"clamped_count"`
+	UnprotectableCount     int `json:"unprotectable_count"`
+	AccountingPendingCount int `json:"accounting_pending_count"`
 	// AccountingDelayedCount: cycles whose OKX settlement data is late; the
 	// system keeps retrying automatically (formerly "needs review").
-	AccountingDelayedCount       int                   `json:"accounting_delayed_count"`
-	AccountingUnrecoverableCount int                   `json:"accounting_unrecoverable_count"`
-	LegacyUnverifiedCount        int                   `json:"legacy_unverified_count"`
-	AverageCoverage              float64               `json:"average_coverage"`
-	IgnoredCount                 int                   `json:"ignored_count"`
-	ReentryFirst                 int                   `json:"reentry_first"`
-	ReentrySecond                int                   `json:"reentry_second"`
-	ReentryThirdPlus             int                   `json:"reentry_third_plus"`
-	MaxAvoidedLoss               float64               `json:"max_avoided_loss"`
-	MaxOpportunityCost           float64               `json:"max_opportunity_cost"`
-	ProtectionMissingSeconds     float64               `json:"protection_missing_seconds"`
-	ReentrySuccessRate           float64               `json:"reentry_success_rate"`
-	FalseKillRate                float64               `json:"false_kill_rate"`
-	Trend                        []CopyGuardTrendPoint `json:"trend"`
+	AccountingDelayedCount       int     `json:"accounting_delayed_count"`
+	AccountingUnrecoverableCount int     `json:"accounting_unrecoverable_count"`
+	LegacyUnverifiedCount        int     `json:"legacy_unverified_count"`
+	AverageCoverage              float64 `json:"average_coverage"`
+	IgnoredCount                 int     `json:"ignored_count"`
+	ReentryFirst                 int     `json:"reentry_first"`
+	ReentrySecond                int     `json:"reentry_second"`
+	ReentryThirdPlus             int     `json:"reentry_third_plus"`
+	MaxAvoidedLoss               float64 `json:"max_avoided_loss"`
+	MaxOpportunityCost           float64 `json:"max_opportunity_cost"`
+	ProtectionMissingSeconds     float64 `json:"protection_missing_seconds"`
+	ReentrySuccessRate           float64 `json:"reentry_success_rate"`
+	FalseKillRate                float64 `json:"false_kill_rate"`
+	// v5 统计口径修正：比率必须带样本数展示（"误杀率 66.7%（3 样本）"单独
+	// 展示会严重误导），估算基线的净效果与实测口径分层列示。
+	ReentrySampleCount int `json:"reentry_sample_count"` // 重入成功率的分母（已结束的重入 attempt 数）
+	StoppedCycleCount  int `json:"stopped_cycle_count"`  // 误杀率的分母（已对账且发生过止损的周期数）
+	FalseKillCount     int `json:"false_kill_count"`     // 误杀次数（分子）
+	// EstimatedBaselineCycles: 基线仍为"最后观测价估算"（baseline_source=
+	// last_observed）的已对账周期数；其净效果单独累加在
+	// EstimatedNetGuardEffect，headline NetGuardEffect 中已实测部分 =
+	// NetGuardEffect − EstimatedNetGuardEffect。
+	EstimatedBaselineCycles int                   `json:"estimated_baseline_cycles"`
+	EstimatedNetGuardEffect float64               `json:"estimated_net_guard_effect"`
+	Trend                   []CopyGuardTrendPoint `json:"trend"`
 }
 
 type CopyGuardTrendPoint struct {
@@ -1319,10 +1361,10 @@ func (s *CopyTradeStore) CopyGuardSummary(traderIDs []string, from, to time.Time
 		args = append(args, id)
 	}
 	args = append(args, from.UTC().Format("2006-01-02 15:04:05"), to.UTC().Format("2006-01-02 15:04:05"))
-	q := `SELECT COUNT(DISTINCT trader_id),COUNT(*),COALESCE(SUM(stop_count),0),COALESCE(SUM(reentry_count),0),COALESCE(SUM(CASE WHEN accounting_status='RECONCILED' THEN actual_pnl ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='RECONCILED' THEN baseline_pnl ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='RECONCILED' AND stop_count>0 AND net_guard_effect>0 THEN net_guard_effect ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='RECONCILED' AND stop_count>0 AND net_guard_effect<0 THEN -net_guard_effect ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='RECONCILED' AND stop_count>0 THEN net_guard_effect ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='RECONCILED' THEN fees ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='RECONCILED' THEN funding_fee ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='RECONCILED' THEN liquidation_penalty ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='RECONCILED' THEN slippage ELSE 0 END),0),COALESCE(SUM(CASE WHEN closed_at IS NULL AND protection_status='VERIFIED' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN closed_at IS NULL AND protection_status='PENDING' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN closed_at IS NULL AND protection_status='UNKNOWN' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN closed_at IS NULL AND protection_status='DEGRADED' THEN 1 ELSE 0 END),0),COALESCE(AVG(CASE WHEN closed_at IS NULL THEN protection_coverage END),0),COALESCE(SUM(CASE WHEN accounting_status='PENDING' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='DELAYED' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='UNRECOVERABLE' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='LEGACY_UNVERIFIED' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN reentry_count>=1 THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN reentry_count>=2 THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN reentry_count>=3 THEN 1 ELSE 0 END),0),COALESCE(MAX(CASE WHEN accounting_status='RECONCILED' AND stop_count>0 AND net_guard_effect>0 THEN net_guard_effect ELSE 0 END),0),COALESCE(MAX(CASE WHEN accounting_status='RECONCILED' AND stop_count>0 AND net_guard_effect<0 THEN -net_guard_effect ELSE 0 END),0),COALESCE(SUM(protection_missing_seconds+CASE WHEN protection_missing_at IS NOT NULL THEN MAX(0,(julianday(COALESCE(closed_at,CURRENT_TIMESTAMP))-julianday(protection_missing_at))*86400) ELSE 0 END),0) FROM copy_guard_cycles WHERE trader_id IN (` + marks + `) AND opened_at>=? AND opened_at<?`
+	q := `SELECT COUNT(DISTINCT trader_id),COUNT(*),COALESCE(SUM(stop_count),0),COALESCE(SUM(reentry_count),0),COALESCE(SUM(CASE WHEN accounting_status='RECONCILED' THEN actual_pnl ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='RECONCILED' THEN baseline_pnl ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='RECONCILED' AND stop_count>0 AND net_guard_effect>0 THEN net_guard_effect ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='RECONCILED' AND stop_count>0 AND net_guard_effect<0 THEN -net_guard_effect ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='RECONCILED' AND stop_count>0 THEN net_guard_effect ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='RECONCILED' THEN fees ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='RECONCILED' THEN funding_fee ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='RECONCILED' THEN liquidation_penalty ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='RECONCILED' THEN slippage ELSE 0 END),0),COALESCE(SUM(CASE WHEN closed_at IS NULL AND protection_status='VERIFIED' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN closed_at IS NULL AND protection_status='PENDING' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN closed_at IS NULL AND protection_status='UNKNOWN' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN closed_at IS NULL AND protection_status='DEGRADED' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN closed_at IS NULL AND protection_status='CLAMPED' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN closed_at IS NULL AND protection_status='UNPROTECTABLE' THEN 1 ELSE 0 END),0),COALESCE(AVG(CASE WHEN closed_at IS NULL THEN protection_coverage END),0),COALESCE(SUM(CASE WHEN accounting_status='PENDING' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='DELAYED' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='UNRECOVERABLE' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN accounting_status='LEGACY_UNVERIFIED' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN reentry_count>=1 THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN reentry_count>=2 THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN reentry_count>=3 THEN 1 ELSE 0 END),0),COALESCE(MAX(CASE WHEN accounting_status='RECONCILED' AND stop_count>0 AND net_guard_effect>0 THEN net_guard_effect ELSE 0 END),0),COALESCE(MAX(CASE WHEN accounting_status='RECONCILED' AND stop_count>0 AND net_guard_effect<0 THEN -net_guard_effect ELSE 0 END),0),COALESCE(SUM(protection_missing_seconds+CASE WHEN protection_missing_at IS NOT NULL THEN MAX(0,(julianday(COALESCE(closed_at,CURRENT_TIMESTAMP))-julianday(protection_missing_at))*86400) ELSE 0 END),0) FROM copy_guard_cycles WHERE trader_id IN (` + marks + `) AND opened_at>=? AND opened_at<?`
 	q, args = appendCopyGuardFilter(q, args, filter)
 	var x CopyGuardSummary
-	err := s.db.QueryRow(q, args...).Scan(&x.FollowerCount, &x.CycleCount, &x.StopCount, &x.ReentryCount, &x.ActualPnL, &x.BaselinePnL, &x.AvoidedLoss, &x.OpportunityCost, &x.NetGuardEffect, &x.Fees, &x.FundingFee, &x.LiquidationPenalty, &x.Slippage, &x.ProtectedCount, &x.PendingProtectionCount, &x.UnknownCount, &x.DegradedCount, &x.AverageCoverage, &x.AccountingPendingCount, &x.AccountingDelayedCount, &x.AccountingUnrecoverableCount, &x.LegacyUnverifiedCount, &x.ReentryFirst, &x.ReentrySecond, &x.ReentryThirdPlus, &x.MaxAvoidedLoss, &x.MaxOpportunityCost, &x.ProtectionMissingSeconds)
+	err := s.db.QueryRow(q, args...).Scan(&x.FollowerCount, &x.CycleCount, &x.StopCount, &x.ReentryCount, &x.ActualPnL, &x.BaselinePnL, &x.AvoidedLoss, &x.OpportunityCost, &x.NetGuardEffect, &x.Fees, &x.FundingFee, &x.LiquidationPenalty, &x.Slippage, &x.ProtectedCount, &x.PendingProtectionCount, &x.UnknownCount, &x.DegradedCount, &x.ClampedCount, &x.UnprotectableCount, &x.AverageCoverage, &x.AccountingPendingCount, &x.AccountingDelayedCount, &x.AccountingUnrecoverableCount, &x.LegacyUnverifiedCount, &x.ReentryFirst, &x.ReentrySecond, &x.ReentryThirdPlus, &x.MaxAvoidedLoss, &x.MaxOpportunityCost, &x.ProtectionMissingSeconds)
 	if err != nil {
 		return &x, err
 	}
@@ -1337,12 +1379,16 @@ func (s *CopyTradeStore) CopyGuardSummary(traderIDs []string, from, to time.Time
 	var endedReentries, winningReentries, stoppedCycles, falseKills int
 	_ = s.db.QueryRow(`SELECT COUNT(*),COALESCE(SUM(CASE WHEN pnl>0 THEN 1 ELSE 0 END),0) FROM copy_guard_attempts WHERE cycle_id IN (`+filteredCycleQuery+`) AND attempt_no>0 AND closed_at IS NOT NULL`, rateArgs...).Scan(&endedReentries, &winningReentries)
 	_ = s.db.QueryRow(`SELECT COALESCE(SUM(CASE WHEN stop_count>0 AND accounting_status='RECONCILED' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN stop_count>0 AND accounting_status='RECONCILED' AND baseline_pnl>0 AND net_guard_effect<0 THEN 1 ELSE 0 END),0) FROM copy_guard_cycles WHERE id IN (`+filteredCycleQuery+`)`, rateArgs...).Scan(&stoppedCycles, &falseKills)
+	x.ReentrySampleCount, x.StoppedCycleCount, x.FalseKillCount = endedReentries, stoppedCycles, falseKills
 	if endedReentries > 0 {
 		x.ReentrySuccessRate = float64(winningReentries) / float64(endedReentries)
 	}
 	if stoppedCycles > 0 {
 		x.FalseKillRate = float64(falseKills) / float64(stoppedCycles)
 	}
+	// v5 统计分层：估算基线（最后观测价，领航员真实离场价未获得）的周期
+	// 单列，避免估算值混入 headline 后误导（实测口径 = 总值 − 估算部分）。
+	_ = s.db.QueryRow(`SELECT COUNT(*),COALESCE(SUM(CASE WHEN stop_count>0 THEN net_guard_effect ELSE 0 END),0) FROM copy_guard_cycles WHERE id IN (`+filteredCycleQuery+`) AND accounting_status='RECONCILED' AND baseline_source='last_observed'`, rateArgs...).Scan(&x.EstimatedBaselineCycles, &x.EstimatedNetGuardEffect)
 	trendArgs := make([]interface{}, 0, len(traderIDs)+2)
 	for _, id := range traderIDs {
 		trendArgs = append(trendArgs, id)

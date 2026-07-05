@@ -124,64 +124,62 @@ type CopyConfig struct {
 	BinanceCSRFToken string `json:"binance_csrf_token,omitempty"` // CSRF header csrftoken
 
 	// ============================================================
-	// 账户保护 / 止损兜底（v3 风控）
+	// Copy Guard（账户保护止损，v5：两层硬止损 + 可保护性状态机 + 确认式重入）
 	// 仅 OKX 路径生效；HL/Binance 路径下被忽略
 	// 字段含义见 store/copytrade.go CopyTradeConfig
+	// v3 旧策略与噪音下限/周期熔断/反加仓铁律等参数已于 v5 下线
 	// ============================================================
 	RiskStopLossEnabled  bool    `json:"risk_stop_loss_enabled"`
-	RiskAccountPct       float64 `json:"risk_account_pct"`
-	RiskATREnabled       bool    `json:"risk_atr_enabled"`
+	RiskAccountPct       float64 `json:"risk_account_pct"` // v5：单笔账户最大亏损硬兜底，默认 0.10
 	RiskATRMultiplier    float64 `json:"risk_atr_multiplier"`
 	RiskATRTimeframe     string  `json:"risk_atr_timeframe"`
 	RiskLeverageFallback bool    `json:"risk_leverage_fallback"`
-	RiskLeverageMaxLoss  float64 `json:"risk_leverage_max_loss"`
+	RiskLeverageMaxLoss  float64 `json:"risk_leverage_max_loss"` // v5：仓位保证金止损，默认 0.20
 	RiskReentryEnabled   bool    `json:"risk_reentry_enabled"`
-	RiskReentryRatio     float64 `json:"risk_reentry_ratio"` // v4: × 被止损仓位名义；v3: ×copy_ratio×领航员占比
-	RiskReentryTolerance float64 `json:"risk_reentry_tolerance"`
+	RiskReentryRatio     float64 `json:"risk_reentry_ratio"` // × 被止损仓位名义
 
-	// v3.2 反加仓铁律（详见 store.CopyTradeConfig 同名字段注释）
-	RiskReentryBlockAddback     bool    `json:"risk_reentry_block_addback"`
-	RiskReentryAddbackTolerance float64 `json:"risk_reentry_addback_tolerance"`
-	RiskPolicyVersion           int     `json:"risk_policy_version"`
-	RiskStopMode                string  `json:"risk_stop_mode"`
-	RiskATRPeriod               int     `json:"risk_atr_period"`
-	RiskATRCacheMaxAgeMinutes   int     `json:"risk_atr_cache_max_age_minutes"`
-	RiskATRFallbackPct          float64 `json:"risk_atr_fallback_pct"`
-	RiskTriggerPriceType        string  `json:"risk_trigger_price_type"`
-	RiskSlippageBufferBPS       float64 `json:"risk_slippage_buffer_bps"`
-	RiskLiquidationBufferATR    float64 `json:"risk_liquidation_buffer_atr"`
-	RiskMaxReentries            int     `json:"risk_max_reentries"`
-	RiskReentryBandATR          float64 `json:"risk_reentry_band_atr"`
-	RiskReentryCooldownSeconds  int     `json:"risk_reentry_cooldown_seconds"`
-	RiskReentryMaxChaseATR      float64 `json:"risk_reentry_max_chase_atr"`
-	RiskReentryMaxATRExpansion  float64 `json:"risk_reentry_max_atr_expansion"`
-	RiskWatchTimeoutMinutes     int     `json:"risk_watch_timeout_minutes"`
-	RiskMigrationConfirmed      bool    `json:"risk_migration_confirmed"`
+	RiskPolicyVersion          int     `json:"risk_policy_version"` // >=4 = Copy Guard 启用标记（v3 行为已下线）
+	RiskStopMode               string  `json:"risk_stop_mode"`
+	RiskATRPeriod              int     `json:"risk_atr_period"`
+	RiskATRCacheMaxAgeMinutes  int     `json:"risk_atr_cache_max_age_minutes"`
+	RiskATRFallbackPct         float64 `json:"risk_atr_fallback_pct"`
+	RiskTriggerPriceType       string  `json:"risk_trigger_price_type"`
+	RiskSlippageBufferBPS      float64 `json:"risk_slippage_buffer_bps"`
+	RiskLiquidationBufferATR   float64 `json:"risk_liquidation_buffer_atr"`
+	RiskMaxReentries           int     `json:"risk_max_reentries"`
+	RiskReentryBandATR         float64 `json:"risk_reentry_band_atr"`
+	RiskReentryCooldownSeconds int     `json:"risk_reentry_cooldown_seconds"`
+	RiskReentryMaxChaseATR     float64 `json:"risk_reentry_max_chase_atr"`
+	RiskReentryMaxATRExpansion float64 `json:"risk_reentry_max_atr_expansion"`
+	RiskWatchTimeoutMinutes    int     `json:"risk_watch_timeout_minutes"`
+	RiskMigrationConfirmed     bool    `json:"risk_migration_confirmed"`
 	// RiskAddonBudgetPct: 加仓账户风险预算（v4）。加仓后总敞口按当前止损距离
 	// 的预期损失超过账户权益的该比例时记录 ADDON_RISK_WARNING 告警（仅告警
 	// 不拦截，兜底风控不干扰领航员动作）。1.0 = 不告警。
 	RiskAddonBudgetPct float64 `json:"risk_addon_budget_pct"`
-	// v4.1 止损噪音下限 / 重入加严（字段含义见 store.CopyTradeConfig 同名注释）
-	RiskStopNoiseFloorATR         float64 `json:"risk_stop_noise_floor_atr"`
+	// v4.1 重入加严（字段含义见 store.CopyTradeConfig 同名注释）
 	RiskReentryMinRecoveryATR     float64 `json:"risk_reentry_min_recovery_atr"`
 	RiskReentryCooldownEscalation float64 `json:"risk_reentry_cooldown_escalation"`
 	RiskReentryRecoveryEscalation float64 `json:"risk_reentry_recovery_escalation"`
-	RiskCycleMaxLossPct           float64 `json:"risk_cycle_max_loss_pct"`
+	// RiskUnprotectableAction: 保护单不可建立（clamp 也不可行）时的处置模式（v5）。
+	//   "close"（默认）：保护优先——立即平掉跟单仓位，周期进入观察期
+	//   "follow"：跟单优先——继续裸跑，UI 标红 + 升级告警（用户显式选择）
+	RiskUnprotectableAction string `json:"risk_unprotectable_action"`
+	// RiskReentryNoiseOverride: 止损距离/ATR < 0.3（极易扫损档）时默认禁用自动
+	// 重入；置 true 可强制放行（按谨慎档执行）。
+	RiskReentryNoiseOverride bool `json:"risk_reentry_noise_override"`
 }
 
 // FillRiskDefaults 兜底默认值（与 store.CopyTradeConfig.FillRiskDefaults 保持一致）
 // 调用时机：integration 从 store.CopyTradeConfig 构造 engine.CopyConfig 时
 //
-// RiskAccountPct 默认 0.5 (=50%) 是用户明确选择的激进配置（v3.1）
-// 详见 store.CopyTradeConfig.FillRiskDefaults 的注释
+// v5 默认值选型（数学验证见 Copy Guard v5 方案）：
+//   - RiskAccountPct 0.10：账户线抢先于仓位止损需要敞口 > 账户线%×杠杆/20%，
+//     10% 下 50x 需敞口 >25 倍权益——正常跟单不干扰，只锁灾难敞口
+//   - RiskLeverageMaxLoss 0.20：仓位保证金止损，日常主力线
 func (c *CopyConfig) FillRiskDefaults() {
 	if c.RiskAccountPct == 0 {
-		if c.RiskPolicyVersion >= 4 {
-			// v4.1：账户线 = 灾难硬兜底，默认 20%（详见 store 同名注释）
-			c.RiskAccountPct = 0.20
-		} else {
-			c.RiskAccountPct = 0.5
-		}
+		c.RiskAccountPct = 0.10
 	}
 	if c.RiskATRMultiplier == 0 {
 		c.RiskATRMultiplier = 1.5
@@ -190,22 +188,10 @@ func (c *CopyConfig) FillRiskDefaults() {
 		c.RiskATRTimeframe = "1h"
 	}
 	if c.RiskLeverageMaxLoss == 0 {
-		if c.RiskPolicyVersion >= 4 {
-			c.RiskLeverageMaxLoss = 0.3
-		} else {
-			c.RiskLeverageMaxLoss = 0.5
-		}
+		c.RiskLeverageMaxLoss = 0.2
 	}
 	if c.RiskReentryRatio == 0 {
 		c.RiskReentryRatio = 0.5
-	}
-	// v3.3：与 store.CopyTradeConfig.FillRiskDefaults 保持一致
-	if c.RiskReentryTolerance == 0 {
-		c.RiskReentryTolerance = 0.02
-	}
-	// v3.2 反加仓铁律默认：允许加仓 ≤ 20%
-	if c.RiskReentryAddbackTolerance == 0 {
-		c.RiskReentryAddbackTolerance = 1.20
 	}
 	if c.RiskPolicyVersion >= 4 {
 		if c.RiskStopMode == "" {
@@ -229,9 +215,6 @@ func (c *CopyConfig) FillRiskDefaults() {
 		if c.RiskAddonBudgetPct == 0 {
 			c.RiskAddonBudgetPct = 0.15
 		}
-		if c.RiskStopNoiseFloorATR == 0 {
-			c.RiskStopNoiseFloorATR = 1.0
-		}
 		if c.RiskReentryMinRecoveryATR == 0 {
 			c.RiskReentryMinRecoveryATR = 0.5
 		}
@@ -241,8 +224,8 @@ func (c *CopyConfig) FillRiskDefaults() {
 		if c.RiskReentryRecoveryEscalation == 0 {
 			c.RiskReentryRecoveryEscalation = 1.5
 		}
-		if c.RiskCycleMaxLossPct == 0 {
-			c.RiskCycleMaxLossPct = 1.0
+		if c.RiskUnprotectableAction == "" {
+			c.RiskUnprotectableAction = "close"
 		}
 	}
 }

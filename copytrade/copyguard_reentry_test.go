@@ -108,7 +108,7 @@ func TestStopObservedClosesAttempt(t *testing.T) {
 	if err := st.CopyTrade().OpenCopyGuardAttempt(cycle.ID, 0, 1717.33, 110, 0.064, 7.59); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.CopyTrade().RecordCopyGuardStopObserved(cycle.ID, "trader-1", 0, 7.59, 1700, 1, -1.1, map[string]interface{}{"confirmation": "position_absent_fallback"}); err != nil {
+	if err := st.CopyTrade().RecordCopyGuardStopObserved(cycle.ID, "trader-1", 0, 7.59, 1700, 1, map[string]interface{}{"confirmation": "position_absent_fallback", "leader_pnl": -1.1}); err != nil {
 		t.Fatal(err)
 	}
 	got, err := st.CopyTrade().GetCopyGuardCycle(cycle.ID)
@@ -187,10 +187,11 @@ func TestDoubleStopReentryLifecycle(t *testing.T) {
 }
 
 // ============================================================================
-// 重入判定：首轮观察不判穿越（B7）；穿越后正常触发；失败不消耗次数
+// 重入判定（v5 确认式）：首轮观察不计确认（B7）；连续 N tick 满足才触发；
+// 中途破坏清零重来
 // ============================================================================
 
-func TestReentryFirstTickGuardAndCrossing(t *testing.T) {
+func TestReentryFirstTickGuardAndConfirmation(t *testing.T) {
 	e, st := newReentryTestEngine(t)
 	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700)
 	// RecordCopyGuardStop 未写 last_observed_price → 首轮为 0
@@ -198,7 +199,7 @@ func TestReentryFirstTickGuardAndCrossing(t *testing.T) {
 		t.Fatalf("precondition: LastObservedPrice must start at 0, got %v", cycle.LastObservedPrice)
 	}
 	// ATR fallback = 1700*0.02 = 34；band=0.5 → boundary = 1700-17 = 1683
-	// 标记价 1690 已在带内：首轮（last=0）必须只记录观测、不触发
+	// 标记价 1690 已在带内：首轮（last=0）必须只记录观测、不计确认
 	e.leaderState.Positions["ETHUSDT_long"] = &Position{Symbol: "ETHUSDT", Side: SideLong, Size: 1, EntryPrice: 1700, MarkPrice: 1690, MarginMode: "cross", PosID: "leader-pos"}
 	e.checkReentryConditions()
 	select {
@@ -211,17 +212,26 @@ func TestReentryFirstTickGuardAndCrossing(t *testing.T) {
 		t.Fatalf("first tick must persist observation only: %+v", cycle)
 	}
 
-	// 价格先跌出带外（1660 < 1683），下一轮记录带外观测
-	e.leaderState.Positions["ETHUSDT_long"].MarkPrice = 1660
+	// 带内 2 个 tick：确认累计但未达阈值（3），不触发
+	e.checkReentryConditions()
 	e.checkReentryConditions()
 	select {
 	case <-e.decisionCh:
-		t.Fatal("below-boundary tick must not trigger reentry")
+		t.Fatal("in-band ticks below the confirmation threshold must not trigger reentry")
 	default:
 	}
 
-	// 再穿回带内（1660 → 1690 穿越 1683）→ 触发重入决策 + REENTRY_PENDING
+	// 跌出带外（1660 < 1683）→ 确认计数必须清零
+	e.leaderState.Positions["ETHUSDT_long"].MarkPrice = 1660
+	e.checkReentryConditions()
+	if e.reentryCandidateTicks["leader-pos"] != 0 {
+		t.Fatalf("out-of-band tick must reset the confirmation counter, got %d", e.reentryCandidateTicks["leader-pos"])
+	}
+
+	// 重新回带内并连续 3 tick 确认 → 触发重入决策 + REENTRY_PENDING
 	e.leaderState.Positions["ETHUSDT_long"].MarkPrice = 1690
+	e.checkReentryConditions()
+	e.checkReentryConditions()
 	e.checkReentryConditions()
 	select {
 	case full := <-e.decisionCh:
@@ -229,7 +239,7 @@ func TestReentryFirstTickGuardAndCrossing(t *testing.T) {
 			t.Fatalf("unexpected reentry decision: %+v", full.Decisions)
 		}
 	default:
-		t.Fatal("band crossing must emit a reentry decision")
+		t.Fatal("three confirmed in-band ticks must emit a reentry decision")
 	}
 	cycle, _ = st.CopyTrade().GetCopyGuardCycle(cycle.ID)
 	if cycle.Status != store.CopyGuardReentryPending {
@@ -252,6 +262,9 @@ func TestReentrySizeUsesStoppedAttemptNotional(t *testing.T) {
 	_ = st.CopyTrade().UpdateCopyGuardObservation(cycle.ID, store.CopyGuardStoppedWatching, 1700, 1660, 34)
 	// 领航员当前持仓极大（加仓后）：旧公式会算出 1×0.5×(2500×1690/1000)×100 ≈ 21 万
 	e.leaderState.Positions["ETHUSDT_long"] = &Position{Symbol: "ETHUSDT", Side: SideLong, Size: 2500, EntryPrice: 1700, MarkPrice: 1690, MarginMode: "cross", PosID: "leader-pos"}
+	// v5 确认式：连续 3 tick 满足才触发
+	e.checkReentryConditions()
+	e.checkReentryConditions()
 	e.checkReentryConditions()
 	select {
 	case full := <-e.decisionCh:
@@ -263,7 +276,7 @@ func TestReentrySizeUsesStoppedAttemptNotional(t *testing.T) {
 			t.Fatalf("reentry size must be stopped-attempt notional × ratio (want 50), got %v", got)
 		}
 	default:
-		t.Fatal("band crossing must emit a reentry decision")
+		t.Fatal("confirmed in-band ticks must emit a reentry decision")
 	}
 }
 
@@ -324,21 +337,25 @@ func TestReentryMinRecoveryRaisesBoundary(t *testing.T) {
 	_ = st.CopyTrade().UpdateCopyGuardObservation(cycle.ID, store.CopyGuardStoppedWatching, 1700, 1660, 34)
 	e.leaderState.Positions["ETHUSDT_long"] = &Position{Symbol: "ETHUSDT", Side: SideLong, Size: 1, EntryPrice: 1700, MarkPrice: 1690, MarginMode: "cross", PosID: "leader-pos"}
 
-	// 1690 穿越了旧带宽边界 1683，但未达到恢复下限 1700 → 不得重入
+	// 1690 在旧带宽边界 1683 之上，但未达到恢复下限 1700 → 不得重入
+	e.checkReentryConditions()
+	e.checkReentryConditions()
 	e.checkReentryConditions()
 	select {
 	case <-e.decisionCh:
-		t.Fatal("crossing the band without min recovery must not trigger reentry")
+		t.Fatal("in-band price without min recovery must not trigger reentry")
 	default:
 	}
 
-	// 恢复到 1705（≥1700 且 ≤ 追价上限 1700+68）→ 触发
+	// 恢复到 1705（≥1700 且 ≤ 追价上限 1700+68）→ 连续确认后触发
 	e.leaderState.Positions["ETHUSDT_long"].MarkPrice = 1705
+	e.checkReentryConditions()
+	e.checkReentryConditions()
 	e.checkReentryConditions()
 	select {
 	case <-e.decisionCh:
 	default:
-		t.Fatal("crossing the recovery-raised boundary must trigger reentry")
+		t.Fatal("confirmed ticks above the recovery-raised boundary must trigger reentry")
 	}
 }
 
@@ -356,8 +373,10 @@ func TestReentryConservativeAnchorIgnoresAveragedDownEntry(t *testing.T) {
 	_ = st.CopyTrade().UpdateCopyGuardObservation(cycle.ID, store.CopyGuardStoppedWatching, 1700, 1620, 34)
 	e.leaderState.Positions["ETHUSDT_long"] = &Position{Symbol: "ETHUSDT", Side: SideLong, Size: 2, EntryPrice: 1650, MarkPrice: 1640, MarginMode: "cross", PosID: "leader-pos"}
 
-	// 按摊低后的实时均价算边界是 1650−17=1633（1620→1640 会穿越）；
+	// 按摊低后的实时均价算边界是 1650−17=1633（1640 在带内）；
 	// 保守锚点必须用快照 1700 → 边界 1683，1640 不得触发
+	e.checkReentryConditions()
+	e.checkReentryConditions()
 	e.checkReentryConditions()
 	select {
 	case <-e.decisionCh:
@@ -365,55 +384,58 @@ func TestReentryConservativeAnchorIgnoresAveragedDownEntry(t *testing.T) {
 	default:
 	}
 
-	// 真实恢复到 1690（穿越 1683，≤ 锚点 1700+68）→ 触发
+	// 真实恢复到 1690（≥1683，≤ 锚点 1700+68）→ 连续确认后触发
 	e.leaderState.Positions["ETHUSDT_long"].MarkPrice = 1690
+	e.checkReentryConditions()
+	e.checkReentryConditions()
 	e.checkReentryConditions()
 	select {
 	case <-e.decisionCh:
 	default:
-		t.Fatal("crossing the snapshot-anchored boundary must trigger reentry")
+		t.Fatal("confirmed ticks above the snapshot-anchored boundary must trigger reentry")
 	}
 }
 
 // ============================================================================
-// v4.1 周期累计亏损熔断：已实现亏损触达权益比例后不再重入
+// v5 噪音档：止损时 distance/ATR < 0.3 → 自动重入默认禁用；override 放行但
+// 走谨慎档（确认 tick 数翻倍）
 // ============================================================================
 
-func TestCycleLossBreakerBlocksReentry(t *testing.T) {
+func TestReentryNoiseTierDisablesAndOverrides(t *testing.T) {
 	e, st := newReentryTestEngine(t)
-	e.config.RiskCycleMaxLossPct = 0.10 // 权益 100 → 熔断线 −10
 	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700)
-	if _, err := st.DB().Exec(`UPDATE copy_guard_cycles SET actual_pnl=-12 WHERE id=?`, cycle.ID); err != nil {
+	// 把止损快照改成极窄距离：entry 1700 → exit 1693.2（distance=6.8），
+	// ATRAtStop=34 → ratio=0.2 < 0.3 → 噪音档禁入
+	if _, err := st.DB().Exec(`UPDATE copy_guard_attempts SET exit_price=1693.2, stop_fill_price=1693.2 WHERE cycle_id=? AND attempt_no=0`, cycle.ID); err != nil {
 		t.Fatal(err)
 	}
 	_ = st.CopyTrade().UpdateCopyGuardObservation(cycle.ID, store.CopyGuardStoppedWatching, 1700, 1660, 34)
 	e.leaderState.Positions["ETHUSDT_long"] = &Position{Symbol: "ETHUSDT", Side: SideLong, Size: 1, EntryPrice: 1700, MarkPrice: 1690, MarginMode: "cross", PosID: "leader-pos"}
 
+	for i := 0; i < 6; i++ {
+		e.checkReentryConditions()
+	}
+	select {
+	case <-e.decisionCh:
+		t.Fatal("distance/ATR < 0.3 must disable automatic reentry by default")
+	default:
+	}
+
+	// override 后放行，但走谨慎档：确认 tick 数翻倍（6）
+	e.config.RiskReentryNoiseOverride = true
+	for i := 0; i < 5; i++ {
+		e.checkReentryConditions()
+	}
+	select {
+	case <-e.decisionCh:
+		t.Fatal("cautious tier must require doubled confirmation ticks")
+	default:
+	}
 	e.checkReentryConditions()
 	select {
 	case <-e.decisionCh:
-		t.Fatal("cycle loss breaker must block reentry even when the price condition holds")
 	default:
-	}
-	got, _ := st.CopyTrade().GetCopyGuardCycle(cycle.ID)
-	if got.Status != store.CopyGuardCycleLossCapped {
-		t.Fatalf("cycle must be flagged CYCLE_LOSS_CAPPED: %+v", got)
-	}
-	if got.ClosedAt != nil {
-		t.Fatalf("capped cycle stays open until the leader closes: %+v", got)
-	}
-	events, err := st.CopyTrade().ListCopyGuardEvents(cycle.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	found := false
-	for _, ev := range events {
-		if ev.Type == "CYCLE_LOSS_BREAKER" {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatal("CYCLE_LOSS_BREAKER event must be recorded")
+		t.Fatal("override + doubled confirmation must eventually trigger reentry")
 	}
 }
 
@@ -554,30 +576,35 @@ func TestWatchSamplesRecordGateTimeline(t *testing.T) {
 		t.Fatalf("first sample must record gate/boundary/chase: %+v", samples[0])
 	}
 
-	// tick 3：穿回带内触发重入 → REENTRY_TRIGGERED 采样 + REENTRY_GATE_CHANGED 事件
+	// tick 3-5：回到带内，v5 确认式——先 REENTRY_CANDIDATE 采样，连续 3 tick
+	// 后 REENTRY_TRIGGERED 采样 + 决策
 	e.leaderState.Positions["ETHUSDT_long"].MarkPrice = 1690
+	e.checkReentryConditions()
+	samples, _ = st.CopyTrade().ListCopyGuardWatchSamples(cycle.ID)
+	if len(samples) != 2 || samples[1].Gate != watchGateReentryCandidate {
+		t.Fatalf("first in-band tick must record REENTRY_CANDIDATE: %+v", samples)
+	}
+	e.checkReentryConditions()
 	e.checkReentryConditions()
 	select {
 	case <-e.decisionCh:
 	default:
-		t.Fatal("crossing tick must emit a reentry decision")
+		t.Fatal("confirmed ticks must emit a reentry decision")
 	}
 	samples, _ = st.CopyTrade().ListCopyGuardWatchSamples(cycle.ID)
-	if len(samples) != 2 || samples[1].Gate != watchGateReentryTriggered {
-		t.Fatalf("gate change must append a sample immediately: %+v", samples)
+	if len(samples) != 3 || samples[2].Gate != watchGateReentryTriggered {
+		t.Fatalf("trigger must append a REENTRY_TRIGGERED sample: %+v", samples)
 	}
 	events, _ := st.CopyTrade().ListCopyGuardEvents(cycle.ID)
 	gateChanges := 0
 	for _, ev := range events {
 		if ev.Type == "REENTRY_GATE_CHANGED" {
 			gateChanges++
-			if ev.Metadata["from"] != watchGatePriceNotReturned || ev.Metadata["to"] != watchGateReentryTriggered {
-				t.Fatalf("gate change event must carry from/to: %+v", ev.Metadata)
-			}
 		}
 	}
-	if gateChanges != 1 {
-		t.Fatalf("exactly one REENTRY_GATE_CHANGED expected, got %d", gateChanges)
+	// PRICE_NOT_RETURNED → REENTRY_CANDIDATE → REENTRY_TRIGGERED 两次变化
+	if gateChanges != 2 {
+		t.Fatalf("exactly two REENTRY_GATE_CHANGED expected, got %d", gateChanges)
 	}
 }
 

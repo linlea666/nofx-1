@@ -85,6 +85,12 @@ type Engine struct {
 	// v4 加仓预算：ADDON_RISK_WARNING 事件/告警限频（key = leaderPosID）
 	// 与 poll 串行执行，无需额外锁
 	lastAddonBudgetEvent map[string]time.Time
+
+	// v5 确认式重入：REENTRY_CANDIDATE 连续确认计数（key = leaderPosID）。
+	// 条件持续满足时逐 tick 递增，任一 tick 破坏即清零；达到确认阈值才重入。
+	// 内存态：引擎重启后从 0 重新累计（保守方向，不会导致提前重入）。
+	// 与 poll 串行执行，无需额外锁。
+	reentryCandidateTicks map[string]int
 }
 
 // EngineOption 引擎配置选项
@@ -124,20 +130,21 @@ func NewEngine(
 	opts ...EngineOption,
 ) (*Engine, error) {
 	e := &Engine{
-		traderID:             traderID,
-		config:               config,
-		getFollowerBalance:   getBalance,
-		getFollowerEquity:    getBalance,
-		getFollowerPositions: getPositions,
-		seenFills:            make(map[string]time.Time),
-		seenTTL:              1 * time.Hour,
-		stateSyncInterval:    20 * time.Second,
-		decisionCh:           make(chan *decision.FullDecision, 10),
-		riskEventCh:          make(chan *RiskEvent, 32),
-		stopCh:               make(chan struct{}),
-		stats:                &EngineStats{StartTime: time.Now()},
-		stopRiskSuspectCount: make(map[string]int),
-		lastAddonBudgetEvent: make(map[string]time.Time),
+		traderID:              traderID,
+		config:                config,
+		getFollowerBalance:    getBalance,
+		getFollowerEquity:     getBalance,
+		getFollowerPositions:  getPositions,
+		seenFills:             make(map[string]time.Time),
+		seenTTL:               1 * time.Hour,
+		stateSyncInterval:     20 * time.Second,
+		decisionCh:            make(chan *decision.FullDecision, 10),
+		riskEventCh:           make(chan *RiskEvent, 32),
+		stopCh:                make(chan struct{}),
+		stats:                 &EngineStats{StartTime: time.Now()},
+		stopRiskSuspectCount:  make(map[string]int),
+		lastAddonBudgetEvent:  make(map[string]time.Time),
+		reentryCandidateTicks: make(map[string]int),
 	}
 
 	// 应用选项
@@ -1335,9 +1342,11 @@ func (e *Engine) buildDecisionV2(signal *TradeSignal, match *SignalMatchResult, 
 		logger.Infof("📊 [%s] %s | 金额=%.2f 杠杆=%dx 模式=%s 入场价=%.4f",
 			e.traderID, match.Action, copySize, dec.Leverage, dec.MarginMode, fill.Price)
 
-		// 🛑 v3 风控：账户保护止损（仅 OKX + 启用风控）
-		// 这里基于 fill.Price 估算 SL（作为兜底）；integration 层执行后会用实际成交价精确重挂
-		// 双层保险：即使 integration 重挂失败，至少 auto_trader 自动挂的估算 SL 还在
+		// 🛑 Copy Guard：开仓时预估止损价（仅日志参考，不随开仓单附带）。
+		// 真实保护单由 integration 层在成交后用实际成交价计算并经
+		// upsertV4Protection 状态机挂出（含 clamp / GUARD_UNPROTECTABLE 处置）。
+		// v5：账户线已是硬 cap（ExpectedLossPct 不可能超过 RiskAccountPct），
+		// 旧的"预计损失超警戒"告警已无意义，随 v3 一并移除。
 		if e.config.ProviderType == ProviderOKX && e.config.RiskStopLossEnabled && copySize > 0 {
 			slInput := &StopLossCalcInput{
 				Symbol:         fill.Symbol,
@@ -1348,17 +1357,10 @@ func (e *Engine) buildDecisionV2(signal *TradeSignal, match *SignalMatchResult, 
 				FollowerEquity: e.getFollowerEquity(),
 			}
 			if slResult, err := calcStopLossPrice(e.config, slInput); err == nil && slResult.SLPrice > 0 {
-				// v4 precise manager records algoId after execution; do not create an untracked symbol-level order.
-				if e.config.RiskPolicyVersion < 4 {
-					dec.StopLoss = slResult.SLPrice
-				}
-				logger.Infof("🛑 [%s] SL 估算（开仓即挂） | %s %s | SL=%.4f 距离=%.4f(%.2f%%) 控线=%s ATR=%.4f tickSz=%.6f",
+				logger.Infof("🛑 [%s] SL 估算 | %s %s | SL=%.4f 距离=%.4f(%.2f%%) 控线=%s ATR=%.4f 距离/ATR=%.2f tickSz=%.6f",
 					e.traderID, fill.Symbol, fill.PositionSide,
 					slResult.SLPrice, slResult.SLDistance,
-					(slResult.SLDistance/fill.Price)*100, slResult.GovernedBy, slResult.ATRValue, slResult.TickSize)
-				if e.config.RiskPolicyVersion >= 4 && e.config.RiskStopMode == "volatility_priority" && slResult.ExpectedLossPct > e.config.RiskAccountPct {
-					e.logWarning(Warning{Timestamp: time.Now(), Symbol: fill.Symbol, Type: "copy_guard_risk_warning", Message: fmt.Sprintf("预计止损损失 %.2f%% 超过警戒 %.2f%%", slResult.ExpectedLossPct*100, e.config.RiskAccountPct*100), SignalAction: string(match.Action), SignalValue: fill.Value, CopyValue: copySize, Executed: true})
-				}
+					(slResult.SLDistance/fill.Price)*100, slResult.GovernedBy, slResult.ATRValue, slResult.DistanceATRRatio, slResult.TickSize)
 			} else if err != nil {
 				logger.Warnf("⚠️ [%s] SL 估算失败（仅记录，integration 层会用实际成交价重算）: %v", e.traderID, err)
 			} else if slResult != nil && slResult.OpenImmediateHit {

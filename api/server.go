@@ -438,53 +438,52 @@ type CopyConfigReq struct {
 	BinanceP20T      string `json:"binance_p20t,omitempty"`       // 登录 cookie p20t
 	BinanceCSRFToken string `json:"binance_csrf_token,omitempty"` // CSRF header csrftoken
 
-	// 账户保护 v3 风控字段 —— 仅 OKX 路径生效
+	// Copy Guard 账户保护风控字段（v5）—— 仅 OKX 路径生效
 	// 字段含义详见 store.CopyTradeConfig
 	// 开关字段用 *bool 区分"未传"(nil) 和"显式 false"（避免 Go JSON 零值歧义）
 	// 数值字段直接用值类型，零值由 store.FillRiskDefaults 兜底
+	// v3 遗留字段（risk_atr_enabled / risk_reentry_tolerance / 反加仓铁律 /
+	// risk_stop_noise_floor_atr / risk_cycle_max_loss_pct）已随 v5 下线
 	RiskStopLossEnabled  *bool   `json:"risk_stop_loss_enabled,omitempty"`
 	RiskAccountPct       float64 `json:"risk_account_pct,omitempty"`
-	RiskATREnabled       *bool   `json:"risk_atr_enabled,omitempty"`
 	RiskATRMultiplier    float64 `json:"risk_atr_multiplier,omitempty"`
 	RiskATRTimeframe     string  `json:"risk_atr_timeframe,omitempty"`
 	RiskLeverageFallback *bool   `json:"risk_leverage_fallback,omitempty"`
 	RiskLeverageMaxLoss  float64 `json:"risk_leverage_max_loss,omitempty"`
 	RiskReentryEnabled   *bool   `json:"risk_reentry_enabled,omitempty"`
 	RiskReentryRatio     float64 `json:"risk_reentry_ratio,omitempty"`
-	RiskReentryTolerance float64 `json:"risk_reentry_tolerance,omitempty"`
 
-	// v3.2 反加仓铁律配置（详见 store.CopyTradeConfig 注释）
-	RiskReentryBlockAddback     *bool    `json:"risk_reentry_block_addback,omitempty"`
-	RiskReentryAddbackTolerance float64  `json:"risk_reentry_addback_tolerance,omitempty"`
-	RiskPolicyVersion           int      `json:"risk_policy_version,omitempty"`
-	RiskStopMode                string   `json:"risk_stop_mode,omitempty"`
-	RiskATRPeriod               int      `json:"risk_atr_period,omitempty"`
-	RiskATRCacheMaxAgeMinutes   int      `json:"risk_atr_cache_max_age_minutes,omitempty"`
-	RiskATRFallbackPct          float64  `json:"risk_atr_fallback_pct,omitempty"`
-	RiskTriggerPriceType        string   `json:"risk_trigger_price_type,omitempty"`
-	RiskSlippageBufferBPS       *float64 `json:"risk_slippage_buffer_bps,omitempty"`
-	RiskLiquidationBufferATR    *float64 `json:"risk_liquidation_buffer_atr,omitempty"`
-	RiskMaxReentries            *int     `json:"risk_max_reentries,omitempty"`
-	RiskReentryBandATR          *float64 `json:"risk_reentry_band_atr,omitempty"`
-	RiskReentryCooldownSeconds  *int     `json:"risk_reentry_cooldown_seconds,omitempty"`
-	RiskReentryMaxChaseATR      *float64 `json:"risk_reentry_max_chase_atr,omitempty"`
-	RiskReentryMaxATRExpansion  float64  `json:"risk_reentry_max_atr_expansion,omitempty"`
-	RiskWatchTimeoutMinutes     *int     `json:"risk_watch_timeout_minutes,omitempty"`
-	RiskMigrationConfirmed      bool     `json:"risk_migration_confirmed,omitempty"`
-	RiskAddonBudgetPct          float64  `json:"risk_addon_budget_pct,omitempty"`
-	RiskHighRiskConfirmed       bool     `json:"risk_high_risk_confirmed,omitempty"`
+	RiskPolicyVersion          int      `json:"risk_policy_version,omitempty"`
+	RiskStopMode               string   `json:"risk_stop_mode,omitempty"`
+	RiskATRPeriod              int      `json:"risk_atr_period,omitempty"`
+	RiskATRCacheMaxAgeMinutes  int      `json:"risk_atr_cache_max_age_minutes,omitempty"`
+	RiskATRFallbackPct         float64  `json:"risk_atr_fallback_pct,omitempty"`
+	RiskTriggerPriceType       string   `json:"risk_trigger_price_type,omitempty"`
+	RiskSlippageBufferBPS      *float64 `json:"risk_slippage_buffer_bps,omitempty"`
+	RiskLiquidationBufferATR   *float64 `json:"risk_liquidation_buffer_atr,omitempty"`
+	RiskMaxReentries           *int     `json:"risk_max_reentries,omitempty"`
+	RiskReentryBandATR         *float64 `json:"risk_reentry_band_atr,omitempty"`
+	RiskReentryCooldownSeconds *int     `json:"risk_reentry_cooldown_seconds,omitempty"`
+	RiskReentryMaxChaseATR     *float64 `json:"risk_reentry_max_chase_atr,omitempty"`
+	RiskReentryMaxATRExpansion float64  `json:"risk_reentry_max_atr_expansion,omitempty"`
+	RiskWatchTimeoutMinutes    *int     `json:"risk_watch_timeout_minutes,omitempty"`
+	RiskMigrationConfirmed     bool     `json:"risk_migration_confirmed,omitempty"`
+	RiskAddonBudgetPct         float64  `json:"risk_addon_budget_pct,omitempty"`
+	RiskHighRiskConfirmed      bool     `json:"risk_high_risk_confirmed,omitempty"`
 
-	// v4.1 止损噪音下限 / 重入加严（零值由 store.FillRiskDefaults 兜底）
-	RiskStopNoiseFloorATR         float64 `json:"risk_stop_noise_floor_atr,omitempty"`
+	// v4.1 重入加严（零值由 store.FillRiskDefaults 兜底）
 	RiskReentryMinRecoveryATR     float64 `json:"risk_reentry_min_recovery_atr,omitempty"`
 	RiskReentryCooldownEscalation float64 `json:"risk_reentry_cooldown_escalation,omitempty"`
 	RiskReentryRecoveryEscalation float64 `json:"risk_reentry_recovery_escalation,omitempty"`
-	RiskCycleMaxLossPct           float64 `json:"risk_cycle_max_loss_pct,omitempty"`
+
+	// v5 可保护性状态机 / 噪音档重入
+	RiskUnprotectableAction  string `json:"risk_unprotectable_action,omitempty"`
+	RiskReentryNoiseOverride *bool  `json:"risk_reentry_noise_override,omitempty"`
 }
 
-// applyCopyConfigRiskFields 把 CopyConfigReq 中的 v3 风控字段透传到 store.CopyTradeConfig
+// applyCopyConfigRiskFields 把 CopyConfigReq 中的 Copy Guard 风控字段透传到 store.CopyTradeConfig
 //
-// 设计：开关字段未传时(nil)使用合理默认（启用 SL/ATR/杠杆兜底，禁用二次进场）；
+// 设计：开关字段未传时(nil)使用合理默认（启用 SL/杠杆兜底）；
 // 数值字段零值会由 store.Upsert 内部的 FillRiskDefaults 兜底，无需在此处理。
 //
 // 调用点：Create handler / Update handler 内部，构造 copyConfig 后调用一次。
@@ -495,18 +494,15 @@ func applyCopyConfigRiskFields(copyConfig *store.CopyTradeConfig, req *CopyConfi
 	}
 	// 开关：nil 用合理默认；非 nil 用 *值
 	copyConfig.RiskStopLossEnabled = derefBoolDefault(req.RiskStopLossEnabled, true)
-	copyConfig.RiskATREnabled = derefBoolDefault(req.RiskATREnabled, true)
 	copyConfig.RiskLeverageFallback = derefBoolDefault(req.RiskLeverageFallback, true)
 	copyConfig.RiskReentryEnabled = derefBoolDefault(req.RiskReentryEnabled, req.RiskPolicyVersion >= 4)
-	copyConfig.RiskReentryBlockAddback = derefBoolDefault(req.RiskReentryBlockAddback, true) // v3.2 反加仓铁律默认启用
+	copyConfig.RiskReentryNoiseOverride = derefBoolDefault(req.RiskReentryNoiseOverride, false)
 	// 数值字段：直接透传，零值由 store.FillRiskDefaults 兜底
 	copyConfig.RiskAccountPct = req.RiskAccountPct
 	copyConfig.RiskATRMultiplier = req.RiskATRMultiplier
 	copyConfig.RiskATRTimeframe = req.RiskATRTimeframe
 	copyConfig.RiskLeverageMaxLoss = req.RiskLeverageMaxLoss
 	copyConfig.RiskReentryRatio = req.RiskReentryRatio
-	copyConfig.RiskReentryTolerance = req.RiskReentryTolerance
-	copyConfig.RiskReentryAddbackTolerance = req.RiskReentryAddbackTolerance
 	copyConfig.RiskPolicyVersion = req.RiskPolicyVersion
 	copyConfig.RiskStopMode = req.RiskStopMode
 	copyConfig.RiskATRPeriod = req.RiskATRPeriod
@@ -515,7 +511,8 @@ func applyCopyConfigRiskFields(copyConfig *store.CopyTradeConfig, req *CopyConfi
 	copyConfig.RiskTriggerPriceType = req.RiskTriggerPriceType
 	copyConfig.RiskSlippageBufferBPS = derefFloatDefault(req.RiskSlippageBufferBPS, 10)
 	copyConfig.RiskLiquidationBufferATR = derefFloatDefault(req.RiskLiquidationBufferATR, 0.5)
-	copyConfig.RiskMaxReentries = derefIntDefault(req.RiskMaxReentries, 2)
+	// v5：默认单周期最多重入 1 次
+	copyConfig.RiskMaxReentries = derefIntDefault(req.RiskMaxReentries, 1)
 	copyConfig.RiskReentryBandATR = derefFloatDefault(req.RiskReentryBandATR, 0.5)
 	// v4.1：默认冷却 300s（旧默认 60s 在高杠杆震荡下重入过快）
 	copyConfig.RiskReentryCooldownSeconds = derefIntDefault(req.RiskReentryCooldownSeconds, 300)
@@ -524,12 +521,12 @@ func applyCopyConfigRiskFields(copyConfig *store.CopyTradeConfig, req *CopyConfi
 	copyConfig.RiskWatchTimeoutMinutes = derefIntDefault(req.RiskWatchTimeoutMinutes, 0)
 	copyConfig.RiskMigrationConfirmed = req.RiskMigrationConfirmed
 	copyConfig.RiskAddonBudgetPct = req.RiskAddonBudgetPct
-	// v4.1 止损噪音下限 / 重入加严：零值由 store.FillRiskDefaults 兜底
-	copyConfig.RiskStopNoiseFloorATR = req.RiskStopNoiseFloorATR
+	// v4.1 重入加严：零值由 store.FillRiskDefaults 兜底
 	copyConfig.RiskReentryMinRecoveryATR = req.RiskReentryMinRecoveryATR
 	copyConfig.RiskReentryCooldownEscalation = req.RiskReentryCooldownEscalation
 	copyConfig.RiskReentryRecoveryEscalation = req.RiskReentryRecoveryEscalation
-	copyConfig.RiskCycleMaxLossPct = req.RiskCycleMaxLossPct
+	// v5 可保护性处置模式（空值由 FillRiskDefaults 兜底为 close）
+	copyConfig.RiskUnprotectableAction = req.RiskUnprotectableAction
 }
 
 // derefBoolDefault 安全解引用 *bool：nil 返回 def，非 nil 返回 *p
@@ -893,9 +890,9 @@ func (s *Server) handleCreateTrader(c *gin.Context) {
 		if err := s.store.CopyTrade().Upsert(copyConfig); err != nil {
 			logger.Infof("⚠️ Failed to create copy trade config: %v", err)
 		} else {
-			logger.Infof("✓ Copy trade config created: provider=%s, leader=%s, ratio=%.0f%% (risk SL=%v ATR=%v reentry=%v)",
+			logger.Infof("✓ Copy trade config created: provider=%s, leader=%s, ratio=%.0f%% (risk SL=%v reentry=%v)",
 				copyConfig.ProviderType, copyConfig.LeaderID, copyConfig.CopyRatio*100,
-				copyConfig.RiskStopLossEnabled, copyConfig.RiskATREnabled, copyConfig.RiskReentryEnabled)
+				copyConfig.RiskStopLossEnabled, copyConfig.RiskReentryEnabled)
 		}
 	}
 
@@ -1101,9 +1098,9 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 			if err := s.store.CopyTrade().Upsert(copyConfig); err != nil {
 				logger.Infof("⚠️ Failed to update copy trade config: %v", err)
 			} else {
-				logger.Infof("✓ Copy trade config updated: provider=%s, leader=%s, ratio=%.0f%% (risk SL=%v ATR=%v reentry=%v)",
+				logger.Infof("✓ Copy trade config updated: provider=%s, leader=%s, ratio=%.0f%% (risk SL=%v reentry=%v)",
 					copyConfig.ProviderType, copyConfig.LeaderID, copyConfig.CopyRatio*100,
-					copyConfig.RiskStopLossEnabled, copyConfig.RiskATREnabled, copyConfig.RiskReentryEnabled)
+					copyConfig.RiskStopLossEnabled, copyConfig.RiskReentryEnabled)
 			}
 		} else if decisionMode == "ai" {
 			// If switching to AI mode, disable copy trade
