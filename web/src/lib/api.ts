@@ -1041,6 +1041,26 @@ export const api = {
       throw new Error(result.message || '保存重入 AI 配置失败')
     return result.data!
   },
+  // 分析历史列表（跨信号，最新在前）
+  async getReentryHistory(limit = 50) {
+    const result = await httpClient.get<{
+      analyses: import('../types').ReentryAIAnalysis[]
+    }>(`${API_BASE}/reentry-advisor/analyses?limit=${limit}`)
+    if (!result.success)
+      throw new Error(result.message || '获取重入分析历史失败')
+    return result.data!.analyses
+  },
+  // 市场指标实时预览（60s 后端缓存，与信号无关）
+  async getReentryMarketPreview(symbol: string) {
+    const result = await httpClient.get<{
+      preview: import('../types').ReentryMarketPreview
+    }>(
+      `${API_BASE}/reentry-advisor/market-preview?symbol=${encodeURIComponent(symbol)}`
+    )
+    if (!result.success)
+      throw new Error(result.message || '获取市场指标预览失败')
+    return result.data!.preview
+  },
   async getReentryStats() {
     const result = await httpClient.get<{
       stats: import('../types').ReentryAIStats

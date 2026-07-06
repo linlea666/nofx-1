@@ -23,6 +23,8 @@ import (
 // Phase 2（内置 AI 分析）：
 //   POST /api/reentry-advisor/analyses/:id/analyze            手动触发内置 AI 分析（异步）
 //   GET  /api/reentry-advisor/stats                           结论分布与准确率统计
+//   GET  /api/reentry-advisor/analyses                        分析历史列表（跨信号，最新在前）
+//   GET  /api/reentry-advisor/market-preview?symbol=          市场指标实时预览（60s 缓存）
 //
 // 归属校验：分析记录 → 信号 → 交易员 → 当前用户（同人工重入信号 API 口径）
 // ============================================================================
@@ -45,6 +47,8 @@ func (h *ReentryAIHandler) RegisterRoutes(group *gin.RouterGroup) {
 		g.POST("/signals/:signal_id/regenerate", h.RegenerateAnalysis)
 		g.PUT("/analyses/:id/external", h.SaveExternal)
 		g.POST("/analyses/:id/analyze", h.AnalyzeInternal)
+		g.GET("/analyses", h.ListHistory)
+		g.GET("/market-preview", h.MarketPreview)
 		g.GET("/stats", h.GetStats)
 		g.GET("/config", h.GetConfig)
 		g.PUT("/config", h.SaveConfig)
@@ -202,12 +206,63 @@ func (h *ReentryAIHandler) AnalyzeInternal(c *gin.Context) {
 	c.JSON(200, gin.H{"message": "AI 分析已开始，结果稍后自动写入本条记录"})
 }
 
-// GetStats 内外部 AI 结论分布与准确率统计
+// ownedTraderIDs 当前用户名下交易员 ID 列表（统计/列表接口的归属过滤参数）
+func (h *ReentryAIHandler) ownedTraderIDs(c *gin.Context) ([]string, error) {
+	set, err := h.ownedTraderSet(c)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(set))
+	for id := range set {
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
+// ListHistory 分析历史列表（跨信号，限当前用户名下交易员，最新在前）
+// @Summary 重入分析历史
+// @Tags ReentryAdvisor
+// @Router /api/reentry-advisor/analyses [get]
+func (h *ReentryAIHandler) ListHistory(c *gin.Context) {
+	ids, err := h.ownedTraderIDs(c)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
+	analyses, err := h.store.ReentryAI().ListReentryAnalysesByTraders(ids, limit)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"analyses": analyses, "count": len(analyses)})
+}
+
+// MarketPreview 市场指标实时预览（与信号无关，同数据包指标口径，60s 结果缓存）
+// @Summary 市场指标预览
+// @Tags ReentryAdvisor
+// @Param symbol query string true "交易对，如 BTCUSDT"
+// @Router /api/reentry-advisor/market-preview [get]
+func (h *ReentryAIHandler) MarketPreview(c *gin.Context) {
+	preview, err := reentryadvisor.GetMarketPreview(c.Query("symbol"))
+	if err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"preview": preview})
+}
+
+// GetStats 内外部 AI 结论分布与准确率统计（限当前用户名下交易员）
 // @Summary 重入 AI 统计
 // @Tags ReentryAdvisor
 // @Router /api/reentry-advisor/stats [get]
 func (h *ReentryAIHandler) GetStats(c *gin.Context) {
-	stats, err := h.store.ReentryAI().GetReentryAIStats()
+	ids, err := h.ownedTraderIDs(c)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	stats, err := h.store.ReentryAI().GetReentryAIStats(ids)
 	if err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return

@@ -391,7 +391,9 @@ func buildMarketSection(bn *binanceClient, symbol string, atr float64, meta *Met
 	}
 	for _, tf := range cvdTimeframes {
 		if klines := futuresByTF[tf]; len(klines) > 0 {
-			m.ContractCVD[tf] = summarizeCVD(klines)
+			if cvd := summarizeCVD(klines); cvd != nil {
+				m.ContractCVD[tf] = cvd
+			}
 		}
 	}
 
@@ -413,7 +415,9 @@ func buildMarketSection(bn *binanceClient, symbol string, atr float64, meta *Met
 			continue
 		}
 		spotOK = true
-		spotCVD[tf] = summarizeCVD(klines)
+		if cvd := summarizeCVD(klines); cvd != nil {
+			spotCVD[tf] = cvd
+		}
 		if tf == "1h" && len(klines) >= 24 {
 			for _, k := range klines[len(klines)-24:] {
 				spotQuote24h += k.QuoteVolume

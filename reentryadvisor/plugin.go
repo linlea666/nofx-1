@@ -32,6 +32,11 @@ const (
 	regenerateCooldown = 60 * time.Second
 	// backfillEvery 结局盈亏回填频率：每 12 轮（约 60s）扫一次已执行信号
 	backfillEvery = 12
+	// maxAutoAnalysisRetries 自动 AI 分析失败后的补跑上限（首跑之外），
+	// 防止模型持续故障时无限烧 API
+	maxAutoAnalysisRetries = 2
+	// manualAnalyzeCooldown 手动"内置 AI 分析"按钮冷却，防误触连击烧 token
+	manualAnalyzeCooldown = 30 * time.Second
 )
 
 // Advisor 插件实例（进程内单例）
@@ -48,6 +53,10 @@ type Advisor struct {
 	// Phase 2：内置 AI 分析进行中标记（防止同一记录并发分析）
 	inflightMu sync.Mutex
 	inflight   map[int64]bool
+	// aiRetries 自动分析失败补跑计数（analysis ID → 已补跑次数，内存态，
+	// 重启清零重新给额度）；analyzeLast 手动 analyze 冷却（analysis ID → 上次触发）
+	aiRetries   map[int64]int
+	analyzeLast map[int64]time.Time
 
 	// Phase 2：结局回填节流计数（每 backfillEvery 轮跑一次）
 	pollCount int
@@ -61,10 +70,12 @@ var (
 // Start 创建并启动插件（main.go 调用一次）。返回实例供 Stop。
 func Start(st *store.Store) *Advisor {
 	a := &Advisor{
-		st:       st,
-		bn:       newBinanceClient(),
-		stopCh:   make(chan struct{}),
-		inflight: map[int64]bool{},
+		st:          st,
+		bn:          newBinanceClient(),
+		stopCh:      make(chan struct{}),
+		inflight:    map[int64]bool{},
+		aiRetries:   map[int64]int{},
+		analyzeLast: map[int64]time.Time{},
 	}
 	defaultAdvisorMu.Lock()
 	defaultAdvisor = a
@@ -79,7 +90,8 @@ func Start(st *store.Store) *Advisor {
 	return a
 }
 
-// Stop 停止轮询（幂等）
+// Stop 停止轮询并等待在途 AI 分析协程收尾（幂等；started=false 先挡住
+// 新的 spawnAnalysis，再关 stopCh，wg.Wait 覆盖轮询与分析协程）
 func (a *Advisor) Stop() {
 	a.mu.Lock()
 	if !a.started {
@@ -143,6 +155,10 @@ func (a *Advisor) pollOnce() {
 			continue
 		}
 		if has {
+			// 已有数据包但自动 AI 分析未成功（调用失败/当时未开启）→ 限次补跑
+			if cfg.AIEnabled {
+				a.maybeRetryAnalysis(sig.ID)
+			}
 			continue
 		}
 		analysis, err := a.generateForSignal(sig, cfg)
@@ -154,9 +170,56 @@ func (a *Advisor) pollOnce() {
 			sig.ID, sig.Symbol, sig.Side, analysis.ID, analysis.MarketDataAvailable, orNone(analysis.MissingFields))
 		// Phase 2：自动内置 AI 分析（异步，AI 慢不阻塞轮询；完成后邮件通知）
 		if cfg.AIEnabled {
-			go a.runAnalysis(analysis.ID, true)
+			a.spawnAnalysis(analysis.ID, true)
 		}
 	}
+}
+
+// maybeRetryAnalysis 对 PENDING 信号的最新快照补跑自动 AI 分析：
+// 仅当该快照既无原始回复也无结论（首跑失败或生成时自动分析未开启），
+// 且未在分析中、补跑次数未超上限时触发。修复"自动分析与生成事件一次性
+// 绑定，瞬时故障后永不重试"的缺口。
+func (a *Advisor) maybeRetryAnalysis(signalID int64) {
+	latest, err := a.st.ReentryAI().LatestReentryAnalysisBySignal(signalID)
+	if err != nil || latest == nil {
+		return
+	}
+	if latest.RawResponse != "" || latest.Verdict != "" {
+		return // 已有结果（含"已回复但不可解析"，那是模型输出问题，不自动重跑）
+	}
+	a.inflightMu.Lock()
+	if a.inflight[latest.ID] || a.aiRetries[latest.ID] >= maxAutoAnalysisRetries {
+		a.inflightMu.Unlock()
+		return
+	}
+	a.aiRetries[latest.ID]++
+	attempt := a.aiRetries[latest.ID]
+	a.inflightMu.Unlock()
+	logger.Infof("[ReentryAdvisor] 补跑自动 AI 分析 (analysis=%d, signal=%d, 第 %d/%d 次)",
+		latest.ID, signalID, attempt, maxAutoAnalysisRetries)
+	a.spawnAnalysis(latest.ID, true)
+}
+
+// spawnAnalysis 以受管 goroutine 启动内置 AI 分析：纳入 wg（Stop 会等待
+// 收尾，避免对已关闭资源写入），插件已停止时不再启动。
+func (a *Advisor) spawnAnalysis(analysisID int64, autoTriggered bool) bool {
+	a.mu.Lock()
+	if !a.started {
+		a.mu.Unlock()
+		return false
+	}
+	a.wg.Add(1)
+	a.mu.Unlock()
+	go func() {
+		defer a.wg.Done()
+		select {
+		case <-a.stopCh:
+			return
+		default:
+		}
+		a.runAnalysis(analysisID, autoTriggered)
+	}()
+	return true
 }
 
 // backfillOutcomes 为已执行（EXECUTED）信号回填重入尝试的真实结局盈亏。
@@ -273,9 +336,9 @@ func RegenerateForSignal(signalID int64) (*store.ReentryAIAnalysis, error) {
 		return nil, err
 	}
 	logger.Infof("[ReentryAdvisor] 信号 %d (%s %s) 数据包已手动重新生成 (analysis=%d)", sig.ID, sig.Symbol, sig.Side, analysis.ID)
-	// 自动分析开启时对新快照顺带跑内置 AI（用户在界面上，不发邮件）
+	// 自动分析开启时对新快照顺带跑内置 AI（用户在界面上，不发邮件、不自动入场）
 	if cfg.AIEnabled {
-		go a.runAnalysis(analysis.ID, false)
+		a.spawnAnalysis(analysis.ID, false)
 	}
 	return analysis, nil
 }

@@ -18,6 +18,7 @@ import type {
   ReentryAIAnalysis,
   ReentryAIConfig,
   ReentryAIStats,
+  ReentryMarketPreview,
 } from '../types'
 
 const money = (v: number) => `${v >= 0 ? '+' : ''}${v.toFixed(2)} USDT`
@@ -264,6 +265,10 @@ function InternalVerdictCard({ analysis }: { analysis: ReentryAIAnalysis }) {
   )
 }
 
+// AnalysisModalTarget 弹窗只依赖信号的标识与展示字段，历史列表（信号可能已
+// 关闭）与待确认横幅共用同一弹窗
+type AnalysisModalTarget = Pick<CopyGuardManualSignal, 'id' | 'symbol' | 'side'>
+
 // 重入 AI 助手分析弹窗：三段可复制（System Prompt / User Prompt / 纯数据 JSON）
 // + 内置 AI 结论（Phase 2）+ 外部 AI 结论粘贴区（永久可编辑，供准确率对比留档）。
 // 数据由 reentryadvisor 插件在信号产生后自动生成；可手动重新生成新快照（60s 冷却）。
@@ -271,7 +276,7 @@ function AnalysisModal({
   signal,
   onClose,
 }: {
-  signal: CopyGuardManualSignal
+  signal: AnalysisModalTarget
   onClose: () => void
 }) {
   const {
@@ -535,6 +540,13 @@ function AdvisorSettingsCard() {
     api.getModelConfigs()
   )
   const enabledModels = models.filter((m) => m.enabled)
+  // A1：分析历史（跨信号，含已执行/已忽略的旧信号，供准确率复盘）
+  const { data: history = [] } = useSWR<ReentryAIAnalysis[]>(
+    'reentry-advisor-history',
+    () => api.getReentryHistory(50),
+    { refreshInterval: 30000 }
+  )
+  const [viewing, setViewing] = useState<AnalysisModalTarget | null>(null)
 
   const [draft, setDraft] = useState<ReentryAIConfig | null>(null)
   const [busy, setBusy] = useState(false)
@@ -766,6 +778,280 @@ function AdvisorSettingsCard() {
               评分口径：已执行信号的重入尝试闭合对账后回填净盈亏；ENTER
               且盈利、SKIP 且亏损记为正确，WAIT 不计入。
             </div>
+          </div>
+        )}
+        {history.length > 0 && (
+          <div className="space-y-2 rounded bg-[#0B0E11] p-3">
+            <div className="text-xs font-medium text-[#EAECEF]">
+              分析历史（最近 {history.length} 条快照，含已执行/已忽略信号，点击查看详情）
+            </div>
+            <div className="max-h-72 overflow-y-auto">
+              <table className="w-full text-left text-xs">
+                <thead className="sticky top-0 bg-[#0B0E11] text-[#848E9C]">
+                  <tr>
+                    <th className="py-1 pr-3 font-normal">快照时间</th>
+                    <th className="py-1 pr-3 font-normal">交易对</th>
+                    <th className="py-1 pr-3 font-normal">信号</th>
+                    <th className="py-1 pr-3 font-normal">内置 AI</th>
+                    <th className="py-1 pr-3 font-normal">外部 AI</th>
+                    <th className="py-1 pr-3 font-normal">结局盈亏</th>
+                  </tr>
+                </thead>
+                <tbody className="text-[#B7BDC6]">
+                  {history.map((a) => (
+                    <tr
+                      key={a.id}
+                      onClick={() =>
+                        setViewing({ id: a.signal_id, symbol: a.symbol, side: a.side })
+                      }
+                      className="cursor-pointer border-t border-[#181A20] hover:bg-[#181A20]"
+                    >
+                      <td className="py-1.5 pr-3">{dateLabel(a.snapshot_at)}</td>
+                      <td className="py-1.5 pr-3">
+                        {a.symbol} {sideLabel(a.side)}单
+                      </td>
+                      <td className="py-1.5 pr-3">#{a.signal_id}</td>
+                      <td className="py-1.5 pr-3">
+                        {a.verdict
+                          ? `${verdictLabels[a.verdict] || a.verdict}（${(a.confidence * 100).toFixed(0)}%）`
+                          : a.raw_response
+                            ? '未解析'
+                            : '—'}
+                      </td>
+                      <td className="py-1.5 pr-3">
+                        {a.external_verdict
+                          ? verdictLabels[a.external_verdict] || a.external_verdict
+                          : '—'}
+                      </td>
+                      <td className="py-1.5 pr-3">
+                        {a.outcome_pnl != null ? (
+                          <span
+                            className={
+                              a.outcome_pnl >= 0
+                                ? 'text-[#0ECB81]'
+                                : 'text-[#F6465D]'
+                            }
+                          >
+                            {money(a.outcome_pnl)}
+                          </span>
+                        ) : (
+                          '—'
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+      </div>
+      {viewing && (
+        <AnalysisModal signal={viewing} onClose={() => setViewing(null)} />
+      )}
+    </details>
+  )
+}
+
+// A2：市场指标实时预览卡片（折叠）。与信号无关，任意币种随时查看数据包
+// 同口径的市场层指标（后端 60s 结果缓存，打开时前端每 60s 自动刷新），
+// 用于持续观察指标质量、评估增删指标。
+function MarketPreviewCard() {
+  const [symbolInput, setSymbolInput] = useState('BTCUSDT')
+  const [symbol, setSymbol] = useState('')
+  const {
+    data: preview,
+    error,
+    isValidating,
+  } = useSWR<ReentryMarketPreview>(
+    symbol ? `reentry-market-preview-${symbol}` : null,
+    () => api.getReentryMarketPreview(symbol),
+    { refreshInterval: 60000, revalidateOnFocus: false }
+  )
+  const doQuery = () => {
+    const s = symbolInput.trim().toUpperCase()
+    if (s) setSymbol(s)
+  }
+  const m = preview?.market ?? null
+  const cvdLine = (cvd?: Record<string, { slope_recent: string; divergence_note?: string }>) =>
+    cvd
+      ? ['5m', '15m', '1h', '4h']
+          .filter((tf) => cvd[tf])
+          .map((tf) => `${tf} ${cvd[tf].slope_recent}`)
+          .join(' · ')
+      : '—'
+
+  return (
+    <details className="rounded-lg border border-[#2B3139] bg-[#181A20]">
+      <summary className="cursor-pointer px-4 py-3 text-sm font-medium text-[#EAECEF]">
+        📊 市场指标实时预览
+        <span className="ml-2 text-xs font-normal text-[#848E9C]">
+          与重入数据包同口径的市场层指标，任意币种随时查看（60s 缓存刷新）
+        </span>
+      </summary>
+      <div className="space-y-3 border-t border-[#2B3139] p-4 text-sm">
+        <div className="flex flex-wrap items-center gap-2">
+          <input
+            value={symbolInput}
+            onChange={(e) => setSymbolInput(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && doQuery()}
+            placeholder="BTCUSDT"
+            className="w-40 rounded border border-[#2B3139] bg-[#0B0E11] px-2 py-1 text-xs uppercase"
+          />
+          <button
+            onClick={doQuery}
+            className="rounded bg-[#F0B90B] px-3 py-1 text-xs font-medium text-black hover:opacity-90"
+          >
+            查看
+          </button>
+          {preview && (
+            <span className="text-xs text-[#848E9C]">
+              快照 {dateLabel(preview.generated_at)}
+              {isValidating ? ' · 刷新中…' : ''}
+            </span>
+          )}
+        </div>
+        {error != null && (
+          <div className="text-xs text-[#F6465D]">
+            {error instanceof Error ? error.message : String(error)}
+          </div>
+        )}
+        {preview && !preview.futures_available && (
+          <div className="rounded border border-[#F0B90B] bg-[#F0B90B]/10 p-3 text-xs text-[#F0B90B]">
+            {preview.symbol} 无 Binance 合约市场数据，无法预览（重入数据包对此类币种也会缺失市场层）。
+          </div>
+        )}
+        {m && preview && (
+          <>
+            <div className="grid gap-x-6 gap-y-1.5 text-xs text-[#B7BDC6] md:grid-cols-2">
+              <span>
+                当前价 <span className="text-[#EAECEF]">{m.current_price}</span>
+                <span className="ml-1 text-[#848E9C]">（{m.current_price_source}）</span>
+              </span>
+              <span>
+                ATR(OKX 1h){' '}
+                <span className="text-[#EAECEF]">
+                  {preview.atr_okx_1h > 0 ? preview.atr_okx_1h : '获取失败'}
+                </span>
+              </span>
+              {m.funding && (
+                <span>
+                  资金费率{' '}
+                  <span className="text-[#EAECEF]">
+                    {(m.funding.current_rate * 100).toFixed(4)}%
+                  </span>
+                  <span className="ml-1 text-[#848E9C]">
+                    （{m.funding.state} · 10 日分位 {m.funding.current_percentile_10d}% · 距结算{' '}
+                    {Math.round(m.funding.next_funding_minutes)} 分钟）
+                  </span>
+                </span>
+              )}
+              {m.basis && (
+                <span>
+                  基差{' '}
+                  <span className={m.basis.basis_pct >= 0 ? 'text-[#0ECB81]' : 'text-[#F6465D]'}>
+                    {m.basis.basis_pct}%
+                  </span>
+                  <span className="ml-1 text-[#848E9C]">（正=升水）</span>
+                </span>
+              )}
+              {m.open_interest && (
+                <span>
+                  持仓量{' '}
+                  <span className="text-[#EAECEF]">
+                    {(m.open_interest.latest_usd / 1e6).toFixed(1)}M USD
+                  </span>
+                  <span className="ml-1 text-[#848E9C]">
+                    （1h {m.open_interest.change_pct['1h'] ?? '—'}% · 4h{' '}
+                    {m.open_interest.change_pct['4h'] ?? '—'}% · 24h{' '}
+                    {m.open_interest.change_pct['24h'] ?? '—'}%）
+                  </span>
+                </span>
+              )}
+              {m.open_interest && (
+                <span>
+                  价格×OI 解读{' '}
+                  <span className="text-[#EAECEF]">{m.open_interest.price_oi_read_4h}</span>
+                </span>
+              )}
+              {m.long_short_ratio && (
+                <span>
+                  多空比{' '}
+                  <span className="text-[#EAECEF]">
+                    散户 {m.long_short_ratio.global_accounts_ratio} · 大户{' '}
+                    {m.long_short_ratio.top_positions_ratio}
+                  </span>
+                  <span className="ml-1 text-[#848E9C]">
+                    （24h 趋势 {m.long_short_ratio.global_trend_24h}）
+                  </span>
+                </span>
+              )}
+              {m.spot_to_contract_volume_ratio_24h != null &&
+                m.spot_to_contract_volume_ratio_24h > 0 && (
+                  <span>
+                    现货/合约成交额比(24h){' '}
+                    <span className="text-[#EAECEF]">{m.spot_to_contract_volume_ratio_24h}</span>
+                  </span>
+                )}
+              <span>
+                合约 CVD 斜率 <span className="text-[#EAECEF]">{cvdLine(m.contract_cvd)}</span>
+              </span>
+              <span>
+                现货 CVD 斜率 <span className="text-[#EAECEF]">{cvdLine(m.spot_cvd)}</span>
+              </span>
+              {m.klines &&
+                ['1h', '4h', '1d'].map(
+                  (tf) =>
+                    m.klines![tf] && (
+                      <span key={tf}>
+                        {tf} 窗口涨跌{' '}
+                        <span
+                          className={
+                            m.klines![tf].pct_change_window >= 0
+                              ? 'text-[#0ECB81]'
+                              : 'text-[#F6465D]'
+                          }
+                        >
+                          {m.klines![tf].pct_change_window}%
+                        </span>
+                        <span className="ml-1 text-[#848E9C]">
+                          · 量比(5/20) {m.klines![tf].volume_ratio_5_20}
+                        </span>
+                      </span>
+                    )
+                )}
+              {m.support_resistance &&
+                ['1h', '4h'].map(
+                  (tf) =>
+                    m.support_resistance![tf] && (
+                      <span key={tf}>
+                        {tf} 支撑/阻力{' '}
+                        <span className="text-[#EAECEF]">
+                          {m.support_resistance![tf].nearest_support || '—'} /{' '}
+                          {m.support_resistance![tf].nearest_resistance || '—'}
+                        </span>
+                        <span className="ml-1 text-[#848E9C]">
+                          （距 {m.support_resistance![tf].support_distance_atr} /{' '}
+                          {m.support_resistance![tf].resistance_distance_atr} ATR）
+                        </span>
+                      </span>
+                    )
+                )}
+            </div>
+            {(preview.missing_fields?.length ?? 0) > 0 && (
+              <div className="text-xs text-[#848E9C]">
+                部分字段降级：{preview.missing_fields!.join('、')}
+              </div>
+            )}
+            <CopyableSection
+              title="完整市场层 JSON（与数据包 market 段同结构）"
+              content={JSON.stringify(m, null, 2)}
+            />
+          </>
+        )}
+        {!symbol && (
+          <div className="text-xs text-[#848E9C]">
+            输入 Binance 合约交易对（如 BTCUSDT、ETHUSDT）后点击查看。指标口径与重入决策数据包完全一致，可用于评估指标有效性、决定后续增删。
           </div>
         )}
       </div>
@@ -1209,6 +1495,7 @@ export function CopyGuardPage() {
       </div>
       <ManualSignalsBanner />
       <AdvisorSettingsCard />
+      <MarketPreviewCard />
       <div className="grid md:grid-cols-5 gap-3">
         <input
           value={traderID}

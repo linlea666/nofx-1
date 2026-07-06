@@ -209,13 +209,6 @@ func (a *Advisor) markAnalysisDone(id int64) {
 	a.inflightMu.Unlock()
 }
 
-// AnalysisRunning 该分析记录是否正在内置 AI 分析中（API 状态回显用）
-func (a *Advisor) AnalysisRunning(id int64) bool {
-	a.inflightMu.Lock()
-	defer a.inflightMu.Unlock()
-	return a.inflight[id]
-}
-
 // runAnalysis 对一条分析快照执行内置 AI 分析并写回结果。
 // autoTriggered=true（新信号自动分析路径）时：完成后追加一封结论邮件（与
 // 既有信号邮件互补，不阻塞不修改 copytrade 邮件流程）；且在 Phase 3 自动
@@ -292,7 +285,7 @@ func (a *Advisor) runAnalysis(analysisID int64, autoTriggered bool) {
 	// Phase 3：自动入场（仅自动分析路径；结果并入结论邮件）
 	if autoTriggered {
 		autoEntryNote := a.maybeAutoEnter(analysis, cfg, pv)
-		a.notifyVerdict(analysis, pv, autoEntryNote)
+		a.notifyVerdict(analysis, cfg, pv, autoEntryNote)
 	}
 }
 
@@ -345,7 +338,7 @@ func (a *Advisor) maybeAutoEnter(analysis *store.ReentryAIAnalysis, cfg *store.R
 // notifyVerdict AI 结论邮件（自动分析路径）。信号本身的告警邮件由 copytrade
 // 即时发出；这封是补充结论（含自动入场执行说明），限流键独立，notifier 未
 // 启用时零副作用。
-func (a *Advisor) notifyVerdict(analysis *store.ReentryAIAnalysis, pv *parsedVerdict, autoEntryNote string) {
+func (a *Advisor) notifyVerdict(analysis *store.ReentryAIAnalysis, cfg *store.ReentryAIConfig, pv *parsedVerdict, autoEntryNote string) {
 	verdictText := map[string]string{
 		store.ReentryVerdictEnter: "ENTER（建议确认重入）",
 		store.ReentryVerdictWait:  "WAIT（建议继续观察）",
@@ -374,9 +367,12 @@ func (a *Advisor) notifyVerdict(analysis *store.ReentryAIAnalysis, pv *parsedVer
 			fmt.Fprintf(&b, "  - %s\n", r)
 		}
 	}
-	if autoEntryNote != "" {
+	switch {
+	case autoEntryNote != "":
 		fmt.Fprintf(&b, "\n自动入场: %s\n", autoEntryNote)
-	} else {
+	case cfg.AutoEntryEnabled:
+		b.WriteString("\n自动入场已开启，但仅结论为 ENTER 时触发，本条未下单。请在 Copy Guard 页面查看完整数据包并人工决策。")
+	default:
 		b.WriteString("\n请在 Copy Guard 页面查看完整数据包并人工确认。AI 结论仅供参考，未开启自动入场时不会下单。")
 	}
 	notifier.Notify(notifier.Alert{
@@ -390,6 +386,7 @@ func (a *Advisor) notifyVerdict(analysis *store.ReentryAIAnalysis, pv *parsedVer
 
 // AnalyzeAnalysis 手动触发内置 AI 分析（API 层调用，异步执行）。
 // 不受 ai_enabled（自动分析开关）限制：只要模型可解析即可手动分析。
+// 30s 冷却防误触连击烧 token；手动路径永不发邮件、永不自动入场。
 func AnalyzeAnalysis(analysisID int64) error {
 	defaultAdvisorMu.RLock()
 	a := defaultAdvisor
@@ -407,9 +404,21 @@ func AnalyzeAnalysis(analysisID int64) error {
 	if _, err := resolveAIModel(a.st, cfg); err != nil {
 		return err
 	}
-	if a.AnalysisRunning(analysisID) {
+	a.inflightMu.Lock()
+	if a.inflight[analysisID] {
+		a.inflightMu.Unlock()
 		return fmt.Errorf("该记录的 AI 分析正在进行中，请稍候")
 	}
-	go a.runAnalysis(analysisID, false)
+	if last, ok := a.analyzeLast[analysisID]; ok {
+		if since := time.Since(last); since < manualAnalyzeCooldown {
+			a.inflightMu.Unlock()
+			return fmt.Errorf("操作过于频繁，请 %d 秒后再试", int((manualAnalyzeCooldown-since).Seconds())+1)
+		}
+	}
+	a.analyzeLast[analysisID] = time.Now()
+	a.inflightMu.Unlock()
+	if !a.spawnAnalysis(analysisID, false) {
+		return fmt.Errorf("重入 AI 助手插件已停止")
+	}
 	return nil
 }

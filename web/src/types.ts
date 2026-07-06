@@ -912,6 +912,62 @@ export interface ReentryAIStats {
   external_correct: number
 }
 
+// 市场指标实时预览（A2，与信号无关；market 结构与数据包 market 段一致，
+// 此处只声明卡片展示用到的字段，完整内容以原始 JSON 折叠段展示）
+export interface ReentryMarketPreview {
+  symbol: string
+  generated_at: string
+  futures_available: boolean
+  spot_available: boolean
+  atr_okx_1h: number
+  market: {
+    current_price: number
+    current_price_source: string
+    klines?: Record<
+      string,
+      { pct_change_window: number; volume_ratio_5_20: number }
+    >
+    contract_cvd?: Record<
+      string,
+      { slope_recent: string; divergence_note?: string }
+    >
+    spot_cvd?: Record<
+      string,
+      { slope_recent: string; divergence_note?: string }
+    >
+    open_interest?: {
+      latest_usd: number
+      change_pct: Record<string, number>
+      price_oi_read_4h: string
+    }
+    funding?: {
+      current_rate: number
+      state: string
+      current_percentile_10d: number
+      next_funding_minutes: number
+    }
+    long_short_ratio?: {
+      global_accounts_ratio: number
+      top_positions_ratio: number
+      global_trend_24h: string
+    }
+    basis?: { basis_pct: number }
+    support_resistance?: Record<
+      string,
+      {
+        nearest_support: number
+        support_touches: number
+        support_distance_atr: number
+        nearest_resistance: number
+        resistance_touches: number
+        resistance_distance_atr: number
+      }
+    >
+    spot_to_contract_volume_ratio_24h?: number
+  } | null
+  missing_fields?: string[]
+}
+
 export interface CopyTradeStats {
   signals_received: number
   signals_followed: number

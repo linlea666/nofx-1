@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -213,6 +214,37 @@ func (s *ReentryAIStore) ListReentryAnalysesBySignal(signalID int64, limit int) 
 	return out, rows.Err()
 }
 
+// ListReentryAnalysesByTraders 按归属交易员列出分析历史（跨信号，最新在前），
+// A1 分析历史列表用。traderIDs 为空返回空列表。
+func (s *ReentryAIStore) ListReentryAnalysesByTraders(traderIDs []string, limit int) ([]*ReentryAIAnalysis, error) {
+	out := []*ReentryAIAnalysis{}
+	if len(traderIDs) == 0 {
+		return out, nil
+	}
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	args := make([]interface{}, 0, len(traderIDs)+1)
+	for _, id := range traderIDs {
+		args = append(args, id)
+	}
+	args = append(args, limit)
+	rows, err := s.db.Query(`SELECT `+reentryAnalysisColumns+` FROM reentry_ai_analyses
+		WHERE trader_id IN (`+sqlMarks(len(traderIDs))+`) ORDER BY id DESC LIMIT ?`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		a, err := scanReentryAnalysis(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
 // LatestReentryAnalysisBySignal 某信号最新一条分析（无记录返回 sql.ErrNoRows）
 func (s *ReentryAIStore) LatestReentryAnalysisBySignal(signalID int64) (*ReentryAIAnalysis, error) {
 	row := s.db.QueryRow(`SELECT `+reentryAnalysisColumns+` FROM reentry_ai_analyses WHERE signal_id=? ORDER BY id DESC LIMIT 1`, signalID)
@@ -305,14 +337,17 @@ func (s *ReentryAIStore) SetReentryOutcomeForSignal(signalID int64, pnl float64)
 }
 
 // ReentryAIStats 内外部 AI 结论分布与准确率统计。
-// 准确率口径：仅统计有结局盈亏的记录；ENTER 且盈利 / SKIP 且亏损 记为正确；
+//
+// 口径（按信号去重）：同一信号"重新生成"会产生多个快照，为避免重复快照
+// 放大样本，内部/外部各取"该信号最新一条带相应结论的快照"作为唯一样本。
+// 准确率：仅统计有结局盈亏的样本；ENTER 且盈利 / SKIP 且亏损 记为正确；
 // WAIT 不计入（无对错基准）。结局盈亏 = 该信号重入尝试的已对账净额（pnl−fee）。
 type ReentryAIStats struct {
 	TotalAnalyses  int `json:"total_analyses"`
 	SignalsCovered int `json:"signals_covered"`
-	ScoredCount    int `json:"scored_count"` // 已回填结局的分析记录数
+	ScoredCount    int `json:"scored_count"` // 已回填结局的信号数
 
-	InternalVerdicts map[string]int `json:"internal_verdicts"` // ENTER/WAIT/SKIP → 数量
+	InternalVerdicts map[string]int `json:"internal_verdicts"` // ENTER/WAIT/SKIP → 信号数（按信号去重）
 	ExternalVerdicts map[string]int `json:"external_verdicts"`
 
 	InternalScored  int `json:"internal_scored"` // 内部结论中可评分（ENTER/SKIP 且有结局）
@@ -321,23 +356,42 @@ type ReentryAIStats struct {
 	ExternalCorrect int `json:"external_correct"`
 }
 
-// GetReentryAIStats 汇总统计（表量级小，直接聚合查询）
-func (s *ReentryAIStore) GetReentryAIStats() (*ReentryAIStats, error) {
+// sqlMarks 生成 "?,?,...,?" 占位符
+func sqlMarks(n int) string {
+	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
+}
+
+// GetReentryAIStats 汇总统计，按 traderIDs 归属过滤（表量级小，直接聚合查询）。
+// traderIDs 为空返回零值统计（当前用户名下无交易员）。
+func (s *ReentryAIStore) GetReentryAIStats(traderIDs []string) (*ReentryAIStats, error) {
 	st := &ReentryAIStats{
 		InternalVerdicts: map[string]int{},
 		ExternalVerdicts: map[string]int{},
 	}
+	if len(traderIDs) == 0 {
+		return st, nil
+	}
+	marks := sqlMarks(len(traderIDs))
+	args := make([]interface{}, len(traderIDs))
+	for i, id := range traderIDs {
+		args[i] = id
+	}
 	err := s.db.QueryRow(`SELECT COUNT(*), COUNT(DISTINCT signal_id),
-		COALESCE(SUM(CASE WHEN outcome_pnl IS NOT NULL THEN 1 ELSE 0 END),0)
-		FROM reentry_ai_analyses`).Scan(&st.TotalAnalyses, &st.SignalsCovered, &st.ScoredCount)
+		COUNT(DISTINCT CASE WHEN outcome_pnl IS NOT NULL THEN signal_id END)
+		FROM reentry_ai_analyses WHERE trader_id IN (`+marks+`)`, args...).
+		Scan(&st.TotalAnalyses, &st.SignalsCovered, &st.ScoredCount)
 	if err != nil {
 		return nil, err
 	}
+	// 每信号取最新一条带结论的快照为样本（MAX(id) 子查询去重）
 	fill := func(col string, verdicts map[string]int, scored, correct *int) error {
-		rows, err := s.db.Query(`SELECT ` + col + `, COUNT(*),
-			COALESCE(SUM(CASE WHEN outcome_pnl IS NOT NULL AND ` + col + ` IN ('ENTER','SKIP') THEN 1 ELSE 0 END),0),
-			COALESCE(SUM(CASE WHEN outcome_pnl IS NOT NULL AND ((` + col + `='ENTER' AND outcome_pnl>0) OR (` + col + `='SKIP' AND outcome_pnl<=0)) THEN 1 ELSE 0 END),0)
-			FROM reentry_ai_analyses WHERE ` + col + ` != '' GROUP BY ` + col)
+		rows, err := s.db.Query(`SELECT `+col+`, COUNT(*),
+			COALESCE(SUM(CASE WHEN outcome_pnl IS NOT NULL AND `+col+` IN ('ENTER','SKIP') THEN 1 ELSE 0 END),0),
+			COALESCE(SUM(CASE WHEN outcome_pnl IS NOT NULL AND ((`+col+`='ENTER' AND outcome_pnl>0) OR (`+col+`='SKIP' AND outcome_pnl<=0)) THEN 1 ELSE 0 END),0)
+			FROM reentry_ai_analyses a
+			WHERE a.trader_id IN (`+marks+`) AND a.`+col+` != ''
+			  AND a.id = (SELECT MAX(b.id) FROM reentry_ai_analyses b WHERE b.signal_id = a.signal_id AND b.`+col+` != '')
+			GROUP BY `+col, args...)
 		if err != nil {
 			return err
 		}
