@@ -887,6 +887,30 @@ export interface ReentryAIAnalysis {
   updated_at?: string
 }
 
+// 重入 AI 助手全局配置（Phase 2）
+export interface ReentryAIConfig {
+  enabled: boolean // 插件总开关（数据包自动生成）
+  ai_enabled: boolean // 新信号自动触发内置 AI 分析
+  provider: string
+  model: string // ai_models 表的模型 ID（空=自动选默认）
+  prompt_template: string // 自定义 System Prompt（空=内置默认）
+  confidence_threshold: number // Phase 3 预留
+  timeout_seconds: number
+}
+
+// 重入 AI 结论分布与准确率统计（Phase 2）
+export interface ReentryAIStats {
+  total_analyses: number
+  signals_covered: number
+  scored_count: number
+  internal_verdicts: Record<string, number>
+  external_verdicts: Record<string, number>
+  internal_scored: number
+  internal_correct: number
+  external_scored: number
+  external_correct: number
+}
+
 export interface CopyTradeStats {
   signals_received: number
   signals_followed: number

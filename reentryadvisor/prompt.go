@@ -11,9 +11,18 @@ import (
 const promptVersion = "v1"
 
 // buildSystemPrompt 重入决策顾问的角色与硬约束。
-// Phase 1 仅供用户复制给外部 AI；Phase 2 起同一文本直接喂内置模型
-// （同一快照同一 prompt，保证内外对比同源公平）。
-func buildSystemPrompt() string {
+// 同一文本既供用户复制给外部 AI，也直接喂内置模型（同一快照同一 prompt，
+// 保证内外对比同源公平）。template 非空时整体替换默认模板（配置页自定义），
+// 在数据包生成时固化进快照，之后模板再改不影响已生成记录。
+func buildSystemPrompt(template string) string {
+	if t := strings.TrimSpace(template); t != "" {
+		return t
+	}
+	return DefaultSystemPrompt()
+}
+
+// DefaultSystemPrompt 内置默认 System Prompt（配置页"恢复默认"与占位展示用）
+func DefaultSystemPrompt() string {
 	return `你是"跟单风控重入决策顾问"。一个跟单系统的保护性止损已把跟随仓位止损出局，而领航员（被跟单者）仍持有原方向仓位；系统的规则引擎已确认重入的技术门控全部通过（冷却期、价格回归边界、波动扩张上限、连续确认），现在需要你基于完整数据包做最后一层"市场结构与拥挤度"判断：此刻确认重入是否明智。
 
 ## 你的核心判断清单（逐条评估，结论必须逐条引用数据包字段与数值）

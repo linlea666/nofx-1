@@ -12,9 +12,12 @@ import {
 } from 'recharts'
 import { api } from '../lib/api'
 import type {
+  AIModel,
   CopyGuardCycle,
   CopyGuardManualSignal,
   ReentryAIAnalysis,
+  ReentryAIConfig,
+  ReentryAIStats,
 } from '../types'
 
 const money = (v: number) => `${v >= 0 ? '+' : ''}${v.toFixed(2)} USDT`
@@ -200,8 +203,68 @@ function CopyableSection({
   )
 }
 
+// 内外部 AI 结论标签样式（ENTER 绿 / WAIT 黄 / SKIP 红）
+const verdictStyles: Record<string, string> = {
+  ENTER: 'bg-[#0ECB81]/15 text-[#0ECB81] border-[#0ECB81]',
+  WAIT: 'bg-[#F0B90B]/15 text-[#F0B90B] border-[#F0B90B]',
+  SKIP: 'bg-[#F6465D]/15 text-[#F6465D] border-[#F6465D]',
+}
+const verdictLabels: Record<string, string> = {
+  ENTER: 'ENTER · 建议重入',
+  WAIT: 'WAIT · 继续观察',
+  SKIP: 'SKIP · 建议忽略',
+}
+
+// 内置 AI 结论卡片：verdict 徽标 + 置信度 + 依据/风险列表（reasons JSON）
+function InternalVerdictCard({ analysis }: { analysis: ReentryAIAnalysis }) {
+  const parsed = useMemo(() => {
+    try {
+      return JSON.parse(analysis.reasons || '{}') as {
+        reasons?: string[]
+        risk_notes?: string[]
+        suggested_notional?: number
+      }
+    } catch {
+      return {}
+    }
+  }, [analysis.reasons])
+  if (!analysis.verdict) return null
+  return (
+    <div
+      className={`space-y-2 rounded border p-3 ${verdictStyles[analysis.verdict] || 'border-[#2B3139]'}`}
+    >
+      <div className="flex flex-wrap items-center gap-3 text-sm font-medium">
+        <span>内置 AI 结论：{verdictLabels[analysis.verdict] || analysis.verdict}</span>
+        <span className="text-xs font-normal">
+          置信度 {(analysis.confidence * 100).toFixed(0)}%
+        </span>
+        {parsed.suggested_notional ? (
+          <span className="text-xs font-normal">
+            建议金额 {parsed.suggested_notional.toFixed(2)} USDT
+          </span>
+        ) : null}
+      </div>
+      {(parsed.reasons?.length ?? 0) > 0 && (
+        <ul className="list-disc space-y-1 pl-5 text-xs text-[#EAECEF]">
+          {parsed.reasons!.map((r, i) => (
+            <li key={i}>{r}</li>
+          ))}
+        </ul>
+      )}
+      {(parsed.risk_notes?.length ?? 0) > 0 && (
+        <div className="text-xs text-[#B7BDC6]">
+          风险提示：{parsed.risk_notes!.join('；')}
+        </div>
+      )}
+      <div className="text-xs text-[#848E9C]">
+        AI 结论仅供参考，不会自动入场；入场仍需上方「确认重入」人工操作。
+      </div>
+    </div>
+  )
+}
+
 // 重入 AI 助手分析弹窗：三段可复制（System Prompt / User Prompt / 纯数据 JSON）
-// + 外部 AI 结论粘贴区（永久可编辑，供准确率对比留档）。
+// + 内置 AI 结论（Phase 2）+ 外部 AI 结论粘贴区（永久可编辑，供准确率对比留档）。
 // 数据由 reentryadvisor 插件在信号产生后自动生成；可手动重新生成新快照（60s 冷却）。
 function AnalysisModal({
   signal,
@@ -264,6 +327,20 @@ function AnalysisModal({
       })
       setNotice('外部 AI 结论已保存')
       void mutate()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+  const doAnalyzeInternal = async () => {
+    if (!analysis) return
+    setBusy(true)
+    setError('')
+    setNotice('')
+    try {
+      await api.analyzeReentryAnalysis(analysis.id)
+      setNotice('内置 AI 分析已开始，结果稍后自动出现在本页（10 秒轮询）')
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -340,11 +417,32 @@ function AnalysisModal({
                 title="纯数据 JSON（喂外部 AI 用）"
                 content={analysis.datapack_json}
               />
+              <InternalVerdictCard analysis={analysis} />
+              {analysis.raw_response && !analysis.verdict && (
+                <div className="rounded border border-[#F0B90B] bg-[#F0B90B]/10 p-3 text-xs text-[#F0B90B]">
+                  内置 AI 已返回但结论未能解析为结构化 JSON，原始回复见下方。
+                </div>
+              )}
               {analysis.raw_response && (
                 <CopyableSection
-                  title="系统 AI 返回"
+                  title="内置 AI 原始回复"
                   content={analysis.raw_response}
                 />
+              )}
+              {analysis.outcome_pnl != null && (
+                <div className="text-xs text-[#848E9C]">
+                  真实结局：本次重入尝试已闭合，净盈亏{' '}
+                  <span
+                    className={
+                      analysis.outcome_pnl >= 0
+                        ? 'text-[#0ECB81]'
+                        : 'text-[#F6465D]'
+                    }
+                  >
+                    {money(analysis.outcome_pnl)}
+                  </span>
+                  （含手续费）
+                </div>
               )}
               <div className="space-y-2 rounded border border-[#2B3139] bg-[#0B0E11] p-3">
                 <div className="flex items-center justify-between text-sm text-[#EAECEF]">
@@ -387,16 +485,225 @@ function AnalysisModal({
           <span className="text-xs text-[#848E9C]">
             数据快照有时效性：距信号产生较久后请先重新生成再发给 AI 判断。
           </span>
-          <button
-            onClick={() => void doRegenerate()}
-            disabled={busy}
-            className="rounded bg-[#F0B90B] px-3 py-1 text-xs font-medium text-black hover:opacity-90 disabled:opacity-40"
-          >
-            {busy ? '处理中…' : analyses.length === 0 ? '立即生成' : '重新生成（新快照）'}
-          </button>
+          <span className="flex gap-2">
+            {analysis && (
+              <button
+                onClick={() => void doAnalyzeInternal()}
+                disabled={busy}
+                className="rounded bg-[#2B3139] px-3 py-1 text-xs hover:bg-[#3B424C] disabled:opacity-40"
+                title="用配置的内置模型分析当前快照（同一 Prompt，可与外部 AI 对比）"
+              >
+                {analysis.verdict ? '重跑内置 AI' : '内置 AI 分析'}
+              </button>
+            )}
+            <button
+              onClick={() => void doRegenerate()}
+              disabled={busy}
+              className="rounded bg-[#F0B90B] px-3 py-1 text-xs font-medium text-black hover:opacity-90 disabled:opacity-40"
+            >
+              {busy ? '处理中…' : analyses.length === 0 ? '立即生成' : '重新生成（新快照）'}
+            </button>
+          </span>
         </div>
       </div>
     </div>
+  )
+}
+
+// 准确率格子（内部/外部 AI 各一行）
+function accuracyText(scored: number, correct: number) {
+  if (scored === 0) return '暂无可评分样本'
+  return `${correct}/${scored} 正确（${((correct / scored) * 100).toFixed(0)}%）`
+}
+
+// 重入 AI 助手设置卡片（折叠）：插件开关 / 自动分析开关 / 模型选择 /
+// Prompt 模板 / 超时 + 内外部 AI 结论分布与准确率统计。
+// 评分口径：仅已执行且重入尝试闭合对账的信号；ENTER 且盈利、SKIP 且亏损记为
+// 正确，WAIT 不计入。
+function AdvisorSettingsCard() {
+  const { data: cfgData, mutate: mutateCfg } = useSWR(
+    'reentry-advisor-config',
+    () => api.getReentryConfig()
+  )
+  const { data: stats } = useSWR<ReentryAIStats>(
+    'reentry-advisor-stats',
+    () => api.getReentryStats(),
+    { refreshInterval: 60000 }
+  )
+  const { data: models = [] } = useSWR<AIModel[]>('model-configs', () =>
+    api.getModelConfigs()
+  )
+  const enabledModels = models.filter((m) => m.enabled)
+
+  const [draft, setDraft] = useState<ReentryAIConfig | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const [notice, setNotice] = useState('')
+  const cfg = draft ?? cfgData?.config ?? null
+
+  const update = (patch: Partial<ReentryAIConfig>) => {
+    if (!cfg) return
+    setDraft({ ...cfg, ...patch })
+  }
+  const doSave = async () => {
+    if (!cfg) return
+    setBusy(true)
+    setError('')
+    setNotice('')
+    try {
+      await api.saveReentryConfig(cfg)
+      setNotice('配置已保存')
+      setDraft(null)
+      void mutateCfg()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <details className="rounded-lg border border-[#2B3139] bg-[#181A20]">
+      <summary className="cursor-pointer px-4 py-3 text-sm font-medium text-[#EAECEF]">
+        🤖 重入 AI 助手设置与统计
+        <span className="ml-2 text-xs font-normal text-[#848E9C]">
+          人工重入信号的决策数据包与内置 AI 分析（AI 只给建议，不会自动入场）
+        </span>
+      </summary>
+      <div className="space-y-4 border-t border-[#2B3139] p-4 text-sm">
+        {!cfg ? (
+          <div className="text-[#848E9C]">配置加载中…</div>
+        ) : (
+          <>
+            <div className="grid gap-3 md:grid-cols-2">
+              <label className="flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  checked={cfg.enabled}
+                  onChange={(e) => update({ enabled: e.target.checked })}
+                />
+                <span>
+                  启用插件
+                  <span className="ml-1 text-xs text-[#848E9C]">
+                    （新信号自动生成决策数据包）
+                  </span>
+                </span>
+              </label>
+              <label className="flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  checked={cfg.ai_enabled}
+                  onChange={(e) => update({ ai_enabled: e.target.checked })}
+                />
+                <span>
+                  自动内置 AI 分析
+                  <span className="ml-1 text-xs text-[#848E9C]">
+                    （新信号生成数据包后自动喂给内置模型并邮件通知结论）
+                  </span>
+                </span>
+              </label>
+              <label className="flex items-center gap-2">
+                <span className="w-24 shrink-0 text-[#848E9C]">分析模型</span>
+                <select
+                  value={cfg.model}
+                  onChange={(e) => update({ model: e.target.value })}
+                  className="flex-1 rounded border border-[#2B3139] bg-[#0B0E11] px-2 py-1"
+                >
+                  <option value="">自动（优先已启用的 DeepSeek）</option>
+                  {enabledModels.map((m) => (
+                    <option key={m.id} value={m.id}>
+                      {m.name}（{m.provider}）
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="flex items-center gap-2">
+                <span className="w-24 shrink-0 text-[#848E9C]">调用超时</span>
+                <input
+                  type="number"
+                  min={10}
+                  max={300}
+                  value={cfg.timeout_seconds}
+                  onChange={(e) =>
+                    update({ timeout_seconds: Number(e.target.value) })
+                  }
+                  className="w-24 rounded border border-[#2B3139] bg-[#0B0E11] px-2 py-1"
+                />
+                <span className="text-xs text-[#848E9C]">秒</span>
+              </label>
+            </div>
+            <div className="space-y-1">
+              <div className="flex items-center justify-between text-xs text-[#848E9C]">
+                <span>
+                  自定义 System Prompt（留空使用内置默认；修改只影响之后生成的快照。注意保留
+                  JSON 输出格式要求，否则内置分析无法解析结论）
+                </span>
+                {cfg.prompt_template && (
+                  <button
+                    onClick={() => update({ prompt_template: '' })}
+                    className="underline hover:text-[#EAECEF]"
+                  >
+                    恢复默认
+                  </button>
+                )}
+              </div>
+              <textarea
+                value={cfg.prompt_template}
+                onChange={(e) => update({ prompt_template: e.target.value })}
+                rows={4}
+                placeholder={cfgData?.default_prompt?.slice(0, 300) + '…'}
+                className="w-full rounded border border-[#2B3139] bg-[#0B0E11] p-2 text-xs text-[#EAECEF]"
+              />
+            </div>
+            <div className="flex items-center justify-between">
+              <span className="text-xs">
+                {error && <span className="text-[#F6465D]">{error}</span>}
+                {notice && <span className="text-[#0ECB81]">{notice}</span>}
+              </span>
+              <button
+                onClick={() => void doSave()}
+                disabled={busy || !draft}
+                className="rounded bg-[#F0B90B] px-4 py-1.5 text-xs font-medium text-black hover:opacity-90 disabled:opacity-40"
+              >
+                {busy ? '保存中…' : '保存配置'}
+              </button>
+            </div>
+          </>
+        )}
+        {stats && stats.total_analyses > 0 && (
+          <div className="space-y-2 rounded bg-[#0B0E11] p-3">
+            <div className="text-xs font-medium text-[#EAECEF]">
+              结论统计（快照 {stats.total_analyses} 条 / 信号{' '}
+              {stats.signals_covered} 个 / 已回填结局 {stats.scored_count} 条）
+            </div>
+            <div className="grid gap-x-6 gap-y-1 text-xs text-[#B7BDC6] md:grid-cols-2">
+              <span>
+                内置 AI：
+                {['ENTER', 'WAIT', 'SKIP']
+                  .map((v) => `${v} ${stats.internal_verdicts[v] || 0}`)
+                  .join(' · ')}
+              </span>
+              <span>
+                准确率 {accuracyText(stats.internal_scored, stats.internal_correct)}
+              </span>
+              <span>
+                外部 AI：
+                {['ENTER', 'WAIT', 'SKIP']
+                  .map((v) => `${v} ${stats.external_verdicts[v] || 0}`)
+                  .join(' · ')}
+              </span>
+              <span>
+                准确率 {accuracyText(stats.external_scored, stats.external_correct)}
+              </span>
+            </div>
+            <div className="text-xs text-[#848E9C]">
+              评分口径：已执行信号的重入尝试闭合对账后回填净盈亏；ENTER
+              且盈利、SKIP 且亏损记为正确，WAIT 不计入。
+            </div>
+          </div>
+        )}
+      </div>
+    </details>
   )
 }
 
@@ -835,6 +1142,7 @@ export function CopyGuardPage() {
         </div>
       </div>
       <ManualSignalsBanner />
+      <AdvisorSettingsCard />
       <div className="grid md:grid-cols-5 gap-3">
         <input
           value={traderID}

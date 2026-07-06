@@ -1015,4 +1015,38 @@ export const api = {
       throw new Error(result.message || '保存外部 AI 结论失败')
     return result.data!
   },
+  // Phase 2：手动触发内置 AI 分析（异步，结果稍后写回记录）
+  async analyzeReentryAnalysis(analysisId: number) {
+    const result = await httpClient.post<{ message: string }>(
+      `${API_BASE}/reentry-advisor/analyses/${analysisId}/analyze`
+    )
+    if (!result.success) throw new Error(result.message || '触发 AI 分析失败')
+    return result.data!
+  },
+  async getReentryConfig() {
+    const result = await httpClient.get<{
+      config: import('../types').ReentryAIConfig
+      default_prompt: string
+    }>(`${API_BASE}/reentry-advisor/config`)
+    if (!result.success)
+      throw new Error(result.message || '获取重入 AI 配置失败')
+    return result.data!
+  },
+  async saveReentryConfig(config: import('../types').ReentryAIConfig) {
+    const result = await httpClient.put<{
+      message: string
+      config: import('../types').ReentryAIConfig
+    }>(`${API_BASE}/reentry-advisor/config`, config)
+    if (!result.success)
+      throw new Error(result.message || '保存重入 AI 配置失败')
+    return result.data!
+  },
+  async getReentryStats() {
+    const result = await httpClient.get<{
+      stats: import('../types').ReentryAIStats
+    }>(`${API_BASE}/reentry-advisor/stats`)
+    if (!result.success)
+      throw new Error(result.message || '获取重入 AI 统计失败')
+    return result.data!.stats
+  },
 }

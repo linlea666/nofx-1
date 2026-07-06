@@ -20,6 +20,10 @@ import (
 //   GET  /api/reentry-advisor/config                          全局配置
 //   PUT  /api/reentry-advisor/config                          保存全局配置
 //
+// Phase 2（内置 AI 分析）：
+//   POST /api/reentry-advisor/analyses/:id/analyze            手动触发内置 AI 分析（异步）
+//   GET  /api/reentry-advisor/stats                           结论分布与准确率统计
+//
 // 归属校验：分析记录 → 信号 → 交易员 → 当前用户（同人工重入信号 API 口径）
 // ============================================================================
 
@@ -40,6 +44,8 @@ func (h *ReentryAIHandler) RegisterRoutes(group *gin.RouterGroup) {
 		g.GET("/signals/:signal_id/analyses", h.ListAnalyses)
 		g.POST("/signals/:signal_id/regenerate", h.RegenerateAnalysis)
 		g.PUT("/analyses/:id/external", h.SaveExternal)
+		g.POST("/analyses/:id/analyze", h.AnalyzeInternal)
+		g.GET("/stats", h.GetStats)
 		g.GET("/config", h.GetConfig)
 		g.PUT("/config", h.SaveConfig)
 	}
@@ -80,6 +86,34 @@ func (h *ReentryAIHandler) ownedSignal(c *gin.Context) *store.CopyGuardManualRee
 		return nil
 	}
 	return sig
+}
+
+// ownedAnalysis 解析 :id 并校验分析记录归属；失败时已写响应，返回 nil
+func (h *ReentryAIHandler) ownedAnalysis(c *gin.Context) *store.ReentryAIAnalysis {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(400, gin.H{"error": "invalid analysis id"})
+		return nil
+	}
+	analysis, err := h.store.ReentryAI().GetReentryAnalysis(id)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			c.JSON(404, gin.H{"error": "analysis not found"})
+		} else {
+			c.JSON(500, gin.H{"error": err.Error()})
+		}
+		return nil
+	}
+	owned, err := h.ownedTraderSet(c)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return nil
+	}
+	if !owned[analysis.TraderID] {
+		c.JSON(403, gin.H{"error": "analysis not owned by current user"})
+		return nil
+	}
+	return analysis
 }
 
 // ListAnalyses 某信号的分析记录（最新在前）
@@ -126,29 +160,11 @@ func (h *ReentryAIHandler) RegenerateAnalysis(c *gin.Context) {
 // @Param id path int true "Analysis ID"
 // @Router /api/reentry-advisor/analyses/{id}/external [put]
 func (h *ReentryAIHandler) SaveExternal(c *gin.Context) {
-	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
-	if err != nil {
-		c.JSON(400, gin.H{"error": "invalid analysis id"})
+	analysis := h.ownedAnalysis(c)
+	if analysis == nil {
 		return
 	}
-	analysis, err := h.store.ReentryAI().GetReentryAnalysis(id)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			c.JSON(404, gin.H{"error": "analysis not found"})
-		} else {
-			c.JSON(500, gin.H{"error": err.Error()})
-		}
-		return
-	}
-	owned, err := h.ownedTraderSet(c)
-	if err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
-		return
-	}
-	if !owned[analysis.TraderID] {
-		c.JSON(403, gin.H{"error": "analysis not owned by current user"})
-		return
-	}
+	id := analysis.ID
 	var req struct {
 		ExternalResponse string `json:"external_response"`
 		ExternalVerdict  string `json:"external_verdict"`
@@ -169,7 +185,37 @@ func (h *ReentryAIHandler) SaveExternal(c *gin.Context) {
 	c.JSON(200, gin.H{"message": "外部 AI 结论已保存", "analysis": latest})
 }
 
-// GetConfig 全局配置
+// AnalyzeInternal 手动触发内置 AI 分析（异步执行，前端轮询列表拿结果）
+// @Summary 触发内置 AI 分析
+// @Tags ReentryAdvisor
+// @Param id path int true "Analysis ID"
+// @Router /api/reentry-advisor/analyses/{id}/analyze [post]
+func (h *ReentryAIHandler) AnalyzeInternal(c *gin.Context) {
+	analysis := h.ownedAnalysis(c)
+	if analysis == nil {
+		return
+	}
+	if err := reentryadvisor.AnalyzeAnalysis(analysis.ID); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"message": "AI 分析已开始，结果稍后自动写入本条记录"})
+}
+
+// GetStats 内外部 AI 结论分布与准确率统计
+// @Summary 重入 AI 统计
+// @Tags ReentryAdvisor
+// @Router /api/reentry-advisor/stats [get]
+func (h *ReentryAIHandler) GetStats(c *gin.Context) {
+	stats, err := h.store.ReentryAI().GetReentryAIStats()
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"stats": stats})
+}
+
+// GetConfig 全局配置（附内置默认 Prompt，供配置页占位与"恢复默认"）
 // @Summary 重入 AI 助手配置
 // @Tags ReentryAdvisor
 // @Router /api/reentry-advisor/config [get]
@@ -179,10 +225,10 @@ func (h *ReentryAIHandler) GetConfig(c *gin.Context) {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(200, gin.H{"config": cfg})
+	c.JSON(200, gin.H{"config": cfg, "default_prompt": reentryadvisor.DefaultSystemPrompt()})
 }
 
-// SaveConfig 保存全局配置（Phase 1 仅 enabled 生效，其余为 Phase 2 预留）
+// SaveConfig 保存全局配置
 // @Summary 保存重入 AI 助手配置
 // @Tags ReentryAdvisor
 // @Router /api/reentry-advisor/config [put]
@@ -200,6 +246,15 @@ func (h *ReentryAIHandler) SaveConfig(c *gin.Context) {
 	}
 	if cfg.Provider == "" {
 		cfg.Provider = "deepseek"
+	}
+	// model 非空时校验其存在并同步 provider（provider 列仅作展示冗余）
+	if cfg.Model != "" {
+		m, err := h.store.AIModel().GetByID(cfg.Model)
+		if err != nil {
+			c.JSON(400, gin.H{"error": "所选模型不存在: " + cfg.Model})
+			return
+		}
+		cfg.Provider = m.Provider
 	}
 	if err := h.store.ReentryAI().SaveReentryAIConfig(&cfg); err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})

@@ -55,7 +55,7 @@ func TestBuildDataPackGuardLayerWithMarketUnavailable(t *testing.T) {
 	sig := newTestSignal(t, st, "ZZZNOSUCHCOINUSDT")
 
 	a := &Advisor{st: st, bn: newBinanceClient()}
-	analysis, err := a.generateForSignal(sig)
+	analysis, err := a.generateForSignal(sig, &store.ReentryAIConfig{Enabled: true})
 	if err != nil {
 		t.Fatal(err)
 	}

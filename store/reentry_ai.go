@@ -67,12 +67,13 @@ type ReentryAIAnalysis struct {
 
 // ReentryAIConfig 全局配置（单行，id 恒为 1）
 type ReentryAIConfig struct {
-	Enabled             bool    `json:"enabled"`              // 插件总开关（Phase 1 控制数据包自动生成）
-	Provider            string  `json:"provider"`             // Phase 2：内置分析模型 provider（密钥复用 ai_models 表）
-	Model               string  `json:"model"`                // Phase 2：模型名
-	PromptTemplate      string  `json:"prompt_template"`      // Phase 2：自定义 prompt 模板（空=内置默认）
+	Enabled             bool    `json:"enabled"`              // 插件总开关（控制数据包自动生成）
+	AIEnabled           bool    `json:"ai_enabled"`           // Phase 2：新信号自动触发内置 AI 分析（默认关；手动"AI 分析"按钮不受此开关限制）
+	Provider            string  `json:"provider"`             // 展示用 provider（实际密钥由 model 指向的 ai_models 行决定）
+	Model               string  `json:"model"`                // ai_models 表的模型 ID（空=自动选用已启用的默认模型）
+	PromptTemplate      string  `json:"prompt_template"`      // 自定义 System Prompt 模板（空=内置默认；在数据包生成时固化进快照）
 	ConfidenceThreshold float64 `json:"confidence_threshold"` // Phase 3：自动入场置信度门槛
-	TimeoutSeconds      int     `json:"timeout_seconds"`      // Phase 2：AI 调用超时
+	TimeoutSeconds      int     `json:"timeout_seconds"`      // AI 调用超时
 }
 
 // ReentryAIStore 重入 AI 助手存储
@@ -111,6 +112,7 @@ func (s *ReentryAIStore) initTables() error {
 		CREATE TABLE IF NOT EXISTS reentry_ai_config (
 			id INTEGER PRIMARY KEY CHECK (id = 1),
 			enabled BOOLEAN DEFAULT 1,
+			ai_enabled BOOLEAN DEFAULT 0,
 			provider TEXT DEFAULT 'deepseek',
 			model TEXT DEFAULT '',
 			prompt_template TEXT DEFAULT '',
@@ -119,7 +121,12 @@ func (s *ReentryAIStore) initTables() error {
 			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		);
 	`)
-	return err
+	if err != nil {
+		return err
+	}
+	// Phase 1 建表无 ai_enabled 列，老库补列（重复执行报 duplicate column 忽略）
+	s.db.Exec(`ALTER TABLE reentry_ai_config ADD COLUMN ai_enabled BOOLEAN DEFAULT 0`)
+	return nil
 }
 
 const reentryAnalysisColumns = `id, signal_id, trader_id, cycle_id, symbol, side,
@@ -239,6 +246,120 @@ func (s *ReentryAIStore) UpdateReentryExternal(id int64, externalResponse, exter
 	return nil
 }
 
+// UpdateReentryInternalResult 写入内置 AI 分析结果（Phase 2）。
+// verdict 允许空串（表示原始回复解析失败，仅存 raw 供人工查看）。
+func (s *ReentryAIStore) UpdateReentryInternalResult(id int64, rawResponse, verdict string, confidence float64, reasons string) error {
+	switch verdict {
+	case "", ReentryVerdictEnter, ReentryVerdictWait, ReentryVerdictSkip:
+	default:
+		return fmt.Errorf("无效的内部结论标签: %s", verdict)
+	}
+	res, err := s.db.Exec(`UPDATE reentry_ai_analyses SET raw_response=?, verdict=?, confidence=?, reasons=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
+		rawResponse, verdict, confidence, reasons, id)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("分析记录不存在: %d", id)
+	}
+	return nil
+}
+
+// ListExecutedSignalIDsPendingOutcome 已执行（EXECUTED）但分析记录尚未回填
+// 结局盈亏的信号 ID 列表（Phase 2 准确率回填轮询用）。
+func (s *ReentryAIStore) ListExecutedSignalIDsPendingOutcome(limit int) ([]int64, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	rows, err := s.db.Query(`SELECT DISTINCT a.signal_id FROM reentry_ai_analyses a
+		JOIN copy_guard_manual_reentry_signals s ON s.id = a.signal_id
+		WHERE a.outcome_pnl IS NULL AND s.status = ? ORDER BY a.signal_id LIMIT ?`,
+		ManualReentryStatusExecuted, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []int64{}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
+// SetReentryOutcomeForSignal 将该信号全部分析记录的结局盈亏回填为同一值
+// （同信号的多个快照对应同一次真实重入，结局一致）。
+func (s *ReentryAIStore) SetReentryOutcomeForSignal(signalID int64, pnl float64) error {
+	_, err := s.db.Exec(`UPDATE reentry_ai_analyses SET outcome_pnl=?, updated_at=CURRENT_TIMESTAMP WHERE signal_id=? AND outcome_pnl IS NULL`, pnl, signalID)
+	return err
+}
+
+// ReentryAIStats 内外部 AI 结论分布与准确率统计。
+// 准确率口径：仅统计有结局盈亏的记录；ENTER 且盈利 / SKIP 且亏损 记为正确；
+// WAIT 不计入（无对错基准）。结局盈亏 = 该信号重入尝试的已对账净额（pnl−fee）。
+type ReentryAIStats struct {
+	TotalAnalyses  int `json:"total_analyses"`
+	SignalsCovered int `json:"signals_covered"`
+	ScoredCount    int `json:"scored_count"` // 已回填结局的分析记录数
+
+	InternalVerdicts map[string]int `json:"internal_verdicts"` // ENTER/WAIT/SKIP → 数量
+	ExternalVerdicts map[string]int `json:"external_verdicts"`
+
+	InternalScored  int `json:"internal_scored"` // 内部结论中可评分（ENTER/SKIP 且有结局）
+	InternalCorrect int `json:"internal_correct"`
+	ExternalScored  int `json:"external_scored"`
+	ExternalCorrect int `json:"external_correct"`
+}
+
+// GetReentryAIStats 汇总统计（表量级小，直接聚合查询）
+func (s *ReentryAIStore) GetReentryAIStats() (*ReentryAIStats, error) {
+	st := &ReentryAIStats{
+		InternalVerdicts: map[string]int{},
+		ExternalVerdicts: map[string]int{},
+	}
+	err := s.db.QueryRow(`SELECT COUNT(*), COUNT(DISTINCT signal_id),
+		COALESCE(SUM(CASE WHEN outcome_pnl IS NOT NULL THEN 1 ELSE 0 END),0)
+		FROM reentry_ai_analyses`).Scan(&st.TotalAnalyses, &st.SignalsCovered, &st.ScoredCount)
+	if err != nil {
+		return nil, err
+	}
+	fill := func(col string, verdicts map[string]int, scored, correct *int) error {
+		rows, err := s.db.Query(`SELECT ` + col + `, COUNT(*),
+			COALESCE(SUM(CASE WHEN outcome_pnl IS NOT NULL AND ` + col + ` IN ('ENTER','SKIP') THEN 1 ELSE 0 END),0),
+			COALESCE(SUM(CASE WHEN outcome_pnl IS NOT NULL AND ((` + col + `='ENTER' AND outcome_pnl>0) OR (` + col + `='SKIP' AND outcome_pnl<=0)) THEN 1 ELSE 0 END),0)
+			FROM reentry_ai_analyses WHERE ` + col + ` != '' GROUP BY ` + col)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var verdict string
+			var count, sc, co int
+			if err := rows.Scan(&verdict, &count, &sc, &co); err != nil {
+				return err
+			}
+			verdicts[verdict] = count
+			*scored += sc
+			*correct += co
+		}
+		return rows.Err()
+	}
+	if err := fill("verdict", st.InternalVerdicts, &st.InternalScored, &st.InternalCorrect); err != nil {
+		return nil, err
+	}
+	if err := fill("external_verdict", st.ExternalVerdicts, &st.ExternalScored, &st.ExternalCorrect); err != nil {
+		return nil, err
+	}
+	return st, nil
+}
+
 // GetReentryAIConfig 读全局配置；无行时返回默认值（enabled=true）
 func (s *ReentryAIStore) GetReentryAIConfig() (*ReentryAIConfig, error) {
 	cfg := &ReentryAIConfig{
@@ -247,8 +368,8 @@ func (s *ReentryAIStore) GetReentryAIConfig() (*ReentryAIConfig, error) {
 		ConfidenceThreshold: 0.7,
 		TimeoutSeconds:      60,
 	}
-	err := s.db.QueryRow(`SELECT enabled, provider, model, prompt_template, confidence_threshold, timeout_seconds FROM reentry_ai_config WHERE id=1`).
-		Scan(&cfg.Enabled, &cfg.Provider, &cfg.Model, &cfg.PromptTemplate, &cfg.ConfidenceThreshold, &cfg.TimeoutSeconds)
+	err := s.db.QueryRow(`SELECT enabled, ai_enabled, provider, model, prompt_template, confidence_threshold, timeout_seconds FROM reentry_ai_config WHERE id=1`).
+		Scan(&cfg.Enabled, &cfg.AIEnabled, &cfg.Provider, &cfg.Model, &cfg.PromptTemplate, &cfg.ConfidenceThreshold, &cfg.TimeoutSeconds)
 	if err == sql.ErrNoRows {
 		return cfg, nil
 	}
@@ -263,12 +384,12 @@ func (s *ReentryAIStore) SaveReentryAIConfig(cfg *ReentryAIConfig) error {
 	if cfg == nil {
 		return fmt.Errorf("nil reentry ai config")
 	}
-	_, err := s.db.Exec(`INSERT INTO reentry_ai_config (id, enabled, provider, model, prompt_template, confidence_threshold, timeout_seconds, updated_at)
-		VALUES (1, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-		ON CONFLICT(id) DO UPDATE SET enabled=excluded.enabled, provider=excluded.provider, model=excluded.model,
+	_, err := s.db.Exec(`INSERT INTO reentry_ai_config (id, enabled, ai_enabled, provider, model, prompt_template, confidence_threshold, timeout_seconds, updated_at)
+		VALUES (1, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+		ON CONFLICT(id) DO UPDATE SET enabled=excluded.enabled, ai_enabled=excluded.ai_enabled, provider=excluded.provider, model=excluded.model,
 			prompt_template=excluded.prompt_template, confidence_threshold=excluded.confidence_threshold,
 			timeout_seconds=excluded.timeout_seconds, updated_at=CURRENT_TIMESTAMP`,
-		cfg.Enabled, cfg.Provider, cfg.Model, cfg.PromptTemplate, cfg.ConfidenceThreshold, cfg.TimeoutSeconds)
+		cfg.Enabled, cfg.AIEnabled, cfg.Provider, cfg.Model, cfg.PromptTemplate, cfg.ConfidenceThreshold, cfg.TimeoutSeconds)
 	return err
 }
 
