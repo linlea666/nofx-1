@@ -864,23 +864,39 @@ func (e *Engine) checkReentryConditions() {
 			stoppedNotional = v4Cycle.FollowerNotional
 		}
 		reentrySize := stoppedNotional * e.config.RiskReentryRatio
-		if reentrySize <= 0 {
-			logger.Warnf("⚠️ [%s] 重入金额非正(%.4f)，跳过 | posId=%s", e.traderID, reentrySize, mapping.LeaderPosID)
-			e.recordWatchSample(v4Cycle, leaderPos, markPrice, currentATR, reentryBoundary, chaseLimit, watchGateMinNotional)
-			delete(e.reentryCandidateTicks, mapping.LeaderPosID)
-			continue
-		}
-		// 最小金额防御：低于交易所最小订单价值会导致下单失败 → 触发熔断；
+		// 最小金额阈值：低于交易所最小订单价值会导致下单失败 → 触发熔断；
 		// 优先级用配置的 MinTradeWarn（与开仓金额最小阈值同一概念），未配置时用 10 USDT 兜底
 		minReentry := e.config.MinTradeWarn
 		if minReentry <= 0 {
 			minReentry = 10.0
 		}
-		if reentrySize < minReentry {
-			logger.Infof("⏭️ [%s] 重入金额 %.2f < 阈值 %.2f，跳过本次（条件保持，下轮再判） | posId=%s",
-				e.traderID, reentrySize, minReentry, mapping.LeaderPosID)
-			e.recordWatchSample(v4Cycle, leaderPos, markPrice, currentATR, reentryBoundary, chaseLimit, watchGateMinNotional)
-			continue
+		if manualMode {
+			// v5.2 人工重入建议金额：按首仓名义全额（不随止损次数衰减）。
+			// 几何衰减是自动路径的无人值守安全设计（cycle-15 事故约束）；
+			// 人工路径由用户最终确认把关，衰减到微名义会让反转捕获失去意义，
+			// 且会被下方 MIN_NOTIONAL 护栏整条吞掉信号——cycle-41 实盘中第 3
+			// 次止损后建议额 4.18 < 10，信号/邮件永远发不出，错过领航员反转。
+			if first := e.firstAttemptNotional(v4Cycle); first > 0 {
+				reentrySize = first
+			}
+			// 低于最小下单额时抬到 门槛×1.2（留滑点/手续费余地）。人工模式下
+			// 金额护栏只兜底、不拦截：拦截即重现"信号发不出"的死锁。
+			if reentrySize < minReentry {
+				reentrySize = minReentry * manualReentryMinNotionalHeadroom
+			}
+		} else {
+			if reentrySize <= 0 {
+				logger.Warnf("⚠️ [%s] 重入金额非正(%.4f)，跳过 | posId=%s", e.traderID, reentrySize, mapping.LeaderPosID)
+				e.recordWatchSample(v4Cycle, leaderPos, markPrice, currentATR, reentryBoundary, chaseLimit, watchGateMinNotional)
+				delete(e.reentryCandidateTicks, mapping.LeaderPosID)
+				continue
+			}
+			if reentrySize < minReentry {
+				logger.Infof("⏭️ [%s] 重入金额 %.2f < 阈值 %.2f，跳过本次（条件保持，下轮再判） | posId=%s",
+					e.traderID, reentrySize, minReentry, mapping.LeaderPosID)
+				e.recordWatchSample(v4Cycle, leaderPos, markPrice, currentATR, reentryBoundary, chaseLimit, watchGateMinNotional)
+				continue
+			}
 		}
 		// v5 可保护性预检：预算"重入成交后按当前配置算出的止损距离"是否连
 		// 极紧止损都挂不出（distance < 0.1% 即 OpenImmediateHit）。强平价在
@@ -995,6 +1011,23 @@ func (e *Engine) findStoppedAttempt(cycle *store.CopyGuardCycle) *store.CopyGuar
 		}
 	}
 	return nil
+}
+
+// firstAttemptNotional 周期首仓（attempt_no=0）的名义价值，人工重入建议金额
+// 的基准（不随止损次数几何衰减）。attempt 数据缺失（旧数据/回填周期）时回退
+// 周期跟随名义；再缺失返回 0，由调用方决定兜底。
+func (e *Engine) firstAttemptNotional(cycle *store.CopyGuardCycle) float64 {
+	if cycle == nil || e.store == nil {
+		return 0
+	}
+	if attempts, err := e.store.CopyTrade().ListCopyGuardAttempts(cycle.ID); err == nil {
+		for _, attempt := range attempts {
+			if attempt.AttemptNo == 0 && attempt.Notional > 0 {
+				return attempt.Notional
+			}
+		}
+	}
+	return cycle.FollowerNotional
 }
 
 // attemptStopFillPrice 被止损 attempt 的止损成交价（数据缺失返回 0）
@@ -1188,6 +1221,9 @@ const (
 	watchGateReentryWindowInfeasible = "REENTRY_WINDOW_INFEASIBLE"
 	watchSampleInterval       = 60 * time.Second         // 固定间隔采样（gate 不变时）
 	watchResumeGapMultiplier  = 5                        // 采样断档 > 间隔×该倍数 → 记 WATCH_RESUMED
+	// 人工重入建议金额低于最小下单额时抬到 门槛×该系数（滑点/手续费余地），
+	// 与 ConfirmManualReentry 的执行侧兜底保持同一常量。
+	manualReentryMinNotionalHeadroom = 1.2
 )
 
 // recordWatchSample 观察期采样：固定间隔必采 + 门控原因变化立即补采。

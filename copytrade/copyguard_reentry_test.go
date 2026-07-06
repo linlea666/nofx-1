@@ -2,6 +2,7 @@ package copytrade
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -917,6 +918,121 @@ func TestManualModeNoSignalWhenPriceNotReturned(t *testing.T) {
 
 	if n, _ := st.CopyTrade().CountManualReentrySignalsForCycle(cycle.ID); n != 0 {
 		t.Fatalf("manualMode must not signal before price returns to boundary, got %d", n)
+	}
+}
+
+// ============================================================================
+// B. 人工重入金额（cycle-41）：自动路径名义几何衰减到 < 最小下单额时，
+//    MIN_NOTIONAL 护栏曾把人工信号整条吞掉（信号/邮件永远发不出）。
+//    人工路径改为：建议金额 = 首仓名义全额；< 最小下单额时抬到 门槛×1.2。
+// ============================================================================
+
+// 复刻 cycle-41：3 次止损、名义衰减 100→50→8，自动重入次数用尽转人工。
+// 旧逻辑建议额 = 8×0.5 = 4 < 10 → 信号被 MIN_NOTIONAL 吞掉；
+// 新逻辑必须发出 PENDING 信号且建议额 = 首仓名义 100。
+func TestManualModeSignalUsesFirstAttemptNotional(t *testing.T) {
+	e, st := newReentryTestEngine(t)
+	e.config.RiskManualReentryEnabled = true // RiskMaxReentries=2（脚手架默认）
+
+	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700) // attempt 0 名义 100 已止损
+	// 重入 #1（名义 50）→ 止损；重入 #2（名义 8）→ 止损 → reentry_count=2 用尽
+	if err := st.CopyTrade().RecordCopyGuardReentryFilled(cycle, 1705, 50, 50.0/1705, 34, map[string]interface{}{}); err != nil {
+		t.Fatal(err)
+	}
+	cycle, _ = st.CopyTrade().GetCopyGuardCycle(cycle.ID)
+	if err := st.CopyTrade().RecordCopyGuardStop(cycle, 34, 1683, -1, 0.05, 0, "algo-1", map[string]interface{}{}); err != nil {
+		t.Fatal(err)
+	}
+	cycle, _ = st.CopyTrade().GetCopyGuardCycle(cycle.ID)
+	if err := st.CopyTrade().RecordCopyGuardReentryFilled(cycle, 1702, 8, 8.0/1702, 34, map[string]interface{}{}); err != nil {
+		t.Fatal(err)
+	}
+	cycle, _ = st.CopyTrade().GetCopyGuardCycle(cycle.ID)
+	if err := st.CopyTrade().RecordCopyGuardStop(cycle, 34, 1680, -0.2, 0.01, 0, "algo-2", map[string]interface{}{}); err != nil {
+		t.Fatal(err)
+	}
+	cycle, _ = st.CopyTrade().GetCopyGuardCycle(cycle.ID)
+	if cycle.ReentryCount != 2 || cycle.StopCount != 3 {
+		t.Fatalf("precondition: want reentry_count=2 stop_count=3, got %+v", cycle)
+	}
+
+	// ATR fallback 34：边界 1700−17=1683，mark 1690 已回归且带内
+	e.leaderState.Positions["ETHUSDT_long"] = &Position{Symbol: "ETHUSDT", Side: SideLong, Size: 1, EntryPrice: 1700, MarkPrice: 1690, MarginMode: "cross", PosID: "leader-pos"}
+	for i := 0; i < 6; i++ {
+		e.checkReentryConditions()
+	}
+
+	sigs, err := st.CopyTrade().ListManualReentrySignals([]string{"trader-1"}, []string{store.ManualReentryStatusPending}, 10)
+	if err != nil || len(sigs) != 1 {
+		t.Fatalf("manual signal must survive tiny decayed notional: %v %v", sigs, err)
+	}
+	if sigs[0].RecommendedNotional != 100 {
+		t.Fatalf("manual recommendation must be the first-attempt notional (100), got %.2f", sigs[0].RecommendedNotional)
+	}
+	select {
+	case <-e.decisionCh:
+		t.Fatal("manualMode must not emit an auto reentry decision")
+	default:
+	}
+}
+
+// 首仓名义本身 < 最小下单额：建议额抬到 门槛×1.2（默认 10→12），信号仍必须发出
+func TestManualModeSignalFloorsToMinNotional(t *testing.T) {
+	e, st := newReentryTestEngine(t)
+	e.config.RiskManualReentryEnabled = true
+	e.config.RiskMaxReentries = 0 // reentry_count(0)>=0 → 直接用尽 → manualMode
+	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700)
+	// 首仓名义压到 5（< 门槛 10）
+	if _, err := st.DB().Exec(`UPDATE copy_guard_attempts SET notional=5 WHERE cycle_id=? AND attempt_no=0`, cycle.ID); err != nil {
+		t.Fatal(err)
+	}
+	e.leaderState.Positions["ETHUSDT_long"] = &Position{Symbol: "ETHUSDT", Side: SideLong, Size: 1, EntryPrice: 1700, MarkPrice: 1690, MarginMode: "cross", PosID: "leader-pos"}
+	for i := 0; i < 6; i++ {
+		e.checkReentryConditions()
+	}
+
+	sigs, err := st.CopyTrade().ListManualReentrySignals([]string{"trader-1"}, []string{store.ManualReentryStatusPending}, 10)
+	if err != nil || len(sigs) != 1 {
+		t.Fatalf("manual signal must be generated with floored notional: %v %v", sigs, err)
+	}
+	if want := 10.0 * manualReentryMinNotionalHeadroom; sigs[0].RecommendedNotional != want {
+		t.Fatalf("floored recommendation want %.2f, got %.2f", want, sigs[0].RecommendedNotional)
+	}
+}
+
+// 确认执行的金额界校验：override > 建议上限 / < 最小下单额均拒绝且无副作用
+// （信号保持 PENDING）；合法 override 通过金额闸门（后续因周期缺失失败属预期）。
+func TestConfirmManualReentryOverrideBounds(t *testing.T) {
+	st, err := store.New(filepath.Join(t.TempDir(), "override.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ti := NewTraderIntegration("trader-1", flatExecutor{}, st)
+	ti.engine = &Engine{config: &CopyConfig{ProviderType: ProviderOKX, LeaderID: "leader", MinTradeWarn: 10}}
+
+	sig, err := st.CopyTrade().SaveManualReentrySignal(&store.CopyGuardManualReentrySignal{
+		CycleID: 999, TraderID: "trader-1", LeaderPosID: "leader-pos", Symbol: "ETHUSDT",
+		Side: "long", MarginMode: "cross", TriggerPrice: 1690, RecommendedNotional: 100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ti.ConfirmManualReentry(sig.ID, "op", 150); err == nil || !strings.Contains(err.Error(), "超过建议上限") {
+		t.Fatalf("override above recommendation must be rejected, got %v", err)
+	}
+	if err := ti.ConfirmManualReentry(sig.ID, "op", 5); err == nil || !strings.Contains(err.Error(), "低于最小下单阈值") {
+		t.Fatalf("override below min notional must be rejected, got %v", err)
+	}
+	got, _ := st.CopyTrade().GetManualReentrySignal(sig.ID)
+	if got.Status != store.ManualReentryStatusPending {
+		t.Fatalf("rejected overrides must leave the signal PENDING, got %s", got.Status)
+	}
+	// 合法金额：通过金额闸门，失败点必须是后续的周期一致性（信号周期不存在）
+	if err := ti.ConfirmManualReentry(sig.ID, "op", 50); err == nil ||
+		strings.Contains(err.Error(), "超过建议上限") || strings.Contains(err.Error(), "低于最小下单阈值") {
+		t.Fatalf("valid override must pass the amount gate, got %v", err)
 	}
 }
 

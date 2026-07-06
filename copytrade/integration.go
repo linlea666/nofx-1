@@ -3017,6 +3017,9 @@ func (ti *TraderIntegration) markManualReentryOutcome(cycleID int64, status, err
 }
 
 // ConfirmManualReentry 用户确认人工重入信号 → 系统代执行。
+// overrideNotional：用户在确认弹窗中编辑后的执行金额；<=0 表示未编辑，用信号
+// 建议金额。允许范围 [最小下单额, 建议金额]——上界封在建议金额（首仓名义），
+// 保持"重入风险以首仓为界"的安全不变量。
 //
 // 人工确认最高优先：仅四项硬校验可拦截（领航员已平仓 / 领航员已反向 /
 // 本地已有同向仓位 / 金额低于最小下单额），价格偏移、可保护性预检等一律
@@ -3026,7 +3029,7 @@ func (ti *TraderIntegration) markManualReentryOutcome(cycleID int64, status, err
 // 幂等：ClaimManualReentrySignal 原子抢占（PENDING→EXECUTING），重复点击/
 // 并发确认只有一次生效。硬校验失败时回退 PENDING（可再次确认）或
 // INVALIDATED（根本性失效）。
-func (ti *TraderIntegration) ConfirmManualReentry(signalID int64, operator string) error {
+func (ti *TraderIntegration) ConfirmManualReentry(signalID int64, operator string, overrideNotional float64) error {
 	if ti.engine == nil || ti.engine.config == nil {
 		return fmt.Errorf("跟单引擎未运行")
 	}
@@ -3042,13 +3045,23 @@ func (ti *TraderIntegration) ConfirmManualReentry(signalID int64, operator strin
 		return fmt.Errorf("信号当前状态为 %s，无法确认（可能已执行、已忽略或已失效）", sig.Status)
 	}
 
-	// 硬校验 3（先查，无副作用）：金额 ≥ 最小下单额
+	// 硬校验 3（先查，无副作用）：执行金额界校验。
+	// 未编辑（<=0）用建议金额；编辑值必须落在 [最小下单额, 建议金额]。
 	minReentry := ti.engine.config.MinTradeWarn
 	if minReentry <= 0 {
 		minReentry = 10.0
 	}
-	if sig.RecommendedNotional < minReentry {
-		return fmt.Errorf("建议重入金额 %.2f USDT 低于最小下单阈值 %.2f USDT，无法执行", sig.RecommendedNotional, minReentry)
+	execNotional := sig.RecommendedNotional
+	if overrideNotional > 0 {
+		// +0.01 容差：前端预填值经 toFixed(2) 四舍五入，可能比原始建议值大
+		// 最多半分钱，不应因此误拒
+		if overrideNotional > sig.RecommendedNotional+0.01 {
+			return fmt.Errorf("执行金额 %.2f USDT 超过建议上限 %.2f USDT（重入风险以首仓名义为界），请调低", overrideNotional, sig.RecommendedNotional)
+		}
+		execNotional = overrideNotional
+	}
+	if execNotional < minReentry {
+		return fmt.Errorf("执行金额 %.2f USDT 低于最小下单阈值 %.2f USDT，无法执行", execNotional, minReentry)
 	}
 
 	// 周期一致性：信号绑定的周期必须仍是打开的观察周期
@@ -3116,22 +3129,24 @@ func (ti *TraderIntegration) ConfirmManualReentry(signalID int64, operator strin
 	if sig.TriggerPrice > 0 && confirmPrice > 0 {
 		priceDriftPct = (confirmPrice - sig.TriggerPrice) / sig.TriggerPrice * 100
 	}
-	_ = cs.SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "GUARD_MANUAL_REENTRY_CONFIRMED", Price: confirmPrice, Notional: sig.RecommendedNotional, Metadata: map[string]interface{}{
-		"signal_id":       sig.ID,
-		"operator":        operator,
-		"signal_price":    sig.TriggerPrice,
-		"confirm_price":   confirmPrice,
-		"price_drift_pct": priceDriftPct,
-		"protectable":     sig.Protectable,
+	_ = cs.SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "GUARD_MANUAL_REENTRY_CONFIRMED", Price: confirmPrice, Notional: execNotional, Metadata: map[string]interface{}{
+		"signal_id":         sig.ID,
+		"operator":          operator,
+		"signal_price":      sig.TriggerPrice,
+		"confirm_price":     confirmPrice,
+		"price_drift_pct":   priceDriftPct,
+		"protectable":       sig.Protectable,
+		"executed_notional": execNotional,
+		"recommended":       sig.RecommendedNotional,
 	}})
-	logger.Infof("🧑‍💻 [%s] 人工重入已确认，开始执行 | signal=%d cycle=%d %s %s 金额=%.2f 确认价=%.4f（信号价 %.4f，偏移 %.2f%%）",
-		ti.traderID, sig.ID, cycle.ID, sig.Symbol, sig.Side, sig.RecommendedNotional, confirmPrice, sig.TriggerPrice, priceDriftPct)
+	logger.Infof("🧑‍💻 [%s] 人工重入已确认，开始执行 | signal=%d cycle=%d %s %s 金额=%.2f（建议 %.2f）确认价=%.4f（信号价 %.4f，偏移 %.2f%%）",
+		ti.traderID, sig.ID, cycle.ID, sig.Symbol, sig.Side, execNotional, sig.RecommendedNotional, confirmPrice, sig.TriggerPrice, priceDriftPct)
 
 	// 复用自动重入执行链：状态推进 REENTRY_PENDING → emitReentryDecision →
 	// consumeDecisions/executeFullDecision（映射激活、attempt 记账、保护单
 	// 状态机全部继承）。ATR 传 0（UpdateCopyGuardObservation 对 0 保留原值）。
 	_ = cs.UpdateCopyGuardObservation(cycle.ID, store.CopyGuardReentryPending, leaderPos.EntryPrice, confirmPrice, 0)
-	if !ti.engine.emitReentryDecision(mapping, leaderPos, sig.RecommendedNotional, confirmPrice) {
+	if !ti.engine.emitReentryDecision(mapping, leaderPos, execNotional, confirmPrice) {
 		// 决策通道满：回退周期与信号状态，让用户可稍后重试
 		_ = cs.UpdateCopyGuardObservation(cycle.ID, store.CopyGuardAttemptsExhausted, leaderPos.EntryPrice, confirmPrice, 0)
 		_ = cs.ReleaseManualReentrySignal(signalID, store.ManualReentryStatusPending, "决策通道繁忙，未能提交执行")
@@ -3252,12 +3267,13 @@ func (ti *TraderIntegration) sendManualReentrySignalAlert(event *RiskEvent) {
 
 // ConfirmManualReentryForTrader 包级导出：API 层确认人工重入信号。
 // 需要运行中的跟单引擎（实时复核领航员持仓 + 复用决策执行链）。
-func ConfirmManualReentryForTrader(traderID string, signalID int64, operator string) error {
+// overrideNotional <=0 表示用信号建议金额（见 ConfirmManualReentry）。
+func ConfirmManualReentryForTrader(traderID string, signalID int64, operator string, overrideNotional float64) error {
 	integration, exists := integrations[traderID]
 	if !exists || !integration.IsRunning() {
 		return fmt.Errorf("该交易员跟单未运行，无法执行人工重入（请先启动跟单）")
 	}
-	return integration.ConfirmManualReentry(signalID, operator)
+	return integration.ConfirmManualReentry(signalID, operator, overrideNotional)
 }
 
 // ============================================================================

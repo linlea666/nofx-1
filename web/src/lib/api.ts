@@ -965,11 +965,15 @@ export const api = {
       throw new Error(result.message || '获取人工重入信号失败')
     return result.data!.signals
   },
-  async confirmCopyGuardManualSignal(id: number) {
+  async confirmCopyGuardManualSignal(id: number, notional?: number) {
+    // notional：确认弹窗中编辑后的执行金额；缺省用信号建议金额（后端界校验）
     const result = await httpClient.post<{
       message: string
       signal: import('../types').CopyGuardManualSignal
-    }>(`${API_BASE}/copytrade/risk/manual-signals/${id}/confirm`)
+    }>(
+      `${API_BASE}/copytrade/risk/manual-signals/${id}/confirm`,
+      notional && notional > 0 ? { notional } : undefined
+    )
     if (!result.success) throw new Error(result.message || '确认人工重入失败')
     return result.data!
   },

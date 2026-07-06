@@ -28,6 +28,23 @@ const statusLabels: Record<string, string> = {
   // 注：不可保护（裸跑）不是周期状态——follow 模式下周期保持 FOLLOWING，
   // 信号载体是 protection_status=UNPROTECTABLE（下方保护状态标红）
 }
+// 空仓观察态：止损成交后跟随者无本地持仓，protection_status 残留 TRIGGERED
+// 是上一笔保护单的终态，不是"保护异常"——按中性"观察中·无持仓"呈现，
+// 避免黄色"已触发·0%"误导（cycle-41 实盘反馈）。
+const watchingFlatStatuses = new Set([
+  'STOPPED_WATCHING',
+  'ATTEMPTS_EXHAUSTED',
+  'WATCH_TIMEOUT',
+])
+const isWatchingFlat = (c: {
+  status: string
+  closed_at?: string | null
+  protection_status: string
+}) =>
+  !c.closed_at &&
+  watchingFlatStatuses.has(c.status) &&
+  c.protection_status === 'TRIGGERED'
+
 const protectionLabels: Record<string, string> = {
   PENDING: '待建立',
   VERIFIED: '保护有效',
@@ -149,6 +166,7 @@ function ManualSignalsBanner() {
   const [confirming, setConfirming] = useState<CopyGuardManualSignal | null>(
     null
   )
+  const [confirmAmount, setConfirmAmount] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
@@ -156,10 +174,23 @@ function ManualSignalsBanner() {
 
   const doConfirm = async () => {
     if (!confirming) return
+    // 金额可编辑：预填建议值，允许调低（上界=建议金额，下界由后端按最小下单额复核）
+    const amount = Number(confirmAmount)
+    if (!Number.isFinite(amount) || amount <= 0) {
+      setError('请输入有效的执行金额')
+      return
+    }
+    // +0.01 容差：预填值经 toFixed(2) 四舍五入可能比原始建议值高出半分钱
+    if (amount > confirming.recommended_notional + 0.01) {
+      setError(
+        `执行金额不能超过建议上限 ${confirming.recommended_notional.toFixed(2)} USDT（重入风险以首仓名义为界）`
+      )
+      return
+    }
     setBusy(true)
     setError('')
     try {
-      await api.confirmCopyGuardManualSignal(confirming.id)
+      await api.confirmCopyGuardManualSignal(confirming.id, amount)
       setNotice(
         `已确认重入 ${confirming.symbol} ${sideLabel(confirming.side)}单，系统正在执行；执行结果稍后可在周期明细的事件流中查看`
       )
@@ -248,6 +279,7 @@ function ManualSignalsBanner() {
                     <button
                       onClick={() => {
                         setError('')
+                        setConfirmAmount(sig.recommended_notional.toFixed(2))
                         setConfirming(sig)
                       }}
                       className="rounded bg-[#0ECB81] px-3 py-1 font-medium text-black hover:opacity-90"
@@ -278,8 +310,21 @@ function ManualSignalsBanner() {
               <span>{confirming.trader_name || confirming.trader_id}</span>
               <span className="text-[#848E9C]">信号价格</span>
               <span>{confirming.trigger_price}</span>
-              <span className="text-[#848E9C]">建议重入金额</span>
-              <span>{confirming.recommended_notional.toFixed(2)} USDT</span>
+              <span className="text-[#848E9C]">执行金额（可编辑）</span>
+              <span className="flex items-center gap-2">
+                <input
+                  type="number"
+                  min={0}
+                  step="0.01"
+                  max={confirming.recommended_notional}
+                  value={confirmAmount}
+                  onChange={(e) => setConfirmAmount(e.target.value)}
+                  className="w-28 rounded border border-[#2B3139] bg-[#0B0E11] px-2 py-1 text-[#EAECEF]"
+                />
+                <span className="text-xs text-[#848E9C]">
+                  USDT · 建议 {confirming.recommended_notional.toFixed(2)}（上限）
+                </span>
+              </span>
               <span className="text-[#848E9C]">本周期已止损</span>
               <span>{confirming.stop_count} 次</span>
               <span className="text-[#848E9C]">保护单预检</span>
@@ -796,7 +841,7 @@ export function CopyGuardPage() {
                 </td>
                 <td
                   className={`p-3 ${
-                    c.closed_at
+                    c.closed_at || isWatchingFlat(c)
                       ? 'text-[#848E9C]'
                       : c.protection_status === 'VERIFIED'
                         ? 'text-[#0ECB81]'
@@ -813,7 +858,9 @@ export function CopyGuardPage() {
                     c.protection_status === 'PENDING' ||
                     c.protection_status === 'UNPROTECTABLE')
                     ? '已结束'
-                    : `${localized(protectionLabels, c.protection_status)} · ${(c.protection_coverage * 100).toFixed(0)}%`}
+                    : isWatchingFlat(c)
+                      ? '观察中·无持仓'
+                      : `${localized(protectionLabels, c.protection_status)} · ${(c.protection_coverage * 100).toFixed(0)}%`}
                 </td>
                 <td className="p-3">
                   {c.stop_count}/{c.reentry_count}
@@ -902,7 +949,11 @@ export function CopyGuardPage() {
           <div className="grid md:grid-cols-3 gap-3 mb-4 text-sm">
             <Metric
               label="保护状态"
-              value={`${localized(protectionLabels, detail.cycle.protection_status)} / ${(detail.cycle.protection_coverage * 100).toFixed(0)}%`}
+              value={
+                isWatchingFlat(detail.cycle)
+                  ? '观察中·无持仓'
+                  : `${localized(protectionLabels, detail.cycle.protection_status)} / ${(detail.cycle.protection_coverage * 100).toFixed(0)}%`
+              }
             />
             <Metric
               label="保护单"
@@ -1137,6 +1188,7 @@ export function CopyGuardPage() {
                   {e.type === 'PROTECTIVE_STOP_ACTIVE' &&
                   e.metadata &&
                   (e.metadata.governed_by === 'margin_cap' ||
+                    e.metadata.governed_by === 'account_cap' ||
                     e.metadata.governed_by === 'clamp') &&
                   typeof e.metadata.distance_atr_ratio === 'number' &&
                   e.metadata.distance_atr_ratio < 0.5 ? (

@@ -363,7 +363,13 @@ func (h *CopyTradeHandler) ConfirmManualSignal(c *gin.Context) {
 		return
 	}
 	operator := c.GetString("user_id")
-	if err := copytrade.ConfirmManualReentryForTrader(sig.TraderID, sig.ID, operator); err != nil {
+	// 可选请求体：用户在确认弹窗编辑后的执行金额（0/缺省=用信号建议金额），
+	// 界校验在 ConfirmManualReentry 内做（[最小下单额, 建议金额]）
+	var req struct {
+		Notional float64 `json:"notional"`
+	}
+	_ = c.ShouldBindJSON(&req) // 无 body 属正常情形，忽略解析错误
+	if err := copytrade.ConfirmManualReentryForTrader(sig.TraderID, sig.ID, operator, req.Notional); err != nil {
 		// 硬校验失败/状态冲突等都是用户可读错误，直接透传
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
@@ -550,7 +556,9 @@ func (h *CopyTradeHandler) SaveConfig(c *gin.Context) {
 	} else if existing != nil {
 		config.RiskLeverageFallback = existing.RiskLeverageFallback
 	} else {
-		config.RiskLeverageFallback = true // 默认 on
+		// v5.2 默认 off（抗噪默认态，与 api/server.go、store 层 FillRiskDefaults
+		// 保持一致）：margin_cap 在高杠杆下会把止损压进噪音区
+		config.RiskLeverageFallback = false
 	}
 	if req.RiskLeverageMaxLoss != nil {
 		config.RiskLeverageMaxLoss = *req.RiskLeverageMaxLoss

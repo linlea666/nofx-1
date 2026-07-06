@@ -76,6 +76,17 @@
 
 **开启 margin_cap 的场景：** 低杠杆 / 想要更小单次亏损时可在 UI 手动打开「仓位保证金止损上限」，恢复旧的更严封顶行为。
 
+### v5.2.1 人工重入金额修复（cycle-41）
+
+**背景：** cycle-41 实盘中第 3 次止损后（attempt 名义 41.8→20.9→8.36 几何衰减），人工重入建议额 = 8.36×0.5 = 4.18 < 最小下单额 10，`MIN_NOTIONAL` 门控在 `emitManualReentrySignal` 之前 `continue` → 信号/邮件永远发不出，错过领航员反转。
+
+| 改动 | 说明 |
+|------|------|
+| 人工建议金额 = 首仓名义全额 | 几何衰减是自动路径的无人值守安全约束（cycle-15）；人工路径由用户确认把关，按 `firstAttemptNotional`（attempt_no=0）全额建议 |
+| 最小额兜底不拦截 | 人工模式下建议额 < 最小下单额时抬到 门槛×1.2（`manualReentryMinNotionalHeadroom`），不再吞信号；自动路径护栏不变 |
+| 确认弹窗金额可编辑 | `ConfirmManualReentry(signalID, operator, overrideNotional)`：范围 [最小下单额, 建议金额]，上界封在首仓名义（安全不变量）；API body `{"notional": n}` 可选 |
+| 保护健康显示 | 空仓观察态（STOPPED_WATCHING / ATTEMPTS_EXHAUSTED / WATCH_TIMEOUT）+ protection_status=TRIGGERED 显示"观察中·无持仓"，不再误呈黄色"已触发·0%" |
+
 ---
 
 ## 3. v5.1 数据流（端到端）
@@ -85,7 +96,7 @@ ATTEMPTS_EXHAUSTED + manualMode 开启
   │
   ▼
 engine_risk.checkReentryConditions
-  │  复用完整门控链（冷却 / 边界 / 连续确认 / 金额 / 可保护性预检仅提示）
+  │  复用完整门控链（冷却 / 边界 / 连续确认；金额兜底不拦截、可保护性预检仅提示）
   │  触发点：emitManualReentrySignal（非 emitReentryDecision）
   ▼
 store.SaveManualReentrySignal → PENDING（同周期去重刷新快照）

@@ -177,10 +177,10 @@ type CopyConfig struct {
 // FillRiskDefaults 兜底默认值（与 store.CopyTradeConfig.FillRiskDefaults 保持一致）
 // 调用时机：integration 从 store.CopyTradeConfig 构造 engine.CopyConfig 时
 //
-// v5 默认值选型（数学验证见 Copy Guard v5 方案）：
-//   - RiskAccountPct 0.10：账户线抢先于仓位止损需要敞口 > 账户线%×杠杆/20%，
-//     10% 下 50x 需敞口 >25 倍权益——正常跟单不干扰，只锁灾难敞口
-//   - RiskLeverageMaxLoss 0.20：仓位保证金止损，日常主力线
+// v5.2 默认值选型（与 store.CopyTradeConfig.FillRiskDefaults 保持一致）：
+//   - RiskATRMultiplier 2.0：止损距离基线（k×ATR），抗噪主力线
+//   - RiskAccountPct 0.10：账户硬兜底，只锁灾难敞口，正常跟单不干扰
+//   - RiskLeverageMaxLoss 0.20：仅当 RiskLeverageFallback 开启时的保证金封顶（默认关）
 func (c *CopyConfig) FillRiskDefaults() {
 	if c.RiskAccountPct == 0 {
 		c.RiskAccountPct = 0.10
