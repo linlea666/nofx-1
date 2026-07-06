@@ -690,8 +690,9 @@ func (ti *TraderIntegration) pollV4ProtectiveStops() {
 		// Coverage must be judged against the real follower position, not the
 		// locally stored quantity: after a failed amend the stored number can
 		// match the exchange order while the position has grown.
+		// 每 3s 例行覆盖率基准：缓存读即可（fresh=false），避免击穿持仓缓存
 		baseQty := stored.Quantity
-		if posQty, ok := ti.followerPositionQuantity(cycle.Symbol, cycle.Side, cycle.MarginMode); ok && posQty > 0 {
+		if posQty, ok := ti.followerPositionQuantity(cycle.Symbol, cycle.Side, cycle.MarginMode, false); ok && posQty > 0 {
 			baseQty = posQty
 		}
 		ratio := protectionRatio(live.Quantity, baseQty)
@@ -1076,9 +1077,9 @@ func (ti *TraderIntegration) executeFullDecision(fullDec *decision.FullDecision)
 
 		ti.captureV4FollowerBeforeClose(dec)
 
-		// 执行交易
+		// 执行交易（瞬态错误有界重试：限流/读失败等"保证未下单"错误不再一次定死）
 		startTime := time.Now()
-		err := ti.executor.ExecuteDecision(dec)
+		err := ti.executeDecisionWithRetry(dec)
 
 		// 构建决策动作记录
 		action := store.DecisionAction{
@@ -1192,6 +1193,70 @@ func (ti *TraderIntegration) executeFullDecision(fullDec *decision.FullDecision)
 
 	// 保存到 decision_records 表，复用现有日志系统
 	ti.saveDecisionRecord(fullDec, decisionActions, executionLogs)
+}
+
+// executeDecisionRetryBackoffs 决策执行瞬态失败的重试退避序列。
+// 总时长 ≤ 14s：对跟单延迟可接受，且在 consumeDecisions 消费 goroutine 内
+// 阻塞执行，天然保持同一 trader 决策的先后顺序。
+var executeDecisionRetryBackoffs = []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second}
+
+// executeDecisionWithRetry 执行决策，仅对"保证订单未进交易所"的瞬态错误
+// 做有界退避重试（见 isRetryableExecutionError）。
+//
+// 背景（OKX 50011 跟单执行失败）：开仓执行链第一步是 GetPositions 前置读，
+// 撞上限流会让整个决策立即失败；而 fill 在引擎层已 markSeen、OKX 路径无
+// 快照兜底信号 → 一次读失败 = 该次跟单永久错过。重试耗尽后仍走原有失败
+// 分支（告警邮件 / 熔断计数 / v5.1 信号回写），行为不变。
+func (ti *TraderIntegration) executeDecisionWithRetry(dec *decision.Decision) error {
+	err := ti.executor.ExecuteDecision(dec)
+	for attempt := 0; err != nil && attempt < len(executeDecisionRetryBackoffs); attempt++ {
+		if !isRetryableExecutionError(err) {
+			return err
+		}
+		backoff := executeDecisionRetryBackoffs[attempt]
+		logger.Warnf("🔁 [%s] 跟单执行瞬态失败，%v 后重试（第 %d/%d 次） | %s %s | error=%v",
+			ti.traderID, backoff, attempt+1, len(executeDecisionRetryBackoffs), dec.Action, dec.Symbol, err)
+		select {
+		case <-ti.ctx.Done():
+			return err
+		case <-time.After(backoff):
+		}
+		err = ti.executor.ExecuteDecision(dec)
+	}
+	return err
+}
+
+// isRetryableExecutionError 判断决策执行失败是否可安全重试。
+//
+// 可重试的前提是"订单保证没有进入交易所"，避免重试造成重复下单：
+//   - OKX 50011 / Too Many Requests：网关限流拒绝，请求未被处理
+//     （下单请求被 50011 拒绝时订单同样未创建，重试安全）
+//   - "failed to get positions" / "failed to get account balance" /
+//     "failed to get market price"：执行链下单前的读取阶段失败
+//     （auto_trader 的错误包装前缀），无论底层原因（限流/超时/网络）都
+//     发生在任何下单动作之前
+//
+// 明确不重试：下单阶段的超时等歧义错误（订单可能已进交易所）、
+// 业务性拒单（保证金不足有独立减半重试、重复仓位、最小下单额等）。
+func isRetryableExecutionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "code=50011") || strings.Contains(msg, "too many requests") {
+		return true
+	}
+	readStagePrefixes := []string{
+		"failed to get positions",
+		"failed to get account balance",
+		"failed to get market price",
+	}
+	for _, kw := range readStagePrefixes {
+		if strings.Contains(msg, kw) {
+			return true
+		}
+	}
+	return false
 }
 
 // isBenignCloseError 判断 close/reduce 类决策的失败是否属于"本地仓位已不存在"。
@@ -2549,8 +2614,22 @@ func (ti *TraderIntegration) adoptProtectiveOrderByClientID(mgr ProtectiveStopMa
 // followerPositionQuantity returns the follower's current position size for
 // the given symbol/side/marginMode. ok is false when positions cannot be
 // fetched (unknown state must not be mistaken for flat).
-func (ti *TraderIntegration) followerPositionQuantity(symbol, side, marginMode string) (float64, bool) {
-	positions, err := ti.getFreshPositions()
+//
+// fresh 语义：
+//   - true：强制绕过交易所持仓缓存（GetPositionsFresh）。仅用于"误判代价高"
+//     的事件路径（如保护单消失后的空仓判定——误把有仓判成无仓会漏报降级，
+//     误把无仓判成有仓会重建无仓保护单，v5 修过这个坑）。
+//   - false：走带 TTL 的缓存读。用于每 3s 的例行巡检（如保护单覆盖率基准），
+//     15s 内的数据足够；例行巡检若强制刷新会持续击穿缓存，是 OKX 50011
+//     限流（跟单执行失败）的根因之一。
+func (ti *TraderIntegration) followerPositionQuantity(symbol, side, marginMode string, fresh bool) (float64, bool) {
+	var positions []map[string]interface{}
+	var err error
+	if fresh {
+		positions, err = ti.getFreshPositions()
+	} else {
+		positions, err = ti.executor.GetPositions()
+	}
 	if err != nil {
 		return 0, false
 	}
@@ -2575,7 +2654,8 @@ func (ti *TraderIntegration) followerPositionQuantity(symbol, side, marginMode s
 // position for the given symbol/side/marginMode. Returns false when positions
 // cannot be fetched (unknown must not be treated as flat).
 func (ti *TraderIntegration) isFollowerPositionFlat(symbol, side, marginMode string) bool {
-	qty, ok := ti.followerPositionQuantity(symbol, side, marginMode)
+	// 空仓判定必须用最新数据：结果直接决定"止损已触发"与"保护降级"的分流
+	qty, ok := ti.followerPositionQuantity(symbol, side, marginMode, true)
 	return ok && qty == 0
 }
 

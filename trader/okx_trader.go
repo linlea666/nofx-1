@@ -508,8 +508,10 @@ func (t *OKXTrader) GetBalance() (map[string]interface{}, error) {
 // GetPositions gets all positions
 func (t *OKXTrader) GetPositions() ([]map[string]interface{}, error) {
 	// Check cache
+	// 有效性基于时间而非 cachedPositions != nil：空仓账户的合法结果是空切片，
+	// 若用 nil 判断，空仓时缓存永远不生效 → 每次查询都打真实 API（50011 根因之一）
 	t.positionsCacheMutex.RLock()
-	if t.cachedPositions != nil && time.Since(t.positionsCacheTime) < t.cacheDuration {
+	if !t.positionsCacheTime.IsZero() && time.Since(t.positionsCacheTime) < t.cacheDuration {
 		// 确保缓存数据中的 mgnMode 不为空（可能在缓存时 OKX API 返回了空值）
 		result := t.ensureMgnModeInPositions(t.cachedPositions)
 		t.positionsCacheMutex.RUnlock()
@@ -544,7 +546,8 @@ func (t *OKXTrader) GetPositions() ([]map[string]interface{}, error) {
 		return nil, fmt.Errorf("failed to parse position data: %w", err)
 	}
 
-	var result []map[string]interface{}
+	// 空仓时保持空切片（非 nil），使"无持仓"成为可缓存状态
+	result := make([]map[string]interface{}, 0, len(positions))
 	for _, pos := range positions {
 		contractCount, _ := strconv.ParseFloat(pos.Pos, 64)
 		if contractCount == 0 {
@@ -801,9 +804,8 @@ func (t *OKXTrader) SetMarginMode(symbol string, isCrossMargin bool) error {
 	t.symbolMgnModes[symbol+"_short_pending"] = mgnMode
 	t.symbolMgnModesMutex.Unlock()
 
-	t.positionsCacheMutex.Lock()
-	t.cachedPositions = nil
-	t.positionsCacheMutex.Unlock()
+	// 缓存有效性判断基于 positionsCacheTime，必须走统一失效入口（同时清时间戳）
+	t.invalidatePositionsCache()
 
 	logger.Debugf("  📝 [OKX] 缓存 %s 待开仓保证金模式: %s（不调用 set-isolated-mode，依赖订单 tdMode）",
 		symbol, mgnMode)
