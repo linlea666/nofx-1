@@ -887,14 +887,15 @@ export interface ReentryAIAnalysis {
   updated_at?: string
 }
 
-// 重入 AI 助手全局配置（Phase 2）
+// 重入 AI 助手全局配置
 export interface ReentryAIConfig {
   enabled: boolean // 插件总开关（数据包自动生成）
   ai_enabled: boolean // 新信号自动触发内置 AI 分析
+  auto_entry_enabled: boolean // Phase 3：ENTER 且置信度达标时自动确认重入（依赖 ai_enabled）
   provider: string
   model: string // ai_models 表的模型 ID（空=自动选默认）
   prompt_template: string // 自定义 System Prompt（空=内置默认）
-  confidence_threshold: number // Phase 3 预留
+  confidence_threshold: number // 自动入场置信度门槛
   timeout_seconds: number
 }
 

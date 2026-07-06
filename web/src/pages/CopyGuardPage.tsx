@@ -257,7 +257,8 @@ function InternalVerdictCard({ analysis }: { analysis: ReentryAIAnalysis }) {
         </div>
       )}
       <div className="text-xs text-[#848E9C]">
-        AI 结论仅供参考，不会自动入场；入场仍需上方「确认重入」人工操作。
+        未开启「AI 自动入场」时结论仅供参考，入场需人工点击「确认重入」；
+        开启后仅新信号的自动分析会按门槛自动执行，本弹窗手动分析永不自动入场。
       </div>
     </div>
   )
@@ -567,7 +568,7 @@ function AdvisorSettingsCard() {
       <summary className="cursor-pointer px-4 py-3 text-sm font-medium text-[#EAECEF]">
         🤖 重入 AI 助手设置与统计
         <span className="ml-2 text-xs font-normal text-[#848E9C]">
-          人工重入信号的决策数据包与内置 AI 分析（AI 只给建议，不会自动入场）
+          人工重入信号的决策数据包、内置 AI 分析与可选的 AI 自动入场
         </span>
       </summary>
       <div className="space-y-4 border-t border-[#2B3139] p-4 text-sm">
@@ -593,7 +594,15 @@ function AdvisorSettingsCard() {
                 <input
                   type="checkbox"
                   checked={cfg.ai_enabled}
-                  onChange={(e) => update({ ai_enabled: e.target.checked })}
+                  onChange={(e) =>
+                    update({
+                      ai_enabled: e.target.checked,
+                      // 关闭自动分析时联动关闭自动入场（后端也会拒绝该组合）
+                      ...(e.target.checked
+                        ? {}
+                        : { auto_entry_enabled: false }),
+                    })
+                  }
                 />
                 <span>
                   自动内置 AI 分析
@@ -631,6 +640,63 @@ function AdvisorSettingsCard() {
                 />
                 <span className="text-xs text-[#848E9C]">秒</span>
               </label>
+            </div>
+            <div
+              className={`space-y-2 rounded border p-3 ${
+                cfg.auto_entry_enabled
+                  ? 'border-[#F6465D] bg-[#F6465D]/5'
+                  : 'border-[#2B3139] bg-[#0B0E11]'
+              }`}
+            >
+              <div className="flex flex-wrap items-center gap-4">
+                <label className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={cfg.auto_entry_enabled}
+                    disabled={!cfg.ai_enabled}
+                    onChange={(e) =>
+                      update({ auto_entry_enabled: e.target.checked })
+                    }
+                  />
+                  <span className="font-medium">
+                    AI 自动入场（Phase 3，高风险）
+                  </span>
+                </label>
+                <label className="flex items-center gap-2 text-xs text-[#848E9C]">
+                  置信度门槛
+                  <input
+                    type="number"
+                    min={0.5}
+                    max={1}
+                    step={0.05}
+                    value={cfg.confidence_threshold}
+                    onChange={(e) =>
+                      update({ confidence_threshold: Number(e.target.value) })
+                    }
+                    className="w-20 rounded border border-[#2B3139] bg-[#181A20] px-2 py-1 text-[#EAECEF]"
+                  />
+                  （建议 ≥ 0.7）
+                </label>
+              </div>
+              <div className="text-xs leading-relaxed text-[#848E9C]">
+                开启后：新信号的内置 AI 结论为 ENTER
+                且置信度达到门槛时，系统将以操作者「ai:auto」自动确认重入（金额取
+                AI 建议与信号建议的较小值，上限仍封死在首仓名义）。
+                领航员持仓、方向一致、本地无同向仓位等全部硬校验依然生效；数据快照超过
+                10 分钟或任何校验失败都会放弃自动入场并在邮件中说明，信号保留给人工处理。
+                {!cfg.ai_enabled && (
+                  <span className="text-[#F0B90B]">
+                    {' '}
+                    需先开启「自动内置 AI 分析」。
+                  </span>
+                )}
+                {cfg.auto_entry_enabled && (
+                  <span className="text-[#F6465D]">
+                    {' '}
+                    ⚠️ AI 判断可能出错，自动入场直接动用真实资金，请确保已理解全部风险并从小金额开始验证。
+                  </span>
+                )}
+              </div>
             </div>
             <div className="space-y-1">
               <div className="flex items-center justify-between text-xs text-[#848E9C]">

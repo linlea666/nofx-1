@@ -247,6 +247,11 @@ func (h *ReentryAIHandler) SaveConfig(c *gin.Context) {
 	if cfg.Provider == "" {
 		cfg.Provider = "deepseek"
 	}
+	// Phase 3 依赖链：自动入场必须建立在自动分析之上（无分析则无结论可依据）
+	if cfg.AutoEntryEnabled && !cfg.AIEnabled {
+		c.JSON(400, gin.H{"error": "开启 AI 自动入场前，请先开启「自动内置 AI 分析」"})
+		return
+	}
 	// model 非空时校验其存在并同步 provider（provider 列仅作展示冗余）
 	if cfg.Model != "" {
 		m, err := h.store.AIModel().GetByID(cfg.Model)

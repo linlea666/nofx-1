@@ -69,6 +69,7 @@ type ReentryAIAnalysis struct {
 type ReentryAIConfig struct {
 	Enabled             bool    `json:"enabled"`              // 插件总开关（控制数据包自动生成）
 	AIEnabled           bool    `json:"ai_enabled"`           // Phase 2：新信号自动触发内置 AI 分析（默认关；手动"AI 分析"按钮不受此开关限制）
+	AutoEntryEnabled    bool    `json:"auto_entry_enabled"`   // Phase 3：AI 结论 ENTER 且置信度达标时自动确认重入（默认关；依赖 ai_enabled）
 	Provider            string  `json:"provider"`             // 展示用 provider（实际密钥由 model 指向的 ai_models 行决定）
 	Model               string  `json:"model"`                // ai_models 表的模型 ID（空=自动选用已启用的默认模型）
 	PromptTemplate      string  `json:"prompt_template"`      // 自定义 System Prompt 模板（空=内置默认；在数据包生成时固化进快照）
@@ -113,6 +114,7 @@ func (s *ReentryAIStore) initTables() error {
 			id INTEGER PRIMARY KEY CHECK (id = 1),
 			enabled BOOLEAN DEFAULT 1,
 			ai_enabled BOOLEAN DEFAULT 0,
+			auto_entry_enabled BOOLEAN DEFAULT 0,
 			provider TEXT DEFAULT 'deepseek',
 			model TEXT DEFAULT '',
 			prompt_template TEXT DEFAULT '',
@@ -124,8 +126,9 @@ func (s *ReentryAIStore) initTables() error {
 	if err != nil {
 		return err
 	}
-	// Phase 1 建表无 ai_enabled 列，老库补列（重复执行报 duplicate column 忽略）
+	// 早期建表缺列时老库补列（重复执行报 duplicate column 忽略）
 	s.db.Exec(`ALTER TABLE reentry_ai_config ADD COLUMN ai_enabled BOOLEAN DEFAULT 0`)
+	s.db.Exec(`ALTER TABLE reentry_ai_config ADD COLUMN auto_entry_enabled BOOLEAN DEFAULT 0`)
 	return nil
 }
 
@@ -368,8 +371,8 @@ func (s *ReentryAIStore) GetReentryAIConfig() (*ReentryAIConfig, error) {
 		ConfidenceThreshold: 0.7,
 		TimeoutSeconds:      60,
 	}
-	err := s.db.QueryRow(`SELECT enabled, ai_enabled, provider, model, prompt_template, confidence_threshold, timeout_seconds FROM reentry_ai_config WHERE id=1`).
-		Scan(&cfg.Enabled, &cfg.AIEnabled, &cfg.Provider, &cfg.Model, &cfg.PromptTemplate, &cfg.ConfidenceThreshold, &cfg.TimeoutSeconds)
+	err := s.db.QueryRow(`SELECT enabled, ai_enabled, auto_entry_enabled, provider, model, prompt_template, confidence_threshold, timeout_seconds FROM reentry_ai_config WHERE id=1`).
+		Scan(&cfg.Enabled, &cfg.AIEnabled, &cfg.AutoEntryEnabled, &cfg.Provider, &cfg.Model, &cfg.PromptTemplate, &cfg.ConfidenceThreshold, &cfg.TimeoutSeconds)
 	if err == sql.ErrNoRows {
 		return cfg, nil
 	}
@@ -384,12 +387,13 @@ func (s *ReentryAIStore) SaveReentryAIConfig(cfg *ReentryAIConfig) error {
 	if cfg == nil {
 		return fmt.Errorf("nil reentry ai config")
 	}
-	_, err := s.db.Exec(`INSERT INTO reentry_ai_config (id, enabled, ai_enabled, provider, model, prompt_template, confidence_threshold, timeout_seconds, updated_at)
-		VALUES (1, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-		ON CONFLICT(id) DO UPDATE SET enabled=excluded.enabled, ai_enabled=excluded.ai_enabled, provider=excluded.provider, model=excluded.model,
+	_, err := s.db.Exec(`INSERT INTO reentry_ai_config (id, enabled, ai_enabled, auto_entry_enabled, provider, model, prompt_template, confidence_threshold, timeout_seconds, updated_at)
+		VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+		ON CONFLICT(id) DO UPDATE SET enabled=excluded.enabled, ai_enabled=excluded.ai_enabled, auto_entry_enabled=excluded.auto_entry_enabled,
+			provider=excluded.provider, model=excluded.model,
 			prompt_template=excluded.prompt_template, confidence_threshold=excluded.confidence_threshold,
 			timeout_seconds=excluded.timeout_seconds, updated_at=CURRENT_TIMESTAMP`,
-		cfg.Enabled, cfg.AIEnabled, cfg.Provider, cfg.Model, cfg.PromptTemplate, cfg.ConfidenceThreshold, cfg.TimeoutSeconds)
+		cfg.Enabled, cfg.AIEnabled, cfg.AutoEntryEnabled, cfg.Provider, cfg.Model, cfg.PromptTemplate, cfg.ConfidenceThreshold, cfg.TimeoutSeconds)
 	return err
 }
 
