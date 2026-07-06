@@ -12,6 +12,7 @@ import (
 	"nofx/market"
 	"nofx/mcp"
 	"nofx/notifier"
+	"nofx/reentryadvisor"
 	"nofx/store"
 	"nofx/trader"
 	"os"
@@ -140,6 +141,11 @@ func main() {
 	if err := traderManager.LoadTradersFromStore(st); err != nil {
 		logger.Fatalf("❌ Failed to load traders: %v", err)
 	}
+
+	// 重入 AI 助手插件（DB 轮询发现人工重入信号 → 生成决策数据包，零侵入跟单引擎；
+	// 可在配置 reentry_ai_config.enabled 中关闭，关闭/异常均不影响跟单）
+	reentryAdvisor := reentryadvisor.Start(st)
+	defer reentryAdvisor.Stop()
 
 	// Display loaded trader information
 	traders, err := st.Trader().List("default")

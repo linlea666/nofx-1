@@ -1,0 +1,659 @@
+package reentryadvisor
+
+import (
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"math"
+	"strings"
+	"time"
+
+	"nofx/market"
+	"nofx/store"
+)
+
+// ============================================================================
+// 决策数据包组装：Copy Guard 仓位层（既有表读取）+ 市场层（Binance 快照）
+//
+// 市场层降级策略：Binance 无该币种合约 → market=null、futures_available=false，
+// 仓位层照常完整输出（+OKX ATR）；单个字段拉取失败只记 missing_fields 不整体失败。
+// ============================================================================
+
+// 数据包内各周期的（拉取根数, 入包根数）。拉取多于入包是为了指标计算需要
+// 足够历史（量比 base 20、S/R 摆动窗口、CVD 累计段）。
+var timeframeSpec = []struct {
+	tf      string
+	fetch   int
+	include int
+}{
+	{"5m", 60, 24},
+	{"15m", 60, 24},
+	{"30m", 48, 16},
+	{"1h", 120, 24},
+	{"4h", 120, 24},
+	{"1d", 30, 14},
+}
+
+// cvdTimeframes 计算现货/合约 CVD 的周期子集
+var cvdTimeframes = []string{"5m", "15m", "1h", "4h"}
+
+// DataPack 完整决策数据包（datapack_json 的结构）
+type DataPack struct {
+	Meta      MetaSection    `json:"meta"`
+	CopyGuard GuardSection   `json:"copy_guard"`
+	Market    *MarketSection `json:"market,omitempty"`
+}
+
+type MetaSection struct {
+	SnapshotAt       string   `json:"snapshot_at"`
+	Symbol           string   `json:"symbol"`
+	Side             string   `json:"side"`
+	FuturesAvailable bool     `json:"binance_futures_available"`
+	SpotAvailable    bool     `json:"binance_spot_available"`
+	DataSources      string   `json:"data_sources"`
+	MissingFields    []string `json:"missing_fields,omitempty"`
+	Note             string   `json:"note,omitempty"`
+}
+
+type GuardSection struct {
+	SignalID   int64  `json:"signal_id"`
+	CycleID    int64  `json:"cycle_id"`
+	TraderID   string `json:"trader_id"`
+	Symbol     string `json:"symbol"`
+	Side       string `json:"side"`
+	MarginMode string `json:"margin_mode,omitempty"`
+
+	AccountEquityAtCycleOpen float64 `json:"account_equity_at_cycle_open"`
+	RecommendedNotional      float64 `json:"recommended_notional_usdt"`
+	TriggerPrice             float64 `json:"signal_trigger_price"`
+
+	// ATR：与引擎门控同源（OKX 标记价 K 线），保证与信号判定一致
+	GateATR          float64 `json:"gate_atr_okx"`
+	GateATRTimeframe string  `json:"gate_atr_timeframe"`
+	ATRAtCycleEntry  float64 `json:"atr_at_cycle_entry"`
+	ATRExpansionPct  float64 `json:"atr_expansion_vs_entry_pct"` // 当前 ATR 相对首仓时的扩张幅度
+
+	StopCount        int     `json:"stop_count"`
+	AutoReentryCount int     `json:"auto_reentry_count"`
+	DistanceATRRatio float64 `json:"last_stop_distance_atr_ratio"` // 止损距离/ATR（<0.3 为噪音档）
+	ReentryBoundary  float64 `json:"reentry_boundary_price"`
+	ChaseLimit       float64 `json:"chase_limit_price,omitempty"` // 最近观察采样的追价上限（0=未知）
+	Protectable      bool    `json:"new_stop_protectable_precheck"`
+	SignalReason     string  `json:"signal_reason"`
+
+	Leader   LeaderInfo     `json:"leader"`
+	Attempts []AttemptEntry `json:"attempts"`
+	LastStop *LastStopInfo  `json:"last_stop,omitempty"`
+
+	Policy map[string]interface{} `json:"risk_policy"`
+}
+
+type LeaderInfo struct {
+	StillHolding        bool    `json:"still_holding_same_side"`
+	Size                float64 `json:"position_size"`
+	EntryPrice          float64 `json:"entry_price"`
+	EntryAtCycleOpen    float64 `json:"entry_price_at_cycle_open"`
+	UnrealizedPnLPct    float64 `json:"unrealized_pnl_pct_est"`
+	SizeVsCycleBaseline float64 `json:"size_vs_cycle_baseline_ratio"` // 当前仓位/周期基线仓位（>1=加过仓）
+}
+
+type AttemptEntry struct {
+	AttemptNo  int     `json:"attempt_no"` // 0=首仓
+	Status     string  `json:"status"`
+	EntryPrice float64 `json:"entry_price"`
+	ExitPrice  float64 `json:"exit_price,omitempty"`
+	Notional   float64 `json:"notional_usdt"`
+	PnL        float64 `json:"pnl_usdt"`
+	Fee        float64 `json:"fee_usdt"`
+	ATR        float64 `json:"atr_at_entry,omitempty"`
+	OpenedAt   string  `json:"opened_at"`
+	ClosedAt   string  `json:"closed_at,omitempty"`
+}
+
+type LastStopInfo struct {
+	Price                  float64 `json:"stop_price"`
+	DistanceFromCurrentATR float64 `json:"current_price_distance_atr"` // 当前价距上次止损价（ATR 倍数，正=沿持仓方向恢复）
+	StopClusterSpreadATR   float64 `json:"stop_cluster_spread_atr"`    // 各次止损价最大间距（ATR 倍数，小=同一噪声区反复扫损）
+}
+
+type MarketSection struct {
+	CurrentPrice       float64 `json:"current_price"`
+	CurrentPriceSource string  `json:"current_price_source"`
+
+	Klines map[string]*KlineSummary `json:"klines"`
+
+	ContractCVD map[string]*CVDSummary `json:"contract_cvd,omitempty"`
+	SpotCVD     map[string]*CVDSummary `json:"spot_cvd,omitempty"`
+
+	OpenInterest *OISummary      `json:"open_interest,omitempty"`
+	Funding      *FundingSummary `json:"funding,omitempty"`
+	LongShort    *LSSummary      `json:"long_short_ratio,omitempty"`
+	Basis        *BasisSummary   `json:"basis,omitempty"`
+
+	SupportResistance map[string]*SRSummary `json:"support_resistance,omitempty"`
+
+	// 现货/合约成交额对比：判断恢复由现货真实买盘驱动还是纯合约投机
+	SpotToContractVolumeRatio24h float64 `json:"spot_to_contract_volume_ratio_24h,omitempty"`
+}
+
+type KlineSummary struct {
+	// bars: [open_time_ms, open, high, low, close, volume]，旧→新
+	Bars           [][]float64 `json:"bars"`
+	PctChange      float64     `json:"pct_change_window"` // 入包窗口首尾涨跌幅 %
+	VolumeRatio520 float64     `json:"volume_ratio_5_20"` // 近5根均量/前20根均量（>1 放量）
+}
+
+type CVDSummary struct {
+	SeriesTail []float64 `json:"series_tail"` // 最近 20 个累计值（旧→新，以窗口起点为 0）
+	Last       float64   `json:"last"`
+	SlopeSign  string    `json:"slope_recent"` // rising / falling / flat（近 20 根线性斜率）
+	Divergence string    `json:"divergence_note,omitempty"`
+}
+
+type OISummary struct {
+	Latest      float64            `json:"latest"`
+	LatestUSD   float64            `json:"latest_usd"`
+	ChangePct   map[string]float64 `json:"change_pct"` // 1h/4h/24h
+	SeriesTail  []float64          `json:"series_1h_tail"`
+	PriceOIRead string             `json:"price_oi_read_4h"` // 四象限解读
+}
+
+type FundingSummary struct {
+	CurrentRate        float64 `json:"current_rate"`
+	State              string  `json:"state"`
+	NextFundingMinutes float64 `json:"next_funding_minutes"`
+	Avg10d             float64 `json:"avg_rate_10d"`
+	Percentile10d      float64 `json:"current_percentile_10d"`
+}
+
+type LSSummary struct {
+	GlobalAccountsRatio float64 `json:"global_accounts_ratio"` // >1 = 做多人数占优
+	TopPositionsRatio   float64 `json:"top_positions_ratio"`   // 大户持仓量多空比
+	GlobalTrend24h      string  `json:"global_trend_24h"`      // rising / falling / flat
+}
+
+type BasisSummary struct {
+	MarkPrice  float64 `json:"mark_price"`
+	IndexPrice float64 `json:"index_price"`
+	BasisPct   float64 `json:"basis_pct"` // 正=升水（多头拥挤倾向）
+}
+
+type SRSummary struct {
+	NearestSupport        float64 `json:"nearest_support"`
+	SupportTouches        int     `json:"support_touches"`
+	SupportDistanceATR    float64 `json:"support_distance_atr"`
+	NearestResistance     float64 `json:"nearest_resistance"`
+	ResistanceTouches     int     `json:"resistance_touches"`
+	ResistanceDistanceATR float64 `json:"resistance_distance_atr"`
+}
+
+// buildDataPack 为一条人工重入信号组装完整数据包。
+// 除仓位层核心数据（信号/周期/attempt 表）失败会返回错误外，市场层任何
+// 字段失败只降级并记录 missing_fields。
+func buildDataPack(st *store.Store, bn *binanceClient, sig *store.CopyGuardManualReentrySignal) (*DataPack, error) {
+	cycle, err := st.CopyTrade().GetCopyGuardCycle(sig.CycleID)
+	if err != nil {
+		return nil, fmt.Errorf("读取周期 %d 失败: %w", sig.CycleID, err)
+	}
+	attempts, err := st.CopyTrade().ListCopyGuardAttempts(sig.CycleID)
+	if err != nil {
+		return nil, fmt.Errorf("读取周期 %d attempts 失败: %w", sig.CycleID, err)
+	}
+
+	pack := &DataPack{
+		Meta: MetaSection{
+			SnapshotAt:  time.Now().UTC().Format(time.RFC3339),
+			Symbol:      sig.Symbol,
+			Side:        sig.Side,
+			DataSources: "binance_futures(fapi) + binance_spot + okx_mark_price_atr(与门控同源)",
+		},
+	}
+
+	// ---------- Copy Guard 仓位层 ----------
+	guard := GuardSection{
+		SignalID:                 sig.ID,
+		CycleID:                  sig.CycleID,
+		TraderID:                 sig.TraderID,
+		Symbol:                   sig.Symbol,
+		Side:                     sig.Side,
+		MarginMode:               sig.MarginMode,
+		AccountEquityAtCycleOpen: round(cycle.AccountEquity, 2),
+		RecommendedNotional:      round(sig.RecommendedNotional, 2),
+		TriggerPrice:             sig.TriggerPrice,
+		ATRAtCycleEntry:          cycle.ATRAtEntry,
+		StopCount:                sig.StopCount,
+		AutoReentryCount:         sig.ReentryCount,
+		DistanceATRRatio:         round(sig.DistanceATRRatio, 4),
+		ReentryBoundary:          sig.ReentryBoundary,
+		Protectable:              sig.Protectable,
+		SignalReason:             sig.Reason,
+		Policy:                   extractRiskPolicy(cycle.PolicySnapshot),
+	}
+
+	// ATR：优先取实时（与引擎同源 OKX 标记价），失败回退信号快照值
+	atrTF := "1h"
+	if v, ok := guard.Policy["risk_atr_timeframe"].(string); ok && v != "" {
+		atrTF = v
+	}
+	guard.GateATRTimeframe = atrTF
+	if atr, err := market.GetOKXATRWithMaxAge(sig.Symbol, atrTF, 14, 2*time.Hour); err == nil && atr > 0 {
+		guard.GateATR = atr
+	} else {
+		guard.GateATR = sig.ATR
+		if err != nil {
+			pack.Meta.MissingFields = append(pack.Meta.MissingFields, "okx_atr_live(已回退信号快照值)")
+		}
+	}
+	if guard.ATRAtCycleEntry > 0 && guard.GateATR > 0 {
+		guard.ATRExpansionPct = round((guard.GateATR/guard.ATRAtCycleEntry-1)*100, 2)
+	}
+
+	// 最近观察采样：追价上限（chase_limit 不在信号快照里，从采样表补）
+	if sample, err := st.CopyTrade().GetLatestCopyGuardWatchSample(sig.CycleID); err == nil && sample != nil {
+		guard.ChaseLimit = sample.ChaseLimit
+	} else if err != nil && err != sql.ErrNoRows {
+		pack.Meta.MissingFields = append(pack.Meta.MissingFields, "chase_limit")
+	}
+
+	for _, a := range attempts {
+		e := AttemptEntry{
+			AttemptNo:  a.AttemptNo,
+			Status:     a.Status,
+			EntryPrice: a.EntryPrice,
+			ExitPrice:  a.ExitPrice,
+			Notional:   round(a.Notional, 2),
+			PnL:        round(a.PnL, 4),
+			Fee:        round(a.Fee, 4),
+			ATR:        a.ATR,
+			OpenedAt:   a.OpenedAt.UTC().Format(time.RFC3339),
+		}
+		if a.ClosedAt != nil {
+			e.ClosedAt = a.ClosedAt.UTC().Format(time.RFC3339)
+		}
+		guard.Attempts = append(guard.Attempts, e)
+	}
+
+	// ---------- 市场层（Binance 快照，可整体缺失） ----------
+	pack.Market = buildMarketSection(bn, sig.Symbol, guard.GateATR, &pack.Meta)
+
+	// 当前价：市场层可用时取 Binance 标记价/最新收盘，否则回退信号触发价
+	currentPrice := sig.TriggerPrice
+	if pack.Market != nil && pack.Market.CurrentPrice > 0 {
+		currentPrice = pack.Market.CurrentPrice
+	} else {
+		pack.Meta.Note = "该币种无 Binance 市场数据，市场层缺失；current_price 使用信号触发价，请结合 OKX 行情人工判断"
+	}
+
+	// 领航员状态（基于信号快照 + 当前价估算）
+	guard.Leader = LeaderInfo{
+		StillHolding:     sig.LeaderSize > 0,
+		Size:             sig.LeaderSize,
+		EntryPrice:       sig.LeaderEntryPrice,
+		EntryAtCycleOpen: cycle.LeaderEntryPrice,
+	}
+	if sig.LeaderEntryPrice > 0 && currentPrice > 0 {
+		pnl := pctChange(sig.LeaderEntryPrice, currentPrice)
+		if strings.EqualFold(sig.Side, "short") {
+			pnl = -pnl
+		}
+		guard.Leader.UnrealizedPnLPct = round(pnl, 3)
+	}
+	if cycle.BaselineLeaderSize > 0 {
+		guard.Leader.SizeVsCycleBaseline = round(sig.LeaderSize/cycle.BaselineLeaderSize, 3)
+	}
+
+	// 止损簇分析：上次止损价距当前价（沿持仓方向为正）+ 各次止损价最大间距
+	guard.LastStop = buildLastStopInfo(attempts, sig.Side, currentPrice, guard.GateATR)
+
+	pack.CopyGuard = guard
+	return pack, nil
+}
+
+// buildLastStopInfo 从 attempts 提取止损簇信息；无 STOPPED attempt 返回 nil
+func buildLastStopInfo(attempts []*store.CopyGuardAttempt, side string, currentPrice, atr float64) *LastStopInfo {
+	var stopPrices []float64
+	var lastStop float64
+	lastNo := -1
+	for _, a := range attempts {
+		if a.Status != "STOPPED" {
+			continue
+		}
+		price := a.StopFillPrice
+		if price <= 0 {
+			price = a.ExitPrice
+		}
+		if price <= 0 {
+			continue
+		}
+		stopPrices = append(stopPrices, price)
+		if a.AttemptNo > lastNo {
+			lastNo = a.AttemptNo
+			lastStop = price
+		}
+	}
+	if lastStop <= 0 {
+		return nil
+	}
+	info := &LastStopInfo{Price: lastStop}
+	if atr > 0 && currentPrice > 0 {
+		// 多单：价高于止损价 = 沿方向恢复（正）；空单相反
+		dist := (currentPrice - lastStop) / atr
+		if strings.EqualFold(side, "short") {
+			dist = -dist
+		}
+		info.DistanceFromCurrentATR = round(dist, 3)
+	}
+	if len(stopPrices) > 1 && atr > 0 {
+		min, max := stopPrices[0], stopPrices[0]
+		for _, p := range stopPrices[1:] {
+			if p < min {
+				min = p
+			}
+			if p > max {
+				max = p
+			}
+		}
+		info.StopClusterSpreadATR = round((max-min)/atr, 3)
+	}
+	return info
+}
+
+// buildMarketSection Binance 市场层；合约不可用返回 nil
+func buildMarketSection(bn *binanceClient, symbol string, atr float64, meta *MetaSection) *MarketSection {
+	// 先探测主周期：失败即视为 Binance 无此币种合约
+	primaryKlines, err := bn.futuresKlines(symbol, "1h", 120)
+	if err != nil || len(primaryKlines) == 0 {
+		meta.FuturesAvailable = false
+		meta.SpotAvailable = false
+		return nil
+	}
+	meta.FuturesAvailable = true
+
+	m := &MarketSection{
+		Klines:            map[string]*KlineSummary{},
+		ContractCVD:       map[string]*CVDSummary{},
+		SupportResistance: map[string]*SRSummary{},
+	}
+
+	// 多周期 K 线 + 量比 + 合约 CVD
+	futuresByTF := map[string][]market.Kline{"1h": primaryKlines}
+	for _, spec := range timeframeSpec {
+		klines := futuresByTF[spec.tf]
+		if klines == nil {
+			klines, err = bn.futuresKlines(symbol, spec.tf, spec.fetch)
+			if err != nil {
+				meta.MissingFields = append(meta.MissingFields, "futures_klines_"+spec.tf)
+				continue
+			}
+			futuresByTF[spec.tf] = klines
+		}
+		m.Klines[spec.tf] = summarizeKlines(klines, spec.include)
+	}
+	for _, tf := range cvdTimeframes {
+		if klines := futuresByTF[tf]; len(klines) > 0 {
+			m.ContractCVD[tf] = summarizeCVD(klines)
+		}
+	}
+
+	// 当前价：最新 1h K 线收盘（premiumIndex 成功时用标记价覆盖）
+	m.CurrentPrice = primaryKlines[len(primaryKlines)-1].Close
+	m.CurrentPriceSource = "binance_futures_1h_last_close"
+
+	// 现货 CVD + 现货/合约成交额比
+	spotOK := false
+	spotCVD := map[string]*CVDSummary{}
+	var spotQuote24h float64
+	for _, tf := range cvdTimeframes {
+		limit := 60
+		if tf == "1h" || tf == "4h" {
+			limit = 120
+		}
+		klines, err := bn.spotKlines(symbol, tf, limit)
+		if err != nil {
+			continue
+		}
+		spotOK = true
+		spotCVD[tf] = summarizeCVD(klines)
+		if tf == "1h" && len(klines) >= 24 {
+			for _, k := range klines[len(klines)-24:] {
+				spotQuote24h += k.QuoteVolume
+			}
+		}
+	}
+	meta.SpotAvailable = spotOK
+	if spotOK {
+		m.SpotCVD = spotCVD
+		if spotQuote24h > 0 && len(primaryKlines) >= 24 {
+			var contractQuote24h float64
+			for _, k := range primaryKlines[len(primaryKlines)-24:] {
+				contractQuote24h += k.QuoteVolume
+			}
+			if contractQuote24h > 0 {
+				m.SpotToContractVolumeRatio24h = round(spotQuote24h/contractQuote24h, 4)
+			}
+		}
+	} else {
+		meta.MissingFields = append(meta.MissingFields, "spot_cvd(该币种无 Binance 现货)")
+	}
+
+	// OI：当前 + 1h 历史 48 点
+	if oiHist, err := bn.openInterestHist(symbol, "1h", 48); err == nil && len(oiHist) > 0 {
+		latest := oiHist[len(oiHist)-1]
+		oi := &OISummary{
+			Latest:    latest.Value,
+			LatestUSD: round(latest.ValueUSD, 0),
+			ChangePct: map[string]float64{},
+		}
+		for label, back := range map[string]int{"1h": 1, "4h": 4, "24h": 24} {
+			if len(oiHist) > back {
+				oi.ChangePct[label] = round(pctChange(oiHist[len(oiHist)-1-back].Value, latest.Value), 3)
+			}
+		}
+		tail := oiHist
+		if len(tail) > 24 {
+			tail = tail[len(tail)-24:]
+		}
+		for _, p := range tail {
+			oi.SeriesTail = append(oi.SeriesTail, round(p.Value, 2))
+		}
+		// 四象限：4h 价格变化 × 4h OI 变化
+		var price4hChange float64
+		if k := futuresByTF["1h"]; len(k) >= 5 {
+			price4hChange = pctChange(k[len(k)-5].Close, k[len(k)-1].Close)
+		}
+		oi.PriceOIRead = priceOIQuadrant(price4hChange, oi.ChangePct["4h"])
+		m.OpenInterest = oi
+	} else {
+		meta.MissingFields = append(meta.MissingFields, "open_interest")
+	}
+
+	// 资金费 + 基差
+	if premium, err := bn.premiumIndex(symbol); err == nil {
+		if premium.MarkPrice > 0 {
+			m.CurrentPrice = premium.MarkPrice
+			m.CurrentPriceSource = "binance_futures_mark_price"
+		}
+		funding := &FundingSummary{
+			CurrentRate: premium.LastFundingRate,
+			State:       fundingState(premium.LastFundingRate),
+		}
+		if premium.NextFundingTime > 0 {
+			funding.NextFundingMinutes = round(time.Until(time.UnixMilli(premium.NextFundingTime)).Minutes(), 1)
+		}
+		if hist, err := bn.fundingHistory(symbol, 30); err == nil && len(hist) > 0 {
+			var sum float64
+			for _, h := range hist {
+				sum += h
+			}
+			funding.Avg10d = sum / float64(len(hist))
+			funding.Percentile10d = round(percentileRank(hist, premium.LastFundingRate), 1)
+		} else {
+			meta.MissingFields = append(meta.MissingFields, "funding_history")
+		}
+		m.Funding = funding
+		if premium.IndexPrice > 0 {
+			m.Basis = &BasisSummary{
+				MarkPrice:  premium.MarkPrice,
+				IndexPrice: premium.IndexPrice,
+				BasisPct:   round((premium.MarkPrice-premium.IndexPrice)/premium.IndexPrice*100, 4),
+			}
+		}
+	} else {
+		meta.MissingFields = append(meta.MissingFields, "funding_and_basis")
+	}
+
+	// 多空比
+	ls := &LSSummary{}
+	lsOK := false
+	if global, err := bn.longShortRatio(symbol, "global", "1h", 24); err == nil && len(global) > 0 {
+		ls.GlobalAccountsRatio = global[len(global)-1].Ratio
+		series := make([]float64, len(global))
+		for i, p := range global {
+			series[i] = p.Ratio
+		}
+		ls.GlobalTrend24h = slopeLabel(seriesSlope(series, len(series)), 0.001)
+		lsOK = true
+	}
+	if top, err := bn.longShortRatio(symbol, "top", "1h", 1); err == nil && len(top) > 0 {
+		ls.TopPositionsRatio = top[len(top)-1].Ratio
+		lsOK = true
+	}
+	if lsOK {
+		m.LongShort = ls
+	} else {
+		meta.MissingFields = append(meta.MissingFields, "long_short_ratio")
+	}
+
+	// 支撑/阻力：1h 与 4h 各算一组（摆动点聚类，tolerance=0.25×ATR）
+	for _, tf := range []string{"1h", "4h"} {
+		klines := futuresByTF[tf]
+		if len(klines) == 0 {
+			continue
+		}
+		sup, res, supT, resT := nearestSupportResistance(klines, m.CurrentPrice, atr)
+		sr := &SRSummary{
+			NearestSupport: sup, SupportTouches: supT,
+			NearestResistance: res, ResistanceTouches: resT,
+		}
+		if atr > 0 {
+			if sup > 0 {
+				sr.SupportDistanceATR = round((m.CurrentPrice-sup)/atr, 3)
+			}
+			if res > 0 {
+				sr.ResistanceDistanceATR = round((res-m.CurrentPrice)/atr, 3)
+			}
+		}
+		m.SupportResistance[tf] = sr
+	}
+
+	return m
+}
+
+// summarizeKlines 截取入包窗口并计算窗口涨跌幅 + 量比
+func summarizeKlines(klines []market.Kline, include int) *KlineSummary {
+	s := &KlineSummary{VolumeRatio520: round(volumeRatio(klines, 5, 20), 3)}
+	tail := klines
+	if len(tail) > include {
+		tail = tail[len(tail)-include:]
+	}
+	for _, k := range tail {
+		s.Bars = append(s.Bars, []float64{
+			float64(k.OpenTime),
+			roundSig(k.Open), roundSig(k.High), roundSig(k.Low), roundSig(k.Close),
+			round(k.Volume, 2),
+		})
+	}
+	if len(tail) > 1 {
+		s.PctChange = round(pctChange(tail[0].Open, tail[len(tail)-1].Close), 3)
+	}
+	return s
+}
+
+// summarizeCVD CVD 摘要：窗口末 20 值（以窗口起点归零）+ 斜率 + 价量背离
+func summarizeCVD(klines []market.Kline) *CVDSummary {
+	series := cvdSeries(klines)
+	if len(series) == 0 {
+		return nil
+	}
+	const window = 20
+	start := 0
+	if len(series) > window {
+		start = len(series) - window
+	}
+	base := 0.0
+	if start > 0 {
+		base = series[start-1]
+	}
+	s := &CVDSummary{}
+	for _, v := range series[start:] {
+		s.SeriesTail = append(s.SeriesTail, round(v-base, 2))
+	}
+	s.Last = s.SeriesTail[len(s.SeriesTail)-1]
+	slope := seriesSlope(series, window)
+	// 平坦阈值：相对窗口内均量的量纲
+	var avgVol float64
+	for _, k := range klines[start:] {
+		avgVol += k.Volume
+	}
+	if n := len(klines) - start; n > 0 {
+		avgVol /= float64(n)
+	}
+	s.SlopeSign = slopeLabel(slope, avgVol*0.01)
+
+	// 背离：窗口内价格与 CVD 方向相反
+	priceChange := pctChange(klines[start].Close, klines[len(klines)-1].Close)
+	switch {
+	case priceChange > 0.1 && s.SlopeSign == "falling":
+		s.Divergence = "价涨但CVD走弱（买盘不济，疑似诱多/回补驱动）"
+	case priceChange < -0.1 && s.SlopeSign == "rising":
+		s.Divergence = "价跌但CVD走强（卖压不济，疑似诱空/存在承接）"
+	}
+	return s
+}
+
+func slopeLabel(slope, flatThreshold float64) string {
+	if flatThreshold < 0 {
+		flatThreshold = 0
+	}
+	switch {
+	case slope > flatThreshold:
+		return "rising"
+	case slope < -flatThreshold:
+		return "falling"
+	default:
+		return "flat"
+	}
+}
+
+// roundSig 价格保留 6 位有效数字（兼容高价币与小数币）
+func roundSig(v float64) float64 {
+	if v == 0 {
+		return 0
+	}
+	digits := 6 - int(math.Ceil(math.Log10(math.Abs(v))))
+	if digits < 0 {
+		digits = 0
+	}
+	if digits > 10 {
+		digits = 10
+	}
+	return round(v, digits)
+}
+
+// extractRiskPolicy 从周期 policy_snapshot 提取 risk_* 与 min_trade_warn 字段
+func extractRiskPolicy(snapshot string) map[string]interface{} {
+	out := map[string]interface{}{}
+	if snapshot == "" {
+		return out
+	}
+	var full map[string]interface{}
+	if err := json.Unmarshal([]byte(snapshot), &full); err != nil {
+		return out
+	}
+	for k, v := range full {
+		if strings.HasPrefix(k, "risk_") || k == "min_trade_warn" || k == "copy_ratio" {
+			out[k] = v
+		}
+	}
+	return out
+}

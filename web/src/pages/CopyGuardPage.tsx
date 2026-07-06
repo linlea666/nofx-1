@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
+import type { MouseEvent as ReactMouseEvent } from 'react'
 import useSWR from 'swr'
 import {
   Legend,
@@ -10,7 +11,11 @@ import {
   YAxis,
 } from 'recharts'
 import { api } from '../lib/api'
-import type { CopyGuardCycle, CopyGuardManualSignal } from '../types'
+import type {
+  CopyGuardCycle,
+  CopyGuardManualSignal,
+  ReentryAIAnalysis,
+} from '../types'
 
 const money = (v: number) => `${v >= 0 ? '+' : ''}${v.toFixed(2)} USDT`
 
@@ -155,6 +160,246 @@ const dateLabel = (value?: string) => {
   return Number.isNaN(date.getTime()) ? '-' : date.toLocaleString()
 }
 
+// 重入 AI 助手：可折叠可复制文本区块（对齐 Prompt 透明化样式）
+function CopyableSection({
+  title,
+  content,
+}: {
+  title: string
+  content: string
+}) {
+  const [copied, setCopied] = useState(false)
+  const doCopy = async (e: ReactMouseEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    try {
+      await navigator.clipboard.writeText(content)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1500)
+    } catch {
+      window.prompt('复制失败，请手动复制：', content.slice(0, 500))
+    }
+  }
+  return (
+    <details className="rounded border border-[#2B3139] bg-[#0B0E11]">
+      <summary className="flex cursor-pointer items-center justify-between px-3 py-2 text-sm text-[#EAECEF]">
+        <span>
+          {title}（{content.length} chars）
+        </span>
+        <button
+          onClick={(e) => void doCopy(e)}
+          className="rounded bg-[#2B3139] px-2 py-0.5 text-xs hover:bg-[#3B424C]"
+        >
+          {copied ? '✓ 已复制' : '复制'}
+        </button>
+      </summary>
+      <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-all border-t border-[#2B3139] p-3 text-xs leading-relaxed text-[#B7BDC6]">
+        {content || '（空）'}
+      </pre>
+    </details>
+  )
+}
+
+// 重入 AI 助手分析弹窗：三段可复制（System Prompt / User Prompt / 纯数据 JSON）
+// + 外部 AI 结论粘贴区（永久可编辑，供准确率对比留档）。
+// 数据由 reentryadvisor 插件在信号产生后自动生成；可手动重新生成新快照（60s 冷却）。
+function AnalysisModal({
+  signal,
+  onClose,
+}: {
+  signal: CopyGuardManualSignal
+  onClose: () => void
+}) {
+  const {
+    data: analyses = [],
+    mutate,
+    isLoading,
+  } = useSWR<ReentryAIAnalysis[]>(
+    `reentry-analyses-${signal.id}`,
+    () => api.getReentryAnalyses(signal.id),
+    { refreshInterval: 10000 }
+  )
+  const [selectedId, setSelectedId] = useState<number | null>(null)
+  const analysis =
+    analyses.find((a) => a.id === selectedId) ?? analyses[0] ?? null
+  const [externalText, setExternalText] = useState('')
+  const [externalVerdict, setExternalVerdict] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const [notice, setNotice] = useState('')
+
+  // 切换快照时同步外部结论编辑区（未保存的编辑不跨快照带走）
+  const analysisId = analysis?.id
+  useEffect(() => {
+    if (!analysis) return
+    setExternalText(analysis.external_response)
+    setExternalVerdict(analysis.external_verdict)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [analysisId])
+
+  const doRegenerate = async () => {
+    setBusy(true)
+    setError('')
+    setNotice('')
+    try {
+      const res = await api.regenerateReentryAnalysis(signal.id)
+      setNotice('数据包已重新生成（新快照）')
+      setSelectedId(res.analysis.id)
+      void mutate()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+  const doSaveExternal = async () => {
+    if (!analysis) return
+    setBusy(true)
+    setError('')
+    setNotice('')
+    try {
+      await api.saveReentryExternal(analysis.id, {
+        external_response: externalText,
+        external_verdict: externalVerdict,
+      })
+      setNotice('外部 AI 结论已保存')
+      void mutate()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+      <div className="flex max-h-[88vh] w-full max-w-3xl flex-col gap-3 overflow-y-auto rounded-lg border border-[#2B3139] bg-[#181A20] p-6 text-sm">
+        <div className="flex items-center justify-between">
+          <div className="text-base font-bold">
+            重入分析数据：{signal.symbol} {sideLabel(signal.side)}单
+            <span className="ml-2 text-xs font-normal text-[#848E9C]">
+              信号 #{signal.id}
+            </span>
+          </div>
+          <button
+            onClick={onClose}
+            className="rounded bg-[#2B3139] px-3 py-1 text-xs hover:bg-[#3B424C]"
+          >
+            关闭
+          </button>
+        </div>
+
+        {analyses.length === 0 ? (
+          <div className="rounded bg-[#0B0E11] p-4 text-[#848E9C]">
+            {isLoading
+              ? '加载中…'
+              : '分析数据尚未生成（插件每 5 秒自动处理新信号）。若长时间未出现，可能插件已关闭，可点击下方按钮手动生成。'}
+          </div>
+        ) : (
+          analysis && (
+            <>
+              <div className="flex flex-wrap items-center gap-3 text-xs text-[#848E9C]">
+                <span>
+                  快照时间 {dateLabel(analysis.snapshot_at)} · 模板{' '}
+                  {analysis.prompt_version}
+                </span>
+                {analyses.length > 1 && (
+                  <select
+                    value={analysis.id}
+                    onChange={(e) => setSelectedId(Number(e.target.value))}
+                    className="rounded border border-[#2B3139] bg-[#0B0E11] px-2 py-1 text-[#EAECEF]"
+                  >
+                    {analyses.map((a) => (
+                      <option key={a.id} value={a.id}>
+                        快照 #{a.id} · {dateLabel(a.snapshot_at)}
+                      </option>
+                    ))}
+                  </select>
+                )}
+              </div>
+              {!analysis.market_data_available && (
+                <div className="rounded border border-[#F0B90B] bg-[#F0B90B]/10 p-3 text-xs text-[#F0B90B]">
+                  该币种无 Binance 市场数据，市场层缺失（仓位层数据完整）——请结合
+                  OKX 行情人工判断。
+                </div>
+              )}
+              {analysis.missing_fields && (
+                <div className="text-xs text-[#848E9C]">
+                  部分字段降级：{analysis.missing_fields}
+                </div>
+              )}
+              <CopyableSection
+                title="System Prompt"
+                content={analysis.system_prompt}
+              />
+              <CopyableSection
+                title="User Prompt（含数据包）"
+                content={analysis.user_prompt}
+              />
+              <CopyableSection
+                title="纯数据 JSON（喂外部 AI 用）"
+                content={analysis.datapack_json}
+              />
+              {analysis.raw_response && (
+                <CopyableSection
+                  title="系统 AI 返回"
+                  content={analysis.raw_response}
+                />
+              )}
+              <div className="space-y-2 rounded border border-[#2B3139] bg-[#0B0E11] p-3">
+                <div className="flex items-center justify-between text-sm text-[#EAECEF]">
+                  <span>外部 AI 结论（粘贴留档，供准确率对比）</span>
+                  <select
+                    value={externalVerdict}
+                    onChange={(e) => setExternalVerdict(e.target.value)}
+                    className="rounded border border-[#2B3139] bg-[#181A20] px-2 py-1 text-xs"
+                  >
+                    <option value="">结论标签（可选）</option>
+                    <option value="ENTER">ENTER · 建议重入</option>
+                    <option value="WAIT">WAIT · 继续观察</option>
+                    <option value="SKIP">SKIP · 建议忽略</option>
+                  </select>
+                </div>
+                <textarea
+                  value={externalText}
+                  onChange={(e) => setExternalText(e.target.value)}
+                  rows={5}
+                  placeholder="将外部 AI（如 ChatGPT / DeepSeek 网页版）的分析结论粘贴到这里保存…"
+                  className="w-full rounded border border-[#2B3139] bg-[#181A20] p-2 text-xs text-[#EAECEF]"
+                />
+                <div className="flex justify-end">
+                  <button
+                    onClick={() => void doSaveExternal()}
+                    disabled={busy}
+                    className="rounded bg-[#2B3139] px-3 py-1 text-xs hover:bg-[#3B424C] disabled:opacity-40"
+                  >
+                    保存外部结论
+                  </button>
+                </div>
+              </div>
+            </>
+          )
+        )}
+
+        {error && <div className="text-xs text-[#F6465D]">{error}</div>}
+        {notice && <div className="text-xs text-[#0ECB81]">{notice}</div>}
+        <div className="flex items-center justify-between">
+          <span className="text-xs text-[#848E9C]">
+            数据快照有时效性：距信号产生较久后请先重新生成再发给 AI 判断。
+          </span>
+          <button
+            onClick={() => void doRegenerate()}
+            disabled={busy}
+            className="rounded bg-[#F0B90B] px-3 py-1 text-xs font-medium text-black hover:opacity-90 disabled:opacity-40"
+          >
+            {busy ? '处理中…' : analyses.length === 0 ? '立即生成' : '重新生成（新快照）'}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // v5.1 人工重入待确认横幅：自动重入次数用尽后出现合格信号时（邮件同步提醒），
 // 用户在此确认（系统代执行）或忽略。30 秒轮询，无待处理信号时不渲染。
 function ManualSignalsBanner() {
@@ -164,6 +409,9 @@ function ManualSignalsBanner() {
     { refreshInterval: 30000 }
   )
   const [confirming, setConfirming] = useState<CopyGuardManualSignal | null>(
+    null
+  )
+  const [analyzing, setAnalyzing] = useState<CopyGuardManualSignal | null>(
     null
   )
   const [confirmAmount, setConfirmAmount] = useState('')
@@ -272,6 +520,13 @@ function ManualSignalsBanner() {
                 {dateLabel(sig.created_at)}
               </span>
               <span className="ml-auto flex gap-2">
+                <button
+                  onClick={() => setAnalyzing(sig)}
+                  className="rounded bg-[#2B3139] px-3 py-1 hover:bg-[#3B424C]"
+                  title="查看重入决策数据包与 Prompt（可复制给外部 AI 判断）"
+                >
+                  分析数据
+                </button>
                 {sig.status === 'EXECUTING' ? (
                   <span className="px-3 py-1 text-[#F0B90B]">执行中…</span>
                 ) : (
@@ -298,6 +553,9 @@ function ManualSignalsBanner() {
             </div>
           ))}
         </div>
+      )}
+      {analyzing && (
+        <AnalysisModal signal={analyzing} onClose={() => setAnalyzing(null)} />
       )}
       {confirming && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">

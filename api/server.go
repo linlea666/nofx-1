@@ -222,6 +222,10 @@ func (s *Server) setupRoutes() {
 			// Copy Trade routes
 			copyTradeHandler := NewCopyTradeHandler(s.store, s.traderManager)
 			copyTradeHandler.RegisterRoutes(protected)
+
+			// Reentry Advisor routes（重入 AI 助手插件）
+			reentryAIHandler := NewReentryAIHandler(s.store)
+			reentryAIHandler.RegisterRoutes(protected)
 		}
 	}
 }

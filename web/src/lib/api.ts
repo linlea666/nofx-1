@@ -984,4 +984,35 @@ export const api = {
     if (!result.success) throw new Error(result.message || '忽略信号失败')
     return result.data!
   },
+
+  // 重入 AI 助手（Reentry Advisor 插件）
+  async getReentryAnalyses(signalId: number) {
+    const result = await httpClient.get<{
+      analyses: import('../types').ReentryAIAnalysis[]
+    }>(`${API_BASE}/reentry-advisor/signals/${signalId}/analyses`)
+    if (!result.success)
+      throw new Error(result.message || '获取重入分析数据失败')
+    return result.data!.analyses
+  },
+  async regenerateReentryAnalysis(signalId: number) {
+    const result = await httpClient.post<{
+      message: string
+      analysis: import('../types').ReentryAIAnalysis
+    }>(`${API_BASE}/reentry-advisor/signals/${signalId}/regenerate`)
+    if (!result.success)
+      throw new Error(result.message || '重新生成分析数据失败')
+    return result.data!
+  },
+  async saveReentryExternal(
+    analysisId: number,
+    body: { external_response: string; external_verdict: string }
+  ) {
+    const result = await httpClient.put<{
+      message: string
+      analysis: import('../types').ReentryAIAnalysis
+    }>(`${API_BASE}/reentry-advisor/analyses/${analysisId}/external`, body)
+    if (!result.success)
+      throw new Error(result.message || '保存外部 AI 结论失败')
+    return result.data!
+  },
 }

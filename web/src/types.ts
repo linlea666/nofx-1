@@ -861,6 +861,32 @@ export interface CopyGuardManualSignal {
   executed_at?: string
 }
 
+// 重入 AI 助手：一次数据包快照 + 双 AI 结果载体（同信号可多条，重新生成产生新快照）
+export interface ReentryAIAnalysis {
+  id: number
+  signal_id: number
+  trader_id: string
+  cycle_id: number
+  symbol: string
+  side: string
+  system_prompt: string
+  user_prompt: string
+  datapack_json: string // 纯数据 JSON（喂外部 AI 用）
+  market_data_available: boolean // false = 该币种无 Binance 市场数据（仓位层仍完整）
+  missing_fields: string // 逗号分隔的降级字段列表
+  raw_response: string // 内部 AI 返回（Phase 2 起）
+  verdict: string
+  confidence: number
+  reasons: string
+  external_response: string // 用户粘贴的外部 AI 结论（永久可编辑）
+  external_verdict: '' | 'ENTER' | 'WAIT' | 'SKIP'
+  prompt_version: string
+  snapshot_at: string
+  outcome_pnl?: number
+  created_at: string
+  updated_at?: string
+}
+
 export interface CopyTradeStats {
   signals_received: number
   signals_followed: number

@@ -27,6 +27,7 @@ type Store struct {
 	equity       *EquityStore
 	copyTrade    *CopyTradeStore
 	binanceCreds *BinanceCredentialsStore
+	reentryAI    *ReentryAIStore
 
 	// Encryption functions
 	encryptFunc func(string) string
@@ -159,6 +160,9 @@ func (s *Store) initTables() error {
 	}
 	if err := s.BinanceCreds().initTables(); err != nil {
 		return fmt.Errorf("failed to initialize binance credentials tables: %w", err)
+	}
+	if err := s.ReentryAI().initTables(); err != nil {
+		return fmt.Errorf("failed to initialize reentry ai tables: %w", err)
 	}
 	return nil
 }
@@ -308,6 +312,16 @@ func (s *Store) BinanceCreds() *BinanceCredentialsStore {
 		s.binanceCreds = &BinanceCredentialsStore{db: s.db}
 	}
 	return s.binanceCreds
+}
+
+// ReentryAI gets reentry advisor storage
+func (s *Store) ReentryAI() *ReentryAIStore {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.reentryAI == nil {
+		s.reentryAI = &ReentryAIStore{db: s.db}
+	}
+	return s.reentryAI
 }
 
 // Close closes database connection
