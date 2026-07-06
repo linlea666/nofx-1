@@ -56,6 +56,26 @@
 | 默认开启 | `risk_manual_reentry_enabled` 存 **主表列 DEFAULT 1**（不用 JSON 缺省 false） |
 | 邮件可读性 | 保护类 / 人工重入邮件须带**交易员显示名**（修复 `notifyProtection` 仅 TraderID 的问题） |
 
+### v5.2 止损抗噪（margin_cap 默认关 + k=2.0）
+
+**背景：** 实盘发现止损挂得过近，轻微波动即被扫出。用 cycle-41 / cycle-71 / 截图三组真实数据核验，根因有二：
+
+- **高杠杆 margin_cap 坍缩：** 止损距离 = `min(ATR基线, margin_cap, account_cap)`，其中 `margin_cap = entry × RiskLeverageMaxLoss / leverage`。100x + 20% 时 margin_cap ≈ 入场价的 0.2%（如 ETH 仅 3.53 点），必然落进市场噪音区，与高杠杆天然冲突，是被扫的直接根因。
+- **小仓 ATR 倍数偏小：** 1.5×ATR 对黄金等品种 1h 的 ~9 点摆动扛不住（cycle-41 被扫 3 次）。
+
+**方案（B）：**
+
+| 改动 | 说明 |
+|------|------|
+| margin_cap 默认关 | `RiskLeverageFallback` 默认 `false`（复用既有跳过分支，零计算逻辑改动）。止损改由 `min(k×ATR, account_cap)` 决定；`account_cap`（默认 10% 权益）始终参与 min，单笔亏损硬兜底不变（不会重演 cycle-64 的 -40%） |
+| ATR 倍数 1.5→2.0 | `RiskATRMultiplier` 默认提到 2.0，兼顾小仓噪音 |
+| 杠杆/仓位不变 | 不改杠杆、不缩仓，完整保持领航员盈亏比 |
+| 存量迁移 | `store/copyguard.go` defaults-gen 代次 6：`risk_atr_multiplier` 1.5→2.0、`risk_leverage_fallback` 1→0（仅匹配旧默认值，用户显式值不动，UI 可改回） |
+| 连带正效 | 止损变宽 → `DistanceATRRatio` 提高 → 高杠杆下不再频繁误触"噪音禁入"，与目标一致 |
+| clamp 安全线 | 100x 下 2×ATR 若超强平距离，由现有 clamp-to-liq 收到强平安全线内（不改） |
+
+**开启 margin_cap 的场景：** 低杠杆 / 想要更小单次亏损时可在 UI 手动打开「仓位保证金止损上限」，恢复旧的更严封顶行为。
+
 ---
 
 ## 3. v5.1 数据流（端到端）

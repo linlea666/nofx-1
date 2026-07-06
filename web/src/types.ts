@@ -202,10 +202,10 @@ export interface CopyConfigRequest {
   // ============================================================
   risk_stop_loss_enabled?: boolean // 默认 true：启用账户保护硬止损
   risk_account_pct?: number // 默认 0.10 (10%)：单笔最多亏账户的百分比（账户兜底线）
-  risk_atr_multiplier?: number // 默认 1.5：SL 距离基线 = k×ATR（1.0-3.0）
+  risk_atr_multiplier?: number // 默认 2.0：SL 距离基线 = k×ATR（1.0-3.0，抗噪主力线）
   risk_atr_timeframe?: string // 默认 "1h"：ATR 时间周期（"15m" / "1h" / "4h"）
-  risk_leverage_fallback?: boolean // 默认 true：启用保证金硬 cap
-  risk_leverage_max_loss?: number // 默认 0.2：保证金最大亏损封顶（0-1，硬上限）
+  risk_leverage_fallback?: boolean // 默认 false：margin_cap 默认关（高杠杆下会压进噪音区）
+  risk_leverage_max_loss?: number // 默认 0.2：仅 risk_leverage_fallback 开启时的保证金封顶
   risk_reentry_enabled?: boolean // 默认 true（v4+）：止损后确认式重入
   risk_reentry_ratio?: number // 默认 0.5：重入仓位系数（× 被止损仓位名义）
   // v5.1 默认 true：自动重入次数用尽后，出现合格重入信号时邮件提醒人工确认（系统代执行）

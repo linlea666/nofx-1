@@ -98,7 +98,7 @@ type CopyGuardPolicy struct {
 
 // copyGuardPolicyDefaultsVersion 当前默认值代次；migrateCopyGuardPolicyDefaults
 // 只处理低于该值的存量策略。
-const copyGuardPolicyDefaultsVersion = 5
+const copyGuardPolicyDefaultsVersion = 6
 
 type CopyGuardCycle struct {
 	ID                  int64   `json:"id"`
@@ -494,6 +494,13 @@ func (s *CopyTradeStore) loadCopyGuardPolicy(c *CopyTradeConfig) error {
 //   - 仅回补被代次 4 规则降为 1 的行（defaults_version==4 且 max_reentries==1）；
 //     从未跑过代次 4 的行本来就是 2 或用户显式值，不动。
 //
+// 代次 6（v5.2 止损抗噪）：高杠杆下 margin_cap（entry×maxLoss/lev）会把止损压进
+// 市场噪音区导致频繁扫损，改由 ATR 基线 + 账户线主导。
+//   - risk_atr_multiplier：1.5（旧默认）→ 2.0（抗噪基线）
+//   - risk_leverage_fallback：1（旧默认开）→ 0（margin_cap 默认关）
+//   - 仅替换等于旧默认值的行；用户显式改过（如 1.8 / 显式开启）无法区分，与历史代次
+//     一致按旧默认匹配，迁移后用户仍可在 UI 手动改回。
+//
 // 仅当存量值等于旧默认值时才替换（用户显式改过的值保留）；处理后写入当前
 // defaults_version 书签，幂等且不会覆盖之后用户再设回旧值的选择。
 // 各代次规则以来源代次为守卫，避免对已迁移过的行重复执行。
@@ -552,6 +559,11 @@ func (s *CopyTradeStore) migrateCopyGuardPolicyDefaults() {
 			_, _ = s.db.Exec(`UPDATE copy_trade_configs SET risk_leverage_max_loss=0.30 WHERE trader_id=? AND risk_leverage_max_loss=0.50`, item.traderID)
 			_, _ = s.db.Exec(`UPDATE copy_trade_configs SET risk_account_pct=0.10 WHERE trader_id=? AND risk_account_pct=0.20`, item.traderID)
 			_, _ = s.db.Exec(`UPDATE copy_trade_configs SET risk_leverage_max_loss=0.20 WHERE trader_id=? AND risk_leverage_max_loss=0.30`, item.traderID)
+		}
+		if fromVersion < 6 {
+			// 代次 6（v5.2 止损抗噪）：ATR 倍数 1.5→2.0、margin_cap 开关 1→0（默认关）
+			_, _ = s.db.Exec(`UPDATE copy_trade_configs SET risk_atr_multiplier=2.0 WHERE trader_id=? AND risk_atr_multiplier=1.5`, item.traderID)
+			_, _ = s.db.Exec(`UPDATE copy_trade_configs SET risk_leverage_fallback=0 WHERE trader_id=? AND risk_leverage_fallback=1`, item.traderID)
 		}
 	}
 }

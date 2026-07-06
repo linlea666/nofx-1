@@ -28,11 +28,16 @@ type RiskDistanceResult struct {
 
 // ComputeRiskDistanceV4 is pure and unit-explicit; exchange/network concerns stay outside it.
 //
-// Copy Guard v5 两层硬止损：三项纯取严（min），任何机制不得放宽——
+// Copy Guard v5.2 止损：各项纯取严（min），任何机制不得放宽——
 //
-//	distance = min( ATR 基线      = atrDistance（默认 1.5×ATR，噪音参考线）,
-//	                仓位保证金止损 = entry × RiskLeverageMaxLoss / leverage（默认 20%，日常主力）,
-//	                账户硬兜底     = equity × RiskAccountPct / notional × entry（默认 10%，只管灾难敞口） )
+//	distance = min( ATR 基线      = atrDistance（默认 2.0×ATR，抗噪主力线）,
+//	                [可选] 保证金 = entry × RiskLeverageMaxLoss / leverage（RiskLeverageFallback 默认关）,
+//	                账户硬兜底     = equity × RiskAccountPct / notional × entry（默认 10%，单笔硬兜底） )
+//
+// v5.2 抗噪：仓位保证金止损（margin_cap）默认关闭（RiskLeverageFallback=false）。
+// 高杠杆下 entry×maxLoss/lev 会坍缩进市场噪音区（100x×20%≈0.2% 即止损），是频繁
+// 扫损的直接根因；改由 ATR 基线 + 账户线主导，账户线始终参与 min 作单笔硬兜底。
+// 用户可显式开启 RiskLeverageFallback 恢复更严的保证金封顶（低杠杆场景仍有意义）。
 //
 // v4.1 的噪音下限（noise_floor）放宽机制已删除：它在高杠杆下覆盖保证金 cap，
 // 是实盘 -40% 止损（周期 64）的直接根因。ATR 不再放宽硬止损，但保留基线、

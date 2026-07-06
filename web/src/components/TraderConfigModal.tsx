@@ -91,9 +91,9 @@ interface FormState {
   // ============================================================
   risk_stop_loss_enabled: boolean // 默认 true：启用账户保护硬止损
   risk_account_pct: number // 默认 10%（前端用百分比展示，提交时转 0.10）：账户兜底线
-  risk_atr_multiplier: number // 默认 1.5
+  risk_atr_multiplier: number // 默认 2.0
   risk_atr_timeframe: string // 默认 "1h"
-  risk_leverage_fallback: boolean // 默认 true
+  risk_leverage_fallback: boolean // 默认 false（margin_cap 默认关）
   risk_leverage_max_loss: number // 默认 20%（前端用百分比展示，提交时转 0.2）：保证金硬 cap
   risk_reentry_enabled: boolean // 默认 true：确认式重入
   risk_reentry_ratio: number // 默认 50%（前端用百分比，提交时转 0.5）
@@ -163,9 +163,9 @@ export function TraderConfigModal({
     // 账户保护 v5 风控默认值（与后端 store.FillRiskDefaults 保持一致）
     risk_stop_loss_enabled: true,
     risk_account_pct: 10, // v5：账户兜底线默认 10%
-    risk_atr_multiplier: 1.5,
+    risk_atr_multiplier: 2.0, // v5.2 抗噪：默认 2.0×ATR
     risk_atr_timeframe: '1h',
-    risk_leverage_fallback: true,
+    risk_leverage_fallback: false, // v5.2：margin_cap 默认关
     risk_leverage_max_loss: 20, // %（提交时 /100 转 0.2）—— v5 默认 20% 硬 cap
     risk_reentry_enabled: true,
     risk_reentry_ratio: 50, // %（提交时 /100 转 0.5）
@@ -287,9 +287,9 @@ export function TraderConfigModal({
             risk_stop_loss_enabled: cfg.risk_stop_loss_enabled ?? true,
             risk_account_pct:
               cfg.risk_account_pct != null ? cfg.risk_account_pct * 100 : 10,
-            risk_atr_multiplier: cfg.risk_atr_multiplier ?? 1.5,
+            risk_atr_multiplier: cfg.risk_atr_multiplier ?? 2.0,
             risk_atr_timeframe: cfg.risk_atr_timeframe ?? '1h',
-            risk_leverage_fallback: cfg.risk_leverage_fallback ?? true,
+            risk_leverage_fallback: cfg.risk_leverage_fallback ?? false,
             risk_leverage_max_loss:
               cfg.risk_leverage_max_loss != null
                 ? cfg.risk_leverage_max_loss * 100
@@ -377,9 +377,9 @@ export function TraderConfigModal({
         // 风控默认值（与 useState 初始值保持一致）
         risk_stop_loss_enabled: true,
         risk_account_pct: 10,
-        risk_atr_multiplier: 1.5,
+        risk_atr_multiplier: 2.0,
         risk_atr_timeframe: '1h',
-        risk_leverage_fallback: true,
+        risk_leverage_fallback: false,
         risk_leverage_max_loss: 20,
         risk_reentry_enabled: true,
         risk_reentry_ratio: 50,
@@ -1172,8 +1172,8 @@ export function TraderConfigModal({
                             <div className="grid grid-cols-2 gap-3">
                               <div className="col-span-2 flex items-center justify-between rounded border border-[#F0B90B44] bg-[#F0B90B0D] p-3 text-xs">
                                 <span className="text-[#848E9C]">
-                                  推荐（v5）：ATR14 / 1小时 /
-                                  1.5倍，仓位保证金硬止损20%，账户兜底10%，确认式重入50%×2次（冷却300s逐次加严），不可保护时立即离场
+                                  推荐（v5.2）：ATR14 / 1小时 /
+                                  2.0倍，仓位保证金上限默认关（抗噪），账户兜底10%，确认式重入50%×2次（冷却300s逐次加严），不可保护时立即离场
                                 </span>
                                 <button
                                   type="button"
@@ -1185,11 +1185,11 @@ export function TraderConfigModal({
                                       risk_trigger_price_type: 'mark',
                                       risk_atr_period: 14,
                                       risk_atr_cache_max_age_minutes: 120,
-                                      risk_atr_multiplier: 1.5,
+                                      risk_atr_multiplier: 2.0,
                                       risk_atr_timeframe: '1h',
                                       risk_atr_fallback_pct: 2,
                                       risk_account_pct: 10,
-                                      risk_leverage_fallback: true,
+                                      risk_leverage_fallback: false,
                                       risk_leverage_max_loss: 20,
                                       risk_slippage_buffer_bps: 10,
                                       risk_liquidation_buffer_atr: 0.5,
@@ -1414,7 +1414,7 @@ export function TraderConfigModal({
                                 </label>
                                 <p className="text-xs text-[#848E9C]">
                                   止损距离基线 =
-                                  倍数×ATR，自动适应不同币种波动率
+                                  倍数×ATR，自动适应不同币种波动率（默认 2.0，抗噪主力线）
                                 </p>
                               </div>
                             </div>
@@ -1433,7 +1433,7 @@ export function TraderConfigModal({
                                     onChange={(e) =>
                                       handleInputChange(
                                         'risk_atr_multiplier',
-                                        parseFloat(e.target.value) || 1.5
+                                        parseFloat(e.target.value) || 2.0
                                       )
                                     }
                                     className="w-full px-3 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF] focus:border-[#F0B90B] focus:outline-none text-sm"
@@ -1474,7 +1474,7 @@ export function TraderConfigModal({
                                   </label>
                                   <p className="text-xs text-[#848E9C]">
                                     {formData.risk_policy_version >= 4
-                                      ? '亏损达到仓位保证金的此比例即止损（与 OKX 收益率同口径，和 ATR 距离取更紧者）。设得越低越早止损，但更容易被正常波动扫出，靠二次进场弥补'
+                                      ? '可选的更严保证金封顶，默认关闭。高杠杆下会把止损压进噪音区（如 100x×20%≈0.2% 就止损），易被正常波动扫出；仅低杠杆或想要更小单次亏损时开启，开启后与 ATR 距离取更紧者'
                                       : '保证金亏损达此比例时强制平仓（高杠杆兜底）'}
                                   </p>
                                 </div>
@@ -1859,9 +1859,8 @@ export function TraderConfigModal({
                               <line x1="12" x2="12.01" y1="16" y2="16" />
                             </svg>
                             <span className="text-xs text-[#848E9C]">
-                              账户保护止损算法（v5）：ATR 波动基线 +
-                              仓位保证金硬 cap + 账户兜底线，三者取最紧且
-                              cap 绝不放宽。SL 由 OKX 交易所托管（algo
+                              账户保护止损算法（v5.2）：ATR 波动基线（默认 2.0×ATR，抗噪主力线）
+                              + 账户兜底线，取更紧者（仓位保证金上限默认关，可选开启作更严封顶）。SL 由 OKX 交易所托管（algo
                               条件单），即使本系统离线也不影响触发。
                               加仓后会按新均价自动收紧
                               SL，保护账户最大亏损不变；止损价被强平价挤压时自动夹紧（CLAMPED），确认无法保护时按上方配置离场或标红裸跟。

@@ -345,3 +345,61 @@ func TestMigratePolicyDefaults(t *testing.T) {
 		t.Fatalf("policies at the current version must not be rescanned: %+v", p)
 	}
 }
+
+// 代次 6（v5.2 止损抗噪）迁移：把主表 risk_atr_multiplier 1.5→2.0、
+// risk_leverage_fallback 1→0；仅匹配旧默认值，用户显式值（1.8/已关）保留；
+// 已达当前代次的策略不重扫。
+func TestMigratePolicyDefaultsGen6(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "defaults-gen6.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cs := st.CopyTrade()
+
+	// 播种 trader + copy_guard_policy(DefaultsVersion<6) + copy_trade_configs 行
+	seed := func(traderID string, defaultsVer int, atr float64, levFallback int) {
+		t.Helper()
+		if _, err := st.DB().Exec(`INSERT INTO traders(id, name, ai_model_id, exchange_id, initial_balance) VALUES(?,?,?,?,0)`, traderID, traderID, "m", "e"); err != nil {
+			t.Fatal(err)
+		}
+		b, merr := json.Marshal(CopyGuardPolicy{Version: 4, DefaultsVersion: defaultsVer})
+		if merr != nil {
+			t.Fatal(merr)
+		}
+		if _, err := st.DB().Exec(`INSERT INTO copy_guard_policies(trader_id, policy_json) VALUES(?,?)`, traderID, string(b)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.DB().Exec(`INSERT INTO copy_trade_configs(trader_id, provider_type, leader_id, risk_atr_multiplier, risk_leverage_fallback) VALUES(?, 'okx', 'lead', ?, ?)`, traderID, atr, levFallback); err != nil {
+			t.Fatal(err)
+		}
+	}
+	loadCfg := func(traderID string) (float64, int) {
+		t.Helper()
+		var atr float64
+		var lev int
+		if err := st.DB().QueryRow(`SELECT risk_atr_multiplier, risk_leverage_fallback FROM copy_trade_configs WHERE trader_id=?`, traderID).Scan(&atr, &lev); err != nil {
+			t.Fatal(err)
+		}
+		return atr, lev
+	}
+
+	// 旧默认行：应迁移为 2.0 / 0
+	seed("t-old", 5, 1.5, 1)
+	// 用户显式行：1.8 与已关闭 fallback 都不得被改
+	seed("t-custom", 5, 1.8, 0)
+	// 已达当前代次：不重扫（即使值等于旧默认）
+	seed("t-current", copyGuardPolicyDefaultsVersion, 1.5, 1)
+
+	cs.migrateCopyGuardPolicyDefaults()
+
+	if atr, lev := loadCfg("t-old"); atr != 2.0 || lev != 0 {
+		t.Fatalf("旧默认行应迁移为 2.0/0，got atr=%.2f lev=%d", atr, lev)
+	}
+	if atr, lev := loadCfg("t-custom"); atr != 1.8 || lev != 0 {
+		t.Fatalf("用户显式值必须保留，got atr=%.2f lev=%d", atr, lev)
+	}
+	if atr, lev := loadCfg("t-current"); atr != 1.5 || lev != 1 {
+		t.Fatalf("已达当前代次的行不得被重扫，got atr=%.2f lev=%d", atr, lev)
+	}
+}

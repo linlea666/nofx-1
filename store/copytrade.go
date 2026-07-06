@@ -43,13 +43,13 @@ type CopyTradeConfig struct {
 	// 账户硬兜底（v5：单笔最多亏账户的百分比，任何模式下的最终封顶）
 	RiskAccountPct float64 `json:"risk_account_pct"` // 默认 0.10 (=10%)
 
-	// ATR 基线（噪音参考线：三项取严中的宽松项，不再放宽硬 cap）
-	RiskATRMultiplier float64 `json:"risk_atr_multiplier"` // 默认 1.5，范围 0.5-5
+	// ATR 基线（v5.2 抗噪主力线：止损距离 = k×ATR，与账户线取严）
+	RiskATRMultiplier float64 `json:"risk_atr_multiplier"` // 默认 2.0，范围 0.5-5
 	RiskATRTimeframe  string  `json:"risk_atr_timeframe"`  // 默认 "1h"，可选 "15m"/"1h"/"4h"
 
-	// 仓位保证金止损（v5 日常主力线：保证金最大亏损不超此比例）
-	RiskLeverageFallback bool    `json:"risk_leverage_fallback"` // 默认 true
-	RiskLeverageMaxLoss  float64 `json:"risk_leverage_max_loss"` // 默认 0.2 (=20% 保证金)
+	// 仓位保证金止损（可选的更严封顶；高杠杆下会把止损压进噪音区，默认关）
+	RiskLeverageFallback bool    `json:"risk_leverage_fallback"` // 默认 false
+	RiskLeverageMaxLoss  float64 `json:"risk_leverage_max_loss"` // 默认 0.2 (=20% 保证金，仅开启时生效)
 
 	// 二次进场（v5 确认式重入）
 	RiskReentryEnabled bool    `json:"risk_reentry_enabled"`
@@ -109,15 +109,17 @@ type CopyTradeConfig struct {
 // 调用时机：从数据库读出后立即调用，或前端未传字段时
 // 设计目的：保证旧库（ALTER TABLE 后字段为 0/false/""）也能跑出合理默认行为
 //
-// v5 默认值选型（与 copytrade.CopyConfig.FillRiskDefaults 保持一致）：
+// v5.2 默认值选型（与 copytrade.CopyConfig.FillRiskDefaults 保持一致）：
+//   - RiskATRMultiplier 2.0：止损距离基线（k×ATR），抗噪主力线
 //   - RiskAccountPct 0.10：账户硬兜底，只锁灾难敞口，正常跟单不干扰
-//   - RiskLeverageMaxLoss 0.20：仓位保证金止损，日常主力线
+//   - RiskLeverageMaxLoss 0.20：仅当 RiskLeverageFallback 开启时的保证金封顶（默认关）
 func (c *CopyTradeConfig) FillRiskDefaults() {
 	if c.RiskAccountPct == 0 {
 		c.RiskAccountPct = 0.10
 	}
 	if c.RiskATRMultiplier == 0 {
-		c.RiskATRMultiplier = 1.5
+		// v5.2 抗噪：止损距离基线默认 2.0×ATR（与 copytrade.CopyConfig 保持一致）
+		c.RiskATRMultiplier = 2.0
 	}
 	if c.RiskATRTimeframe == "" {
 		c.RiskATRTimeframe = "1h"
@@ -232,9 +234,9 @@ func (s *CopyTradeStore) initTables() error {
 	// 创建也不再读写（旧库中的存量列保留为休眠数据）
 	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_stop_loss_enabled INTEGER DEFAULT 1`)
 	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_account_pct REAL DEFAULT 0`)
-	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_atr_multiplier REAL DEFAULT 1.5`)
+	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_atr_multiplier REAL DEFAULT 2.0`)
 	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_atr_timeframe TEXT DEFAULT '1h'`)
-	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_leverage_fallback INTEGER DEFAULT 1`)
+	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_leverage_fallback INTEGER DEFAULT 0`)
 	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_leverage_max_loss REAL DEFAULT 0`)
 	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_reentry_enabled INTEGER DEFAULT 0`)
 	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_reentry_ratio REAL DEFAULT 0.5`)
@@ -365,7 +367,7 @@ const copyTradeConfigSelectColumns = `
 	COALESCE(risk_account_pct, 0) AS risk_account_pct,
 	COALESCE(risk_atr_multiplier, 1.5) AS risk_atr_multiplier,
 	COALESCE(risk_atr_timeframe, '1h') AS risk_atr_timeframe,
-	COALESCE(risk_leverage_fallback, 1) AS risk_leverage_fallback,
+	COALESCE(risk_leverage_fallback, 0) AS risk_leverage_fallback,
 	COALESCE(risk_leverage_max_loss, 0) AS risk_leverage_max_loss,
 	COALESCE(risk_reentry_enabled, 0) AS risk_reentry_enabled,
 	COALESCE(risk_reentry_ratio, 0.5) AS risk_reentry_ratio,

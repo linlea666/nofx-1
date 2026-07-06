@@ -131,10 +131,10 @@ type CopyConfig struct {
 	// ============================================================
 	RiskStopLossEnabled  bool    `json:"risk_stop_loss_enabled"`
 	RiskAccountPct       float64 `json:"risk_account_pct"` // v5：单笔账户最大亏损硬兜底，默认 0.10
-	RiskATRMultiplier    float64 `json:"risk_atr_multiplier"`
+	RiskATRMultiplier    float64 `json:"risk_atr_multiplier"` // v5.2：止损距离基线 k×ATR，默认 2.0
 	RiskATRTimeframe     string  `json:"risk_atr_timeframe"`
-	RiskLeverageFallback bool    `json:"risk_leverage_fallback"`
-	RiskLeverageMaxLoss  float64 `json:"risk_leverage_max_loss"` // v5：仓位保证金止损，默认 0.20
+	RiskLeverageFallback bool    `json:"risk_leverage_fallback"` // v5.2：margin_cap 开关，默认 false（关）
+	RiskLeverageMaxLoss  float64 `json:"risk_leverage_max_loss"` // 仅 RiskLeverageFallback 开启时生效，默认 0.20
 	RiskReentryEnabled   bool    `json:"risk_reentry_enabled"`
 	RiskReentryRatio     float64 `json:"risk_reentry_ratio"` // × 被止损仓位名义
 
@@ -186,7 +186,8 @@ func (c *CopyConfig) FillRiskDefaults() {
 		c.RiskAccountPct = 0.10
 	}
 	if c.RiskATRMultiplier == 0 {
-		c.RiskATRMultiplier = 1.5
+		// v5.2 抗噪：止损距离基线默认 2.0×ATR（原 1.5 对高波动币种 1h 噪音偏紧、易扫损）
+		c.RiskATRMultiplier = 2.0
 	}
 	if c.RiskATRTimeframe == "" {
 		c.RiskATRTimeframe = "1h"

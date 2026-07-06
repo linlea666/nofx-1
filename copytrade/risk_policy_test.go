@@ -117,6 +117,68 @@ func TestComputeRiskDistanceV4AccountHardBackstopCapsEveryMode(t *testing.T) {
 	}
 }
 
+// TestComputeRiskDistanceV4DefaultMarginCapOffResistsNoise 复现截图 ETH 场景：
+// v5.2 默认关闭 margin_cap（RiskLeverageFallback=false）后，高杠杆止损不再被
+// entry×maxLoss/lev 压进噪音区，改由 min(k×ATR, account_cap) 决定；account_cap
+// 始终参与 min 作单笔硬兜底。
+func TestComputeRiskDistanceV4DefaultMarginCapOffResistsNoise(t *testing.T) {
+	// entry=1766, 100x, notional=859, equity=90, ATR raw≈10.6, k=2.0
+	// atrDistance = 10.6×2.0 = 21.2；account_cap = 90×0.10/859×1766 ≈ 18.51
+	// margin_cap（若开启）= 1766×0.2/100 = 3.532（噪音区）
+	const entry, notional, equity = 1766.0, 859.0, 90.0
+	const atrDistance = 21.2
+	c := &CopyConfig{ProviderType: ProviderOKX, RiskPolicyVersion: 4, RiskStopMode: "volatility_priority", RiskAccountPct: 0.10, RiskLeverageMaxLoss: 0.2, RiskATRMultiplier: 2.0, RiskLeverageFallback: false}
+
+	r, err := ComputeRiskDistanceV4(c, entry, notional, equity, atrDistance, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	accountCap := equity * 0.10 / notional * entry // ≈ 18.51
+	if math.Abs(r.Distance-accountCap) > 1e-6 || r.GovernedBy != "account_cap" {
+		t.Fatalf("默认关 margin_cap 时应由 account_cap(≈%.2f) 主导，got %+v", accountCap, r)
+	}
+	// 抗噪目标：止损距离远大于坍缩的 margin_cap 3.53 点
+	if r.Distance <= 3.532 {
+		t.Fatalf("止损距离必须显著大于坍缩的 margin_cap 3.53，got %.4f", r.Distance)
+	}
+
+	// 对照组：显式开启 margin_cap → 恢复旧的坍缩行为（0.2% ≈ 3.53 点）
+	c.RiskLeverageFallback = true
+	r2, err := ComputeRiskDistanceV4(c, entry, notional, equity, atrDistance, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marginCap := entry * 0.2 / 100 // ≈ 3.532
+	if math.Abs(r2.Distance-marginCap) > 1e-6 || r2.GovernedBy != "margin_cap" {
+		t.Fatalf("显式开启 margin_cap 应恢复坍缩距离(≈%.2f)，got %+v", marginCap, r2)
+	}
+}
+
+// TestComputeRiskDistanceV4Cycle41GoldNoiseResistance 用 cycle-41（XAU）真实参数离线核验：
+// 实盘 k=1.5 时 SL 距离 7.59 点，被 ~8 点摆动扫了 3 次。k=2.0 后止损距离应 >9.4 点，
+// 且不被 account_cap / margin_cap 压回噪音区（两者对该小仓都极宽）。
+func TestComputeRiskDistanceV4Cycle41GoldNoiseResistance(t *testing.T) {
+	// 日志实测：atr_value=5.0609367，entry=4180.4，notional=20.902，equity=102.596，leverage=50
+	const rawATR, entry, notional, equity, leverage = 5.060936717414582, 4180.4, 20.902, 102.59603407481568, 50
+	c := &CopyConfig{ProviderType: ProviderOKX, RiskPolicyVersion: 4, RiskStopMode: "volatility_priority", RiskAccountPct: 0.10, RiskLeverageMaxLoss: 0.2, RiskATRMultiplier: 2.0, RiskLeverageFallback: false}
+
+	r, err := ComputeRiskDistanceV4(c, entry, notional, equity, rawATR*2.0, leverage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.GovernedBy != "atr" {
+		t.Fatalf("小仓下 account_cap/margin_cap 都极宽，应由 ATR 主导，got %+v", r)
+	}
+	// k=2.0 → 10.12 点 > 实测 ~9.4 点摆动，不再被扫
+	if r.Distance <= 9.4 {
+		t.Fatalf("k=2.0 止损距离必须 >9.4 点摆动，got %.4f", r.Distance)
+	}
+	// 对照旧 k=1.5：7.59 点（会被扫）
+	if r.Distance <= 7.591405076121873 {
+		t.Fatalf("k=2.0 距离必须显著大于旧 1.5×ATR 的 7.59 点，got %.4f", r.Distance)
+	}
+}
+
 func TestValidateRiskPolicyV4(t *testing.T) {
 	c := &CopyConfig{ProviderType: ProviderOKX, RiskPolicyVersion: 4, RiskStopMode: "volatility_priority", RiskATRPeriod: 14, RiskATRCacheMaxAgeMinutes: 120, RiskATRMultiplier: 1.5, RiskATRFallbackPct: 0.02, RiskTriggerPriceType: "mark", RiskAccountPct: 0.02, RiskLiquidationBufferATR: 0.5, RiskMaxReentries: 2, RiskReentryRatio: 0.5, RiskReentryBandATR: 0.5, RiskReentryCooldownSeconds: 60, RiskReentryMaxATRExpansion: 2}
 	if err := ValidateRiskPolicyV4(c); err != nil {
