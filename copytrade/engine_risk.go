@@ -152,7 +152,11 @@ const addonBudgetEventInterval = 60 * time.Second
 // 时静默跳过。
 func (e *Engine) warnAddonRiskBudget(signal *TradeSignal, posID string, copySize float64) {
 	cfg := e.config
-	if cfg == nil || !SupportsCopyGuard(cfg.ProviderType) || !cfg.RiskStopLossEnabled {
+	// 显式 v4+ 门槛：加仓预算是 Copy Guard v4 特性。version<4 的存量配置
+	// 目前也进不来（budget 默认 0 + 无 open cycle 双重隐式短路），此检查
+	// 把门控从"依赖下游数据缺失"改为与 shouldManageStopLoss 等一致的
+	// 显式判定，防止未来重构 cycle 创建时机时悄悄漏风。
+	if cfg == nil || !SupportsCopyGuard(cfg.ProviderType) || cfg.RiskPolicyVersion < 4 || !cfg.RiskStopLossEnabled {
 		return
 	}
 	budget := cfg.RiskAddonBudgetPct

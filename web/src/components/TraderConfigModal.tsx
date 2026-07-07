@@ -305,7 +305,12 @@ export function TraderConfigModal({
                 : 50,
             risk_manual_reentry_enabled:
               cfg.risk_manual_reentry_enabled ?? true,
-            risk_policy_version: cfg.risk_policy_version ?? 4,
+            // `|| 4` 而非 `?? 4`：0 是旧版 API 对非 OKX 数据源剥离
+            // risk_policy_version 留下的哨兵值，不是用户选择。本表单只能
+            // 编辑 v4+（v5）策略，加载时把 0 归一为 4，否则存量币安配置
+            // 会陷入"面板可见但参数区隐藏、保存永续 0、止损永不激活"的
+            // 自锁状态（激活仍需用户显式保存，opt-in 语义不变）。
+            risk_policy_version: cfg.risk_policy_version || 4,
             risk_stop_mode: cfg.risk_stop_mode ?? 'volatility_priority',
             risk_atr_period: cfg.risk_atr_period ?? 14,
             risk_atr_cache_max_age_minutes:
