@@ -1759,6 +1759,146 @@ func (ti *TraderIntegration) saveSignalLog(dec *decision.Decision, status, error
 	if err := ti.store.CopyTrade().SaveSignalLog(log); err != nil {
 		logger.Warnf("⚠️ [%s] 保存信号日志失败: %v", ti.traderID, err)
 	}
+
+	// 统一跟单事件日志（Seam A）：动作事件（开仓/加仓/减仓/平仓，全 provider）。
+	// 复用本唯一入口，避免散落埋点；best-effort，绝不影响上游流程。
+	ti.recordActionEvent(dec, status, errorMsg, log.SignalID)
+}
+
+// recordCopyEvent 统一跟单事件写入器（best-effort）。
+// 写入失败仅告警、绝不上抛，保证交易主链路零影响。
+func (ti *TraderIntegration) recordCopyEvent(e *store.CopyTradeEvent) {
+	if ti.store == nil || e == nil {
+		return
+	}
+	if e.TraderID == "" {
+		e.TraderID = ti.traderID
+	}
+	if e.LeaderID == "" && ti.engine != nil && ti.engine.config != nil {
+		e.LeaderID = ti.engine.config.LeaderID
+	}
+	if e.ProviderType == "" && ti.engine != nil && ti.engine.config != nil {
+		e.ProviderType = string(ti.engine.config.ProviderType)
+	}
+	if err := ti.store.CopyTrade().LogCopyEvent(e); err != nil {
+		logger.Warnf("⚠️ [%s] 保存跟单事件日志失败: %v", ti.traderID, err)
+	}
+}
+
+// recordActionEvent 把一次跟单执行结果落成统一动作事件。
+// status ∈ {executed, skipped, silent_close, failed}（saveSignalLog 的四个来源）。
+func (ti *TraderIntegration) recordActionEvent(dec *decision.Decision, status, errorMsg, signalID string) {
+	eventType, side := classifyCopyAction(dec.Action)
+	if eventType == "" {
+		return // hold/wait 等非动作决策不记录
+	}
+
+	// 开仓 vs 加仓：执行成功前本地已有 active 映射即为加仓（与 updatePositionMapping 同口径）。
+	// 二次入场（reentry）视为重新开仓，其重入语义由 Seam B 的 reentry 事件单独记录。
+	if eventType == store.CopyEventTypeOpen && dec.LeaderPosID != "" &&
+		!strings.Contains(dec.Reasoning, "reentry") {
+		if m, err := ti.store.CopyTrade().GetActiveMapping(ti.traderID, dec.LeaderPosID); err == nil && m != nil {
+			eventType = store.CopyEventTypeAdd
+		}
+	}
+
+	evStatus, severity := "success", store.CopyEventSeverityInfo
+	switch status {
+	case "executed":
+		evStatus, severity = "success", store.CopyEventSeverityInfo
+	case "skipped":
+		evStatus, severity = "skipped", store.CopyEventSeverityInfo
+	case "silent_close":
+		// 良性 close 自愈（本地仓位已不存在），非失败也非常态。
+		evStatus, severity = "success", store.CopyEventSeverityWarn
+	case "failed":
+		evStatus, severity = "failed", store.CopyEventSeverityError
+	}
+
+	// 幂等键：仅在有领航员 fill ID 时启用（引擎瞬态失败重放同一 fill 的相同结果去重）。
+	dedup := ""
+	if dec.SourceFillID != "" {
+		dedup = fmt.Sprintf("a|%s|%s|%s|%s", ti.traderID, dec.SourceFillID, eventType, evStatus)
+	}
+
+	ti.recordCopyEvent(&store.CopyTradeEvent{
+		Category:    store.CopyEventCategoryAction,
+		EventType:   eventType,
+		Severity:    severity,
+		Symbol:      dec.Symbol,
+		Side:        side,
+		MarginMode:  dec.MarginMode,
+		LeaderPosID: dec.LeaderPosID,
+		SignalID:    signalID,
+		Status:      evStatus,
+		Price:       dec.EntryPrice,
+		Notional:    dec.PositionSizeUSD,
+		Summary:     buildActionSummary(eventType, dec, evStatus, errorMsg),
+		Detail:      buildActionDetail(dec, errorMsg),
+		DedupKey:    dedup,
+	})
+}
+
+// classifyCopyAction 把决策 action 归一化为动作事件类型与方向。
+func classifyCopyAction(action string) (eventType, side string) {
+	switch action {
+	case "open_long":
+		return store.CopyEventTypeOpen, "long"
+	case "open_short":
+		return store.CopyEventTypeOpen, "short"
+	case "reduce_long":
+		return store.CopyEventTypeReduce, "long"
+	case "reduce_short":
+		return store.CopyEventTypeReduce, "short"
+	case "close_long":
+		return store.CopyEventTypeClose, "long"
+	case "close_short":
+		return store.CopyEventTypeClose, "short"
+	}
+	return "", ""
+}
+
+func buildActionSummary(eventType string, dec *decision.Decision, evStatus, errorMsg string) string {
+	label := map[string]string{
+		store.CopyEventTypeOpen:   "开仓",
+		store.CopyEventTypeAdd:    "加仓",
+		store.CopyEventTypeReduce: "减仓",
+		store.CopyEventTypeClose:  "平仓",
+	}[eventType]
+	switch evStatus {
+	case "failed":
+		return fmt.Sprintf("%s %s 执行失败: %s", label, dec.Symbol, errorMsg)
+	case "skipped":
+		return fmt.Sprintf("%s %s 跳过（未下单）", label, dec.Symbol)
+	default:
+		if dec.PositionSizeUSD > 0 {
+			return fmt.Sprintf("%s %s %.2f USDT", label, dec.Symbol, dec.PositionSizeUSD)
+		}
+		return fmt.Sprintf("%s %s", label, dec.Symbol)
+	}
+}
+
+func buildActionDetail(dec *decision.Decision, errorMsg string) map[string]interface{} {
+	d := map[string]interface{}{}
+	if dec.Leverage > 0 {
+		d["leverage"] = dec.Leverage
+	}
+	if dec.CloseRatio > 0 {
+		d["close_ratio"] = dec.CloseRatio
+	}
+	if dec.LeaderPosSize > 0 {
+		d["leader_pos_size"] = dec.LeaderPosSize
+	}
+	if dec.ExchangeOrderID != "" {
+		d["exchange_order_id"] = dec.ExchangeOrderID
+	}
+	if errorMsg != "" {
+		d["error"] = errorMsg
+	}
+	if len(d) == 0 {
+		return nil
+	}
+	return d
 }
 
 // updatePositionMapping 更新仓位映射（执行成功后调用）

@@ -13,6 +13,7 @@ import { StrategyStudioPage } from './pages/StrategyStudioPage'
 import { DebateArenaPage } from './pages/DebateArenaPage'
 import { DashboardPage } from './pages/DashboardPage'
 import { CopyGuardPage } from './pages/CopyGuardPage'
+import { CopyEventLogPage } from './pages/CopyEventLogPage'
 import HeaderBar from './components/HeaderBar'
 import { LanguageProvider, useLanguage } from './contexts/LanguageContext'
 import { AuthProvider, useAuth } from './contexts/AuthContext'
@@ -47,6 +48,7 @@ type Page =
   | 'register'
   | 'data-dashboard'
   | 'copy-guard'
+  | 'copy-events'
 
 // 获取友好的AI模型名称
 function getModelDisplayName(modelId: string): string {
@@ -105,6 +107,7 @@ function App() {
     if (path === '/data-dashboard' || hash === 'data-dashboard')
       return 'data-dashboard'
     if (path === '/copy-guard' || hash === 'copy-guard') return 'copy-guard'
+    if (path === '/copy-events' || hash === 'copy-events') return 'copy-events'
     if (path === '/dashboard' || hash === 'trader' || hash === 'details')
       return 'trader'
     return 'competition' // 默认为竞赛页面
@@ -129,6 +132,12 @@ function App() {
         setCurrentPage('strategy')
       } else if (path === '/debate' || hash === 'debate') {
         setCurrentPage('debate')
+      } else if (path === '/copy-guard' || hash === 'copy-guard') {
+        setCurrentPage('copy-guard')
+      } else if (path === '/copy-events' || hash === 'copy-events') {
+        setCurrentPage('copy-events')
+      } else if (path === '/data-dashboard' || hash === 'data-dashboard') {
+        setCurrentPage('data-dashboard')
       } else if (
         path === '/dashboard' ||
         hash === 'trader' ||
@@ -372,6 +381,32 @@ function App() {
         />
         <main className="max-w-[1920px] mx-auto px-6 py-6 pt-24">
           <CopyGuardPage />
+        </main>
+      </div>
+    )
+  }
+  if (route === '/copy-events') {
+    return (
+      <div
+        className="min-h-screen"
+        style={{ background: '#0B0E11', color: '#EAECEF' }}
+      >
+        <HeaderBar
+          isLoggedIn={!!user}
+          currentPage="copy-events"
+          language={language}
+          onLanguageChange={setLanguage}
+          user={user}
+          onLogout={logout}
+          onPageChange={(page: Page) => {
+            const path = page === 'trader' ? '/dashboard' : `/${page}`
+            window.history.pushState({}, '', path)
+            setRoute(path)
+            setCurrentPage(page)
+          }}
+        />
+        <main className="max-w-[1920px] mx-auto px-6 py-6 pt-24">
+          <CopyEventLogPage />
         </main>
       </div>
     )

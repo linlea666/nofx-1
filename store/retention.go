@@ -38,6 +38,9 @@ type RetentionPolicy struct {
 	CopyGuardCycleDays int
 	// SignalLogDays: copy_trade_signal_logs.
 	SignalLogDays int
+	// CopyEventDays: copy_trade_events（统一跟单事件日志：动作/止损/二次入场/
+	// 接手/保护/对账）。导出窗口上限 15 天，保留默认 30 天留足缓冲。
+	CopyEventDays int
 	// DebateDays: completed/cancelled debate sessions (children cascade).
 	DebateDays int
 	// LogFileDays: data/nofx_YYYY-MM-DD.log files on disk.
@@ -56,6 +59,7 @@ func DefaultRetentionPolicy() RetentionPolicy {
 		CopyGuardWatchSampleDays: 30,
 		CopyGuardCycleDays:       180,
 		SignalLogDays:            30,
+		CopyEventDays:            30,
 		DebateDays:               30,
 		LogFileDays:              30,
 	}
@@ -79,6 +83,7 @@ func LoadRetentionPolicyFromEnv() RetentionPolicy {
 	overrideDays("RETENTION_COPYGUARD_WATCH_SAMPLE_DAYS", &p.CopyGuardWatchSampleDays)
 	overrideDays("RETENTION_COPYGUARD_CYCLE_DAYS", &p.CopyGuardCycleDays)
 	overrideDays("RETENTION_SIGNAL_LOG_DAYS", &p.SignalLogDays)
+	overrideDays("RETENTION_COPY_EVENT_DAYS", &p.CopyEventDays)
 	overrideDays("RETENTION_DEBATE_DAYS", &p.DebateDays)
 	overrideDays("RETENTION_LOG_FILE_DAYS", &p.LogFileDays)
 	return p
@@ -158,6 +163,7 @@ func (r *RetentionService) RunOnce() {
 	total += r.cleanCopyGuardWatchSamples()
 	total += r.cleanCopyGuardCycles()
 	total += r.cleanSignalLogs()
+	total += r.cleanCopyEvents()
 	total += r.cleanDebates()
 	r.cleanLogFiles()
 	if total > 0 {
@@ -311,6 +317,20 @@ func (r *RetentionService) cleanSignalLogs() int64 {
 		DELETE FROM copy_trade_signal_logs WHERE id IN (
 			SELECT id FROM copy_trade_signal_logs WHERE datetime(created_at) < ? LIMIT %d)`, retentionBatchSize),
 		cutoff(r.policy.SignalLogDays))
+}
+
+// cleanCopyEvents removes old unified copy-trade event log rows past the
+// retention window. Unlike copy_guard_events (kept while their cycle is open),
+// these are a flat operational timeline with no open/closed notion, so age is
+// the only criterion.
+func (r *RetentionService) cleanCopyEvents() int64 {
+	if r.policy.CopyEventDays <= 0 {
+		return 0
+	}
+	return r.batchDelete("copy_trade_events", fmt.Sprintf(`
+		DELETE FROM copy_trade_events WHERE id IN (
+			SELECT id FROM copy_trade_events WHERE datetime(created_at) < ? LIMIT %d)`, retentionBatchSize),
+		cutoff(r.policy.CopyEventDays))
 }
 
 // cleanDebates removes finished debate sessions; participants/messages/votes

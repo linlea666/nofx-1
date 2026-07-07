@@ -830,6 +830,44 @@ export interface CopyGuardCycle {
   reconciled_at?: string
 }
 
+// 统一跟单事件日志（开仓/加仓/减仓/平仓 + 止损/二次入场/接手/保护/对账）
+export type CopyEventCategory =
+  | 'action'
+  | 'stoploss'
+  | 'reentry'
+  | 'takeover'
+  | 'protection'
+  | 'reconcile'
+  | 'error'
+export type CopyEventSeverity = 'info' | 'warn' | 'error'
+
+export interface CopyTradeEvent {
+  id: number
+  trader_id: string
+  trader_name?: string
+  leader_id: string
+  provider_type: string // okx | hyperliquid | binance
+  category: CopyEventCategory
+  event_type: string
+  severity: CopyEventSeverity
+  symbol: string
+  side: string
+  margin_mode: string
+  leader_pos_id: string
+  follower_pos_id: string
+  cycle_id: number // 关联 Copy Guard 周期（OKX 有值，其它为 0）
+  signal_id: string
+  status: string // success | failed | skipped | ''
+  price: number
+  quantity: number
+  notional: number
+  pnl: number
+  operator: string // 人工 user_id | ai:auto | ai
+  summary: string
+  detail?: Record<string, unknown>
+  created_at: string
+}
+
 // v5.1 人工重入信号（自动重入次数用尽后，合格信号等待用户确认）
 export interface CopyGuardManualSignal {
   id: number

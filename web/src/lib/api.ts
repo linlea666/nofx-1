@@ -956,6 +956,20 @@ export const api = {
     return result.data!
   },
 
+  async getCopyEvents(params = '') {
+    const result = await httpClient.get<{
+      events: import('../types').CopyTradeEvent[]
+      count: number
+      total: number
+    }>(`${API_BASE}/copytrade/events${params}`)
+    if (!result.success)
+      throw new Error(result.message || '获取跟单事件日志失败')
+    return {
+      events: result.data!.events ?? [],
+      total: result.data!.total ?? 0,
+    }
+  },
+
   // v5.1 人工重入信号
   async getCopyGuardManualSignals(params = '') {
     const result = await httpClient.get<{

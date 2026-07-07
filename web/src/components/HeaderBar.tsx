@@ -18,6 +18,7 @@ type Page =
   | 'register'
   | 'data-dashboard'
   | 'copy-guard'
+  | 'copy-events'
 
 interface HeaderBarProps {
   onLoginClick?: () => void
@@ -114,6 +115,23 @@ export default function HeaderBar({
                   }}
                 >
                   Copy Guard
+                </button>
+
+                <button
+                  onClick={() => {
+                    window.location.href = '/copy-events'
+                  }}
+                  className="text-sm font-bold transition-all duration-300 relative focus:outline-2 focus:outline-yellow-500"
+                  style={{
+                    color:
+                      currentPage === 'copy-events'
+                        ? 'var(--brand-yellow)'
+                        : 'var(--brand-light-gray)',
+                    padding: '8px 16px',
+                    borderRadius: '8px',
+                  }}
+                >
+                  {t('copyEventsNav', language)}
                 </button>
 
                 <button
@@ -913,6 +931,23 @@ export default function HeaderBar({
                 }}
               >
                 Copy Guard
+              </button>
+              <button
+                onClick={() => {
+                  window.location.href = '/copy-events'
+                }}
+                className="block text-sm font-bold hover:text-yellow-500"
+                style={{
+                  color:
+                    currentPage === 'copy-events'
+                      ? 'var(--brand-yellow)'
+                      : 'var(--brand-light-gray)',
+                  padding: '12px 16px',
+                  width: '100%',
+                  textAlign: 'left',
+                }}
+              >
+                {t('copyEventsNav', language)}
               </button>
               <button
                 onClick={() => {

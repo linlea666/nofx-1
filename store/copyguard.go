@@ -846,7 +846,12 @@ func (s *CopyTradeStore) RecordCopyGuardStop(cycle *CopyGuardCycle, atr, exitPri
 	if _, err = tx.Exec(`INSERT INTO copy_guard_events(cycle_id,trader_id,type,price,quantity,pnl,fee,metadata_json) VALUES(?,?,?,?,?,?,?,?)`, cycle.ID, cycle.TraderID, "STOP_TRIGGERED", exitPrice, metadataFloat(metadata, "quantity"), pnl, fee, string(raw)); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	// Seam B：提交后镜像止损事件（best-effort）
+	s.mirrorGuardEventToCopyEvents(cycle.ID, cycle.TraderID, "STOP_TRIGGERED", exitPrice, metadataFloat(metadata, "quantity"), 0, pnl, metadata)
+	return nil
 }
 
 func (s *CopyTradeStore) ReconcileCopyGuardAttempt(cycleID int64, attempt int, pnl, fee, funding, penalty float64) error {
@@ -922,7 +927,12 @@ func (s *CopyTradeStore) RecordCopyGuardStopObserved(cycleID int64, traderID str
 	if _, err = tx.Exec(`INSERT INTO copy_guard_events(cycle_id,trader_id,type,price,quantity,metadata_json) VALUES(?,?,?,?,?,?)`, cycleID, traderID, "STOP_CONFIRMED", price, quantity, string(raw)); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	// Seam B：提交后镜像止损确认事件（best-effort）
+	s.mirrorGuardEventToCopyEvents(cycleID, traderID, "STOP_CONFIRMED", price, quantity, 0, 0, metadata)
+	return nil
 }
 
 func (s *CopyTradeStore) RecordCopyGuardReentryFilled(cycle *CopyGuardCycle, entryPrice, notional, quantity, atr float64, metadata map[string]interface{}) error {
@@ -949,7 +959,12 @@ func (s *CopyTradeStore) RecordCopyGuardReentryFilled(cycle *CopyGuardCycle, ent
 	if _, err = tx.Exec(`INSERT INTO copy_guard_events(cycle_id,trader_id,type,price,quantity,notional,metadata_json) VALUES(?,?,?,?,?,?,?)`, cycle.ID, cycle.TraderID, eventType, entryPrice, quantity, notional, string(raw)); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	// Seam B：提交后镜像二次入场成交事件（best-effort）
+	s.mirrorGuardEventToCopyEvents(cycle.ID, cycle.TraderID, eventType, entryPrice, quantity, notional, 0, metadata)
+	return nil
 }
 
 func (s *CopyTradeStore) CloseCopyGuardCycle(id int64, status string, actual, baseline, fees, funding, penalty, slippage float64) error {
@@ -1263,6 +1278,10 @@ func (s *CopyTradeStore) SaveCopyGuardEvent(e *CopyGuardEvent) error {
 	}
 	b, _ := json.Marshal(e.Metadata)
 	_, err := s.db.Exec(`INSERT INTO copy_guard_events(cycle_id,trader_id,type,price,quantity,notional,pnl,fee,metadata_json) VALUES(?,?,?,?,?,?,?,?,?)`, e.CycleID, e.TraderID, e.Type, e.Price, e.Quantity, e.Notional, e.PnL, e.Fee, string(b))
+	if err == nil {
+		// Seam B：镜像到统一跟单事件日志（best-effort，白名单命中才落库）
+		s.mirrorGuardEventToCopyEvents(e.CycleID, e.TraderID, e.Type, e.Price, e.Quantity, e.Notional, e.PnL, e.Metadata)
+	}
 	return err
 }
 

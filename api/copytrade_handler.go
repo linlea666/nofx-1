@@ -53,6 +53,10 @@ func (h *CopyTradeHandler) RegisterRoutes(group *gin.RouterGroup) {
 		copyTrade.GET("/risk/cycles/:id/export", h.ExportRiskCycle)
 		copyTrade.GET("/risk/export", h.ExportRiskCycles)
 
+		// 统一跟单事件日志（开仓/加仓/减仓/平仓 + 止损/二次入场/接手/保护/对账）
+		copyTrade.GET("/events", h.GetCopyEvents)
+		copyTrade.GET("/events/export", h.ExportCopyEvents)
+
 		// v5.1 人工重入信号：列表 / 确认（系统代执行）/ 忽略
 		copyTrade.GET("/risk/manual-signals", h.ListManualSignals)
 		copyTrade.POST("/risk/manual-signals/:id/confirm", h.ConfirmManualSignal)
@@ -293,6 +297,131 @@ func (h *CopyTradeHandler) ExportRiskCycles(c *gin.Context) {
 			break
 		}
 	}
+	w.Flush()
+}
+
+// ============================================================================
+// 统一跟单事件日志 API
+// ============================================================================
+
+// copyEventWindows 导出/查询支持的时间窗（用于给 AI 分析）。
+var copyEventWindows = map[string]time.Duration{
+	"1h":  time.Hour,
+	"3h":  3 * time.Hour,
+	"5h":  5 * time.Hour,
+	"24h": 24 * time.Hour,
+	"7d":  7 * 24 * time.Hour,
+	"15d": 15 * 24 * time.Hour,
+}
+
+// copyEventTimeRange 解析时间范围：优先 window（1h/3h/5h/24h/7d/15d），
+// 否则回退 from/to（RFC3339），默认最近 24 小时。
+func copyEventTimeRange(c *gin.Context) (time.Time, time.Time) {
+	to := time.Now().UTC().Add(time.Second)
+	if w := strings.TrimSpace(c.Query("window")); w != "" {
+		if d, ok := copyEventWindows[w]; ok {
+			return to.Add(-d), to
+		}
+	}
+	from := to.AddDate(0, 0, -1)
+	if v := c.Query("from"); v != "" {
+		if x, e := time.Parse(time.RFC3339, v); e == nil {
+			from = x
+		}
+	}
+	if v := c.Query("to"); v != "" {
+		if x, e := time.Parse(time.RFC3339, v); e == nil {
+			to = x
+		}
+	}
+	return from, to
+}
+
+func copyEventFilter(c *gin.Context) store.CopyEventFilter {
+	return store.CopyEventFilter{
+		Provider:  strings.TrimSpace(c.Query("provider")),
+		Category:  strings.TrimSpace(c.Query("category")),
+		Severity:  strings.TrimSpace(c.Query("severity")),
+		Symbol:    strings.TrimSpace(strings.ToUpper(c.Query("symbol"))),
+		EventType: strings.TrimSpace(c.Query("event_type")),
+	}
+}
+
+// GetCopyEvents 查询当前用户名下交易员的跟单事件（时间倒序，分页）。
+func (h *CopyTradeHandler) GetCopyEvents(c *gin.Context) {
+	ids, _, names, err := h.ownedTraderIDs(c)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	from, to := copyEventTimeRange(c)
+	filter := copyEventFilter(c)
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "100"))
+	offset, _ := strconv.Atoi(c.DefaultQuery("offset", "0"))
+	events, err := h.store.CopyTrade().QueryCopyEvents(ids, from, to, filter, limit, offset)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	for _, e := range events {
+		e.TraderName = names[e.TraderID]
+	}
+	total, err := h.store.CopyTrade().CountCopyEvents(ids, from, to, filter)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"events": events, "count": len(events), "total": total, "from": from, "to": to})
+}
+
+// ExportCopyEvents 导出跟单事件（csv|jsonl），时间戳为 ISO UTC，便于喂 AI 分析。
+func (h *CopyTradeHandler) ExportCopyEvents(c *gin.Context) {
+	ids, _, names, err := h.ownedTraderIDs(c)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	from, to := copyEventTimeRange(c)
+	filter := copyEventFilter(c)
+	format := strings.ToLower(c.DefaultQuery("format", "jsonl"))
+	if format != "csv" && format != "jsonl" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "format must be csv or jsonl"})
+		return
+	}
+	window := strings.TrimSpace(c.Query("window"))
+	if window == "" {
+		window = "range"
+	}
+
+	if format == "jsonl" {
+		c.Header("Content-Type", "application/x-ndjson")
+		c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=copy-events-%s.jsonl", window))
+		enc := json.NewEncoder(c.Writer)
+		_ = h.store.CopyTrade().StreamCopyEvents(ids, from, to, filter, func(e *store.CopyTradeEvent) error {
+			e.TraderName = names[e.TraderID]
+			return enc.Encode(e)
+		})
+		return
+	}
+
+	c.Header("Content-Type", "text/csv; charset=utf-8")
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=copy-events-%s.csv", window))
+	w := csv.NewWriter(c.Writer)
+	_ = w.Write([]string{"created_at_utc", "trader_id", "trader_name", "leader_id", "provider", "category", "event_type", "severity", "symbol", "side", "margin_mode", "status", "leader_pos_id", "cycle_id", "signal_id", "price", "quantity", "notional", "pnl", "operator", "summary"})
+	_ = h.store.CopyTrade().StreamCopyEvents(ids, from, to, filter, func(e *store.CopyTradeEvent) error {
+		cycleID := ""
+		if e.CycleID > 0 {
+			cycleID = strconv.FormatInt(e.CycleID, 10)
+		}
+		_ = w.Write([]string{
+			e.CreatedAt.UTC().Format(time.RFC3339), e.TraderID, names[e.TraderID], e.LeaderID, e.ProviderType,
+			e.Category, e.EventType, e.Severity, e.Symbol, e.Side, e.MarginMode, e.Status,
+			e.LeaderPosID, cycleID, e.SignalID,
+			fmt.Sprint(e.Price), fmt.Sprint(e.Quantity), fmt.Sprint(e.Notional), fmt.Sprint(e.PnL),
+			e.Operator, e.Summary,
+		})
+		return nil
+	})
 	w.Flush()
 }
 

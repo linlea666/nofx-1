@@ -19,6 +19,7 @@ export const translations = {
 
     // Navigation
     realtimeNav: 'Live',
+    copyEventsNav: 'Copy Log',
     configNav: 'Config',
     dashboardNav: 'Dashboard',
     strategyNav: 'Strategy',
@@ -1179,6 +1180,7 @@ export const translations = {
 
     // Navigation
     realtimeNav: '实时',
+    copyEventsNav: '跟单日志',
     configNav: '配置',
     dashboardNav: '看板',
     strategyNav: '策略',

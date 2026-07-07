@@ -282,10 +282,49 @@ func (a *Advisor) runAnalysis(analysisID int64, autoTriggered bool) {
 	logger.Infof("[ReentryAdvisor] 内置 AI 结论: %s (confidence=%.2f) (analysis=%d, signal=%d, %s %s)",
 		pv.Verdict, pv.Confidence, analysis.ID, analysis.SignalID, analysis.Symbol, analysis.Side)
 
+	// Seam C：把 AI 二次入场分析结论记入统一跟单事件日志（best-effort），
+	// 用于追踪 AI 接收/介入的执行情况。
+	a.recordAIAnalysisEvent(analysis, pv, autoTriggered)
+
 	// Phase 3：自动入场（仅自动分析路径；结果并入结论邮件）
 	if autoTriggered {
 		autoEntryNote := a.maybeAutoEnter(analysis, cfg, pv)
 		a.notifyVerdict(analysis, cfg, pv, autoEntryNote)
+	}
+}
+
+// recordAIAnalysisEvent 把一次内置 AI 二次入场分析结论落成统一跟单事件（best-effort）。
+// Copy Guard / 二次入场仅 OKX 生效，故 provider 固定为 okx。
+func (a *Advisor) recordAIAnalysisEvent(analysis *store.ReentryAIAnalysis, pv *parsedVerdict, autoTriggered bool) {
+	if a.st == nil || analysis == nil || pv == nil {
+		return
+	}
+	trigger := "manual"
+	if autoTriggered {
+		trigger = "auto"
+	}
+	summary := fmt.Sprintf("AI 二次入场分析结论: %s (置信度 %.0f%%)", pv.Verdict, pv.Confidence*100)
+	ev := &store.CopyTradeEvent{
+		TraderID:     analysis.TraderID,
+		ProviderType: "okx",
+		Category:     store.CopyEventCategoryTakeover,
+		EventType:    "AI_ANALYSIS",
+		Severity:     store.CopyEventSeverityInfo,
+		Symbol:       analysis.Symbol,
+		Side:         analysis.Side,
+		CycleID:      analysis.CycleID,
+		Operator:     "ai",
+		Summary:      summary,
+		Detail: map[string]interface{}{
+			"verdict":     pv.Verdict,
+			"confidence":  pv.Confidence,
+			"trigger":     trigger,
+			"analysis_id": analysis.ID,
+			"signal_id":   analysis.SignalID,
+		},
+	}
+	if err := a.st.CopyTrade().LogCopyEvent(ev); err != nil {
+		logger.Warnf("[ReentryAdvisor] AI 分析事件落库失败 (analysis=%d): %v", analysis.ID, err)
 	}
 }
 
