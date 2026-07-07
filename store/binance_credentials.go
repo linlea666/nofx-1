@@ -64,6 +64,12 @@ func (c *BinanceCredentials) MaskedCSRFToken() string {
 	return maskSecret(c.CSRFToken)
 }
 
+// MaskSecret 脱敏任意凭证字符串（前 6 + 后 4 字符），供 API 层复用。
+// 掩码结果必然包含 "***"，可作为"未修改"哨兵在保存路径识别。
+func MaskSecret(s string) string {
+	return maskSecret(s)
+}
+
 func maskSecret(s string) string {
 	s = strings.TrimSpace(s)
 	if s == "" {

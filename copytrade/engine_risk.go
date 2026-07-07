@@ -271,7 +271,12 @@ func finalizeStopLossPrice(input *StopLossCalcInput, result *StopLossCalcResult,
 		result.OpenImmediateHit = true
 		return result, nil
 	}
-	tickSz, _ := getOKXTickSize(input.Symbol)
+	tickSz, tickErr := getOKXTickSize(input.Symbol)
+	if tickErr != nil {
+		// 不阻断：alignToTickSize 对 tickSz=0 会原样返回价格，止损价仍有效，
+		// 只是可能未对齐档位（交易所会自行处理）。留 WARN 便于发现接口异常。
+		logger.Warnf("⚠️ 获取 %s tickSize 失败（止损价不做档位对齐）: %v", input.Symbol, tickErr)
+	}
 	result.TickSize = tickSz
 	if input.Side == SideLong {
 		result.SLPrice = alignToTickSize(input.EntryPrice-result.SLDistance, tickSz, true)
@@ -1442,6 +1447,11 @@ func (e *Engine) emitReentryDecision(mapping *store.CopyTradePositionMapping, le
 	dec := e.buildDecisionV2(signal, match, copySize)
 	dec.Reasoning = fmt.Sprintf("Copy trading: reentry (judge E) following %s leader %s | posId=%s ratio=%.2f×%.2f",
 		e.config.ProviderType, e.config.LeaderID, mapping.LeaderPosID, e.config.CopyRatio, e.config.RiskReentryRatio)
+	// 清空引擎默认的 fill 级稳定 clOrdId：重入的幂等 ID 必须是 integration
+	// 分配的周期级 cgr ID（executeFullDecision 仅在 ClientOrderID 为空时分配，
+	// 重启恢复 recoverV4PendingStates 也按 cgr ID 对账），不能被此处抢占。
+	// 且重入虚拟 fill ID 含纳秒时间戳，本身不具备跨次重放的稳定性。
+	dec.ClientOrderID = ""
 
 	fullDec := &decision.FullDecision{
 		SystemPrompt:        e.buildSystemPromptLog(),

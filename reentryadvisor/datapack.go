@@ -236,7 +236,12 @@ func buildDataPack(st *store.Store, bn *binanceClient, sig *store.CopyGuardManua
 		atrTF = v
 	}
 	guard.GateATRTimeframe = atrTF
-	if atr, err := market.GetOKXATRWithMaxAge(sig.Symbol, atrTF, 14, 2*time.Hour); err == nil && atr > 0 {
+	// ATR 周期跟随策略快照（引擎门控同参），仅缺失时才回退默认 14
+	atrPeriod := 14
+	if v, ok := guard.Policy["risk_atr_period"].(float64); ok && v > 0 {
+		atrPeriod = int(v)
+	}
+	if atr, err := market.GetOKXATRWithMaxAge(sig.Symbol, atrTF, atrPeriod, 2*time.Hour); err == nil && atr > 0 {
 		guard.GateATR = atr
 	} else {
 		guard.GateATR = sig.ATR

@@ -273,6 +273,13 @@ func (ti *TraderIntegration) StartCopyTrading() error {
 	// 启动风控事件消费协程（v3 风控：SL 触发 / 二次进场告警邮件）
 	go ti.consumeRiskEvents()
 	if engineConfig.ProviderType == ProviderOKX && engineConfig.RiskPolicyVersion >= 4 {
+		if !engineConfig.RiskStopLossEnabled {
+			// 用户关闭了「账户保护止损」开关：撤销交易所上仍存活的保护单。
+			// 若不清理，UI 显示"已关闭"但交易所止损单还活着可能触发，
+			// 而触发后的对账（checkStoppedByRisk）又被开关 gate 掉 → 状态机断裂。
+			// 配置变更会重启 integration，所以放在 Start 里天然覆盖开关切换与重启两条路径。
+			ti.cancelProtectionsOnDisable()
+		}
 		ti.recoverV4PendingStates()
 		go ti.monitorV4ProtectiveStops()
 	}
@@ -906,6 +913,17 @@ func (ti *TraderIntegration) handleUnprotectableCycle(cycle *store.CopyGuardCycl
 	}
 
 	// close 模式：强制离场
+	// 先撤已有保护单（可能是 clamp 失败前残留的旧单/接管单）：
+	// 若不撤，市价平仓后交易所会残留 live 止损孤儿单，可能在无仓状态下误触发。
+	// 撤单失败不阻断强平（资金安全优先），仅记录保护状态异常。
+	if mgr, ok := ti.executor.(ProtectiveStopManagerV4); ok {
+		if order, oerr := ti.store.CopyTrade().GetCopyGuardProtectiveOrder(cycle.ID); oerr == nil {
+			if cancelErr := ti.cancelProtectiveOrderForCycle(mgr, cycle, order); cancelErr != nil {
+				logger.Warnf("⚠️ [%s] Copy Guard 强平前撤保护单失败（继续强平）: %v", ti.traderID, cancelErr)
+				ti.markProtectionIssue(cycle, store.CopyGuardProtectionUnknown, "PROTECTION_VERIFY_UNKNOWN", cancelErr, cycle.ProtectionCoverage, false)
+			}
+		}
+	}
 	closeAction := "close_long"
 	if cycle.Side == "short" {
 		closeAction = "close_short"
@@ -1108,12 +1126,30 @@ func (ti *TraderIntegration) executeFullDecision(fullDec *decision.FullDecision)
 			//   2. 不发邮件告警（不是真正的错误，是数据自愈）
 			//   3. 状态记 silent_close 区分于真正的 failed
 			// 开仓/加仓 (open_*/reduce_*) 永远不会进入这里。
-			if ti.isBenignCloseError(dec, err) {
+			if errors.Is(err, trader.ErrPartialCloseSkipped) {
+				// 减仓被边界约束跳过（未下单）：不是失败也不是成功。
+				// 不更新 mapping/lastKnownSize（伪装成功正是旧 bug 根源）、
+				// 不重挂 SL、不告警、不熔断、不重放（重放结果相同，
+				// 等领航员后续减仓累积到全平阈值自然收敛）。
+				logger.Infof("⏭️ [%s] 跟单减仓跳过（未下单） | %s %s | %v",
+					ti.traderID, dec.Action, dec.Symbol, err)
+				executionLogs = append(executionLogs,
+					fmt.Sprintf("⏭️ %s %s 跳过（未下单）: %v", dec.Action, dec.Symbol, err))
+				ti.saveSignalLog(dec, "skipped", err.Error())
+			} else if ti.isBenignCloseError(dec, err) {
 				ti.handleBenignCloseFailure(dec, err)
 				executionLogs = append(executionLogs,
 					fmt.Sprintf("🟡 %s %s silent_close (本地仓位已不存在，自动回收映射): %v",
 						dec.Action, dec.Symbol, err))
 			} else {
+				// 瞬态错误（限流/读阶段失败，保证订单未进交易所）重试耗尽：
+				// 释放引擎侧 fill 去重标记，让下轮 poll 重放该信号
+				// （fill 仍在回看窗口内时可恢复；非瞬态错误不重放，避免死循环）。
+				if isRetryableExecutionError(err) && dec.SourceFillID != "" {
+					ti.engine.UnmarkSeen(dec.SourceFillID)
+					logger.Warnf("🔁 [%s] 瞬态失败重试耗尽，已释放去重标记等待重放 | %s %s fillID=%s",
+						ti.traderID, dec.Action, dec.Symbol, dec.SourceFillID)
+				}
 				traderName := ti.traderDisplayName()
 				logger.Errorf("❌ [%s/%s] 跟单执行失败 | %s %s | error=%v",
 					traderName, ti.traderID, dec.Action, dec.Symbol, err)
@@ -2807,6 +2843,36 @@ func (ti *TraderIntegration) consumeRiskEvents() {
 				logger.Debugf("[%s] 未知风控事件类型: %s", ti.traderID, event.Type)
 			}
 		}
+	}
+}
+
+// cancelProtectionsOnDisable 关闭「账户保护止损」开关后的清理：
+// 撤销该 trader 在交易所上仍 live 的全部 Copy Guard 保护单并记事件，
+// 保证 UI"已关闭"与交易所实际状态一致。撤单失败仅告警（下次重启会再清理）。
+func (ti *TraderIntegration) cancelProtectionsOnDisable() {
+	mgr, ok := ti.executor.(ProtectiveStopManagerV4)
+	if !ok {
+		return
+	}
+	orders, err := ti.store.CopyTrade().ListActiveCopyGuardProtectiveOrders(ti.traderID)
+	if err != nil || len(orders) == 0 {
+		return
+	}
+	logger.Infof("🧹 [%s] 止损开关已关闭，撤销 %d 个存活保护单", ti.traderID, len(orders))
+	for _, order := range orders {
+		cycle, cerr := ti.store.CopyTrade().GetCopyGuardCycle(order.CycleID)
+		if cerr != nil {
+			logger.Warnf("⚠️ [%s] 保护单清理：读取周期失败 cycle=%d: %v", ti.traderID, order.CycleID, cerr)
+			continue
+		}
+		if cancelErr := ti.cancelProtectiveOrderForCycle(mgr, cycle, order); cancelErr != nil {
+			logger.Warnf("⚠️ [%s] 保护单清理：撤单失败 cycle=%d algoId=%s: %v", ti.traderID, cycle.ID, order.AlgoID, cancelErr)
+			continue
+		}
+		_ = ti.store.CopyTrade().UpdateCopyGuardProtectionHealth(cycle.ID, store.CopyGuardProtectionCanceled, 0, "stop loss disabled by user", cycle.FollowerPosID, cycle.EntryOrderID, false)
+		_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "PROTECTION_DISABLED_CANCELED", Metadata: map[string]interface{}{
+			"algo_id": order.AlgoID, "symbol": order.Symbol, "reason": "risk_stop_loss_enabled=false",
+		}})
 	}
 }
 

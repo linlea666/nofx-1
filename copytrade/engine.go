@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"sort"
 	"strings"
 	"sync"
@@ -286,9 +287,23 @@ func (e *Engine) SetStore(st *store.Store) {
 // InitIgnoredPositions 初始化领航员历史仓位（启动跟单时调用）
 // 将领航员当前所有持仓标记为 ignored，后续这些仓位的操作都不跟随
 // 这样可以 100% 准确地区分"新开仓"和"历史仓位操作"
+//
+// 仅在首次启用（该 trader×leader 无任何 mapping 记录）时执行全量标记：
+// 重启/配置变更时跳过——否则停机窗口期领航员新开的仓位（本应跟随，只是
+// 错过了开仓信号）会被误标 ignored 而永久失跟。真正的历史仓位在首次启用
+// 时已持久化为 ignored，重启后依然生效，跳过重写不会削弱保护。
 func (e *Engine) InitIgnoredPositions() error {
 	if e.store == nil {
 		return fmt.Errorf("store not initialized")
+	}
+
+	hasMappings, err := e.store.CopyTrade().HasMappingsForLeader(e.traderID, e.config.LeaderID)
+	if err != nil {
+		return fmt.Errorf("查询已有映射失败: %w", err)
+	}
+	if hasMappings {
+		logger.Infof("📊 [%s] 已有跟单映射记录（重启/配置变更），跳过历史仓位全量 ignored 标记", e.traderID)
+		return nil
 	}
 
 	// 获取领航员当前所有持仓
@@ -450,6 +465,11 @@ func (e *Engine) Stop() {
 // 核心轮询逻辑
 // ============================================================================
 
+// pollLookbackWindow poll 拉取成交的回看窗口。
+// 必须 ≥ initSeenFills 的基线窗口（5 分钟），否则重启瞬间会漏掉基线外的成交；
+// 也是 UnmarkSeen 瞬态失败重放的最长恢复期。
+const pollLookbackWindow = 5 * time.Minute
+
 func (e *Engine) pollLoop(ctx context.Context) {
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
@@ -467,8 +487,11 @@ func (e *Engine) pollLoop(ctx context.Context) {
 }
 
 func (e *Engine) poll() {
-	// 获取最近 1 分钟的成交
-	since := time.Now().Add(-1 * time.Minute)
+	// 回看最近 5 分钟的成交（与 initSeenFills 的去重基线窗口一致）。
+	// 旧值 1 分钟：API 连续失败超过 1 分钟后恢复时，窗口外的成交永久漏单；
+	// 且 UnmarkSeen 重放机制依赖 fill 在后续 poll 中仍可拉到。
+	// 扩大窗口的重复处理风险由 seenFills 去重 + 状态化匹配（持仓 size 对比）双重兜底。
+	since := time.Now().Add(-pollLookbackWindow)
 	fills, err := e.provider.GetFills(e.config.LeaderID, since)
 	if err != nil {
 		e.reportBinanceCredentialsExpired(err, "poll/GetFills")
@@ -1043,15 +1066,19 @@ func (e *Engine) matchOpenAddSignal(signal *TradeSignal, leaderPosMap map[string
 		if posID == "" {
 			posID = fmt.Sprintf("%s_%s", fill.Symbol, fill.PositionSide)
 		}
-		if e.config.ProviderType == ProviderBinance &&
+		// size 增量守卫（OKX/Binance 共用）：到达兜底分支说明第二轮没找到
+		// size 增加的仓位，lastKnownSize 有值时几乎必然是迟到/重复/部分成交
+		// 的残余信号，盲目加仓会造成重复建仓。lastKnownSize=0（旧数据）时
+		// 保留原兜底加仓行为。
+		if (e.config.ProviderType == ProviderBinance || e.config.ProviderType == ProviderOKX) &&
 			singleActiveMapping != nil &&
 			singleActiveMapping.LastKnownSize > 0 &&
 			singleActivePos.Size <= singleActiveMapping.LastKnownSize+binancePositionSizeEpsilon {
-			logger.Infof("📊 [%s] Binance 未检测到 size 增加 | posId=%s 上次=%.4f 当前=%.4f → 跳过迟到/重复成交",
-				e.traderID, posID, singleActiveMapping.LastKnownSize, singleActivePos.Size)
+			logger.Infof("📊 [%s] %s 未检测到 size 增加 | posId=%s 上次=%.4f 当前=%.4f → 跳过迟到/重复成交",
+				e.traderID, e.config.ProviderType, posID, singleActiveMapping.LastKnownSize, singleActivePos.Size)
 			return &SignalMatchResult{
 				ShouldFollow: false,
-				Reason:       "Binance 持仓 size 未增加，可能是迟到/重复成交",
+				Reason:       fmt.Sprintf("%s 持仓 size 未增加，可能是迟到/重复成交", e.config.ProviderType),
 			}
 		}
 		logger.Infof("📊 [%s] 唯一 active 仓位 | posId=%s status=active → 加仓",
@@ -1270,10 +1297,20 @@ func (e *Engine) processSignal(signal *TradeSignal) {
 		e.logWarning(w)
 	}
 
-	// 🔧 加仓 + copySize=0 → 加仓金额不足阈值（已在 calculateCopySizeByPositionChange 中跳过）。
-	// 不生成决策，也不更新 last_known_size（让下一次累积的加仓信号能继续触发）。
-	if matchResult.Action == ActionAdd && copySize == 0 {
-		logger.Infof("🎯 [%s] ⏭️ 加仓跳过 | %s | 金额低于阈值，等待累积", e.traderID, fill.Symbol)
+	// 🔧 开仓/加仓 + copySize=0 → 不生成决策（0 金额决策下游必然失败）。
+	// 两类原因区别对待：
+	//   - 领航员权益不可用（瞬态数据故障）：释放去重标记，等下轮 poll 重放
+	//   - 加仓金额不足阈值 / 余额为零：保持 seen（同一 fill 重放也不会有不同结果）
+	if (matchResult.Action == ActionOpen || matchResult.Action == ActionAdd) && copySize == 0 {
+		for _, w := range warnings {
+			if w.Type == WarnLeaderEquityUnavailable {
+				e.UnmarkSeen(fill.ID)
+				logger.Warnf("🎯 [%s] ⏭️ 跳过并释放去重标记 | %s | 领航员权益不可用，等待下轮重放", e.traderID, fill.Symbol)
+				e.stats.SignalsSkipped++
+				return
+			}
+		}
+		logger.Infof("🎯 [%s] ⏭️ %s跳过 | %s | 金额为零（低于阈值或余额不足）", e.traderID, matchResult.Action, fill.Symbol)
 		e.stats.SignalsSkipped++
 		return
 	}
@@ -1308,7 +1345,12 @@ func (e *Engine) processSignal(signal *TradeSignal) {
 		logger.Infof("⚡ [%s] 决策生成 | %s %s | 金额=%.2f",
 			e.traderID, dec.Action, dec.Symbol, copySize)
 	default:
-		logger.Warnf("⚠️ [%s] 决策通道已满，丢弃", e.traderID)
+		// 通道满时旧逻辑直接丢弃，但 fill 已 markSeen → 该信号永久丢失。
+		// 释放去重标记让下轮 poll 重放（fill 仍在回看窗口内时可恢复），
+		// 并升级为 ERROR：这是会造成漏单的严重拥塞信号。
+		e.UnmarkSeen(fill.ID)
+		logger.Errorf("❌ [%s] 决策通道已满，丢弃决策并释放去重标记等待重放 | %s %s fillID=%s",
+			e.traderID, dec.Action, dec.Symbol, fill.ID)
 	}
 }
 
@@ -1330,6 +1372,15 @@ func (e *Engine) buildDecisionV2(signal *TradeSignal, match *SignalMatchResult, 
 		LeaderPosID:   match.PosID,
 		LeaderPosSize: leaderPosSize,    // 传递领航员当前持仓数量
 		MarginMode:    match.MarginMode, // 直接使用匹配结果中的 marginMode
+		SourceFillID:  fill.ID,          // 执行瞬态失败时用于释放去重标记重放
+	}
+
+	// SyncMarginMode=false：新开仓不同步领航员的全仓/逐仓模式，
+	// 清空后由 auto_trader 回落到跟随者自己的 is_cross_margin 配置。
+	// 仅限 ActionOpen——加仓/减仓/平仓必须沿用 mapping 记录的实际模式
+	// 操作已有仓位，否则会在另一模式下开出第二个仓位（OKX 双仓风险）。
+	if !e.config.SyncMarginMode && match.Action == ActionOpen {
+		dec.MarginMode = ""
 	}
 
 	// ============================================================
@@ -1400,6 +1451,11 @@ func (e *Engine) buildDecisionV2(signal *TradeSignal, match *SignalMatchResult, 
 		if ratio >= FullCloseThreshold {
 			logger.Infof("📊 [%s] 减仓比例 %.1f%% ≥ %.0f%%，转为全量平仓", e.traderID, ratio*100, FullCloseThreshold*100)
 			dec.CloseRatio = 0
+			// 🔑 action 同步改为 close_*：executor 对 reduce/close 走同一平仓链路
+			//（CloseRatio 决定量），但 integration 的 mapping 关闭、Copy Guard 周期
+			// 收尾、保护单撤销都按 action 前缀分发——保持 reduce_* 会导致跟随者
+			// 已空仓而交易所残留 live 止损单（孤儿单误触发风险）。
+			dec.Action = e.mapAction(ActionClose, fill.PositionSide)
 			dec.Reasoning = fmt.Sprintf("Copy trading: close (reduce %.0f%% → full close) following %s leader %s",
 				ratio*100, e.config.ProviderType, e.config.LeaderID)
 			// 清除累积减仓比例
@@ -1416,6 +1472,8 @@ func (e *Engine) buildDecisionV2(signal *TradeSignal, match *SignalMatchResult, 
 				logger.Infof("📊 [%s] 累积减仓 %.1f%% (本次 %.1f%% + 历史 %.1f%%) ≥ %.0f%%，转为全量平仓",
 					e.traderID, newAccumulated*100, ratio*100, accumulatedRatio*100, AccumulatedCloseThreshold*100)
 				dec.CloseRatio = 0
+				// 同上：全平语义必须用 close_* action（撤保护单 + 关 mapping + 周期收尾）
+				dec.Action = e.mapAction(ActionClose, fill.PositionSide)
 				dec.Reasoning = fmt.Sprintf("Copy trading: close (accumulated reduce %.0f%% → full close) following %s leader %s",
 					newAccumulated*100, e.config.ProviderType, e.config.LeaderID)
 				// 清除累积减仓比例
@@ -1449,7 +1507,28 @@ func (e *Engine) buildDecisionV2(signal *TradeSignal, match *SignalMatchResult, 
 		}
 	}
 
+	// 🔐 决策级稳定 clOrdId（重试/重放幂等的最后一道硬闸）：
+	// 同一 fill + 同一最终 action 恒定生成同一 ID。若某次下单请求实际已被
+	// 交易所接受但本地误判失败（限流误判/响应丢失），重试或 UnmarkSeen
+	// 重放的第二单会被交易所以 duplicated clOrdId 拒绝，杜绝重复建仓。
+	// 放在 action 终态确定之后（reduce 可能已升级为 close）。
+	// 重入决策不走此处（integration 层有独立的 cgr 周期级 ID）。
+	dec.ClientOrderID = stableClientOrderID(e.traderID, fill.ID, dec.Action)
+
 	return dec
+}
+
+// stableClientOrderID 生成决策级稳定的客户端订单 ID。
+// 格式 "ct"+16位十六进制（FNV-1a 64），满足 OKX clOrdId 的
+// 字母数字、≤32 字符约束；其他交易所执行器未实现幂等接口时忽略该值。
+func stableClientOrderID(traderID, fillID, action string) string {
+	h := fnv.New64a()
+	h.Write([]byte(traderID))
+	h.Write([]byte{'|'})
+	h.Write([]byte(fillID))
+	h.Write([]byte{'|'})
+	h.Write([]byte(action))
+	return fmt.Sprintf("ct%016x", h.Sum64())
 }
 
 // calculateReduceRatioV2 计算减仓比例（使用统一匹配结果）
@@ -1540,7 +1619,20 @@ func (e *Engine) calculateCopySizeByPositionChange(signal *TradeSignal, match *S
 		}
 	}
 	if leaderEquity <= 0 {
-		leaderEquity = 1 // 防止除零
+		// 领航员权益不可用（API 失败/限频/数据异常）。旧逻辑置 1 防除零，
+		// 但 leaderTradeValue/1 × followerEquity 会产生远超账户承受力的
+		// 跟单金额（资金安全事故）。正确做法：拒绝本次跟单并告警，
+		// 由 processSignal 释放去重标记，等下轮 poll 状态恢复后重放。
+		logger.Errorf("❌ [%s] 领航员权益不可用(=%.4f)，拒绝本次跟单 | %s %s",
+			e.traderID, leaderEquity, fill.Symbol, match.Action)
+		warnings = append(warnings, Warning{
+			Timestamp: time.Now(),
+			Symbol:    fill.Symbol,
+			Type:      WarnLeaderEquityUnavailable,
+			Message:   "领航员账户权益不可用，跳过本次跟单（等待数据恢复后重试）",
+			Executed:  false,
+		})
+		return 0, warnings
 	}
 
 	// 跟随者账户权益
@@ -2188,6 +2280,19 @@ func (e *Engine) markSeen(id string) {
 	if len(e.seenFills) > 1000 && len(e.seenFills)%100 == 0 {
 		e.cleanExpiredFills()
 	}
+}
+
+// UnmarkSeen 释放 fill 的去重标记，使其可被下轮 poll 重放。
+// 用途：瞬态失败（领航员权益不可用/决策通道满/执行阶段限流耗尽重试）后
+// 恢复信号——前提是 fill 仍在 GetFills 回看窗口内。
+// 导出方法：integration 层执行失败路径也需要调用。
+func (e *Engine) UnmarkSeen(id string) {
+	if id == "" {
+		return
+	}
+	e.seenMu.Lock()
+	defer e.seenMu.Unlock()
+	delete(e.seenFills, id)
 }
 
 func (e *Engine) cleanExpiredFills() {

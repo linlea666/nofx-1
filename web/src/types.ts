@@ -998,20 +998,6 @@ export interface CopyTradeSignalLog {
   created_at: string
 }
 
-export interface CopyTradeConfigRequest {
-  provider_type: CopyTradeProvider
-  leader_id: string
-  copy_ratio: number
-  sync_leverage: boolean
-  sync_margin_mode: boolean
-  min_trade_warn: number
-  max_trade_warn: number
-  enabled: boolean
-  // Binance Web 凭证（仅 provider_type=binance 时使用）
-  binance_p20t?: string
-  binance_csrf_token?: string
-}
-
 // ============================================================================
 // Binance 全局共享凭证（v2 凭证全局化）
 // ============================================================================

@@ -235,6 +235,10 @@ func (c *CopyConfig) FillRiskDefaults() {
 	}
 }
 
+// WarnLeaderEquityUnavailable 领航员权益不可用（API 失败/限频），本次跟单被拒绝。
+// processSignal 检测到该预警会释放 fill 去重标记，等数据恢复后由下轮 poll 重放。
+const WarnLeaderEquityUnavailable = "leader_equity_unavailable"
+
 // Warning 预警记录
 type Warning struct {
 	Timestamp    time.Time `json:"timestamp"`

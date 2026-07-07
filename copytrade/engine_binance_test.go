@@ -336,7 +336,9 @@ func TestBinanceLateTradeHistoryDoesNotDuplicateSnapshotOpenAdd(t *testing.T) {
 	}
 }
 
-func TestOKXOpenAddFallbackIsUnchanged(t *testing.T) {
+// OKX 兜底加仓分支现与 Binance 共用 size 增量守卫：
+// lastKnownSize 有值且领航员持仓未增加时，迟到/重复成交不再触发重复加仓。
+func TestOKXOpenAddFallbackSkipsWhenSizeNotIncreased(t *testing.T) {
 	const posID = "okx-pos-id"
 	e, st := newTestCopyTradeEngine(t, ProviderOKX)
 	saveActiveMapping(t, st, posID, 0.01)
@@ -355,8 +357,36 @@ func TestOKXOpenAddFallbackIsUnchanged(t *testing.T) {
 		Timestamp:    time.Now(),
 	})
 	result := e.matchOpenAddSignal(signal, e.buildLeaderPosMap())
+	if result.ShouldFollow {
+		t.Fatalf("expected OKX duplicate open/add to be skipped: %+v", result)
+	}
+	if !strings.Contains(result.Reason, "size 未增加") {
+		t.Fatalf("unexpected reason: %s", result.Reason)
+	}
+}
+
+// lastKnownSize=0（旧数据）时 OKX 兜底加仓行为保持不变（守卫不生效）。
+func TestOKXOpenAddFallbackLegacyMappingStillAdds(t *testing.T) {
+	const posID = "okx-pos-id-legacy"
+	e, st := newTestCopyTradeEngine(t, ProviderOKX)
+	saveActiveMapping(t, st, posID, 0)
+	e.leaderState.Positions[posID] = binanceTestPosition(posID, 0.01)
+	e.leaderState.Positions[posID].PosID = posID
+
+	signal := e.buildSignal(&Fill{
+		ID:           "okx-fill-legacy",
+		Symbol:       "ETHUSDT",
+		Side:         "buy",
+		PositionSide: SideLong,
+		Action:       ActionOpen,
+		Price:        2096.58,
+		Size:         0.01,
+		Value:        20.9658,
+		Timestamp:    time.Now(),
+	})
+	result := e.matchOpenAddSignal(signal, e.buildLeaderPosMap())
 	if !result.ShouldFollow || result.Action != ActionAdd {
-		t.Fatalf("expected OKX fallback add behavior unchanged, got %+v", result)
+		t.Fatalf("expected OKX legacy fallback add behavior unchanged, got %+v", result)
 	}
 }
 

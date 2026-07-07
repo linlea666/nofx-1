@@ -7,6 +7,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sync/singleflight"
+
 	"nofx/market"
 )
 
@@ -40,7 +42,10 @@ type previewCacheEntry struct {
 var (
 	previewMu    sync.Mutex
 	previewCache = map[string]*previewCacheEntry{}
-	symbolRe     = regexp.MustCompile(`^[A-Z0-9]{2,20}$`)
+	// previewFlight 同 symbol 并发请求合并：缓存过期瞬间的多个刷新请求
+	// 只有一个真正打 Binance 权重接口，其余等待共享结果。
+	previewFlight singleflight.Group
+	symbolRe      = regexp.MustCompile(`^[A-Z0-9]{2,20}$`)
 )
 
 // GetMarketPreview 生成（或返回缓存的）某币种市场指标预览。
@@ -51,6 +56,16 @@ func GetMarketPreview(symbol string) (*MarketPreview, error) {
 		return nil, fmt.Errorf("无效的交易对格式（示例：BTCUSDT）")
 	}
 
+	v, err, _ := previewFlight.Do(symbol, func() (interface{}, error) {
+		return buildMarketPreview(symbol)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return v.(*MarketPreview), nil
+}
+
+func buildMarketPreview(symbol string) (*MarketPreview, error) {
 	previewMu.Lock()
 	if e, ok := previewCache[symbol]; ok && time.Since(e.at) < previewCacheTTL {
 		previewMu.Unlock()

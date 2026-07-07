@@ -88,11 +88,16 @@ type CopyTradeOrderExecutor interface {
 	CloseShortPreservingOrders(symbol string, quantity float64) (map[string]interface{}, error)
 }
 
-// CopyTradeIdempotentOrderExecutor is used by Copy Guard reentry so a retry or
-// restart cannot create a second position for the same lifecycle attempt.
+// CopyTradeIdempotentOrderExecutor is used by copy-trade execution paths that
+// carry a stable client order ID (Copy Guard reentry's cycle-level cgr ID and
+// the engine's fill-level decision ID) so a retry, replay or restart cannot
+// create a second order for the same logical action: the exchange rejects the
+// duplicate clOrdId instead of filling it again.
 type CopyTradeIdempotentOrderExecutor interface {
 	OpenLongPreservingOrdersWithClientID(symbol string, quantity float64, leverage int, clientOrderID string) (map[string]interface{}, error)
 	OpenShortPreservingOrdersWithClientID(symbol string, quantity float64, leverage int, clientOrderID string) (map[string]interface{}, error)
+	CloseLongPreservingOrdersWithClientID(symbol string, quantity float64, clientOrderID string) (map[string]interface{}, error)
+	CloseShortPreservingOrdersWithClientID(symbol string, quantity float64, clientOrderID string) (map[string]interface{}, error)
 }
 
 type ClientOrderStatusProvider interface {

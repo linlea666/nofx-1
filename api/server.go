@@ -498,6 +498,15 @@ func applyCopyConfigRiskFields(copyConfig *store.CopyTradeConfig, req *CopyConfi
 	if copyConfig == nil || req == nil {
 		return
 	}
+	// Copy Guard（risk_policy_version >= 4）仅支持 OKX。旧版前端对所有数据源
+	// 都携带 risk_policy_version=4，若不在此剥离，后续 "v4 only for OKX" 校验
+	// 会把 Hyperliquid/Binance 的正常跟单保存整体 400 拒绝。
+	// 语义：非 OKX 忽略全部 Copy Guard 风控字段（这些字段对非 OKX 无意义），
+	// 只保留基础跟单配置。
+	if copyConfig.ProviderType != "okx" {
+		copyConfig.RiskPolicyVersion = 0
+		return
+	}
 	// 开关：nil 用合理默认；非 nil 用 *值
 	copyConfig.RiskStopLossEnabled = derefBoolDefault(req.RiskStopLossEnabled, true)
 	// v5.2：margin_cap（仓位保证金止损上限）默认关。高杠杆下 entry×maxLoss/lev
@@ -562,6 +571,17 @@ func derefIntDefault(p *int, def int) int {
 		return def
 	}
 	return *p
+}
+
+// resolveCredentialUpdate 凭证字段保存语义：
+// 传空或掩码值（含 "***"，即 GET 接口脱敏后原样回传）表示"不修改"，保留旧值。
+// 注意：该语义下无法通过传空字符串清除凭证（改用新值覆盖即可，全局凭证是主路径）。
+func resolveCredentialUpdate(incoming, existing string) string {
+	incoming = strings.TrimSpace(incoming)
+	if incoming == "" || strings.Contains(incoming, "***") {
+		return existing
+	}
+	return incoming
 }
 
 type ModelConfig struct {
@@ -898,14 +918,21 @@ func (s *Server) handleCreateTrader(c *gin.Context) {
 		if copyConfig.CopyRatio <= 0 {
 			copyConfig.CopyRatio = 1.0
 		}
+		if copyConfig.CopyRatio > maxCopyRatio {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("copy_ratio %.2f exceeds max %.0f", copyConfig.CopyRatio, maxCopyRatio)})
+			return
+		}
 
 		if err := s.store.CopyTrade().Upsert(copyConfig); err != nil {
-			logger.Infof("⚠️ Failed to create copy trade config: %v", err)
-		} else {
-			logger.Infof("✓ Copy trade config created: provider=%s, leader=%s, ratio=%.0f%% (risk SL=%v reentry=%v)",
-				copyConfig.ProviderType, copyConfig.LeaderID, copyConfig.CopyRatio*100,
-				copyConfig.RiskStopLossEnabled, copyConfig.RiskReentryEnabled)
+			// 必须显式失败：静默吞掉会造成"交易员已创建但跟单配置缺失"的
+			// 半成品状态，启动跟单时才暴露且难以定位。Upsert 幂等，用户重试即可。
+			logger.Errorf("❌ Failed to create copy trade config: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "trader created but copy trade config save failed, please save again: " + err.Error()})
+			return
 		}
+		logger.Infof("✓ Copy trade config created: provider=%s, leader=%s, ratio=%.0f%% (risk SL=%v reentry=%v)",
+			copyConfig.ProviderType, copyConfig.LeaderID, copyConfig.CopyRatio*100,
+			copyConfig.RiskStopLossEnabled, copyConfig.RiskReentryEnabled)
 	}
 
 	// Immediately load new trader into TraderManager
@@ -1068,15 +1095,23 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 				syncMarginMode = *req.CopyConfig.SyncMarginMode
 			}
 
+			// 读取已有配置：凭证"空/掩码=不修改"语义 + 保留 Enabled 状态都需要旧值
+			existingCopyCfg, _ := s.store.CopyTrade().GetByTraderID(traderID)
+			existingP20T, existingCSRF := "", ""
+			if existingCopyCfg != nil {
+				existingP20T, existingCSRF = existingCopyCfg.BinanceP20T, existingCopyCfg.BinanceCSRFToken
+			}
+
 			copyConfig := &store.CopyTradeConfig{
-				TraderID:         traderID,
-				ProviderType:     req.CopyConfig.ProviderType,
-				LeaderID:         req.CopyConfig.LeaderID,
-				CopyRatio:        req.CopyConfig.CopyRatio,
-				SyncLeverage:     req.CopyConfig.SyncLeverage,
-				SyncMarginMode:   syncMarginMode,
-				BinanceP20T:      req.CopyConfig.BinanceP20T,
-				BinanceCSRFToken: req.CopyConfig.BinanceCSRFToken,
+				TraderID:       traderID,
+				ProviderType:   req.CopyConfig.ProviderType,
+				LeaderID:       req.CopyConfig.LeaderID,
+				CopyRatio:      req.CopyConfig.CopyRatio,
+				SyncLeverage:   req.CopyConfig.SyncLeverage,
+				SyncMarginMode: syncMarginMode,
+				// GET 接口已脱敏返回凭证；编辑回传的掩码值/空值不覆盖已存明文
+				BinanceP20T:      resolveCredentialUpdate(req.CopyConfig.BinanceP20T, existingP20T),
+				BinanceCSRFToken: resolveCredentialUpdate(req.CopyConfig.BinanceCSRFToken, existingCSRF),
 			}
 
 			// v3 风控字段透传（修复 bug：之前 CopyConfigReq 无 risk_* 字段，前端传值被 JSON unmarshal 静默丢弃）
@@ -1097,23 +1132,30 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 			}
 
 			// Update 路径需要保留 Enabled 状态（与 Create 不同：Create 总是 false 等显式启动）
-			// 这里读取已有配置的 Enabled 字段，避免被 Upsert 误覆盖为 false
-			if existing, err := s.store.CopyTrade().GetByTraderID(traderID); err == nil && existing != nil {
-				copyConfig.Enabled = existing.Enabled
+			// 复用前面读出的已有配置，避免被 Upsert 误覆盖为 false
+			if existingCopyCfg != nil {
+				copyConfig.Enabled = existingCopyCfg.Enabled
 			}
 
 			// Default copy ratio to 1.0 (100%)
 			if copyConfig.CopyRatio <= 0 {
 				copyConfig.CopyRatio = 1.0
 			}
+			if copyConfig.CopyRatio > maxCopyRatio {
+				c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("copy_ratio %.2f exceeds max %.0f", copyConfig.CopyRatio, maxCopyRatio)})
+				return
+			}
 
 			if err := s.store.CopyTrade().Upsert(copyConfig); err != nil {
-				logger.Infof("⚠️ Failed to update copy trade config: %v", err)
-			} else {
-				logger.Infof("✓ Copy trade config updated: provider=%s, leader=%s, ratio=%.0f%% (risk SL=%v reentry=%v)",
-					copyConfig.ProviderType, copyConfig.LeaderID, copyConfig.CopyRatio*100,
-					copyConfig.RiskStopLossEnabled, copyConfig.RiskReentryEnabled)
+				// 同 Create 路径：静默吞掉会让用户以为已保存，实际引擎仍
+				// 在用旧配置运行。Upsert 幂等，返回 500 让用户重试。
+				logger.Errorf("❌ Failed to update copy trade config: %v", err)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "copy trade config save failed, please save again: " + err.Error()})
+				return
 			}
+			logger.Infof("✓ Copy trade config updated: provider=%s, leader=%s, ratio=%.0f%% (risk SL=%v reentry=%v)",
+				copyConfig.ProviderType, copyConfig.LeaderID, copyConfig.CopyRatio*100,
+				copyConfig.RiskStopLossEnabled, copyConfig.RiskReentryEnabled)
 		} else if decisionMode == "ai" {
 			// If switching to AI mode, disable copy trade
 			s.store.CopyTrade().SetEnabled(traderID, false)
@@ -2130,10 +2172,11 @@ func (s *Server) handleGetTraderConfig(c *gin.Context) {
 				"copy_ratio":         cfg.CopyRatio,
 				"sync_leverage":      cfg.SyncLeverage,
 				"sync_margin_mode":   cfg.SyncMarginMode,
-				"min_trade_warn":     cfg.MinTradeWarn,
-				"max_trade_warn":     cfg.MaxTradeWarn,
-				"binance_p20t":       cfg.BinanceP20T,
-				"binance_csrf_token": cfg.BinanceCSRFToken,
+				"min_trade_warn": cfg.MinTradeWarn,
+				"max_trade_warn": cfg.MaxTradeWarn,
+				// 凭证脱敏返回（保存路径识别掩码值为"未修改"，见 resolveCredentialUpdate）
+				"binance_p20t":       store.MaskSecret(cfg.BinanceP20T),
+				"binance_csrf_token": store.MaskSecret(cfg.BinanceCSRFToken),
 			}
 		}
 	}

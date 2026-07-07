@@ -7,6 +7,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	neturl "net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -317,43 +318,80 @@ func (p *OKXProvider) Type() ProviderType {
 	return ProviderOKX
 }
 
-// GetFills 获取成交记录
+// okxFillsPageLimit 单页条数（接口上限 50）；okxFillsMaxPages 分页保护上限，
+// 5 分钟回看窗口内最多拉 250 条，防止异常数据导致轮询长时间阻塞。
+const (
+	okxFillsPageLimit = 50
+	okxFillsMaxPages  = 5
+)
+
+// GetFills 获取成交记录（分页拉全回看窗口）。
+//
+// 旧实现单次 limit=50：窗口内成交超过 50 条时更早的成交被静默截断，
+// 高频领航员场景下造成永久漏单。现按时间窗口右边界前移分页拉取。
+//
+// 去重键为 ordId|fillTime|sz|px 复合键：同一订单分多笔成交时 ordId 相同，
+// 旧的纯 ordId 键会让第 2..n 笔部分成交被引擎 seenFills 误判为已处理。
 func (p *OKXProvider) GetFills(uniqueName string, since time.Time) ([]Fill, error) {
-	now := time.Now()
-	url := fmt.Sprintf(
-		"%s?uniqueName=%s&startModify=%d&endModify=%d&instType=SWAP&limit=50&t=%d",
-		OKXTradeRecordsAPI,
-		uniqueName,
-		since.UnixMilli(),
-		now.UnixMilli(),
-		now.UnixMilli(),
-	)
-
-	var resp OKXTradeRecordsResp
-	if err := p.get(url, &resp); err != nil {
-		return nil, err
-	}
-
-	if resp.Code != "0" {
-		return nil, fmt.Errorf("OKX API error: %s", resp.Msg)
-	}
-
+	sinceMs := since.UnixMilli()
+	endMs := time.Now().UnixMilli()
+	seen := make(map[string]bool) // 页间窗口重叠去重（endModify 以同毫秒记录为界）
 	var fills []Fill
-	for _, raw := range resp.Data {
-		fill := Fill{
-			ID:        raw.OrdId,
-			Symbol:    normalizeOKXSymbol(raw.InstId),
-			Price:     parseFloat(raw.AvgPx),
-			Size:      parseFloat(raw.Sz),
-			Value:     parseFloat(raw.Value), // OKX API 现已直接返回 USD 名义价值
-			Timestamp: time.UnixMilli(parseInt64(raw.FillTime)),
-			Raw:       raw,
+
+	for page := 0; page < okxFillsMaxPages; page++ {
+		url := fmt.Sprintf(
+			"%s?uniqueName=%s&startModify=%d&endModify=%d&instType=SWAP&limit=%d&t=%d",
+			OKXTradeRecordsAPI,
+			neturl.QueryEscape(uniqueName),
+			sinceMs,
+			endMs,
+			okxFillsPageLimit,
+			time.Now().UnixMilli(),
+		)
+
+		var resp OKXTradeRecordsResp
+		if err := p.get(url, &resp); err != nil {
+			return nil, err
+		}
+		if resp.Code != "0" {
+			return nil, fmt.Errorf("OKX API error: %s", resp.Msg)
+		}
+		if len(resp.Data) == 0 {
+			break
 		}
 
-		// 解析方向
-		fill.Side, fill.PositionSide, fill.Action = parseOKXDirection(raw.Side, raw.PosSide)
+		oldestMs := endMs
+		for _, raw := range resp.Data {
+			fill := Fill{
+				// 复合去重键：见函数注释。全链路（seenFills/SourceFillID/clOrdId hash）
+				// 都把该 ID 当不透明键使用，格式变化无兼容性影响。
+				ID:        fmt.Sprintf("%s|%s|%s|%s", raw.OrdId, raw.FillTime, raw.Sz, raw.AvgPx),
+				Symbol:    normalizeOKXSymbol(raw.InstId),
+				Price:     parseFloat(raw.AvgPx),
+				Size:      parseFloat(raw.Sz),
+				Value:     parseFloat(raw.Value), // OKX API 现已直接返回 USD 名义价值
+				Timestamp: time.UnixMilli(parseInt64(raw.FillTime)),
+				Raw:       raw,
+			}
+			if ft := parseInt64(raw.FillTime); ft > 0 && ft < oldestMs {
+				oldestMs = ft
+			}
+			if seen[fill.ID] {
+				continue
+			}
+			seen[fill.ID] = true
 
-		fills = append(fills, fill)
+			// 解析方向
+			fill.Side, fill.PositionSide, fill.Action = parseOKXDirection(raw.Side, raw.PosSide)
+
+			fills = append(fills, fill)
+		}
+
+		// 不满一页 = 窗口已拉完；或右边界无法继续前移（同毫秒批量成交）时停止
+		if len(resp.Data) < okxFillsPageLimit || oldestMs <= sinceMs || oldestMs >= endMs {
+			break
+		}
+		endMs = oldestMs
 	}
 
 	return fills, nil
@@ -392,7 +430,7 @@ func (p *OKXProvider) GetPositionHistory(uniqueName string, limit int) ([]OKXLea
 		limit = 100
 	}
 	url := fmt.Sprintf("%s?uniqueName=%s&instType=SWAP&limit=%d&sortType=1&t=%d",
-		OKXPositionHistoryAPI, uniqueName, limit, time.Now().UnixMilli())
+		OKXPositionHistoryAPI, neturl.QueryEscape(uniqueName), limit, time.Now().UnixMilli())
 	var resp OKXPositionHistoryResp
 	if err := p.get(url, &resp); err != nil {
 		return nil, err
@@ -438,17 +476,25 @@ func (p *OKXProvider) GetAccountState(uniqueName string) (*AccountState, error) 
 	now := time.Now().UnixMilli()
 
 	// 1. 获取资产
-	assetURL := fmt.Sprintf("%s?uniqueName=%s&t=%d", OKXAssetAPI, uniqueName, now)
+	assetURL := fmt.Sprintf("%s?uniqueName=%s&t=%d", OKXAssetAPI, neturl.QueryEscape(uniqueName), now)
 	var assetResp OKXAssetResp
 	if err := p.get(assetURL, &assetResp); err != nil {
 		return nil, err
 	}
+	// 业务码校验：OKX 限频/uniqueName 无效等场景 HTTP 仍是 200，但 code != "0"
+	// 且 data 为空。若不校验，TotalEquity 会静默保持 0，下游比例计算分母失真。
+	if assetResp.Code != "0" {
+		return nil, fmt.Errorf("OKX asset API error: code=%s msg=%s", assetResp.Code, assetResp.Msg)
+	}
 
 	// 2. 获取持仓
-	posURL := fmt.Sprintf("%s?uniqueName=%s&t=%d", OKXPositionAPI, uniqueName, now)
+	posURL := fmt.Sprintf("%s?uniqueName=%s&t=%d", OKXPositionAPI, neturl.QueryEscape(uniqueName), now)
 	var posResp OKXPositionResp
 	if err := p.get(posURL, &posResp); err != nil {
 		return nil, err
+	}
+	if posResp.Code != "0" {
+		return nil, fmt.Errorf("OKX position API error: code=%s msg=%s", posResp.Code, posResp.Msg)
 	}
 
 	state := &AccountState{

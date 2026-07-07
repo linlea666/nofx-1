@@ -893,8 +893,10 @@ func (t *OKXTrader) openLong(symbol string, quantity float64, leverage int, canc
 	}
 
 	// Set leverage for long direction only (don't affect existing short positions)
+	// 失败不阻断（可能是"已是目标杠杆"等良性响应），但升级为 WARN：
+	// 跟单模式下杠杆未同步意味着实际风险敞口与领航员偏离，需要人工关注
 	if err := t.setLeverageForSide(symbol, leverage, "long"); err != nil {
-		logger.Infof("  ⚠️ Failed to set leverage: %v", err)
+		logger.Warnf("  ⚠️ Failed to set leverage %dx for %s long (继续下单，实际杠杆可能为旧值): %v", leverage, symbol, err)
 	}
 
 	instId := t.convertSymbol(symbol)
@@ -989,8 +991,9 @@ func (t *OKXTrader) openShort(symbol string, quantity float64, leverage int, can
 	}
 
 	// Set leverage for short direction only (don't affect existing long positions)
+	// 同 openLong：失败不阻断但升级为 WARN
 	if err := t.setLeverageForSide(symbol, leverage, "short"); err != nil {
-		logger.Infof("  ⚠️ Failed to set leverage: %v", err)
+		logger.Warnf("  ⚠️ Failed to set leverage %dx for %s short (继续下单，实际杠杆可能为旧值): %v", leverage, symbol, err)
 	}
 
 	instId := t.convertSymbol(symbol)
@@ -1067,14 +1070,18 @@ func (t *OKXTrader) openShort(symbol string, quantity float64, leverage int, can
 
 // CloseLong closes long position
 func (t *OKXTrader) CloseLong(symbol string, quantity float64) (map[string]interface{}, error) {
-	return t.closeLong(symbol, quantity, true)
+	return t.closeLong(symbol, quantity, true, "")
 }
 
 func (t *OKXTrader) CloseLongPreservingOrders(symbol string, quantity float64) (map[string]interface{}, error) {
-	return t.closeLong(symbol, quantity, false)
+	return t.closeLong(symbol, quantity, false, "")
 }
 
-func (t *OKXTrader) closeLong(symbol string, quantity float64, cancelExisting bool) (map[string]interface{}, error) {
+func (t *OKXTrader) CloseLongPreservingOrdersWithClientID(symbol string, quantity float64, clientOrderID string) (map[string]interface{}, error) {
+	return t.closeLong(symbol, quantity, false, clientOrderID)
+}
+
+func (t *OKXTrader) closeLong(symbol string, quantity float64, cancelExisting bool, clientOrderID string) (map[string]interface{}, error) {
 	instId := t.convertSymbol(symbol)
 
 	// Get instrument info for contract conversion
@@ -1117,6 +1124,9 @@ func (t *OKXTrader) closeLong(symbol string, quantity float64, cancelExisting bo
 	logger.Infof("🔻 OKX close long: symbol=%s, quantity=%.6f, ctVal=%.6f, contracts=%.2f, szStr=%s",
 		symbol, quantity, inst.CtVal, contracts, szStr)
 
+	if clientOrderID == "" {
+		clientOrderID = genOkxClOrdID()
+	}
 	body := map[string]interface{}{
 		"instId":  instId,
 		"tdMode":  tdMode, // 使用仓位实际的保证金模式
@@ -1124,7 +1134,7 @@ func (t *OKXTrader) closeLong(symbol string, quantity float64, cancelExisting bo
 		"posSide": "long",
 		"ordType": "market",
 		"sz":      szStr,
-		"clOrdId": genOkxClOrdID(),
+		"clOrdId": clientOrderID,
 		"tag":     okxTag,
 	}
 
@@ -1160,6 +1170,7 @@ func (t *OKXTrader) closeLong(symbol string, quantity float64, cancelExisting bo
 
 	return map[string]interface{}{
 		"orderId": orders[0].OrdId,
+		"clOrdId": clientOrderID,
 		"symbol":  symbol,
 		"status":  "FILLED",
 	}, nil
@@ -1167,14 +1178,18 @@ func (t *OKXTrader) closeLong(symbol string, quantity float64, cancelExisting bo
 
 // CloseShort closes short position
 func (t *OKXTrader) CloseShort(symbol string, quantity float64) (map[string]interface{}, error) {
-	return t.closeShort(symbol, quantity, true)
+	return t.closeShort(symbol, quantity, true, "")
 }
 
 func (t *OKXTrader) CloseShortPreservingOrders(symbol string, quantity float64) (map[string]interface{}, error) {
-	return t.closeShort(symbol, quantity, false)
+	return t.closeShort(symbol, quantity, false, "")
 }
 
-func (t *OKXTrader) closeShort(symbol string, quantity float64, cancelExisting bool) (map[string]interface{}, error) {
+func (t *OKXTrader) CloseShortPreservingOrdersWithClientID(symbol string, quantity float64, clientOrderID string) (map[string]interface{}, error) {
+	return t.closeShort(symbol, quantity, false, clientOrderID)
+}
+
+func (t *OKXTrader) closeShort(symbol string, quantity float64, cancelExisting bool, clientOrderID string) (map[string]interface{}, error) {
 	instId := t.convertSymbol(symbol)
 
 	// Get instrument info for contract conversion
@@ -1222,6 +1237,9 @@ func (t *OKXTrader) closeShort(symbol string, quantity float64, cancelExisting b
 	logger.Infof("🔻 OKX close short: symbol=%s, quantity=%.6f, ctVal=%.6f, contracts=%.2f, szStr=%s",
 		symbol, quantity, inst.CtVal, contracts, szStr)
 
+	if clientOrderID == "" {
+		clientOrderID = genOkxClOrdID()
+	}
 	body := map[string]interface{}{
 		"instId":  instId,
 		"tdMode":  tdMode, // 使用仓位实际的保证金模式
@@ -1229,7 +1247,7 @@ func (t *OKXTrader) closeShort(symbol string, quantity float64, cancelExisting b
 		"posSide": "short",
 		"ordType": "market",
 		"sz":      szStr,
-		"clOrdId": genOkxClOrdID(),
+		"clOrdId": clientOrderID,
 		"tag":     okxTag,
 	}
 
@@ -1268,6 +1286,7 @@ func (t *OKXTrader) closeShort(symbol string, quantity float64, cancelExisting b
 
 	return map[string]interface{}{
 		"orderId": orders[0].OrdId,
+		"clOrdId": clientOrderID,
 		"symbol":  symbol,
 		"status":  "FILLED",
 	}, nil

@@ -153,6 +153,7 @@ type Decision struct {
 	LeaderPosSize   float64 `json:"leader_pos_size,omitempty"` // 领航员当前持仓数量（用于 lastKnownSize 追踪）
 	ClientOrderID   string  `json:"client_order_id,omitempty"` // Copy Guard 幂等执行与重启恢复
 	ExchangeOrderID string  `json:"exchange_order_id,omitempty"`
+	SourceFillID    string  `json:"source_fill_id,omitempty"` // 产生该决策的领航员 fill ID（瞬态失败后释放去重标记重放用）
 }
 
 // FullDecision AI's complete decision (including chain of thought)

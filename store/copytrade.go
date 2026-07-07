@@ -809,6 +809,21 @@ func (s *CopyTradeStore) getMappingByStatus(traderID, leaderPosID, status string
 
 // SaveIgnoredPosition 保存历史仓位（启动跟单时调用）
 // 标记为 ignored 状态，后续这些仓位的操作都不跟随
+// HasMappingsForLeader 该 trader 对该 leader 是否已有任何 mapping 记录（任意状态）。
+// 用于区分"首次启用跟单"（应全量标 ignored 保护历史仓位）与"重启/配置变更"
+// （跳过全量 ignored，避免停机窗口期的新仓被误标为永久忽略）。
+func (s *CopyTradeStore) HasMappingsForLeader(traderID, leaderID string) (bool, error) {
+	var count int
+	err := s.db.QueryRow(`
+		SELECT COUNT(1) FROM copy_trade_position_mappings
+		WHERE trader_id = ? AND leader_id = ?
+	`, traderID, leaderID).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
 func (s *CopyTradeStore) SaveIgnoredPosition(traderID, leaderID, leaderPosID, symbol, side, marginMode string) error {
 	_, err := s.db.Exec(`
 		INSERT INTO copy_trade_position_mappings 

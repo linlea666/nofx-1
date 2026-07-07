@@ -194,7 +194,6 @@ export function TraderConfigModal({
     risk_unprotectable_action: 'close',
     risk_reentry_noise_override: false,
   })
-  const [, setCopyTradeConfig] = useState<CopyTradeConfig | null>(null)
   const [isSaving, setIsSaving] = useState(false)
   const [strategies, setStrategies] = useState<Strategy[]>([])
   const [isFetchingBalance, setIsFetchingBalance] = useState(false)
@@ -271,7 +270,6 @@ export function TraderConfigModal({
         )
         if (result.success && result.data?.config) {
           const cfg = result.data.config
-          setCopyTradeConfig(cfg)
           // 只加载跟单参数，decision_mode 由 traderData 决定
           // 风控字段：后端用比例（如 0.02=2%）存，前端用百分比展示，× 100 转换
           setFormData((prev) => ({
@@ -450,10 +448,14 @@ export function TraderConfigModal({
     if (!onSave) return
 
     // v4.1：账户线语义为"灾难硬兜底"（默认 20%），确认阈值相应上调到 50%
+    // 仅 OKX 需要确认（Copy Guard 风控仅对 OKX 生效）
+    const isOKXCopyGuard =
+      formData.decision_mode === 'copy_trade' &&
+      formData.copy_provider_type === 'okx' &&
+      formData.risk_policy_version >= 4
     let highRiskConfirmed = false
     if (
-      formData.decision_mode === 'copy_trade' &&
-      formData.risk_policy_version >= 4 &&
+      isOKXCopyGuard &&
       formData.risk_account_pct >= 50 &&
       !window.confirm(
         `账户灾难兜底线为 ${formData.risk_account_pct.toFixed(2)}%，属于极高风险配置。确认仍要保存吗？`
@@ -461,8 +463,18 @@ export function TraderConfigModal({
     ) {
       return
     }
-    if (formData.risk_policy_version >= 4 && formData.risk_account_pct >= 50) {
+    if (isOKXCopyGuard && formData.risk_account_pct >= 50) {
       highRiskConfirmed = true
+    }
+
+    // 跟单模式领航员 ID 必填：旧逻辑在 leader_id 为空时静默不带 copy_config，
+    // 交易员被保存为"跟单模式但无跟单配置"的半成品状态
+    if (
+      formData.decision_mode === 'copy_trade' &&
+      !formData.copy_leader_id.trim()
+    ) {
+      window.alert('跟单模式必须填写领航员 ID / 地址')
+      return
     }
 
     setIsSaving(true)
@@ -496,47 +508,54 @@ export function TraderConfigModal({
           leader_id: formData.copy_leader_id,
           copy_ratio: formData.copy_ratio,
           sync_leverage: formData.copy_sync_leverage,
-          sync_margin_mode: formData.copy_sync_margin_mode, // 同步保证金模式
-          // 账户保护 v5 风控（前端展示百分比 → 后端存比例，× 0.01 转换）
-          // 仅 OKX 路径生效；HL/Binance 后端会忽略这些字段（已通过 ProviderType 守卫）
-          risk_stop_loss_enabled: formData.risk_stop_loss_enabled,
-          risk_account_pct: formData.risk_account_pct / 100,
-          risk_atr_multiplier: formData.risk_atr_multiplier,
-          risk_atr_timeframe: formData.risk_atr_timeframe,
-          risk_leverage_fallback: formData.risk_leverage_fallback,
-          risk_leverage_max_loss: formData.risk_leverage_max_loss / 100,
-          risk_reentry_enabled: formData.risk_reentry_enabled,
-          risk_reentry_ratio: formData.risk_reentry_ratio / 100,
-          risk_manual_reentry_enabled: formData.risk_manual_reentry_enabled,
-          risk_policy_version: formData.risk_policy_version,
-          risk_stop_mode: formData.risk_stop_mode,
-          risk_atr_period: formData.risk_atr_period,
-          risk_atr_cache_max_age_minutes:
-            formData.risk_atr_cache_max_age_minutes,
-          risk_atr_fallback_pct: formData.risk_atr_fallback_pct / 100,
-          risk_trigger_price_type: formData.risk_trigger_price_type,
-          risk_slippage_buffer_bps: formData.risk_slippage_buffer_bps,
-          risk_liquidation_buffer_atr: formData.risk_liquidation_buffer_atr,
-          risk_max_reentries: formData.risk_max_reentries,
-          risk_reentry_band_atr: formData.risk_reentry_band_atr,
-          risk_reentry_cooldown_seconds: formData.risk_reentry_cooldown_seconds,
-          risk_reentry_max_chase_atr: formData.risk_reentry_max_chase_atr,
-          risk_reentry_max_atr_expansion:
-            formData.risk_reentry_max_atr_expansion,
-          risk_watch_timeout_minutes: formData.risk_watch_timeout_minutes,
-          risk_migration_confirmed: formData.risk_migration_confirmed,
-          risk_addon_budget_pct: formData.risk_addon_budget_pct / 100,
-          risk_high_risk_confirmed: highRiskConfirmed,
-          // v4.1 重入加严
-          risk_reentry_min_recovery_atr:
-            formData.risk_reentry_min_recovery_atr,
-          risk_reentry_cooldown_escalation:
-            formData.risk_reentry_cooldown_escalation,
-          risk_reentry_recovery_escalation:
-            formData.risk_reentry_recovery_escalation,
-          // v5 可保护性状态机 / 噪音档重入
-          risk_unprotectable_action: formData.risk_unprotectable_action,
-          risk_reentry_noise_override: formData.risk_reentry_noise_override,
+          sync_margin_mode: formData.copy_sync_margin_mode, // 同步保证金模式（仅 OKX 生效）
+        }
+        // 账户保护 v5 风控（Copy Guard）仅 OKX 支持：
+        // 非 OKX 不携带任何 risk_* 字段（含 risk_policy_version），
+        // 否则后端 "v4 only for OKX" 校验会拒绝保存。
+        if (formData.copy_provider_type === 'okx') {
+          Object.assign(saveData.copy_config, {
+            // 前端展示百分比 → 后端存比例，× 0.01 转换
+            risk_stop_loss_enabled: formData.risk_stop_loss_enabled,
+            risk_account_pct: formData.risk_account_pct / 100,
+            risk_atr_multiplier: formData.risk_atr_multiplier,
+            risk_atr_timeframe: formData.risk_atr_timeframe,
+            risk_leverage_fallback: formData.risk_leverage_fallback,
+            risk_leverage_max_loss: formData.risk_leverage_max_loss / 100,
+            risk_reentry_enabled: formData.risk_reentry_enabled,
+            risk_reentry_ratio: formData.risk_reentry_ratio / 100,
+            risk_manual_reentry_enabled: formData.risk_manual_reentry_enabled,
+            risk_policy_version: formData.risk_policy_version,
+            risk_stop_mode: formData.risk_stop_mode,
+            risk_atr_period: formData.risk_atr_period,
+            risk_atr_cache_max_age_minutes:
+              formData.risk_atr_cache_max_age_minutes,
+            risk_atr_fallback_pct: formData.risk_atr_fallback_pct / 100,
+            risk_trigger_price_type: formData.risk_trigger_price_type,
+            risk_slippage_buffer_bps: formData.risk_slippage_buffer_bps,
+            risk_liquidation_buffer_atr: formData.risk_liquidation_buffer_atr,
+            risk_max_reentries: formData.risk_max_reentries,
+            risk_reentry_band_atr: formData.risk_reentry_band_atr,
+            risk_reentry_cooldown_seconds:
+              formData.risk_reentry_cooldown_seconds,
+            risk_reentry_max_chase_atr: formData.risk_reentry_max_chase_atr,
+            risk_reentry_max_atr_expansion:
+              formData.risk_reentry_max_atr_expansion,
+            risk_watch_timeout_minutes: formData.risk_watch_timeout_minutes,
+            risk_migration_confirmed: formData.risk_migration_confirmed,
+            risk_addon_budget_pct: formData.risk_addon_budget_pct / 100,
+            risk_high_risk_confirmed: highRiskConfirmed,
+            // v4.1 重入加严
+            risk_reentry_min_recovery_atr:
+              formData.risk_reentry_min_recovery_atr,
+            risk_reentry_cooldown_escalation:
+              formData.risk_reentry_cooldown_escalation,
+            risk_reentry_recovery_escalation:
+              formData.risk_reentry_recovery_escalation,
+            // v5 可保护性状态机 / 噪音档重入
+            risk_unprotectable_action: formData.risk_unprotectable_action,
+            risk_reentry_noise_override: formData.risk_reentry_noise_override,
+          })
         }
         // Binance 数据源额外携带 Web 私有接口凭证
         if (formData.copy_provider_type === 'binance') {
@@ -1031,7 +1050,7 @@ export function TraderConfigModal({
                     <div>
                       <label className="text-sm text-[#EAECEF]">同步杠杆</label>
                       <p className="text-xs text-[#848E9C]">
-                        使用与领航员相同的杠杆倍数
+                        使用与领航员相同的杠杆倍数；关闭后固定使用 10 倍杠杆
                       </p>
                     </div>
                     <button
@@ -1058,14 +1077,15 @@ export function TraderConfigModal({
                     </button>
                   </div>
 
-                  {/* Sync Margin Mode (OKX) */}
+                  {/* Sync Margin Mode（仅 OKX：HL/Binance 数据源无仓位级全仓/逐仓语义） */}
+                  {formData.copy_provider_type === 'okx' && (
                   <div className="flex items-center justify-between">
                     <div>
                       <label className="text-sm text-[#EAECEF]">
                         同步保证金模式
                       </label>
                       <p className="text-xs text-[#848E9C]">
-                        跟随领航员的全仓/逐仓模式（OKX 专用）
+                        跟随领航员的全仓/逐仓模式；关闭后新开仓使用交易员自身的保证金模式配置
                       </p>
                     </div>
                     <button
@@ -1091,6 +1111,7 @@ export function TraderConfigModal({
                       />
                     </button>
                   </div>
+                  )}
 
                   {/* Info Box */}
                   <div className="p-3 bg-[#0B0E11] border border-[#2B3139] rounded flex items-start gap-2">

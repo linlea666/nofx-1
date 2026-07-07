@@ -18,6 +18,10 @@ import (
 	"nofx/store"
 )
 
+// maxCopyRatio 跟单系数硬上限（前端滑杆上限 3，后端留出直连 API 余量）。
+// 两个保存入口（SaveConfig / server.go 创建与更新交易员）共用。
+const maxCopyRatio = 10.0
+
 // CopyTradeHandler 跟单 API Handler
 type CopyTradeHandler struct {
 	store         *store.Store
@@ -488,9 +492,21 @@ func (h *CopyTradeHandler) GetConfig(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"config": config,
+		"config": maskedCopyTradeConfig(config),
 		"status": copytrade.IsCopyTradingRunning(traderID),
 	})
+}
+
+// maskedCopyTradeConfig 返回凭证已脱敏的配置副本（API 响应专用，不落库）。
+// 前端编辑时掩码值原样回传，保存路径通过 resolveCredentialUpdate 识别为"未修改"。
+func maskedCopyTradeConfig(config *store.CopyTradeConfig) *store.CopyTradeConfig {
+	if config == nil {
+		return nil
+	}
+	masked := *config
+	masked.BinanceP20T = store.MaskSecret(masked.BinanceP20T)
+	masked.BinanceCSRFToken = store.MaskSecret(masked.BinanceCSRFToken)
+	return &masked
 }
 
 // SaveConfig 保存跟单配置
@@ -508,25 +524,37 @@ func (h *CopyTradeHandler) SaveConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	// 跟单系数上限校验（与前端滑杆上限 3 保持数量级一致，留出直连 API 余量）：
+	// 无上限时误传 100 会以百倍杠杆化仓位跟单，属于资金安全隐患
+	if req.CopyRatio > maxCopyRatio {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("copy_ratio %.2f exceeds max %.0f", req.CopyRatio, maxCopyRatio)})
+		return
+	}
+
+	// 读取已有配置，作为风控字段与凭证字段的旧值兜底
+	// 设计：风控字段全部可选；前端不传字段保持原值；旧库读出来的默认值由 FillRiskDefaults 兜底
+	existing, _ := h.store.CopyTrade().GetByTraderID(traderID)
+
+	existingP20T, existingCSRF := "", ""
+	if existing != nil {
+		existingP20T, existingCSRF = existing.BinanceP20T, existing.BinanceCSRFToken
+	}
 
 	// 构造配置
 	config := &store.CopyTradeConfig{
-		TraderID:         traderID,
-		ProviderType:     req.ProviderType,
-		LeaderID:         req.LeaderID,
-		CopyRatio:        req.CopyRatio,
-		SyncLeverage:     req.SyncLeverage,
-		SyncMarginMode:   req.SyncMarginMode,
-		MinTradeWarn:     req.MinTradeWarn,
-		MaxTradeWarn:     req.MaxTradeWarn,
-		Enabled:          req.Enabled,
-		BinanceP20T:      req.BinanceP20T,
-		BinanceCSRFToken: req.BinanceCSRFToken,
+		TraderID:       traderID,
+		ProviderType:   req.ProviderType,
+		LeaderID:       req.LeaderID,
+		CopyRatio:      req.CopyRatio,
+		SyncLeverage:   req.SyncLeverage,
+		SyncMarginMode: req.SyncMarginMode,
+		MinTradeWarn:   req.MinTradeWarn,
+		MaxTradeWarn:   req.MaxTradeWarn,
+		Enabled:        req.Enabled,
+		// GET 接口已脱敏返回凭证；编辑回传的掩码值/空值不覆盖已存明文
+		BinanceP20T:      resolveCredentialUpdate(req.BinanceP20T, existingP20T),
+		BinanceCSRFToken: resolveCredentialUpdate(req.BinanceCSRFToken, existingCSRF),
 	}
-
-	// 读取已有配置，作为风控字段的旧值兜底
-	// 设计：风控字段全部可选；前端不传字段保持原值；旧库读出来的默认值由 FillRiskDefaults 兜底
-	existing, _ := h.store.CopyTrade().GetByTraderID(traderID)
 
 	// 风控字段透传（指针类型，未传则使用旧值或默认值）
 	if req.RiskStopLossEnabled != nil {
@@ -617,7 +645,7 @@ func (h *CopyTradeHandler) SaveConfig(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"message": "config saved",
-		"config":  config,
+		"config":  maskedCopyTradeConfig(config),
 	})
 }
 

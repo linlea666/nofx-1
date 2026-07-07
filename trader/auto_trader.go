@@ -2,6 +2,7 @@ package trader
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"nofx/decision"
@@ -932,6 +933,29 @@ func (at *AutoTrader) ExecuteDecision(d *decision.Decision) error {
 	return nil
 }
 
+// ErrPartialCloseSkipped 减仓因边界约束（仓位太小无法按比例减 / 减仓价值低于
+// 交易所最小订单价值）被跳过，未向交易所下任何订单。
+// 必须以错误形式向上传递：旧版直接 return nil 伪装成功，导致跟单 integration
+// 误更新 lastKnownSize/减仓计数并按空执行重挂止损单。
+// 调用方用 errors.Is 识别后按"跳过"处理（不更新 mapping、不告警、不熔断）。
+var ErrPartialCloseSkipped = errors.New("partial close skipped (no order placed)")
+
+// fillCopyTradeMarginMode 跟单开仓决策缺省 MarginMode 时回填交易员自身配置。
+// 缺省来源：SyncMarginMode=false（引擎主动清空）或数据源未提供模式。
+// 回填后重复仓位检查、SetMarginMode、mapping 记录、Copy Guard 保护单 tdMode
+// 全链路统一使用真实模式；AI 决策（非跟单）不受影响。
+func (at *AutoTrader) fillCopyTradeMarginMode(isCopyTrade bool, d *decision.Decision) {
+	if !isCopyTrade || d.MarginMode != "" {
+		return
+	}
+	if at.config.IsCrossMargin {
+		d.MarginMode = "cross"
+	} else {
+		d.MarginMode = "isolated"
+	}
+	logger.Infof("  📊 跟单开仓使用交易员自身保证金模式: %s（未同步领航员模式）", d.MarginMode)
+}
+
 func (at *AutoTrader) openLongOrder(copyTrade bool, symbol string, quantity float64, leverage int, clientOrderID string) (map[string]interface{}, error) {
 	if copyTrade {
 		if clientOrderID != "" {
@@ -960,8 +984,13 @@ func (at *AutoTrader) openShortOrder(copyTrade bool, symbol string, quantity flo
 	return at.trader.OpenShort(symbol, quantity, leverage)
 }
 
-func (at *AutoTrader) closeLongOrder(copyTrade bool, symbol string, quantity float64) (map[string]interface{}, error) {
+func (at *AutoTrader) closeLongOrder(copyTrade bool, symbol string, quantity float64, clientOrderID string) (map[string]interface{}, error) {
 	if copyTrade {
+		if clientOrderID != "" {
+			if executor, ok := at.trader.(CopyTradeIdempotentOrderExecutor); ok {
+				return executor.CloseLongPreservingOrdersWithClientID(symbol, quantity, clientOrderID)
+			}
+		}
 		if executor, ok := at.trader.(CopyTradeOrderExecutor); ok {
 			return executor.CloseLongPreservingOrders(symbol, quantity)
 		}
@@ -969,8 +998,13 @@ func (at *AutoTrader) closeLongOrder(copyTrade bool, symbol string, quantity flo
 	return at.trader.CloseLong(symbol, quantity)
 }
 
-func (at *AutoTrader) closeShortOrder(copyTrade bool, symbol string, quantity float64) (map[string]interface{}, error) {
+func (at *AutoTrader) closeShortOrder(copyTrade bool, symbol string, quantity float64, clientOrderID string) (map[string]interface{}, error) {
 	if copyTrade {
+		if clientOrderID != "" {
+			if executor, ok := at.trader.(CopyTradeIdempotentOrderExecutor); ok {
+				return executor.CloseShortPreservingOrdersWithClientID(symbol, quantity, clientOrderID)
+			}
+		}
 		if executor, ok := at.trader.(CopyTradeOrderExecutor); ok {
 			return executor.CloseShortPreservingOrders(symbol, quantity)
 		}
@@ -1004,6 +1038,11 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 	isCopyTrade := strings.Contains(decision.Reasoning, "Copy trading")
 	// 检查是否为加仓操作（跟单加仓时 Reasoning 包含 "add"）
 	isAddPosition := isCopyTrade && strings.Contains(strings.ToLower(decision.Reasoning), "add")
+
+	// 跟单开仓 MarginMode 为空（SyncMarginMode=false 或数据源未提供）：
+	// 回填为交易员自身配置的模式，让后续的重复仓位检查、mapping 记录、
+	// Copy Guard 保护单 tdMode 都基于真实模式，而不是残留空串。
+	at.fillCopyTradeMarginMode(isCopyTrade, decision)
 
 	// [CODE ENFORCED] Check max positions limit (跟单模式跳过，领航员已通过风控)
 	if !isCopyTrade {
@@ -1218,6 +1257,9 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 	isCopyTrade := strings.Contains(decision.Reasoning, "Copy trading")
 	// 检查是否为加仓操作（跟单加仓时 Reasoning 包含 "add"）
 	isAddPosition := isCopyTrade && strings.Contains(strings.ToLower(decision.Reasoning), "add")
+
+	// 跟单开仓 MarginMode 回填（与 executeOpenLongWithRecord 对称，见其注释）
+	at.fillCopyTradeMarginMode(isCopyTrade, decision)
 
 	// [CODE ENFORCED] Check max positions limit (跟单模式跳过，领航员已通过风控)
 	if !isCopyTrade {
@@ -1487,23 +1529,28 @@ func (at *AutoTrader) executeCloseLongWithRecord(decision *decision.Decision, ac
 		if totalQuantity < minPositionForPartialClose && decision.CloseRatio < 0.9 {
 			logger.Warnf("  ⚠️ 仓位太小 (%.4f < %.4f)，无法按 %.0f%% 比例减仓，跳过本次操作",
 				totalQuantity, minPositionForPartialClose, decision.CloseRatio*100)
-			return nil
+			// 返回 sentinel 错误而非 nil：伪装成功会让跟单侧误更新
+			// lastKnownSize/减仓计数并按空执行重挂止损单
+			return fmt.Errorf("%w: 仓位 %.4f 过小无法按 %.0f%% 减仓",
+				ErrPartialCloseSkipped, totalQuantity, decision.CloseRatio*100)
 		}
 
-		// 🆕 边界检查 2：价值检查（Hyperliquid 最小订单价值 $10）
-		// 减仓价值太小会被交易所拒绝（Order must have minimum value of $10）
+		// 🆕 边界检查 2：价值检查（仅 Hyperliquid：最小订单价值 $10 硬约束）
+		// 其他交易所（OKX/Binance 等）无此限制，误伤会导致小仓减仓永远被跳过、
+		// 与领航员仓位长期漂移
 		// 如果接近全平（>90%），不跳过，让它尝试执行
 		closeValue := closeQuantity * currentPrice
 		const minOrderValue = 10.0 // Hyperliquid 最小 $10
-		if closeValue < minOrderValue && decision.CloseRatio < 0.9 {
+		if at.exchange == "hyperliquid" && closeValue < minOrderValue && decision.CloseRatio < 0.9 {
 			logger.Warnf("  ⚠️ 减仓价值太小 (%.2f < $%.0f)，跳过本次操作（等待后续全平）",
 				closeValue, minOrderValue)
-			return nil
+			return fmt.Errorf("%w: 减仓价值 %.2f 低于 Hyperliquid 最小订单价值 $%.0f",
+				ErrPartialCloseSkipped, closeValue, minOrderValue)
 		}
 	}
 
 	// Close position
-	order, err := at.closeLongOrder(isCopyTrade, decision.Symbol, closeQuantity)
+	order, err := at.closeLongOrder(isCopyTrade, decision.Symbol, closeQuantity, decision.ClientOrderID)
 	if err != nil {
 		return err
 	}
@@ -1616,23 +1663,25 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *decision.Decision, a
 		if totalQuantity < minPositionForPartialClose && decision.CloseRatio < 0.9 {
 			logger.Warnf("  ⚠️ 仓位太小 (%.4f < %.4f)，无法按 %.0f%% 比例减仓，跳过本次操作",
 				totalQuantity, minPositionForPartialClose, decision.CloseRatio*100)
-			return nil
+			// 同 executeCloseLongWithRecord：sentinel 错误，禁止伪装成功
+			return fmt.Errorf("%w: 仓位 %.4f 过小无法按 %.0f%% 减仓",
+				ErrPartialCloseSkipped, totalQuantity, decision.CloseRatio*100)
 		}
 
-		// 🆕 边界检查 2：价值检查（Hyperliquid 最小订单价值 $10）
-		// 减仓价值太小会被交易所拒绝（Order must have minimum value of $10）
+		// 🆕 边界检查 2：价值检查（仅 Hyperliquid：最小订单价值 $10 硬约束）
 		// 如果接近全平（>90%），不跳过，让它尝试执行
 		closeValue := closeQuantity * currentPrice
 		const minOrderValue = 10.0 // Hyperliquid 最小 $10
-		if closeValue < minOrderValue && decision.CloseRatio < 0.9 {
+		if at.exchange == "hyperliquid" && closeValue < minOrderValue && decision.CloseRatio < 0.9 {
 			logger.Warnf("  ⚠️ 减仓价值太小 (%.2f < $%.0f)，跳过本次操作（等待后续全平）",
 				closeValue, minOrderValue)
-			return nil
+			return fmt.Errorf("%w: 减仓价值 %.2f 低于 Hyperliquid 最小订单价值 $%.0f",
+				ErrPartialCloseSkipped, closeValue, minOrderValue)
 		}
 	}
 
 	// Close position
-	order, err := at.closeShortOrder(isCopyTrade, decision.Symbol, closeQuantity)
+	order, err := at.closeShortOrder(isCopyTrade, decision.Symbol, closeQuantity, decision.ClientOrderID)
 	if err != nil {
 		return err
 	}
