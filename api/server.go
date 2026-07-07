@@ -498,12 +498,11 @@ func applyCopyConfigRiskFields(copyConfig *store.CopyTradeConfig, req *CopyConfi
 	if copyConfig == nil || req == nil {
 		return
 	}
-	// Copy Guard（risk_policy_version >= 4）仅支持 OKX。旧版前端对所有数据源
-	// 都携带 risk_policy_version=4，若不在此剥离，后续 "v4 only for OKX" 校验
-	// 会把 Hyperliquid/Binance 的正常跟单保存整体 400 拒绝。
-	// 语义：非 OKX 忽略全部 Copy Guard 风控字段（这些字段对非 OKX 无意义），
-	// 只保留基础跟单配置。
-	if copyConfig.ProviderType != "okx" {
+	// Copy Guard（risk_policy_version >= 4）支持 OKX 与 Binance 领航员数据源。
+	// 不支持的数据源（Hyperliquid）对所有 Copy Guard 风控字段无意义，若不剥离
+	// risk_policy_version，后续 "v4 only for OKX/Binance" 校验会把其正常跟单
+	// 保存整体 400 拒绝。语义：不支持的数据源忽略全部风控字段，只保留基础跟单配置。
+	if !copytrade.SupportsCopyGuard(copytrade.ProviderType(copyConfig.ProviderType)) {
 		copyConfig.RiskPolicyVersion = 0
 		return
 	}
@@ -897,8 +896,8 @@ func (s *Server) handleCreateTrader(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
-		if copyConfig.RiskPolicyVersion >= 4 && copyConfig.ProviderType != "okx" {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "copy guard v4 is only supported for OKX"})
+		if copyConfig.RiskPolicyVersion >= 4 && !copytrade.SupportsCopyGuard(copytrade.ProviderType(copyConfig.ProviderType)) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "copy guard v4 is only supported for OKX or Binance leader sources"})
 			return
 		}
 		// v4.1：账户线语义为"灾难硬兜底"（默认 20%），确认阈值 50%（与
@@ -1120,8 +1119,8 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 				return
 			}
-			if copyConfig.RiskPolicyVersion >= 4 && copyConfig.ProviderType != "okx" {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "copy guard v4 is only supported for OKX"})
+			if copyConfig.RiskPolicyVersion >= 4 && !copytrade.SupportsCopyGuard(copytrade.ProviderType(copyConfig.ProviderType)) {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "copy guard v4 is only supported for OKX or Binance leader sources"})
 				return
 			}
 			// v4.1：账户线语义为"灾难硬兜底"（默认 20%），确认阈值 50%（与
@@ -2166,14 +2165,14 @@ func (s *Server) handleGetTraderConfig(c *gin.Context) {
 	if decisionMode == "copy_trade" {
 		if cfg, err := s.store.CopyTrade().GetByTraderID(traderID); err == nil && cfg != nil {
 			copyConfig = map[string]interface{}{
-				"enabled":            cfg.Enabled,
-				"provider_type":      cfg.ProviderType,
-				"leader_id":          cfg.LeaderID,
-				"copy_ratio":         cfg.CopyRatio,
-				"sync_leverage":      cfg.SyncLeverage,
-				"sync_margin_mode":   cfg.SyncMarginMode,
-				"min_trade_warn": cfg.MinTradeWarn,
-				"max_trade_warn": cfg.MaxTradeWarn,
+				"enabled":          cfg.Enabled,
+				"provider_type":    cfg.ProviderType,
+				"leader_id":        cfg.LeaderID,
+				"copy_ratio":       cfg.CopyRatio,
+				"sync_leverage":    cfg.SyncLeverage,
+				"sync_margin_mode": cfg.SyncMarginMode,
+				"min_trade_warn":   cfg.MinTradeWarn,
+				"max_trade_warn":   cfg.MaxTradeWarn,
 				// 凭证脱敏返回（保存路径识别掩码值为"未修改"，见 resolveCredentialUpdate）
 				"binance_p20t":       store.MaskSecret(cfg.BinanceP20T),
 				"binance_csrf_token": store.MaskSecret(cfg.BinanceCSRFToken),

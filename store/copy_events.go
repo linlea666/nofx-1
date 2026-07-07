@@ -311,6 +311,14 @@ func classifyGuardEvent(eventType string) (category, severity string, include bo
 	return "", "", false
 }
 
+// copyGuardTraderProvider 取跟单配置的数据源类型（用于事件镜像标注 provider）。
+// best-effort：查询失败返回空串，调用方回退默认值。
+func (s *CopyTradeStore) copyGuardTraderProvider(traderID string) string {
+	var provider string
+	_ = s.db.QueryRow(`SELECT provider_type FROM copy_trade_configs WHERE trader_id=?`, traderID).Scan(&provider)
+	return provider
+}
+
 // copyGuardCycleContext 取镜像所需的少量 cycle 上下文（仅白名单命中时调用，罕见）。
 func (s *CopyTradeStore) copyGuardCycleContext(cycleID int64) (symbol, side, marginMode, leaderID, leaderPosID, followerPosID string) {
 	_ = s.db.QueryRow(
@@ -329,10 +337,18 @@ func (s *CopyTradeStore) mirrorGuardEventToCopyEvents(cycleID int64, traderID, e
 	}
 	symbol, side, marginMode, leaderID, leaderPosID, followerPosID := s.copyGuardCycleContext(cycleID)
 	operator := metadataString(metadata, "operator")
+	// Copy Guard now runs for any SupportsCopyGuard data source (OKX / Binance),
+	// so the event's provider must reflect the trader's actual config rather
+	// than a hard-coded value. Fall back to "okx" only if the lookup fails
+	// (best-effort; events are rare and never block the guard transaction).
+	providerType := "okx"
+	if p := s.copyGuardTraderProvider(traderID); p != "" {
+		providerType = p
+	}
 	ev := &CopyTradeEvent{
 		TraderID:      traderID,
 		LeaderID:      leaderID,
-		ProviderType:  "okx", // Copy Guard 仅 OKX 生效
+		ProviderType:  providerType,
 		Category:      category,
 		EventType:     eventType,
 		Severity:      severity,

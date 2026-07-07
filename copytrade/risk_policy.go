@@ -182,8 +182,8 @@ func ValidateRiskPolicyV4(c *CopyConfig) error {
 	if c.RiskPolicyVersion < 4 {
 		return nil
 	}
-	if c.ProviderType != ProviderOKX {
-		return fmt.Errorf("copy guard v4 is only supported for OKX")
+	if !SupportsCopyGuard(c.ProviderType) {
+		return fmt.Errorf("copy guard v4 is only supported for OKX or Binance leader sources")
 	}
 	if c.RiskStopMode != "volatility_priority" && c.RiskStopMode != "account_hard_limit" {
 		return fmt.Errorf("invalid risk_stop_mode %q", c.RiskStopMode)

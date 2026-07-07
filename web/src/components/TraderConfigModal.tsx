@@ -35,6 +35,12 @@ function getShortName(fullName: string): string {
   return parts.length > 1 ? parts[parts.length - 1] : fullName
 }
 
+// Copy Guard 账户保护支持的领航员数据源（与后端 copytrade.SupportsCopyGuard 对齐）。
+// Hyperliquid 无稳定的仓位级 posId，不进入 Copy Guard 状态机。
+function copyGuardCapableProvider(provider: CopyTradeProvider): boolean {
+  return provider === 'okx' || provider === 'binance'
+}
+
 // 交易所注册链接配置
 const EXCHANGE_REGISTRATION_LINKS: Record<
   string,
@@ -84,7 +90,7 @@ interface FormState {
   copy_binance_p20t: string
   copy_binance_csrf_token: string
   // ============================================================
-  // 账户保护 / 止损兜底（Copy Guard v5）—— 仅 OKX 路径生效
+  // 账户保护 / 止损兜底（Copy Guard v5）—— OKX / Binance 数据源生效
   // 所有字段都有合理默认值，用户可在 UI 调整。
   // v3 遗留字段（atr_enabled / reentry_tolerance / 反加仓铁律 /
   // stop_noise_floor / cycle_max_loss）已随 v5 下线。
@@ -448,14 +454,14 @@ export function TraderConfigModal({
     if (!onSave) return
 
     // v4.1：账户线语义为"灾难硬兜底"（默认 20%），确认阈值相应上调到 50%
-    // 仅 OKX 需要确认（Copy Guard 风控仅对 OKX 生效）
-    const isOKXCopyGuard =
+    // Copy Guard 风控对 OKX 与 Binance 领航员数据源生效
+    const isCopyGuardEnabled =
       formData.decision_mode === 'copy_trade' &&
-      formData.copy_provider_type === 'okx' &&
+      copyGuardCapableProvider(formData.copy_provider_type) &&
       formData.risk_policy_version >= 4
     let highRiskConfirmed = false
     if (
-      isOKXCopyGuard &&
+      isCopyGuardEnabled &&
       formData.risk_account_pct >= 50 &&
       !window.confirm(
         `账户灾难兜底线为 ${formData.risk_account_pct.toFixed(2)}%，属于极高风险配置。确认仍要保存吗？`
@@ -463,7 +469,7 @@ export function TraderConfigModal({
     ) {
       return
     }
-    if (isOKXCopyGuard && formData.risk_account_pct >= 50) {
+    if (isCopyGuardEnabled && formData.risk_account_pct >= 50) {
       highRiskConfirmed = true
     }
 
@@ -510,10 +516,10 @@ export function TraderConfigModal({
           sync_leverage: formData.copy_sync_leverage,
           sync_margin_mode: formData.copy_sync_margin_mode, // 同步保证金模式（仅 OKX 生效）
         }
-        // 账户保护 v5 风控（Copy Guard）仅 OKX 支持：
-        // 非 OKX 不携带任何 risk_* 字段（含 risk_policy_version），
-        // 否则后端 "v4 only for OKX" 校验会拒绝保存。
-        if (formData.copy_provider_type === 'okx') {
+        // 账户保护 v5 风控（Copy Guard）支持 OKX 与 Binance 领航员数据源：
+        // 不支持的数据源（Hyperliquid）不携带任何 risk_* 字段（含
+        // risk_policy_version），否则后端 "v4 only for OKX/Binance" 校验会拒绝保存。
+        if (copyGuardCapableProvider(formData.copy_provider_type)) {
           Object.assign(saveData.copy_config, {
             // 前端展示百分比 → 后端存比例，× 0.01 转换
             risk_stop_loss_enabled: formData.risk_stop_loss_enabled,
@@ -1135,11 +1141,12 @@ export function TraderConfigModal({
                   </div>
 
                   {/* ============================================================
-                      账户保护 / 止损兜底（v3 风控）—— 仅 OKX 路径生效
-                      显示规则：仅 copy_provider_type=okx 时显示
+                      账户保护 / 止损兜底（Copy Guard v5）—— OKX / Binance 数据源生效
+                      显示规则：copy_provider_type ∈ {okx, binance} 时显示
                       所有数值用百分比展示，提交时由 handleSave 转为比例
+                      保护单挂在跟随者执行交易所（须支持交易所托管条件单）
                       ============================================================ */}
-                  {formData.copy_provider_type === 'okx' && (
+                  {copyGuardCapableProvider(formData.copy_provider_type) && (
                     <div className="mt-4 p-4 bg-[#0B0E11] border border-[#F0B90B33] rounded-lg space-y-4">
                       <div className="flex items-center gap-2">
                         <svg
@@ -1156,7 +1163,7 @@ export function TraderConfigModal({
                           账户保护（止损兜底）
                         </span>
                         <span className="px-2 py-0.5 text-[10px] bg-[#F0B90B22] text-[#F0B90B] rounded">
-                          仅 OKX
+                          OKX / 币安
                         </span>
                       </div>
 

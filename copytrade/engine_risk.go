@@ -22,7 +22,9 @@ import (
 //   - 仓位保证金止损：日常主力线（默认 20% 保证金）
 //   - 账户硬兜底：单笔最多亏账户的 RiskAccountPct（默认 10%），只锁灾难敞口
 //
-// 仅 OKX 路径调用，HL/Binance 完全不走这里。v3 旧三层算法已于 v5 下线。
+// 由 SupportsCopyGuard 的数据源（OKX / Binance 领航员）在 v4+ 配置下调用；
+// Hyperliquid 完全不走这里。保护单始终挂在跟随者执行交易所（须支持交易所托管
+// 条件单，启动时由 validateV4ExecutorCapabilities 校验）。v3 旧三层算法已于 v5 下线。
 // ============================================================================
 
 // StopLossCalcInput 止损价计算输入
@@ -150,7 +152,7 @@ const addonBudgetEventInterval = 60 * time.Second
 // 时静默跳过。
 func (e *Engine) warnAddonRiskBudget(signal *TradeSignal, posID string, copySize float64) {
 	cfg := e.config
-	if cfg == nil || cfg.ProviderType != ProviderOKX || !cfg.RiskStopLossEnabled {
+	if cfg == nil || !SupportsCopyGuard(cfg.ProviderType) || !cfg.RiskStopLossEnabled {
 		return
 	}
 	budget := cfg.RiskAddonBudgetPct
@@ -376,12 +378,12 @@ func (e *Engine) findLocalPositionForMapping(localPositions map[string]*Position
 //  4. 连续 stopRiskSuspectThreshold 次确认（防 GetPositions API 抖动误判）
 //
 // 调用时机：每个 poll 周期同步领航员状态后
-// 仅 OKX 路径生效；HL/Binance 在 plan v1 暂不实现 SL 兜底
+// 由 SupportsCopyGuard 的数据源（OKX / Binance）在 v4+ 配置下生效；Hyperliquid 不走
 func (e *Engine) checkStoppedByRisk() {
 	if e.store == nil || e.config == nil {
 		return
 	}
-	if e.config.ProviderType != ProviderOKX {
+	if !SupportsCopyGuard(e.config.ProviderType) {
 		return
 	}
 	if !e.config.RiskStopLossEnabled {
@@ -549,7 +551,7 @@ func (e *Engine) checkReentryConditions() {
 	if e.store == nil || e.config == nil {
 		return
 	}
-	if e.config.ProviderType != ProviderOKX {
+	if !SupportsCopyGuard(e.config.ProviderType) {
 		return
 	}
 	if e.reentryCandidateTicks == nil {
@@ -1224,8 +1226,8 @@ const (
 	watchGateManualReentrySignal = "MANUAL_REENTRY_SIGNAL"
 	// 自动重入价格窗口塌缩为空集（恢复下界越过追价上限）→ 自动重入实质用尽
 	watchGateReentryWindowInfeasible = "REENTRY_WINDOW_INFEASIBLE"
-	watchSampleInterval       = 60 * time.Second         // 固定间隔采样（gate 不变时）
-	watchResumeGapMultiplier  = 5                        // 采样断档 > 间隔×该倍数 → 记 WATCH_RESUMED
+	watchSampleInterval              = 60 * time.Second // 固定间隔采样（gate 不变时）
+	watchResumeGapMultiplier         = 5                // 采样断档 > 间隔×该倍数 → 记 WATCH_RESUMED
 	// 人工重入建议金额低于最小下单额时抬到 门槛×该系数（滑点/手续费余地），
 	// 与 ConfirmManualReentry 的执行侧兜底保持同一常量。
 	manualReentryMinNotionalHeadroom = 1.2

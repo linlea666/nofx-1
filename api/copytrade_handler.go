@@ -740,8 +740,8 @@ func (h *CopyTradeHandler) SaveConfig(c *gin.Context) {
 		config.RiskManualReentryEnabled = true // 默认 on
 	}
 	applyCopyGuardV4Request(config, existing, &req)
-	if config.RiskPolicyVersion >= 4 && config.ProviderType != "okx" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "copy guard is only supported for OKX"})
+	if config.RiskPolicyVersion >= 4 && !copytrade.SupportsCopyGuard(copytrade.ProviderType(config.ProviderType)) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "copy guard is only supported for OKX or Binance leader sources"})
 		return
 	}
 	// v5：账户线是硬兜底（默认 10%），>= 50% 属于极端配置需二次确认。

@@ -15,6 +15,23 @@ const (
 	ProviderBinance     ProviderType = "binance"
 )
 
+// SupportsCopyGuard reports whether a leader data source is eligible for Copy
+// Guard account protection (exchange-managed stop loss + confirmed reentry).
+//
+// Hyperliquid is excluded: it has no stable per-position id and a different
+// fill lifecycle. OKX and Binance both expose per-position lifecycles that the
+// guard's cycle model (keyed by leaderPosID) relies on.
+//
+// This predicate gates only the *leader data source*. Copy Guard places
+// protective stops on the *follower execution venue*, which must independently
+// support exchange-managed protective stops; that capability is validated
+// separately at engine start (validateV4ExecutorCapabilities). A supported
+// data source combined with an execution venue that cannot honor protective
+// stops fails loudly at start rather than running unprotected.
+func SupportsCopyGuard(p ProviderType) bool {
+	return p == ProviderOKX || p == ProviderBinance
+}
+
 // ActionType 交易动作类型
 type ActionType string
 
@@ -130,7 +147,7 @@ type CopyConfig struct {
 	// v3 旧策略与噪音下限/周期熔断/反加仓铁律等参数已于 v5 下线
 	// ============================================================
 	RiskStopLossEnabled  bool    `json:"risk_stop_loss_enabled"`
-	RiskAccountPct       float64 `json:"risk_account_pct"` // v5：单笔账户最大亏损硬兜底，默认 0.10
+	RiskAccountPct       float64 `json:"risk_account_pct"`    // v5：单笔账户最大亏损硬兜底，默认 0.10
 	RiskATRMultiplier    float64 `json:"risk_atr_multiplier"` // v5.2：止损距离基线 k×ATR，默认 2.0
 	RiskATRTimeframe     string  `json:"risk_atr_timeframe"`
 	RiskLeverageFallback bool    `json:"risk_leverage_fallback"` // v5.2：margin_cap 开关，默认 false（关）
@@ -305,18 +322,18 @@ type RiskEvent struct {
 	ReentrySize       float64 // 重入金额（USDT）（manual：建议重入名义）
 
 	// 人工重入信号快照（仅 Type=RiskEventManualReentrySignal 有效）
-	ManualSignalID  int64   // copy_guard_manual_reentry_signals.id
-	CycleID         int64   // 所属 Copy Guard 周期
-	StopCount       int     // 周期累计止损次数
-	ReentryCount    int     // 周期已自动重入次数
-	Protectable     bool    // 可保护性预检（仅提示，不拦截人工确认）
-	NoiseRatio      float64 // 止损距离/ATR（噪音档参考，0=数据缺失）
-	CurrentATR      float64 // 信号触发时 ATR
-	LastStopPrice   float64 // 最近一次止损成交价（0=数据缺失）
-	EstStopDistance float64 // 预算止损距离（供邮件展示建议止损价，0=未预检）
-	ChaseLimit      float64 // 自动路径追价上限（0=未计算；人工路径忽略但用于提示）
-	ChaseExceededBy float64 // 当前价超出追价上限的幅度（>0 表示强反转追入）
-	WindowInfeasible bool   // 自动重入窗口是否已塌缩为空集
+	ManualSignalID   int64   // copy_guard_manual_reentry_signals.id
+	CycleID          int64   // 所属 Copy Guard 周期
+	StopCount        int     // 周期累计止损次数
+	ReentryCount     int     // 周期已自动重入次数
+	Protectable      bool    // 可保护性预检（仅提示，不拦截人工确认）
+	NoiseRatio       float64 // 止损距离/ATR（噪音档参考，0=数据缺失）
+	CurrentATR       float64 // 信号触发时 ATR
+	LastStopPrice    float64 // 最近一次止损成交价（0=数据缺失）
+	EstStopDistance  float64 // 预算止损距离（供邮件展示建议止损价，0=未预检）
+	ChaseLimit       float64 // 自动路径追价上限（0=未计算；人工路径忽略但用于提示）
+	ChaseExceededBy  float64 // 当前价超出追价上限的幅度（>0 表示强反转追入）
+	WindowInfeasible bool    // 自动重入窗口是否已塌缩为空集
 }
 
 // PositionKey 生成仓位的唯一键 (不含保证金模式，向后兼容)

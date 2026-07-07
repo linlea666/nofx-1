@@ -68,15 +68,23 @@ type FreshPositionsProvider interface {
 	GetPositionsFresh() ([]map[string]interface{}, error)
 }
 
+// ProtectiveStopCapabilityChecker lets Copy Guard probe whether the concrete
+// execution exchange (not the AutoTrader wrapper) can place exchange-managed
+// protective stops, so startup can reject incapable venues up front.
+type ProtectiveStopCapabilityChecker interface {
+	SupportsProtectiveStops() bool
+}
+
 var (
-	_ DecisionExecutor            = (*trader.AutoTrader)(nil)
-	_ StopLossManager             = (*trader.AutoTrader)(nil)
-	_ ProtectiveStopManagerV4     = (*trader.AutoTrader)(nil)
-	_ ClosedPnLProvider           = (*trader.AutoTrader)(nil)
-	_ ClosedPnLByPositionProvider = (*trader.AutoTrader)(nil)
-	_ OrderStatusProvider         = (*trader.AutoTrader)(nil)
-	_ ClientOrderStatusProvider   = (*trader.AutoTrader)(nil)
-	_ FreshPositionsProvider      = (*trader.AutoTrader)(nil)
+	_ DecisionExecutor                = (*trader.AutoTrader)(nil)
+	_ StopLossManager                 = (*trader.AutoTrader)(nil)
+	_ ProtectiveStopManagerV4         = (*trader.AutoTrader)(nil)
+	_ ClosedPnLProvider               = (*trader.AutoTrader)(nil)
+	_ ClosedPnLByPositionProvider     = (*trader.AutoTrader)(nil)
+	_ OrderStatusProvider             = (*trader.AutoTrader)(nil)
+	_ ClientOrderStatusProvider       = (*trader.AutoTrader)(nil)
+	_ FreshPositionsProvider          = (*trader.AutoTrader)(nil)
+	_ ProtectiveStopCapabilityChecker = (*trader.AutoTrader)(nil)
 )
 
 // mappingFailureCircuitThreshold 跟单 active mapping 的连续失败熔断阈值。
@@ -148,7 +156,7 @@ func (ti *TraderIntegration) StartCopyTrading() error {
 	if !copyConfig.Enabled {
 		return fmt.Errorf("copy trade is not enabled for trader %s", ti.traderID)
 	}
-	if ProviderType(copyConfig.ProviderType) == ProviderOKX && copyConfig.RiskPolicyVersion >= 4 {
+	if SupportsCopyGuard(ProviderType(copyConfig.ProviderType)) && copyConfig.RiskPolicyVersion >= 4 {
 		if err := validateV4ExecutorCapabilities(ti.executor); err != nil {
 			return fmt.Errorf("Copy Guard v4 runtime unavailable: %w", err)
 		}
@@ -285,7 +293,7 @@ func (ti *TraderIntegration) StartCopyTrading() error {
 	go ti.consumeDecisions()
 	// 启动风控事件消费协程（v3 风控：SL 触发 / 二次进场告警邮件）
 	go ti.consumeRiskEvents()
-	if engineConfig.ProviderType == ProviderOKX && engineConfig.RiskPolicyVersion >= 4 {
+	if SupportsCopyGuard(engineConfig.ProviderType) && engineConfig.RiskPolicyVersion >= 4 {
 		if !engineConfig.RiskStopLossEnabled {
 			// 用户关闭了「账户保护止损」开关：撤销交易所上仍存活的保护单。
 			// 若不清理，UI 显示"已关闭"但交易所止损单还活着可能触发，
@@ -319,6 +327,16 @@ func validateV4ExecutorCapabilities(executor DecisionExecutor) error {
 		if !check.ok {
 			return fmt.Errorf("executor does not support %s", check.name)
 		}
+	}
+	// The interface checks above always pass for *trader.AutoTrader (its
+	// protective-stop methods exist at compile time and error only at runtime
+	// when the wrapped exchange lacks support). This runtime probe inspects the
+	// concrete exchange so a supported data source (e.g. Binance leader) paired
+	// with an execution venue that cannot place exchange-managed protective
+	// stops fails loudly at start instead of degrading into a retry loop that
+	// would eventually force-close positions as unprotectable.
+	if checker, ok := executor.(ProtectiveStopCapabilityChecker); ok && !checker.SupportsProtectiveStops() {
+		return fmt.Errorf("execution exchange does not support exchange-managed protective stops")
 	}
 	return nil
 }
@@ -361,7 +379,7 @@ func (ti *TraderIntegration) backfillV4Cycles() {
 		return
 	}
 	cfg := ti.engine.config
-	if cfg.ProviderType != ProviderOKX || cfg.RiskPolicyVersion < 4 || !cfg.RiskStopLossEnabled {
+	if !SupportsCopyGuard(cfg.ProviderType) || cfg.RiskPolicyVersion < 4 || !cfg.RiskStopLossEnabled {
 		return
 	}
 	if time.Since(ti.lastV4Backfill) < backfillV4CyclesEvery {
@@ -1963,7 +1981,7 @@ func (ti *TraderIntegration) updatePositionMapping(dec *decision.Decision) {
 		if existingMapping != nil && existingMapping.Side != expectedSide {
 			logger.Warnf("⚠️ [%s] posId 方向变更检测 | posId=%s 旧 side=%s 新 side=%s → 关闭旧映射并重建",
 				ti.traderID, dec.LeaderPosID, existingMapping.Side, expectedSide)
-			if ti.engine.config.ProviderType == ProviderOKX && ti.engine.config.RiskPolicyVersion >= 4 {
+			if SupportsCopyGuard(ti.engine.config.ProviderType) && ti.engine.config.RiskPolicyVersion >= 4 {
 				if oldCycle, cycleErr := copyTradeStore.GetOpenCopyGuardCycle(ti.traderID, dec.LeaderPosID); cycleErr == nil {
 					if mgr, ok := ti.executor.(ProtectiveStopManagerV4); ok {
 						if order, orderErr := copyTradeStore.GetCopyGuardProtectiveOrder(oldCycle.ID); orderErr == nil {
@@ -2017,7 +2035,7 @@ func (ti *TraderIntegration) updatePositionMapping(dec *decision.Decision) {
 			} else {
 				logger.Infof("📝 [%s] 仓位映射已保存 | posId=%s %s %s %s lastKnownSize=%.4f",
 					ti.traderID, dec.LeaderPosID, dec.Symbol, expectedSide, dec.MarginMode, dec.LeaderPosSize)
-				if ti.engine.config.ProviderType == ProviderOKX && ti.engine.config.RiskPolicyVersion >= 4 && ti.engine.config.RiskStopLossEnabled {
+				if SupportsCopyGuard(ti.engine.config.ProviderType) && ti.engine.config.RiskPolicyVersion >= 4 && ti.engine.config.RiskStopLossEnabled {
 					policyJSON, _ := json.Marshal(ti.engine.config)
 					cycle, cerr := copyTradeStore.EnsureCopyGuardCycle(&store.CopyGuardCycle{TraderID: ti.traderID, LeaderID: ti.engine.config.LeaderID, LeaderPosID: dec.LeaderPosID, Symbol: dec.Symbol, Side: expectedSide, MarginMode: dec.MarginMode, Status: store.CopyGuardFollowing, PolicySnapshot: string(policyJSON), LeaderEntryPrice: dec.EntryPrice, FollowerEntryPrice: dec.EntryPrice, FollowerNotional: dec.PositionSizeUSD, AccountEquity: ti.getEquityFunc()(), LastObservedPrice: dec.EntryPrice})
 					if cerr != nil {
@@ -2029,7 +2047,7 @@ func (ti *TraderIntegration) updatePositionMapping(dec *decision.Decision) {
 				}
 			}
 		}
-		if ti.engine.config.ProviderType == ProviderOKX && ti.engine.config.RiskPolicyVersion >= 4 && dec.ExchangeOrderID != "" {
+		if SupportsCopyGuard(ti.engine.config.ProviderType) && ti.engine.config.RiskPolicyVersion >= 4 && dec.ExchangeOrderID != "" {
 			if cycle, cycleErr := copyTradeStore.GetOpenCopyGuardCycle(ti.traderID, dec.LeaderPosID); cycleErr == nil {
 				_ = copyTradeStore.UpdateCopyGuardExecutionOrder(cycle.ID, dec.ExchangeOrderID, "")
 				_ = copyTradeStore.UpdateCopyGuardAttemptIdentity(cycle.ID, cycle.ReentryCount, "", dec.ExchangeOrderID, "")
@@ -2047,14 +2065,14 @@ func (ti *TraderIntegration) updatePositionMapping(dec *decision.Decision) {
 				logger.Warnf("⚠️ [%s] 更新 lastKnownSize 失败: %v", ti.traderID, err)
 			}
 		}
-		if ti.engine.config.ProviderType == ProviderOKX && ti.engine.config.RiskPolicyVersion >= 4 && dec.ExchangeOrderID != "" {
+		if SupportsCopyGuard(ti.engine.config.ProviderType) && ti.engine.config.RiskPolicyVersion >= 4 && dec.ExchangeOrderID != "" {
 			if cycle, cycleErr := copyTradeStore.GetOpenCopyGuardCycle(ti.traderID, dec.LeaderPosID); cycleErr == nil {
 				_ = copyTradeStore.UpdateCopyGuardExecutionOrder(cycle.ID, "", dec.ExchangeOrderID)
 			}
 		}
 
 	case "close_long", "close_short":
-		if ti.engine.config.ProviderType == ProviderOKX && ti.engine.config.RiskPolicyVersion >= 4 {
+		if SupportsCopyGuard(ti.engine.config.ProviderType) && ti.engine.config.RiskPolicyVersion >= 4 {
 			ti.finalizeCopyGuardCycle(dec)
 		}
 		// 平仓：关闭映射
@@ -2109,7 +2127,7 @@ func (ti *TraderIntegration) finalizeCopyGuardCycle(dec *decision.Decision) {
 }
 
 func (ti *TraderIntegration) captureV4FollowerBeforeClose(dec *decision.Decision) {
-	if dec == nil || ti.engine == nil || ti.engine.config == nil || ti.engine.config.ProviderType != ProviderOKX || ti.engine.config.RiskPolicyVersion < 4 {
+	if dec == nil || ti.engine == nil || ti.engine.config == nil || !SupportsCopyGuard(ti.engine.config.ProviderType) || ti.engine.config.RiskPolicyVersion < 4 {
 		return
 	}
 	if dec.Action != "close_long" && dec.Action != "close_short" {
@@ -2377,7 +2395,17 @@ func (ti *TraderIntegration) shouldManageStopLoss(dec *decision.Decision) bool {
 	if ti.engine == nil || ti.engine.config == nil {
 		return false
 	}
-	if ti.engine.config.ProviderType != ProviderOKX {
+	if !SupportsCopyGuard(ti.engine.config.ProviderType) {
+		return false
+	}
+	// Copy Guard protective stops are a v4+ feature: cycles are only created for
+	// v4 configs. Gating on the version here keeps this in lockstep with cycle
+	// creation so we never try to attach a protective stop to a lifecycle that
+	// was never opened (legacy configs, e.g. a Binance follower whose stored
+	// risk_stop_loss_enabled defaults to true but risk_policy_version is 0).
+	// For OKX this is a no-op: an OKX follower with stop loss enabled is always
+	// upgraded to v4 (upgradeLegacyRiskPolicy).
+	if ti.engine.config.RiskPolicyVersion < 4 {
 		return false
 	}
 	if !ti.engine.config.RiskStopLossEnabled {

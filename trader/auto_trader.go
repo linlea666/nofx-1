@@ -843,6 +843,18 @@ func (at *AutoTrader) GetMarketPrice(symbol string) (float64, error) {
 	return at.trader.GetMarketPrice(symbol)
 }
 
+// SupportsProtectiveStops reports whether the underlying exchange trader can
+// place exchange-managed protective stops (Copy Guard). It inspects the
+// concrete trader rather than the AutoTrader wrapper: AutoTrader always
+// satisfies ProtectiveStopManager at compile time (the methods exist) but they
+// return errors at runtime when the wrapped exchange lacks support. Callers
+// (Copy Guard startup validation) use this to fail fast on incapable execution
+// venues instead of degrading into a protective-stop retry loop.
+func (at *AutoTrader) SupportsProtectiveStops() bool {
+	_, ok := at.trader.(ProtectiveStopManager)
+	return ok
+}
+
 func (at *AutoTrader) PlaceProtectiveStop(req ProtectiveStopRequest) (*ProtectiveStopOrder, error) {
 	mgr, ok := at.trader.(ProtectiveStopManager)
 	if !ok {

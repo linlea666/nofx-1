@@ -1417,7 +1417,7 @@ func (e *Engine) buildDecisionV2(signal *TradeSignal, match *SignalMatchResult, 
 		// upsertV4Protection 状态机挂出（含 clamp / GUARD_UNPROTECTABLE 处置）。
 		// v5：账户线已是硬 cap（ExpectedLossPct 不可能超过 RiskAccountPct），
 		// 旧的"预计损失超警戒"告警已无意义，随 v3 一并移除。
-		if e.config.ProviderType == ProviderOKX && e.config.RiskStopLossEnabled && copySize > 0 {
+		if SupportsCopyGuard(e.config.ProviderType) && e.config.RiskPolicyVersion >= 4 && e.config.RiskStopLossEnabled && copySize > 0 {
 			slInput := &StopLossCalcInput{
 				Symbol:         fill.Symbol,
 				Side:           fill.PositionSide,
@@ -2075,12 +2075,15 @@ func (e *Engine) syncLeaderState() error {
 	// 🔑 v3 风控：SL 触发对账 + 二次进场监控（仅 OKX）
 	// 调用时机：领航员状态刚同步完，本地持仓由 getFollowerPositions() 实时取
 	// 设计原则：放在 syncLeaderState 末尾，保证所有 active mapping 的对账用最新数据
-	if e.config != nil && e.config.ProviderType == ProviderOKX {
+	// Copy Guard risk reconciliation runs for supported data sources on v4+
+	// configs. The version gate keeps legacy configs (e.g. a Binance follower
+	// whose stored risk_stop_loss_enabled defaults to true but
+	// risk_policy_version is 0) out of the stop/reentry state machine; OKX with
+	// stop loss enabled is always v4, so behavior there is unchanged.
+	if e.config != nil && SupportsCopyGuard(e.config.ProviderType) && e.config.RiskPolicyVersion >= 4 {
 		e.checkStoppedByRisk()
 		e.checkReentryConditions()
-		if e.config.RiskPolicyVersion >= 4 {
-			e.refreshEstimatedBaselines()
-		}
+		e.refreshEstimatedBaselines()
 	}
 
 	return nil
