@@ -961,12 +961,14 @@ export const api = {
       events: import('../types').CopyTradeEvent[]
       count: number
       total: number
+      traders?: Record<string, string> // 全部交易员 id->名称，供筛选下拉
     }>(`${API_BASE}/copytrade/events${params}`)
     if (!result.success)
       throw new Error(result.message || '获取跟单事件日志失败')
     return {
       events: result.data!.events ?? [],
       total: result.data!.total ?? 0,
+      traders: result.data!.traders ?? {},
     }
   },
 

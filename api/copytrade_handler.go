@@ -95,6 +95,29 @@ func (h *CopyTradeHandler) ownedTraderIDs(c *gin.Context) ([]string, map[string]
 	}
 	return ids, set, names, nil
 }
+
+// allTraderIDs 系统内全部交易员（跨用户），仅供跟单事件日志的只读查询/导出使用：
+// 全部账户由管理员操作，AI 分析需要所有交易员的完整事件时间线。
+// 注意：写操作与其他归属敏感接口必须继续走 ownedTraderIDs，不得改用本函数。
+func (h *CopyTradeHandler) allTraderIDs(c *gin.Context) ([]string, map[string]string, error) {
+	list, err := h.store.Trader().ListAll()
+	if err != nil {
+		return nil, nil, err
+	}
+	ids := make([]string, 0, len(list))
+	names := map[string]string{}
+	filter := strings.TrimSpace(c.Query("trader_id"))
+	for _, t := range list {
+		// names 覆盖全部交易员，便于回填历史事件的名称（即使按 trader_id 收窄查询）
+		names[t.ID] = t.Name
+		if filter != "" && t.ID != filter {
+			continue
+		}
+		ids = append(ids, t.ID)
+	}
+	return ids, names, nil
+}
+
 func riskTimeRange(c *gin.Context) (time.Time, time.Time) {
 	to := time.Now().UTC().Add(time.Second)
 	from := to.AddDate(0, 0, -30)
@@ -347,9 +370,10 @@ func copyEventFilter(c *gin.Context) store.CopyEventFilter {
 	}
 }
 
-// GetCopyEvents 查询当前用户名下交易员的跟单事件（时间倒序，分页）。
+// GetCopyEvents 查询系统内全部交易员的跟单事件（时间倒序，分页）。
+// 作用域为全局（跨用户）：见 allTraderIDs 说明。响应额外携带 traders（id->名称）供前端筛选下拉使用。
 func (h *CopyTradeHandler) GetCopyEvents(c *gin.Context) {
-	ids, _, names, err := h.ownedTraderIDs(c)
+	ids, names, err := h.allTraderIDs(c)
 	if err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
@@ -371,12 +395,13 @@ func (h *CopyTradeHandler) GetCopyEvents(c *gin.Context) {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(200, gin.H{"events": events, "count": len(events), "total": total, "from": from, "to": to})
+	c.JSON(200, gin.H{"events": events, "count": len(events), "total": total, "from": from, "to": to, "traders": names})
 }
 
 // ExportCopyEvents 导出跟单事件（csv|jsonl），时间戳为 ISO UTC，便于喂 AI 分析。
+// 作用域为全局（跨用户）：见 allTraderIDs 说明。
 func (h *CopyTradeHandler) ExportCopyEvents(c *gin.Context) {
-	ids, _, names, err := h.ownedTraderIDs(c)
+	ids, names, err := h.allTraderIDs(c)
 	if err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return

@@ -140,6 +140,15 @@ export function CopyEventLogPage() {
   const events = data?.events ?? []
   const total = data?.total ?? 0
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
+  // 全部交易员 id->名称（后端随查询返回，跨用户全局），用于筛选下拉
+  const traders = data?.traders ?? {}
+  const traderOptions = useMemo(
+    () =>
+      Object.entries(traders).sort((a, b) =>
+        (a[1] || a[0]).localeCompare(b[1] || b[0])
+      ),
+    [traders]
+  )
 
   const exportEvents = async (format: 'csv' | 'jsonl') => {
     const token = localStorage.getItem('auth_token')
@@ -249,12 +258,18 @@ export function CopyEventLogPage() {
           placeholder="交易对，如 BTCUSDT"
           className={selectClass}
         />
-        <input
+        <select
           value={traderID}
           onChange={(e) => setTraderID(e.target.value)}
-          placeholder="跟单员 ID"
           className={selectClass}
-        />
+        >
+          <option value="">全部交易员</option>
+          {traderOptions.map(([id, name]) => (
+            <option key={id} value={id}>
+              {name || id}
+            </option>
+          ))}
+        </select>
       </div>
 
       <p className="text-xs text-[#5E6673]">
@@ -270,6 +285,7 @@ export function CopyEventLogPage() {
           <thead className="text-left border-b border-[#2B3139] text-[#848E9C]">
             <tr>
               <th className="py-2 px-2">时间</th>
+              <th className="py-2 px-2">交易员</th>
               <th className="py-2 px-2">交易对</th>
               <th className="py-2 px-2">数据源</th>
               <th className="py-2 px-2">分类</th>
@@ -297,6 +313,12 @@ export function CopyEventLogPage() {
                 >
                   <td className="py-2 px-2 whitespace-nowrap text-[#B7BDC6]">
                     {new Date(e.created_at).toLocaleString()}
+                  </td>
+                  <td
+                    className="py-2 px-2 max-w-[140px] truncate text-[#EAECEF]"
+                    title={e.trader_id}
+                  >
+                    {e.trader_name || e.trader_id || '-'}
                   </td>
                   <td className="py-2 px-2 font-medium">{e.symbol || '-'}</td>
                   <td className="py-2 px-2 text-[#848E9C]">
@@ -394,7 +416,7 @@ export function CopyEventLogPage() {
             })}
             {events.length === 0 && (
               <tr>
-                <td colSpan={13} className="py-10 text-center text-[#5E6673]">
+                <td colSpan={14} className="py-10 text-center text-[#5E6673]">
                   {isLoading ? '加载中…' : '当前时间窗与过滤条件下暂无事件'}
                 </td>
               </tr>
