@@ -63,6 +63,8 @@ const eventTypeLabels: Record<string, string> = {
   BASELINE_CALIBRATED: '基线校准',
   LEADER_CLOSED: '领航员平仓',
   LEADER_REVERSED: '领航员反手',
+  ENGINE_START_FAILED: '引擎启动失败',
+  BINANCE_CREDENTIALS_EXPIRED: '凭证失效',
 }
 
 const statusLabels: Record<string, string> = {

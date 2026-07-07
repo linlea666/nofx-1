@@ -220,6 +220,25 @@ func (e *Engine) reportBinanceCredentialsExpired(err error, where string) bool {
 		// 🔑 全局唯一限流键：无论多少 trader 触发，60s 内只发一封
 		RateKey: "binance_creds_expired|" + label,
 	})
+
+	// Seam D：凭证失效会让 Binance 跟单静默停跟，写入统一日志便于排查。
+	// best-effort + 小时分桶去重（凭证检查可能每轮触发，避免刷屏）。
+	if e.store != nil {
+		if lerr := e.store.CopyTrade().LogCopyEvent(&store.CopyTradeEvent{
+			TraderID:     e.traderID,
+			LeaderID:     e.config.LeaderID,
+			ProviderType: string(e.config.ProviderType),
+			Category:     store.CopyEventCategoryError,
+			EventType:    "BINANCE_CREDENTIALS_EXPIRED",
+			Severity:     store.CopyEventSeverityError,
+			Status:       "failed",
+			Summary:      "Binance 跟单凭证未配置或已过期，跟单已停跟",
+			Detail:       map[string]interface{}{"where": where, "affected_traders": len(affectedTraders)},
+			DedupKey:     fmt.Sprintf("err|%s|binance_creds_expired|%d", e.traderID, time.Now().Unix()/3600),
+		}); lerr != nil {
+			logger.Warnf("⚠️ [%s] 保存凭证失效事件到跟单日志失败: %v", e.traderID, lerr)
+		}
+	}
 	return true
 }
 

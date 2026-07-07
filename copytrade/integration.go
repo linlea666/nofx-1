@@ -265,6 +265,19 @@ func (ti *TraderIntegration) StartCopyTrading() error {
 				"Reason":   err.Error(),
 			},
 		})
+		// Seam D：引擎启动失败（跟随者根本起不来）也进统一日志，便于追踪。
+		// 按小时分桶去重，避免重启循环刷屏。
+		ti.recordCopyEvent(&store.CopyTradeEvent{
+			LeaderID:     copyConfig.LeaderID,
+			ProviderType: copyConfig.ProviderType,
+			Category:     store.CopyEventCategoryError,
+			EventType:    "ENGINE_START_FAILED",
+			Severity:     store.CopyEventSeverityError,
+			Status:       "failed",
+			Summary:      fmt.Sprintf("跟单引擎启动失败: %s", err.Error()),
+			Detail:       map[string]interface{}{"error": err.Error()},
+			DedupKey:     fmt.Sprintf("err|%s|engine_start|%d", ti.traderID, time.Now().Unix()/3600),
+		})
 		return fmt.Errorf("failed to start copy trade engine: %w", err)
 	}
 
