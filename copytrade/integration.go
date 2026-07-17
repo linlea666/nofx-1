@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"nofx/copyguardmetrics"
 	"nofx/decision"
 	"nofx/logger"
 	"nofx/market"
@@ -269,26 +270,30 @@ func (ti *TraderIntegration) StartCopyTrading() error {
 
 	// 启动引擎
 	if err := engine.Start(ti.ctx); err != nil {
+		traderName := ti.traderDisplayName()
 		// 异步发送邮件告警（未启用通知器时为 no-op）
 		notifier.Notify(notifier.Alert{
-			Category: "copy_trade",
-			TraderID: ti.traderID,
-			Title:    "跟单引擎启动失败",
+			Category:   "copy_trade",
+			TraderID:   ti.traderID,
+			TraderName: traderName,
+			Title:      "跟单引擎启动失败",
 			Body: fmt.Sprintf(
 				"跟单引擎启动失败 (Copy Trade Engine Start Failed)\n\n"+
+					"Trader Name: %s\n"+
 					"Trader ID: %s\n"+
 					"Provider:  %s\n"+
 					"Leader ID: %s\n\n"+
 					"错误信息 (Error):\n%s",
-				ti.traderID,
+				traderName, ti.traderID,
 				copyConfig.ProviderType,
 				copyConfig.LeaderID,
 				err.Error(),
 			),
 			Fields: map[string]string{
-				"Provider": copyConfig.ProviderType,
-				"Leader":   copyConfig.LeaderID,
-				"Reason":   err.Error(),
+				"TraderName": traderName,
+				"Provider":   copyConfig.ProviderType,
+				"Leader":     copyConfig.LeaderID,
+				"Reason":     err.Error(),
 			},
 		})
 		// Seam D：引擎启动失败（跟随者根本起不来）也进统一日志，便于追踪。
@@ -502,9 +507,16 @@ func (ti *TraderIntegration) notifyCycleClosedSummary(cycle *store.CopyGuardCycl
 	attemptNo := cycle.ReentryCount
 	generation := 0
 	key := fmt.Sprintf("CYCLE_CLOSED_SUMMARY|%s|%d|%d|%d", ti.traderID, cycle.ID, attemptNo, generation)
+	aiSummary, aiEvaluationErr := copyguardmetrics.EvaluateCycleAIDecisions(ti.store, cycle.ID)
+	if aiEvaluationErr != nil {
+		logger.Warnf("⚠️ [%s] Copy Guard 周期汇总 AI 后验评价失败 cycle=%d: %v", ti.traderID, cycle.ID, aiEvaluationErr)
+	}
 	if policy.NotificationLevel == "critical" {
 		_ = ti.saveCycleSummaryEmailStatus(cycle, notifier.DeliveryDisabled, key, "notification level is critical")
 		return
+	}
+	if aiEvaluationErr != nil {
+		return // keep the summary pending; the next scan retries idempotently
 	}
 	attempts, err := ti.store.CopyTrade().ListCopyGuardAttempts(cycle.ID)
 	if err != nil {
@@ -527,12 +539,16 @@ func (ti *TraderIntegration) notifyCycleClosedSummary(cycle *store.CopyGuardCycl
 		}
 	}
 	traderName := ti.traderDisplayName()
+	aiEffect := "本周期没有生产 AI 候选决策"
+	if aiSummary != nil && aiSummary.TotalDecisions > 0 {
+		aiEffect = fmt.Sprintf("AI 决策: %d 次（可评价 %d / 数据不足 %d）\n最终决策: %s\n最终效果: %s\n错过反转: %d\n正确放弃: %d\n风控避免坏入场: %d\n实际重入盈亏: %+.4f USDT\n评价版本: v%d", aiSummary.TotalDecisions, aiSummary.ScorableDecisions, aiSummary.UnscorableDecisions, aiSummary.FinalDecision, aiSummary.FinalDecisionOutcome, aiSummary.MissedReversals, aiSummary.CorrectAbandons, aiSummary.RiskGateSavedLosses, aiSummary.ActualReentryPnL, aiSummary.EvaluationVersion)
+	}
 	notifier.Notify(notifier.Alert{
-		Category: "copy_trade", TraderID: ti.traderID,
+		Category: "copy_trade", TraderID: ti.traderID, TraderName: traderName,
 		Title:   fmt.Sprintf("%s | Copy Guard 周期结束汇总 %s %s", traderName, cycle.Symbol, cycle.Side),
-		Body:    fmt.Sprintf("Trader Name: %s\nTrader ID: %s\nCycle: %d\nLeader Position: %s\nSymbol / Side: %s / %s\n\n实际 Copy Guard: %+.4f USDT\n无 Copy Guard 基线: %+.4f USDT\n只止损: %+.4f USDT\n第一次重入贡献: %+.4f USDT\n第二次重入贡献: %+.4f USDT\n全部重入贡献: %+.4f USDT\n净保护效果: %+.4f USDT\n手续费: %.4f USDT\n滑点: %.4f USDT\n对账状态: %s", traderName, ti.traderID, cycle.ID, cycle.LeaderPosID, cycle.Symbol, cycle.Side, cycle.ActualPnL, cycle.BaselinePnL, stopOnly, first, second, reentry, cycle.NetGuardEffect, cycle.Fees, cycle.Slippage, cycle.AccountingStatus),
+		Body:    fmt.Sprintf("Trader Name: %s\nTrader ID: %s\nCycle: %d\nLeader Position: %s\nSymbol / Side: %s / %s\n\n实际 Copy Guard: %+.4f USDT\n无 Copy Guard 基线: %+.4f USDT\n只止损: %+.4f USDT\n第一次重入贡献: %+.4f USDT\n第二次重入贡献: %+.4f USDT\n全部重入贡献: %+.4f USDT\n净保护效果: %+.4f USDT\n手续费: %.4f USDT\n滑点: %.4f USDT\n对账状态: %s\n\n--- AI 决策效果 ---\n%s", traderName, ti.traderID, cycle.ID, cycle.LeaderPosID, cycle.Symbol, cycle.Side, cycle.ActualPnL, cycle.BaselinePnL, stopOnly, first, second, reentry, cycle.NetGuardEffect, cycle.Fees, cycle.Slippage, cycle.AccountingStatus, aiEffect),
 		RateKey: key, DedupKey: key,
-		Fields: map[string]string{"CycleID": fmt.Sprint(cycle.ID), "AttemptNo": fmt.Sprint(attemptNo), "Generation": fmt.Sprint(generation), "AccountingStatus": cycle.AccountingStatus},
+		Fields: map[string]string{"TraderName": traderName, "CycleID": fmt.Sprint(cycle.ID), "AttemptNo": fmt.Sprint(attemptNo), "Generation": fmt.Sprint(generation), "AccountingStatus": cycle.AccountingStatus},
 		StatusHook: func(status notifier.DeliveryStatus, deliveryErr error) {
 			if err := ti.saveCycleSummaryEmailStatus(cycle, status, key, errorString(deliveryErr)); err != nil {
 				logger.Warnf("⚠️ [%s] Copy Guard 邮件状态落库失败 cycle=%d status=%s: %v", ti.traderID, cycle.ID, status, err)
@@ -1458,12 +1474,13 @@ func (ti *TraderIntegration) executeFullDecision(fullDec *decision.FullDecision)
 
 				// 异步发送邮件告警（未启用通知器时为 no-op，零阻塞、零副作用）
 				notifier.Notify(notifier.Alert{
-					Category: "copy_trade",
-					TraderID: ti.traderID,
-					Title:    fmt.Sprintf("%s | %s %s 失败", traderName, dec.Action, dec.Symbol),
-					Body:     ti.buildExecFailureAlertBody(dec, err, traderName),
-					RateKey:  alertKey,
-					DedupKey: alertKey,
+					Category:   "copy_trade",
+					TraderID:   ti.traderID,
+					TraderName: traderName,
+					Title:      fmt.Sprintf("%s | %s %s 失败", traderName, dec.Action, dec.Symbol),
+					Body:       ti.buildExecFailureAlertBody(dec, err, traderName),
+					RateKey:    alertKey,
+					DedupKey:   alertKey,
 					Fields: map[string]string{
 						"TraderName":  traderName,
 						"Provider":    string(ti.engine.config.ProviderType),
@@ -1724,9 +1741,10 @@ func (ti *TraderIntegration) checkAndTripMappingCircuit(dec *decision.Decision, 
 
 	alertKey := fmt.Sprintf("circuit|%s|%s", ti.traderID, dec.LeaderPosID)
 	notifier.Notify(notifier.Alert{
-		Category: "copy_trade",
-		TraderID: ti.traderID,
-		Title:    fmt.Sprintf("%s | 跟单映射熔断（%s %s）", traderName, dec.Action, dec.Symbol),
+		Category:   "copy_trade",
+		TraderID:   ti.traderID,
+		TraderName: traderName,
+		Title:      fmt.Sprintf("%s | 跟单映射熔断（%s %s）", traderName, dec.Action, dec.Symbol),
 		Body: fmt.Sprintf(
 			"跟随者 %s 的 leaderPosID=%s 已连续失败 %d 次（阈值 %d），系统主动关闭该映射，停止重试。\n"+
 				"最近一次错误：%v\n"+
@@ -2102,11 +2120,12 @@ func (ti *TraderIntegration) sendCopyActionAlert(dec *decision.Decision, duratio
 	rateKey := fmt.Sprintf("copy_action|%s|%s|%s", ti.traderID, dec.Symbol, dec.Action)
 
 	notifier.Notify(notifier.Alert{
-		Category: "copy_trade",
-		TraderID: ti.traderID,
-		Title:    fmt.Sprintf("%s | 跟单成功 %s %s", traderName, dec.Action, dec.Symbol),
-		Body:     ti.buildCopyActionAlertBody(dec, traderName, durationMs),
-		RateKey:  rateKey,
+		Category:   "copy_trade",
+		TraderID:   ti.traderID,
+		TraderName: traderName,
+		Title:      fmt.Sprintf("%s | 跟单成功 %s %s", traderName, dec.Action, dec.Symbol),
+		Body:       ti.buildCopyActionAlertBody(dec, traderName, durationMs),
+		RateKey:    rateKey,
 		Fields: map[string]string{
 			"TraderName":    traderName,
 			"Provider":      string(ProviderBinance),
@@ -2171,15 +2190,7 @@ func (ti *TraderIntegration) traderDisplayName() string {
 	if ti.store == nil {
 		return ti.traderID
 	}
-	trader, err := ti.store.Trader().GetByID(ti.traderID)
-	if err != nil || trader == nil {
-		return ti.traderID
-	}
-	name := strings.TrimSpace(trader.Name)
-	if name == "" {
-		return ti.traderID
-	}
-	return name
+	return ti.store.Trader().ResolveDisplayName(ti.traderID)
 }
 
 // saveSignalLog 保存信号日志到数据库
@@ -3150,11 +3161,11 @@ func (ti *TraderIntegration) enforceAIReentryProtection(dec *decision.Decision) 
 		key := fmt.Sprintf("REENTRY_FILLED|%s|%d|%d|%d", ti.traderID, cycle.ID, attemptNo, generation)
 		traderName := ti.traderDisplayName()
 		notifier.Notify(notifier.Alert{
-			Category: "copy_trade", TraderID: ti.traderID,
+			Category: "copy_trade", TraderID: ti.traderID, TraderName: traderName,
 			Title:   fmt.Sprintf("%s | AI 重入成交且保护生效 %s %s", traderName, cycle.Symbol, cycle.Side),
 			Body:    fmt.Sprintf("Trader Name: %s\nTrader ID: %s\nCycle: %d\nAttempt: %d\nCandidate: %d\nActual Notional: %.2f USDT\nStop Price: verified on exchange\nProtection Coverage: %.2f%%", traderName, ti.traderID, cycle.ID, attemptNo, candidateID, cycle.FollowerNotional, cycle.ProtectionCoverage*100),
 			RateKey: key, DedupKey: key,
-			Fields: map[string]string{"CycleID": fmt.Sprint(cycle.ID), "AttemptNo": fmt.Sprint(attemptNo), "CandidateID": fmt.Sprint(candidateID), "Generation": fmt.Sprint(generation), "ProtectionCoverage": fmt.Sprintf("%.4f", cycle.ProtectionCoverage)},
+			Fields: map[string]string{"TraderName": traderName, "CycleID": fmt.Sprint(cycle.ID), "AttemptNo": fmt.Sprint(attemptNo), "CandidateID": fmt.Sprint(candidateID), "Generation": fmt.Sprint(generation), "ProtectionCoverage": fmt.Sprintf("%.4f", cycle.ProtectionCoverage)},
 		})
 		return
 	}
@@ -3634,7 +3645,7 @@ func (ti *TraderIntegration) notifyProtection(cycle *store.CopyGuardCycle, title
 	// 标题与字段带交易员显示名：保护类邮件此前只有 TraderID，多交易员场景
 	// 下用户无法直接判断是哪个账户出的问题（小白可读性缺陷，全局修复）
 	traderName := ti.traderDisplayName()
-	notifier.Notify(notifier.Alert{Category: "copy_trade", TraderID: ti.traderID, Title: fmt.Sprintf("%s | %s | %s %s", traderName, title, cycle.Symbol, cycle.Side), Body: fmt.Sprintf("Trader Name: %s\nTrader ID:   %s\n\n%s", traderName, ti.traderID, body), RateKey: key, DedupKey: key, Fields: map[string]string{"TraderName": traderName, "CycleID": fmt.Sprint(cycle.ID), "LeaderPosID": cycle.LeaderPosID, "Symbol": cycle.Symbol, "Side": cycle.Side, "MarginMode": cycle.MarginMode}})
+	notifier.Notify(notifier.Alert{Category: "copy_trade", TraderID: ti.traderID, TraderName: traderName, Title: fmt.Sprintf("%s | %s | %s %s", traderName, title, cycle.Symbol, cycle.Side), Body: fmt.Sprintf("Trader Name: %s\nTrader ID:   %s\n\n%s", traderName, ti.traderID, body), RateKey: key, DedupKey: key, Fields: map[string]string{"TraderName": traderName, "CycleID": fmt.Sprint(cycle.ID), "LeaderPosID": cycle.LeaderPosID, "Symbol": cycle.Symbol, "Side": cycle.Side, "MarginMode": cycle.MarginMode}})
 }
 
 // ============================================================================
@@ -3798,13 +3809,14 @@ func (ti *TraderIntegration) sendStopLossTriggerAlert(event *RiskEvent) {
 		recoveryHint)
 
 	notifier.Notify(notifier.Alert{
-		Time:     event.Timestamp,
-		Category: "copy_trade",
-		TraderID: ti.traderID,
-		Title:    fmt.Sprintf("%s | 账户保护止损触发 %s %s", traderName, event.Symbol, event.Side),
-		Body:     body,
-		RateKey:  alertKey,
-		DedupKey: alertKey,
+		Time:       event.Timestamp,
+		Category:   "copy_trade",
+		TraderID:   ti.traderID,
+		TraderName: traderName,
+		Title:      fmt.Sprintf("%s | 账户保护止损触发 %s %s", traderName, event.Symbol, event.Side),
+		Body:       body,
+		RateKey:    alertKey,
+		DedupKey:   alertKey,
 		Fields: map[string]string{
 			"TraderName":  traderName,
 			"Provider":    providerType,
@@ -3884,13 +3896,14 @@ func (ti *TraderIntegration) sendReentryInitiatedAlert(event *RiskEvent) {
 		event.ReentryEntryPrice, event.ReentrySize, copyRatio*100, reentryRatio*100)
 
 	notifier.Notify(notifier.Alert{
-		Time:     event.Timestamp,
-		Category: "copy_trade",
-		TraderID: ti.traderID,
-		Title:    fmt.Sprintf("%s | 二次进场触发 %s %s", traderName, event.Symbol, event.Side),
-		Body:     body,
-		RateKey:  alertKey,
-		DedupKey: alertKey,
+		Time:       event.Timestamp,
+		Category:   "copy_trade",
+		TraderID:   ti.traderID,
+		TraderName: traderName,
+		Title:      fmt.Sprintf("%s | 二次进场触发 %s %s", traderName, event.Symbol, event.Side),
+		Body:       body,
+		RateKey:    alertKey,
+		DedupKey:   alertKey,
 		Fields: map[string]string{
 			"TraderName":        traderName,
 			"Provider":          providerType,
@@ -4415,13 +4428,14 @@ func (ti *TraderIntegration) sendManualReentrySignalAlert(event *RiskEvent) {
 	// 小时分桶：engine 冷却（≥1h）后再次提醒时 key 变化，不被 notifier 永久去重
 	alertKey := fmt.Sprintf("manual_reentry|%s|%d|%d", ti.traderID, event.ManualSignalID, event.Timestamp.Unix()/3600)
 	notifier.Notify(notifier.Alert{
-		Time:     event.Timestamp,
-		Category: "copy_trade",
-		TraderID: ti.traderID,
-		Title:    fmt.Sprintf("%s | 人工重入待确认 %s %s", traderName, event.Symbol, sideZH(event.Side)),
-		Body:     body,
-		RateKey:  alertKey,
-		DedupKey: alertKey,
+		Time:       event.Timestamp,
+		Category:   "copy_trade",
+		TraderID:   ti.traderID,
+		TraderName: traderName,
+		Title:      fmt.Sprintf("%s | 人工重入待确认 %s %s", traderName, event.Symbol, sideZH(event.Side)),
+		Body:       body,
+		RateKey:    alertKey,
+		DedupKey:   alertKey,
 		Fields: map[string]string{
 			"TraderName":   traderName,
 			"Leader":       leaderID,

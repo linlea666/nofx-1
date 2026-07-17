@@ -114,13 +114,16 @@ func LoadFromEnv() Config {
 // Alert 一条告警事件
 type Alert struct {
 	Time     time.Time
-	Category string            // copy_trade | trader | system | startup ...
-	TraderID string            // 关联的 trader（可空，例如系统级告警）
-	Title    string            // 主题片段
-	Body     string            // 详情正文
-	Fields   map[string]string // 可选附加字段（会附在正文）
-	RateKey  string            // 限流键，留空时按 Category+TraderID+Title 自动生成
-	DedupKey string            // 一次性去重键：同 key 告警进程生命周期内只发送一次
+	Category string // copy_trade | trader | system | startup ...
+	TraderID string // 关联的 trader（可空，例如系统级告警）
+	// TraderName is the user-facing account name resolved by the business
+	// layer. The notifier deliberately does not query application storage.
+	TraderName string
+	Title      string            // 主题片段
+	Body       string            // 详情正文
+	Fields     map[string]string // 可选附加字段（会附在正文）
+	RateKey    string            // 限流键，留空时按 Category+TraderID+Title 自动生成
+	DedupKey   string            // 一次性去重键：同 key 告警进程生命周期内只发送一次
 	// StatusHook 用于需要审计邮件状态的业务。回调不影响入队/发送
 	// 结果；普通告警留空即保持旧行为。
 	StatusHook func(status DeliveryStatus, err error)
@@ -484,6 +487,11 @@ func buildBody(a Alert) string {
 	b.WriteString("\n")
 
 	if a.TraderID != "" {
+		if strings.TrimSpace(a.TraderName) != "" {
+			b.WriteString("账户名称 (Trader Name): ")
+			b.WriteString(strings.TrimSpace(a.TraderName))
+			b.WriteString("\n")
+		}
 		b.WriteString("账号 (TraderID): ")
 		b.WriteString(a.TraderID)
 		b.WriteString("\n")

@@ -18,6 +18,7 @@ import type {
   CopyGuardManualSignal,
   ReentryAIAnalysis,
   ReentryAIConfig,
+  ReentryAIDecisionEvaluation,
   ReentryAIDiagnostic,
   ReentryAIStats,
   ReentryMarketPreview,
@@ -125,6 +126,8 @@ const eventLabels: Record<string, string> = {
   REENTRY_RECOVERED_AFTER_RESTART: '重启后重入状态已恢复',
   REENTRY_RECOVERY_PENDING: '重启后重入状态待确认',
   AI_REVIEW_REQUESTED: '操作员请求 AI 尽快复查',
+  AI_DECISION_OUTCOME_FINALIZED: 'AI 单次决策后验评价完成',
+  AI_CANDIDATE_OUTCOME_FINALIZED: 'AI 候选周期评价完成',
   ADDON_RISK_WARNING: '加仓风险告警（仍跟随）',
   ADDON_SKIPPED_BUDGET: '加仓超预算被拦截（旧版）',
   CYCLE_LOSS_BREAKER: '周期亏损熔断触发',
@@ -573,13 +576,14 @@ function CandidateAnalysisModal({
   analysisId: number
   onClose: () => void
 }) {
-  const {
-    data: analysis,
-    error,
-    isLoading,
-  } = useSWR<ReentryAIAnalysis>(`candidate-analysis-${analysisId}`, () =>
+  const { data, error, isLoading } = useSWR<{
+    analysis: ReentryAIAnalysis
+    evaluations: ReentryAIDecisionEvaluation[]
+  }>(`candidate-analysis-${analysisId}`, () =>
     api.getReentryAnalysis(analysisId)
   )
+  const analysis = data?.analysis
+  const evaluations = data?.evaluations ?? []
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
       <div className="flex max-h-[88vh] w-full max-w-3xl flex-col gap-3 overflow-y-auto rounded-lg border border-[#2B3139] bg-[#181A20] p-6 text-sm">
@@ -614,6 +618,54 @@ function CandidateAnalysisModal({
               </div>
             )}
             <InternalVerdictCard analysis={analysis} />
+            <div className="space-y-2 rounded border border-[#2B3139] bg-[#0B0E11] p-3 text-xs">
+              <div className="font-medium text-[#EAECEF]">
+                决策后验评价（确定性口径）
+              </div>
+              {evaluations.length === 0 ? (
+                <div className="text-[#848E9C]">
+                  周期闭合并完成行情归档后生成；不会让 AI
+                  给自己打分，也不会影响交易。
+                </div>
+              ) : (
+                evaluations.map((evaluation) => (
+                  <div
+                    key={evaluation.id}
+                    className="grid gap-1 rounded bg-[#181A20] p-3 text-[#B7BDC6] md:grid-cols-2"
+                  >
+                    <span>
+                      结论：{evaluation.decision_outcome} · 市场：
+                      {evaluation.market_outcome}
+                    </span>
+                    <span>
+                      可执行性：{evaluation.actionability} · 评价 v
+                      {evaluation.evaluation_version}
+                    </span>
+                    <span>
+                      MFE +{evaluation.mfe_atr.toFixed(2)} ATR / MAE -
+                      {evaluation.mae_atr.toFixed(2)} ATR
+                    </span>
+                    <span>
+                      覆盖率 {(evaluation.coverage_ratio * 100).toFixed(0)}% ·{' '}
+                      {evaluation.sample_count} 条采样
+                    </span>
+                    <span>
+                      窗口：{dateLabel(evaluation.window_start_at)} →{' '}
+                      {dateLabel(evaluation.window_end_at)}
+                    </span>
+                    <span>
+                      真实执行：{evaluation.actual_executed ? '是' : '否'}
+                      {evaluation.actual_pnl != null
+                        ? ` · ${money(evaluation.actual_pnl)}`
+                        : ''}
+                    </span>
+                    <span className="md:col-span-2 text-[#848E9C]">
+                      {evaluation.reason}
+                    </span>
+                  </div>
+                ))
+              )}
+            </div>
             <CopyableSection
               title="生产 System Prompt"
               content={analysis.system_prompt}
@@ -1001,6 +1053,19 @@ function AdvisorSettingsCard() {
                   attempt 已对账的 {stats.candidate_scored}
                   条可回填真实盈亏，其中盈利 {stats.candidate_profitable}
                   条。不会把未执行决策伪装成反事实盈亏。
+                </div>
+                <div className="border-t border-[#2B3139] pt-2">
+                  后验评价：{stats.candidate_evaluated} 条，其中不可评分{' '}
+                  {stats.candidate_unscorable} 条；市场结果{' '}
+                  {Object.entries(stats.candidate_market_outcomes ?? {})
+                    .map(([outcome, count]) => `${outcome} ${count}`)
+                    .join(' · ') || '暂无'}
+                </div>
+                <div className="text-[#848E9C]">
+                  决策效果：
+                  {Object.entries(stats.candidate_evaluation_outcomes ?? {})
+                    .map(([outcome, count]) => `${outcome} ${count}`)
+                    .join(' · ') || '周期闭合后生成'}
                 </div>
               </div>
             )}
@@ -2528,6 +2593,44 @@ export function CopyGuardPage() {
                     .join('、')}
                 </div>
               )}
+            </div>
+          )}
+          {detail.ai_effect_summary?.total_decisions > 0 && (
+            <div className="mb-4 rounded border border-[#2B3139] bg-[#181A20] p-4 text-sm">
+              <div className="mb-2 font-medium">
+                AI 重入决策效果（评价 v
+                {detail.ai_effect_summary.evaluation_version}）
+              </div>
+              <div className="grid gap-3 md:grid-cols-3">
+                <Metric
+                  label="决策 / 可评分 / 不可评分"
+                  value={`${detail.ai_effect_summary.total_decisions} / ${detail.ai_effect_summary.scorable_decisions} / ${detail.ai_effect_summary.unscorable_decisions}`}
+                />
+                <Metric
+                  label="错过反转 / 正确放弃"
+                  value={`${detail.ai_effect_summary.missed_reversals} / ${detail.ai_effect_summary.correct_abandons}`}
+                />
+                <Metric
+                  label="风控避免继续亏损"
+                  value={detail.ai_effect_summary.risk_gate_saved_losses}
+                />
+                <Metric
+                  label="最终 AI 决策"
+                  value={detail.ai_effect_summary.final_decision || '-'}
+                />
+                <Metric
+                  label="最终决策效果"
+                  value={detail.ai_effect_summary.final_decision_outcome || '-'}
+                />
+                <Metric
+                  label="真实重入净盈亏"
+                  value={money(detail.ai_effect_summary.actual_reentry_pnl)}
+                />
+              </div>
+              <div className="mt-3 text-xs text-[#848E9C]">
+                评价只基于已保存的观察行情、执行事件和交易所对账；INSUFFICIENT_DATA
+                会明确记为不可评分，不用估算盈亏冒充真实结果。
+              </div>
             </div>
           )}
           <div className="mb-4 rounded bg-[#181A20] p-3 text-sm text-[#848E9C]">

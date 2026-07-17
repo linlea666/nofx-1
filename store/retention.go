@@ -289,6 +289,9 @@ func (r *RetentionService) cleanCopyGuardCycles() int64 {
 	var total int64
 	// Children first: these tables have no FK cascade to copy_guard_cycles.
 	for _, child := range []struct{ table, key string }{
+		{"reentry_ai_decision_evaluations", "id"},
+		{"reentry_ai_analyses", "id"},
+		{"copy_guard_reentry_candidates", "id"},
 		{"copy_guard_attempts", "id"},
 		{"copy_guard_events", "id"},
 		{"copy_guard_watch_samples", "id"},

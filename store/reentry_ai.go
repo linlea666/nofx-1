@@ -14,10 +14,11 @@ import (
 // 原始回复、严格解析结果、调用状态和最终结局。历史人工信号字段仅保留为
 // 只读兼容，v7 执行路径不再依赖人工确认。
 //
-// 三张表：
+// 四张表：
 //   reentry_ai_analyses  每个候选/历史信号的完整调用审计记录
 //   reentry_ai_config    单行全局配置；生产 Prompt 只允许 analysis_focus 补充
 //   reentry_ai_diagnostics 零交易模型连接与严格 Schema 自检，独立于交易统计
+//   reentry_ai_decision_evaluations 版本化、确定性的后验决策效果
 //
 // AI 关闭时分析表静默闲置；候选与订单的确定性风控状态由 Copy Guard 表维护。
 // ============================================================================
@@ -158,7 +159,10 @@ func (s *ReentryAIStore) initTables() error {
 	if err := s.initReentryCandidateTables(); err != nil {
 		return err
 	}
-	return s.initReentryDiagnosticTable()
+	if err := s.initReentryDiagnosticTable(); err != nil {
+		return err
+	}
+	return s.initReentryDecisionEvaluationTable()
 }
 
 const reentryAnalysisColumns = `id, signal_id, candidate_id, trader_id, cycle_id, symbol, side, attempt_no, decision_generation, call_status, call_error, data_hash,
@@ -480,11 +484,15 @@ type ReentryAIStats struct {
 	// Candidate calls are never deduplicated away: WAIT, ABANDON, invalid
 	// schema and transport/model failures all remain visible. Accuracy is only
 	// computed where an ENTER analysis maps to a reconciled attempt.
-	CandidateAnalyses     int            `json:"candidate_analyses"`
-	CandidateDecisions    map[string]int `json:"candidate_decisions"`
-	CandidateCallStatuses map[string]int `json:"candidate_call_statuses"`
-	CandidateScored       int            `json:"candidate_scored"`
-	CandidateProfitable   int            `json:"candidate_profitable"`
+	CandidateAnalyses           int            `json:"candidate_analyses"`
+	CandidateDecisions          map[string]int `json:"candidate_decisions"`
+	CandidateCallStatuses       map[string]int `json:"candidate_call_statuses"`
+	CandidateScored             int            `json:"candidate_scored"`
+	CandidateProfitable         int            `json:"candidate_profitable"`
+	CandidateEvaluated          int            `json:"candidate_evaluated"`
+	CandidateUnscorable         int            `json:"candidate_unscorable"`
+	CandidateEvaluationOutcomes map[string]int `json:"candidate_evaluation_outcomes"`
+	CandidateMarketOutcomes     map[string]int `json:"candidate_market_outcomes"`
 }
 
 // sqlMarks 生成 "?,?,...,?" 占位符
@@ -496,10 +504,12 @@ func sqlMarks(n int) string {
 // traderIDs 为空返回零值统计（当前用户名下无交易员）。
 func (s *ReentryAIStore) GetReentryAIStats(traderIDs []string) (*ReentryAIStats, error) {
 	st := &ReentryAIStats{
-		InternalVerdicts:      map[string]int{},
-		ExternalVerdicts:      map[string]int{},
-		CandidateDecisions:    map[string]int{},
-		CandidateCallStatuses: map[string]int{},
+		InternalVerdicts:            map[string]int{},
+		ExternalVerdicts:            map[string]int{},
+		CandidateDecisions:          map[string]int{},
+		CandidateCallStatuses:       map[string]int{},
+		CandidateEvaluationOutcomes: map[string]int{},
+		CandidateMarketOutcomes:     map[string]int{},
 	}
 	if len(traderIDs) == 0 {
 		return st, nil
@@ -567,6 +577,28 @@ func (s *ReentryAIStore) GetReentryAIStats(traderIDs []string) (*ReentryAIStats,
 		st.CandidateProfitable += profitable
 	}
 	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	evalArgs := append(append([]interface{}{}, args...), ReentryDecisionEvaluationVersion)
+	evalRows, err := s.db.Query(`SELECT decision_outcome,market_outcome,COUNT(*) FROM reentry_ai_decision_evaluations WHERE trader_id IN (`+marks+`) AND evaluation_version=? GROUP BY decision_outcome,market_outcome`, evalArgs...)
+	if err != nil {
+		return nil, err
+	}
+	defer evalRows.Close()
+	for evalRows.Next() {
+		var decisionOutcome, marketOutcome string
+		var count int
+		if err := evalRows.Scan(&decisionOutcome, &marketOutcome, &count); err != nil {
+			return nil, err
+		}
+		st.CandidateEvaluated += count
+		st.CandidateEvaluationOutcomes[decisionOutcome] += count
+		st.CandidateMarketOutcomes[marketOutcome] += count
+		if decisionOutcome == "UNSCORABLE" {
+			st.CandidateUnscorable += count
+		}
+	}
+	if err := evalRows.Err(); err != nil {
 		return nil, err
 	}
 	return st, nil

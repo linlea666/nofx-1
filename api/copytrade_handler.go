@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"nofx/copyguardmetrics"
 	"nofx/copytrade"
 	"nofx/logger"
 	"nofx/manager"
@@ -338,12 +339,13 @@ func riskFilter(c *gin.Context) store.CopyGuardFilter {
 }
 
 type copyGuardCycleArtifacts struct {
-	Attempts     []*store.CopyGuardAttempt          `json:"attempts"`
-	Events       []*store.CopyGuardEvent            `json:"events"`
-	Protection   *store.CopyGuardProtectiveOrder    `json:"protection,omitempty"`
-	WatchSamples []*store.CopyGuardWatchSample      `json:"watch_samples"`
-	Candidates   []*store.CopyGuardReentryCandidate `json:"ai_candidates"`
-	AIAnalyses   []*store.ReentryAIAnalysis         `json:"ai_analyses"`
+	Attempts      []*store.CopyGuardAttempt            `json:"attempts"`
+	Events        []*store.CopyGuardEvent              `json:"events"`
+	Protection    *store.CopyGuardProtectiveOrder      `json:"protection,omitempty"`
+	WatchSamples  []*store.CopyGuardWatchSample        `json:"watch_samples"`
+	Candidates    []*store.CopyGuardReentryCandidate   `json:"ai_candidates"`
+	AIAnalyses    []*store.ReentryAIAnalysis           `json:"ai_analyses"`
+	AIEvaluations []*store.ReentryAIDecisionEvaluation `json:"ai_decision_evaluations"`
 }
 
 type copyGuardAttemptAttribution struct {
@@ -515,21 +517,26 @@ func (h *CopyTradeHandler) loadCopyGuardCycleArtifacts(cycleID int64) (*copyGuar
 	if artifacts.AIAnalyses, err = h.store.ReentryAI().ListReentryAnalysesByCycle(cycleID, 500); err != nil {
 		return nil, err
 	}
+	if artifacts.AIEvaluations, err = h.store.ReentryAI().ListReentryDecisionEvaluationsByCycle(cycleID); err != nil {
+		return nil, err
+	}
 	return artifacts, nil
 }
 
 func copyGuardCycleDocument(cycle *store.CopyGuardCycle, artifacts *copyGuardCycleArtifacts) gin.H {
 	return gin.H{
-		"schema_version":   4,
-		"defaults_version": store.CopyGuardDefaultsVersion(),
-		"cycle":            cycle,
-		"attempts":         artifacts.Attempts,
-		"events":           artifacts.Events,
-		"protection":       artifacts.Protection,
-		"watch_samples":    artifacts.WatchSamples,
-		"ai_candidates":    artifacts.Candidates,
-		"ai_analyses":      artifacts.AIAnalyses,
-		"attribution":      buildCopyGuardAttribution(cycle, artifacts.Attempts, artifacts.Events),
+		"schema_version":          5,
+		"defaults_version":        store.CopyGuardDefaultsVersion(),
+		"cycle":                   cycle,
+		"attempts":                artifacts.Attempts,
+		"events":                  artifacts.Events,
+		"protection":              artifacts.Protection,
+		"watch_samples":           artifacts.WatchSamples,
+		"ai_candidates":           artifacts.Candidates,
+		"ai_analyses":             artifacts.AIAnalyses,
+		"ai_decision_evaluations": artifacts.AIEvaluations,
+		"ai_effect_summary":       copyguardmetrics.SummarizeCycleAIEffects(cycle, artifacts.Attempts, artifacts.AIEvaluations),
+		"attribution":             buildCopyGuardAttribution(cycle, artifacts.Attempts, artifacts.Events),
 	}
 }
 
@@ -652,7 +659,7 @@ func (h *CopyTradeHandler) ExportRiskCycles(c *gin.Context) {
 				cycle.TraderName = names[cycle.TraderID]
 				artifacts, loadErr := h.loadCopyGuardCycleArtifacts(cycle.ID)
 				if loadErr != nil {
-					logger.Warnf("Copy Guard schema v4 export skipped cycle=%d: %v", cycle.ID, loadErr)
+					logger.Warnf("Copy Guard schema v5 export skipped cycle=%d: %v", cycle.ID, loadErr)
 					continue
 				}
 				doc := copyGuardCycleDocument(cycle, artifacts)
@@ -668,7 +675,7 @@ func (h *CopyTradeHandler) ExportRiskCycles(c *gin.Context) {
 	c.Header("Content-Type", "text/csv; charset=utf-8")
 	c.Header("Content-Disposition", "attachment; filename=copy-guard.csv")
 	w := csv.NewWriter(c.Writer)
-	_ = w.Write([]string{"cycle_id", "trader_id", "trader_name", "leader_id", "leader_pos_id", "symbol", "side", "margin_mode", "status", "accounting_status", "accounting_error", "tracking_difference", "protection_status", "protection_coverage", "protection_retries", "protection_missing_seconds", "protection_error", "stop_count", "reentry_count", "actual_pnl", "baseline_no_guard_pnl", "stop_only_pnl", "first_reentry_pnl", "second_reentry_pnl", "reentry_contribution", "realized_path_max_drawdown_usd", "worst_attempt_pnl", "max_post_stop_mfe_usd", "max_post_stop_mae_usd", "net_guard_effect", "fees", "funding_fee", "liquidation_penalty", "slippage", "opened_at", "closed_at"})
+	_ = w.Write([]string{"cycle_id", "trader_id", "trader_name", "leader_id", "leader_pos_id", "symbol", "side", "margin_mode", "status", "accounting_status", "accounting_error", "tracking_difference", "protection_status", "protection_coverage", "protection_retries", "protection_missing_seconds", "protection_error", "stop_count", "reentry_count", "actual_pnl", "baseline_no_guard_pnl", "stop_only_pnl", "first_reentry_pnl", "second_reentry_pnl", "reentry_contribution", "realized_path_max_drawdown_usd", "worst_attempt_pnl", "max_post_stop_mfe_usd", "max_post_stop_mae_usd", "net_guard_effect", "fees", "funding_fee", "liquidation_penalty", "slippage", "ai_decisions", "ai_scorable", "ai_unscorable", "ai_missed_reversals", "ai_correct_abandons", "ai_risk_gate_saved_losses", "ai_final_decision", "ai_final_outcome", "ai_actual_reentry_pnl", "ai_evaluation_version", "opened_at", "closed_at"})
 	for offset := 0; ; offset += 500 {
 		rows, err := h.store.CopyTrade().ListCopyGuardCycles(ids, from, to, 500, offset, riskFilter(c))
 		if err != nil {
@@ -683,7 +690,9 @@ func (h *CopyTradeHandler) ExportRiskCycles(c *gin.Context) {
 			attempts, _ := h.store.CopyTrade().ListCopyGuardAttempts(x.ID)
 			events, _ := h.store.CopyTrade().ListCopyGuardEvents(x.ID)
 			attribution := buildCopyGuardAttribution(x, attempts, events)
-			_ = w.Write([]string{strconv.FormatInt(x.ID, 10), x.TraderID, x.TraderName, x.LeaderID, x.LeaderPosID, x.Symbol, x.Side, x.MarginMode, x.Status, x.AccountingStatus, x.AccountingError, fmt.Sprint(x.TrackingDifference), x.ProtectionStatus, fmt.Sprint(x.ProtectionCoverage), strconv.Itoa(x.ProtectionRetries), fmt.Sprint(x.ProtectionMissingSeconds), x.ProtectionError, strconv.Itoa(x.StopCount), strconv.Itoa(x.ReentryCount), fmt.Sprint(x.ActualPnL), fmt.Sprint(x.BaselinePnL), fmt.Sprint(attribution.StopOnlyPnL), fmt.Sprint(attribution.FirstReentryPnL), fmt.Sprint(attribution.SecondReentryPnL), fmt.Sprint(attribution.ReentryContribution), fmt.Sprint(attribution.RealizedPathMaxDrawdownUSD), fmt.Sprint(attribution.WorstAttemptPnL), fmt.Sprint(attribution.MaxPostStopMFEUSD), fmt.Sprint(attribution.MaxPostStopMAEUSD), fmt.Sprint(x.NetGuardEffect), fmt.Sprint(x.Fees), fmt.Sprint(x.FundingFee), fmt.Sprint(x.LiquidationPenalty), fmt.Sprint(x.Slippage), x.OpenedAt.Format(time.RFC3339), closed})
+			evaluations, _ := h.store.ReentryAI().ListReentryDecisionEvaluationsByCycle(x.ID)
+			aiEffect := copyguardmetrics.SummarizeCycleAIEffects(x, attempts, evaluations)
+			_ = w.Write([]string{strconv.FormatInt(x.ID, 10), x.TraderID, x.TraderName, x.LeaderID, x.LeaderPosID, x.Symbol, x.Side, x.MarginMode, x.Status, x.AccountingStatus, x.AccountingError, fmt.Sprint(x.TrackingDifference), x.ProtectionStatus, fmt.Sprint(x.ProtectionCoverage), strconv.Itoa(x.ProtectionRetries), fmt.Sprint(x.ProtectionMissingSeconds), x.ProtectionError, strconv.Itoa(x.StopCount), strconv.Itoa(x.ReentryCount), fmt.Sprint(x.ActualPnL), fmt.Sprint(x.BaselinePnL), fmt.Sprint(attribution.StopOnlyPnL), fmt.Sprint(attribution.FirstReentryPnL), fmt.Sprint(attribution.SecondReentryPnL), fmt.Sprint(attribution.ReentryContribution), fmt.Sprint(attribution.RealizedPathMaxDrawdownUSD), fmt.Sprint(attribution.WorstAttemptPnL), fmt.Sprint(attribution.MaxPostStopMFEUSD), fmt.Sprint(attribution.MaxPostStopMAEUSD), fmt.Sprint(x.NetGuardEffect), fmt.Sprint(x.Fees), fmt.Sprint(x.FundingFee), fmt.Sprint(x.LiquidationPenalty), fmt.Sprint(x.Slippage), strconv.Itoa(aiEffect.TotalDecisions), strconv.Itoa(aiEffect.ScorableDecisions), strconv.Itoa(aiEffect.UnscorableDecisions), strconv.Itoa(aiEffect.MissedReversals), strconv.Itoa(aiEffect.CorrectAbandons), strconv.Itoa(aiEffect.RiskGateSavedLosses), aiEffect.FinalDecision, aiEffect.FinalDecisionOutcome, fmt.Sprint(aiEffect.ActualReentryPnL), strconv.Itoa(aiEffect.EvaluationVersion), x.OpenedAt.Format(time.RFC3339), closed})
 		}
 		w.Flush()
 		if len(rows) < 500 {

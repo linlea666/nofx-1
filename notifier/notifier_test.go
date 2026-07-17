@@ -2,9 +2,19 @@ package notifier
 
 import (
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestBuildBodyIncludesTraderNameAndStableID(t *testing.T) {
+	body := buildBody(Alert{Category: "copy_trade", TraderID: "trader-id", TraderName: "主账户-A", Title: "AI 决策", Time: time.Now()})
+	for _, want := range []string{"账户名称 (Trader Name): 主账户-A", "账号 (TraderID): trader-id"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("email body missing %q: %s", want, body)
+		}
+	}
+}
 
 func TestEmailNotifierDedupKeySuppressesRepeatedAlerts(t *testing.T) {
 	n := &emailNotifier{

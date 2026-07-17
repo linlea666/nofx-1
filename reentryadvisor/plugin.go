@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"nofx/copyguardmetrics"
 	"nofx/logger"
 	"nofx/store"
 )
@@ -124,6 +125,14 @@ func (a *Advisor) pollOnce() {
 		logger.Warnf("[ReentryAdvisor] 读取配置失败: %v", err)
 		return
 	}
+	// Outcome materialization is independent of whether new AI calls or live
+	// execution are enabled. Turning AI off must not strand already completed
+	// cycles without actual PnL/effect evaluation.
+	a.pollCount++
+	if a.pollCount%backfillEvery == 0 {
+		a.backfillOutcomes()
+		a.backfillDecisionEvaluations()
+	}
 	if !cfg.Enabled {
 		return
 	}
@@ -131,12 +140,19 @@ func (a *Advisor) pollOnce() {
 		a.pollAICandidates(cfg)
 	}
 
-	// Phase 2：结局盈亏回填（低频，独立于新信号处理，失败互不影响）
-	a.pollCount++
-	if a.pollCount%backfillEvery == 0 {
-		a.backfillOutcomes()
-	}
+}
 
+func (a *Advisor) backfillDecisionEvaluations() {
+	cycleIDs, err := a.st.ReentryAI().ListClosedCyclesPendingAIEvaluation(25)
+	if err != nil {
+		logger.Warnf("[ReentryAdvisor] AI 后验评价待处理周期查询失败: %v", err)
+		return
+	}
+	for _, cycleID := range cycleIDs {
+		if _, err := copyguardmetrics.EvaluateCycleAIDecisions(a.st, cycleID); err != nil {
+			logger.Warnf("[ReentryAdvisor] AI 后验评价失败 cycle=%d: %v", cycleID, err)
+		}
+	}
 }
 
 func (a *Advisor) pollAICandidates(cfg *store.ReentryAIConfig) {
@@ -271,6 +287,7 @@ func (a *Advisor) recordCandidateEvent(c *store.CopyGuardReentryCandidate, event
 	detail["candidate_id"] = c.ID
 	detail["attempt_no"] = c.ReentryCount + 1
 	detail["decision_generation"] = c.DecisionGeneration
+	detail["trader_name_snapshot"] = a.st.Trader().ResolveDisplayName(c.TraderID)
 	_ = a.st.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: c.CycleID, TraderID: c.TraderID, Type: event, Price: price, Notional: notional, Metadata: detail})
 }
 

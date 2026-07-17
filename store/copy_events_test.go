@@ -156,7 +156,8 @@ func TestCopyGuardEventRegistryCoversV7Workflow(t *testing.T) {
 		"AI_REVIEW_FAILED": "important", "AI_BUDGET_SUSPENDED": "important", "AI_RESULT_STALE": "verbose",
 		"REENTRY_PREFLIGHT_REJECTED": "verbose", "REENTRY_REQUESTED": "verbose", "REENTRY_FILLED": "important", "REENTRY_FAILED": "important",
 		"PROTECTION_PENDING": "verbose", "PROTECTION_ACTIVE": "verbose", "PROTECTION_DEGRADED": "important", "FORCED_EXIT": "important",
-		"CYCLE_CLOSED_SUMMARY": "important",
+		"CYCLE_CLOSED_SUMMARY":          "important",
+		"AI_DECISION_OUTCOME_FINALIZED": "", "AI_CANDIDATE_OUTCOME_FINALIZED": "",
 	}
 	for eventType, emailLevel := range required {
 		spec, ok := GetCopyGuardEventSpec(eventType)
@@ -169,6 +170,9 @@ func TestCopyGuardEventRegistryCoversV7Workflow(t *testing.T) {
 	}
 	if ShouldSendCopyGuardEmail("critical", "STOP_FLAT_CONFIRMED") || !ShouldSendCopyGuardEmail("critical", "STOP_DUST_RESIDUAL") {
 		t.Fatal("critical mode must suppress normal stop mail but retain residual emergencies")
+	}
+	if ShouldSendCopyGuardEmail("verbose", "AI_DECISION_OUTCOME_FINALIZED") || ShouldSendCopyGuardEmail("important", "AI_CANDIDATE_OUTCOME_FINALIZED") {
+		t.Fatal("post-decision evaluation events must never create per-decision email spam")
 	}
 }
 

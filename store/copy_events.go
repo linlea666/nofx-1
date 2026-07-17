@@ -290,6 +290,8 @@ var copyGuardEventSpecs = map[string]CopyGuardEventSpec{
 	"AI_RESULT_STALE":                  {CopyEventCategoryTakeover, CopyEventSeverityWarn, "verbose", true},
 	"AI_CANDIDATE_TERMINATED":          {CopyEventCategoryTakeover, CopyEventSeverityWarn, "important", true},
 	"AI_ANALYSIS":                      {CopyEventCategoryTakeover, CopyEventSeverityInfo, "verbose", true},
+	"AI_DECISION_OUTCOME_FINALIZED":    {CopyEventCategoryTakeover, CopyEventSeverityInfo, "", true},
+	"AI_CANDIDATE_OUTCOME_FINALIZED":   {CopyEventCategoryTakeover, CopyEventSeverityInfo, "", true},
 	"REENTRY_PREFLIGHT_REJECTED":       {CopyEventCategoryReentry, CopyEventSeverityWarn, "verbose", true},
 	"REENTRY_REQUESTED":                {CopyEventCategoryReentry, CopyEventSeverityInfo, "verbose", true},
 	"REENTRY_FILLED":                   {CopyEventCategoryReentry, CopyEventSeverityInfo, "important", true},
@@ -442,6 +444,10 @@ func guardEventSummary(eventType, symbol, side, operator string) string {
 		return fmt.Sprintf("AI 重入审查异常（%s）| %s", eventType, pair)
 	case "AI_CANDIDATE_TERMINATED":
 		return fmt.Sprintf("AI 候选已由操作员终止 | %s", pair)
+	case "AI_DECISION_OUTCOME_FINALIZED":
+		return fmt.Sprintf("AI 单次决策后验评价已完成 | %s", pair)
+	case "AI_CANDIDATE_OUTCOME_FINALIZED":
+		return fmt.Sprintf("AI 候选最终效果评价已完成 | %s", pair)
 	case "REENTRY_REQUESTED":
 		return fmt.Sprintf("二次入场触发 | %s", pair)
 	case "REENTRY_FILLED", "REENTRY_RECOVERED_AFTER_RESTART":

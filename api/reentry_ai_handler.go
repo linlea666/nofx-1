@@ -229,7 +229,12 @@ func (h *ReentryAIHandler) GetAnalysis(c *gin.Context) {
 	if analysis == nil {
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"analysis": analysis})
+	evaluations, err := h.store.ReentryAI().ListReentryDecisionEvaluationsByAnalysis(analysis.ID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"analysis": analysis, "evaluations": evaluations})
 }
 
 // ownedTraderIDs 当前用户名下交易员 ID 列表（统计/列表接口的归属过滤参数）

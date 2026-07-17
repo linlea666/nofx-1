@@ -954,6 +954,8 @@ export const api = {
       }>
       ai_candidates: import('../types').CopyGuardAICandidate[]
       ai_analyses: import('../types').ReentryAIAnalysis[]
+      ai_decision_evaluations: import('../types').ReentryAIDecisionEvaluation[]
+      ai_effect_summary: import('../types').CopyGuardAIEffectSummary
       attribution: {
         final: boolean
         leader_direction_return: number
@@ -1118,10 +1120,11 @@ export const api = {
   async getReentryAnalysis(analysisId: number) {
     const result = await httpClient.get<{
       analysis: import('../types').ReentryAIAnalysis
+      evaluations: import('../types').ReentryAIDecisionEvaluation[]
     }>(`${API_BASE}/reentry-advisor/analyses/${analysisId}`)
     if (!result.success)
       throw new Error(result.message || '获取 AI 分析详情失败')
-    return result.data!.analysis
+    return result.data!
   },
   async getReentryConfig() {
     const result = await httpClient.get<{

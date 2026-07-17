@@ -1024,6 +1024,63 @@ export interface ReentryAIAnalysis {
   updated_at?: string
 }
 
+// AI 决策的确定性后验评价。仅使用已落库行情、事件和真实对账结果，
+// 不由模型给自己打分；evaluation_version 固定评价口径，便于跨版本比较。
+export interface ReentryAIDecisionEvaluation {
+  id: number
+  analysis_id: number
+  candidate_id: number
+  trader_id: string
+  trader_name_snapshot: string
+  cycle_id: number
+  attempt_no: number
+  decision_generation: number
+  decision: string
+  horizon: 'NEXT_DECISION' | 'ATTEMPT_CLOSE' | 'TERMINAL'
+  evaluation_version: number
+  evaluation_status: string
+  market_outcome:
+    | 'REVERSAL_CONFIRMED'
+    | 'CONTINUED_AGAINST'
+    | 'CHOP_INCONCLUSIVE'
+    | 'INSUFFICIENT_DATA'
+  decision_outcome: string
+  actionability: string
+  reason: string
+  reference_price: number
+  reference_atr: number
+  mfe_atr: number
+  mae_atr: number
+  first_reversal_at?: string
+  window_start_at: string
+  window_end_at: string
+  sample_count: number
+  coverage_ratio: number
+  max_gap_seconds: number
+  actual_executed: boolean
+  actual_pnl?: number
+  evaluation_latency_seconds: number
+  created_at: string
+  updated_at: string
+}
+
+export interface CopyGuardAIEffectSummary {
+  cycle_id: number
+  evaluation_version: number
+  total_decisions: number
+  scorable_decisions: number
+  unscorable_decisions: number
+  decision_counts: Record<string, number>
+  decision_outcome_counts: Record<string, number>
+  market_outcome_counts: Record<string, number>
+  missed_reversals: number
+  correct_abandons: number
+  risk_gate_saved_losses: number
+  actual_reentry_pnl: number
+  final_decision: string
+  final_decision_outcome: string
+}
+
 // 重入 AI 助手全局配置
 export interface ReentryAIConfig {
   enabled: boolean // 插件总开关（数据包自动生成）
@@ -1066,6 +1123,10 @@ export interface ReentryAIStats {
   candidate_call_statuses: Record<string, number>
   candidate_scored: number
   candidate_profitable: number
+  candidate_evaluated: number
+  candidate_unscorable: number
+  candidate_evaluation_outcomes: Record<string, number>
+  candidate_market_outcomes: Record<string, number>
 }
 
 // 市场指标实时预览（A2，与信号无关；market 结构与数据包 market 段一致，

@@ -482,6 +482,22 @@ func (s *TraderStore) GetByID(traderID string) (*Trader, error) {
 	return &t, nil
 }
 
+// ResolveDisplayName returns the user-facing trader/account name used by
+// Copy Guard emails and audit records. Identity lookup is best-effort because
+// notification failures must never enter the trading critical path; a missing
+// or deleted trader safely falls back to its stable ID.
+func (s *TraderStore) ResolveDisplayName(traderID string) string {
+	traderID = strings.TrimSpace(traderID)
+	if traderID == "" {
+		return ""
+	}
+	t, err := s.GetByID(traderID)
+	if err != nil || t == nil || strings.TrimSpace(t.Name) == "" {
+		return traderID
+	}
+	return strings.TrimSpace(t.Name)
+}
+
 func (s *TraderStore) ListAll() ([]*Trader, error) {
 	rows, err := s.db.Query(`
 		SELECT id, user_id, name, ai_model_id, exchange_id, COALESCE(strategy_id, ''),

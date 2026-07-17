@@ -588,17 +588,18 @@ func (a *Advisor) notifyCandidateImportant(c *store.CopyGuardReentryCandidate, e
 	}
 	attemptNo := c.ReentryCount + 1
 	key := fmt.Sprintf("%s|%s|%d|%d|%d", eventType, c.TraderID, c.CycleID, attemptNo, c.DecisionGeneration)
+	traderName := a.st.Trader().ResolveDisplayName(c.TraderID)
 	notifier.Notify(notifier.Alert{
-		Category: "copy_trade", TraderID: c.TraderID,
-		Title:   fmt.Sprintf("%s | %s %s %s", title, c.Symbol, strings.ToUpper(c.Side), c.TraderID),
-		Body:    fmt.Sprintf("%s\n\nTrader ID: %s\nCycle: %d\nAttempt: %d\nCandidate: %d\nGeneration: %d\nLast decision: %s\nConfidence: %.0f%%", body, c.TraderID, c.CycleID, attemptNo, c.ID, c.DecisionGeneration, c.LastDecision, c.Confidence*100),
+		Category: "copy_trade", TraderID: c.TraderID, TraderName: traderName,
+		Title:   fmt.Sprintf("%s | %s | %s %s", traderName, title, c.Symbol, strings.ToUpper(c.Side)),
+		Body:    fmt.Sprintf("%s\n\nTrader Name: %s\nTrader ID: %s\nCycle: %d\nAttempt: %d\nCandidate: %d\nGeneration: %d\nLast decision: %s\nConfidence: %.0f%%\n\n本次决策效果将在后续行情与周期闭合后由确定性评价器回填。", body, traderName, c.TraderID, c.CycleID, attemptNo, c.ID, c.DecisionGeneration, c.LastDecision, c.Confidence*100),
 		RateKey: key, DedupKey: key,
-		Fields: map[string]string{"CycleID": fmt.Sprint(c.CycleID), "AttemptNo": fmt.Sprint(attemptNo), "CandidateID": fmt.Sprint(c.ID), "Generation": fmt.Sprint(c.DecisionGeneration)},
+		Fields: map[string]string{"TraderName": traderName, "CycleID": fmt.Sprint(c.CycleID), "AttemptNo": fmt.Sprint(attemptNo), "CandidateID": fmt.Sprint(c.ID), "Generation": fmt.Sprint(c.DecisionGeneration)},
 	})
 }
 
 // recordAIAnalysisEvent 把一次内置 AI 二次入场分析结论落成统一跟单事件（best-effort）。
-// Copy Guard / 二次入场仅 OKX 生效，故 provider 固定为 okx。
+// provider 从交易员跟单配置解析，避免非 OKX 账户在统一日志中被错误归类。
 func (a *Advisor) recordAIAnalysisEvent(analysis *store.ReentryAIAnalysis, pv *parsedVerdict, autoTriggered bool) {
 	if a.st == nil || analysis == nil || pv == nil {
 		return
@@ -607,10 +608,15 @@ func (a *Advisor) recordAIAnalysisEvent(analysis *store.ReentryAIAnalysis, pv *p
 	if autoTriggered {
 		trigger = "auto"
 	}
+	providerType := ""
+	if cfg, err := a.st.CopyTrade().GetByTraderID(analysis.TraderID); err == nil {
+		providerType = cfg.ProviderType
+	}
+	traderName := a.st.Trader().ResolveDisplayName(analysis.TraderID)
 	summary := fmt.Sprintf("AI 二次入场分析结论: %s (置信度 %.0f%%)", pv.Verdict, pv.Confidence*100)
 	ev := &store.CopyTradeEvent{
 		TraderID:     analysis.TraderID,
-		ProviderType: "okx",
+		ProviderType: providerType,
 		Category:     store.CopyEventCategoryTakeover,
 		EventType:    "AI_ANALYSIS",
 		Severity:     store.CopyEventSeverityInfo,
@@ -620,11 +626,27 @@ func (a *Advisor) recordAIAnalysisEvent(analysis *store.ReentryAIAnalysis, pv *p
 		Operator:     "ai",
 		Summary:      summary,
 		Detail: map[string]interface{}{
-			"verdict":     pv.Verdict,
-			"confidence":  pv.Confidence,
-			"trigger":     trigger,
-			"analysis_id": analysis.ID,
-			"signal_id":   analysis.SignalID,
+			"verdict":              pv.Verdict,
+			"confidence":           pv.Confidence,
+			"regime":               pv.Regime,
+			"size_factor":          pv.SizeFactor,
+			"entry_price_low":      pv.EntryPriceLow,
+			"entry_price_high":     pv.EntryPriceHigh,
+			"attention_price_low":  pv.AttentionPriceLow,
+			"attention_price_high": pv.AttentionPriceHigh,
+			"ttl_seconds":          pv.TTLSeconds,
+			"next_review_seconds":  pv.NextReviewSeconds,
+			"reasons_json":         pv.ReasonsJSON,
+			"trigger":              trigger,
+			"analysis_id":          analysis.ID,
+			"candidate_id":         analysis.CandidateID,
+			"signal_id":            analysis.SignalID,
+			"attempt_no":           analysis.AttemptNo,
+			"decision_generation":  analysis.DecisionGeneration,
+			"data_hash":            analysis.DataHash,
+			"prompt_version":       analysis.PromptVersion,
+			"snapshot_at":          analysis.SnapshotAt,
+			"trader_name_snapshot": traderName,
 		},
 	}
 	if err := a.st.CopyTrade().LogCopyEvent(ev); err != nil {
@@ -680,12 +702,14 @@ func (a *Advisor) notifyVerdict(analysis *store.ReentryAIAnalysis, cfg *store.Re
 	default:
 		b.WriteString("\n本条为旧信号的历史分析，不具备下单能力；真实重入仅由 ai_guarded 候选调度器执行。")
 	}
+	traderName := a.st.Trader().ResolveDisplayName(analysis.TraderID)
 	notifier.Notify(notifier.Alert{
-		Category: "copy_trade",
-		TraderID: analysis.TraderID,
-		Title:    fmt.Sprintf("重入 AI 结论 %s %s → %s", analysis.Symbol, strings.ToUpper(analysis.Side), pv.Verdict),
-		Body:     b.String(),
-		RateKey:  fmt.Sprintf("reentry_ai_verdict|%d", analysis.ID),
+		Category:   "copy_trade",
+		TraderID:   analysis.TraderID,
+		TraderName: traderName,
+		Title:      fmt.Sprintf("%s | 重入 AI 结论 %s %s → %s", traderName, analysis.Symbol, strings.ToUpper(analysis.Side), pv.Verdict),
+		Body:       b.String(),
+		RateKey:    fmt.Sprintf("reentry_ai_verdict|%d", analysis.ID),
 	})
 }
 

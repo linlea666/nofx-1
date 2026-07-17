@@ -214,13 +214,18 @@ func (e *Engine) reportBinanceCredentialsExpired(err error, where string) bool {
 	// label 在 v1 单账号场景下固定为 default；future-proof: 引擎层有 binanceCredLoader 时
 	// 实际 label 由 Provider 决定，这里仅用于 RateKey 与 Body 文案。
 	label := DefaultBinanceCredentialsLabel
+	traderName := e.traderID
+	if e.store != nil {
+		traderName = e.store.Trader().ResolveDisplayName(e.traderID)
+	}
 
 	notifier.Notify(notifier.Alert{
-		Time:     time.Now(),
-		Category: "copy_trade",
-		TraderID: e.traderID,
-		Title:    "Binance 跟单凭证未配置或已过期，请粘贴 cURL",
-		Body:     buildBinanceCredsExpiredAlertBody(label, e.traderID, e.config.LeaderID, where, affectedTraders),
+		Time:       time.Now(),
+		Category:   "copy_trade",
+		TraderID:   e.traderID,
+		TraderName: traderName,
+		Title:      "Binance 跟单凭证未配置或已过期，请粘贴 cURL",
+		Body:       buildBinanceCredsExpiredAlertBody(label, e.traderID, e.config.LeaderID, where, affectedTraders),
 		// 🔑 全局唯一限流键：无论多少 trader 触发，60s 内只发一封
 		RateKey: "binance_creds_expired|" + label,
 	})
