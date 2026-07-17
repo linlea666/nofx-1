@@ -144,6 +144,40 @@ func TestCandidateOperatorTransitionsRejectInFlightEntry(t *testing.T) {
 	}
 }
 
+func TestOperatorReviewRequestUsesSchedulerAndMinimumInterval(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "candidate-request-review.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	rs := st.ReentryAI()
+	candidate, err := rs.EnsureReentryCandidate(&CopyGuardReentryCandidate{CycleID: 712, TraderID: "trader-a", Symbol: "BTCUSDT", Side: "long", FeatureHash: "a"}, time.Now().Add(2*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lastReview := time.Now().UTC().Truncate(time.Second)
+	if _, err := st.db.Exec(`UPDATE copy_guard_reentry_candidates SET status=?,last_review_at=?,next_review_at=? WHERE id=?`, ReentryCandidateWaiting, lastReview, time.Now().Add(2*time.Hour), candidate.ID); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := rs.RequestImmediateReentryCandidateReview(candidate.ID, 5*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := lastReview.Add(5 * time.Minute)
+	if fresh.Status != ReentryCandidateWaiting || fresh.PendingTrigger != "OPERATOR_REVIEW_REQUEST" || fresh.NextReviewAt.Before(want.Add(-time.Second)) || fresh.NextReviewAt.After(want.Add(time.Second)) {
+		t.Fatalf("review request bypassed scheduler/min interval: candidate=%+v want=%s", fresh, want)
+	}
+	if fresh.ReviewCount != 0 || fresh.DecisionGeneration != 0 {
+		t.Fatalf("HTTP-side request must not claim quota or a review lease: %+v", fresh)
+	}
+	if err := rs.PauseReentryCandidate(candidate.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rs.RequestImmediateReentryCandidateReview(candidate.ID, 5*time.Minute); err == nil {
+		t.Fatal("paused candidate must reject production review request")
+	}
+}
+
 func TestPreflightRejectionReturnsToWaitingWithoutAIFailure(t *testing.T) {
 	st, err := New(filepath.Join(t.TempDir(), "candidate-preflight.db"))
 	if err != nil {

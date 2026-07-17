@@ -158,6 +158,7 @@ func TestReentryAIConfigRoundtrip(t *testing.T) {
 	// 保存后读回
 	cfg.Enabled = false
 	cfg.Model = "deepseek-chat"
+	cfg.AnalysisFocus = "重点检查现货 CVD"
 	cfg.ConfidenceThreshold = 0.8
 	if err := st.ReentryAI().SaveReentryAIConfig(cfg); err != nil {
 		t.Fatal(err)
@@ -166,7 +167,7 @@ func TestReentryAIConfigRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Enabled || got.Model != "deepseek-chat" || got.ConfidenceThreshold != 0.8 {
+	if got.Enabled || got.Model != "deepseek-chat" || got.AnalysisFocus != "重点检查现货 CVD" || got.ConfidenceThreshold != 0.8 {
 		t.Fatalf("saved config = %+v", got)
 	}
 
@@ -178,5 +179,29 @@ func TestReentryAIConfigRoundtrip(t *testing.T) {
 	final, _ := st.ReentryAI().GetReentryAIConfig()
 	if !final.Enabled {
 		t.Fatal("upsert should re-enable")
+	}
+}
+
+func TestReentryAIDiagnosticsAreSeparateAndUserScoped(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "reentry_ai_diagnostics.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	rs := st.ReentryAI()
+	first, err := rs.SaveReentryAIDiagnostic(&ReentryAIDiagnostic{UserID: "user-a", Provider: "openai", Model: "model-a", PromptVersion: "v3-ai-guarded", Success: true, LatencyMS: 123, RawResponse: `{"decision":"WAIT"}`, ParsedJSON: `{"decision":"WAIT"}`})
+	if err != nil || first.ID == 0 || first.CreatedAt.IsZero() {
+		t.Fatalf("diagnostic save failed: diagnostic=%+v err=%v", first, err)
+	}
+	if _, err := rs.SaveReentryAIDiagnostic(&ReentryAIDiagnostic{UserID: "user-b", Error: "missing key"}); err != nil {
+		t.Fatal(err)
+	}
+	list, err := rs.ListReentryAIDiagnostics("user-a", 10)
+	if err != nil || len(list) != 1 || list[0].Model != "model-a" {
+		t.Fatalf("diagnostics were not user scoped: list=%+v err=%v", list, err)
+	}
+	stats, err := rs.GetReentryAIStats([]string{"trader-a"})
+	if err != nil || stats.TotalAnalyses != 0 || stats.CandidateAnalyses != 0 {
+		t.Fatalf("zero-trade diagnostics contaminated trading statistics: stats=%+v err=%v", stats, err)
 	}
 }

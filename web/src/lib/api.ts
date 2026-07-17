@@ -1031,6 +1031,16 @@ export const api = {
     )
     if (!result.success) throw new Error(result.message || '恢复候选失败')
   },
+  async requestCopyGuardAICandidateReview(id: number) {
+    const result = await httpClient.post<{
+      message: string
+      candidate: import('../types').CopyGuardAICandidate
+      eligible_at: string
+      may_execute_real_order: boolean
+    }>(`${API_BASE}/copytrade/risk/ai-candidates/${id}/request-review`)
+    if (!result.success) throw new Error(result.message || '请求 AI 复查失败')
+    return result.data!
+  },
   async terminateCopyGuardAICandidate(id: number) {
     const result = await httpClient.post<{ message: string }>(
       `${API_BASE}/copytrade/risk/ai-candidates/${id}/terminate`
@@ -1105,10 +1115,22 @@ export const api = {
     if (!result.success) throw new Error(result.message || '触发 AI 分析失败')
     return result.data!
   },
+  async getReentryAnalysis(analysisId: number) {
+    const result = await httpClient.get<{
+      analysis: import('../types').ReentryAIAnalysis
+    }>(`${API_BASE}/reentry-advisor/analyses/${analysisId}`)
+    if (!result.success)
+      throw new Error(result.message || '获取 AI 分析详情失败')
+    return result.data!.analysis
+  },
   async getReentryConfig() {
     const result = await httpClient.get<{
       config: import('../types').ReentryAIConfig
-      default_prompt: string
+      production_prompt: string
+      production_prompt_version: string
+      legacy_default_prompt: string
+      confidence_source: string
+      recommended_confidence: number
     }>(`${API_BASE}/reentry-advisor/config`)
     if (!result.success)
       throw new Error(result.message || '获取重入 AI 配置失败')
@@ -1122,6 +1144,21 @@ export const api = {
     if (!result.success)
       throw new Error(result.message || '保存重入 AI 配置失败')
     return result.data!
+  },
+  async testReentryAIConnection() {
+    const result = await httpClient.post<{
+      diagnostic: import('../types').ReentryAIDiagnostic
+    }>(`${API_BASE}/reentry-advisor/connection-test`)
+    if (!result.success) throw new Error(result.message || 'AI 连接自检失败')
+    return result.data!.diagnostic
+  },
+  async getReentryAIDiagnostics(limit = 10) {
+    const result = await httpClient.get<{
+      diagnostics: import('../types').ReentryAIDiagnostic[]
+    }>(`${API_BASE}/reentry-advisor/diagnostics?limit=${limit}`)
+    if (!result.success)
+      throw new Error(result.message || '获取 AI 自检记录失败')
+    return result.data!.diagnostics
   },
   // 分析历史列表（跨信号，最新在前）
   async getReentryHistory(limit = 50) {

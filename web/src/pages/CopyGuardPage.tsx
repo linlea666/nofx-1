@@ -18,6 +18,7 @@ import type {
   CopyGuardManualSignal,
   ReentryAIAnalysis,
   ReentryAIConfig,
+  ReentryAIDiagnostic,
   ReentryAIStats,
   ReentryMarketPreview,
 } from '../types'
@@ -123,6 +124,7 @@ const eventLabels: Record<string, string> = {
   REENTRY_REQUESTED: '重入条件满足，已请求下单',
   REENTRY_RECOVERED_AFTER_RESTART: '重启后重入状态已恢复',
   REENTRY_RECOVERY_PENDING: '重启后重入状态待确认',
+  AI_REVIEW_REQUESTED: '操作员请求 AI 尽快复查',
   ADDON_RISK_WARNING: '加仓风险告警（仍跟随）',
   ADDON_SKIPPED_BUDGET: '加仓超预算被拦截（旧版）',
   CYCLE_LOSS_BREAKER: '周期亏损熔断触发',
@@ -220,11 +222,13 @@ const verdictStyles: Record<string, string> = {
   ENTER: 'bg-[#0ECB81]/15 text-[#0ECB81] border-[#0ECB81]',
   WAIT: 'bg-[#F0B90B]/15 text-[#F0B90B] border-[#F0B90B]',
   SKIP: 'bg-[#F6465D]/15 text-[#F6465D] border-[#F6465D]',
+  ABANDON: 'bg-[#F6465D]/15 text-[#F6465D] border-[#F6465D]',
 }
 const verdictLabels: Record<string, string> = {
   ENTER: 'ENTER · 建议重入',
   WAIT: 'WAIT · 继续观察',
   SKIP: 'SKIP · 建议忽略',
+  ABANDON: 'ABANDON · 建议放弃候选',
 }
 
 // 内置 AI 结论卡片：verdict 徽标 + 置信度 + 依据/风险列表（reasons JSON）
@@ -235,6 +239,14 @@ function InternalVerdictCard({ analysis }: { analysis: ReentryAIAnalysis }) {
         reasons?: string[]
         risk_notes?: string[]
         suggested_notional?: number
+        regime?: string
+        size_factor?: number
+        entry_price_low?: number
+        entry_price_high?: number
+        attention_price_low?: number
+        attention_price_high?: number
+        ttl_seconds?: number
+        next_review_seconds?: number
       }
     } catch {
       return {}
@@ -257,6 +269,12 @@ function InternalVerdictCard({ analysis }: { analysis: ReentryAIAnalysis }) {
             建议金额 {parsed.suggested_notional.toFixed(2)} USDT
           </span>
         ) : null}
+        {analysis.candidate_id > 0 && parsed.regime && (
+          <span className="text-xs font-normal">
+            市场状态 {parsed.regime} · 仓位系数{' '}
+            {(parsed.size_factor ?? 0).toFixed(2)}
+          </span>
+        )}
       </div>
       {(parsed.reasons?.length ?? 0) > 0 && (
         <ul className="list-disc space-y-1 pl-5 text-xs text-[#EAECEF]">
@@ -270,10 +288,25 @@ function InternalVerdictCard({ analysis }: { analysis: ReentryAIAnalysis }) {
           风险提示：{parsed.risk_notes!.join('；')}
         </div>
       )}
-      <div className="text-xs text-[#848E9C]">
-        这是旧信号的历史分析视图，不具备下单能力。真实重入只会由持久化 AI
-        候选调度器在重新校验价格、仓位、预算和保护能力后执行。
-      </div>
+      {analysis.candidate_id > 0 ? (
+        <div className="space-y-1 text-xs text-[#848E9C]">
+          <div>
+            入场区间：{parsed.entry_price_low ?? '—'} –{' '}
+            {parsed.entry_price_high ?? '—'}；关注区间：
+            {parsed.attention_price_low ?? '—'} –{' '}
+            {parsed.attention_price_high ?? '—'}
+          </div>
+          <div>
+            这是生产候选结论；只有
+            ENTER、置信度达标且仓位、价格漂移、预算和保护预检全部通过时才可能真实下单。
+          </div>
+        </div>
+      ) : (
+        <div className="text-xs text-[#848E9C]">
+          这是旧信号的历史分析视图，不具备下单能力。真实重入只会由持久化 AI
+          候选调度器在重新校验价格、仓位、预算和保护能力后执行。
+        </div>
+      )}
     </div>
   )
 }
@@ -533,6 +566,79 @@ function AnalysisModal({
   )
 }
 
+function CandidateAnalysisModal({
+  analysisId,
+  onClose,
+}: {
+  analysisId: number
+  onClose: () => void
+}) {
+  const {
+    data: analysis,
+    error,
+    isLoading,
+  } = useSWR<ReentryAIAnalysis>(`candidate-analysis-${analysisId}`, () =>
+    api.getReentryAnalysis(analysisId)
+  )
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+      <div className="flex max-h-[88vh] w-full max-w-3xl flex-col gap-3 overflow-y-auto rounded-lg border border-[#2B3139] bg-[#181A20] p-6 text-sm">
+        <div className="flex items-center justify-between">
+          <div className="font-bold text-[#EAECEF]">
+            生产 AI 候选分析 #{analysisId}
+          </div>
+          <button
+            onClick={onClose}
+            className="rounded bg-[#2B3139] px-3 py-1 text-xs"
+          >
+            关闭
+          </button>
+        </div>
+        {isLoading && <div className="text-[#848E9C]">加载中…</div>}
+        {error && (
+          <div className="text-[#F6465D]">
+            {error instanceof Error ? error.message : String(error)}
+          </div>
+        )}
+        {analysis && (
+          <>
+            <div className="text-xs text-[#848E9C]">
+              {analysis.symbol} {sideLabel(analysis.side)} · cycle{' '}
+              {analysis.cycle_id} · attempt {analysis.attempt_no} · 快照{' '}
+              {dateLabel(analysis.snapshot_at)} · Prompt{' '}
+              {analysis.prompt_version} · 状态 {analysis.call_status}
+            </div>
+            {analysis.call_error && (
+              <div className="rounded border border-[#F6465D] bg-[#F6465D]/10 p-3 text-xs text-[#F6465D]">
+                {analysis.call_error}
+              </div>
+            )}
+            <InternalVerdictCard analysis={analysis} />
+            <CopyableSection
+              title="生产 System Prompt"
+              content={analysis.system_prompt}
+            />
+            <CopyableSection
+              title="生产 User Prompt"
+              content={analysis.user_prompt}
+            />
+            <CopyableSection
+              title="候选数据快照 JSON"
+              content={analysis.datapack_json}
+            />
+            {analysis.raw_response && (
+              <CopyableSection
+                title="模型原始回复"
+                content={analysis.raw_response}
+              />
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  )
+}
+
 // 准确率格子（内部/外部 AI 各一行）
 function accuracyText(scored: number, correct: number) {
   if (scored === 0) return '暂无可评分样本'
@@ -556,6 +662,9 @@ function AdvisorSettingsCard() {
   const { data: models = [] } = useSWR<AIModel[]>('model-configs', () =>
     api.getModelConfigs()
   )
+  const { data: diagnostics = [], mutate: mutateDiagnostics } = useSWR<
+    ReentryAIDiagnostic[]
+  >('reentry-ai-diagnostics', () => api.getReentryAIDiagnostics(5))
   const enabledModels = models.filter((m) => m.enabled)
   // A1：分析历史（跨信号，含已执行/已忽略的旧信号，供准确率复盘）
   const { data: history = [] } = useSWR<ReentryAIAnalysis[]>(
@@ -564,9 +673,14 @@ function AdvisorSettingsCard() {
     { refreshInterval: 30000 }
   )
   const [viewing, setViewing] = useState<AnalysisModalTarget | null>(null)
+  const [viewingCandidateAnalysisID, setViewingCandidateAnalysisID] = useState<
+    number | null
+  >(null)
 
   const [draft, setDraft] = useState<ReentryAIConfig | null>(null)
   const [busy, setBusy] = useState(false)
+  const [testing, setTesting] = useState(false)
+  const [diagnostic, setDiagnostic] = useState<ReentryAIDiagnostic | null>(null)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const cfg = draft ?? cfgData?.config ?? null
@@ -589,6 +703,26 @@ function AdvisorSettingsCard() {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
       setBusy(false)
+    }
+  }
+  const doConnectionTest = async () => {
+    setTesting(true)
+    setDiagnostic(null)
+    setError('')
+    setNotice('')
+    try {
+      const result = await api.testReentryAIConnection()
+      setDiagnostic(result)
+      if (result.success) {
+        setNotice('AI 连接、Prompt 与严格 JSON Schema 自检通过')
+      } else {
+        setError(result.error || 'AI 已响应，但严格 JSON Schema 自检未通过')
+      }
+      void mutateDiagnostics()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setTesting(false)
     }
   }
 
@@ -689,21 +823,10 @@ function AdvisorSettingsCard() {
                   />
                   <span className="font-medium">AI 重入全局执行安全开关</span>
                 </label>
-                <label className="flex items-center gap-2 text-xs text-[#848E9C]">
-                  置信度门槛
-                  <input
-                    type="number"
-                    min={0.5}
-                    max={1}
-                    step={0.05}
-                    value={cfg.confidence_threshold}
-                    onChange={(e) =>
-                      update({ confidence_threshold: Number(e.target.value) })
-                    }
-                    className="w-20 rounded border border-[#2B3139] bg-[#181A20] px-2 py-1 text-[#EAECEF]"
-                  />
-                  （建议 ≥ 0.7）
-                </label>
+                <span className="text-xs text-[#848E9C]">
+                  真实入场门槛来自每个交易员配置，默认 0.80、范围
+                  0.70–0.95；旧全局 0.7 字段不再控制生产候选。
+                </span>
               </div>
               <div className="text-xs leading-relaxed text-[#848E9C]">
                 这是 ai_guarded 交易员配置的全局先决安全开关。开启后 AI
@@ -723,43 +846,104 @@ function AdvisorSettingsCard() {
                 )}
               </div>
             </div>
-            <div className="space-y-1">
-              <div className="flex items-center justify-between text-xs text-[#848E9C]">
-                <span>
-                  自定义 System
-                  Prompt（留空使用内置默认；修改只影响之后生成的快照。注意保留
-                  JSON 输出格式要求，否则内置分析无法解析结论）
-                </span>
-                {cfg.prompt_template && (
-                  <button
-                    onClick={() => update({ prompt_template: '' })}
-                    className="underline hover:text-[#EAECEF]"
-                  >
-                    恢复默认
-                  </button>
-                )}
+            <div className="space-y-2">
+              <div className="text-xs text-[#848E9C]">
+                分析关注点补充（最多 2000 字）。它只提示 AI
+                额外检查哪些证据，不能覆盖生产职责、决策枚举、JSON Schema
+                或代码风控。
               </div>
               <textarea
-                value={cfg.prompt_template}
-                onChange={(e) => update({ prompt_template: e.target.value })}
+                value={cfg.analysis_focus ?? ''}
+                onChange={(e) => update({ analysis_focus: e.target.value })}
                 rows={4}
-                placeholder={cfgData?.default_prompt?.slice(0, 300) + '…'}
+                maxLength={2000}
+                placeholder="例如：重点检查现货 CVD 与合约 CVD 是否背离，以及领航员最近 30 分钟是否持续减仓。"
                 className="w-full rounded border border-[#2B3139] bg-[#0B0E11] p-2 text-xs text-[#EAECEF]"
               />
+              <details className="rounded border border-[#2B3139] bg-[#0B0E11] text-xs">
+                <summary className="cursor-pointer px-3 py-2 text-[#B7BDC6]">
+                  生产 Prompt{' '}
+                  {cfgData?.production_prompt_version ?? 'v3-ai-guarded'}
+                  （固定核心，只读）
+                </summary>
+                <pre className="max-h-64 overflow-auto whitespace-pre-wrap border-t border-[#2B3139] p-3 text-[#848E9C]">
+                  {cfgData?.production_prompt || '加载中…'}
+                </pre>
+              </details>
+              {(cfg.prompt_template || cfgData?.legacy_default_prompt) && (
+                <details className="rounded border border-[#2B3139] bg-[#0B0E11] text-xs">
+                  <summary className="cursor-pointer px-3 py-2 text-[#848E9C]">
+                    历史人工信号 Prompt（只读兼容，不影响 ai_guarded）
+                  </summary>
+                  <pre className="max-h-52 overflow-auto whitespace-pre-wrap border-t border-[#2B3139] p-3 text-[#848E9C]">
+                    {cfg.prompt_template || cfgData?.legacy_default_prompt}
+                  </pre>
+                </details>
+              )}
             </div>
             <div className="flex items-center justify-between">
               <span className="text-xs">
                 {error && <span className="text-[#F6465D]">{error}</span>}
                 {notice && <span className="text-[#0ECB81]">{notice}</span>}
               </span>
-              <button
-                onClick={() => void doSave()}
-                disabled={busy || !draft}
-                className="rounded bg-[#F0B90B] px-4 py-1.5 text-xs font-medium text-black hover:opacity-90 disabled:opacity-40"
-              >
-                {busy ? '保存中…' : '保存配置'}
-              </button>
+              <span className="flex gap-2">
+                <button
+                  onClick={() => void doConnectionTest()}
+                  disabled={busy || testing || !!draft}
+                  title={
+                    draft
+                      ? '请先保存配置，再测试服务器当前生效的模型'
+                      : '会消耗一次很小的模型调用，但绝不会创建候选或订单'
+                  }
+                  className="rounded bg-[#2B3139] px-4 py-1.5 text-xs text-[#EAECEF] disabled:opacity-40"
+                >
+                  {testing ? '自检中…' : 'AI 连接自检（零交易）'}
+                </button>
+                <button
+                  onClick={() => void doSave()}
+                  disabled={busy || !draft}
+                  className="rounded bg-[#F0B90B] px-4 py-1.5 text-xs font-medium text-black hover:opacity-90 disabled:opacity-40"
+                >
+                  {busy ? '保存中…' : '保存配置'}
+                </button>
+              </span>
             </div>
+            {(diagnostic || diagnostics[0]) &&
+              (() => {
+                const d = diagnostic ?? diagnostics[0]
+                return (
+                  <div
+                    className={`space-y-2 rounded border p-3 text-xs ${
+                      d.success
+                        ? 'border-[#0ECB81] bg-[#0ECB81]/5'
+                        : 'border-[#F6465D] bg-[#F6465D]/5'
+                    }`}
+                  >
+                    <div className="font-medium text-[#EAECEF]">
+                      最近自检：{d.success ? '通过' : '失败'} · {d.provider}/
+                      {d.model || '未解析模型'} · {d.latency_ms} ms ·{' '}
+                      {d.prompt_version} · {dateLabel(d.created_at)}
+                    </div>
+                    {d.error && <div className="text-[#F6465D]">{d.error}</div>}
+                    {d.parsed_json && (
+                      <CopyableSection
+                        title="自检解析结果"
+                        content={d.parsed_json}
+                      />
+                    )}
+                    {d.raw_response && (
+                      <CopyableSection
+                        title="自检原始回复"
+                        content={d.raw_response}
+                      />
+                    )}
+                    <div className="text-[#848E9C]">
+                      自检不会创建候选、占用交易额度或下单；它会消耗一次模型调用，并有
+                      30 秒冷却。
+                    </div>
+                  </div>
+                )
+              })()}
           </>
         )}
         {stats && stats.total_analyses > 0 && (
@@ -826,7 +1010,7 @@ function AdvisorSettingsCard() {
           <div className="space-y-2 rounded bg-[#0B0E11] p-3">
             <div className="text-xs font-medium text-[#EAECEF]">
               分析历史（最近 {history.length}{' '}
-              条快照，含已执行/已忽略信号，点击查看详情）
+              条快照，含生产候选和历史信号，点击查看详情）
             </div>
             <div className="max-h-72 overflow-y-auto">
               <table className="w-full text-left text-xs">
@@ -844,13 +1028,17 @@ function AdvisorSettingsCard() {
                   {history.map((a) => (
                     <tr
                       key={a.id}
-                      onClick={() =>
+                      onClick={() => {
+                        if (a.candidate_id > 0) {
+                          setViewingCandidateAnalysisID(a.id)
+                          return
+                        }
                         setViewing({
                           id: a.signal_id,
                           symbol: a.symbol,
                           side: a.side,
                         })
-                      }
+                      }}
                       className="cursor-pointer border-t border-[#181A20] hover:bg-[#181A20]"
                     >
                       <td className="py-1.5 pr-3">
@@ -859,7 +1047,11 @@ function AdvisorSettingsCard() {
                       <td className="py-1.5 pr-3">
                         {a.symbol} {sideLabel(a.side)}单
                       </td>
-                      <td className="py-1.5 pr-3">#{a.signal_id}</td>
+                      <td className="py-1.5 pr-3">
+                        {a.candidate_id > 0
+                          ? `候选 #${a.candidate_id} / 第 ${a.attempt_no} 次`
+                          : `历史信号 #${a.signal_id}`}
+                      </td>
                       <td className="py-1.5 pr-3">
                         {a.verdict
                           ? `${verdictLabels[a.verdict] || a.verdict}（${(a.confidence * 100).toFixed(0)}%）`
@@ -898,6 +1090,12 @@ function AdvisorSettingsCard() {
       </div>
       {viewing && (
         <AnalysisModal signal={viewing} onClose={() => setViewing(null)} />
+      )}
+      {viewingCandidateAnalysisID != null && (
+        <CandidateAnalysisModal
+          analysisId={viewingCandidateAnalysisID}
+          onClose={() => setViewingCandidateAnalysisID(null)}
+        />
       )}
     </details>
   )
@@ -1387,6 +1585,10 @@ function AICandidatesPanel() {
     { refreshInterval: 15000 }
   )
   const [busy, setBusy] = useState<number | null>(null)
+  const [error, setError] = useState('')
+  const [viewingAnalysisID, setViewingAnalysisID] = useState<number | null>(
+    null
+  )
   const candidates = data?.candidates ?? []
   if (candidates.length === 0) return null
 
@@ -1402,6 +1604,7 @@ function AICandidatesPanel() {
     )
       return
     setBusy(candidate.id)
+    setError('')
     try {
       if (action === 'pause') await api.pauseCopyGuardAICandidate(candidate.id)
       if (action === 'resume')
@@ -1409,104 +1612,175 @@ function AICandidatesPanel() {
       if (action === 'terminate')
         await api.terminateCopyGuardAICandidate(candidate.id)
       await mutate()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const requestReview = async (candidate: CopyGuardAICandidate) => {
+    if (
+      !window.confirm(
+        `请求立即复查 ${candidate.symbol}？\n\n这不是模拟分析：系统仍会遵守最短间隔、额度、数据去重和全部确定性风控，但若 AI 返回高置信度 ENTER 且预检通过，可能直接使用真实资金重入。`
+      )
+    )
+      return
+    setBusy(candidate.id)
+    setError('')
+    try {
+      const result = await api.requestCopyGuardAICandidateReview(candidate.id)
+      window.alert(
+        `复查请求已进入安全调度器，最早处理时间：${dateLabel(result.eligible_at)}。`
+      )
+      await mutate()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
     } finally {
       setBusy(null)
     }
   }
 
   return (
-    <section className="rounded border border-[#2B3139] bg-[#181A20] p-4">
-      <div className="mb-3 flex items-center justify-between">
-        <div>
-          <h3 className="font-medium text-[#EAECEF]">AI 持续重入观察</h3>
-          <p className="text-xs text-[#848E9C]">
-            AI
-            只判断反转与入场价值；仓位、预算、价格漂移和保护能力由代码强制复核。
-          </p>
-        </div>
-        <span className="text-xs text-[#F0B90B]">
-          {candidates.length} 个候选
-        </span>
-      </div>
-      <div className="space-y-2">
-        {candidates.map((candidate) => (
-          <div
-            key={candidate.id}
-            className="rounded border border-[#2B3139] bg-[#0B0E11] p-3 text-xs"
-          >
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <div className="font-medium text-[#EAECEF]">
-                {data?.traderNames[candidate.trader_id] ?? candidate.trader_id}{' '}
-                · {candidate.symbol} {sideLabel(candidate.side)} · 第{' '}
-                {candidate.reentry_count + 1} 次候选
-              </div>
-              <span className="rounded bg-[#2B3139] px-2 py-1 text-[#F0B90B]">
-                {candidate.status}
-              </span>
-            </div>
-            <div className="mt-2 grid gap-1 text-[#848E9C] md:grid-cols-3">
-              <span>
-                上次决策：{candidate.last_decision || '尚未分析'}{' '}
-                {candidate.confidence > 0
-                  ? `${(candidate.confidence * 100).toFixed(0)}%`
-                  : ''}
-              </span>
-              <span>
-                复查：{candidate.review_count}/30 · 下次{' '}
-                {new Date(candidate.next_review_at).toLocaleString()}
-              </span>
-              <span>
-                预计上限：{candidate.max_notional.toFixed(2)} USDT · factor{' '}
-                {(candidate.size_factor || 0).toFixed(2)}
-              </span>
-              <span>
-                入场区间：{candidate.entry_price_low || '—'} –{' '}
-                {candidate.entry_price_high || '—'}
-              </span>
-              <span>
-                关注区间：{candidate.attention_price_low || '—'} –{' '}
-                {candidate.attention_price_high || '—'}
-              </span>
-              <span>
-                保护：{candidate.protectable ? '可预检' : '不可保护'} · 止损参考{' '}
-                {candidate.last_stop_price || '—'}
-              </span>
-            </div>
-            {(candidate.pending_trigger || candidate.last_error) && (
-              <div className="mt-2 text-[#F6465D]">
-                {candidate.pending_trigger || candidate.last_error}
-              </div>
-            )}
-            <div className="mt-2 flex justify-end gap-2">
-              {candidate.status === 'PAUSED' ? (
-                <button
-                  disabled={busy === candidate.id}
-                  onClick={() => void operate(candidate, 'resume')}
-                  className="rounded bg-[#2B3139] px-3 py-1 disabled:opacity-40"
-                >
-                  恢复
-                </button>
-              ) : (
-                <button
-                  disabled={busy === candidate.id}
-                  onClick={() => void operate(candidate, 'pause')}
-                  className="rounded bg-[#2B3139] px-3 py-1 disabled:opacity-40"
-                >
-                  暂停
-                </button>
-              )}
-              <button
-                disabled={busy === candidate.id}
-                onClick={() => void operate(candidate, 'terminate')}
-                className="rounded bg-[#F6465D22] px-3 py-1 text-[#F6465D] disabled:opacity-40"
-              >
-                终止
-              </button>
-            </div>
+    <>
+      <section className="rounded border border-[#2B3139] bg-[#181A20] p-4">
+        <div className="mb-3 flex items-center justify-between">
+          <div>
+            <h3 className="font-medium text-[#EAECEF]">AI 持续重入观察</h3>
+            <p className="text-xs text-[#848E9C]">
+              AI
+              只判断反转与入场价值；仓位、预算、价格漂移和保护能力由代码强制复核。
+            </p>
           </div>
-        ))}
-      </div>
-    </section>
+          <span className="text-xs text-[#F0B90B]">
+            {candidates.length} 个候选
+          </span>
+        </div>
+        {error && <div className="mb-2 text-xs text-[#F6465D]">{error}</div>}
+        <div className="space-y-2">
+          {candidates.map((candidate) => (
+            <div
+              key={candidate.id}
+              className="rounded border border-[#2B3139] bg-[#0B0E11] p-3 text-xs"
+            >
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="font-medium text-[#EAECEF]">
+                  {data?.traderNames[candidate.trader_id] ??
+                    candidate.trader_id}{' '}
+                  · {candidate.symbol} {sideLabel(candidate.side)} · 第{' '}
+                  {candidate.reentry_count + 1} 次候选
+                </div>
+                <span className="rounded bg-[#2B3139] px-2 py-1 text-[#F0B90B]">
+                  {candidate.status}
+                </span>
+              </div>
+              <div className="mt-2 grid gap-1 text-[#848E9C] md:grid-cols-3">
+                <span>
+                  上次决策：{candidate.last_decision || '尚未分析'}{' '}
+                  {candidate.confidence > 0
+                    ? `${(candidate.confidence * 100).toFixed(0)}%`
+                    : ''}
+                </span>
+                <span>
+                  复查：{candidate.review_count}/
+                  {candidate.ai_lifecycle_call_limit || 30} · 24h{' '}
+                  {candidate.ai_daily_calls_used || 0}/
+                  {candidate.ai_daily_call_limit || 12} · 下次{' '}
+                  {new Date(candidate.next_review_at).toLocaleString()}
+                </span>
+                <span>
+                  预计上限：{candidate.max_notional.toFixed(2)} USDT · factor{' '}
+                  {(candidate.size_factor || 0).toFixed(2)}
+                </span>
+                <span>
+                  入场区间：{candidate.entry_price_low || '—'} –{' '}
+                  {candidate.entry_price_high || '—'}
+                </span>
+                <span>
+                  关注区间：{candidate.attention_price_low || '—'} –{' '}
+                  {candidate.attention_price_high || '—'}
+                </span>
+                <span>
+                  保护：{candidate.protectable ? '可预检' : '不可保护'} ·
+                  止损参考 {candidate.last_stop_price || '—'}
+                </span>
+                <span>
+                  真实门槛 ≥{' '}
+                  {((candidate.ai_confidence_threshold || 0.8) * 100).toFixed(
+                    0
+                  )}
+                  % · 最短间隔 {candidate.ai_min_review_seconds || 300} 秒
+                </span>
+              </div>
+              {(candidate.pending_trigger || candidate.last_error) && (
+                <div className="mt-2 text-[#F6465D]">
+                  {candidate.pending_trigger || candidate.last_error}
+                </div>
+              )}
+              <div className="mt-2 flex justify-end gap-2">
+                {candidate.last_analysis_id > 0 && (
+                  <button
+                    disabled={busy === candidate.id}
+                    onClick={() =>
+                      setViewingAnalysisID(candidate.last_analysis_id)
+                    }
+                    className="rounded bg-[#2B3139] px-3 py-1 disabled:opacity-40"
+                  >
+                    查看最近分析
+                  </button>
+                )}
+                {(candidate.status === 'WATCHING' ||
+                  candidate.status === 'WAITING') && (
+                  <button
+                    disabled={busy === candidate.id}
+                    onClick={() => void requestReview(candidate)}
+                    className="rounded bg-[#F0B90B] px-3 py-1 text-black disabled:opacity-40"
+                  >
+                    请求立即复查（可能下单）
+                  </button>
+                )}
+                {candidate.status === 'PAUSED' ? (
+                  <button
+                    disabled={busy === candidate.id}
+                    onClick={() => void operate(candidate, 'resume')}
+                    className="rounded bg-[#2B3139] px-3 py-1 disabled:opacity-40"
+                  >
+                    恢复
+                  </button>
+                ) : ['WATCHING', 'WAITING', 'REVIEWING'].includes(
+                    candidate.status
+                  ) ? (
+                  <button
+                    disabled={busy === candidate.id}
+                    onClick={() => void operate(candidate, 'pause')}
+                    className="rounded bg-[#2B3139] px-3 py-1 disabled:opacity-40"
+                  >
+                    暂停
+                  </button>
+                ) : null}
+                {['WATCHING', 'WAITING', 'REVIEWING', 'PAUSED'].includes(
+                  candidate.status
+                ) && (
+                  <button
+                    disabled={busy === candidate.id}
+                    onClick={() => void operate(candidate, 'terminate')}
+                    className="rounded bg-[#F6465D22] px-3 py-1 text-[#F6465D] disabled:opacity-40"
+                  >
+                    终止
+                  </button>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      </section>
+      {viewingAnalysisID != null && (
+        <CandidateAnalysisModal
+          analysisId={viewingAnalysisID}
+          onClose={() => setViewingAnalysisID(null)}
+        />
+      )}
+    </>
   )
 }
 

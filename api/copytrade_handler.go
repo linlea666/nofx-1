@@ -64,6 +64,19 @@ func validateAIGuardedPrerequisites(st *store.Store, cfg *store.CopyTradeConfig)
 	return fmt.Errorf("ai_guarded requires at least one enabled AI model with an API key")
 }
 
+// validateLegacyReentrySelection makes legacy_rule a one-way compatibility
+// state: an existing legacy trader may remain unchanged or migrate out, but no
+// new/non-legacy trader can opt back into the retired execution engine.
+func validateLegacyReentrySelection(existing *store.CopyTradeConfig, requested string) error {
+	if requested != "legacy_rule" {
+		return nil
+	}
+	if existing != nil && existing.RiskReentryDecisionMode == "legacy_rule" {
+		return nil
+	}
+	return fmt.Errorf("legacy_rule is retired for new selections; use ai_guarded or disabled")
+}
+
 // validateRiskConfirmation keeps every configuration entry point on the same
 // high-risk confirmation contract. Above 8%, a boolean is insufficient: the
 // caller must echo the exact percentage value the operator typed.
@@ -99,6 +112,7 @@ func (h *CopyTradeHandler) RegisterRoutes(group *gin.RouterGroup) {
 		copyTrade.GET("/risk/ai-candidates", h.ListAICandidates)
 		copyTrade.POST("/risk/ai-candidates/:id/pause", h.PauseAICandidate)
 		copyTrade.POST("/risk/ai-candidates/:id/resume", h.ResumeAICandidate)
+		copyTrade.POST("/risk/ai-candidates/:id/request-review", h.RequestAICandidateReview)
 		copyTrade.POST("/risk/ai-candidates/:id/terminate", h.TerminateAICandidate)
 		copyTrade.GET("/risk/cycles", h.GetRiskCycles)
 		copyTrade.GET("/risk/cycles/:id", h.GetRiskCycle)
@@ -145,6 +159,17 @@ func (h *CopyTradeHandler) ListAICandidates(c *gin.Context) {
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
+	}
+	for _, candidate := range candidates {
+		if policy, policyErr := h.store.CopyTrade().GetByTraderID(candidate.TraderID); policyErr == nil {
+			candidate.AIConfidenceThreshold = policy.RiskAIConfidenceThreshold
+			candidate.AIMinReviewSeconds = policy.RiskAIMinReviewSeconds
+			candidate.AIDailyCallLimit = policy.RiskAIDailyCallLimit
+			candidate.AILifecycleCallLimit = policy.RiskAILifecycleCallLimit
+		}
+		if calls, callsErr := h.store.ReentryAI().CountReentryCandidateCalls24h(candidate.ID); callsErr == nil {
+			candidate.AIDailyCallsUsed = calls
+		}
 	}
 	c.JSON(http.StatusOK, gin.H{"candidates": candidates, "trader_names": names, "count": len(candidates)})
 }
@@ -196,6 +221,45 @@ func (h *CopyTradeHandler) ResumeAICandidate(c *gin.Context) {
 	}
 	_ = h.store.CopyTrade().UpdateCopyGuardObservation(candidate.CycleID, store.CopyGuardAIWaiting, candidate.LeaderEntryPrice, candidate.TriggerPrice, candidate.ATR)
 	c.JSON(http.StatusOK, gin.H{"message": "AI candidate resumed"})
+}
+
+func (h *CopyTradeHandler) RequestAICandidateReview(c *gin.Context) {
+	candidate := h.getOwnedAICandidate(c)
+	if candidate == nil {
+		return
+	}
+	policy, err := h.store.CopyTrade().GetByTraderID(candidate.TraderID)
+	if err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": "trader risk policy unavailable"})
+		return
+	}
+	if !policy.RiskReentryEnabled || policy.RiskReentryDecisionMode != "ai_guarded" {
+		c.JSON(http.StatusConflict, gin.H{"error": "candidate trader is not enabled for ai_guarded reentry"})
+		return
+	}
+	if err := validateAIGuardedPrerequisites(h.store, policy); err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		return
+	}
+	fresh, err := h.store.ReentryAI().RequestImmediateReentryCandidateReview(candidate.ID, time.Duration(policy.RiskAIMinReviewSeconds)*time.Second)
+	if err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		return
+	}
+	_ = h.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{
+		CycleID: candidate.CycleID, TraderID: candidate.TraderID, Type: "AI_REVIEW_REQUESTED",
+		Metadata: map[string]interface{}{
+			"candidate_id": candidate.ID, "attempt_no": candidate.ReentryCount + 1,
+			"decision_generation": candidate.DecisionGeneration, "operator": c.GetString("user_id"),
+			"eligible_at": fresh.NextReviewAt, "min_review_seconds": policy.RiskAIMinReviewSeconds,
+		},
+	})
+	c.JSON(http.StatusOK, gin.H{
+		"message":                "AI review requested through the guarded scheduler",
+		"candidate":              fresh,
+		"eligible_at":            fresh.NextReviewAt,
+		"may_execute_real_order": true,
+	})
 }
 
 func (h *CopyTradeHandler) TerminateAICandidate(c *gin.Context) {
@@ -1123,6 +1187,10 @@ func (h *CopyTradeHandler) SaveConfig(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
+	}
+	if err := validateLegacyReentrySelection(existing, config.RiskReentryDecisionMode); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
 	}
 	if err := validateAIGuardedPrerequisites(h.store, config); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})

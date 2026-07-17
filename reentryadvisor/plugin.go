@@ -257,7 +257,7 @@ func (a *Advisor) generateForCandidate(c *store.CopyGuardReentryCandidate, cfg *
 		return nil, err
 	}
 	dataHash := fmt.Sprintf("%x", sha256.Sum256(hashInput))
-	analysis := &store.ReentryAIAnalysis{CandidateID: c.ID, TraderID: c.TraderID, CycleID: c.CycleID, Symbol: c.Symbol, Side: c.Side, AttemptNo: c.ReentryCount + 1, DecisionGeneration: c.DecisionGeneration, DataHash: dataHash, SystemPrompt: candidateSystemPrompt(), UserPrompt: buildCandidateUserPrompt(&promptCandidate, string(b)), DatapackJSON: string(b), MarketDataAvailable: pack.Meta.FuturesAvailable, MissingFields: joinMissing(pack.Meta.MissingFields), PromptVersion: candidatePromptVersion, SnapshotPrice: snapshotPrice}
+	analysis := &store.ReentryAIAnalysis{CandidateID: c.ID, TraderID: c.TraderID, CycleID: c.CycleID, Symbol: c.Symbol, Side: c.Side, AttemptNo: c.ReentryCount + 1, DecisionGeneration: c.DecisionGeneration, DataHash: dataHash, SystemPrompt: candidateSystemPrompt(cfg.AnalysisFocus), UserPrompt: buildCandidateUserPrompt(&promptCandidate, string(b)), DatapackJSON: string(b), MarketDataAvailable: pack.Meta.FuturesAvailable, MissingFields: joinMissing(pack.Meta.MissingFields), PromptVersion: candidatePromptVersion, SnapshotPrice: snapshotPrice}
 	return a.st.ReentryAI().SaveReentryAnalysis(analysis)
 }
 

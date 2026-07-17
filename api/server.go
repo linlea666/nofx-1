@@ -736,6 +736,10 @@ func (s *Server) handleCreateTrader(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	if req.DecisionMode == "copy_trade" && req.CopyConfig != nil && req.CopyConfig.RiskReentryDecisionMode != nil && *req.CopyConfig.RiskReentryDecisionMode == "legacy_rule" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "legacy_rule is retired for new traders; use ai_guarded or disabled"})
+		return
+	}
 
 	// Validate leverage values
 	if req.BTCETHLeverage < 0 || req.BTCETHLeverage > 50 {
@@ -1194,6 +1198,10 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 
 			// v3 风控字段透传（修复 bug：之前 CopyConfigReq 无 risk_* 字段，前端传值被 JSON unmarshal 静默丢弃）
 			applyCopyConfigRiskFields(copyConfig, req.CopyConfig)
+			if err := validateLegacyReentrySelection(existingCopyCfg, copyConfig.RiskReentryDecisionMode); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
 			if err := copytrade.ValidateStoredRiskPolicy(copyConfig); err != nil {
 				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 				return

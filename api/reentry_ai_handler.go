@@ -2,8 +2,10 @@ package api
 
 import (
 	"database/sql"
+	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"nofx/reentryadvisor"
@@ -25,6 +27,8 @@ import (
 //   GET  /api/reentry-advisor/stats                           结论分布与准确率统计
 //   GET  /api/reentry-advisor/analyses                        分析历史列表（跨信号，最新在前）
 //   GET  /api/reentry-advisor/market-preview?symbol=          市场指标实时预览（60s 缓存）
+//   POST /api/reentry-advisor/connection-test                  零交易模型/Schema 自检
+//   GET  /api/reentry-advisor/diagnostics                      自检审计记录
 //
 // 归属校验：分析记录 → 信号 → 交易员 → 当前用户（同人工重入信号 API 口径）
 // ============================================================================
@@ -32,6 +36,11 @@ import (
 // ReentryAIHandler 重入 AI 助手 Handler
 type ReentryAIHandler struct {
 	store *store.Store
+}
+
+type reentryAIConfigRequest struct {
+	store.ReentryAIConfig
+	AnalysisFocus *string `json:"analysis_focus"`
 }
 
 // NewReentryAIHandler 创建 Handler
@@ -46,12 +55,15 @@ func (h *ReentryAIHandler) RegisterRoutes(group *gin.RouterGroup) {
 		g.GET("/signals/:signal_id/analyses", h.ListAnalyses)
 		g.POST("/signals/:signal_id/regenerate", h.RegenerateAnalysis)
 		g.PUT("/analyses/:id/external", h.SaveExternal)
+		g.GET("/analyses/:id", h.GetAnalysis)
 		g.POST("/analyses/:id/analyze", h.AnalyzeInternal)
 		g.GET("/analyses", h.ListHistory)
 		g.GET("/market-preview", h.MarketPreview)
 		g.GET("/stats", h.GetStats)
 		g.GET("/config", h.GetConfig)
 		g.PUT("/config", h.SaveConfig)
+		g.POST("/connection-test", h.ConnectionTest)
+		g.GET("/diagnostics", h.ListDiagnostics)
 	}
 }
 
@@ -210,6 +222,16 @@ func (h *ReentryAIHandler) AnalyzeInternal(c *gin.Context) {
 	c.JSON(200, gin.H{"message": "AI 分析已开始，结果稍后自动写入本条记录"})
 }
 
+// GetAnalysis returns one owned analysis snapshot. Candidate details use this
+// read-only endpoint; candidate execution remains scheduler-only.
+func (h *ReentryAIHandler) GetAnalysis(c *gin.Context) {
+	analysis := h.ownedAnalysis(c)
+	if analysis == nil {
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"analysis": analysis})
+}
+
 // ownedTraderIDs 当前用户名下交易员 ID 列表（统计/列表接口的归属过滤参数）
 func (h *ReentryAIHandler) ownedTraderIDs(c *gin.Context) ([]string, error) {
 	set, err := h.ownedTraderSet(c)
@@ -274,7 +296,9 @@ func (h *ReentryAIHandler) GetStats(c *gin.Context) {
 	c.JSON(200, gin.H{"stats": stats})
 }
 
-// GetConfig 全局配置（附内置默认 Prompt，供配置页占位与"恢复默认"）
+// GetConfig returns both contracts explicitly: production ai_guarded uses the
+// immutable-core v3 prompt plus analysis_focus; default_prompt is retained only
+// for the historical manual-signal analysis viewer.
 // @Summary 重入 AI 助手配置
 // @Tags ReentryAdvisor
 // @Router /api/reentry-advisor/config [get]
@@ -284,7 +308,16 @@ func (h *ReentryAIHandler) GetConfig(c *gin.Context) {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(200, gin.H{"config": cfg, "default_prompt": reentryadvisor.DefaultSystemPrompt()})
+	productionPrompt, productionVersion := reentryadvisor.ProductionCandidatePrompt(cfg.AnalysisFocus)
+	c.JSON(200, gin.H{
+		"config":                    cfg,
+		"production_prompt":         productionPrompt,
+		"production_prompt_version": productionVersion,
+		"legacy_default_prompt":     reentryadvisor.DefaultSystemPrompt(),
+		"default_prompt":            reentryadvisor.DefaultSystemPrompt(), // deprecated response alias
+		"confidence_source":         "per_trader_risk_ai_confidence_threshold",
+		"recommended_confidence":    0.80,
+	})
 }
 
 // SaveConfig 保存全局配置
@@ -292,19 +325,43 @@ func (h *ReentryAIHandler) GetConfig(c *gin.Context) {
 // @Tags ReentryAdvisor
 // @Router /api/reentry-advisor/config [put]
 func (h *ReentryAIHandler) SaveConfig(c *gin.Context) {
-	var cfg store.ReentryAIConfig
-	if err := c.ShouldBindJSON(&cfg); err != nil {
+	// Pointer override preserves the new focus addendum when a one-version-old
+	// client PUTs the rest of the config without knowing analysis_focus. An
+	// explicit empty string still clears it.
+	var req reentryAIConfigRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(400, gin.H{"error": "invalid request body"})
 		return
 	}
+	cfg := req.ReentryAIConfig
+	if req.AnalysisFocus != nil {
+		cfg.AnalysisFocus = *req.AnalysisFocus
+	} else if existing, err := h.store.ReentryAI().GetReentryAIConfig(); err == nil {
+		cfg.AnalysisFocus = existing.AnalysisFocus
+	}
 	if cfg.TimeoutSeconds <= 0 {
 		cfg.TimeoutSeconds = 60
+	}
+	if cfg.TimeoutSeconds < 10 || cfg.TimeoutSeconds > 300 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "timeout_seconds must be 10..300"})
+		return
 	}
 	if cfg.ConfidenceThreshold <= 0 || cfg.ConfidenceThreshold > 1 {
 		cfg.ConfidenceThreshold = 0.7
 	}
 	if cfg.Provider == "" {
 		cfg.Provider = "deepseek"
+	}
+	cfg.AnalysisFocus = strings.TrimSpace(cfg.AnalysisFocus)
+	if len([]rune(cfg.AnalysisFocus)) > 2000 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "analysis_focus cannot exceed 2000 characters"})
+		return
+	}
+	for _, r := range cfg.AnalysisFocus {
+		if r < 0x20 && r != '\n' && r != '\r' && r != '\t' {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "analysis_focus contains unsupported control characters"})
+			return
+		}
 	}
 	// Phase 3 依赖链：自动入场必须建立在自动分析之上（无分析则无结论可依据）
 	if cfg.AutoEntryEnabled && !cfg.AIEnabled {
@@ -318,11 +375,62 @@ func (h *ReentryAIHandler) SaveConfig(c *gin.Context) {
 			c.JSON(400, gin.H{"error": "所选模型不存在: " + cfg.Model})
 			return
 		}
+		if (cfg.AIEnabled || cfg.AutoEntryEnabled) && (!m.Enabled || strings.TrimSpace(m.APIKey) == "") {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "开启 AI 分析前，所选模型必须已启用并配置 API Key"})
+			return
+		}
 		cfg.Provider = m.Provider
+	} else if cfg.AIEnabled || cfg.AutoEntryEnabled {
+		models, err := h.store.AIModel().List("default")
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "无法读取默认 AI 模型: " + err.Error()})
+			return
+		}
+		available := false
+		for _, model := range models {
+			if model.Enabled && strings.TrimSpace(model.APIKey) != "" {
+				available = true
+				break
+			}
+		}
+		if !available {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "开启 AI 分析前，请至少配置一个已启用且包含 API Key 的默认模型"})
+			return
+		}
 	}
 	if err := h.store.ReentryAI().SaveReentryAIConfig(&cfg); err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
 	c.JSON(200, gin.H{"message": "配置已保存", "config": cfg})
+}
+
+// ConnectionTest performs one schema-validated, zero-trade call against the
+// saved model configuration. A per-user cooldown prevents an accidental token
+// burn loop; failed tests are returned as audited results rather than hidden as
+// generic HTTP errors.
+func (h *ReentryAIHandler) ConnectionTest(c *gin.Context) {
+	userID := c.GetString("user_id")
+	if latest, err := h.store.ReentryAI().LatestReentryAIDiagnostic(userID); err == nil {
+		if remaining := 30*time.Second - time.Since(latest.CreatedAt); remaining > 0 {
+			c.JSON(http.StatusTooManyRequests, gin.H{"error": "AI 自检冷却中，请稍后再试", "retry_after_seconds": int(remaining.Seconds()) + 1})
+			return
+		}
+	}
+	diagnostic, err := reentryadvisor.RunConnectionSelfTest(h.store, userID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"diagnostic": diagnostic})
+}
+
+func (h *ReentryAIHandler) ListDiagnostics(c *gin.Context) {
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "10"))
+	diagnostics, err := h.store.ReentryAI().ListReentryAIDiagnostics(c.GetString("user_id"), limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"diagnostics": diagnostics, "count": len(diagnostics)})
 }

@@ -58,6 +58,15 @@ type CopyGuardReentryCandidate struct {
 	DecisionTTLSeconds  int     `json:"decision_ttl_seconds"`
 	LastError           string  `json:"last_error"`
 
+	// Effective per-trader policy is populated by the API and is not persisted
+	// on the candidate row. This prevents the dashboard from presenting the
+	// retired global 0.7 field or hard-coded quota values as production truth.
+	AIConfidenceThreshold float64 `json:"ai_confidence_threshold,omitempty"`
+	AIMinReviewSeconds    int     `json:"ai_min_review_seconds,omitempty"`
+	AIDailyCallLimit      int     `json:"ai_daily_call_limit,omitempty"`
+	AIDailyCallsUsed      int     `json:"ai_daily_calls_used,omitempty"`
+	AILifecycleCallLimit  int     `json:"ai_lifecycle_call_limit,omitempty"`
+
 	SnapshotAt   time.Time  `json:"snapshot_at"`
 	LastReviewAt *time.Time `json:"last_review_at,omitempty"`
 	NextReviewAt time.Time  `json:"next_review_at"`
@@ -215,6 +224,12 @@ func (s *ReentryAIStore) ListDueReentryCandidates(limit int) ([]*CopyGuardReentr
 		out = append(out, c)
 	}
 	return out, rows.Err()
+}
+
+func (s *ReentryAIStore) CountReentryCandidateCalls24h(candidateID int64) (int, error) {
+	var count int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM reentry_ai_analyses WHERE candidate_id=? AND call_status NOT IN ('SKIPPED','PREPARE_FAILED') AND created_at>=datetime('now','-24 hours')`, candidateID).Scan(&count)
+	return count, err
 }
 
 // ClaimReentryCandidateReview 原子领取一次 AI 调用额度。
@@ -501,6 +516,50 @@ func (s *ReentryAIStore) ResumeReentryCandidate(id int64) error {
 		return fmt.Errorf("candidate is not paused")
 	}
 	return nil
+}
+
+// RequestImmediateReentryCandidateReview schedules a production review at the
+// earliest time permitted by the trader's minimum interval. It never claims a
+// quota, calls a model, or changes execution state; the normal scheduler still
+// owns feature-hash dedupe, daily/lifecycle budgets, leases and preflight.
+func (s *ReentryAIStore) RequestImmediateReentryCandidateReview(id int64, minInterval time.Duration) (*CopyGuardReentryCandidate, error) {
+	if minInterval < 5*time.Minute {
+		minInterval = 5 * time.Minute
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	var status string
+	var last sql.NullString
+	if err = tx.QueryRow(`SELECT status,last_review_at FROM copy_guard_reentry_candidates WHERE id=?`, id).Scan(&status, &last); err != nil {
+		return nil, err
+	}
+	if status != ReentryCandidateWatching && status != ReentryCandidateWaiting {
+		return nil, fmt.Errorf("candidate status %s cannot be manually reviewed", status)
+	}
+	eligible := time.Now().UTC()
+	if last.Valid {
+		lastReview, parseErr := parseDBTime(last.String)
+		if parseErr != nil {
+			return nil, parseErr
+		}
+		if next := lastReview.Add(minInterval); next.After(eligible) {
+			eligible = next.UTC()
+		}
+	}
+	res, err := tx.Exec(`UPDATE copy_guard_reentry_candidates SET next_review_at=?,pending_trigger='OPERATOR_REVIEW_REQUEST',last_error='',updated_at=CURRENT_TIMESTAMP WHERE id=? AND status IN (?,?)`, eligible, id, ReentryCandidateWatching, ReentryCandidateWaiting)
+	if err != nil {
+		return nil, err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return nil, fmt.Errorf("candidate was claimed or changed before review request")
+	}
+	if err = tx.Commit(); err != nil {
+		return nil, err
+	}
+	return s.GetReentryCandidate(id)
 }
 
 func (s *ReentryAIStore) ListReentryCandidatesByCycle(cycleID int64) ([]*CopyGuardReentryCandidate, error) {

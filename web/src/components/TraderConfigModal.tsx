@@ -219,6 +219,7 @@ export function TraderConfigModal({
     risk_reentry_noise_override: false,
   })
   const [isSaving, setIsSaving] = useState(false)
+  const [loadedLegacyReentry, setLoadedLegacyReentry] = useState(false)
   const [strategies, setStrategies] = useState<Strategy[]>([])
   const [isFetchingBalance, setIsFetchingBalance] = useState(false)
   const [balanceFetchError, setBalanceFetchError] = useState<string>('')
@@ -288,12 +289,16 @@ export function TraderConfigModal({
   useEffect(() => {
     const fetchCopyTradeConfig = async () => {
       if (!isEditMode || !traderData?.trader_id) return
+      setLoadedLegacyReentry(false)
       try {
         const result = await httpClient.get<{ config: CopyTradeConfig }>(
           `/api/copytrade/config/${traderData.trader_id}`
         )
         if (result.success && result.data?.config) {
           const cfg = result.data.config
+          setLoadedLegacyReentry(
+            cfg.risk_reentry_decision_mode === 'legacy_rule'
+          )
           // 只加载跟单参数，decision_mode 由 traderData 决定
           // 风控字段：后端用比例（如 0.02=2%）存，前端用百分比展示，× 100 转换
           setFormData((prev) => ({
@@ -327,7 +332,7 @@ export function TraderConfigModal({
                 ? cfg.risk_reentry_ratio * 100
                 : 50,
             risk_reentry_decision_mode:
-              cfg.risk_reentry_decision_mode ?? 'legacy_rule',
+              cfg.risk_reentry_decision_mode ?? 'ai_guarded',
             risk_ai_confidence_threshold:
               (cfg.risk_ai_confidence_threshold ?? 0.8) * 100,
             risk_ai_min_review_seconds: cfg.risk_ai_min_review_seconds ?? 300,
@@ -379,6 +384,7 @@ export function TraderConfigModal({
         }
       } catch (error) {
         // 没有跟单配置，保持当前状态
+        setLoadedLegacyReentry(false)
         console.log('No copy trade config found')
       }
     }
@@ -450,6 +456,7 @@ export function TraderConfigModal({
           traderData.decision_mode || prev.decision_mode || 'copy_trade',
       }))
     } else if (!isEditMode) {
+      setLoadedLegacyReentry(false)
       setFormData({
         trader_name: '',
         ai_model: availableModels[0]?.id || '',
@@ -1552,11 +1559,44 @@ export function TraderConfigModal({
                                 <option value="ai_guarded">
                                   AI 判断 + 代码风控（推荐）
                                 </option>
-                                <option value="legacy_rule">
-                                  旧规则（存量兼容）
-                                </option>
+                                {loadedLegacyReentry && (
+                                  <option value="legacy_rule">
+                                    旧规则（已废弃，仅本存量配置可保留）
+                                  </option>
+                                )}
                                 <option value="disabled">不重入</option>
                               </select>
+                              {loadedLegacyReentry &&
+                                formData.risk_reentry_decision_mode ===
+                                  'legacy_rule' && (
+                                  <div className="mt-2 rounded border border-[#F0B90B] bg-[#F0B90B]/10 p-2 text-xs text-[#F0B90B]">
+                                    此交易员仍在使用已废弃旧规则。AI
+                                    不会失败回退旧规则；建议迁移到
+                                    ai_guarded，或选择“不重入”。
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        setFormData((prev) => ({
+                                          ...prev,
+                                          risk_reentry_decision_mode:
+                                            'ai_guarded',
+                                          risk_reentry_ratio: Math.min(
+                                            prev.risk_reentry_ratio,
+                                            50
+                                          ),
+                                          risk_max_reentries: Math.min(
+                                            prev.risk_max_reentries,
+                                            2
+                                          ),
+                                          risk_unprotectable_action: 'close',
+                                        }))
+                                      }
+                                      className="ml-2 underline"
+                                    >
+                                      迁移到 AI 模式
+                                    </button>
+                                  </div>
+                                )}
                             </label>
                             {[
                               ['risk_account_pct', '单次尝试风险 %'],

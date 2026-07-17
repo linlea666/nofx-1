@@ -973,6 +973,11 @@ export interface CopyGuardAICandidate {
   attention_price_high: number
   last_analysis_id: number
   last_error: string
+  ai_confidence_threshold: number
+  ai_min_review_seconds: number
+  ai_daily_call_limit: number
+  ai_daily_calls_used: number
+  ai_lifecycle_call_limit: number
   snapshot_at: string
   last_review_at?: string
   next_review_at: string
@@ -1026,9 +1031,23 @@ export interface ReentryAIConfig {
   auto_entry_enabled: boolean // ai_guarded 候选真实执行的全局安全开关（依赖 ai_enabled）
   provider: string
   model: string // ai_models 表的模型 ID（空=自动选默认）
-  prompt_template: string // 自定义 System Prompt（空=内置默认）
-  confidence_threshold: number // AI 候选 ENTER_NOW 的全局最低置信度门槛
+  prompt_template: string // 仅历史人工信号分析兼容；不影响 ai_guarded
+  analysis_focus: string // 追加到不可覆盖的生产 Prompt 后的分析关注点
+  confidence_threshold: number // 仅历史人工信号分析兼容
   timeout_seconds: number
+}
+
+export interface ReentryAIDiagnostic {
+  id: number
+  provider: string
+  model: string
+  prompt_version: string
+  success: boolean
+  latency_ms: number
+  raw_response: string
+  parsed_json: string
+  error?: string
+  created_at: string
 }
 
 // 重入 AI 结论分布与准确率统计（Phase 2）

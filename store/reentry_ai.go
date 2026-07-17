@@ -14,11 +14,10 @@ import (
 // 原始回复、严格解析结果、调用状态和最终结局。历史人工信号字段仅保留为
 // 只读兼容，v7 执行路径不再依赖人工确认。
 //
-// 两张表：
+// 三张表：
 //   reentry_ai_analyses  每个候选/历史信号的完整调用审计记录
-//   reentry_ai_config    单行全局配置（Phase 1 仅 enabled 生效；provider/
-//                        model/prompt_template/confidence_threshold 等列为
-//                        Phase 2 内置 AI 分析预留，避免后续 ALTER）
+//   reentry_ai_config    单行全局配置；生产 Prompt 只允许 analysis_focus 补充
+//   reentry_ai_diagnostics 零交易模型连接与严格 Schema 自检，独立于交易统计
 //
 // AI 关闭时分析表静默闲置；候选与订单的确定性风控状态由 Copy Guard 表维护。
 // ============================================================================
@@ -80,8 +79,9 @@ type ReentryAIConfig struct {
 	AutoEntryEnabled    bool    `json:"auto_entry_enabled"`   // ai_guarded 候选真实执行的全局安全开关（默认关；依赖 ai_enabled）
 	Provider            string  `json:"provider"`             // 展示用 provider（实际密钥由 model 指向的 ai_models 行决定）
 	Model               string  `json:"model"`                // ai_models 表的模型 ID（空=自动选用已启用的默认模型）
-	PromptTemplate      string  `json:"prompt_template"`      // 自定义 System Prompt 模板（空=内置默认；在数据包生成时固化进快照）
-	ConfidenceThreshold float64 `json:"confidence_threshold"` // AI 候选 ENTER_NOW 的全局最低置信度门槛
+	PromptTemplate      string  `json:"prompt_template"`      // 仅历史人工信号分析兼容；ai_guarded 不读取此字段
+	AnalysisFocus       string  `json:"analysis_focus"`       // 追加到不可覆盖的生产 Prompt 后，仅用于补充分析关注点
+	ConfidenceThreshold float64 `json:"confidence_threshold"` // 仅历史分析兼容；ai_guarded 使用交易员级 risk_ai_confidence_threshold
 	TimeoutSeconds      int     `json:"timeout_seconds"`      // AI 调用超时
 }
 
@@ -133,6 +133,7 @@ func (s *ReentryAIStore) initTables() error {
 			provider TEXT DEFAULT 'deepseek',
 			model TEXT DEFAULT '',
 			prompt_template TEXT DEFAULT '',
+			analysis_focus TEXT DEFAULT '',
 			confidence_threshold REAL DEFAULT 0.7,
 			timeout_seconds INTEGER DEFAULT 60,
 			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -153,7 +154,11 @@ func (s *ReentryAIStore) initTables() error {
 	// 早期建表缺列时老库补列（重复执行报 duplicate column 忽略）
 	s.db.Exec(`ALTER TABLE reentry_ai_config ADD COLUMN ai_enabled BOOLEAN DEFAULT 0`)
 	s.db.Exec(`ALTER TABLE reentry_ai_config ADD COLUMN auto_entry_enabled BOOLEAN DEFAULT 0`)
-	return s.initReentryCandidateTables()
+	s.db.Exec(`ALTER TABLE reentry_ai_config ADD COLUMN analysis_focus TEXT DEFAULT ''`)
+	if err := s.initReentryCandidateTables(); err != nil {
+		return err
+	}
+	return s.initReentryDiagnosticTable()
 }
 
 const reentryAnalysisColumns = `id, signal_id, candidate_id, trader_id, cycle_id, symbol, side, attempt_no, decision_generation, call_status, call_error, data_hash,
@@ -575,8 +580,8 @@ func (s *ReentryAIStore) GetReentryAIConfig() (*ReentryAIConfig, error) {
 		ConfidenceThreshold: 0.7,
 		TimeoutSeconds:      60,
 	}
-	err := s.db.QueryRow(`SELECT enabled, ai_enabled, auto_entry_enabled, provider, model, prompt_template, confidence_threshold, timeout_seconds FROM reentry_ai_config WHERE id=1`).
-		Scan(&cfg.Enabled, &cfg.AIEnabled, &cfg.AutoEntryEnabled, &cfg.Provider, &cfg.Model, &cfg.PromptTemplate, &cfg.ConfidenceThreshold, &cfg.TimeoutSeconds)
+	err := s.db.QueryRow(`SELECT enabled, ai_enabled, auto_entry_enabled, provider, model, prompt_template, analysis_focus, confidence_threshold, timeout_seconds FROM reentry_ai_config WHERE id=1`).
+		Scan(&cfg.Enabled, &cfg.AIEnabled, &cfg.AutoEntryEnabled, &cfg.Provider, &cfg.Model, &cfg.PromptTemplate, &cfg.AnalysisFocus, &cfg.ConfidenceThreshold, &cfg.TimeoutSeconds)
 	if err == sql.ErrNoRows {
 		return cfg, nil
 	}
@@ -591,13 +596,13 @@ func (s *ReentryAIStore) SaveReentryAIConfig(cfg *ReentryAIConfig) error {
 	if cfg == nil {
 		return fmt.Errorf("nil reentry ai config")
 	}
-	_, err := s.db.Exec(`INSERT INTO reentry_ai_config (id, enabled, ai_enabled, auto_entry_enabled, provider, model, prompt_template, confidence_threshold, timeout_seconds, updated_at)
-		VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+	_, err := s.db.Exec(`INSERT INTO reentry_ai_config (id, enabled, ai_enabled, auto_entry_enabled, provider, model, prompt_template, analysis_focus, confidence_threshold, timeout_seconds, updated_at)
+		VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 		ON CONFLICT(id) DO UPDATE SET enabled=excluded.enabled, ai_enabled=excluded.ai_enabled, auto_entry_enabled=excluded.auto_entry_enabled,
 			provider=excluded.provider, model=excluded.model,
-			prompt_template=excluded.prompt_template, confidence_threshold=excluded.confidence_threshold,
+			prompt_template=excluded.prompt_template, analysis_focus=excluded.analysis_focus, confidence_threshold=excluded.confidence_threshold,
 			timeout_seconds=excluded.timeout_seconds, updated_at=CURRENT_TIMESTAMP`,
-		cfg.Enabled, cfg.AIEnabled, cfg.AutoEntryEnabled, cfg.Provider, cfg.Model, cfg.PromptTemplate, cfg.ConfidenceThreshold, cfg.TimeoutSeconds)
+		cfg.Enabled, cfg.AIEnabled, cfg.AutoEntryEnabled, cfg.Provider, cfg.Model, cfg.PromptTemplate, cfg.AnalysisFocus, cfg.ConfidenceThreshold, cfg.TimeoutSeconds)
 	return err
 }
 

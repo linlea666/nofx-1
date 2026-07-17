@@ -282,6 +282,7 @@ var copyGuardEventSpecs = map[string]CopyGuardEventSpec{
 	"STOP_DUST_RESIDUAL":               {CopyEventCategoryStopLoss, CopyEventSeverityError, "critical", true},
 	"AI_CANDIDATE_CREATED":             {CopyEventCategoryTakeover, CopyEventSeverityInfo, "verbose", true},
 	"AI_REVIEW_WAIT":                   {CopyEventCategoryTakeover, CopyEventSeverityInfo, "verbose", true},
+	"AI_REVIEW_REQUESTED":              {CopyEventCategoryTakeover, CopyEventSeverityInfo, "verbose", true},
 	"AI_REVIEW_ENTER":                  {CopyEventCategoryTakeover, CopyEventSeverityInfo, "verbose", true},
 	"AI_REVIEW_ABANDON":                {CopyEventCategoryTakeover, CopyEventSeverityWarn, "important", true},
 	"AI_REVIEW_FAILED":                 {CopyEventCategoryTakeover, CopyEventSeverityWarn, "important", true},
@@ -431,6 +432,8 @@ func guardEventSummary(eventType, symbol, side, operator string) string {
 		return fmt.Sprintf("AI 持续观察候选已创建 | %s", pair)
 	case "AI_REVIEW_WAIT":
 		return fmt.Sprintf("AI 继续观察 | %s", pair)
+	case "AI_REVIEW_REQUESTED":
+		return fmt.Sprintf("操作员请求 AI 尽快复查 | %s", pair)
 	case "AI_REVIEW_ENTER":
 		return fmt.Sprintf("AI 建议重入，进入确定性预检 | %s", pair)
 	case "AI_REVIEW_ABANDON":

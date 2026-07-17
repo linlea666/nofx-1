@@ -152,7 +152,7 @@ func TestGuardEventMirroredToCopyEvents(t *testing.T) {
 func TestCopyGuardEventRegistryCoversV7Workflow(t *testing.T) {
 	required := map[string]string{
 		"STOP_PENDING_FLAT": "verbose", "STOP_PARTIAL": "critical", "STOP_FLAT_CONFIRMED": "important", "STOP_DUST_RESIDUAL": "critical",
-		"AI_CANDIDATE_CREATED": "verbose", "AI_REVIEW_WAIT": "verbose", "AI_REVIEW_ENTER": "verbose", "AI_REVIEW_ABANDON": "important",
+		"AI_CANDIDATE_CREATED": "verbose", "AI_REVIEW_WAIT": "verbose", "AI_REVIEW_REQUESTED": "verbose", "AI_REVIEW_ENTER": "verbose", "AI_REVIEW_ABANDON": "important",
 		"AI_REVIEW_FAILED": "important", "AI_BUDGET_SUSPENDED": "important", "AI_RESULT_STALE": "verbose",
 		"REENTRY_PREFLIGHT_REJECTED": "verbose", "REENTRY_REQUESTED": "verbose", "REENTRY_FILLED": "important", "REENTRY_FAILED": "important",
 		"PROTECTION_PENDING": "verbose", "PROTECTION_ACTIVE": "verbose", "PROTECTION_DEGRADED": "important", "FORCED_EXIT": "important",
