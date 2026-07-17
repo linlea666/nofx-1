@@ -121,6 +121,33 @@ type Alert struct {
 	Fields   map[string]string // 可选附加字段（会附在正文）
 	RateKey  string            // 限流键，留空时按 Category+TraderID+Title 自动生成
 	DedupKey string            // 一次性去重键：同 key 告警进程生命周期内只发送一次
+	// StatusHook 用于需要审计邮件状态的业务。回调不影响入队/发送
+	// 结果；普通告警留空即保持旧行为。
+	StatusHook func(status DeliveryStatus, err error)
+}
+
+type DeliveryStatus string
+
+const (
+	DeliveryDisabled    DeliveryStatus = "disabled"
+	DeliveryDeduped     DeliveryStatus = "deduped"
+	DeliveryRateLimited DeliveryStatus = "rate_limited"
+	DeliveryQueued      DeliveryStatus = "queued"
+	DeliveryDropped     DeliveryStatus = "dropped"
+	DeliverySent        DeliveryStatus = "sent"
+	DeliveryFailed      DeliveryStatus = "failed"
+)
+
+func reportDelivery(a Alert, status DeliveryStatus, err error) {
+	if a.StatusHook == nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Warnf("⚠️ 邮件状态回调 panic 已忽略: %v", r)
+		}
+	}()
+	a.StatusHook(status, err)
 }
 
 // ============================================================================
@@ -136,8 +163,8 @@ type Notifier interface {
 // noopNotifier 不发送任何通知（未启用时使用）
 type noopNotifier struct{}
 
-func (n noopNotifier) Notify(Alert) {}
-func (n noopNotifier) Shutdown()    {}
+func (n noopNotifier) Notify(a Alert) { reportDelivery(a, DeliveryDisabled, nil) }
+func (n noopNotifier) Shutdown()      {}
 
 // 全局单例（默认 no-op，未初始化时调用零副作用）
 var (
@@ -297,6 +324,7 @@ func (n *emailNotifier) Notify(a Alert) {
 	if a.DedupKey != "" {
 		if _, loaded := n.deduped.LoadOrStore(a.DedupKey, time.Now()); loaded {
 			logger.Debugf("📭 通知去重跳过 | dedupKey=%s", a.DedupKey)
+			reportDelivery(a, DeliveryDeduped, nil)
 			return
 		}
 		dedupReserved = true
@@ -315,6 +343,7 @@ func (n *emailNotifier) Notify(a Alert) {
 				// 命中限流，静默丢弃（debug 级日志，避免日志刷屏）
 				logger.Debugf("📭 通知限流跳过 | key=%s elapsed=%s < interval=%s",
 					key, time.Since(last).Truncate(time.Second), n.cfg.MinInterval)
+				reportDelivery(a, DeliveryRateLimited, nil)
 				if dedupReserved {
 					n.deduped.Delete(a.DedupKey)
 				}
@@ -327,16 +356,19 @@ func (n *emailNotifier) Notify(a Alert) {
 	// 3. 非阻塞入队
 	select {
 	case n.queue <- a:
+		reportDelivery(a, DeliveryQueued, nil)
 	case <-n.stopCh:
 		// 已关闭，丢弃
 		if dedupReserved {
 			n.deduped.Delete(a.DedupKey)
 		}
+		reportDelivery(a, DeliveryDropped, fmt.Errorf("notifier is stopped"))
 	default:
 		// 队列满，丢弃 + warn
 		if dedupReserved {
 			n.deduped.Delete(a.DedupKey)
 		}
+		reportDelivery(a, DeliveryDropped, fmt.Errorf("notification queue is full"))
 		logger.Warnf("⚠️ 邮件通知队列已满（容量=%d），丢弃: %s", n.cfg.QueueSize, a.Title)
 	}
 }
@@ -372,9 +404,11 @@ func (n *emailNotifier) send(a Alert) {
 
 	if err := n.client.Send(n.cfg.To, subject, body); err != nil {
 		logger.Warnf("⚠️ 邮件发送失败: %v | subject=%s", err, subject)
+		reportDelivery(a, DeliveryFailed, err)
 		return
 	}
 	logger.Infof("📧 邮件已发送 | %s → %s", subject, strings.Join(n.cfg.To, ","))
+	reportDelivery(a, DeliverySent, nil)
 }
 
 // Shutdown 等待队列消费完毕（最多 5 秒）

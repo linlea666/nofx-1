@@ -9,6 +9,7 @@ import (
 
 // promptVersion 记入每条分析记录，用于后续准确率统计时区分模板代次
 const promptVersion = "v1"
+const candidatePromptVersion = "v2-ai-guarded"
 
 // buildSystemPrompt 重入决策顾问的角色与硬约束。
 // 同一文本既供用户复制给外部 AI，也直接喂内置模型（同一快照同一 prompt，
@@ -53,6 +54,34 @@ func DefaultSystemPrompt() string {
 }
 
 decision 语义：ENTER=建议立即确认重入；WAIT=条件不充分，保留信号继续观察；SKIP=建议忽略本信号（结构性不利）。`
+}
+
+func candidateSystemPrompt() string {
+	return `你是 Copy Guard 的趋势反转判断器。保护止损已经将跟随仓位完全平掉，领航员仍持有原方向。你只负责判断当前是否已经形成值得接回的趋势反转；确定性代码将独立复核仓位、风险预算、价格漂移和保护止损。
+
+必须结合 copy_guard 的止损/尝试/领航员状态与 market 的多周期结构、CVD、OI、Funding、多空比、基差、成交量和支撑阻力。不要因为价格回到领航员成本附近就直接批准；也不要因为当前价高于领航员成本就机械拒绝。数据缺失或相互冲突时返回 WAIT。
+
+严格输出一个 JSON 对象，不要输出 Markdown 或其他文本：
+{
+  "decision": "ENTER_NOW" | "WAIT" | "ABANDON",
+  "regime": "FALSE_BREAK" | "REVERSAL" | "CONTINUATION" | "CHOP",
+  "confidence": 0.0,
+  "size_factor": 0.0,
+  "entry_price_low": 0.0,
+  "entry_price_high": 0.0,
+  "attention_price_low": 0.0,
+  "attention_price_high": 0.0,
+  "ttl_seconds": 30,
+  "next_review_seconds": 900,
+  "reasons": ["引用具体字段和值"],
+  "risk_notes": ["主要风险和数据局限"]
+}
+
+约束：ENTER_NOW 时 confidence 必须反映证据强度，size_factor 只能在 (0,1]；其余决策 size_factor 必须为 0。价格区间必须为正且 low<=high。ttl_seconds 只能 15..60；next_review_seconds 只能 300..21600。ABANDON 只用于原重入逻辑已经结构性失效，普通暂不适合必须返回 WAIT。`
+}
+
+func buildCandidateUserPrompt(c *store.CopyGuardReentryCandidate, datapackJSON string) string {
+	return fmt.Sprintf("候选 #%d，cycle=%d，%s %s；当前快照价 %.8f，最大允许名义 %.2f USDT，已止损 %d 次、已重入 %d 次。请只根据以下结构化数据输出严格 JSON：\n%s", c.ID, c.CycleID, c.Symbol, strings.ToUpper(c.Side), c.TriggerPrice, c.MaxNotional, c.StopCount, c.ReentryCount, datapackJSON)
 }
 
 // buildUserPrompt 信号概要 + 数据包 JSON

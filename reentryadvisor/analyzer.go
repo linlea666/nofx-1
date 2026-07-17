@@ -3,6 +3,8 @@ package reentryadvisor
 import (
 	"encoding/json"
 	"fmt"
+	"io"
+	"math"
 	"strings"
 	"time"
 
@@ -14,31 +16,116 @@ import (
 )
 
 // ============================================================================
-// Phase 2：内置 AI 分析
+// 内置 AI 分析与 ai_guarded 候选决策
 //
 // 对已落库的分析快照（reentry_ai_analyses）调用内置 LLM，得到与外部 AI 同源
 // 同 Prompt 的结论（verdict/confidence/reasons），写回同一条记录，供前端
 // 展示与内外对比。密钥复用 ai_models 表（与自动交易/辩论模块同一套配置）。
 //
-// 失败降级：模型未配置、调用超时、JSON 解析失败都只记日志 + 保留 raw 回复，
-// 不影响数据包透明化与人工确认主流程。
+// 失败时保留分析审计行并按 5/15/60 分钟退避，不回退硬规则下单。
 // ============================================================================
 
 // aiVerdict 模型输出的严格 JSON 结论（schema 见 buildSystemPrompt 输出格式段）
 type aiVerdict struct {
-	Decision          string   `json:"decision"`
-	Confidence        float64  `json:"confidence"`
-	SuggestedNotional float64  `json:"suggested_notional"`
-	Reasons           []string `json:"reasons"`
-	RiskNotes         []string `json:"risk_notes"`
+	Decision           string   `json:"decision"`
+	Regime             string   `json:"regime"`
+	Confidence         float64  `json:"confidence"`
+	SuggestedNotional  float64  `json:"suggested_notional"`
+	SizeFactor         float64  `json:"size_factor"`
+	EntryPriceLow      float64  `json:"entry_price_low"`
+	EntryPriceHigh     float64  `json:"entry_price_high"`
+	AttentionPriceLow  float64  `json:"attention_price_low"`
+	AttentionPriceHigh float64  `json:"attention_price_high"`
+	TTLSeconds         int      `json:"ttl_seconds"`
+	NextReviewSeconds  int      `json:"next_review_seconds"`
+	Reasons            []string `json:"reasons"`
+	RiskNotes          []string `json:"risk_notes"`
 }
 
 // parsedVerdict 解析归一化后的结论
 type parsedVerdict struct {
-	Verdict           string
-	Confidence        float64
-	SuggestedNotional float64 // 仅 ENTER 且模型给出有效值时 >0
-	ReasonsJSON       string  // reasons + risk_notes（+建议金额）的 JSON，前端整体展示
+	Verdict                               string
+	Confidence                            float64
+	SuggestedNotional                     float64 // 仅 ENTER 且模型给出有效值时 >0
+	ReasonsJSON                           string  // reasons + risk_notes（+建议金额）的 JSON，前端整体展示
+	Regime                                string
+	SizeFactor                            float64
+	EntryPriceLow, EntryPriceHigh         float64
+	AttentionPriceLow, AttentionPriceHigh float64
+	TTLSeconds, NextReviewSeconds         int
+}
+
+func parseAICandidateVerdict(raw string) (*parsedVerdict, error) {
+	obj, ok := extractJSONObject(raw)
+	if !ok {
+		return nil, fmt.Errorf("回复中未找到 JSON 对象")
+	}
+	if strings.TrimSpace(raw) != obj {
+		return nil, fmt.Errorf("候选回复必须只包含一个 JSON 对象")
+	}
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(obj), &keys); err != nil {
+		return nil, fmt.Errorf("JSON 解析失败: %w", err)
+	}
+	allowedKeys := map[string]struct{}{}
+	for _, key := range []string{"decision", "regime", "confidence", "size_factor", "entry_price_low", "entry_price_high", "attention_price_low", "attention_price_high", "ttl_seconds", "next_review_seconds", "reasons", "risk_notes"} {
+		allowedKeys[key] = struct{}{}
+		if _, exists := keys[key]; !exists {
+			return nil, fmt.Errorf("缺少必填字段 %s", key)
+		}
+	}
+	for key := range keys {
+		if _, allowed := allowedKeys[key]; !allowed {
+			return nil, fmt.Errorf("候选回复包含未定义字段 %s", key)
+		}
+	}
+	var v aiVerdict
+	decoder := json.NewDecoder(strings.NewReader(obj))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&v); err != nil {
+		return nil, fmt.Errorf("JSON 解析失败: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return nil, fmt.Errorf("JSON 对象后存在额外内容")
+	}
+	decision := strings.ToUpper(strings.TrimSpace(v.Decision))
+	if decision != "ENTER_NOW" && decision != store.ReentryVerdictWait && decision != store.ReentryVerdictAbandon {
+		return nil, fmt.Errorf("decision 字段无效: %q", v.Decision)
+	}
+	regime := strings.ToUpper(strings.TrimSpace(v.Regime))
+	switch regime {
+	case "FALSE_BREAK", "REVERSAL", "CONTINUATION", "CHOP":
+	default:
+		return nil, fmt.Errorf("regime 字段无效: %q", v.Regime)
+	}
+	if v.Confidence < 0 || v.Confidence > 1 {
+		return nil, fmt.Errorf("confidence 越界")
+	}
+	if decision == "ENTER_NOW" {
+		if v.SizeFactor <= 0 || v.SizeFactor > 1 {
+			return nil, fmt.Errorf("ENTER_NOW size_factor 必须在 (0,1]")
+		}
+		if v.EntryPriceLow <= 0 || v.EntryPriceHigh < v.EntryPriceLow {
+			return nil, fmt.Errorf("入场价格区间无效")
+		}
+	} else if v.SizeFactor != 0 {
+		return nil, fmt.Errorf("非入场决策 size_factor 必须为 0")
+	}
+	if v.AttentionPriceLow < 0 || v.AttentionPriceHigh < v.AttentionPriceLow {
+		return nil, fmt.Errorf("关注价格区间无效")
+	}
+	if v.TTLSeconds < 15 || v.TTLSeconds > 60 {
+		return nil, fmt.Errorf("ttl_seconds 必须为 15..60")
+	}
+	if v.NextReviewSeconds < 300 || v.NextReviewSeconds > 21600 {
+		return nil, fmt.Errorf("next_review_seconds 必须为 300..21600")
+	}
+	payload, _ := json.Marshal(map[string]interface{}{"reasons": v.Reasons, "risk_notes": v.RiskNotes, "regime": regime, "size_factor": v.SizeFactor, "entry_price_low": v.EntryPriceLow, "entry_price_high": v.EntryPriceHigh, "attention_price_low": v.AttentionPriceLow, "attention_price_high": v.AttentionPriceHigh, "ttl_seconds": v.TTLSeconds, "next_review_seconds": v.NextReviewSeconds})
+	normalized := decision
+	if decision == "ENTER_NOW" {
+		normalized = store.ReentryVerdictEnter
+	}
+	return &parsedVerdict{Verdict: normalized, Confidence: v.Confidence, ReasonsJSON: string(payload), Regime: regime, SizeFactor: v.SizeFactor, EntryPriceLow: v.EntryPriceLow, EntryPriceHigh: v.EntryPriceHigh, AttentionPriceLow: v.AttentionPriceLow, AttentionPriceHigh: v.AttentionPriceHigh, TTLSeconds: v.TTLSeconds, NextReviewSeconds: v.NextReviewSeconds}, nil
 }
 
 // resolveAIModel 解析配置指向的 ai_models 行：
@@ -80,23 +167,27 @@ func resolveAIModel(st *store.Store, cfg *store.ReentryAIConfig) (*store.AIModel
 // newAIClientForModel provider → mcp 客户端映射（与 debate/api-strategy 同一套口径）
 func newAIClientForModel(m *store.AIModel, timeout time.Duration) (mcp.AIClient, error) {
 	var client mcp.AIClient
+	// Fixed low temperature makes repeated reviews comparable. Disable the
+	// transport client's hidden retries so one claimed candidate review always
+	// equals exactly one billable API call.
+	opts := []mcp.ClientOption{mcp.WithTemperature(0.1), mcp.WithMaxRetries(1)}
 	switch m.Provider {
 	case "deepseek":
-		client = mcp.NewDeepSeekClient()
+		client = mcp.NewDeepSeekClientWithOptions(opts...)
 	case "qwen":
-		client = mcp.NewQwenClient()
+		client = mcp.NewQwenClientWithOptions(opts...)
 	case "openai":
-		client = mcp.NewOpenAIClient()
+		client = mcp.NewOpenAIClientWithOptions(opts...)
 	case "claude":
-		client = mcp.NewClaudeClient()
+		client = mcp.NewClaudeClientWithOptions(opts...)
 	case "gemini":
-		client = mcp.NewGeminiClient()
+		client = mcp.NewGeminiClientWithOptions(opts...)
 	case "grok":
-		client = mcp.NewGrokClient()
+		client = mcp.NewGrokClientWithOptions(opts...)
 	case "kimi":
-		client = mcp.NewKimiClient()
+		client = mcp.NewKimiClientWithOptions(opts...)
 	case "custom":
-		client = mcp.New()
+		client = mcp.NewClient(opts...)
 	default:
 		return nil, fmt.Errorf("不支持的模型 provider: %s", m.Provider)
 	}
@@ -210,14 +301,18 @@ func (a *Advisor) markAnalysisDone(id int64) {
 }
 
 // runAnalysis 对一条分析快照执行内置 AI 分析并写回结果。
-// autoTriggered=true（新信号自动分析路径）时：完成后追加一封结论邮件（与
-// 既有信号邮件互补，不阻塞不修改 copytrade 邮件流程）；且在 Phase 3 自动
-// 入场开启并达到置信度门槛时尝试自动确认重入。手动触发（按钮/重新生成）
-// 永不自动入场。解析失败自动重试一次；两次都失败则保留 raw 供人工查看。
+// candidate_id>0 的记录只允许由持久化候选调度器领取和执行；历史人工信号
+// 的自动分析仅补充结论邮件，绝不再调用旧人工确认链路下单。解析失败时，
+// 历史分析自动重试一次，候选分析则按一次调用计费并交调度器退避。
 func (a *Advisor) runAnalysis(analysisID int64, autoTriggered bool) {
+	candidateID := int64(0)
+	candidateFinished := false
 	defer func() {
 		if r := recover(); r != nil {
 			logger.Errorf("[ReentryAdvisor] AI 分析 panic 已恢复 (analysis=%d): %v", analysisID, r)
+			if candidateID > 0 && !candidateFinished {
+				a.failCandidateAnalysis(candidateID, analysisID, fmt.Sprintf("AI analysis panic: %v", r), 0)
+			}
 		}
 	}()
 	if !a.markAnalysisRunning(analysisID) {
@@ -230,21 +325,31 @@ func (a *Advisor) runAnalysis(analysisID int64, autoTriggered bool) {
 		logger.Warnf("[ReentryAdvisor] AI 分析读取记录失败 (analysis=%d): %v", analysisID, err)
 		return
 	}
+	candidateID = analysis.CandidateID
 	cfg, err := a.st.ReentryAI().GetReentryAIConfig()
 	if err != nil {
 		logger.Warnf("[ReentryAdvisor] AI 分析读取配置失败: %v", err)
+		a.failCandidateBeforeModel(candidateID, analysisID, "AI config unavailable: "+err.Error())
 		return
 	}
 	model, err := resolveAIModel(a.st, cfg)
 	if err != nil {
 		logger.Warnf("[ReentryAdvisor] AI 分析模型解析失败 (analysis=%d): %v", analysisID, err)
+		a.failCandidateBeforeModel(candidateID, analysisID, "AI model unavailable: "+err.Error())
 		return
 	}
 	timeout := time.Duration(cfg.TimeoutSeconds) * time.Second
 	client, err := newAIClientForModel(model, timeout)
 	if err != nil {
 		logger.Warnf("[ReentryAdvisor] AI 客户端创建失败 (analysis=%d): %v", analysisID, err)
+		a.failCandidateBeforeModel(candidateID, analysisID, "AI client unavailable: "+err.Error())
 		return
+	}
+	if candidateID > 0 {
+		if err := a.st.ReentryAI().MarkReentryAnalysisRunning(analysis.ID); err != nil {
+			a.failCandidateBeforeModel(candidateID, analysisID, "AI call lease unavailable: "+err.Error())
+			return
+		}
 	}
 
 	logger.Infof("[ReentryAdvisor] 开始内置 AI 分析 (analysis=%d, signal=%d, %s %s, model=%s/%s)",
@@ -252,13 +357,23 @@ func (a *Advisor) runAnalysis(analysisID int64, autoTriggered bool) {
 
 	var raw string
 	var pv *parsedVerdict
-	for attempt := 1; attempt <= 2; attempt++ {
+	maxAttempts := 2
+	if analysis.CandidateID > 0 {
+		// Candidate review_count is the API-call budget. Retrying inside one
+		// review would make 12 stored reviews consume up to 24 paid calls.
+		maxAttempts = 1
+	}
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		raw, err = client.CallWithMessages(analysis.SystemPrompt, analysis.UserPrompt)
 		if err != nil {
 			logger.Warnf("[ReentryAdvisor] AI 调用失败 (analysis=%d, 第 %d 次): %v", analysisID, attempt, err)
 			continue
 		}
-		pv, err = parseAIVerdict(raw)
+		if analysis.CandidateID > 0 {
+			pv, err = parseAICandidateVerdict(raw)
+		} else {
+			pv, err = parseAIVerdict(raw)
+		}
 		if err == nil {
 			break
 		}
@@ -266,6 +381,17 @@ func (a *Advisor) runAnalysis(analysisID int64, autoTriggered bool) {
 	}
 	if raw == "" {
 		// 两次调用都没拿到回复，无可落库内容
+		if analysis.CandidateID > 0 {
+			_ = a.st.ReentryAI().MarkReentryAnalysisFailed(analysis.ID, "AI call failed")
+			if c, e := a.st.ReentryAI().GetReentryCandidate(analysis.CandidateID); e == nil {
+				_ = a.st.ReentryAI().FailReentryCandidateReview(c.ID, "AI call failed", candidateFailureBackoff(c.FailureCount+1))
+				a.updateCandidateCycleStatus(c, store.CopyGuardAIWaiting)
+				a.recordCandidateEvent(c, "AI_REVIEW_FAILED", 0, 0, map[string]interface{}{"reason": "ai_call_failed"})
+				if c.FailureCount+1 == 3 {
+					a.notifyCandidateImportant(c, "AI_REVIEW_FAILED", "AI 连续调用失败", "模型连续失败，候选将按 60 分钟退避继续观察。")
+				}
+			}
+		}
 		return
 	}
 	if pv == nil {
@@ -273,10 +399,21 @@ func (a *Advisor) runAnalysis(analysisID int64, autoTriggered bool) {
 	}
 	if saveErr := a.st.ReentryAI().UpdateReentryInternalResult(analysis.ID, raw, pv.Verdict, pv.Confidence, pv.ReasonsJSON); saveErr != nil {
 		logger.Warnf("[ReentryAdvisor] AI 结果落库失败 (analysis=%d): %v", analysisID, saveErr)
+		a.failCandidateAnalysis(candidateID, analysisID, "AI result persistence failed: "+saveErr.Error(), 0)
 		return
 	}
 	if pv.Verdict == "" {
 		logger.Warnf("[ReentryAdvisor] AI 分析完成但结论不可解析，已存原始回复 (analysis=%d)", analysisID)
+		if analysis.CandidateID > 0 {
+			if c, e := a.st.ReentryAI().GetReentryCandidate(analysis.CandidateID); e == nil {
+				_ = a.st.ReentryAI().FailReentryCandidateReview(c.ID, "invalid AI response", candidateFailureBackoff(c.FailureCount+1))
+				a.updateCandidateCycleStatus(c, store.CopyGuardAIWaiting)
+				a.recordCandidateEvent(c, "AI_REVIEW_FAILED", 0, 0, map[string]interface{}{"reason": "invalid_response", "analysis_id": analysis.ID})
+				if c.FailureCount+1 == 3 {
+					a.notifyCandidateImportant(c, "AI_REVIEW_FAILED", "AI 连续返回无效结果", "模型输出连续不符合严格 JSON 契约，候选将退避后复查。")
+				}
+			}
+		}
 		return
 	}
 	logger.Infof("[ReentryAdvisor] 内置 AI 结论: %s (confidence=%.2f) (analysis=%d, signal=%d, %s %s)",
@@ -285,12 +422,179 @@ func (a *Advisor) runAnalysis(analysisID int64, autoTriggered bool) {
 	// Seam C：把 AI 二次入场分析结论记入统一跟单事件日志（best-effort），
 	// 用于追踪 AI 接收/介入的执行情况。
 	a.recordAIAnalysisEvent(analysis, pv, autoTriggered)
-
-	// Phase 3：自动入场（仅自动分析路径；结果并入结论邮件）
-	if autoTriggered {
-		autoEntryNote := a.maybeAutoEnter(analysis, cfg, pv)
-		a.notifyVerdict(analysis, cfg, pv, autoEntryNote)
+	if analysis.CandidateID > 0 {
+		if err := a.finishCandidateAnalysis(analysis, cfg, pv); err != nil {
+			a.failCandidateAnalysis(analysis.CandidateID, analysis.ID, err.Error(), 0)
+			return
+		}
+		candidateFinished = true
+		return
 	}
+
+	// 历史人工信号只保留分析和审计，不再具有任何执行能力。真实 AI 重入
+	// 只能经过上面的 candidate_id 路径和 ExecuteAIReentryForTrader。
+	if autoTriggered {
+		a.notifyVerdict(analysis, cfg, pv, legacyAnalysisExecutionNote(cfg, pv))
+	}
+}
+
+func (a *Advisor) finishCandidateAnalysis(analysis *store.ReentryAIAnalysis, cfg *store.ReentryAIConfig, pv *parsedVerdict) error {
+	c, err := a.st.ReentryAI().GetReentryCandidate(analysis.CandidateID)
+	if err != nil {
+		return fmt.Errorf("candidate unavailable after analysis: %w", err)
+	}
+	traderCfg, err := a.st.CopyTrade().GetByTraderID(c.TraderID)
+	if err != nil {
+		return fmt.Errorf("trader risk policy unavailable after analysis: %w", err)
+	}
+	abandonThreshold := math.Max(0.80, traderCfg.RiskAIConfidenceThreshold)
+	nextSeconds := pv.NextReviewSeconds
+	if pv.Verdict == store.ReentryVerdictWait || pv.Verdict == store.ReentryVerdictAbandon {
+		// Paid heartbeat is owned by deterministic code: 15m → 30m → 60m →
+		// 2h. Market/leader/attention-zone events may still pull the review
+		// forward, subject to the 5m minimum interval and feature-hash dedupe.
+		switch {
+		case c.ReviewCount <= 1:
+			nextSeconds = 15 * 60
+		case c.ReviewCount == 2:
+			nextSeconds = 30 * 60
+		case c.ReviewCount == 3:
+			nextSeconds = 60 * 60
+		default:
+			nextSeconds = 2 * 60 * 60
+		}
+	}
+	next := time.Now().Add(time.Duration(nextSeconds) * time.Second)
+	candle := candidateClosed5mCandleKey(analysis)
+	enterApproved := pv.Verdict == store.ReentryVerdictEnter && pv.Confidence >= traderCfg.RiskAIConfidenceThreshold
+	d := store.ReentryCandidateDecision{Decision: pv.Verdict, Regime: pv.Regime, Confidence: pv.Confidence, SizeFactor: pv.SizeFactor, EntryPriceLow: pv.EntryPriceLow, EntryPriceHigh: pv.EntryPriceHigh, AttentionPriceLow: pv.AttentionPriceLow, AttentionPriceHigh: pv.AttentionPriceHigh, NextReview: next, AnalysisID: analysis.ID, TTLSeconds: pv.TTLSeconds, CandleKey: candle, ConfirmAbandon: pv.Verdict == store.ReentryVerdictAbandon && pv.Confidence >= abandonThreshold && candle != "", EnterApproved: enterApproved}
+	if err := a.st.ReentryAI().FinishReentryCandidateReview(c.ID, d); err != nil {
+		return err
+	}
+	event := "AI_REVIEW_WAIT"
+	if pv.Verdict == store.ReentryVerdictEnter {
+		event = "AI_REVIEW_ENTER"
+	}
+	if pv.Verdict == store.ReentryVerdictAbandon {
+		event = "AI_REVIEW_ABANDON"
+	}
+	a.recordCandidateEvent(c, event, c.TriggerPrice, c.MaxNotional*pv.SizeFactor, map[string]interface{}{"analysis_id": analysis.ID, "data_hash": analysis.DataHash, "model": cfg.Model, "prompt_version": analysis.PromptVersion, "confidence": pv.Confidence, "regime": pv.Regime, "size_factor": pv.SizeFactor, "entry_price_low": pv.EntryPriceLow, "entry_price_high": pv.EntryPriceHigh, "next_review_at": next, "ai_next_review_seconds": pv.NextReviewSeconds, "scheduled_next_review_seconds": nextSeconds})
+	if pv.Verdict == store.ReentryVerdictWait {
+		_ = a.st.CopyTrade().UpdateCopyGuardObservation(c.CycleID, store.CopyGuardAIWaiting, c.LeaderEntryPrice, c.TriggerPrice, c.ATR)
+		return nil
+	}
+	if pv.Verdict == store.ReentryVerdictAbandon {
+		fresh, _ := a.st.ReentryAI().GetReentryCandidate(c.ID)
+		if fresh != nil && fresh.ConsecutiveAbandons >= 2 && pv.Confidence >= abandonThreshold {
+			_ = a.st.ReentryAI().MarkReentryCandidateStatus(c.ID, store.ReentryCandidateAbandoned, "two confirmed ABANDON decisions")
+			_ = a.st.CopyTrade().UpdateCopyGuardObservation(c.CycleID, store.CopyGuardAIAbandoned, c.LeaderEntryPrice, c.TriggerPrice, c.ATR)
+			a.notifyCandidateImportant(fresh, "AI_REVIEW_ABANDON", "AI 已确认放弃重入候选", "两个不同的已收盘 5m K 线均给出高置信度 ABANDON，候选已结束。")
+		} else {
+			a.updateCandidateCycleStatus(c, store.CopyGuardAIWaiting)
+		}
+		return nil
+	}
+	if pv.Confidence < traderCfg.RiskAIConfidenceThreshold {
+		a.recordCandidateEvent(c, "REENTRY_PREFLIGHT_REJECTED", c.TriggerPrice, 0, map[string]interface{}{"analysis_id": analysis.ID, "reason": "confidence_below_threshold", "confidence": pv.Confidence, "required_confidence": traderCfg.RiskAIConfidenceThreshold})
+		a.updateCandidateCycleStatus(c, store.CopyGuardAIWaiting)
+		return nil
+	}
+	if err := copytrade.ExecuteAIReentryForTrader(c.TraderID, c.ID, analysis.ID); err != nil {
+		logger.Warnf("[ReentryAdvisor] AI 重入预检拒绝 candidate=%d: %v", c.ID, err)
+		_ = a.st.ReentryAI().RejectReentryCandidatePreflight(c.ID, err.Error(), time.Duration(traderCfg.RiskAIMinReviewSeconds)*time.Second)
+		a.updateCandidateCycleStatus(c, store.CopyGuardAIWaiting)
+		a.recordCandidateEvent(c, "REENTRY_PREFLIGHT_REJECTED", c.TriggerPrice, 0, map[string]interface{}{"analysis_id": analysis.ID, "error": err.Error()})
+	}
+	return nil
+}
+
+// candidateClosed5mCandleKey returns the actual last completed 5m candle from
+// the persisted point-in-time datapack. Never fall back to analysis wall time:
+// two reviews in different clock buckets over the same closed candle must not
+// satisfy the two-candle ABANDON rule.
+func candidateClosed5mCandleKey(analysis *store.ReentryAIAnalysis) string {
+	if analysis == nil || analysis.DatapackJSON == "" {
+		return ""
+	}
+	var pack struct {
+		Market *struct {
+			Klines map[string]*KlineSummary `json:"klines"`
+		} `json:"market"`
+	}
+	if err := json.Unmarshal([]byte(analysis.DatapackJSON), &pack); err != nil || pack.Market == nil {
+		return ""
+	}
+	summary := pack.Market.Klines["5m"]
+	if summary == nil || len(summary.Bars) == 0 {
+		return ""
+	}
+	bar := summary.Bars[len(summary.Bars)-1]
+	if len(bar) == 0 || bar[0] <= 0 {
+		return ""
+	}
+	return time.UnixMilli(int64(bar[0])).UTC().Format(time.RFC3339)
+}
+
+// failCandidateAnalysis closes every pre-decision failure path. The store
+// condition prevents a late model result from resurrecting an operator-paused
+// or terminated candidate.
+func (a *Advisor) failCandidateAnalysis(candidateID, analysisID int64, message string, failureCount int) {
+	if candidateID <= 0 {
+		return
+	}
+	c, err := a.st.ReentryAI().GetReentryCandidate(candidateID)
+	if err != nil || (c.Status != store.ReentryCandidateReviewing && c.Status != store.ReentryCandidateEntryPending) {
+		return
+	}
+	if analysisID > 0 {
+		_ = a.st.ReentryAI().MarkReentryAnalysisFailed(analysisID, message)
+	}
+	if failureCount <= 0 {
+		failureCount = c.FailureCount + 1
+	}
+	if err := a.st.ReentryAI().FailReentryCandidateReview(c.ID, message, candidateFailureBackoff(failureCount)); err != nil {
+		return
+	}
+	a.updateCandidateCycleStatus(c, store.CopyGuardAIWaiting)
+	a.recordCandidateEvent(c, "AI_REVIEW_FAILED", 0, 0, map[string]interface{}{"reason": message, "failure_count": failureCount})
+}
+
+func (a *Advisor) failCandidateBeforeModel(candidateID, analysisID int64, message string) {
+	if candidateID <= 0 {
+		return
+	}
+	c, err := a.st.ReentryAI().GetReentryCandidate(candidateID)
+	if err != nil || c.Status != store.ReentryCandidateReviewing {
+		return
+	}
+	failureCount := c.FailureCount + 1
+	if err := a.st.ReentryAI().FailReentryCandidateBeforeModel(c.ID, analysisID, message, candidateFailureBackoff(failureCount)); err != nil {
+		return
+	}
+	a.updateCandidateCycleStatus(c, store.CopyGuardAIWaiting)
+	a.recordCandidateEvent(c, "AI_REVIEW_FAILED", 0, 0, map[string]interface{}{"reason": message, "failure_count": failureCount, "before_model_call": true})
+	if failureCount == 3 {
+		a.notifyCandidateImportant(c, "AI_REVIEW_FAILED", "AI 重入分析连续准备失败", "模型尚未被调用，候选不会消耗调用额度，并将按退避策略继续等待。")
+	}
+}
+
+func (a *Advisor) notifyCandidateImportant(c *store.CopyGuardReentryCandidate, eventType, title, body string) {
+	if c == nil {
+		return
+	}
+	traderCfg, err := a.st.CopyTrade().GetByTraderID(c.TraderID)
+	if err == nil && !store.ShouldSendCopyGuardEmail(traderCfg.RiskNotificationLevel, eventType) {
+		return
+	}
+	attemptNo := c.ReentryCount + 1
+	key := fmt.Sprintf("%s|%s|%d|%d|%d", eventType, c.TraderID, c.CycleID, attemptNo, c.DecisionGeneration)
+	notifier.Notify(notifier.Alert{
+		Category: "copy_trade", TraderID: c.TraderID,
+		Title:   fmt.Sprintf("%s | %s %s %s", title, c.Symbol, strings.ToUpper(c.Side), c.TraderID),
+		Body:    fmt.Sprintf("%s\n\nTrader ID: %s\nCycle: %d\nAttempt: %d\nCandidate: %d\nGeneration: %d\nLast decision: %s\nConfidence: %.0f%%", body, c.TraderID, c.CycleID, attemptNo, c.ID, c.DecisionGeneration, c.LastDecision, c.Confidence*100),
+		RateKey: key, DedupKey: key,
+		Fields: map[string]string{"CycleID": fmt.Sprint(c.CycleID), "AttemptNo": fmt.Sprint(attemptNo), "CandidateID": fmt.Sprint(c.ID), "Generation": fmt.Sprint(c.DecisionGeneration)},
+	})
 }
 
 // recordAIAnalysisEvent 把一次内置 AI 二次入场分析结论落成统一跟单事件（best-effort）。
@@ -328,50 +632,14 @@ func (a *Advisor) recordAIAnalysisEvent(analysis *store.ReentryAIAnalysis, pv *p
 	}
 }
 
-// autoEntryMaxSnapshotAge 自动入场的快照新鲜度护栏：数据包生成到 AI 结论
-// 落地超过该时长（模型排队/超时重试导致）时放弃自动入场，转人工。
-const autoEntryMaxSnapshotAge = 10 * time.Minute
-
-// maybeAutoEnter Phase 3 自动确认重入。返回给结论邮件的执行说明（空=未尝试）。
-//
-// 安全设计：
-//   - 双开关（ai_enabled + auto_entry_enabled）+ 置信度门槛，默认全关；
-//   - 只在结论为 ENTER 时触发，金额取 min(模型建议, 信号建议)（上界仍由
-//     ConfirmManualReentry 封死在首仓名义）；
-//   - 完整复用人工确认链路 ConfirmManualReentryForTrader：领航员仍持仓、
-//     方向一致、本地无同向仓位、金额下限、PENDING→EXECUTING 原子抢占等
-//     全部硬校验与审计事件（operator="ai:auto"）原样生效；
-//   - 任何失败只记日志+邮件说明，信号保持 PENDING 可人工处理。
-func (a *Advisor) maybeAutoEnter(analysis *store.ReentryAIAnalysis, cfg *store.ReentryAIConfig, pv *parsedVerdict) string {
-	if !cfg.AutoEntryEnabled {
-		return ""
+// legacyAnalysisExecutionNote 明确封死旧人工信号的 AI 自动确认旁路。
+// auto_entry_enabled 现在仅代表 ai_guarded 候选执行的全局安全开关；即使
+// 历史信号分析得到 ENTER，也只能用于审计，不能下单。
+func legacyAnalysisExecutionNote(cfg *store.ReentryAIConfig, pv *parsedVerdict) string {
+	if cfg.AutoEntryEnabled && pv.Verdict == store.ReentryVerdictEnter {
+		return "未执行：旧人工重入执行链已废弃；本结论仅用于历史审计。真实重入必须由持久化 AI 候选调度器重新预检后执行。"
 	}
-	if pv.Verdict != store.ReentryVerdictEnter {
-		return ""
-	}
-	if pv.Confidence < cfg.ConfidenceThreshold {
-		return fmt.Sprintf("未自动入场：置信度 %.0f%% 低于门槛 %.0f%%，请人工决策。",
-			pv.Confidence*100, cfg.ConfidenceThreshold*100)
-	}
-	if age := time.Since(analysis.SnapshotAt); age > autoEntryMaxSnapshotAge {
-		return fmt.Sprintf("未自动入场：数据快照已过时（%s 前生成），请在页面重新生成后人工决策。",
-			age.Truncate(time.Second))
-	}
-	sig, err := a.st.CopyTrade().GetManualReentrySignal(analysis.SignalID)
-	if err != nil || sig.Status != store.ManualReentryStatusPending {
-		return "未自动入场：信号已不在待确认状态。"
-	}
-	notional := sig.RecommendedNotional
-	if pv.SuggestedNotional > 0 && pv.SuggestedNotional < notional {
-		notional = pv.SuggestedNotional
-	}
-	logger.Infof("[ReentryAdvisor] 触发 AI 自动入场 (signal=%d, %s %s, confidence=%.2f≥%.2f, 金额=%.2f)",
-		sig.ID, sig.Symbol, sig.Side, pv.Confidence, cfg.ConfidenceThreshold, notional)
-	if err := copytrade.ConfirmManualReentryForTrader(sig.TraderID, sig.ID, "ai:auto", notional); err != nil {
-		logger.Warnf("[ReentryAdvisor] AI 自动入场被拒 (signal=%d): %v", sig.ID, err)
-		return fmt.Sprintf("自动入场未执行：%v。信号保持待确认，可人工处理。", err)
-	}
-	return fmt.Sprintf("已自动确认重入（金额 %.2f USDT），系统正在执行；执行结果见周期事件流。", notional)
+	return ""
 }
 
 // notifyVerdict AI 结论邮件（自动分析路径）。信号本身的告警邮件由 copytrade
@@ -408,11 +676,9 @@ func (a *Advisor) notifyVerdict(analysis *store.ReentryAIAnalysis, cfg *store.Re
 	}
 	switch {
 	case autoEntryNote != "":
-		fmt.Fprintf(&b, "\n自动入场: %s\n", autoEntryNote)
-	case cfg.AutoEntryEnabled:
-		b.WriteString("\n自动入场已开启，但仅结论为 ENTER 时触发，本条未下单。请在 Copy Guard 页面查看完整数据包并人工决策。")
+		fmt.Fprintf(&b, "\n执行状态: %s\n", autoEntryNote)
 	default:
-		b.WriteString("\n请在 Copy Guard 页面查看完整数据包并人工确认。AI 结论仅供参考，未开启自动入场时不会下单。")
+		b.WriteString("\n本条为旧信号的历史分析，不具备下单能力；真实重入仅由 ai_guarded 候选调度器执行。")
 	}
 	notifier.Notify(notifier.Alert{
 		Category: "copy_trade",
@@ -437,8 +703,12 @@ func AnalyzeAnalysis(analysisID int64) error {
 	if err != nil {
 		return err
 	}
-	if _, err := a.st.ReentryAI().GetReentryAnalysis(analysisID); err != nil {
+	analysis, err := a.st.ReentryAI().GetReentryAnalysis(analysisID)
+	if err != nil {
 		return fmt.Errorf("分析记录不存在: %d", analysisID)
+	}
+	if analysis.CandidateID > 0 {
+		return fmt.Errorf("AI 候选分析由持久化调度器管理，禁止手动触发")
 	}
 	if _, err := resolveAIModel(a.st, cfg); err != nil {
 		return err

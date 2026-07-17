@@ -51,8 +51,7 @@ func TestComputeOwnPathBaselineReproducesWLD(t *testing.T) {
 }
 
 // ============================================================================
-// 加仓账户风险预算（v4.1 仅告警不拦截）：超预算记录 ADDON_RISK_WARNING +
-// 事件限频；预算内不产生事件
+// 加仓账户风险预算：超预算必须缩量并记录 ADDON_RISK_SHRUNK；预算内不改量。
 // ============================================================================
 
 func newAddonBudgetEngine(t *testing.T) (*Engine, *store.Store) {
@@ -85,7 +84,7 @@ func newAddonBudgetEngine(t *testing.T) (*Engine, *store.Store) {
 	return e, st
 }
 
-func TestAddonBudgetWarnsWithoutBlocking(t *testing.T) {
+func TestAddonBudgetShrinksInsteadOfOnlyWarning(t *testing.T) {
 	e, st := newAddonBudgetEngine(t)
 	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "pos-add", Symbol: "WLDUSDT", Side: "long", MarginMode: "cross", Status: store.CopyGuardFollowing, PolicySnapshot: "{}", LeaderEntryPrice: 1, FollowerEntryPrice: 1, FollowerNotional: 100, AccountEquity: 100})
 	if err != nil {
@@ -100,21 +99,26 @@ func TestAddonBudgetWarnsWithoutBlocking(t *testing.T) {
 		}
 		n := 0
 		for _, ev := range events {
-			if ev.Type == "ADDON_RISK_WARNING" {
+			if ev.Type == "ADDON_RISK_SHRUNK" {
 				n++
 			}
 		}
 		return n
 	}
 
-	// 现有名义 100 + 加仓 700 = 800，预期损失 800×2% = 16 USD = 16% > 预算 15% → 告警
-	e.warnAddonRiskBudget(signal, "pos-add", 700)
+	// 现有名义 100 + 请求加仓 700 = 800，预期损失 16% > 预算 15%；
+	// 最大总名义应压到 750，因此本次只允许 650。
+	if got := e.limitAddonRiskBudget(signal, "pos-add", 700); got != 650 {
+		t.Fatalf("expected addon to shrink to 650, got %.8f", got)
+	}
 	if countBudgetEvents() != 1 {
-		t.Fatalf("expected exactly 1 ADDON_RISK_WARNING event, got %d", countBudgetEvents())
+		t.Fatalf("expected exactly 1 ADDON_RISK_SHRUNK event, got %d", countBudgetEvents())
 	}
 
-	// 60 秒限频窗口内重复超预算：不重复写事件
-	e.warnAddonRiskBudget(signal, "pos-add", 700)
+	// 60 秒限频窗口内重复超预算：仍须缩量，但不重复写事件。
+	if got := e.limitAddonRiskBudget(signal, "pos-add", 700); got != 650 {
+		t.Fatalf("rate limiting must not bypass shrink, got %.8f", got)
+	}
 	if countBudgetEvents() != 1 {
 		t.Fatalf("rate-limited warning must not write a duplicate event, got %d", countBudgetEvents())
 	}
@@ -125,19 +129,23 @@ func TestAddonBudgetWarnsWithoutBlocking(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e2.warnAddonRiskBudget(signal, "pos-add", 500)
+	if got := e2.limitAddonRiskBudget(signal, "pos-add", 500); got != 500 {
+		t.Fatalf("an add within budget must remain unchanged, got %.8f", got)
+	}
 	events2, _ := st2.CopyTrade().ListCopyGuardEvents(cycle2.ID)
 	for _, ev := range events2 {
-		if ev.Type == "ADDON_RISK_WARNING" {
+		if ev.Type == "ADDON_RISK_SHRUNK" {
 			t.Fatal("an add within the budget must not produce a warning event")
 		}
 	}
 	// 预算设 0（禁用）→ 完全不检查
 	e2.config.RiskAddonBudgetPct = 0
-	e2.warnAddonRiskBudget(signal, "pos-add", 10000)
+	if got := e2.limitAddonRiskBudget(signal, "pos-add", 10000); got != 10000 {
+		t.Fatalf("budget=0 must leave addon unchanged, got %.8f", got)
+	}
 	events2, _ = st2.CopyTrade().ListCopyGuardEvents(cycle2.ID)
 	for _, ev := range events2 {
-		if ev.Type == "ADDON_RISK_WARNING" {
+		if ev.Type == "ADDON_RISK_SHRUNK" {
 			t.Fatal("budget=0 disables the check entirely")
 		}
 	}

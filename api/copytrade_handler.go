@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -36,6 +37,52 @@ func NewCopyTradeHandler(st *store.Store, tm *manager.TraderManager) *CopyTradeH
 	}
 }
 
+func validateAIGuardedPrerequisites(st *store.Store, cfg *store.CopyTradeConfig) error {
+	if cfg == nil || cfg.RiskReentryDecisionMode != "ai_guarded" {
+		return nil
+	}
+	aiCfg, err := st.ReentryAI().GetReentryAIConfig()
+	if err != nil || !aiCfg.Enabled || !aiCfg.AIEnabled || !aiCfg.AutoEntryEnabled {
+		return fmt.Errorf("ai_guarded requires enabled Reentry AI analysis and global AI execution safety switch")
+	}
+	if aiCfg.Model != "" {
+		model, modelErr := st.AIModel().GetByID(aiCfg.Model)
+		if modelErr != nil || !model.Enabled || strings.TrimSpace(model.APIKey) == "" {
+			return fmt.Errorf("ai_guarded model is missing, disabled, or has no API key")
+		}
+		return nil
+	}
+	models, err := st.AIModel().List("default")
+	if err != nil {
+		return fmt.Errorf("cannot validate AI model: %w", err)
+	}
+	for _, model := range models {
+		if model.Enabled && strings.TrimSpace(model.APIKey) != "" {
+			return nil
+		}
+	}
+	return fmt.Errorf("ai_guarded requires at least one enabled AI model with an API key")
+}
+
+// validateRiskConfirmation keeps every configuration entry point on the same
+// high-risk confirmation contract. Above 8%, a boolean is insufficient: the
+// caller must echo the exact percentage value the operator typed.
+func validateRiskConfirmation(accountRisk float64, confirmed bool, typedPercent *float64) error {
+	if accountRisk <= 0.04 {
+		return nil
+	}
+	if !confirmed {
+		return fmt.Errorf("risk_account_pct > 4%% requires risk_high_risk_confirmed")
+	}
+	if accountRisk > 0.08 {
+		expected := accountRisk * 100
+		if typedPercent == nil || math.IsNaN(*typedPercent) || math.IsInf(*typedPercent, 0) || math.Abs(*typedPercent-expected) > 1e-9 {
+			return fmt.Errorf("risk_account_pct > 8%% requires matching risk_extreme_risk_confirm_value")
+		}
+	}
+	return nil
+}
+
 // RegisterRoutes 注册路由
 func (h *CopyTradeHandler) RegisterRoutes(group *gin.RouterGroup) {
 	copyTrade := group.Group("/copytrade")
@@ -48,6 +95,11 @@ func (h *CopyTradeHandler) RegisterRoutes(group *gin.RouterGroup) {
 		copyTrade.GET("/stats/:trader_id", h.GetStats)
 		copyTrade.GET("/logs/:trader_id", h.GetLogs)
 		copyTrade.GET("/risk/summary", h.GetRiskSummary)
+		copyTrade.GET("/risk/defaults", h.GetRiskDefaults)
+		copyTrade.GET("/risk/ai-candidates", h.ListAICandidates)
+		copyTrade.POST("/risk/ai-candidates/:id/pause", h.PauseAICandidate)
+		copyTrade.POST("/risk/ai-candidates/:id/resume", h.ResumeAICandidate)
+		copyTrade.POST("/risk/ai-candidates/:id/terminate", h.TerminateAICandidate)
 		copyTrade.GET("/risk/cycles", h.GetRiskCycles)
 		copyTrade.GET("/risk/cycles/:id", h.GetRiskCycle)
 		copyTrade.GET("/risk/cycles/:id/export", h.ExportRiskCycle)
@@ -74,6 +126,90 @@ func (h *CopyTradeHandler) RegisterRoutes(group *gin.RouterGroup) {
 			creds.DELETE("/:label", h.DeleteBinanceCredentials)
 		}
 	}
+}
+
+func (h *CopyTradeHandler) ListAICandidates(c *gin.Context) {
+	ids, _, names, err := h.ownedTraderIDs(c)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	var statuses []string
+	for _, status := range strings.Split(strings.TrimSpace(c.Query("status")), ",") {
+		if status = strings.ToUpper(strings.TrimSpace(status)); status != "" {
+			statuses = append(statuses, status)
+		}
+	}
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "100"))
+	candidates, err := h.store.ReentryAI().ListReentryCandidatesByTraders(ids, statuses, limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"candidates": candidates, "trader_names": names, "count": len(candidates)})
+}
+
+func (h *CopyTradeHandler) getOwnedAICandidate(c *gin.Context) *store.CopyGuardReentryCandidate {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid candidate id"})
+		return nil
+	}
+	_, owned, _, err := h.ownedTraderIDs(c)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return nil
+	}
+	candidate, err := h.store.ReentryAI().GetReentryCandidate(id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "candidate not found"})
+		return nil
+	}
+	if !owned[candidate.TraderID] {
+		c.JSON(http.StatusForbidden, gin.H{"error": "candidate not owned by current user"})
+		return nil
+	}
+	return candidate
+}
+
+func (h *CopyTradeHandler) PauseAICandidate(c *gin.Context) {
+	candidate := h.getOwnedAICandidate(c)
+	if candidate == nil {
+		return
+	}
+	if err := h.store.ReentryAI().PauseReentryCandidate(candidate.ID); err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		return
+	}
+	_ = h.store.CopyTrade().UpdateCopyGuardObservation(candidate.CycleID, store.CopyGuardAIWaiting, candidate.LeaderEntryPrice, candidate.TriggerPrice, candidate.ATR)
+	c.JSON(http.StatusOK, gin.H{"message": "AI candidate paused"})
+}
+
+func (h *CopyTradeHandler) ResumeAICandidate(c *gin.Context) {
+	candidate := h.getOwnedAICandidate(c)
+	if candidate == nil {
+		return
+	}
+	if err := h.store.ReentryAI().ResumeReentryCandidate(candidate.ID); err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		return
+	}
+	_ = h.store.CopyTrade().UpdateCopyGuardObservation(candidate.CycleID, store.CopyGuardAIWaiting, candidate.LeaderEntryPrice, candidate.TriggerPrice, candidate.ATR)
+	c.JSON(http.StatusOK, gin.H{"message": "AI candidate resumed"})
+}
+
+func (h *CopyTradeHandler) TerminateAICandidate(c *gin.Context) {
+	candidate := h.getOwnedAICandidate(c)
+	if candidate == nil {
+		return
+	}
+	if err := h.store.ReentryAI().TerminateReentryCandidate(candidate.ID); err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		return
+	}
+	_ = h.store.CopyTrade().UpdateCopyGuardObservation(candidate.CycleID, store.CopyGuardAIAbandoned, candidate.LeaderEntryPrice, candidate.TriggerPrice, candidate.ATR)
+	_ = h.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: candidate.CycleID, TraderID: candidate.TraderID, Type: "AI_CANDIDATE_TERMINATED", Metadata: map[string]interface{}{"candidate_id": candidate.ID, "operator": c.GetString("user_id")}})
+	c.JSON(http.StatusOK, gin.H{"message": "AI candidate terminated"})
 }
 
 func (h *CopyTradeHandler) ownedTraderIDs(c *gin.Context) ([]string, map[string]bool, map[string]string, error) {
@@ -137,6 +273,202 @@ func riskFilter(c *gin.Context) store.CopyGuardFilter {
 	return store.CopyGuardFilter{LeaderID: strings.TrimSpace(c.Query("leader_id")), Symbol: strings.TrimSpace(c.Query("symbol")), Status: strings.TrimSpace(c.Query("status")), ResultType: strings.TrimSpace(c.Query("result_type"))}
 }
 
+type copyGuardCycleArtifacts struct {
+	Attempts     []*store.CopyGuardAttempt          `json:"attempts"`
+	Events       []*store.CopyGuardEvent            `json:"events"`
+	Protection   *store.CopyGuardProtectiveOrder    `json:"protection,omitempty"`
+	WatchSamples []*store.CopyGuardWatchSample      `json:"watch_samples"`
+	Candidates   []*store.CopyGuardReentryCandidate `json:"ai_candidates"`
+	AIAnalyses   []*store.ReentryAIAnalysis         `json:"ai_analyses"`
+}
+
+type copyGuardAttemptAttribution struct {
+	AttemptNo      int      `json:"attempt_no"`
+	PnL            float64  `json:"pnl"`
+	Fee            float64  `json:"fee"`
+	Funding        float64  `json:"funding_fee"`
+	StopOnly       bool     `json:"stop_only_path"`
+	RecoverySec    *float64 `json:"first_recovery_seconds,omitempty"`
+	PostStopMFEUSD *float64 `json:"post_stop_mfe_usd,omitempty"`
+	PostStopMAEUSD *float64 `json:"post_stop_mae_usd,omitempty"`
+}
+
+type copyGuardAttribution struct {
+	Final                      bool                          `json:"final"`
+	LeaderDirectionReturn      float64                       `json:"leader_direction_return"`
+	BaselineNoGuardPnL         float64                       `json:"baseline_no_guard_pnl"`
+	StopOnlyPnL                float64                       `json:"stop_only_pnl"`
+	ActualCopyGuardPnL         float64                       `json:"actual_copy_guard_pnl"`
+	StopSavings                float64                       `json:"stop_savings"`
+	MissedProfit               float64                       `json:"missed_profit"`
+	ReentryContribution        float64                       `json:"reentry_contribution"`
+	FirstReentryPnL            float64                       `json:"first_reentry_pnl"`
+	SecondReentryPnL           float64                       `json:"second_reentry_pnl"`
+	Fees                       float64                       `json:"fees"`
+	Slippage                   float64                       `json:"slippage"`
+	RealizedPathMaxDrawdownUSD float64                       `json:"realized_path_max_drawdown_usd"`
+	WorstAttemptPnL            float64                       `json:"worst_attempt_pnl"`
+	MaxPostStopMFEUSD          float64                       `json:"max_post_stop_mfe_usd"`
+	MaxPostStopMAEUSD          float64                       `json:"max_post_stop_mae_usd"`
+	Attempts                   []copyGuardAttemptAttribution `json:"attempts"`
+}
+
+func copyGuardNumber(value interface{}) (float64, bool) {
+	switch v := value.(type) {
+	case float64:
+		return v, true
+	case float32:
+		return float64(v), true
+	case int:
+		return float64(v), true
+	case int64:
+		return float64(v), true
+	case json.Number:
+		x, err := v.Float64()
+		return x, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func copyGuardAttemptRecovery(events []*store.CopyGuardEvent) map[int]map[string]float64 {
+	out := make(map[int]map[string]float64)
+	for _, event := range events {
+		if event == nil || event.Type != "WATCH_SUMMARY" {
+			continue
+		}
+		items, ok := event.Metadata["attempt_recovery"].([]interface{})
+		if !ok {
+			continue
+		}
+		for _, item := range items {
+			values, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			attemptValue, ok := copyGuardNumber(values["attempt_no"])
+			if !ok {
+				continue
+			}
+			metrics := make(map[string]float64)
+			for _, key := range []string{"first_recovery_seconds", "max_favorable_excursion_usd", "max_adverse_excursion_usd"} {
+				if value, exists := copyGuardNumber(values[key]); exists {
+					metrics[key] = value
+				}
+			}
+			out[int(attemptValue)] = metrics
+		}
+	}
+	return out
+}
+
+func buildCopyGuardAttribution(cycle *store.CopyGuardCycle, attempts []*store.CopyGuardAttempt, events []*store.CopyGuardEvent) copyGuardAttribution {
+	a := copyGuardAttribution{BaselineNoGuardPnL: cycle.BaselinePnL, ActualCopyGuardPnL: cycle.ActualPnL, Fees: cycle.Fees, Slippage: cycle.Slippage, Attempts: make([]copyGuardAttemptAttribution, 0, len(attempts))}
+	a.Final = cycle.ClosedAt != nil && cycle.AccountingStatus == store.CopyGuardAccountingReconciled
+	recovery := copyGuardAttemptRecovery(events)
+	peak, cumulative := float64(0), float64(0)
+	if cycle.LeaderEntryPrice > 0 && cycle.LastObservedPrice > 0 {
+		a.LeaderDirectionReturn = (cycle.LastObservedPrice - cycle.LeaderEntryPrice) / cycle.LeaderEntryPrice
+		if strings.EqualFold(cycle.Side, "short") {
+			a.LeaderDirectionReturn = -a.LeaderDirectionReturn
+		}
+	}
+	for _, attempt := range attempts {
+		if attempt == nil {
+			continue
+		}
+		item := copyGuardAttemptAttribution{AttemptNo: attempt.AttemptNo, PnL: attempt.PnL, Fee: attempt.Fee, Funding: attempt.FundingFee, StopOnly: attempt.AttemptNo == 0}
+		if metrics, ok := recovery[attempt.AttemptNo]; ok {
+			if value, exists := metrics["first_recovery_seconds"]; exists && value >= 0 {
+				item.RecoverySec = &value
+			}
+			if value, exists := metrics["max_favorable_excursion_usd"]; exists {
+				item.PostStopMFEUSD = &value
+				if value > a.MaxPostStopMFEUSD {
+					a.MaxPostStopMFEUSD = value
+				}
+			}
+			if value, exists := metrics["max_adverse_excursion_usd"]; exists {
+				item.PostStopMAEUSD = &value
+				if value > a.MaxPostStopMAEUSD {
+					a.MaxPostStopMAEUSD = value
+				}
+			}
+		}
+		a.Attempts = append(a.Attempts, item)
+		if attempt.PnL < a.WorstAttemptPnL {
+			a.WorstAttemptPnL = attempt.PnL
+		}
+		cumulative += attempt.PnL
+		if cumulative > peak {
+			peak = cumulative
+		}
+		if drawdown := peak - cumulative; drawdown > a.RealizedPathMaxDrawdownUSD {
+			a.RealizedPathMaxDrawdownUSD = drawdown
+		}
+		switch attempt.AttemptNo {
+		case 0:
+			a.StopOnlyPnL = attempt.PnL
+		case 1:
+			a.FirstReentryPnL = attempt.PnL
+			a.ReentryContribution += attempt.PnL
+		case 2:
+			a.SecondReentryPnL = attempt.PnL
+			a.ReentryContribution += attempt.PnL
+		default:
+			a.ReentryContribution += attempt.PnL
+		}
+	}
+	if a.Final {
+		delta := a.StopOnlyPnL - a.BaselineNoGuardPnL
+		if delta >= 0 {
+			a.StopSavings = delta
+		} else {
+			a.MissedProfit = -delta
+		}
+	}
+	return a
+}
+
+func (h *CopyTradeHandler) loadCopyGuardCycleArtifacts(cycleID int64) (*copyGuardCycleArtifacts, error) {
+	artifacts := &copyGuardCycleArtifacts{}
+	var err error
+	if artifacts.Events, err = h.store.CopyTrade().ListCopyGuardEvents(cycleID); err != nil {
+		return nil, err
+	}
+	if artifacts.Attempts, err = h.store.CopyTrade().ListCopyGuardAttempts(cycleID); err != nil {
+		return nil, err
+	}
+	if artifacts.Protection, err = h.store.CopyTrade().GetCopyGuardProtectiveOrder(cycleID); err != nil {
+		artifacts.Protection = nil
+	}
+	if artifacts.WatchSamples, err = h.store.CopyTrade().ListCopyGuardWatchSamples(cycleID); err != nil {
+		return nil, err
+	}
+	if artifacts.Candidates, err = h.store.ReentryAI().ListReentryCandidatesByCycle(cycleID); err != nil {
+		return nil, err
+	}
+	if artifacts.AIAnalyses, err = h.store.ReentryAI().ListReentryAnalysesByCycle(cycleID, 500); err != nil {
+		return nil, err
+	}
+	return artifacts, nil
+}
+
+func copyGuardCycleDocument(cycle *store.CopyGuardCycle, artifacts *copyGuardCycleArtifacts) gin.H {
+	return gin.H{
+		"schema_version":   4,
+		"defaults_version": store.CopyGuardDefaultsVersion(),
+		"cycle":            cycle,
+		"attempts":         artifacts.Attempts,
+		"events":           artifacts.Events,
+		"protection":       artifacts.Protection,
+		"watch_samples":    artifacts.WatchSamples,
+		"ai_candidates":    artifacts.Candidates,
+		"ai_analyses":      artifacts.AIAnalyses,
+		"attribution":      buildCopyGuardAttribution(cycle, artifacts.Attempts, artifacts.Events),
+	}
+}
+
 func (h *CopyTradeHandler) GetRiskSummary(c *gin.Context) {
 	ids, _, _, err := h.ownedTraderIDs(c)
 	if err != nil {
@@ -191,26 +523,12 @@ func (h *CopyTradeHandler) GetRiskCycle(c *gin.Context) {
 		return
 	}
 	cycle.TraderName = names[cycle.TraderID]
-	events, err := h.store.CopyTrade().ListCopyGuardEvents(id)
+	artifacts, err := h.loadCopyGuardCycleArtifacts(id)
 	if err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
-	attempts, err := h.store.CopyTrade().ListCopyGuardAttempts(id)
-	if err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
-		return
-	}
-	protection, protectionErr := h.store.CopyTrade().GetCopyGuardProtectiveOrder(id)
-	if protectionErr != nil {
-		protection = nil
-	}
-	// 观察期采样时间线（v4.1）：出局后每个 tick 的价格/边界/门控轨迹
-	watchSamples, samplesErr := h.store.CopyTrade().ListCopyGuardWatchSamples(id)
-	if samplesErr != nil {
-		watchSamples = nil
-	}
-	c.JSON(200, gin.H{"cycle": cycle, "events": events, "attempts": attempts, "protection": protection, "watch_samples": watchSamples})
+	c.JSON(200, copyGuardCycleDocument(cycle, artifacts))
 }
 
 func (h *CopyTradeHandler) ExportRiskCycle(c *gin.Context) {
@@ -234,28 +552,16 @@ func (h *CopyTradeHandler) ExportRiskCycle(c *gin.Context) {
 		return
 	}
 	cycle.TraderName = names[cycle.TraderID]
-	events, err := h.store.CopyTrade().ListCopyGuardEvents(id)
+	artifacts, err := h.loadCopyGuardCycleArtifacts(id)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
-	}
-	attempts, err := h.store.CopyTrade().ListCopyGuardAttempts(id)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	protection, protectionErr := h.store.CopyTrade().GetCopyGuardProtectiveOrder(id)
-	if protectionErr != nil {
-		protection = nil
-	}
-	watchSamples, samplesErr := h.store.CopyTrade().ListCopyGuardWatchSamples(id)
-	if samplesErr != nil {
-		watchSamples = nil
 	}
 	c.Header("Content-Type", "application/x-ndjson")
 	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=copy-guard-cycle-%d.jsonl", id))
-	// schema_version 3：新增 watch_samples（观察期采样时间线，离线回测输入）
-	_ = json.NewEncoder(c.Writer).Encode(gin.H{"schema_version": 3, "exported_at": time.Now().UTC(), "cycle": cycle, "attempts": attempts, "events": events, "protection": protection, "watch_samples": watchSamples})
+	doc := copyGuardCycleDocument(cycle, artifacts)
+	doc["exported_at"] = time.Now().UTC()
+	_ = json.NewEncoder(c.Writer).Encode(doc)
 }
 func (h *CopyTradeHandler) ExportRiskCycles(c *gin.Context) {
 	ids, _, names, err := h.ownedTraderIDs(c)
@@ -280,17 +586,14 @@ func (h *CopyTradeHandler) ExportRiskCycles(c *gin.Context) {
 			}
 			for _, cycle := range rows {
 				cycle.TraderName = names[cycle.TraderID]
-				events, _ := h.store.CopyTrade().ListCopyGuardEvents(cycle.ID)
-				attempts, _ := h.store.CopyTrade().ListCopyGuardAttempts(cycle.ID)
-				protection, protectionErr := h.store.CopyTrade().GetCopyGuardProtectiveOrder(cycle.ID)
-				if protectionErr != nil {
-					protection = nil
+				artifacts, loadErr := h.loadCopyGuardCycleArtifacts(cycle.ID)
+				if loadErr != nil {
+					logger.Warnf("Copy Guard schema v4 export skipped cycle=%d: %v", cycle.ID, loadErr)
+					continue
 				}
-				watchSamples, samplesErr := h.store.CopyTrade().ListCopyGuardWatchSamples(cycle.ID)
-				if samplesErr != nil {
-					watchSamples = nil
-				}
-				_ = enc.Encode(gin.H{"cycle": cycle, "attempts": attempts, "events": events, "protection": protection, "watch_samples": watchSamples})
+				doc := copyGuardCycleDocument(cycle, artifacts)
+				doc["exported_at"] = time.Now().UTC()
+				_ = enc.Encode(doc)
 			}
 			if len(rows) < 500 {
 				break
@@ -301,7 +604,7 @@ func (h *CopyTradeHandler) ExportRiskCycles(c *gin.Context) {
 	c.Header("Content-Type", "text/csv; charset=utf-8")
 	c.Header("Content-Disposition", "attachment; filename=copy-guard.csv")
 	w := csv.NewWriter(c.Writer)
-	_ = w.Write([]string{"cycle_id", "trader_id", "trader_name", "leader_id", "leader_pos_id", "symbol", "side", "margin_mode", "status", "accounting_status", "accounting_error", "tracking_difference", "protection_status", "protection_coverage", "protection_retries", "protection_missing_seconds", "protection_error", "stop_count", "reentry_count", "actual_pnl", "baseline_no_guard_pnl", "net_guard_effect", "fees", "funding_fee", "liquidation_penalty", "slippage", "opened_at", "closed_at"})
+	_ = w.Write([]string{"cycle_id", "trader_id", "trader_name", "leader_id", "leader_pos_id", "symbol", "side", "margin_mode", "status", "accounting_status", "accounting_error", "tracking_difference", "protection_status", "protection_coverage", "protection_retries", "protection_missing_seconds", "protection_error", "stop_count", "reentry_count", "actual_pnl", "baseline_no_guard_pnl", "stop_only_pnl", "first_reentry_pnl", "second_reentry_pnl", "reentry_contribution", "realized_path_max_drawdown_usd", "worst_attempt_pnl", "max_post_stop_mfe_usd", "max_post_stop_mae_usd", "net_guard_effect", "fees", "funding_fee", "liquidation_penalty", "slippage", "opened_at", "closed_at"})
 	for offset := 0; ; offset += 500 {
 		rows, err := h.store.CopyTrade().ListCopyGuardCycles(ids, from, to, 500, offset, riskFilter(c))
 		if err != nil {
@@ -313,7 +616,10 @@ func (h *CopyTradeHandler) ExportRiskCycles(c *gin.Context) {
 			if x.ClosedAt != nil {
 				closed = x.ClosedAt.Format(time.RFC3339)
 			}
-			_ = w.Write([]string{strconv.FormatInt(x.ID, 10), x.TraderID, x.TraderName, x.LeaderID, x.LeaderPosID, x.Symbol, x.Side, x.MarginMode, x.Status, x.AccountingStatus, x.AccountingError, fmt.Sprint(x.TrackingDifference), x.ProtectionStatus, fmt.Sprint(x.ProtectionCoverage), strconv.Itoa(x.ProtectionRetries), fmt.Sprint(x.ProtectionMissingSeconds), x.ProtectionError, strconv.Itoa(x.StopCount), strconv.Itoa(x.ReentryCount), fmt.Sprint(x.ActualPnL), fmt.Sprint(x.BaselinePnL), fmt.Sprint(x.NetGuardEffect), fmt.Sprint(x.Fees), fmt.Sprint(x.FundingFee), fmt.Sprint(x.LiquidationPenalty), fmt.Sprint(x.Slippage), x.OpenedAt.Format(time.RFC3339), closed})
+			attempts, _ := h.store.CopyTrade().ListCopyGuardAttempts(x.ID)
+			events, _ := h.store.CopyTrade().ListCopyGuardEvents(x.ID)
+			attribution := buildCopyGuardAttribution(x, attempts, events)
+			_ = w.Write([]string{strconv.FormatInt(x.ID, 10), x.TraderID, x.TraderName, x.LeaderID, x.LeaderPosID, x.Symbol, x.Side, x.MarginMode, x.Status, x.AccountingStatus, x.AccountingError, fmt.Sprint(x.TrackingDifference), x.ProtectionStatus, fmt.Sprint(x.ProtectionCoverage), strconv.Itoa(x.ProtectionRetries), fmt.Sprint(x.ProtectionMissingSeconds), x.ProtectionError, strconv.Itoa(x.StopCount), strconv.Itoa(x.ReentryCount), fmt.Sprint(x.ActualPnL), fmt.Sprint(x.BaselinePnL), fmt.Sprint(attribution.StopOnlyPnL), fmt.Sprint(attribution.FirstReentryPnL), fmt.Sprint(attribution.SecondReentryPnL), fmt.Sprint(attribution.ReentryContribution), fmt.Sprint(attribution.RealizedPathMaxDrawdownUSD), fmt.Sprint(attribution.WorstAttemptPnL), fmt.Sprint(attribution.MaxPostStopMFEUSD), fmt.Sprint(attribution.MaxPostStopMAEUSD), fmt.Sprint(x.NetGuardEffect), fmt.Sprint(x.Fees), fmt.Sprint(x.FundingFee), fmt.Sprint(x.LiquidationPenalty), fmt.Sprint(x.Slippage), x.OpenedAt.Format(time.RFC3339), closed})
 		}
 		w.Flush()
 		if len(rows) < 500 {
@@ -520,23 +826,11 @@ func (h *CopyTradeHandler) ConfirmManualSignal(c *gin.Context) {
 	if sig == nil {
 		return
 	}
-	operator := c.GetString("user_id")
-	// 可选请求体：用户在确认弹窗编辑后的执行金额（0/缺省=用信号建议金额），
-	// 界校验在 ConfirmManualReentry 内做（[最小下单额, 建议金额]）
-	var req struct {
-		Notional float64 `json:"notional"`
-	}
-	_ = c.ShouldBindJSON(&req) // 无 body 属正常情形，忽略解析错误
-	if err := copytrade.ConfirmManualReentryForTrader(sig.TraderID, sig.ID, operator, req.Notional); err != nil {
-		// 硬校验失败/状态冲突等都是用户可读错误，直接透传
-		c.JSON(400, gin.H{"error": err.Error()})
-		return
-	}
-	latest, err := h.store.CopyTrade().GetManualReentrySignal(sig.ID)
-	if err != nil {
-		latest = sig
-	}
-	c.JSON(200, gin.H{"message": "重入已确认，系统正在执行", "signal": latest})
+	c.JSON(http.StatusGone, gin.H{
+		"error":         "manual reentry confirmation was retired in Copy Guard v7",
+		"deprecated":    true,
+		"candidate_api": "/api/copytrade/risk/ai-candidates",
+	})
 }
 
 // DismissManualSignal 忽略人工重入信号
@@ -549,22 +843,11 @@ func (h *CopyTradeHandler) DismissManualSignal(c *gin.Context) {
 	if sig == nil {
 		return
 	}
-	operator := c.GetString("user_id")
-	ok, err := h.store.CopyTrade().DismissManualReentrySignal(sig.ID, operator)
-	if err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
-		return
-	}
-	if !ok {
-		c.JSON(409, gin.H{"error": fmt.Sprintf("信号当前状态为 %s，无法忽略", sig.Status)})
-		return
-	}
-	// 审计事件：忽略动作落周期事件流
-	_ = h.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: sig.CycleID, TraderID: sig.TraderID, Type: "GUARD_MANUAL_REENTRY_DISMISSED", Price: sig.TriggerPrice, Notional: sig.RecommendedNotional, Metadata: map[string]interface{}{
-		"signal_id": sig.ID,
-		"operator":  operator,
-	}})
-	c.JSON(200, gin.H{"message": "信号已忽略"})
+	c.JSON(http.StatusGone, gin.H{
+		"error":         "manual reentry dismissal was retired in Copy Guard v7; terminate the AI candidate instead",
+		"deprecated":    true,
+		"candidate_api": "/api/copytrade/risk/ai-candidates",
+	})
 }
 
 // CopyTradeConfigRequest 跟单配置请求
@@ -583,21 +866,30 @@ type CopyTradeConfigRequest struct {
 	BinanceCSRFToken string `json:"binance_csrf_token"`
 
 	// ============================================================
-	// Copy Guard 账户保护 / 止损兜底（v5）—— 仅 OKX 路径生效
+	// Copy Guard v7 风控与 AI guarded 重入配置
 	// 所有字段都是可选的（前端不传走 store 默认值，详见 store.CopyTradeConfig.FillRiskDefaults）
 	// v3 遗留字段（risk_atr_enabled / risk_reentry_tolerance / 反加仓铁律 /
 	// risk_stop_noise_floor_atr / risk_cycle_max_loss_pct）已随 v5 下线，
 	// 前端传入将被忽略。
 	// ============================================================
-	RiskStopLossEnabled  *bool    `json:"risk_stop_loss_enabled,omitempty"`
-	RiskAccountPct       *float64 `json:"risk_account_pct,omitempty"`
-	RiskATRMultiplier    *float64 `json:"risk_atr_multiplier,omitempty"`
-	RiskATRTimeframe     *string  `json:"risk_atr_timeframe,omitempty"`
-	RiskLeverageFallback *bool    `json:"risk_leverage_fallback,omitempty"`
-	RiskLeverageMaxLoss  *float64 `json:"risk_leverage_max_loss,omitempty"`
-	RiskReentryEnabled   *bool    `json:"risk_reentry_enabled,omitempty"`
-	RiskReentryRatio     *float64 `json:"risk_reentry_ratio,omitempty"`
-	// v5.1 人工重入（自动重入用尽后邮件提醒+人工确认代执行），默认 true
+	RiskStopLossEnabled        *bool    `json:"risk_stop_loss_enabled,omitempty"`
+	RiskAccountPct             *float64 `json:"risk_account_pct,omitempty"`
+	RiskATRMultiplier          *float64 `json:"risk_atr_multiplier,omitempty"`
+	RiskATRTimeframe           *string  `json:"risk_atr_timeframe,omitempty"`
+	RiskLeverageFallback       *bool    `json:"risk_leverage_fallback,omitempty"`
+	RiskLeverageMaxLoss        *float64 `json:"risk_leverage_max_loss,omitempty"`
+	RiskReentryEnabled         *bool    `json:"risk_reentry_enabled,omitempty"`
+	RiskReentryRatio           *float64 `json:"risk_reentry_ratio,omitempty"`
+	RiskReentryDecisionMode    *string  `json:"risk_reentry_decision_mode,omitempty"`
+	RiskCycleLossBudgetPct     *float64 `json:"risk_cycle_loss_budget_pct,omitempty"`
+	RiskPortfolioLossBudgetPct *float64 `json:"risk_portfolio_loss_budget_pct,omitempty"`
+	RiskRoundTripFeeBPS        *float64 `json:"risk_round_trip_fee_bps,omitempty"`
+	RiskAIConfidenceThreshold  *float64 `json:"risk_ai_confidence_threshold,omitempty"`
+	RiskAIMinReviewSeconds     *int     `json:"risk_ai_min_review_seconds,omitempty"`
+	RiskAIDailyCallLimit       *int     `json:"risk_ai_daily_call_limit,omitempty"`
+	RiskAILifecycleCallLimit   *int     `json:"risk_ai_lifecycle_call_limit,omitempty"`
+	RiskNotificationLevel      *string  `json:"risk_notification_level,omitempty"`
+	// 历史人工重入兼容字段；v7 固定 false
 	RiskManualReentryEnabled *bool `json:"risk_manual_reentry_enabled,omitempty"`
 
 	RiskPolicyVersion          *int     `json:"risk_policy_version,omitempty"`
@@ -617,6 +909,7 @@ type CopyTradeConfigRequest struct {
 	RiskMigrationConfirmed     *bool    `json:"risk_migration_confirmed,omitempty"`
 	RiskAddonBudgetPct         *float64 `json:"risk_addon_budget_pct,omitempty"`
 	RiskHighRiskConfirmed      bool     `json:"risk_high_risk_confirmed,omitempty"`
+	RiskExtremeConfirmValue    *float64 `json:"risk_extreme_risk_confirm_value,omitempty"`
 
 	// v4.1 重入加严（字段含义见 store.CopyTradeConfig 注释）
 	RiskReentryMinRecoveryATR     *float64 `json:"risk_reentry_min_recovery_atr,omitempty"`
@@ -648,6 +941,15 @@ func (h *CopyTradeHandler) GetConfig(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"config": maskedCopyTradeConfig(config),
 		"status": copytrade.IsCopyTradingRunning(traderID),
+	})
+}
+
+// GetRiskDefaults 返回新交易员 Copy Guard 推荐默认值。前端不得再复制一份常量。
+func (h *CopyTradeHandler) GetRiskDefaults(c *gin.Context) {
+	d := store.NewCopyGuardDefaults()
+	c.JSON(http.StatusOK, gin.H{
+		"defaults_version": store.CopyGuardDefaultsVersion(),
+		"defaults":         d,
 	})
 }
 
@@ -757,22 +1059,73 @@ func (h *CopyTradeHandler) SaveConfig(c *gin.Context) {
 	} else if existing != nil {
 		config.RiskReentryRatio = existing.RiskReentryRatio
 	}
+	if req.RiskReentryDecisionMode != nil {
+		config.RiskReentryDecisionMode = *req.RiskReentryDecisionMode
+	} else if existing != nil {
+		config.RiskReentryDecisionMode = existing.RiskReentryDecisionMode
+	} else {
+		config.RiskReentryDecisionMode = "ai_guarded"
+	}
+	if req.RiskCycleLossBudgetPct != nil {
+		config.RiskCycleLossBudgetPct = *req.RiskCycleLossBudgetPct
+	} else if existing != nil {
+		config.RiskCycleLossBudgetPct = existing.RiskCycleLossBudgetPct
+	}
+	if req.RiskPortfolioLossBudgetPct != nil {
+		config.RiskPortfolioLossBudgetPct = *req.RiskPortfolioLossBudgetPct
+	} else if existing != nil {
+		config.RiskPortfolioLossBudgetPct = existing.RiskPortfolioLossBudgetPct
+	}
+	if req.RiskRoundTripFeeBPS != nil {
+		config.RiskRoundTripFeeBPS = *req.RiskRoundTripFeeBPS
+	} else if existing != nil {
+		config.RiskRoundTripFeeBPS = existing.RiskRoundTripFeeBPS
+	}
+	if req.RiskAIConfidenceThreshold != nil {
+		config.RiskAIConfidenceThreshold = *req.RiskAIConfidenceThreshold
+	} else if existing != nil {
+		config.RiskAIConfidenceThreshold = existing.RiskAIConfidenceThreshold
+	}
+	if req.RiskAIMinReviewSeconds != nil {
+		config.RiskAIMinReviewSeconds = *req.RiskAIMinReviewSeconds
+	} else if existing != nil {
+		config.RiskAIMinReviewSeconds = existing.RiskAIMinReviewSeconds
+	}
+	if req.RiskAIDailyCallLimit != nil {
+		config.RiskAIDailyCallLimit = *req.RiskAIDailyCallLimit
+	} else if existing != nil {
+		config.RiskAIDailyCallLimit = existing.RiskAIDailyCallLimit
+	}
+	if req.RiskAILifecycleCallLimit != nil {
+		config.RiskAILifecycleCallLimit = *req.RiskAILifecycleCallLimit
+	} else if existing != nil {
+		config.RiskAILifecycleCallLimit = existing.RiskAILifecycleCallLimit
+	}
+	if req.RiskNotificationLevel != nil {
+		config.RiskNotificationLevel = *req.RiskNotificationLevel
+	} else if existing != nil {
+		config.RiskNotificationLevel = existing.RiskNotificationLevel
+	}
 	if req.RiskManualReentryEnabled != nil {
 		config.RiskManualReentryEnabled = *req.RiskManualReentryEnabled
 	} else if existing != nil {
 		config.RiskManualReentryEnabled = existing.RiskManualReentryEnabled
 	} else {
-		config.RiskManualReentryEnabled = true // 默认 on
+		config.RiskManualReentryEnabled = false // v7 已废弃逐笔人工确认
 	}
 	applyCopyGuardV4Request(config, existing, &req)
 	if config.RiskPolicyVersion >= 4 && !copytrade.SupportsCopyGuard(copytrade.ProviderType(config.ProviderType)) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "copy guard is only supported for OKX or Binance leader sources"})
 		return
 	}
-	// v5：账户线是硬兜底（默认 10%），>= 50% 属于极端配置需二次确认。
-	// v3→v4 迁移确认已下线：存量配置由 store 层在加载时强制升级。
-	if config.RiskPolicyVersion >= 4 && config.RiskAccountPct >= 0.50 && !req.RiskHighRiskConfirmed {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "risk_account_pct >= 50% requires risk_high_risk_confirmed"})
+	if config.RiskPolicyVersion >= 4 {
+		if err := validateRiskConfirmation(config.RiskAccountPct, req.RiskHighRiskConfirmed, req.RiskExtremeConfirmValue); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	if err := validateAIGuardedPrerequisites(h.store, config); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 	if err := copytrade.ValidateStoredRiskPolicy(config); err != nil {

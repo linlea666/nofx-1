@@ -42,8 +42,8 @@ func TestExportRiskCycleUsesTraderNameAndOwnership(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("owner export status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
-	// schema_version 3：新增 watch_samples（观察期采样时间线）
-	if !strings.Contains(recorder.Body.String(), "156-平凡无奇交易员") || !strings.Contains(recorder.Body.String(), `"schema_version":3`) || !strings.Contains(recorder.Body.String(), `"watch_samples"`) {
+	// schema_version 4 必须带完整 AI 候选/分析和默认值代次。
+	if !strings.Contains(recorder.Body.String(), "156-平凡无奇交易员") || !strings.Contains(recorder.Body.String(), `"schema_version":4`) || !strings.Contains(recorder.Body.String(), `"watch_samples"`) || !strings.Contains(recorder.Body.String(), `"ai_candidates"`) || !strings.Contains(recorder.Body.String(), `"ai_analyses"`) || !strings.Contains(recorder.Body.String(), `"defaults_version":7`) {
 		t.Fatalf("export missing display metadata: %s", recorder.Body.String())
 	}
 

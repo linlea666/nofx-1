@@ -5,7 +5,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"nofx/market"
 	"nofx/store"
 )
 
@@ -132,5 +134,17 @@ func TestLastStopInfoCluster(t *testing.T) {
 	}
 	if buildLastStopInfo(nil, "long", 100, 1) != nil {
 		t.Fatal("no stopped attempts should return nil")
+	}
+}
+
+func TestClosedKlinesExcludeFormingCandle(t *testing.T) {
+	now := time.UnixMilli(1_000_000)
+	input := []market.Kline{
+		{OpenTime: 1, CloseTime: now.UnixMilli() - 1, Close: 100},
+		{OpenTime: 2, CloseTime: now.UnixMilli() + 60_000, Close: 101},
+	}
+	got := closedKlinesAt(input, now)
+	if len(got) != 1 || got[0].OpenTime != 1 {
+		t.Fatalf("forming candle leaked into technical inputs: %+v", got)
 	}
 }

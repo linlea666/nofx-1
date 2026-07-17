@@ -919,6 +919,7 @@ export const api = {
         status: string
         entry_price: number
         exit_price: number
+        quantity: number
         notional: number
         pnl: number
         fee: number
@@ -941,6 +942,7 @@ export const api = {
       watch_samples?: Array<{
         id: number
         cycle_id: number
+        attempt_no: number
         mark_price: number
         atr: number
         leader_entry_price: number
@@ -950,6 +952,38 @@ export const api = {
         gate: string
         created_at: string
       }>
+      ai_candidates: import('../types').CopyGuardAICandidate[]
+      ai_analyses: import('../types').ReentryAIAnalysis[]
+      attribution: {
+        final: boolean
+        leader_direction_return: number
+        baseline_no_guard_pnl: number
+        stop_only_pnl: number
+        actual_copy_guard_pnl: number
+        stop_savings: number
+        missed_profit: number
+        reentry_contribution: number
+        first_reentry_pnl: number
+        second_reentry_pnl: number
+        fees: number
+        slippage: number
+        realized_path_max_drawdown_usd: number
+        worst_attempt_pnl: number
+        max_post_stop_mfe_usd: number
+        max_post_stop_mae_usd: number
+        attempts: Array<{
+          attempt_no: number
+          pnl: number
+          fee: number
+          funding_fee: number
+          stop_only_path: boolean
+          first_recovery_seconds?: number
+          post_stop_mfe_usd?: number
+          post_stop_mae_usd?: number
+        }>
+      }
+      schema_version: number
+      defaults_version: number
     }>(`${API_BASE}/copytrade/risk/cycles/${id}`)
     if (!result.success)
       throw new Error(result.message || '获取 Copy Guard 生命周期失败')
@@ -972,7 +1006,39 @@ export const api = {
     }
   },
 
-  // v5.1 人工重入信号
+  // Copy Guard v7 持久化 AI 重入候选
+  async getCopyGuardAICandidates(params = '') {
+    const result = await httpClient.get<{
+      candidates: import('../types').CopyGuardAICandidate[]
+      trader_names: Record<string, string>
+    }>(`${API_BASE}/copytrade/risk/ai-candidates${params}`)
+    if (!result.success)
+      throw new Error(result.message || '获取 AI 重入候选失败')
+    return {
+      candidates: result.data!.candidates ?? [],
+      traderNames: result.data!.trader_names ?? {},
+    }
+  },
+  async pauseCopyGuardAICandidate(id: number) {
+    const result = await httpClient.post<{ message: string }>(
+      `${API_BASE}/copytrade/risk/ai-candidates/${id}/pause`
+    )
+    if (!result.success) throw new Error(result.message || '暂停候选失败')
+  },
+  async resumeCopyGuardAICandidate(id: number) {
+    const result = await httpClient.post<{ message: string }>(
+      `${API_BASE}/copytrade/risk/ai-candidates/${id}/resume`
+    )
+    if (!result.success) throw new Error(result.message || '恢复候选失败')
+  },
+  async terminateCopyGuardAICandidate(id: number) {
+    const result = await httpClient.post<{ message: string }>(
+      `${API_BASE}/copytrade/risk/ai-candidates/${id}/terminate`
+    )
+    if (!result.success) throw new Error(result.message || '终止候选失败')
+  },
+
+  // v5.1 旧人工信号只保留读取兼容；确认/忽略接口已由后端废弃。
   async getCopyGuardManualSignals(params = '') {
     const result = await httpClient.get<{
       signals: import('../types').CopyGuardManualSignal[]

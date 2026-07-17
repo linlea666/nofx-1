@@ -9,7 +9,7 @@ import (
 )
 
 // TestBackfillOutcomes 已执行信号 → 重入尝试闭合并对账后，分析记录回填
-// 结局净额（pnl − fee），随后统计口径正确。
+// 结局净额（OKX 已含费的 pnl，不重复扣 fee），随后统计口径正确。
 func TestBackfillOutcomes(t *testing.T) {
 	st, err := store.New(filepath.Join(t.TempDir(), "backfill.db"))
 	if err != nil {
@@ -66,8 +66,8 @@ func TestBackfillOutcomes(t *testing.T) {
 	}
 	a.backfillOutcomes()
 	got, _ = st.ReentryAI().GetReentryAnalysis(analysis.ID)
-	if got.OutcomePnL == nil || *got.OutcomePnL != -5.5 {
-		t.Fatalf("outcome = %v, want -5.5", got.OutcomePnL)
+	if got.OutcomePnL == nil || *got.OutcomePnL != -5 {
+		t.Fatalf("outcome = %v, want -5", got.OutcomePnL)
 	}
 
 	// 内外部结论 + 统计：ENTER 且亏损 → 内部错误；SKIP 且亏损 → 外部正确

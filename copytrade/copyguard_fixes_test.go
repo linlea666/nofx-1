@@ -209,7 +209,7 @@ func TestAdoptProtectiveOrderByClientID(t *testing.T) {
 	// 已存在 live 订单且价格/数量不一致 → 接管 + amend
 	existing := &trader.ProtectiveStopOrder{AlgoID: "okx-1", ClientID: req.ClientID, Quantity: 0.05, TriggerPrice: 1700, State: "live"}
 	mgr := &mockStopMgr{byClient: map[string]*trader.ProtectiveStopOrder{req.ClientID: existing}}
-	adopted, err := ti.adoptProtectiveOrderByClientID(mgr, cycle, req, 0.01)
+	adopted, err := ti.adoptProtectiveOrderByClientID(mgr, cycle, req, 0.01, 0.001)
 	if err != nil || adopted == nil || adopted.AlgoID != "okx-1" {
 		t.Fatalf("live conflicting order must be adopted: %v %v", adopted, err)
 	}
@@ -224,7 +224,7 @@ func TestAdoptProtectiveOrderByClientID(t *testing.T) {
 	// 已触发的订单 → 接管记录但不 amend，由轮询记录止损
 	fired := &trader.ProtectiveStopOrder{AlgoID: "okx-2", ClientID: req.ClientID, Quantity: 0.064, TriggerPrice: 1711.63, State: "effective"}
 	mgr = &mockStopMgr{byClient: map[string]*trader.ProtectiveStopOrder{req.ClientID: fired}}
-	adopted, err = ti.adoptProtectiveOrderByClientID(mgr, cycle, req, 0.01)
+	adopted, err = ti.adoptProtectiveOrderByClientID(mgr, cycle, req, 0.01, 0.001)
 	if err != nil || adopted == nil || !isProtectiveStopFired(adopted.State) {
 		t.Fatalf("fired order must be adopted as-is: %v %v", adopted, err)
 	}
@@ -235,7 +235,7 @@ func TestAdoptProtectiveOrderByClientID(t *testing.T) {
 	// 终态订单（已撤销）→ 返回 (nil, nil)，调用方换新 clientID 重挂
 	canceledOrder := &trader.ProtectiveStopOrder{AlgoID: "okx-3", ClientID: req.ClientID, State: "canceled"}
 	mgr = &mockStopMgr{byClient: map[string]*trader.ProtectiveStopOrder{req.ClientID: canceledOrder}}
-	adopted, err = ti.adoptProtectiveOrderByClientID(mgr, cycle, req, 0.01)
+	adopted, err = ti.adoptProtectiveOrderByClientID(mgr, cycle, req, 0.01, 0.001)
 	if err != nil || adopted != nil {
 		t.Fatalf("terminal order cannot be adopted: %v %v", adopted, err)
 	}

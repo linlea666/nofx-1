@@ -45,6 +45,15 @@ func TestProtectionCoverageAndRetrySchedule(t *testing.T) {
 	if got := protectionCoverage(12, 10); got != 1 {
 		t.Fatalf("display coverage must cap at 100%%, got %v", got)
 	}
+	if !protectionQuantityMatches(0.063, 0.064, 0.001) {
+		t.Fatal("one base-quantity lot of rounding must be accepted")
+	}
+	if !protectionQuantityMatches(0.065, 0.064, 0.001) {
+		t.Fatal("one lot of over-coverage rounding must be accepted")
+	}
+	if protectionQuantityMatches(0.0629, 0.064, 0.001) {
+		t.Fatal("a difference larger than one lot must be rejected")
+	}
 	want := []time.Duration{0, time.Second, 3 * time.Second, 10 * time.Second, 30 * time.Second, time.Minute}
 	for i, expected := range want {
 		if got := protectionRetryDelay(i); got != expected {
@@ -120,6 +129,8 @@ func TestV4AccountingIgnoresPriorAttemptRecord(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 重入 attempt 1，随后领航员平仓
+	cycle, _ = st.CopyTrade().GetCopyGuardCycle(cycle.ID)
+	_ = st.CopyTrade().UpdateCopyGuardObservation(cycle.ID, store.CopyGuardReentryPending, cycle.LeaderEntryPrice, cycle.LastObservedPrice, 0)
 	cycle, _ = st.CopyTrade().GetCopyGuardCycle(cycle.ID)
 	if err := st.CopyTrade().RecordCopyGuardReentryFilled(cycle, 1761.94, 1150.55, 0.653, 14.9, map[string]interface{}{}); err != nil {
 		t.Fatal(err)

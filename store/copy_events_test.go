@@ -148,3 +148,46 @@ func TestGuardEventMirroredToCopyEvents(t *testing.T) {
 		t.Fatalf("mirrored guard event should be provider okx, got %s", stop.ProviderType)
 	}
 }
+
+func TestCopyGuardEventRegistryCoversV7Workflow(t *testing.T) {
+	required := map[string]string{
+		"STOP_PENDING_FLAT": "verbose", "STOP_PARTIAL": "critical", "STOP_FLAT_CONFIRMED": "important", "STOP_DUST_RESIDUAL": "critical",
+		"AI_CANDIDATE_CREATED": "verbose", "AI_REVIEW_WAIT": "verbose", "AI_REVIEW_ENTER": "verbose", "AI_REVIEW_ABANDON": "important",
+		"AI_REVIEW_FAILED": "important", "AI_BUDGET_SUSPENDED": "important", "AI_RESULT_STALE": "verbose",
+		"REENTRY_PREFLIGHT_REJECTED": "verbose", "REENTRY_REQUESTED": "verbose", "REENTRY_FILLED": "important", "REENTRY_FAILED": "important",
+		"PROTECTION_PENDING": "verbose", "PROTECTION_ACTIVE": "verbose", "PROTECTION_DEGRADED": "important", "FORCED_EXIT": "important",
+		"CYCLE_CLOSED_SUMMARY": "important",
+	}
+	for eventType, emailLevel := range required {
+		spec, ok := GetCopyGuardEventSpec(eventType)
+		if !ok || !spec.Mirror || spec.Category == "" || spec.Severity == "" || spec.EmailLevel != emailLevel {
+			t.Errorf("incomplete event spec for %s: %+v exists=%v", eventType, spec, ok)
+		}
+	}
+	if ShouldSendCopyGuardEmail("important", "AI_REVIEW_WAIT") || !ShouldSendCopyGuardEmail("verbose", "AI_REVIEW_WAIT") {
+		t.Fatal("AI WAIT must be silent by default and visible only in verbose mode")
+	}
+	if ShouldSendCopyGuardEmail("critical", "STOP_FLAT_CONFIRMED") || !ShouldSendCopyGuardEmail("critical", "STOP_DUST_RESIDUAL") {
+		t.Fatal("critical mode must suppress normal stop mail but retain residual emergencies")
+	}
+}
+
+func TestCopyGuardEventSchemaV4CorrelationEnvelope(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "event-envelope.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	event := &CopyGuardEvent{CycleID: 9, TraderID: "trader-a", Type: "AI_REVIEW_WAIT", Metadata: map[string]interface{}{"attempt_no": 2, "analysis_id": 17}}
+	if err := st.CopyTrade().SaveCopyGuardEvent(event); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"schema_version", "trader_id", "cycle_id", "attempt_no", "candidate_id", "analysis_id", "decision_generation", "reason_code", "data_hash", "snapshot_at", "model", "prompt_version", "planned_qty", "actual_qty", "stop_price", "risk_budget", "latency_ms"} {
+		if _, ok := event.Metadata[key]; !ok {
+			t.Errorf("schema v4 event missing %s: %+v", key, event.Metadata)
+		}
+	}
+	if event.Metadata["attempt_no"] != 2 || event.Metadata["analysis_id"] != 17 {
+		t.Fatalf("producer correlation values were overwritten: %+v", event.Metadata)
+	}
+}

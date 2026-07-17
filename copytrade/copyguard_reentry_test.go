@@ -1,8 +1,9 @@
 package copytrade
 
 import (
+	"errors"
+	"fmt"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -19,10 +20,15 @@ import (
 type stopMgrExecutor struct {
 	flatExecutor
 	*mockStopMgr
-	positions []map[string]interface{}
+	positions  []map[string]interface{}
+	closeCalls int
 }
 
 func (e *stopMgrExecutor) GetPositions() ([]map[string]interface{}, error) { return e.positions, nil }
+func (e *stopMgrExecutor) ClosePositionMarket(string, string) (string, error) {
+	e.closeCalls++
+	return "forced-close", nil
+}
 
 func newReentryTestEngine(t *testing.T) (*Engine, *store.Store) {
 	t.Helper()
@@ -150,6 +156,8 @@ func TestDoubleStopReentryLifecycle(t *testing.T) {
 	}
 
 	// 第 1 次重入：attempt 1 开启，reentry_count=1
+	_ = st.CopyTrade().UpdateCopyGuardObservation(cycle.ID, store.CopyGuardReentryPending, cycle.LeaderEntryPrice, cycle.LastObservedPrice, 0)
+	cycle, _ = st.CopyTrade().GetCopyGuardCycle(cycle.ID)
 	if err := st.CopyTrade().RecordCopyGuardReentryFilled(cycle, 1705, 55, 0.032, 8, map[string]interface{}{}); err != nil {
 		t.Fatal(err)
 	}
@@ -168,6 +176,8 @@ func TestDoubleStopReentryLifecycle(t *testing.T) {
 	}
 
 	// 第 2 次重入：attempt 2 开启，reentry_count=2，UNIQUE(cycle_id, attempt_no) 无冲突
+	_ = st.CopyTrade().UpdateCopyGuardObservation(cycle.ID, store.CopyGuardReentryPending, cycle.LeaderEntryPrice, cycle.LastObservedPrice, 0)
+	cycle, _ = st.CopyTrade().GetCopyGuardCycle(cycle.ID)
 	if err := st.CopyTrade().RecordCopyGuardReentryFilled(cycle, 1702, 27, 0.016, 9, map[string]interface{}{}); err != nil {
 		t.Fatal(err)
 	}
@@ -703,6 +713,47 @@ func TestPollCancelsOrphanProtectiveOrder(t *testing.T) {
 	}
 }
 
+func TestProtectiveStopMustConfirmFlatBeforeWatchingOrReentry(t *testing.T) {
+	st, err := store.New(filepath.Join(t.TempDir(), "partial-stop.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	mock := &mockStopMgr{byID: map[string]*trader.ProtectiveStopOrder{
+		"stop-algo": {AlgoID: "stop-algo", PositionSide: "long", MarginMode: "cross", Quantity: .05, TriggerPrice: 98, State: "effective"},
+	}}
+	executor := &stopMgrExecutor{mockStopMgr: mock, positions: []map[string]interface{}{{"symbol": "ETHUSDT", "side": "long", "mgnMode": "cross", "positionAmt": .01, "entryPrice": 100}}}
+	ti := NewTraderIntegration("trader-1", executor, st)
+	ti.engine = &Engine{traderID: "trader-1", config: &CopyConfig{ProviderType: ProviderOKX, RiskPolicyVersion: 4, RiskATRTimeframe: "unsupported", RiskATRPeriod: 14, RiskATRFallbackPct: .02}, store: st, leaderState: &AccountState{Positions: map[string]*Position{}}}
+	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "leader-pos", Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", Status: store.CopyGuardFollowing, PolicySnapshot: "{}", LeaderEntryPrice: 100, FollowerEntryPrice: 100, FollowerNotional: 5, AccountEquity: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CopyTrade().OpenCopyGuardAttempt(cycle.ID, 0, 100, 5, .05, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CopyTrade().UpsertCopyGuardProtectiveOrder(&store.CopyGuardProtectiveOrder{CycleID: cycle.ID, TraderID: "trader-1", AlgoID: "stop-algo", AlgoClientID: "cg", Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", Quantity: .05, TriggerPrice: 98, TriggerType: "mark", Status: "live"}); err != nil {
+		t.Fatal(err)
+	}
+
+	ti.pollV4ProtectiveStops()
+	partial, _ := st.CopyTrade().GetCopyGuardCycle(cycle.ID)
+	if partial.Status != store.CopyGuardStopPartial || partial.StopCount != 0 || executor.closeCalls != 1 {
+		t.Fatalf("partial stop must stay blocked and issue one controlled exit: cycle=%+v closes=%d", partial, executor.closeCalls)
+	}
+	if candidates, _ := st.ReentryAI().ListReentryCandidatesByCycle(cycle.ID); len(candidates) != 0 {
+		t.Fatalf("residual position must never create reentry candidate: %+v", candidates)
+	}
+
+	// Only a fresh exchange-flat observation may advance into stopped watching.
+	executor.positions = nil
+	ti.pollV4ProtectiveStops()
+	flat, _ := st.CopyTrade().GetCopyGuardCycle(cycle.ID)
+	if flat.Status != store.CopyGuardStoppedWatching || flat.StopCount != 1 {
+		t.Fatalf("confirmed flat must close the attempt exactly once: %+v", flat)
+	}
+}
+
 // ============================================================================
 // upsert 验证失败时 DB 必须记录 OKX 实单数量而非请求数量（B1）
 // ============================================================================
@@ -728,7 +779,7 @@ func TestUpsertRecordsVerifiedQuantityOnMismatch(t *testing.T) {
 	mock.byID["new-algo"] = &trader.ProtectiveStopOrder{AlgoID: "new-algo", ClientID: "cg", PositionSide: "long", MarginMode: "cross", Quantity: 0.064, TriggerPrice: 1711.63, State: "live"}
 
 	dec := &decision.Decision{Symbol: "ETHUSDT", Action: "open_long", LeaderPosID: "leader-pos", MarginMode: "cross", EntryPrice: 1717.33}
-	ti.upsertV4Protection(dec, "long", 0.128, 1717.33, &StopLossCalcResult{SLPrice: 1711.63, TickSize: 0.01})
+	ti.upsertV4Protection(dec, "long", 0.128, 1717.33, &StopLossCalcResult{SLPrice: 1711.63, TickSize: 0.01, QuantityStep: 0.001})
 
 	stored, err := st.CopyTrade().GetCopyGuardProtectiveOrder(cycle.ID)
 	if err != nil {
@@ -875,7 +926,7 @@ func TestReentryWindowNotJudgedDuringCooldown(t *testing.T) {
 }
 
 // manualMode + 价格越过追价上限但已回归下界：忽略 chase，连续确认后生成 PENDING
-func TestManualModeIgnoresChaseAndSignalsOnRecovery(t *testing.T) {
+func TestRetiredManualModeDoesNotSignalOnRecovery(t *testing.T) {
 	e, st := newReentryTestEngine(t)
 	e.config.RiskManualReentryEnabled = true
 	e.config.RiskMaxReentries = 0 // ReentryCount(0)>=0 → 直接 ATTEMPTS_EXHAUSTED → manualMode
@@ -890,8 +941,8 @@ func TestManualModeIgnoresChaseAndSignalsOnRecovery(t *testing.T) {
 	e.checkReentryConditions()
 	e.checkReentryConditions()
 
-	if n, _ := st.CopyTrade().CountManualReentrySignalsForCycle(cycle.ID); n < 1 {
-		t.Fatalf("manualMode must generate a PENDING signal when price recovered past boundary even beyond chase, got %d", n)
+	if n, _ := st.CopyTrade().CountManualReentrySignalsForCycle(cycle.ID); n != 0 {
+		t.Fatalf("v7 must never create a manual execution signal, got %d", n)
 	}
 	select {
 	case <-e.decisionCh:
@@ -930,12 +981,14 @@ func TestManualModeNoSignalWhenPriceNotReturned(t *testing.T) {
 // 复刻 cycle-41：3 次止损、名义衰减 100→50→8，自动重入次数用尽转人工。
 // 旧逻辑建议额 = 8×0.5 = 4 < 10 → 信号被 MIN_NOTIONAL 吞掉；
 // 新逻辑必须发出 PENDING 信号且建议额 = 首仓名义 100。
-func TestManualModeSignalUsesFirstAttemptNotional(t *testing.T) {
+func TestRetiredManualModeDoesNotReviveAfterMultipleStops(t *testing.T) {
 	e, st := newReentryTestEngine(t)
 	e.config.RiskManualReentryEnabled = true // RiskMaxReentries=2（脚手架默认）
 
 	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700) // attempt 0 名义 100 已止损
 	// 重入 #1（名义 50）→ 止损；重入 #2（名义 8）→ 止损 → reentry_count=2 用尽
+	_ = st.CopyTrade().UpdateCopyGuardObservation(cycle.ID, store.CopyGuardReentryPending, cycle.LeaderEntryPrice, cycle.LastObservedPrice, 0)
+	cycle, _ = st.CopyTrade().GetCopyGuardCycle(cycle.ID)
 	if err := st.CopyTrade().RecordCopyGuardReentryFilled(cycle, 1705, 50, 50.0/1705, 34, map[string]interface{}{}); err != nil {
 		t.Fatal(err)
 	}
@@ -943,6 +996,8 @@ func TestManualModeSignalUsesFirstAttemptNotional(t *testing.T) {
 	if err := st.CopyTrade().RecordCopyGuardStop(cycle, 34, 1683, -1, 0.05, 0, "algo-1", map[string]interface{}{}); err != nil {
 		t.Fatal(err)
 	}
+	cycle, _ = st.CopyTrade().GetCopyGuardCycle(cycle.ID)
+	_ = st.CopyTrade().UpdateCopyGuardObservation(cycle.ID, store.CopyGuardReentryPending, cycle.LeaderEntryPrice, cycle.LastObservedPrice, 0)
 	cycle, _ = st.CopyTrade().GetCopyGuardCycle(cycle.ID)
 	if err := st.CopyTrade().RecordCopyGuardReentryFilled(cycle, 1702, 8, 8.0/1702, 34, map[string]interface{}{}); err != nil {
 		t.Fatal(err)
@@ -963,11 +1018,8 @@ func TestManualModeSignalUsesFirstAttemptNotional(t *testing.T) {
 	}
 
 	sigs, err := st.CopyTrade().ListManualReentrySignals([]string{"trader-1"}, []string{store.ManualReentryStatusPending}, 10)
-	if err != nil || len(sigs) != 1 {
-		t.Fatalf("manual signal must survive tiny decayed notional: %v %v", sigs, err)
-	}
-	if sigs[0].RecommendedNotional != 100 {
-		t.Fatalf("manual recommendation must be the first-attempt notional (100), got %.2f", sigs[0].RecommendedNotional)
+	if err != nil || len(sigs) != 0 {
+		t.Fatalf("retired manual path must not create signals: %v %v", sigs, err)
 	}
 	select {
 	case <-e.decisionCh:
@@ -977,7 +1029,7 @@ func TestManualModeSignalUsesFirstAttemptNotional(t *testing.T) {
 }
 
 // 首仓名义本身 < 最小下单额：建议额抬到 门槛×1.2（默认 10→12），信号仍必须发出
-func TestManualModeSignalFloorsToMinNotional(t *testing.T) {
+func TestRetiredManualModeDoesNotCreateMinimumSizedSignal(t *testing.T) {
 	e, st := newReentryTestEngine(t)
 	e.config.RiskManualReentryEnabled = true
 	e.config.RiskMaxReentries = 0 // reentry_count(0)>=0 → 直接用尽 → manualMode
@@ -992,17 +1044,12 @@ func TestManualModeSignalFloorsToMinNotional(t *testing.T) {
 	}
 
 	sigs, err := st.CopyTrade().ListManualReentrySignals([]string{"trader-1"}, []string{store.ManualReentryStatusPending}, 10)
-	if err != nil || len(sigs) != 1 {
-		t.Fatalf("manual signal must be generated with floored notional: %v %v", sigs, err)
-	}
-	if want := 10.0 * manualReentryMinNotionalHeadroom; sigs[0].RecommendedNotional != want {
-		t.Fatalf("floored recommendation want %.2f, got %.2f", want, sigs[0].RecommendedNotional)
+	if err != nil || len(sigs) != 0 {
+		t.Fatalf("retired manual path must not create a floored signal: %v %v", sigs, err)
 	}
 }
 
-// 确认执行的金额界校验：override > 建议上限 / < 最小下单额均拒绝且无副作用
-// （信号保持 PENDING）；合法 override 通过金额闸门（后续因周期缺失失败属预期）。
-func TestConfirmManualReentryOverrideBounds(t *testing.T) {
+func TestConfirmManualReentryIsRetiredWithoutSideEffects(t *testing.T) {
 	st, err := store.New(filepath.Join(t.TempDir(), "override.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -1019,31 +1066,126 @@ func TestConfirmManualReentryOverrideBounds(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := ti.ConfirmManualReentry(sig.ID, "op", 150); err == nil || !strings.Contains(err.Error(), "超过建议上限") {
-		t.Fatalf("override above recommendation must be rejected, got %v", err)
-	}
-	if err := ti.ConfirmManualReentry(sig.ID, "op", 5); err == nil || !strings.Contains(err.Error(), "低于最小下单阈值") {
-		t.Fatalf("override below min notional must be rejected, got %v", err)
+	if err := ti.ConfirmManualReentry(sig.ID, "op", 150); !errors.Is(err, ErrManualReentryRetired) {
+		t.Fatalf("manual confirmation must return the v7 retirement error, got %v", err)
 	}
 	got, _ := st.CopyTrade().GetManualReentrySignal(sig.ID)
 	if got.Status != store.ManualReentryStatusPending {
-		t.Fatalf("rejected overrides must leave the signal PENDING, got %s", got.Status)
+		t.Fatalf("retired confirmation must not mutate the signal, got %s", got.Status)
 	}
-	// 合法金额：通过金额闸门，失败点必须是后续的周期一致性（信号周期不存在）
-	if err := ti.ConfirmManualReentry(sig.ID, "op", 50); err == nil ||
-		strings.Contains(err.Error(), "超过建议上限") || strings.Contains(err.Error(), "低于最小下单阈值") {
-		t.Fatalf("valid override must pass the amount gate, got %v", err)
+}
+
+func TestAIReentryExecutionFailureReleasesRiskAndReturnsToWaiting(t *testing.T) {
+	st, err := store.New(filepath.Join(t.TempDir(), "ai-execution-failure.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "leader-pos", Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", Status: store.CopyGuardReentryPending, PolicySnapshot: "{}", AccountEquity: 100, LeaderEntryPrice: 1700, LastObservedPrice: 1690})
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := st.ReentryAI().EnsureReentryCandidate(&store.CopyGuardReentryCandidate{CycleID: cycle.ID, TraderID: "trader-1", LeaderPosID: "leader-pos", Symbol: "ETHUSDT", Side: "long", FeatureHash: "enter"}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB().Exec(`UPDATE copy_guard_reentry_candidates SET status=?,last_analysis_id=17,decision_generation=3 WHERE id=?`, store.ReentryCandidateEntryPending, candidate.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.ReentryAI().ReserveCopyGuardRisk("trader-1", cycle.ID, 1, 2, 100, .02, .05, .08); err != nil {
+		t.Fatal(err)
+	}
+	ti := NewTraderIntegration("trader-1", flatExecutor{}, st)
+	ti.engine = &Engine{config: &CopyConfig{RiskPolicyVersion: 7, RiskReentryDecisionMode: "ai_guarded", RiskAIMinReviewSeconds: 300}}
+	ti.handleReentryExecutionFailure(cycle, errors.New("exchange rejected order"))
+
+	usage, err := st.ReentryAI().GetCopyGuardRiskUsage("trader-1", cycle.ID)
+	if err != nil || usage.CycleUsedUSD != 0 || usage.PortfolioUsedUSD != 0 {
+		t.Fatalf("failed order leaked risk reservation: usage=%+v err=%v", usage, err)
+	}
+	freshCandidate, _ := st.ReentryAI().GetReentryCandidate(candidate.ID)
+	freshCycle, _ := st.CopyTrade().GetCopyGuardCycle(cycle.ID)
+	if freshCandidate.Status != store.ReentryCandidateWaiting || freshCandidate.FailureCount != 0 || freshCycle.Status != store.CopyGuardAIWaiting {
+		t.Fatalf("failed execution did not return to AI waiting: candidate=%+v cycle=%+v", freshCandidate, freshCycle)
+	}
+}
+
+func TestAIReentryAmbiguousErrorsNeverReleaseForRetry(t *testing.T) {
+	if !isAmbiguousReentryExecutionError(errors.New("post order request timeout")) {
+		t.Fatal("post-submit timeout must be treated as an uncertain order")
+	}
+	if isAmbiguousReentryExecutionError(fmt.Errorf("%w: price drift", errAIReentryOrderPreflight)) {
+		t.Fatal("deterministic final preflight rejection is known to be pre-order")
+	}
+	if isAmbiguousReentryExecutionError(errors.New("failed to get positions: network timeout")) {
+		t.Fatal("pre-order position read failure is safe to retry")
+	}
+}
+
+func TestAIReentryAmbiguousFailureKeepsLeaseAndReservation(t *testing.T) {
+	st, err := store.New(filepath.Join(t.TempDir(), "ai-ambiguous-failure.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "leader-pos", Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", Status: store.CopyGuardReentryPending, PolicySnapshot: "{}", AccountEquity: 100, LeaderEntryPrice: 1700, LastObservedPrice: 1690})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = st.CopyTrade().UpdateCopyGuardPendingOrder(cycle.ID, "cgr-uncertain")
+	candidate, err := st.ReentryAI().EnsureReentryCandidate(&store.CopyGuardReentryCandidate{CycleID: cycle.ID, TraderID: "trader-1", LeaderPosID: "leader-pos", Symbol: "ETHUSDT", Side: "long", FeatureHash: "enter"}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB().Exec(`UPDATE copy_guard_reentry_candidates SET status=? WHERE id=?`, store.ReentryCandidateEntryPending, candidate.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.ReentryAI().ReserveCopyGuardRisk("trader-1", cycle.ID, 1, 2, 100, .02, .05, .08); err != nil {
+		t.Fatal(err)
+	}
+	ti := NewTraderIntegration("trader-1", flatExecutor{}, st)
+	ti.engine = &Engine{config: &CopyConfig{RiskPolicyVersion: 7, RiskReentryDecisionMode: "ai_guarded", RiskAIMinReviewSeconds: 300}}
+	freshCycle, _ := st.CopyTrade().GetCopyGuardCycle(cycle.ID)
+	ti.handleReentryExecutionFailure(freshCycle, errors.New("exchange response timeout after submit"))
+
+	usage, _ := st.ReentryAI().GetCopyGuardRiskUsage("trader-1", cycle.ID)
+	freshCandidate, _ := st.ReentryAI().GetReentryCandidate(candidate.ID)
+	freshCycle, _ = st.CopyTrade().GetCopyGuardCycle(cycle.ID)
+	if usage.PortfolioUsedUSD != 2 || freshCandidate.Status != store.ReentryCandidateEntryPending || freshCycle.Status != store.CopyGuardReentryPending {
+		t.Fatalf("uncertain order became retryable: usage=%+v candidate=%s cycle=%s", usage, freshCandidate.Status, freshCycle.Status)
+	}
+	if countGuardEvents(t, st, cycle.ID, "REENTRY_RECOVERY_PENDING") != 1 {
+		t.Fatal("uncertain order must emit one recovery-pending audit event")
+	}
+}
+
+func TestCopyGuardCandidateStatusMapsToCycleState(t *testing.T) {
+	cases := map[string]string{
+		store.ReentryCandidateWatching:        store.CopyGuardAIWatching,
+		store.ReentryCandidateReviewing:       store.CopyGuardAIReviewing,
+		store.ReentryCandidateWaiting:         store.CopyGuardAIWaiting,
+		store.ReentryCandidatePaused:          store.CopyGuardAIWaiting,
+		store.ReentryCandidateEntryPending:    store.CopyGuardReentryPending,
+		store.ReentryCandidateAbandoned:       store.CopyGuardAIAbandoned,
+		store.ReentryCandidateInvalidated:     store.CopyGuardAIAbandoned,
+		store.ReentryCandidateExpired:         store.CopyGuardWatchTimeout,
+		store.ReentryCandidateBudgetSuspended: store.CopyGuardBudgetSuspended,
+	}
+	for candidate, want := range cases {
+		if got := copyGuardCycleStatusForCandidate(candidate); got != want {
+			t.Fatalf("candidate %s mapped to %s, want %s", candidate, got, want)
+		}
 	}
 }
 
 // 纯函数：窗口可行性判定（long/short 镜像 + chaseLimit<=0 不判定 + epsilon 容差）
 func TestReentryWindowInfeasibleHelper(t *testing.T) {
 	cases := []struct {
-		name             string
-		side             string
-		boundary, chase  float64
-		anchor           float64
-		want             bool
+		name            string
+		side            string
+		boundary, chase float64
+		anchor          float64
+		want            bool
 	}{
 		{"long empty set", "long", 1790, 1784, 1779, true},
 		{"long feasible", "long", 1683, 1717, 1700, false},

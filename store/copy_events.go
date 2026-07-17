@@ -268,47 +268,94 @@ func appendCopyEventFilter(q string, args []interface{}, filter CopyEventFilter)
 // REENTRY_GATE_CHANGED / 身份捕获等）不镜像，保持日志轻量。
 // ============================================================================
 
-// classifyGuardEvent 白名单：copy_guard_events.type → (category, severity)。
-// 第三个返回值 false 表示该类型不镜像（高频/内部明细）。
+type CopyGuardEventSpec struct {
+	Category, Severity, EmailLevel string
+	Mirror                         bool
+}
+
+var copyGuardEventSpecs = map[string]CopyGuardEventSpec{
+	"STOP_TRIGGERED":                   {CopyEventCategoryStopLoss, CopyEventSeverityWarn, "important", true},
+	"STOP_CONFIRMED":                   {CopyEventCategoryStopLoss, CopyEventSeverityWarn, "important", true},
+	"STOP_PENDING_FLAT":                {CopyEventCategoryStopLoss, CopyEventSeverityWarn, "verbose", true},
+	"STOP_PARTIAL":                     {CopyEventCategoryStopLoss, CopyEventSeverityError, "critical", true},
+	"STOP_FLAT_CONFIRMED":              {CopyEventCategoryStopLoss, CopyEventSeverityWarn, "important", true},
+	"STOP_DUST_RESIDUAL":               {CopyEventCategoryStopLoss, CopyEventSeverityError, "critical", true},
+	"AI_CANDIDATE_CREATED":             {CopyEventCategoryTakeover, CopyEventSeverityInfo, "verbose", true},
+	"AI_REVIEW_WAIT":                   {CopyEventCategoryTakeover, CopyEventSeverityInfo, "verbose", true},
+	"AI_REVIEW_ENTER":                  {CopyEventCategoryTakeover, CopyEventSeverityInfo, "verbose", true},
+	"AI_REVIEW_ABANDON":                {CopyEventCategoryTakeover, CopyEventSeverityWarn, "important", true},
+	"AI_REVIEW_FAILED":                 {CopyEventCategoryTakeover, CopyEventSeverityWarn, "important", true},
+	"AI_BUDGET_SUSPENDED":              {CopyEventCategoryTakeover, CopyEventSeverityWarn, "important", true},
+	"AI_RESULT_STALE":                  {CopyEventCategoryTakeover, CopyEventSeverityWarn, "verbose", true},
+	"AI_CANDIDATE_TERMINATED":          {CopyEventCategoryTakeover, CopyEventSeverityWarn, "important", true},
+	"AI_ANALYSIS":                      {CopyEventCategoryTakeover, CopyEventSeverityInfo, "verbose", true},
+	"REENTRY_PREFLIGHT_REJECTED":       {CopyEventCategoryReentry, CopyEventSeverityWarn, "verbose", true},
+	"REENTRY_REQUESTED":                {CopyEventCategoryReentry, CopyEventSeverityInfo, "verbose", true},
+	"REENTRY_FILLED":                   {CopyEventCategoryReentry, CopyEventSeverityInfo, "important", true},
+	"REENTRY_RECOVERED_AFTER_RESTART":  {CopyEventCategoryReentry, CopyEventSeverityInfo, "important", true},
+	"REENTRY_WINDOW_COLLAPSED":         {CopyEventCategoryReentry, CopyEventSeverityWarn, "important", true},
+	"REENTRY_FAILED":                   {CopyEventCategoryReentry, CopyEventSeverityError, "important", true},
+	"REENTRY_RECOVERY_PENDING":         {CopyEventCategoryReentry, CopyEventSeverityWarn, "important", true},
+	"GUARD_MANUAL_REENTRY_SIGNAL":      {CopyEventCategoryTakeover, CopyEventSeverityInfo, "verbose", true},
+	"GUARD_MANUAL_REENTRY_CONFIRMED":   {CopyEventCategoryTakeover, CopyEventSeverityInfo, "verbose", true},
+	"GUARD_MANUAL_REENTRY_DISMISSED":   {CopyEventCategoryTakeover, CopyEventSeverityInfo, "verbose", true},
+	"PROTECTION_RECOVERED":             {CopyEventCategoryProtection, CopyEventSeverityInfo, "verbose", true},
+	"PROTECTIVE_STOP_ACTIVE":           {CopyEventCategoryProtection, CopyEventSeverityInfo, "verbose", true},
+	"PROTECTION_PENDING":               {CopyEventCategoryProtection, CopyEventSeverityInfo, "verbose", true},
+	"PROTECTION_ACTIVE":                {CopyEventCategoryProtection, CopyEventSeverityInfo, "verbose", true},
+	"PROTECTION_DEGRADED":              {CopyEventCategoryProtection, CopyEventSeverityWarn, "important", true},
+	"PROTECTION_CLAMPED":               {CopyEventCategoryProtection, CopyEventSeverityWarn, "important", true},
+	"PROTECTION_COVERAGE_LOW":          {CopyEventCategoryProtection, CopyEventSeverityWarn, "important", true},
+	"PROTECTIVE_STOP_GONE":             {CopyEventCategoryProtection, CopyEventSeverityWarn, "important", true},
+	"PROTECTION_VERIFY_UNKNOWN":        {CopyEventCategoryProtection, CopyEventSeverityWarn, "important", true},
+	"ADDON_RISK_WARNING":               {CopyEventCategoryProtection, CopyEventSeverityWarn, "important", true},
+	"ADDON_RISK_SHRUNK":                {CopyEventCategoryProtection, CopyEventSeverityWarn, "important", true},
+	"FORCED_EXIT":                      {CopyEventCategoryProtection, CopyEventSeverityWarn, "important", true},
+	"PROTECTION_CREATE_FAILED":         {CopyEventCategoryProtection, CopyEventSeverityError, "critical", true},
+	"GUARD_UNPROTECTABLE":              {CopyEventCategoryProtection, CopyEventSeverityError, "critical", true},
+	"GUARD_FORCED_EXIT":                {CopyEventCategoryProtection, CopyEventSeverityError, "critical", true},
+	"GUARD_FORCED_EXIT_FAILED":         {CopyEventCategoryProtection, CopyEventSeverityError, "critical", true},
+	"ACCOUNTING_RECONCILED":            {CopyEventCategoryReconcile, CopyEventSeverityInfo, "verbose", true},
+	"ATTEMPT_RECONCILED":               {CopyEventCategoryReconcile, CopyEventSeverityInfo, "verbose", true},
+	"WATCH_SUMMARY":                    {CopyEventCategoryReconcile, CopyEventSeverityInfo, "verbose", false},
+	"BASELINE_CALIBRATED":              {CopyEventCategoryReconcile, CopyEventSeverityInfo, "verbose", true},
+	"LEADER_CLOSED":                    {CopyEventCategoryReconcile, CopyEventSeverityInfo, "important", true},
+	"CYCLE_CLOSED_SUMMARY":             {CopyEventCategoryReconcile, CopyEventSeverityInfo, "important", true},
+	"CYCLE_SUMMARY_EMAIL_QUEUED":       {CopyEventCategoryReconcile, CopyEventSeverityInfo, "verbose", false},
+	"CYCLE_SUMMARY_EMAIL_RATE_LIMITED": {CopyEventCategoryReconcile, CopyEventSeverityInfo, "verbose", false},
+	"CYCLE_SUMMARY_EMAIL_DEDUPED":      {CopyEventCategoryReconcile, CopyEventSeverityInfo, "verbose", false},
+	"CYCLE_SUMMARY_EMAIL_SENT":         {CopyEventCategoryReconcile, CopyEventSeverityInfo, "verbose", false},
+	"CYCLE_SUMMARY_EMAIL_FAILED":       {CopyEventCategoryReconcile, CopyEventSeverityWarn, "important", false},
+	"CYCLE_SUMMARY_EMAIL_DROPPED":      {CopyEventCategoryReconcile, CopyEventSeverityWarn, "important", false},
+	"CYCLE_SUMMARY_EMAIL_DISABLED":     {CopyEventCategoryReconcile, CopyEventSeverityInfo, "verbose", false},
+	"LEADER_REVERSED":                  {CopyEventCategoryReconcile, CopyEventSeverityWarn, "important", true},
+	"ACCOUNTING_DELAYED":               {CopyEventCategoryReconcile, CopyEventSeverityWarn, "important", true},
+	"ACCOUNTING_UNRECOVERABLE":         {CopyEventCategoryReconcile, CopyEventSeverityError, "critical", true},
+}
+
 func classifyGuardEvent(eventType string) (category, severity string, include bool) {
-	switch eventType {
-	// 止损介入
-	case "STOP_TRIGGERED", "STOP_CONFIRMED":
-		return CopyEventCategoryStopLoss, CopyEventSeverityWarn, true
-	// 二次入场
-	case "REENTRY_REQUESTED", "REENTRY_FILLED", "REENTRY_RECOVERED_AFTER_RESTART":
-		return CopyEventCategoryReentry, CopyEventSeverityInfo, true
-	case "REENTRY_WINDOW_COLLAPSED":
-		return CopyEventCategoryReentry, CopyEventSeverityWarn, true
-	case "REENTRY_FAILED":
-		return CopyEventCategoryReentry, CopyEventSeverityError, true
-	// 人工接手 / AI 接收
-	case "GUARD_MANUAL_REENTRY_SIGNAL":
-		return CopyEventCategoryTakeover, CopyEventSeverityWarn, true
-	case "GUARD_MANUAL_REENTRY_CONFIRMED", "GUARD_MANUAL_REENTRY_DISMISSED":
-		return CopyEventCategoryTakeover, CopyEventSeverityInfo, true
-	// 保护挂单健康
-	case "PROTECTION_RECOVERED", "PROTECTIVE_STOP_ACTIVE":
-		return CopyEventCategoryProtection, CopyEventSeverityInfo, true
-	case "PROTECTION_DEGRADED", "PROTECTION_CLAMPED", "PROTECTION_COVERAGE_LOW",
-		"PROTECTIVE_STOP_GONE", "PROTECTION_VERIFY_UNKNOWN", "ADDON_RISK_WARNING":
-		return CopyEventCategoryProtection, CopyEventSeverityWarn, true
-	case "PROTECTION_CREATE_FAILED", "GUARD_UNPROTECTABLE", "GUARD_FORCED_EXIT", "GUARD_FORCED_EXIT_FAILED":
-		return CopyEventCategoryProtection, CopyEventSeverityError, true
-	// 对账 / 基线 / 生命周期
-	case "ACCOUNTING_RECONCILED", "BASELINE_CALIBRATED", "LEADER_CLOSED":
-		return CopyEventCategoryReconcile, CopyEventSeverityInfo, true
-	case "LEADER_REVERSED", "ACCOUNTING_DELAYED":
-		return CopyEventCategoryReconcile, CopyEventSeverityWarn, true
-	case "ACCOUNTING_UNRECOVERABLE":
-		return CopyEventCategoryReconcile, CopyEventSeverityError, true
+	s, ok := copyGuardEventSpecs[eventType]
+	return s.Category, s.Severity, ok && s.Mirror
+}
+
+func GetCopyGuardEventSpec(eventType string) (CopyGuardEventSpec, bool) {
+	s, ok := copyGuardEventSpecs[eventType]
+	return s, ok
+}
+
+func ShouldSendCopyGuardEmail(configLevel, eventType string) bool {
+	spec, ok := copyGuardEventSpecs[eventType]
+	if !ok || spec.EmailLevel == "" {
+		return false
 	}
-	// 其余（WATCH_SUMMARY / REENTRY_GATE_CHANGED / WATCH_RESUMED /
-	// INITIAL_ENTRY_FILLED / CYCLE_BACKFILLED / ATTEMPT_RECONCILED /
-	// ACCOUNTING_IDENTITY_* / PROTECTIVE_STOP_ADOPTED|TERMINAL /
-	// PROTECTION_DISABLED_CANCELED / LIQ_PRICE_IGNORED / REENTRY_RECOVERY_PENDING）
-	// 属高频或内部明细，不镜像。
-	return "", "", false
+	switch configLevel {
+	case "verbose":
+		return true
+	case "critical":
+		return spec.EmailLevel == "critical"
+	default: // important is the v7 default and safe fallback for old configs.
+		return spec.EmailLevel == "important" || spec.EmailLevel == "critical"
+	}
 }
 
 // copyGuardTraderProvider 取跟单配置的数据源类型（用于事件镜像标注 provider）。
@@ -374,16 +421,34 @@ func (s *CopyTradeStore) mirrorGuardEventToCopyEvents(cycleID int64, traderID, e
 func guardEventSummary(eventType, symbol, side, operator string) string {
 	pair := strings.TrimSpace(symbol + " " + side)
 	switch eventType {
-	case "STOP_TRIGGERED", "STOP_CONFIRMED":
+	case "STOP_TRIGGERED", "STOP_CONFIRMED", "STOP_FLAT_CONFIRMED":
 		return fmt.Sprintf("账户保护止损触发 | %s", pair)
+	case "STOP_PENDING_FLAT":
+		return fmt.Sprintf("止损单已触发，等待仓位归零 | %s", pair)
+	case "STOP_PARTIAL", "STOP_DUST_RESIDUAL":
+		return fmt.Sprintf("止损后仍有残仓（%s）| %s", eventType, pair)
+	case "AI_CANDIDATE_CREATED":
+		return fmt.Sprintf("AI 持续观察候选已创建 | %s", pair)
+	case "AI_REVIEW_WAIT":
+		return fmt.Sprintf("AI 继续观察 | %s", pair)
+	case "AI_REVIEW_ENTER":
+		return fmt.Sprintf("AI 建议重入，进入确定性预检 | %s", pair)
+	case "AI_REVIEW_ABANDON":
+		return fmt.Sprintf("AI 建议放弃候选 | %s", pair)
+	case "AI_REVIEW_FAILED", "AI_BUDGET_SUSPENDED", "AI_RESULT_STALE":
+		return fmt.Sprintf("AI 重入审查异常（%s）| %s", eventType, pair)
+	case "AI_CANDIDATE_TERMINATED":
+		return fmt.Sprintf("AI 候选已由操作员终止 | %s", pair)
 	case "REENTRY_REQUESTED":
 		return fmt.Sprintf("二次入场触发 | %s", pair)
 	case "REENTRY_FILLED", "REENTRY_RECOVERED_AFTER_RESTART":
 		return fmt.Sprintf("二次入场已成交 | %s", pair)
 	case "REENTRY_FAILED":
 		return fmt.Sprintf("二次入场失败 | %s", pair)
+	case "REENTRY_PREFLIGHT_REJECTED":
+		return fmt.Sprintf("二次入场预检拒绝，返回观察 | %s", pair)
 	case "REENTRY_WINDOW_COLLAPSED":
-		return fmt.Sprintf("自动二次入场窗口关闭，转人工 | %s", pair)
+		return fmt.Sprintf("旧规则二次入场窗口已关闭 | %s", pair)
 	case "GUARD_MANUAL_REENTRY_SIGNAL":
 		return fmt.Sprintf("人工重入信号已生成，等待确认 | %s", pair)
 	case "GUARD_MANUAL_REENTRY_CONFIRMED":
@@ -394,7 +459,9 @@ func guardEventSummary(eventType, symbol, side, operator string) string {
 		return fmt.Sprintf("%s：重入已确认执行 | %s", who, pair)
 	case "GUARD_MANUAL_REENTRY_DISMISSED":
 		return fmt.Sprintf("人工重入信号已忽略 | %s", pair)
-	case "PROTECTIVE_STOP_ACTIVE":
+	case "PROTECTION_PENDING":
+		return fmt.Sprintf("保护止损单建立中 | %s", pair)
+	case "PROTECTIVE_STOP_ACTIVE", "PROTECTION_ACTIVE":
 		return fmt.Sprintf("保护止损单已生效 | %s", pair)
 	case "PROTECTION_RECOVERED":
 		return fmt.Sprintf("保护止损单已恢复 | %s", pair)
@@ -410,8 +477,8 @@ func guardEventSummary(eventType, symbol, side, operator string) string {
 		return fmt.Sprintf("无法保护强平兜底 | %s", pair)
 	case "GUARD_FORCED_EXIT_FAILED":
 		return fmt.Sprintf("强平兜底执行失败 | %s", pair)
-	case "ADDON_RISK_WARNING":
-		return fmt.Sprintf("加仓风险预算预警 | %s", pair)
+	case "ADDON_RISK_WARNING", "ADDON_RISK_SHRUNK":
+		return fmt.Sprintf("加仓风险预算已限制 | %s", pair)
 	case "ACCOUNTING_RECONCILED":
 		return fmt.Sprintf("周期对账完成 | %s", pair)
 	case "ACCOUNTING_DELAYED":

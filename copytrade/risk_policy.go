@@ -26,13 +26,93 @@ type RiskDistanceResult struct {
 	NoiseConflict bool
 }
 
+type ProtectionPlan struct {
+	EntryPrice            float64 `json:"entry_price"`
+	StopPrice             float64 `json:"stop_price"`
+	StopDistance          float64 `json:"stop_distance"`
+	ATR                   float64 `json:"atr"`
+	StructureInvalidation float64 `json:"structure_invalidation"`
+	SlippageBPS           float64 `json:"slippage_bps"`
+	RoundTripFeeBPS       float64 `json:"round_trip_fee_bps"`
+	MaxRiskUSD            float64 `json:"max_risk_usd"`
+	MaxNotional           float64 `json:"max_notional"`
+	PlannedNotional       float64 `json:"planned_notional"`
+	ExpectedLossUSD       float64 `json:"expected_loss_usd"`
+	ExpectedLossPct       float64 `json:"expected_loss_pct"`
+}
+
+// AvailableCopyGuardRiskUSD applies the same three-layer minimum used by the
+// atomic reservation. Usage must exclude the attempt being resized.
+func AvailableCopyGuardRiskUSD(c *CopyConfig, equity float64, usage store.CopyGuardRiskUsage) (float64, error) {
+	if c == nil || equity <= 0 {
+		return 0, fmt.Errorf("invalid risk capacity input")
+	}
+	available := equity * c.RiskAccountPct
+	cycleRemaining := equity*c.RiskCycleLossBudgetPct - usage.CycleUsedUSD
+	portfolioRemaining := equity*c.RiskPortfolioLossBudgetPct - usage.PortfolioUsedUSD
+	if cycleRemaining < available {
+		available = cycleRemaining
+	}
+	if portfolioRemaining < available {
+		available = portfolioRemaining
+	}
+	if available <= 1e-9 {
+		return 0, fmt.Errorf("copy guard risk budget exhausted")
+	}
+	return available, nil
+}
+
+// BuildProtectionPlan keeps market structure and risk sizing in one contract
+// shared by initial entries, add-ons and AI reentries. A wide valid stop always
+// shrinks notional; it is never squeezed merely to fit the account budget.
+func BuildProtectionPlan(c *CopyConfig, side SideType, entryPrice, atr, structureInvalidation, equity, budgetPct, nominalCap float64) (*ProtectionPlan, error) {
+	if c == nil || entryPrice <= 0 || atr <= 0 || equity <= 0 || budgetPct <= 0 || nominalCap <= 0 {
+		return nil, fmt.Errorf("invalid protection plan input")
+	}
+	distance := atr * c.RiskATRMultiplier
+	structureDistance := float64(0)
+	if side == SideLong && structureInvalidation > 0 && structureInvalidation < entryPrice {
+		structureDistance = entryPrice - structureInvalidation + 0.25*atr
+	}
+	if side == SideShort && structureInvalidation > entryPrice {
+		structureDistance = structureInvalidation - entryPrice + 0.25*atr
+	}
+	if structureDistance > distance {
+		distance = structureDistance
+	}
+	minimumExecutionDistance := entryPrice * math.Max(c.RiskSlippageBufferBPS, 1) / 10000
+	if minimumExecutionDistance > distance {
+		distance = minimumExecutionDistance
+	}
+	if distance > 4*atr {
+		return nil, fmt.Errorf("protection distance %.8f exceeds 4 ATR %.8f", distance, 4*atr)
+	}
+	maxNotional, err := MaxNotionalForRiskDistance(c, equity, entryPrice, distance, budgetPct, nominalCap)
+	if err != nil {
+		return nil, fmt.Errorf("risk sizing failed: %w", err)
+	}
+	if maxNotional <= 0 {
+		return nil, fmt.Errorf("risk sizing produced zero notional")
+	}
+	stopPrice := entryPrice - distance
+	if side == SideShort {
+		stopPrice = entryPrice + distance
+	}
+	if stopPrice <= 0 {
+		return nil, fmt.Errorf("computed stop price is invalid")
+	}
+	frictionRate := (c.RiskSlippageBufferBPS + c.RiskRoundTripFeeBPS) / 10000
+	expected := maxNotional * (distance/entryPrice + frictionRate)
+	return &ProtectionPlan{EntryPrice: entryPrice, StopPrice: stopPrice, StopDistance: distance, ATR: atr, StructureInvalidation: structureInvalidation, SlippageBPS: c.RiskSlippageBufferBPS, RoundTripFeeBPS: c.RiskRoundTripFeeBPS, MaxRiskUSD: equity * budgetPct, MaxNotional: maxNotional, PlannedNotional: maxNotional, ExpectedLossUSD: expected, ExpectedLossPct: expected / equity}, nil
+}
+
 // ComputeRiskDistanceV4 is pure and unit-explicit; exchange/network concerns stay outside it.
 //
 // Copy Guard v5.2 止损：各项纯取严（min），任何机制不得放宽——
 //
 //	distance = min( ATR 基线      = atrDistance（默认 2.0×ATR，抗噪主力线）,
 //	                [可选] 保证金 = entry × RiskLeverageMaxLoss / leverage（RiskLeverageFallback 默认关）,
-//	                账户硬兜底     = equity × RiskAccountPct / notional × entry（默认 10%，单笔硬兜底） )
+//	                单次风险预算 = equity × RiskAccountPct / notional × entry（v7 默认 2%） )
 //
 // v5.2 抗噪：仓位保证金止损（margin_cap）默认关闭（RiskLeverageFallback=false）。
 // 高杠杆下 entry×maxLoss/lev 会坍缩进市场噪音区（100x×20%≈0.2% 即止损），是频繁
@@ -59,12 +139,25 @@ func ComputeRiskDistanceV4(c *CopyConfig, entryPrice, positionNotional, accountE
 			r.NoiseConflict = true
 		}
 	}
+	frictionRate := (c.RiskSlippageBufferBPS + c.RiskRoundTripFeeBPS) / 10000
+	if frictionRate < 0 {
+		frictionRate = 0
+	}
 	if c.RiskAccountPct > 0 {
-		accountDistance := accountEquity * c.RiskAccountPct / positionNotional * entryPrice
-		if accountDistance < r.Distance {
-			r.Distance = accountDistance
-			r.GovernedBy = "account_cap"
-			r.NoiseConflict = true
+		// ai_guarded 的止损距离由 ATR/结构失效决定，账户预算只能缩仓，
+		// 不能把止损压进噪音区。legacy_rule 保留原兼容计算。
+		budgetUSD := accountEquity * c.RiskAccountPct
+		if c.RiskReentryDecisionMode != "ai_guarded" {
+			priceRiskBudget := budgetUSD - positionNotional*frictionRate
+			if priceRiskBudget <= 0 {
+				return RiskDistanceResult{}, fmt.Errorf("trading friction exhausts attempt risk budget")
+			}
+			accountDistance := priceRiskBudget / positionNotional * entryPrice
+			if accountDistance < r.Distance {
+				r.Distance = accountDistance
+				r.GovernedBy = "account_cap"
+				r.NoiseConflict = true
+			}
 		}
 	}
 	if c.RiskATRMultiplier > 0 {
@@ -72,12 +165,37 @@ func ComputeRiskDistanceV4(c *CopyConfig, entryPrice, positionNotional, accountE
 			r.DistanceATRRatio = r.Distance / rawATR
 		}
 	}
-	r.ExpectedLossUSD = positionNotional*r.Distance/entryPrice + positionNotional*c.RiskSlippageBufferBPS/10000
+	r.ExpectedLossUSD = positionNotional*r.Distance/entryPrice + positionNotional*frictionRate
 	r.ExpectedLossPct = r.ExpectedLossUSD / accountEquity
+	if c.RiskReentryDecisionMode == "ai_guarded" && c.RiskAccountPct > 0 && r.ExpectedLossPct > c.RiskAccountPct+1e-9 {
+		return RiskDistanceResult{}, fmt.Errorf("ATR/structure stop risk %.4f exceeds attempt budget %.4f; shrink position", r.ExpectedLossPct, c.RiskAccountPct)
+	}
 	if margin := positionNotional / float64(leverage); margin > 0 {
 		r.ExpectedMarginLossPct = r.ExpectedLossUSD / margin
 	}
 	return r, nil
+}
+
+// MaxNotionalForRiskDistance sizes the position around a market-valid stop.
+// Fees and slippage are inside the budget; AI may only multiply the result by
+// a factor <=1 and therefore can never increase deterministic risk.
+func MaxNotionalForRiskDistance(c *CopyConfig, equity, entryPrice, stopDistance, budgetPct, nominalCap float64) (float64, error) {
+	if c == nil || equity <= 0 || entryPrice <= 0 || stopDistance <= 0 || budgetPct <= 0 {
+		return 0, fmt.Errorf("invalid risk sizing input")
+	}
+	frictionRate := (c.RiskSlippageBufferBPS + c.RiskRoundTripFeeBPS) / 10000
+	if frictionRate < 0 {
+		frictionRate = 0
+	}
+	riskRate := stopDistance/entryPrice + frictionRate
+	if riskRate <= 0 {
+		return 0, fmt.Errorf("invalid per-unit risk")
+	}
+	maxNotional := equity * budgetPct / riskRate
+	if nominalCap > 0 && maxNotional > nominalCap {
+		maxNotional = nominalCap
+	}
+	return maxNotional, nil
 }
 
 // ComputeOwnPathBaseline 计算"未被止损、每个 attempt 按自身实际名义持有到领航员
@@ -182,6 +300,11 @@ func ValidateRiskPolicyV4(c *CopyConfig) error {
 	if c.RiskPolicyVersion < 4 {
 		return nil
 	}
+	// API/存储路径在校验前会补默认值，纯函数调用与旧测试也必须得到
+	// 同一契约；复制后补值避免校验函数意外修改调用方配置。
+	normalized := *c
+	normalized.FillRiskDefaults()
+	c = &normalized
 	if !SupportsCopyGuard(c.ProviderType) {
 		return fmt.Errorf("copy guard v4 is only supported for OKX or Binance leader sources")
 	}
@@ -206,17 +329,52 @@ func ValidateRiskPolicyV4(c *CopyConfig) error {
 	if invalidRange(c.RiskAccountPct, 0.001, 1) {
 		return fmt.Errorf("risk_account_pct must be 0.1%%..100%%")
 	}
+	if invalidRange(c.RiskCycleLossBudgetPct, c.RiskAccountPct, 0.20) {
+		return fmt.Errorf("risk_cycle_loss_budget_pct must be >= risk_account_pct and <= 20%%")
+	}
+	if invalidRange(c.RiskPortfolioLossBudgetPct, c.RiskCycleLossBudgetPct, 0.20) {
+		return fmt.Errorf("risk_portfolio_loss_budget_pct must be >= cycle budget and <= 20%%")
+	}
+	if invalidRange(c.RiskRoundTripFeeBPS, 0, 1000) {
+		return fmt.Errorf("risk_round_trip_fee_bps must be 0..1000")
+	}
 	if invalidRange(c.RiskSlippageBufferBPS, 0, 1000) {
 		return fmt.Errorf("risk_slippage_buffer_bps must be 0..1000")
 	}
 	if invalidRange(c.RiskLiquidationBufferATR, 0, 5) {
 		return fmt.Errorf("risk_liquidation_buffer_atr must be 0..5")
 	}
-	if c.RiskMaxReentries < 0 || c.RiskMaxReentries > 10 {
-		return fmt.Errorf("risk_max_reentries must be 0..10")
+	maxReentries := 10
+	if c.RiskReentryDecisionMode == "ai_guarded" {
+		maxReentries = 2
 	}
-	if invalidRange(c.RiskReentryRatio, 0.1, 1) {
-		return fmt.Errorf("risk_reentry_ratio must be 0.1..1")
+	if c.RiskMaxReentries < 0 || c.RiskMaxReentries > maxReentries {
+		return fmt.Errorf("risk_max_reentries must be 0..%d", maxReentries)
+	}
+	maxRatio := 1.0
+	if c.RiskReentryDecisionMode == "ai_guarded" {
+		maxRatio = 0.5
+		if c.RiskUnprotectableAction != "close" {
+			return fmt.Errorf("ai_guarded requires risk_unprotectable_action=close")
+		}
+	}
+	if invalidRange(c.RiskReentryRatio, 0.1, maxRatio) {
+		return fmt.Errorf("risk_reentry_ratio must be 0.1..%.1f", maxRatio)
+	}
+	if c.RiskReentryDecisionMode != "legacy_rule" && c.RiskReentryDecisionMode != "ai_guarded" && c.RiskReentryDecisionMode != "disabled" {
+		return fmt.Errorf("risk_reentry_decision_mode must be legacy_rule, ai_guarded or disabled")
+	}
+	if invalidRange(c.RiskAIConfidenceThreshold, 0.70, 0.95) {
+		return fmt.Errorf("risk_ai_confidence_threshold must be 0.70..0.95")
+	}
+	if c.RiskAIMinReviewSeconds < 300 || c.RiskAIMinReviewSeconds > 21600 {
+		return fmt.Errorf("risk_ai_min_review_seconds must be 300..21600")
+	}
+	if c.RiskAIDailyCallLimit < 1 || c.RiskAIDailyCallLimit > 12 || c.RiskAILifecycleCallLimit < 1 || c.RiskAILifecycleCallLimit > 30 {
+		return fmt.Errorf("AI review limits must be 1..12 per 24h and 1..30 per lifecycle")
+	}
+	if c.RiskNotificationLevel != "critical" && c.RiskNotificationLevel != "important" && c.RiskNotificationLevel != "verbose" {
+		return fmt.Errorf("risk_notification_level must be critical, important or verbose")
 	}
 	if invalidRange(c.RiskReentryBandATR, 0, 3) {
 		return fmt.Errorf("risk_reentry_band_atr must be 0..3")
@@ -260,5 +418,5 @@ func ValidateStoredRiskPolicy(c *store.CopyTradeConfig) error {
 		return nil
 	}
 	c.FillRiskDefaults()
-	return ValidateRiskPolicyV4(&CopyConfig{ProviderType: ProviderType(c.ProviderType), RiskPolicyVersion: c.RiskPolicyVersion, RiskStopMode: c.RiskStopMode, RiskATRPeriod: c.RiskATRPeriod, RiskATRCacheMaxAgeMinutes: c.RiskATRCacheMaxAgeMinutes, RiskATRMultiplier: c.RiskATRMultiplier, RiskATRFallbackPct: c.RiskATRFallbackPct, RiskTriggerPriceType: c.RiskTriggerPriceType, RiskAccountPct: c.RiskAccountPct, RiskSlippageBufferBPS: c.RiskSlippageBufferBPS, RiskLiquidationBufferATR: c.RiskLiquidationBufferATR, RiskMaxReentries: c.RiskMaxReentries, RiskReentryRatio: c.RiskReentryRatio, RiskReentryBandATR: c.RiskReentryBandATR, RiskReentryCooldownSeconds: c.RiskReentryCooldownSeconds, RiskReentryMaxChaseATR: c.RiskReentryMaxChaseATR, RiskReentryMaxATRExpansion: c.RiskReentryMaxATRExpansion, RiskWatchTimeoutMinutes: c.RiskWatchTimeoutMinutes, RiskAddonBudgetPct: c.RiskAddonBudgetPct, RiskReentryMinRecoveryATR: c.RiskReentryMinRecoveryATR, RiskReentryCooldownEscalation: c.RiskReentryCooldownEscalation, RiskReentryRecoveryEscalation: c.RiskReentryRecoveryEscalation, RiskUnprotectableAction: c.RiskUnprotectableAction})
+	return ValidateRiskPolicyV4(&CopyConfig{ProviderType: ProviderType(c.ProviderType), RiskPolicyVersion: c.RiskPolicyVersion, RiskStopMode: c.RiskStopMode, RiskATRPeriod: c.RiskATRPeriod, RiskATRCacheMaxAgeMinutes: c.RiskATRCacheMaxAgeMinutes, RiskATRMultiplier: c.RiskATRMultiplier, RiskATRFallbackPct: c.RiskATRFallbackPct, RiskTriggerPriceType: c.RiskTriggerPriceType, RiskAccountPct: c.RiskAccountPct, RiskCycleLossBudgetPct: c.RiskCycleLossBudgetPct, RiskPortfolioLossBudgetPct: c.RiskPortfolioLossBudgetPct, RiskRoundTripFeeBPS: c.RiskRoundTripFeeBPS, RiskSlippageBufferBPS: c.RiskSlippageBufferBPS, RiskLiquidationBufferATR: c.RiskLiquidationBufferATR, RiskMaxReentries: c.RiskMaxReentries, RiskReentryRatio: c.RiskReentryRatio, RiskReentryDecisionMode: c.RiskReentryDecisionMode, RiskAIConfidenceThreshold: c.RiskAIConfidenceThreshold, RiskAIMinReviewSeconds: c.RiskAIMinReviewSeconds, RiskAIDailyCallLimit: c.RiskAIDailyCallLimit, RiskAILifecycleCallLimit: c.RiskAILifecycleCallLimit, RiskNotificationLevel: c.RiskNotificationLevel, RiskReentryBandATR: c.RiskReentryBandATR, RiskReentryCooldownSeconds: c.RiskReentryCooldownSeconds, RiskReentryMaxChaseATR: c.RiskReentryMaxChaseATR, RiskReentryMaxATRExpansion: c.RiskReentryMaxATRExpansion, RiskWatchTimeoutMinutes: c.RiskWatchTimeoutMinutes, RiskAddonBudgetPct: c.RiskAddonBudgetPct, RiskReentryMinRecoveryATR: c.RiskReentryMinRecoveryATR, RiskReentryCooldownEscalation: c.RiskReentryCooldownEscalation, RiskReentryRecoveryEscalation: c.RiskReentryRecoveryEscalation, RiskUnprotectableAction: c.RiskUnprotectableAction})
 }

@@ -89,6 +89,56 @@ func TestReentryAIAnalysisLifecycle(t *testing.T) {
 	}
 }
 
+func TestCandidateAnalysisAuditIncludesAllDecisionAndFailureStatuses(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "candidate_audit.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	rs := st.ReentryAI()
+	save := func(candidateID int64) *ReentryAIAnalysis {
+		t.Helper()
+		a, err := rs.SaveReentryAnalysis(&ReentryAIAnalysis{CandidateID: candidateID, TraderID: "trader-a", CycleID: candidateID, Symbol: "ETHUSDT", Side: "long", AttemptNo: 1, DecisionGeneration: 2, SystemPrompt: "sys", UserPrompt: "user", DatapackJSON: "{}"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return a
+	}
+	wait := save(11)
+	if err := rs.UpdateReentryInternalResult(wait.ID, `{"decision":"WAIT"}`, ReentryVerdictWait, .7, `{}`); err != nil {
+		t.Fatal(err)
+	}
+	abandon := save(11)
+	if err := rs.UpdateReentryInternalResult(abandon.ID, `{"decision":"ABANDON"}`, ReentryVerdictAbandon, .85, `{}`); err != nil {
+		t.Fatalf("ABANDON must be persistable: %v", err)
+	}
+	invalid := save(12)
+	if err := rs.UpdateReentryInternalResult(invalid.ID, "not-json", "", 0, ""); err != nil {
+		t.Fatal(err)
+	}
+	failed := save(12)
+	if err := rs.MarkReentryAnalysisFailed(failed.ID, "model timeout"); err != nil {
+		t.Fatal(err)
+	}
+	stats, err := rs.GetReentryAIStats([]string{"trader-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.CandidateAnalyses != 4 || stats.SignalsCovered != 2 {
+		t.Fatalf("candidate calls were collapsed or lost: %+v", stats)
+	}
+	if stats.CandidateDecisions[ReentryVerdictWait] != 1 || stats.CandidateDecisions[ReentryVerdictAbandon] != 1 {
+		t.Fatalf("candidate decisions missing: %+v", stats)
+	}
+	if stats.CandidateCallStatuses["COMPLETED"] != 2 || stats.CandidateCallStatuses["INVALID"] != 1 || stats.CandidateCallStatuses["FAILED"] != 1 {
+		t.Fatalf("candidate call statuses missing: %+v", stats)
+	}
+	fresh, err := rs.GetReentryAnalysis(abandon.ID)
+	if err != nil || fresh.AttemptNo != 1 || fresh.DecisionGeneration != 2 || fresh.CallStatus != "COMPLETED" {
+		t.Fatalf("candidate audit linkage did not round-trip: analysis=%+v err=%v", fresh, err)
+	}
+}
+
 func TestReentryAIConfigRoundtrip(t *testing.T) {
 	st, err := New(filepath.Join(t.TempDir(), "reentry_ai_cfg.db"))
 	if err != nil {

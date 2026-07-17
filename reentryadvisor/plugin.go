@@ -1,22 +1,13 @@
-// Package reentryadvisor 重入 AI 助手插件。
+// Package reentryadvisor 实现 Copy Guard 持久化 AI 重入候选调度。
 //
-// Phase 1（半自动数据透明化）：Copy Guard 人工重入信号
-// （copy_guard_manual_reentry_signals）产生后，为其生成"决策数据包 + Prompt"
-// 并落库（reentry_ai_analyses），前端三段折叠可复制展示，用户复制给外部 AI
-// 判断后手工确认入场。
-//
-// Phase 2（内置 AI 分析）：同一快照同一 Prompt 直接喂内置模型（密钥复用
-// ai_models 表），结论写回同一条记录并邮件通知；周期闭合后回填重入尝试的
-// 真实盈亏，内外部 AI 结论准确率可对比。AI 只给建议，入场仍需人工确认。
-//
-// 插件化铁律（方案 A）：
-//   - 通过 DB 轮询（5s）发现新 PENDING 信号，copytrade 引擎零改动；
-//   - 只消费公共接口：store 读表、market.GetOKXATRWithMaxAge、Binance 公共 REST；
-//   - 全局开关（reentry_ai_config.enabled）关闭或插件内部 panic 均不影响跟单
-//     与既有人工重入确认/邮件流程。
+// AI 只判断趋势反转与建议缩放比例；仓位、风险预算、止损可保护性和
+// 订单幂等由 copytrade 确定性执行层最终裁决。插件每 5 秒领取到期候选，
+// 使用数据哈希、最小间隔、退避与日/生命周期额度控制调用。历史人工信号只保留
+// 查询兼容，不再由后台产生分析或执行。
 package reentryadvisor
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"sync"
@@ -86,7 +77,7 @@ func Start(st *store.Store) *Advisor {
 	a.mu.Unlock()
 	a.wg.Add(1)
 	go a.pollLoop()
-	logger.Info("[ReentryAdvisor] 插件已启动（轮询人工重入信号，5s 间隔）")
+	logger.Info("[ReentryAdvisor] AI 重入候选调度已启动（5s 间隔）")
 	return a
 }
 
@@ -119,8 +110,8 @@ func (a *Advisor) pollLoop() {
 	}
 }
 
-// pollOnce 单次轮询：为尚无分析记录的 PENDING 信号生成数据包。
-// 任何异常（含 panic）只影响本轮，绝不外泄影响宿主进程。
+// pollOnce 领取到期 AI 候选并回填历史分析结局。任何异常
+// （含 panic）只影响本轮，绝不外泄影响宿主进程。
 func (a *Advisor) pollOnce() {
 	defer func() {
 		if r := recover(); r != nil {
@@ -136,6 +127,9 @@ func (a *Advisor) pollOnce() {
 	if !cfg.Enabled {
 		return
 	}
+	if cfg.AIEnabled && cfg.AutoEntryEnabled {
+		a.pollAICandidates(cfg)
+	}
 
 	// Phase 2：结局盈亏回填（低频，独立于新信号处理，失败互不影响）
 	a.pollCount++
@@ -143,36 +137,141 @@ func (a *Advisor) pollOnce() {
 		a.backfillOutcomes()
 	}
 
-	signals, err := a.st.ReentryAI().ListManualReentrySignalsByStatus(store.ManualReentryStatusPending, 50)
+}
+
+func (a *Advisor) pollAICandidates(cfg *store.ReentryAIConfig) {
+	if recovered, err := a.st.ReentryAI().RecoverStaleReentryCandidateLeases(10 * time.Minute); err != nil {
+		logger.Warnf("[ReentryAdvisor] 回收 AI 候选过期租约失败: %v", err)
+	} else if recovered > 0 {
+		logger.Warnf("[ReentryAdvisor] 已回收 %d 个 AI 候选过期租约", recovered)
+	}
+	candidates, err := a.st.ReentryAI().ListDueReentryCandidates(50)
 	if err != nil {
-		logger.Warnf("[ReentryAdvisor] 读取待处理信号失败: %v", err)
+		logger.Warnf("[ReentryAdvisor] 读取 AI 候选失败: %v", err)
 		return
 	}
-	for _, sig := range signals {
-		has, err := a.st.ReentryAI().HasReentryAnalysisForSignal(sig.ID)
-		if err != nil {
-			logger.Warnf("[ReentryAdvisor] 查询信号 %d 分析记录失败: %v", sig.ID, err)
+	for _, candidate := range candidates {
+		traderCfg, err := a.st.CopyTrade().GetByTraderID(candidate.TraderID)
+		if err != nil || traderCfg.RiskReentryDecisionMode != "ai_guarded" || !traderCfg.RiskReentryEnabled {
 			continue
 		}
-		if has {
-			// 已有数据包但自动 AI 分析未成功（调用失败/当时未开启）→ 限次补跑
-			if cfg.AIEnabled {
-				a.maybeRetryAnalysis(sig.ID)
+		claimed, ok, err := a.st.ReentryAI().ClaimReentryCandidateReview(candidate.ID, time.Duration(traderCfg.RiskAIMinReviewSeconds)*time.Second, traderCfg.RiskAIDailyCallLimit, traderCfg.RiskAILifecycleCallLimit)
+		if err != nil {
+			logger.Warnf("[ReentryAdvisor] 候选 %d 领取失败: %v", candidate.ID, err)
+			continue
+		}
+		if !ok {
+			if claimed != nil && claimed.Status == store.ReentryCandidateBudgetSuspended {
+				a.updateCandidateCycleStatus(claimed, store.CopyGuardBudgetSuspended)
+				a.recordCandidateEvent(claimed, "AI_BUDGET_SUSPENDED", claimed.TriggerPrice, 0, map[string]interface{}{"review_count": claimed.ReviewCount, "lifecycle_limit": traderCfg.RiskAILifecycleCallLimit})
+				a.notifyCandidateImportant(claimed, "AI_BUDGET_SUSPENDED", "AI 重入观察额度已耗尽", "候选已暂停，不再继续消耗模型额度。")
 			}
 			continue
 		}
-		analysis, err := a.generateForSignal(sig, cfg)
-		if err != nil {
-			logger.Warnf("[ReentryAdvisor] 信号 %d (%s %s) 数据包生成失败: %v", sig.ID, sig.Symbol, sig.Side, err)
+		if claimed == nil {
 			continue
 		}
-		logger.Infof("[ReentryAdvisor] 信号 %d (%s %s) 数据包已生成 (analysis=%d, 市场层=%v, 缺失字段=%s)",
-			sig.ID, sig.Symbol, sig.Side, analysis.ID, analysis.MarketDataAvailable, orNone(analysis.MissingFields))
-		// Phase 2：自动内置 AI 分析（异步，AI 慢不阻塞轮询；完成后邮件通知）
-		if cfg.AIEnabled {
-			a.spawnAnalysis(analysis.ID, true)
+		a.updateCandidateCycleStatus(claimed, store.CopyGuardAIReviewing)
+		analysis, err := a.generateForCandidate(claimed, cfg)
+		if err != nil {
+			failed, _ := a.st.ReentryAI().SaveReentryAnalysis(&store.ReentryAIAnalysis{CandidateID: claimed.ID, TraderID: claimed.TraderID, CycleID: claimed.CycleID, Symbol: claimed.Symbol, Side: claimed.Side, AttemptNo: claimed.ReentryCount + 1, DecisionGeneration: claimed.DecisionGeneration, CallStatus: "PENDING", PromptVersion: candidatePromptVersion, SnapshotPrice: claimed.TriggerPrice})
+			analysisID := int64(0)
+			if failed != nil {
+				analysisID = failed.ID
+			}
+			_ = a.st.ReentryAI().FailReentryCandidateBeforeModel(claimed.ID, analysisID, err.Error(), candidateFailureBackoff(claimed.FailureCount+1))
+			a.updateCandidateCycleStatus(claimed, store.CopyGuardAIWaiting)
+			detail := map[string]interface{}{"error": err.Error(), "stage": "datapack"}
+			if failed != nil {
+				detail["analysis_id"] = failed.ID
+			}
+			a.recordCandidateEvent(claimed, "AI_REVIEW_FAILED", 0, 0, detail)
+			if claimed.FailureCount+1 == 3 {
+				a.notifyCandidateImportant(claimed, "AI_REVIEW_FAILED", "AI 候选数据连续生成失败", "行情或数据包连续不可用，候选将按退避策略继续等待。")
+			}
+			continue
+		}
+		duplicate, hashErr := a.st.ReentryAI().HasCompletedCandidateDataHash(claimed.ID, analysis.ID, analysis.DataHash)
+		if hashErr != nil {
+			_ = a.st.ReentryAI().FailReentryCandidateBeforeModel(claimed.ID, analysis.ID, "data hash dedupe failed: "+hashErr.Error(), candidateFailureBackoff(claimed.FailureCount+1))
+			a.updateCandidateCycleStatus(claimed, store.CopyGuardAIWaiting)
+			continue
+		}
+		if duplicate {
+			if err := a.st.ReentryAI().SkipDuplicateCandidateReview(claimed.ID, analysis.ID, time.Now().Add(2*time.Hour)); err != nil {
+				logger.Warnf("[ReentryAdvisor] 候选 %d 跳过重复数据失败: %v", claimed.ID, err)
+			} else {
+				a.updateCandidateCycleStatus(claimed, store.CopyGuardAIWaiting)
+			}
+			continue
+		}
+		if !a.spawnAnalysis(analysis.ID, true) {
+			_ = a.st.ReentryAI().FailReentryCandidateBeforeModel(claimed.ID, analysis.ID, "advisor stopped before model call", candidateFailureBackoff(claimed.FailureCount+1))
+			a.updateCandidateCycleStatus(claimed, store.CopyGuardAIWaiting)
 		}
 	}
+}
+
+func (a *Advisor) updateCandidateCycleStatus(c *store.CopyGuardReentryCandidate, status string) {
+	if a == nil || a.st == nil || c == nil {
+		return
+	}
+	_ = a.st.CopyTrade().UpdateCopyGuardObservation(c.CycleID, status, c.LeaderEntryPrice, c.TriggerPrice, c.ATR)
+}
+
+func candidateFailureBackoff(n int) time.Duration {
+	if n <= 1 {
+		return 5 * time.Minute
+	}
+	if n == 2 {
+		return 15 * time.Minute
+	}
+	return time.Hour
+}
+
+func (a *Advisor) generateForCandidate(c *store.CopyGuardReentryCandidate, cfg *store.ReentryAIConfig) (*store.ReentryAIAnalysis, error) {
+	pack, err := buildDataPackForCandidate(a.st, a.bn, c)
+	if err != nil {
+		return nil, err
+	}
+	b, err := json.MarshalIndent(pack, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	snapshotPrice := c.TriggerPrice
+	if pack.Market != nil && pack.Market.CurrentPrice > 0 {
+		snapshotPrice = pack.Market.CurrentPrice
+	}
+	promptCandidate := *c
+	promptCandidate.TriggerPrice = snapshotPrice
+	hashGuard := pack.CopyGuard
+	hashGuard.PreviousAIDecisions = nil
+	hashGuard.RecentEvents = nil
+	hashGuard.LeaderTimeline = nil
+	hashInput, err := json.Marshal(struct {
+		FeatureHash string         `json:"feature_hash"`
+		Guard       GuardSection   `json:"copy_guard"`
+		Market      *MarketSection `json:"market"`
+	}{FeatureHash: c.FeatureHash, Guard: hashGuard, Market: pack.Market})
+	if err != nil {
+		return nil, err
+	}
+	dataHash := fmt.Sprintf("%x", sha256.Sum256(hashInput))
+	analysis := &store.ReentryAIAnalysis{CandidateID: c.ID, TraderID: c.TraderID, CycleID: c.CycleID, Symbol: c.Symbol, Side: c.Side, AttemptNo: c.ReentryCount + 1, DecisionGeneration: c.DecisionGeneration, DataHash: dataHash, SystemPrompt: candidateSystemPrompt(), UserPrompt: buildCandidateUserPrompt(&promptCandidate, string(b)), DatapackJSON: string(b), MarketDataAvailable: pack.Meta.FuturesAvailable, MissingFields: joinMissing(pack.Meta.MissingFields), PromptVersion: candidatePromptVersion, SnapshotPrice: snapshotPrice}
+	return a.st.ReentryAI().SaveReentryAnalysis(analysis)
+}
+
+func (a *Advisor) recordCandidateEvent(c *store.CopyGuardReentryCandidate, event string, price, notional float64, detail map[string]interface{}) {
+	if c == nil {
+		return
+	}
+	if detail == nil {
+		detail = map[string]interface{}{}
+	}
+	detail["candidate_id"] = c.ID
+	detail["attempt_no"] = c.ReentryCount + 1
+	detail["decision_generation"] = c.DecisionGeneration
+	_ = a.st.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: c.CycleID, TraderID: c.TraderID, Type: event, Price: price, Notional: notional, Metadata: detail})
 }
 
 // maybeRetryAnalysis 对 PENDING 信号的最新快照补跑自动 AI 分析：
@@ -225,7 +324,8 @@ func (a *Advisor) spawnAnalysis(analysisID int64, autoTriggered bool) bool {
 // backfillOutcomes 为已执行（EXECUTED）信号回填重入尝试的真实结局盈亏。
 // 归属规则：人工重入成交后引擎把周期 reentry_count 自增并开出新尝试，
 // 故本信号对应 attempt_no = 信号快照时的 reentry_count + 1；等该尝试
-// 闭合且对账完成（reconciled）后，以 pnl − fee 作为结局净额回填。
+// 闭合且对账完成（reconciled）后，以 pnl 作为结局净额回填。OKX 结算写入的
+// attempt.PnL 已包含手续费；Fee 单独保留只用于归因展示，不能再次扣除。
 func (a *Advisor) backfillOutcomes() {
 	signalIDs, err := a.st.ReentryAI().ListExecutedSignalIDsPendingOutcome(50)
 	if err != nil {
@@ -247,13 +347,33 @@ func (a *Advisor) backfillOutcomes() {
 			if at.AttemptNo != targetNo || at.ClosedAt == nil || !at.Reconciled {
 				continue
 			}
-			outcome := at.PnL - at.Fee
+			outcome := at.PnL
 			if err := a.st.ReentryAI().SetReentryOutcomeForSignal(sigID, outcome); err != nil {
 				logger.Warnf("[ReentryAdvisor] 结局回填写入失败 (signal=%d): %v", sigID, err)
 				break
 			}
 			logger.Infof("[ReentryAdvisor] 信号 %d (%s %s) 结局已回填: %.4f USDT (attempt_no=%d)",
 				sigID, sig.Symbol, sig.Side, outcome, targetNo)
+			break
+		}
+	}
+	analyses, err := a.st.ReentryAI().ListCandidateAnalysesPendingOutcome(100)
+	if err != nil {
+		logger.Warnf("[ReentryAdvisor] AI 候选结局回填查询失败: %v", err)
+		return
+	}
+	for _, analysis := range analyses {
+		attempts, err := a.st.CopyTrade().ListCopyGuardAttempts(analysis.CycleID)
+		if err != nil {
+			continue
+		}
+		for _, attempt := range attempts {
+			if attempt.AttemptNo != analysis.AttemptNo || attempt.ClosedAt == nil || !attempt.Reconciled {
+				continue
+			}
+			if err := a.st.ReentryAI().SetReentryOutcomeForAnalysis(analysis.ID, attempt.PnL); err == nil {
+				logger.Infof("[ReentryAdvisor] AI 候选结局已回填 analysis=%d cycle=%d attempt=%d pnl=%.4f", analysis.ID, analysis.CycleID, analysis.AttemptNo, attempt.PnL)
+			}
 			break
 		}
 	}
@@ -282,6 +402,7 @@ func (a *Advisor) generateForSignal(sig *store.CopyGuardManualReentrySignal, cfg
 		CycleID:             sig.CycleID,
 		Symbol:              sig.Symbol,
 		Side:                sig.Side,
+		AttemptNo:           sig.ReentryCount + 1,
 		SystemPrompt:        buildSystemPrompt(cfg.PromptTemplate),
 		UserPrompt:          buildUserPrompt(sig, string(packJSON)),
 		DatapackJSON:        string(packJSON),

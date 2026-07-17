@@ -20,7 +20,7 @@ import (
 // 算法（calcStopLossPrice → ComputeRiskDistanceV4）：三项纯取严（min）
 //   - ATR 基线：噪音参考线（默认 1.5×ATR_1h_14），不再放宽硬 cap
 //   - 仓位保证金止损：日常主力线（默认 20% 保证金）
-//   - 账户硬兜底：单笔最多亏账户的 RiskAccountPct（默认 10%），只锁灾难敞口
+//   - 风险预算：单次尝试默认最多亏账户的 RiskAccountPct（v7 默认 2%）
 //
 // 由 SupportsCopyGuard 的数据源（OKX / Binance 领航员）在 v4+ 配置下调用；
 // Hyperliquid 完全不走这里。保护单始终挂在跟随者执行交易所（须支持交易所托管
@@ -46,6 +46,7 @@ type StopLossCalcResult struct {
 	ATRValue         float64 // 实际 ATR 值（参考用）
 	GovernedBy       string  // 哪条规则最终生效："atr" | "margin_cap" | "account_cap" | "clamp"
 	TickSize         float64 // 实际使用的 tickSz（0 = fallback 到 1e-4）
+	QuantityStep     float64 // lotSz * ctVal，以币数表示的最小仓位步长
 	OpenImmediateHit bool    // 是否开仓即触发风险（SL 距离 < 0.1%）
 	ExpectedLossUSD  float64 // 价格损失 + 配置的滑点缓冲
 	ExpectedLossPct  float64 // ExpectedLossUSD / AccountEquityUSD（权益口径）
@@ -131,49 +132,78 @@ func calcStopLossPrice(cfg *CopyConfig, input *StopLossCalcInput) (*StopLossCalc
 }
 
 // ============================================================================
-// 加仓账户风险预算（Copy Guard v4，v4.1 起仅告警不拦截）
+// 加仓账户风险预算（Copy Guard v7：超限自动缩量）
 //
 // 背景：volatility_priority 模式下 RiskAccountPct 只是软性提示，领航员连续
 // 加仓时单笔预期止损损失可以增长（WLD 实盘：5.2% → 28.4%）。这里在跟随加仓
 // 时预估「加仓后总敞口按当前止损距离全损」占账户权益的比例，超过
 // RiskAddonBudgetPct 时记录 ADDON_RISK_WARNING 告警。
 //
-// v4.1 设计修正：兜底风控不干扰领航员的开/加/减/平动作——拦截加仓会让跟随
-// 仓位结构偏离领航员（实际保护由止损噪音下限 + 账户 20% 硬兜底承担），
-// 因此从"拒绝加仓"降级为"仅告警"。
+// v7 把费用与滑点纳入预算，超限时缩小本次加仓；不能安全达到交易所最小量
+// 时拒绝，避免仅告警却继续穿透风险预算。
 // ============================================================================
 
 // addonBudgetEventInterval：同一仓位 ADDON_RISK_WARNING 事件/告警的最小间隔，
 // 限频避免事件与日志刷屏。
 const addonBudgetEventInterval = 60 * time.Second
 
-// warnAddonRiskBudget 检查本次加仓是否超出账户风险预算，超出时仅记录告警
-// 事件（不拦截）。任何数据不可得（无周期记录、权益为零、ATR 失败且无降级）
-// 时静默跳过。
-func (e *Engine) warnAddonRiskBudget(signal *TradeSignal, posID string, copySize float64) {
+// structuralInvalidationPrice uses only completed 5m/15m OKX mark candles.
+// The most recent confirmed two-sided swing is preferred; unavailable market
+// data safely degrades to the ATR-only plan.
+func structuralInvalidationPrice(symbol string, side SideType, entryPrice float64) float64 {
+	best, bestTime := float64(0), int64(0)
+	for _, timeframe := range []string{"5m", "15m"} {
+		klines, err := market.GetOKXCompletedMarkCandles(symbol, timeframe, 40)
+		if err != nil || len(klines) < 5 {
+			continue
+		}
+		for i := len(klines) - 3; i >= 2; i-- {
+			k := klines[i]
+			valid := false
+			price := float64(0)
+			if side == SideLong && k.Low < entryPrice && k.Low < klines[i-1].Low && k.Low <= klines[i-2].Low && k.Low < klines[i+1].Low && k.Low <= klines[i+2].Low {
+				valid, price = true, k.Low
+			}
+			if side == SideShort && k.High > entryPrice && k.High > klines[i-1].High && k.High >= klines[i-2].High && k.High > klines[i+1].High && k.High >= klines[i+2].High {
+				valid, price = true, k.High
+			}
+			if valid && k.OpenTime > bestTime {
+				best, bestTime = price, k.OpenTime
+			}
+			if valid {
+				break
+			}
+		}
+	}
+	return best
+}
+
+// limitAddonRiskBudget 检查本次加仓后的风险，超预算时缩量。Copy Guard
+// 数据缺失时保守拒绝，避免旧逻辑“只告警仍然穿透预算”。
+func (e *Engine) limitAddonRiskBudget(signal *TradeSignal, posID string, copySize float64) float64 {
 	cfg := e.config
 	// 显式 v4+ 门槛：加仓预算是 Copy Guard v4 特性。version<4 的存量配置
 	// 目前也进不来（budget 默认 0 + 无 open cycle 双重隐式短路），此检查
 	// 把门控从"依赖下游数据缺失"改为与 shouldManageStopLoss 等一致的
 	// 显式判定，防止未来重构 cycle 创建时机时悄悄漏风。
 	if cfg == nil || !SupportsCopyGuard(cfg.ProviderType) || cfg.RiskPolicyVersion < 4 || !cfg.RiskStopLossEnabled {
-		return
+		return copySize
 	}
 	budget := cfg.RiskAddonBudgetPct
 	if budget <= 0 || budget >= 1 {
-		return
+		return copySize
 	}
 	if e.store == nil || e.getFollowerEquity == nil || signal == nil || signal.Fill == nil || copySize <= 0 {
-		return
+		return 0
 	}
 	cycle, err := e.store.CopyTrade().GetOpenCopyGuardCycle(e.traderID, posID)
 	if err != nil || cycle == nil {
-		return
+		return 0
 	}
 	equity := e.getFollowerEquity()
 	entryPrice := signal.Fill.Price
 	if equity <= 0 || entryPrice <= 0 {
-		return
+		return 0
 	}
 	period := cfg.RiskATRPeriod
 	if period <= 0 {
@@ -186,34 +216,45 @@ func (e *Engine) warnAddonRiskBudget(signal *TradeSignal, posID string, copySize
 		atrDistance = entryPrice * cfg.RiskATRFallbackPct
 	}
 	if atrDistance <= 0 {
-		return
+		return 0
 	}
 	totalNotional := cycle.FollowerNotional + copySize
 	computed, err := ComputeRiskDistanceV4(cfg, entryPrice, totalNotional, equity, atrDistance, e.getLeaderLeverage(signal))
-	if err != nil || computed.ExpectedLossPct <= budget {
-		return
+	if err != nil {
+		return 0
+	}
+	if computed.ExpectedLossPct <= budget {
+		return copySize
+	}
+	lossRate := computed.ExpectedLossUSD / totalNotional
+	allowed := equity*budget/lossRate - cycle.FollowerNotional
+	if allowed < 0 {
+		allowed = 0
+	}
+	if allowed > copySize {
+		allowed = copySize
 	}
 
 	now := time.Now()
 	if last, ok := e.lastAddonBudgetEvent[posID]; !ok || now.Sub(last) >= addonBudgetEventInterval {
 		e.lastAddonBudgetEvent[posID] = now
-		msg := fmt.Sprintf("加仓风险告警：预期止损损失 %.1f%% 超账户预算 %.1f%%（现有名义 %.2f + 加仓 %.2f，仍跟随）",
-			computed.ExpectedLossPct*100, budget*100, cycle.FollowerNotional, copySize)
+		msg := fmt.Sprintf("加仓风险缩量：预期止损损失 %.1f%% 超预算 %.1f%%（请求 %.2f，允许 %.2f）",
+			computed.ExpectedLossPct*100, budget*100, copySize, allowed)
 		logger.Warnf("🚧 [%s] %s | %s posId=%s", e.traderID, msg, signal.Fill.Symbol, posID)
 		e.logWarning(Warning{
 			Timestamp:    now,
 			Symbol:       signal.Fill.Symbol,
-			Type:         "addon_risk_warning",
+			Type:         "addon_risk_shrunk",
 			Message:      msg,
 			SignalAction: string(ActionAdd),
 			SignalValue:  copySize,
-			CopyValue:    copySize,
-			Executed:     true,
+			CopyValue:    allowed,
+			Executed:     allowed > 0,
 		})
 		if err := e.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{
 			CycleID:  cycle.ID,
 			TraderID: e.traderID,
-			Type:     "ADDON_RISK_WARNING",
+			Type:     "ADDON_RISK_SHRUNK",
 			Price:    entryPrice,
 			Notional: copySize,
 			Metadata: map[string]interface{}{
@@ -221,13 +262,72 @@ func (e *Engine) warnAddonRiskBudget(signal *TradeSignal, posID string, copySize
 				"budget_pct":        budget,
 				"current_notional":  cycle.FollowerNotional,
 				"addon_notional":    copySize,
+				"allowed_notional":  allowed,
 				"governed_by":       computed.GovernedBy,
-				"blocked":           false,
+				"blocked":           allowed <= 0,
 			},
 		}); err != nil {
-			logger.Warnf("⚠️ [%s] ADDON_RISK_WARNING 事件写入失败: %v", e.traderID, err)
+			logger.Warnf("⚠️ [%s] ADDON_RISK_SHRUNK 事件写入失败: %v", e.traderID, err)
 		}
 	}
+	return allowed
+}
+
+func (e *Engine) limitAIGuardedTradeRisk(signal *TradeSignal, posID string, action ActionType, requested float64) float64 {
+	if e.config == nil || e.config.RiskReentryDecisionMode != "ai_guarded" || !e.config.RiskStopLossEnabled || signal == nil || signal.Fill == nil || requested <= 0 || e.getFollowerEquity == nil {
+		return requested
+	}
+	entryPrice, equity := signal.Fill.Price, e.getFollowerEquity()
+	if entryPrice <= 0 || equity <= 0 {
+		return 0
+	}
+	atr, err := market.GetOKXATRWithMaxAge(signal.Fill.Symbol, e.config.RiskATRTimeframe, e.config.RiskATRPeriod, riskATRCacheMaxAge(e.config))
+	if err != nil || atr <= 0 {
+		atr = entryPrice * e.config.RiskATRFallbackPct
+	}
+	if atr <= 0 {
+		return 0
+	}
+	currentNotional := float64(0)
+	var cycle *store.CopyGuardCycle
+	cycleID := int64(0)
+	if action == ActionAdd {
+		cycle, _ = e.store.CopyTrade().GetOpenCopyGuardCycle(e.traderID, posID)
+		if cycle == nil {
+			return 0
+		}
+		cycleID = cycle.ID
+		currentNotional = cycle.FollowerNotional
+	}
+	usage, err := e.store.ReentryAI().GetCopyGuardRiskUsageExcludingAttempt(e.traderID, cycleID, 0)
+	if err != nil {
+		return 0
+	}
+	availableRisk, err := AvailableCopyGuardRiskUSD(e.config, equity, usage)
+	if err != nil {
+		return 0
+	}
+	side := signal.Fill.PositionSide
+	structure := structuralInvalidationPrice(signal.Fill.Symbol, side, entryPrice)
+	plan, err := BuildProtectionPlan(e.config, side, entryPrice, atr, structure, equity, availableRisk/equity, currentNotional+requested)
+	if err != nil {
+		logger.Warnf("[CopyGuard] trader=%s event=ENTRY_RISK_REJECTED symbol=%s reason=%v", e.traderID, signal.Fill.Symbol, err)
+		return 0
+	}
+	allowed := plan.MaxNotional - currentNotional
+	if allowed < 0 {
+		allowed = 0
+	}
+	if allowed > requested {
+		allowed = requested
+	}
+	if allowed+1e-9 < requested {
+		logger.Warnf("[CopyGuard] trader=%s event=ENTRY_RISK_SHRUNK symbol=%s requested=%.2f allowed=%.2f stop=%.8f", e.traderID, signal.Fill.Symbol, requested, allowed, plan.StopPrice)
+		if cycle != nil {
+			_ = e.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: e.traderID, Type: "ADDON_RISK_SHRUNK", Price: entryPrice, Notional: requested, Metadata: map[string]interface{}{"allowed_notional": allowed, "stop_price": plan.StopPrice, "stop_distance": plan.StopDistance, "structure_invalidation": plan.StructureInvalidation, "expected_loss_usd": plan.ExpectedLossUSD, "risk_budget": plan.MaxRiskUSD}})
+		}
+	}
+	return allowed
 }
 
 // isLiquidationPriceDirectionValid checks the liquidation price is on the
@@ -277,11 +377,14 @@ func finalizeStopLossPrice(input *StopLossCalcInput, result *StopLossCalcResult,
 		result.OpenImmediateHit = true
 		return result, nil
 	}
-	tickSz, tickErr := getOKXTickSize(input.Symbol)
-	if tickErr != nil {
+	spec, specErr := getOKXInstrumentSpec(input.Symbol)
+	tickSz := spec.tickSz
+	if specErr != nil {
 		// 不阻断：alignToTickSize 对 tickSz=0 会原样返回价格，止损价仍有效，
 		// 只是可能未对齐档位（交易所会自行处理）。留 WARN 便于发现接口异常。
-		logger.Warnf("⚠️ 获取 %s tickSize 失败（止损价不做档位对齐）: %v", input.Symbol, tickErr)
+		logger.Warnf("⚠️ 获取 %s 合约规格失败（止损价不做档位对齐）: %v", input.Symbol, specErr)
+	} else {
+		result.QuantityStep = spec.lotSz * spec.ctVal
 	}
 	result.TickSize = tickSz
 	if input.Side == SideLong {
@@ -481,18 +584,29 @@ func (e *Engine) checkStoppedByRisk() {
 		leaderSize := leaderPos.Size
 		addCount := mapping.AddCount
 
+		// The lifecycle ledger must commit before the mapping leaves active.
+		// Previously MarkStoppedByRisk ran first and Record... errors were ignored;
+		// one DB failure permanently removed the mapping from this retry loop while
+		// leaving the cycle falsely FOLLOWING. Keeping it active on failure makes
+		// the next confirmed poll retry the same idempotent transition.
+		cycle, cerr := e.store.CopyTrade().GetOpenCopyGuardCycle(e.traderID, mapping.LeaderPosID)
+		if cerr != nil {
+			logger.Errorf("❌ [%s] 仓位已消失但 Copy Guard 周期不可用: %v | posId=%s", e.traderID, cerr, mapping.LeaderPosID)
+			continue
+		}
+		atr, _ := market.GetOKXATRWithMaxAge(mapping.Symbol, e.config.RiskATRTimeframe, e.config.RiskATRPeriod, riskATRCacheMaxAge(e.config))
+		// 统计口径修正（v5）：领航员浮亏是参考信息，写 metadata；事件
+		// pnl 字段留给跟随者自身盈亏（此路径无法得知，由 attempt 对账补）
+		if recordErr := e.store.CopyTrade().RecordCopyGuardStopObserved(cycle.ID, e.traderID, cycle.ReentryCount, atr, leaderPos.MarkPrice, leaderSize, map[string]interface{}{"confirmation": "position_absent_fallback", "leader_unrealized_pnl": leaderPnL}); recordErr != nil {
+			logger.Errorf("[CopyGuard] trader=%s cycle=%d attempt=%d event=STOP_PERSIST_FAILED reason=%v", e.traderID, cycle.ID, cycle.ReentryCount, recordErr)
+			continue
+		}
 		if err := e.store.CopyTrade().MarkStoppedByRisk(e.traderID, mapping.LeaderPosID, leaderPnL, leaderSize, addCount); err != nil {
 			logger.Errorf("❌ [%s] 标记 stopped_by_risk 失败: %v | posId=%s", e.traderID, err, mapping.LeaderPosID)
 			continue
 		}
-		if cycle, cerr := e.store.CopyTrade().GetOpenCopyGuardCycle(e.traderID, mapping.LeaderPosID); cerr == nil {
-			atr, _ := market.GetOKXATRWithMaxAge(mapping.Symbol, e.config.RiskATRTimeframe, e.config.RiskATRPeriod, riskATRCacheMaxAge(e.config))
-			// 统计口径修正（v5）：领航员浮亏是参考信息，写 metadata；事件
-			// pnl 字段留给跟随者自身盈亏（此路径无法得知，由 attempt 对账补）
-			_ = e.store.CopyTrade().RecordCopyGuardStopObserved(cycle.ID, e.traderID, cycle.ReentryCount, atr, leaderPos.MarkPrice, leaderSize, map[string]interface{}{"confirmation": "position_absent_fallback", "leader_unrealized_pnl": leaderPnL})
-			// 快照止损时的领航员均价，供重入保守锚点使用
-			_ = e.store.CopyTrade().SnapshotCopyGuardLeaderEntryAtStop(cycle.ID, leaderPos.EntryPrice)
-		}
+		// 快照止损时的领航员均价，供重入保守锚点使用
+		_ = e.store.CopyTrade().SnapshotCopyGuardLeaderEntryAtStop(cycle.ID, leaderPos.EntryPrice)
 
 		// 清除疑似计数（已转 stopped_by_risk 状态）
 		delete(e.stopRiskSuspectCount, mapping.LeaderPosID)
@@ -661,15 +775,27 @@ func (e *Engine) checkReentryConditions() {
 		noiseDisabled := noiseRatio > 0 && noiseRatio < reentryNoiseDisableRatio && !e.config.RiskReentryNoiseOverride
 		cautious := noiseRatio > 0 && noiseRatio < reentryNoiseCautiousRatio
 
+		// vNext AI 模式完全绕开旧价格带自动执行：规则只负责生成安全候选，
+		// 是否值得重入交给持久化 AI 调度器。AI 失败时不会回退到下方旧规则。
+		if e.config.RiskReentryDecisionMode == "ai_guarded" {
+			e.handleAIGuardedReentry(mapping, leaderPos, v4Cycle, stoppedAttempt, followerEquity, coolingDown, terminalWatchStatus)
+			delete(e.reentryCandidateTicks, mapping.LeaderPosID)
+			continue
+		}
+		if e.config.RiskReentryDecisionMode == "disabled" {
+			terminalWatchStatus = store.CopyGuardAttemptsExhausted
+		}
+
 		// v5.1 人工重入模式：自动重入次数用尽（ATTEMPTS_EXHAUSTED）且开关开启
 		// 时，不终止观察，继续复用下方完整门控链（冷却/边界/连续确认/金额），
 		// 只把触发点从 emitReentryDecision 换成"落信号 + 邮件提醒人工确认"。
 		// WATCH_TIMEOUT 与噪音档禁入的短路保持不变（人工重入同样尊重这两个
 		// 根本性约束）。
-		manualMode := e.config.RiskManualReentryEnabled &&
-			e.config.RiskReentryEnabled &&
-			terminalWatchStatus == store.CopyGuardAttemptsExhausted &&
-			!noiseDisabled
+		// v7 retires per-order human approval. The legacy-rule path remains only
+		// for existing automatic rules; exhausted attempts never create a manual
+		// execution signal. Existing PENDING rows are migrated to durable AI
+		// candidates at startup and the old confirm endpoint returns 410.
+		manualMode := false
 		// 门控链里的观察态写库：人工模式下周期保持 ATTEMPTS_EXHAUSTED（自动
 		// 重入确已用尽，是对 UI 的真实呈现），非人工模式沿用 STOPPED_WATCHING
 		watchStatus := store.CopyGuardStoppedWatching
@@ -801,7 +927,7 @@ func (e *Engine) checkReentryConditions() {
 		// A 层——自动重入窗口可行性不变量：恢复下界越过追价上限时可行区间为空集
 		// （多单 下界>上界；空单 下界<上界；epsilon 相对容差避免裸浮点误判）。
 		// 自动路径下窗口空集意味着自动重入永远打不出，判定为"实质用尽"→ 持久化
-		// ATTEMPTS_EXHAUSTED 交 v5.1 人工确认接管，杜绝死锁在观察态错过反转。
+		// ATTEMPTS_EXHAUSTED 关闭旧规则自动窗口；v7 不再转人工确认。
 		// leader 平仓/反手、冷却期（chaseLimit=0）、noiseDisabled 均已在前面提前
 		// continue；到此必为"应继续自动观察但可行区间不存在"。
 		windowInfeasible := reentryWindowInfeasible(mapping.Side, reentryBoundary, chaseLimit, reentryAnchor)
@@ -817,7 +943,7 @@ func (e *Engine) checkReentryConditions() {
 				"atr":               currentATR,
 				"mark_price":        markPrice,
 			}})
-			logger.Warnf("🚫 [%s] 自动重入窗口塌缩为空集（下界=%.4f 上界=%.4f），判定自动重入用尽→转人工确认 | cycle=%d %s %s",
+			logger.Warnf("🚫 [%s] legacy 自动重入窗口塌缩为空集（下界=%.4f 上界=%.4f），本周期不再自动重入 | cycle=%d %s %s",
 				e.traderID, reentryBoundary, chaseLimit, v4Cycle.ID, mapping.Symbol, mapping.Side)
 			delete(e.reentryCandidateTicks, mapping.LeaderPosID)
 			continue
@@ -1003,6 +1129,257 @@ func (e *Engine) checkReentryConditions() {
 			_ = e.store.CopyTrade().UpdateCopyGuardObservation(v4Cycle.ID, store.CopyGuardStoppedWatching, entryRef, markPrice, currentATR)
 		}
 	}
+}
+
+// handleAIGuardedReentry 把已完全止损的周期转换为 AI 候选。这里不调用模型、
+// 不下单，只负责确定性数据快照、额度上限和可保护性预检。
+func (e *Engine) handleAIGuardedReentry(mapping *store.CopyTradePositionMapping, leaderPos *Position, cycle *store.CopyGuardCycle, stoppedAttempt *store.CopyGuardAttempt, followerEquity float64, coolingDown bool, terminalStatus string) {
+	if mapping == nil || leaderPos == nil || cycle == nil || e.store == nil {
+		return
+	}
+	// The exchange has confirmed this attempt flat. Remove it from live
+	// portfolio exposure, but retain the spent reservation against the cycle's
+	// cumulative loss budget before evaluating any terminal/reentry branch.
+	_ = e.store.ReentryAI().ConsumeCopyGuardRisk(cycle.ID, cycle.ReentryCount)
+	if !e.config.RiskReentryEnabled {
+		if c, err := e.store.ReentryAI().GetReentryCandidateByCycle(cycle.ID); err == nil {
+			_ = e.store.ReentryAI().MarkReentryCandidateStatus(c.ID, store.ReentryCandidateInvalidated, "reentry disabled")
+		}
+		_ = e.store.CopyTrade().UpdateCopyGuardObservation(cycle.ID, store.CopyGuardAttemptsExhausted, leaderPos.EntryPrice, leaderPos.MarkPrice, 0)
+		return
+	}
+	if terminalStatus != "" {
+		status := store.ReentryCandidateInvalidated
+		if terminalStatus == store.CopyGuardWatchTimeout {
+			status = store.ReentryCandidateExpired
+		}
+		if c, err := e.store.ReentryAI().GetReentryCandidateByCycle(cycle.ID); err == nil {
+			_ = e.store.ReentryAI().MarkReentryCandidateStatus(c.ID, status, terminalStatus)
+		}
+		_ = e.store.CopyTrade().UpdateCopyGuardObservation(cycle.ID, terminalStatus, leaderPos.EntryPrice, leaderPos.MarkPrice, 0)
+		return
+	}
+	mark := leaderPos.MarkPrice
+	if mark <= 0 {
+		mark = leaderPos.EntryPrice
+	}
+	if mark <= 0 {
+		return
+	}
+	atr, _ := market.GetOKXATRWithMaxAge(mapping.Symbol, e.config.RiskATRTimeframe, e.config.RiskATRPeriod, riskATRCacheMaxAge(e.config))
+	if atr <= 0 {
+		atr = mark * e.config.RiskATRFallbackPct
+	}
+	if atr <= 0 {
+		return
+	}
+	stoppedNotional, lastStop, noiseRatio := cycle.FollowerNotional, float64(0), float64(0)
+	if stoppedAttempt != nil {
+		if stoppedAttempt.Notional > 0 {
+			stoppedNotional = stoppedAttempt.Notional
+		}
+		lastStop = attemptStopFillPrice(stoppedAttempt)
+		noiseRatio = stopDistanceATRRatio(cycle, stoppedAttempt)
+	}
+	nominalCap := stoppedNotional * e.config.RiskReentryRatio
+	maxNotional := nominalCap
+	equity := followerEquity
+	if equity <= 0 {
+		equity = cycle.AccountEquity
+	}
+	protectable := false
+	if nominalCap > 0 && equity > 0 {
+		usage, usageErr := e.store.ReentryAI().GetCopyGuardRiskUsageExcludingAttempt(e.traderID, cycle.ID, cycle.ReentryCount+1)
+		availableRisk, capacityErr := AvailableCopyGuardRiskUSD(e.config, equity, usage)
+		if usageErr == nil && capacityErr == nil {
+			if sized, sizeErr := MaxNotionalForRiskDistance(e.config, equity, mark, atr*e.config.RiskATRMultiplier, availableRisk/equity, nominalCap); sizeErr == nil {
+				maxNotional = sized
+				p, err := ComputeRiskDistanceV4(e.config, mark, maxNotional, equity, atr*e.config.RiskATRMultiplier, leaderPos.Leverage)
+				protectable = err == nil && p.Distance/mark >= 0.001 && p.Distance <= 4*atr
+			}
+		}
+	}
+	before, beforeErr := e.store.ReentryAI().GetReentryCandidateByCycle(cycle.ID)
+	// Only a meaningful threshold crossing changes the hash. Every tick still
+	// refreshes the snapshot, but it cannot wake the model merely because price
+	// moved to another arbitrary bucket.
+	priceBucket := math.Floor(mark / math.Max(atr*0.25, mark*0.0001))
+	leaderBucket := math.Floor(leaderPos.Size / math.Max(cycle.BaselineLeaderSize*0.05, 1e-9))
+	featureHash := fmt.Sprintf("initial|p%.0f|l%.0f|r%d|s%d", priceBucket, leaderBucket, cycle.ReentryCount, cycle.StopCount)
+	pendingTrigger := "STOP_FLAT_CONFIRMED"
+	if beforeErr == nil && before != nil {
+		featureHash = before.FeatureHash
+		pendingTrigger = before.PendingTrigger
+		prevATR := before.ATR
+		if prevATR <= 0 {
+			prevATR = atr
+		}
+		inRange := func(price, low, high float64) bool { return low > 0 && high >= low && price >= low && price <= high }
+		currentNearLeader := leaderPos.EntryPrice > 0 && math.Abs(mark-leaderPos.EntryPrice) <= 0.5*atr
+		previousNearLeader := before.LeaderEntryPrice > 0 && math.Abs(before.TriggerPrice-before.LeaderEntryPrice) <= 0.5*prevATR
+		currentRecovered, previousRecovered := false, false
+		if lastStop > 0 {
+			if mapping.Side == string(SideLong) {
+				currentRecovered = mark >= lastStop+0.5*atr
+				previousRecovered = before.TriggerPrice >= before.LastStopPrice+0.5*prevATR
+			} else {
+				currentRecovered = mark <= lastStop-0.5*atr
+				previousRecovered = before.TriggerPrice <= before.LastStopPrice-0.5*prevATR
+			}
+		}
+		leaderStep := math.Max(cycle.BaselineLeaderSize*0.05, 1e-9)
+		prevLeaderBucket := math.Floor(before.LeaderSize / leaderStep)
+		atrReference := cycle.ATRAtStop
+		if atrReference <= 0 {
+			atrReference = before.ATR
+		}
+		atrStep := math.Max(atrReference*0.20, mark*0.000001)
+		currentATRBucket, previousATRBucket := math.Floor(atr/atrStep), math.Floor(before.ATR/atrStep)
+		costStep := math.Max(atr*0.25, mark*0.0001)
+		currentCostBucket, previousCostBucket := math.Floor(leaderPos.EntryPrice/costStep), math.Floor(before.LeaderEntryPrice/costStep)
+		candleTrigger, candleHash := e.aiClosedCandleFeature(cycle.ID, mapping.Symbol, mapping.Side, before)
+		switch {
+		case inRange(mark, before.AttentionPriceLow, before.AttentionPriceHigh) && !inRange(before.TriggerPrice, before.AttentionPriceLow, before.AttentionPriceHigh):
+			pendingTrigger = "AI_ATTENTION_ZONE"
+		case candleTrigger != "":
+			pendingTrigger = candleTrigger
+			featureHash = candleHash
+		case leaderBucket != prevLeaderBucket:
+			pendingTrigger = "LEADER_SIZE_CHANGE"
+		case before.LeaderEntryPrice > 0 && currentCostBucket != previousCostBucket:
+			pendingTrigger = "LEADER_COST_CHANGE"
+		case before.ATR > 0 && currentATRBucket != previousATRBucket:
+			pendingTrigger = "ATR_CHANGE"
+		case currentNearLeader && !previousNearLeader:
+			pendingTrigger = "LEADER_ENTRY_ZONE"
+		case currentRecovered && !previousRecovered:
+			pendingTrigger = "STOP_RECOVERY"
+		default:
+			pendingTrigger = before.PendingTrigger
+		}
+		if pendingTrigger != before.PendingTrigger {
+			featureHash = fmt.Sprintf("%s|p%.0f|a%.8f|l%.0f|r%d|s%d", pendingTrigger, priceBucket, atr, leaderBucket, cycle.ReentryCount, cycle.StopCount)
+		}
+	}
+	firstReview := time.Now()
+	if cycle.StoppedAt != nil {
+		firstReview = cycle.StoppedAt.Add(time.Duration(e.config.RiskReentryCooldownSeconds) * time.Second)
+		if firstReview.Before(time.Now()) {
+			firstReview = time.Now()
+		}
+	}
+	candidate, err := e.store.ReentryAI().EnsureReentryCandidate(&store.CopyGuardReentryCandidate{
+		CycleID: cycle.ID, TraderID: e.traderID, LeaderPosID: mapping.LeaderPosID,
+		Symbol: mapping.Symbol, Side: mapping.Side, MarginMode: mapping.MarginMode,
+		TriggerPrice: mark, ATR: atr, MaxNotional: maxNotional, StopCount: cycle.StopCount,
+		ReentryCount: cycle.ReentryCount, LeaderSize: leaderPos.Size, LeaderEntryPrice: leaderPos.EntryPrice,
+		LastStopPrice: lastStop, DistanceATRRatio: noiseRatio, Protectable: protectable,
+		FeatureHash: featureHash, PendingTrigger: pendingTrigger,
+	}, firstReview)
+	if err != nil {
+		logger.Warnf("[CopyGuard] trader=%s cycle=%d event=AI_CANDIDATE_CREATE_FAILED reason=%v", e.traderID, cycle.ID, err)
+		return
+	}
+	cycleStatus := copyGuardCycleStatusForCandidate(candidate.Status)
+	_ = e.store.CopyTrade().UpdateCopyGuardObservation(cycle.ID, cycleStatus, leaderPos.EntryPrice, mark, atr)
+	gate := "AI_WATCHING"
+	if coolingDown {
+		gate = watchGateCooldown
+	}
+	e.recordWatchSample(cycle, leaderPos, mark, atr, 0, 0, gate)
+	if beforeErr != nil {
+		_ = e.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: e.traderID, Type: "AI_CANDIDATE_CREATED", Price: mark, Notional: maxNotional, Metadata: map[string]interface{}{"candidate_id": candidate.ID, "attempt_no": cycle.ReentryCount + 1, "next_review_at": candidate.NextReviewAt, "protectable": protectable, "feature_hash": featureHash}})
+	}
+}
+
+func copyGuardCycleStatusForCandidate(candidateStatus string) string {
+	switch candidateStatus {
+	case store.ReentryCandidateReviewing:
+		return store.CopyGuardAIReviewing
+	case store.ReentryCandidateWaiting, store.ReentryCandidatePaused:
+		return store.CopyGuardAIWaiting
+	case store.ReentryCandidateEntryPending:
+		return store.CopyGuardReentryPending
+	case store.ReentryCandidateAbandoned, store.ReentryCandidateInvalidated:
+		return store.CopyGuardAIAbandoned
+	case store.ReentryCandidateExpired:
+		return store.CopyGuardWatchTimeout
+	case store.ReentryCandidateBudgetSuspended:
+		return store.CopyGuardBudgetSuspended
+	default:
+		return store.CopyGuardAIWatching
+	}
+}
+
+// aiClosedCandleFeature emits only meaningful, original-direction reversal
+// evidence from a newly closed 5m candle. It only decides when another paid
+// review is worth scheduling; the AI still evaluates the complete datapack.
+func (e *Engine) aiClosedCandleFeature(cycleID int64, symbol, side string, candidate *store.CopyGuardReentryCandidate) (string, string) {
+	if candidate == nil || candidate.LastReviewAt == nil {
+		return "", ""
+	}
+	if e.lastAICandleFeatureCheck == nil {
+		e.lastAICandleFeatureCheck = make(map[int64]time.Time)
+	}
+	now := time.Now()
+	if last := e.lastAICandleFeatureCheck[cycleID]; !last.IsZero() && now.Sub(last) < 30*time.Second {
+		return "", ""
+	}
+	e.lastAICandleFeatureCheck[cycleID] = now
+	klines, err := market.GetOKXCompletedCandles(symbol, "5m", 21)
+	if err != nil {
+		// Price structure remains useful if the volume endpoint is temporarily
+		// unavailable; volume confirmation simply stays disabled for this tick.
+		klines, err = market.GetOKXCompletedMarkCandles(symbol, "5m", 8)
+	}
+	if err != nil || len(klines) < 7 {
+		return "", ""
+	}
+	latest := klines[len(klines)-1]
+	// A candle that closed after the previous review may justify a new call,
+	// even if that review happened after the candle opened.
+	if !time.UnixMilli(latest.OpenTime).Add(5 * time.Minute).After(*candidate.LastReviewAt) {
+		return "", ""
+	}
+	prev := klines[len(klines)-6 : len(klines)-1]
+	maxHigh, minLow := prev[0].High, prev[0].Low
+	for _, k := range prev[1:] {
+		if k.High > maxHigh {
+			maxHigh = k.High
+		}
+		if k.Low < minLow {
+			minLow = k.Low
+		}
+	}
+	recentSlope := latest.Close - klines[len(klines)-3].Close
+	priorSlope := klines[len(klines)-3].Close - klines[len(klines)-6].Close
+	breakout, slopeFlip, volumeConfirmed := false, false, false
+	if side == string(SideLong) {
+		breakout = latest.Close > maxHigh
+		slopeFlip = recentSlope > 0 && priorSlope <= 0
+	} else {
+		breakout = latest.Close < minLow
+		slopeFlip = recentSlope < 0 && priorSlope >= 0
+	}
+	if latest.Volume > 0 && len(klines) >= 21 {
+		avgVolume := float64(0)
+		for _, k := range klines[len(klines)-21 : len(klines)-1] {
+			avgVolume += k.Volume
+		}
+		avgVolume /= 20
+		directional := (side == string(SideLong) && latest.Close > latest.Open) || (side == string(SideShort) && latest.Close < latest.Open)
+		volumeConfirmed = directional && avgVolume > 0 && latest.Volume >= 1.5*avgVolume
+	}
+	if !breakout && !slopeFlip && !volumeConfirmed {
+		return "", ""
+	}
+	kind := "MA_SLOPE_REVERSAL"
+	if breakout {
+		kind = "STRUCTURE_BREAK"
+	} else if volumeConfirmed {
+		kind = "VOLUME_CONFIRMATION"
+	}
+	return kind, fmt.Sprintf("%s|c%d|close%.8f|vol%.4f|side%s", kind, latest.OpenTime, latest.Close, latest.Volume, side)
 }
 
 // findStoppedAttempt 找到当前观察期对应的被止损 attempt（attempt_no =
@@ -1273,7 +1650,7 @@ func (e *Engine) recordWatchSample(cycle *store.CopyGuardCycle, leaderPos *Posit
 		}
 	}
 	_ = e.store.CopyTrade().SaveCopyGuardWatchSample(&store.CopyGuardWatchSample{
-		CycleID: cycle.ID, TraderID: e.traderID, MarkPrice: markPrice, ATR: atr,
+		CycleID: cycle.ID, TraderID: e.traderID, AttemptNo: cycle.ReentryCount, MarkPrice: markPrice, ATR: atr,
 		LeaderEntryPrice: leaderEntry, LeaderSize: leaderSize,
 		ReentryBoundary: boundary, ChaseLimit: chaseLimit, Gate: gate,
 	})
@@ -1321,6 +1698,7 @@ func emitWatchSummary(cs *store.CopyTradeStore, traderID string, cycle *store.Co
 	// 观察期价格轨迹统计（相对最后一次止损成交价；有利 = 朝原持仓方向恢复）
 	var maxFavorable, maxAdverse float64
 	firstRecoverySec := float64(-1)
+	attemptRecovery := make([]map[string]interface{}, 0, len(attempts))
 	blockedWhenRecovered := map[string]int{}
 	gateSeconds := map[string]float64{}
 	leaderAddons, leaderReductions := 0, 0
@@ -1342,7 +1720,9 @@ func emitWatchSummary(cs *store.CopyTradeStore, traderID string, cycle *store.Co
 			((long && w.MarkPrice >= w.ReentryBoundary) || (!long && w.MarkPrice <= w.ReentryBoundary))
 		if recovered {
 			if firstRecoverySec < 0 && cycle.StoppedAt != nil {
-				firstRecoverySec = w.CreatedAt.Sub(*cycle.StoppedAt).Seconds()
+				if elapsed := w.CreatedAt.Sub(*cycle.StoppedAt).Seconds(); elapsed >= 0 {
+					firstRecoverySec = elapsed
+				}
 			}
 			if w.Gate != watchGateReentryTriggered && w.Gate != watchGatePriceNotReturned {
 				blockedWhenRecovered[w.Gate]++
@@ -1361,10 +1741,48 @@ func emitWatchSummary(cs *store.CopyTradeStore, traderID string, cycle *store.Co
 		}
 		prev = w
 	}
+	// 每次止损分别计算恢复时间与观察期 MAE/MFE，防止第一次、第二次重入
+	// 的 watch 样本混在一起。旧 schema 的 attempt_no=0 只保留周期级统计。
+	for _, attempt := range attempts {
+		if attempt.Status != "STOPPED" || attempt.ClosedAt == nil || attempt.ExitPrice <= 0 {
+			continue
+		}
+		first := float64(-1)
+		mfe, mae, sampleCount := float64(0), float64(0), 0
+		for _, w := range samples {
+			if w.AttemptNo != attempt.AttemptNo || w.CreatedAt.Before(*attempt.ClosedAt) {
+				continue
+			}
+			sampleCount++
+			diff := w.MarkPrice - attempt.ExitPrice
+			if !long {
+				diff = -diff
+			}
+			if diff > mfe {
+				mfe = diff
+			}
+			if -diff > mae {
+				mae = -diff
+			}
+			recovered := w.ReentryBoundary > 0 && ((long && w.MarkPrice >= w.ReentryBoundary) || (!long && w.MarkPrice <= w.ReentryBoundary))
+			if recovered && first < 0 {
+				first = w.CreatedAt.Sub(*attempt.ClosedAt).Seconds()
+			}
+		}
+		attemptRecovery = append(attemptRecovery, map[string]interface{}{
+			"attempt_no": attempt.AttemptNo, "first_recovery_seconds": first,
+			"max_favorable_excursion": mfe, "max_adverse_excursion": mae,
+			"max_favorable_excursion_usd": mfe * attempt.Quantity,
+			"max_adverse_excursion_usd":   mae * attempt.Quantity,
+			"sample_count":                sampleCount,
+		})
+	}
 
 	watchSeconds := float64(0)
 	if cycle.StoppedAt != nil {
-		watchSeconds = time.Since(*cycle.StoppedAt).Seconds()
+		if elapsed := time.Since(*cycle.StoppedAt).Seconds(); elapsed > 0 {
+			watchSeconds = elapsed
+		}
 	}
 	meta := map[string]interface{}{
 		"stop_count":              cycle.StopCount,
@@ -1377,6 +1795,7 @@ func emitWatchSummary(cs *store.CopyTradeStore, traderID string, cycle *store.Co
 		"max_favorable_excursion": maxFavorable,
 		"max_adverse_excursion":   maxAdverse,
 		"first_recovery_seconds":  firstRecoverySec,
+		"attempt_recovery":        attemptRecovery,
 	}
 	if len(blockedWhenRecovered) > 0 {
 		meta["blocked_when_recovered"] = blockedWhenRecovered

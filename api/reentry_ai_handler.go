@@ -199,6 +199,10 @@ func (h *ReentryAIHandler) AnalyzeInternal(c *gin.Context) {
 	if analysis == nil {
 		return
 	}
+	if analysis.CandidateID > 0 {
+		c.JSON(409, gin.H{"error": "AI 候选分析由持久化调度器管理，禁止手动触发"})
+		return
+	}
 	if err := reentryadvisor.AnalyzeAnalysis(analysis.ID); err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return

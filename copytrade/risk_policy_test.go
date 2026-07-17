@@ -3,6 +3,8 @@ package copytrade
 import (
 	"math"
 	"testing"
+
+	"nofx/store"
 )
 
 func TestComputeRiskDistanceV4ATRGovernsWhenCapsAreWider(t *testing.T) {
@@ -192,5 +194,80 @@ func TestValidateRiskPolicyV4(t *testing.T) {
 	c.RiskUnprotectableAction = "follow"
 	if err := ValidateRiskPolicyV4(c); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestValidateRiskPolicyAIReviewLimitsAreIndependent(t *testing.T) {
+	c := &CopyConfig{ProviderType: ProviderOKX, RiskPolicyVersion: 7}
+	c.FillRiskDefaults()
+	c.RiskAIDailyCallLimit = 12
+	c.RiskAILifecycleCallLimit = 5
+	if err := ValidateRiskPolicyV4(c); err != nil {
+		t.Fatalf("lifecycle limit may be lower than the rolling daily ceiling: %v", err)
+	}
+	c.RiskAIDailyCallLimit = 13
+	if err := ValidateRiskPolicyV4(c); err == nil {
+		t.Fatal("daily limit above 12 must be rejected")
+	}
+	c.RiskAIDailyCallLimit = 12
+	c.RiskAILifecycleCallLimit = 31
+	if err := ValidateRiskPolicyV4(c); err == nil {
+		t.Fatal("lifecycle limit above 30 must be rejected")
+	}
+}
+
+func TestBuildProtectionPlanKeepsFeesAndSlippageInsideBudget(t *testing.T) {
+	c := &CopyConfig{RiskATRMultiplier: 2, RiskSlippageBufferBPS: 10, RiskRoundTripFeeBPS: 12}
+	plan, err := BuildProtectionPlan(c, SideLong, 100, 2, 97, 1000, 0.02, 10000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.StopDistance != 4 || plan.StopPrice != 96 {
+		t.Fatalf("ATR/structure stop changed unexpectedly: %+v", plan)
+	}
+	if plan.ExpectedLossUSD > 20+1e-9 || plan.MaxNotional <= 0 {
+		t.Fatalf("fees and slippage must remain inside 2%% budget: %+v", plan)
+	}
+	// A narrower account budget must resize notional, never squeeze the 2x ATR stop.
+	smaller, err := BuildProtectionPlan(c, SideLong, 100, 2, 97, 1000, 0.01, 10000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if smaller.StopDistance != plan.StopDistance || smaller.MaxNotional >= plan.MaxNotional {
+		t.Fatalf("budget must shrink quantity without moving stop: old=%+v new=%+v", plan, smaller)
+	}
+}
+
+func TestBuildProtectionPlanRejectsStructureBeyondFourATR(t *testing.T) {
+	c := &CopyConfig{RiskATRMultiplier: 2, RiskSlippageBufferBPS: 10, RiskRoundTripFeeBPS: 12}
+	if _, err := BuildProtectionPlan(c, SideLong, 100, 2, 90, 1000, 0.02, 1000); err == nil {
+		t.Fatal("an invalidation beyond 4 ATR must reject entry instead of squeezing the stop")
+	}
+}
+
+func TestMaxNotionalRiskFrictionBoundary(t *testing.T) {
+	c := &CopyConfig{RiskSlippageBufferBPS: 10, RiskRoundTripFeeBPS: 12}
+	notional, err := MaxNotionalForRiskDistance(c, 500, 2000, 40, 0.02, 100000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loss := notional * (40.0/2000.0 + 22.0/10000.0)
+	if math.Abs(loss-10) > 1e-9 {
+		t.Fatalf("planned loss %.12f must exactly respect $10 budget", loss)
+	}
+}
+
+func TestAvailableCopyGuardRiskUsesSmallestRemainingBudget(t *testing.T) {
+	c := &CopyConfig{RiskAccountPct: .02, RiskCycleLossBudgetPct: .05, RiskPortfolioLossBudgetPct: .08}
+	available, err := AvailableCopyGuardRiskUSD(c, 1000, store.CopyGuardRiskUsage{CycleUsedUSD: 34, PortfolioUsedUSD: 65})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// attempt=20, cycle remaining=16, portfolio remaining=15.
+	if math.Abs(available-15) > 1e-9 {
+		t.Fatalf("available risk = %.8f, want 15", available)
+	}
+	if _, err := AvailableCopyGuardRiskUSD(c, 1000, store.CopyGuardRiskUsage{PortfolioUsedUSD: 80}); err == nil {
+		t.Fatal("exhausted portfolio budget must reject sizing")
 	}
 }

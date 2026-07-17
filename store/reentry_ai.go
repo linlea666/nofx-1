@@ -10,35 +10,41 @@ import (
 // ============================================================================
 // 重入 AI 助手（Reentry Advisor）存储层
 //
-// 定位：人工重入信号（copy_guard_manual_reentry_signals）产生后，插件为其
-// 生成"决策数据包 + Prompt"并落库，供前端可复制透明化展示与后续 AI 分析。
+// 定位：Copy Guard 持久化候选的每次模型调用都保存数据快照、Prompt、
+// 原始回复、严格解析结果、调用状态和最终结局。历史人工信号字段仅保留为
+// 只读兼容，v7 执行路径不再依赖人工确认。
 //
 // 两张表：
-//   reentry_ai_analyses  每条信号的分析记录（同信号可多条：手动"重新生成"
-//                        会产生新快照，内/外部 AI 结果各自绑定所属快照）
+//   reentry_ai_analyses  每个候选/历史信号的完整调用审计记录
 //   reentry_ai_config    单行全局配置（Phase 1 仅 enabled 生效；provider/
 //                        model/prompt_template/confidence_threshold 等列为
 //                        Phase 2 内置 AI 分析预留，避免后续 ALTER）
 //
-// 设计约束（插件化铁律）：本文件只新增表与读取既有表，不修改任何 Copy Guard
-// 既有表结构与写路径；插件关闭时这些表静默闲置，对跟单零影响。
+// AI 关闭时分析表静默闲置；候选与订单的确定性风控状态由 Copy Guard 表维护。
 // ============================================================================
 
 // 外部/内部 AI 结论标签（准确率对比用；空串=未标注）
 const (
-	ReentryVerdictEnter = "ENTER"
-	ReentryVerdictWait  = "WAIT"
-	ReentryVerdictSkip  = "SKIP"
+	ReentryVerdictEnter   = "ENTER"
+	ReentryVerdictWait    = "WAIT"
+	ReentryVerdictSkip    = "SKIP"
+	ReentryVerdictAbandon = "ABANDON"
 )
 
 // ReentryAIAnalysis 一次数据包快照 + 双 AI 结果载体
 type ReentryAIAnalysis struct {
-	ID       int64  `json:"id"`
-	SignalID int64  `json:"signal_id"`
-	TraderID string `json:"trader_id"`
-	CycleID  int64  `json:"cycle_id"`
-	Symbol   string `json:"symbol"`
-	Side     string `json:"side"`
+	ID                 int64  `json:"id"`
+	SignalID           int64  `json:"signal_id"`
+	CandidateID        int64  `json:"candidate_id"`
+	TraderID           string `json:"trader_id"`
+	CycleID            int64  `json:"cycle_id"`
+	Symbol             string `json:"symbol"`
+	Side               string `json:"side"`
+	AttemptNo          int    `json:"attempt_no"`
+	DecisionGeneration int    `json:"decision_generation"`
+	CallStatus         string `json:"call_status"`
+	CallError          string `json:"call_error,omitempty"`
+	DataHash           string `json:"data_hash"`
 
 	// 透明化三段的持久化载体
 	SystemPrompt string `json:"system_prompt"`
@@ -60,6 +66,7 @@ type ReentryAIAnalysis struct {
 	ExternalVerdict  string `json:"external_verdict"`
 
 	PromptVersion string     `json:"prompt_version"`
+	SnapshotPrice float64    `json:"snapshot_price"`
 	SnapshotAt    time.Time  `json:"snapshot_at"`
 	OutcomePnL    *float64   `json:"outcome_pnl,omitempty"` // 周期闭合后回填（Phase 2）
 	CreatedAt     time.Time  `json:"created_at"`
@@ -70,11 +77,11 @@ type ReentryAIAnalysis struct {
 type ReentryAIConfig struct {
 	Enabled             bool    `json:"enabled"`              // 插件总开关（控制数据包自动生成）
 	AIEnabled           bool    `json:"ai_enabled"`           // Phase 2：新信号自动触发内置 AI 分析（默认关；手动"AI 分析"按钮不受此开关限制）
-	AutoEntryEnabled    bool    `json:"auto_entry_enabled"`   // Phase 3：AI 结论 ENTER 且置信度达标时自动确认重入（默认关；依赖 ai_enabled）
+	AutoEntryEnabled    bool    `json:"auto_entry_enabled"`   // ai_guarded 候选真实执行的全局安全开关（默认关；依赖 ai_enabled）
 	Provider            string  `json:"provider"`             // 展示用 provider（实际密钥由 model 指向的 ai_models 行决定）
 	Model               string  `json:"model"`                // ai_models 表的模型 ID（空=自动选用已启用的默认模型）
 	PromptTemplate      string  `json:"prompt_template"`      // 自定义 System Prompt 模板（空=内置默认；在数据包生成时固化进快照）
-	ConfidenceThreshold float64 `json:"confidence_threshold"` // Phase 3：自动入场置信度门槛
+	ConfidenceThreshold float64 `json:"confidence_threshold"` // AI 候选 ENTER_NOW 的全局最低置信度门槛
 	TimeoutSeconds      int     `json:"timeout_seconds"`      // AI 调用超时
 }
 
@@ -88,10 +95,16 @@ func (s *ReentryAIStore) initTables() error {
 		CREATE TABLE IF NOT EXISTS reentry_ai_analyses (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			signal_id INTEGER NOT NULL,
+			candidate_id INTEGER NOT NULL DEFAULT 0,
 			trader_id TEXT NOT NULL,
 			cycle_id INTEGER NOT NULL,
 			symbol TEXT NOT NULL DEFAULT '',
 			side TEXT NOT NULL DEFAULT '',
+			attempt_no INTEGER NOT NULL DEFAULT 0,
+			decision_generation INTEGER NOT NULL DEFAULT 0,
+			call_status TEXT NOT NULL DEFAULT 'PENDING',
+			call_error TEXT NOT NULL DEFAULT '',
+			data_hash TEXT NOT NULL DEFAULT '',
 			system_prompt TEXT NOT NULL DEFAULT '',
 			user_prompt TEXT NOT NULL DEFAULT '',
 			datapack_json TEXT NOT NULL DEFAULT '',
@@ -104,6 +117,7 @@ func (s *ReentryAIStore) initTables() error {
 			external_response TEXT DEFAULT '',
 			external_verdict TEXT DEFAULT '',
 			prompt_version TEXT DEFAULT '',
+			snapshot_price REAL DEFAULT 0,
 			snapshot_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 			outcome_pnl REAL,
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -127,26 +141,36 @@ func (s *ReentryAIStore) initTables() error {
 	if err != nil {
 		return err
 	}
+	s.db.Exec(`ALTER TABLE reentry_ai_analyses ADD COLUMN candidate_id INTEGER NOT NULL DEFAULT 0`)
+	s.db.Exec(`ALTER TABLE reentry_ai_analyses ADD COLUMN snapshot_price REAL DEFAULT 0`)
+	s.db.Exec(`ALTER TABLE reentry_ai_analyses ADD COLUMN attempt_no INTEGER NOT NULL DEFAULT 0`)
+	s.db.Exec(`ALTER TABLE reentry_ai_analyses ADD COLUMN decision_generation INTEGER NOT NULL DEFAULT 0`)
+	s.db.Exec(`ALTER TABLE reentry_ai_analyses ADD COLUMN call_status TEXT NOT NULL DEFAULT 'PENDING'`)
+	s.db.Exec(`ALTER TABLE reentry_ai_analyses ADD COLUMN call_error TEXT NOT NULL DEFAULT ''`)
+	s.db.Exec(`ALTER TABLE reentry_ai_analyses ADD COLUMN data_hash TEXT NOT NULL DEFAULT ''`)
+	s.db.Exec(`UPDATE reentry_ai_analyses SET call_status=CASE WHEN verdict<>'' THEN 'COMPLETED' WHEN raw_response<>'' THEN 'INVALID' ELSE call_status END WHERE call_status='PENDING'`)
+	s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_reentry_ai_analyses_candidate ON reentry_ai_analyses(candidate_id,id)`)
 	// 早期建表缺列时老库补列（重复执行报 duplicate column 忽略）
 	s.db.Exec(`ALTER TABLE reentry_ai_config ADD COLUMN ai_enabled BOOLEAN DEFAULT 0`)
 	s.db.Exec(`ALTER TABLE reentry_ai_config ADD COLUMN auto_entry_enabled BOOLEAN DEFAULT 0`)
-	return nil
+	return s.initReentryCandidateTables()
 }
 
-const reentryAnalysisColumns = `id, signal_id, trader_id, cycle_id, symbol, side,
+const reentryAnalysisColumns = `id, signal_id, candidate_id, trader_id, cycle_id, symbol, side, attempt_no, decision_generation, call_status, call_error, data_hash,
 	system_prompt, user_prompt, datapack_json, market_data_available, missing_fields,
 	raw_response, verdict, confidence, reasons, external_response, external_verdict,
-	prompt_version, snapshot_at, outcome_pnl, created_at, updated_at`
+	prompt_version, snapshot_price, snapshot_at, outcome_pnl, created_at, updated_at`
 
 func scanReentryAnalysis(row rowScanner) (*ReentryAIAnalysis, error) {
 	var a ReentryAIAnalysis
 	var snapshot, created string
 	var updated sql.NullString
 	var outcome sql.NullFloat64
-	if err := row.Scan(&a.ID, &a.SignalID, &a.TraderID, &a.CycleID, &a.Symbol, &a.Side,
+	if err := row.Scan(&a.ID, &a.SignalID, &a.CandidateID, &a.TraderID, &a.CycleID, &a.Symbol, &a.Side,
+		&a.AttemptNo, &a.DecisionGeneration, &a.CallStatus, &a.CallError, &a.DataHash,
 		&a.SystemPrompt, &a.UserPrompt, &a.DatapackJSON, &a.MarketDataAvailable, &a.MissingFields,
 		&a.RawResponse, &a.Verdict, &a.Confidence, &a.Reasons, &a.ExternalResponse, &a.ExternalVerdict,
-		&a.PromptVersion, &snapshot, &outcome, &created, &updated); err != nil {
+		&a.PromptVersion, &a.SnapshotPrice, &snapshot, &outcome, &created, &updated); err != nil {
 		return nil, err
 	}
 	var err error
@@ -172,11 +196,11 @@ func (s *ReentryAIStore) SaveReentryAnalysis(a *ReentryAIAnalysis) (*ReentryAIAn
 		return nil, fmt.Errorf("nil reentry analysis")
 	}
 	res, err := s.db.Exec(`INSERT INTO reentry_ai_analyses
-		(signal_id, trader_id, cycle_id, symbol, side, system_prompt, user_prompt, datapack_json,
-		 market_data_available, missing_fields, prompt_version, snapshot_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
-		a.SignalID, a.TraderID, a.CycleID, a.Symbol, a.Side, a.SystemPrompt, a.UserPrompt, a.DatapackJSON,
-		a.MarketDataAvailable, a.MissingFields, a.PromptVersion)
+		(signal_id, candidate_id, trader_id, cycle_id, symbol, side, attempt_no, decision_generation, call_status, call_error, data_hash, system_prompt, user_prompt, datapack_json,
+		 market_data_available, missing_fields, prompt_version, snapshot_price, snapshot_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+		a.SignalID, a.CandidateID, a.TraderID, a.CycleID, a.Symbol, a.Side, a.AttemptNo, a.DecisionGeneration, defaultCallStatus(a.CallStatus), a.CallError, a.DataHash, a.SystemPrompt, a.UserPrompt, a.DatapackJSON,
+		a.MarketDataAvailable, a.MissingFields, a.PromptVersion, a.SnapshotPrice)
 	if err != nil {
 		return nil, err
 	}
@@ -185,6 +209,13 @@ func (s *ReentryAIStore) SaveReentryAnalysis(a *ReentryAIAnalysis) (*ReentryAIAn
 		return nil, err
 	}
 	return s.GetReentryAnalysis(id)
+}
+
+func defaultCallStatus(status string) string {
+	if status == "" {
+		return "PENDING"
+	}
+	return status
 }
 
 // GetReentryAnalysis 按 ID 读取
@@ -199,6 +230,29 @@ func (s *ReentryAIStore) ListReentryAnalysesBySignal(signalID int64, limit int) 
 		limit = 10
 	}
 	rows, err := s.db.Query(`SELECT `+reentryAnalysisColumns+` FROM reentry_ai_analyses WHERE signal_id=? ORDER BY id DESC LIMIT ?`, signalID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*ReentryAIAnalysis{}
+	for rows.Next() {
+		a, err := scanReentryAnalysis(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+// ListReentryAnalysesByCycle returns the complete AI decision history needed
+// to reconstruct a Copy Guard cycle export. The hard cap prevents an invalid
+// request from turning the audit endpoint into an unbounded query.
+func (s *ReentryAIStore) ListReentryAnalysesByCycle(cycleID int64, limit int) ([]*ReentryAIAnalysis, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 200
+	}
+	rows, err := s.db.Query(`SELECT `+reentryAnalysisColumns+` FROM reentry_ai_analyses WHERE cycle_id=? ORDER BY id LIMIT ?`, cycleID, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -285,12 +339,18 @@ func (s *ReentryAIStore) UpdateReentryExternal(id int64, externalResponse, exter
 // verdict 允许空串（表示原始回复解析失败，仅存 raw 供人工查看）。
 func (s *ReentryAIStore) UpdateReentryInternalResult(id int64, rawResponse, verdict string, confidence float64, reasons string) error {
 	switch verdict {
-	case "", ReentryVerdictEnter, ReentryVerdictWait, ReentryVerdictSkip:
+	case "", ReentryVerdictEnter, ReentryVerdictWait, ReentryVerdictSkip, ReentryVerdictAbandon:
 	default:
 		return fmt.Errorf("无效的内部结论标签: %s", verdict)
 	}
-	res, err := s.db.Exec(`UPDATE reentry_ai_analyses SET raw_response=?, verdict=?, confidence=?, reasons=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
-		rawResponse, verdict, confidence, reasons, id)
+	callStatus := "COMPLETED"
+	callError := ""
+	if verdict == "" {
+		callStatus = "INVALID"
+		callError = "model response did not match the strict schema"
+	}
+	res, err := s.db.Exec(`UPDATE reentry_ai_analyses SET raw_response=?, verdict=?, confidence=?, reasons=?,call_status=?,call_error=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
+		rawResponse, verdict, confidence, reasons, callStatus, callError, id)
 	if err != nil {
 		return err
 	}
@@ -302,6 +362,62 @@ func (s *ReentryAIStore) UpdateReentryInternalResult(id int64, rawResponse, verd
 		return fmt.Errorf("分析记录不存在: %d", id)
 	}
 	return nil
+}
+
+func (s *ReentryAIStore) MarkReentryAnalysisFailed(id int64, message string) error {
+	res, err := s.db.Exec(`UPDATE reentry_ai_analyses SET call_status='FAILED',call_error=?,updated_at=CURRENT_TIMESTAMP WHERE id=?`, message, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return fmt.Errorf("分析记录不存在: %d", id)
+	}
+	return nil
+}
+
+func (s *ReentryAIStore) MarkReentryAnalysisRunning(id int64) error {
+	res, err := s.db.Exec(`UPDATE reentry_ai_analyses SET call_status='RUNNING',call_error='',updated_at=CURRENT_TIMESTAMP WHERE id=? AND candidate_id>0 AND call_status='PENDING'`, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return fmt.Errorf("candidate analysis is no longer pending: %d", id)
+	}
+	return nil
+}
+
+func (s *ReentryAIStore) HasCompletedCandidateDataHash(candidateID, beforeID int64, dataHash string) (bool, error) {
+	if candidateID <= 0 || beforeID <= 0 || dataHash == "" {
+		return false, nil
+	}
+	var exists int
+	err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM reentry_ai_analyses WHERE candidate_id=? AND id<? AND data_hash=? AND call_status='COMPLETED')`, candidateID, beforeID, dataHash).Scan(&exists)
+	return exists == 1, err
+}
+
+func (s *ReentryAIStore) ListCandidateAnalysesPendingOutcome(limit int) ([]*ReentryAIAnalysis, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	rows, err := s.db.Query(`SELECT `+reentryAnalysisColumns+` FROM reentry_ai_analyses WHERE candidate_id>0 AND verdict=? AND call_status='COMPLETED' AND outcome_pnl IS NULL ORDER BY id LIMIT ?`, ReentryVerdictEnter, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*ReentryAIAnalysis
+	for rows.Next() {
+		a, err := scanReentryAnalysis(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+func (s *ReentryAIStore) SetReentryOutcomeForAnalysis(analysisID int64, pnl float64) error {
+	_, err := s.db.Exec(`UPDATE reentry_ai_analyses SET outcome_pnl=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND outcome_pnl IS NULL`, pnl, analysisID)
+	return err
 }
 
 // ListExecutedSignalIDsPendingOutcome 已执行（EXECUTED）但分析记录尚未回填
@@ -341,7 +457,8 @@ func (s *ReentryAIStore) SetReentryOutcomeForSignal(signalID int64, pnl float64)
 // 口径（按信号去重）：同一信号"重新生成"会产生多个快照，为避免重复快照
 // 放大样本，内部/外部各取"该信号最新一条带相应结论的快照"作为唯一样本。
 // 准确率：仅统计有结局盈亏的样本；ENTER 且盈利 / SKIP 且亏损 记为正确；
-// WAIT 不计入（无对错基准）。结局盈亏 = 该信号重入尝试的已对账净额（pnl−fee）。
+// WAIT 不计入（无对错基准）。结局盈亏直接使用已对账 attempt.PnL；
+// OKX 已实现盈亏已包含手续费，不得再减 attempt.Fee。
 type ReentryAIStats struct {
 	TotalAnalyses  int `json:"total_analyses"`
 	SignalsCovered int `json:"signals_covered"`
@@ -354,6 +471,15 @@ type ReentryAIStats struct {
 	InternalCorrect int `json:"internal_correct"`
 	ExternalScored  int `json:"external_scored"`
 	ExternalCorrect int `json:"external_correct"`
+
+	// Candidate calls are never deduplicated away: WAIT, ABANDON, invalid
+	// schema and transport/model failures all remain visible. Accuracy is only
+	// computed where an ENTER analysis maps to a reconciled attempt.
+	CandidateAnalyses     int            `json:"candidate_analyses"`
+	CandidateDecisions    map[string]int `json:"candidate_decisions"`
+	CandidateCallStatuses map[string]int `json:"candidate_call_statuses"`
+	CandidateScored       int            `json:"candidate_scored"`
+	CandidateProfitable   int            `json:"candidate_profitable"`
 }
 
 // sqlMarks 生成 "?,?,...,?" 占位符
@@ -365,8 +491,10 @@ func sqlMarks(n int) string {
 // traderIDs 为空返回零值统计（当前用户名下无交易员）。
 func (s *ReentryAIStore) GetReentryAIStats(traderIDs []string) (*ReentryAIStats, error) {
 	st := &ReentryAIStats{
-		InternalVerdicts: map[string]int{},
-		ExternalVerdicts: map[string]int{},
+		InternalVerdicts:      map[string]int{},
+		ExternalVerdicts:      map[string]int{},
+		CandidateDecisions:    map[string]int{},
+		CandidateCallStatuses: map[string]int{},
 	}
 	if len(traderIDs) == 0 {
 		return st, nil
@@ -376,8 +504,8 @@ func (s *ReentryAIStore) GetReentryAIStats(traderIDs []string) (*ReentryAIStats,
 	for i, id := range traderIDs {
 		args[i] = id
 	}
-	err := s.db.QueryRow(`SELECT COUNT(*), COUNT(DISTINCT signal_id),
-		COUNT(DISTINCT CASE WHEN outcome_pnl IS NOT NULL THEN signal_id END)
+	err := s.db.QueryRow(`SELECT COUNT(*), COUNT(DISTINCT CASE WHEN candidate_id>0 THEN 'c:'||candidate_id ELSE 's:'||signal_id END),
+		COUNT(DISTINCT CASE WHEN outcome_pnl IS NOT NULL THEN CASE WHEN candidate_id>0 THEN 'c:'||candidate_id ELSE 's:'||signal_id END END)
 		FROM reentry_ai_analyses WHERE trader_id IN (`+marks+`)`, args...).
 		Scan(&st.TotalAnalyses, &st.SignalsCovered, &st.ScoredCount)
 	if err != nil {
@@ -389,8 +517,8 @@ func (s *ReentryAIStore) GetReentryAIStats(traderIDs []string) (*ReentryAIStats,
 			COALESCE(SUM(CASE WHEN outcome_pnl IS NOT NULL AND `+col+` IN ('ENTER','SKIP') THEN 1 ELSE 0 END),0),
 			COALESCE(SUM(CASE WHEN outcome_pnl IS NOT NULL AND ((`+col+`='ENTER' AND outcome_pnl>0) OR (`+col+`='SKIP' AND outcome_pnl<=0)) THEN 1 ELSE 0 END),0)
 			FROM reentry_ai_analyses a
-			WHERE a.trader_id IN (`+marks+`) AND a.`+col+` != ''
-			  AND a.id = (SELECT MAX(b.id) FROM reentry_ai_analyses b WHERE b.signal_id = a.signal_id AND b.`+col+` != '')
+			WHERE a.trader_id IN (`+marks+`) AND a.candidate_id=0 AND a.`+col+` != ''
+			  AND a.id = (SELECT MAX(b.id) FROM reentry_ai_analyses b WHERE b.candidate_id=0 AND b.signal_id = a.signal_id AND b.`+col+` != '')
 			GROUP BY `+col, args...)
 		if err != nil {
 			return err
@@ -412,6 +540,28 @@ func (s *ReentryAIStore) GetReentryAIStats(traderIDs []string) (*ReentryAIStats,
 		return nil, err
 	}
 	if err := fill("external_verdict", st.ExternalVerdicts, &st.ExternalScored, &st.ExternalCorrect); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.Query(`SELECT verdict,call_status,COUNT(*),COALESCE(SUM(CASE WHEN outcome_pnl IS NOT NULL THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN outcome_pnl>0 THEN 1 ELSE 0 END),0) FROM reentry_ai_analyses WHERE trader_id IN (`+marks+`) AND candidate_id>0 GROUP BY verdict,call_status`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var verdict, status string
+		var count, scored, profitable int
+		if err := rows.Scan(&verdict, &status, &count, &scored, &profitable); err != nil {
+			return nil, err
+		}
+		st.CandidateAnalyses += count
+		st.CandidateCallStatuses[status] += count
+		if verdict != "" {
+			st.CandidateDecisions[verdict] += count
+		}
+		st.CandidateScored += scored
+		st.CandidateProfitable += profitable
+	}
+	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 	return st, nil

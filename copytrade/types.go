@@ -141,22 +141,29 @@ type CopyConfig struct {
 	BinanceCSRFToken string `json:"binance_csrf_token,omitempty"` // CSRF header csrftoken
 
 	// ============================================================
-	// Copy Guard（账户保护止损，v5：两层硬止损 + 可保护性状态机 + 确认式重入）
-	// 仅 OKX 路径生效；HL/Binance 路径下被忽略
+	// Copy Guard v7：波动/结构止损、完整保护状态机与 AI guarded 重入。
 	// 字段含义见 store/copytrade.go CopyTradeConfig
 	// v3 旧策略与噪音下限/周期熔断/反加仓铁律等参数已于 v5 下线
 	// ============================================================
-	RiskStopLossEnabled  bool    `json:"risk_stop_loss_enabled"`
-	RiskAccountPct       float64 `json:"risk_account_pct"`    // v5：单笔账户最大亏损硬兜底，默认 0.10
-	RiskATRMultiplier    float64 `json:"risk_atr_multiplier"` // v5.2：止损距离基线 k×ATR，默认 2.0
-	RiskATRTimeframe     string  `json:"risk_atr_timeframe"`
-	RiskLeverageFallback bool    `json:"risk_leverage_fallback"` // v5.2：margin_cap 开关，默认 false（关）
-	RiskLeverageMaxLoss  float64 `json:"risk_leverage_max_loss"` // 仅 RiskLeverageFallback 开启时生效，默认 0.20
-	RiskReentryEnabled   bool    `json:"risk_reentry_enabled"`
-	RiskReentryRatio     float64 `json:"risk_reentry_ratio"` // × 被止损仓位名义
+	RiskStopLossEnabled        bool    `json:"risk_stop_loss_enabled"`
+	RiskAccountPct             float64 `json:"risk_account_pct"`    // v7：单次尝试风险预算，默认 0.02
+	RiskATRMultiplier          float64 `json:"risk_atr_multiplier"` // v5.2：止损距离基线 k×ATR，默认 2.0
+	RiskATRTimeframe           string  `json:"risk_atr_timeframe"`
+	RiskLeverageFallback       bool    `json:"risk_leverage_fallback"` // v5.2：margin_cap 开关，默认 false（关）
+	RiskLeverageMaxLoss        float64 `json:"risk_leverage_max_loss"` // 仅 RiskLeverageFallback 开启时生效，默认 0.20
+	RiskReentryEnabled         bool    `json:"risk_reentry_enabled"`
+	RiskReentryRatio           float64 `json:"risk_reentry_ratio"` // × 被止损仓位名义
+	RiskReentryDecisionMode    string  `json:"risk_reentry_decision_mode"`
+	RiskCycleLossBudgetPct     float64 `json:"risk_cycle_loss_budget_pct"`
+	RiskPortfolioLossBudgetPct float64 `json:"risk_portfolio_loss_budget_pct"`
+	RiskRoundTripFeeBPS        float64 `json:"risk_round_trip_fee_bps"`
+	RiskAIConfidenceThreshold  float64 `json:"risk_ai_confidence_threshold"`
+	RiskAIMinReviewSeconds     int     `json:"risk_ai_min_review_seconds"`
+	RiskAIDailyCallLimit       int     `json:"risk_ai_daily_call_limit"`
+	RiskAILifecycleCallLimit   int     `json:"risk_ai_lifecycle_call_limit"`
+	RiskNotificationLevel      string  `json:"risk_notification_level"`
 
-	// 人工重入（v5.1）：自动重入次数用尽后继续观察合格信号，
-	// 落信号 + 邮件提醒，由用户确认后系统代执行。默认开（store 列 DEFAULT 1）
+	// 历史人工重入字段仅保留存储兼容；v7 不再执行。
 	RiskManualReentryEnabled bool `json:"risk_manual_reentry_enabled"`
 
 	RiskPolicyVersion          int     `json:"risk_policy_version"` // >=4 = Copy Guard 启用标记（v3 行为已下线）
@@ -175,8 +182,7 @@ type CopyConfig struct {
 	RiskWatchTimeoutMinutes    int     `json:"risk_watch_timeout_minutes"`
 	RiskMigrationConfirmed     bool    `json:"risk_migration_confirmed"`
 	// RiskAddonBudgetPct: 加仓账户风险预算（v4）。加仓后总敞口按当前止损距离
-	// 的预期损失超过账户权益的该比例时记录 ADDON_RISK_WARNING 告警（仅告警
-	// 不拦截，兜底风控不干扰领航员动作）。1.0 = 不告警。
+	// 的预期损失超过账户权益的该比例时自动缩量；低于最小量则拒绝。
 	RiskAddonBudgetPct float64 `json:"risk_addon_budget_pct"`
 	// v4.1 重入加严（字段含义见 store.CopyTradeConfig 同名注释）
 	RiskReentryMinRecoveryATR     float64 `json:"risk_reentry_min_recovery_atr"`
@@ -196,11 +202,11 @@ type CopyConfig struct {
 //
 // v5.2 默认值选型（与 store.CopyTradeConfig.FillRiskDefaults 保持一致）：
 //   - RiskATRMultiplier 2.0：止损距离基线（k×ATR），抗噪主力线
-//   - RiskAccountPct 0.10：账户硬兜底，只锁灾难敞口，正常跟单不干扰
+//   - RiskAccountPct 0.02：v7 单次尝试风险预算（含费用与滑点）
 //   - RiskLeverageMaxLoss 0.20：仅当 RiskLeverageFallback 开启时的保证金封顶（默认关）
 func (c *CopyConfig) FillRiskDefaults() {
 	if c.RiskAccountPct == 0 {
-		c.RiskAccountPct = 0.10
+		c.RiskAccountPct = 0.02
 	}
 	if c.RiskATRMultiplier == 0 {
 		// v5.2 抗噪：止损距离基线默认 2.0×ATR（原 1.5 对高波动币种 1h 噪音偏紧、易扫损）
@@ -214,6 +220,39 @@ func (c *CopyConfig) FillRiskDefaults() {
 	}
 	if c.RiskReentryRatio == 0 {
 		c.RiskReentryRatio = 0.5
+	}
+	if c.RiskReentryDecisionMode == "" {
+		c.RiskReentryDecisionMode = "legacy_rule"
+	}
+	if c.RiskCycleLossBudgetPct == 0 {
+		c.RiskCycleLossBudgetPct = 0.05
+		if c.RiskAccountPct > c.RiskCycleLossBudgetPct {
+			c.RiskCycleLossBudgetPct = c.RiskAccountPct
+		}
+	}
+	if c.RiskPortfolioLossBudgetPct == 0 {
+		c.RiskPortfolioLossBudgetPct = 0.08
+		if c.RiskCycleLossBudgetPct > c.RiskPortfolioLossBudgetPct {
+			c.RiskPortfolioLossBudgetPct = c.RiskCycleLossBudgetPct
+		}
+	}
+	if c.RiskRoundTripFeeBPS == 0 {
+		c.RiskRoundTripFeeBPS = 12
+	}
+	if c.RiskAIConfidenceThreshold == 0 {
+		c.RiskAIConfidenceThreshold = 0.80
+	}
+	if c.RiskAIMinReviewSeconds == 0 {
+		c.RiskAIMinReviewSeconds = 300
+	}
+	if c.RiskAIDailyCallLimit == 0 {
+		c.RiskAIDailyCallLimit = 12
+	}
+	if c.RiskAILifecycleCallLimit == 0 {
+		c.RiskAILifecycleCallLimit = 30
+	}
+	if c.RiskNotificationLevel == "" {
+		c.RiskNotificationLevel = "important"
 	}
 	if c.RiskPolicyVersion >= 4 {
 		if c.RiskStopMode == "" {

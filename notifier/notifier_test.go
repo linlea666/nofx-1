@@ -173,3 +173,24 @@ func TestEmailNotifierDedupKeyReleasedWhenQueueIsFull(t *testing.T) {
 		t.Fatalf("queue len=%d want 1 after retrying dropped dedup alert", got)
 	}
 }
+
+func TestDeliveryStatusHookReportsQueuedAndDeduped(t *testing.T) {
+	n := &emailNotifier{cfg: Config{MinInterval: 0, QueueSize: 2}, queue: make(chan Alert, 2), stopCh: make(chan struct{})}
+	statuses := []DeliveryStatus{}
+	alert := Alert{Category: "copy_trade", Title: "AI protected", DedupKey: "REENTRY_FILLED|t|7|2|1", StatusHook: func(status DeliveryStatus, _ error) {
+		statuses = append(statuses, status)
+	}}
+	n.Notify(alert)
+	n.Notify(alert)
+	if len(statuses) != 2 || statuses[0] != DeliveryQueued || statuses[1] != DeliveryDeduped {
+		t.Fatalf("unexpected delivery audit sequence: %v", statuses)
+	}
+}
+
+func TestNoopNotifierReportsDisabled(t *testing.T) {
+	status := DeliveryStatus("")
+	noopNotifier{}.Notify(Alert{StatusHook: func(got DeliveryStatus, _ error) { status = got }})
+	if status != DeliveryDisabled {
+		t.Fatalf("noop delivery status=%s want disabled", status)
+	}
+}

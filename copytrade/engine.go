@@ -92,6 +92,9 @@ type Engine struct {
 	// 内存态：引擎重启后从 0 重新累计（保守方向，不会导致提前重入）。
 	// 与 poll 串行执行，无需额外锁。
 	reentryCandidateTicks map[string]int
+	// AI 模式只需按已收盘 5m K 线检查结构事件；该内存限频不承担正确性，
+	// 重启后持久化的 last_review_at/feature_hash 仍可防重复模型调用。
+	lastAICandleFeatureCheck map[int64]time.Time
 }
 
 // EngineOption 引擎配置选项
@@ -131,21 +134,22 @@ func NewEngine(
 	opts ...EngineOption,
 ) (*Engine, error) {
 	e := &Engine{
-		traderID:              traderID,
-		config:                config,
-		getFollowerBalance:    getBalance,
-		getFollowerEquity:     getBalance,
-		getFollowerPositions:  getPositions,
-		seenFills:             make(map[string]time.Time),
-		seenTTL:               1 * time.Hour,
-		stateSyncInterval:     20 * time.Second,
-		decisionCh:            make(chan *decision.FullDecision, 10),
-		riskEventCh:           make(chan *RiskEvent, 32),
-		stopCh:                make(chan struct{}),
-		stats:                 &EngineStats{StartTime: time.Now()},
-		stopRiskSuspectCount:  make(map[string]int),
-		lastAddonBudgetEvent:  make(map[string]time.Time),
-		reentryCandidateTicks: make(map[string]int),
+		traderID:                 traderID,
+		config:                   config,
+		getFollowerBalance:       getBalance,
+		getFollowerEquity:        getBalance,
+		getFollowerPositions:     getPositions,
+		seenFills:                make(map[string]time.Time),
+		seenTTL:                  1 * time.Hour,
+		stateSyncInterval:        20 * time.Second,
+		decisionCh:               make(chan *decision.FullDecision, 10),
+		riskEventCh:              make(chan *RiskEvent, 32),
+		stopCh:                   make(chan struct{}),
+		stats:                    &EngineStats{StartTime: time.Now()},
+		stopRiskSuspectCount:     make(map[string]int),
+		lastAddonBudgetEvent:     make(map[string]time.Time),
+		reentryCandidateTicks:    make(map[string]int),
+		lastAICandleFeatureCheck: make(map[int64]time.Time),
 	}
 
 	// 应用选项
@@ -1334,10 +1338,23 @@ func (e *Engine) processSignal(signal *TradeSignal) {
 		return
 	}
 
-	// 🚧 v4.1 加仓账户风险预算：超预算时仅记录 ADDON_RISK_WARNING 告警，
-	// 不再拦截（兜底风控不干扰领航员的加仓动作；实际保护由止损层承担）。
-	if matchResult.Action == ActionAdd {
-		e.warnAddonRiskBudget(signal, matchResult.PosID, copySize)
+	// vNext AI 模式：初始入场与加仓共用 ProtectionPlan，宽止损通过
+	// 缩仓满足风险预算。legacy_rule 只保留兼容的加仓预算逻辑。
+	if matchResult.Action == ActionOpen || matchResult.Action == ActionAdd {
+		if e.config.RiskReentryDecisionMode == "ai_guarded" {
+			copySize = e.limitAIGuardedTradeRisk(signal, matchResult.PosID, matchResult.Action, copySize)
+		} else if matchResult.Action == ActionAdd {
+			copySize = e.limitAddonRiskBudget(signal, matchResult.PosID, copySize)
+		}
+		minAddon := e.config.MinTradeWarn
+		if minAddon <= 0 {
+			minAddon = MinOrderValue
+		}
+		if copySize < minAddon {
+			logger.Warnf("🚫 [%s] 入场风险预算不足或低于最小下单额，拒绝本次%s | %s", e.traderID, matchResult.Action, fill.Symbol)
+			e.stats.SignalsSkipped++
+			return
+		}
 	}
 
 	// ========================================

@@ -156,6 +156,10 @@ func getOKXATRFresh(symbol, timeframe string, period int) (float64, error) {
 	if timeframe == "" {
 		timeframe = "1h"
 	}
+	// ATR policy intentionally accepts only the configured risk timeframes.
+	// Five-minute candles are exposed separately for structure detection, but
+	// allowing them here would silently turn legacy invalid-timeframe fallback
+	// into a much tighter stop.
 	bar := map[string]string{"15m": "15m", "1h": "1H", "4h": "4H"}[strings.ToLower(timeframe)]
 	if bar == "" {
 		return 0, fmt.Errorf("unsupported OKX ATR timeframe: %s", timeframe)
@@ -167,7 +171,6 @@ func getOKXATRFresh(symbol, timeframe string, period int) (float64, error) {
 	if ok && time.Since(cached.ts) < atrCacheTTL {
 		return cached.value, nil
 	}
-	instID := strings.TrimSuffix(strings.ToUpper(symbol), "USDT") + "-USDT-SWAP"
 	limit := period * 3
 	if limit < 50 {
 		limit = 50
@@ -175,63 +178,10 @@ func getOKXATRFresh(symbol, timeframe string, period int) (float64, error) {
 	if limit > 100 {
 		limit = 100
 	}
-	req, err := http.NewRequest(http.MethodGet, "https://www.okx.com/api/v5/market/mark-price-candles", nil)
+	klines, err := GetOKXCompletedMarkCandles(symbol, timeframe, limit)
 	if err != nil {
 		return 0, err
 	}
-	q := req.URL.Query()
-	q.Set("instId", instID)
-	q.Set("bar", bar)
-	q.Set("limit", strconv.Itoa(limit))
-	req.URL.RawQuery = q.Encode()
-	resp, err := getSharedAPIClient().client.Do(req)
-	if err != nil {
-		return 0, fmt.Errorf("get OKX mark candles: %w", err)
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return 0, err
-	}
-	if resp.StatusCode/100 != 2 {
-		return 0, fmt.Errorf("OKX mark candles HTTP %d", resp.StatusCode)
-	}
-	var envelope struct {
-		Code string     `json:"code"`
-		Msg  string     `json:"msg"`
-		Data [][]string `json:"data"`
-	}
-	if err := json.Unmarshal(body, &envelope); err != nil {
-		return 0, err
-	}
-	if envelope.Code != "0" {
-		return 0, fmt.Errorf("OKX mark candles: %s", envelope.Msg)
-	}
-	klines := make([]Kline, 0, len(envelope.Data))
-	now := time.Now().UnixMilli()
-	for _, row := range envelope.Data {
-		if len(row) < 5 {
-			continue
-		}
-		// OKX may append confirm at index 5 or later depending on endpoint version. Timestamp-based
-		// exclusion below is authoritative; confirm=0 is also excluded when present.
-		if len(row) > 5 && row[len(row)-1] == "0" {
-			continue
-		}
-		ts, _ := strconv.ParseInt(row[0], 10, 64)
-		if ts <= 0 || ts >= now {
-			continue
-		}
-		o, _ := strconv.ParseFloat(row[1], 64)
-		h, _ := strconv.ParseFloat(row[2], 64)
-		l, _ := strconv.ParseFloat(row[3], 64)
-		c, _ := strconv.ParseFloat(row[4], 64)
-		if h <= 0 || l <= 0 || c <= 0 {
-			continue
-		}
-		klines = append(klines, Kline{OpenTime: ts, Open: o, High: h, Low: l, Close: c})
-	}
-	sort.Slice(klines, func(i, j int) bool { return klines[i].OpenTime < klines[j].OpenTime })
 	if len(klines) <= period {
 		return 0, fmt.Errorf("insufficient completed OKX candles: %d", len(klines))
 	}
@@ -243,4 +193,89 @@ func getOKXATRFresh(symbol, timeframe string, period int) (float64, error) {
 	atrCache[key] = atrCacheEntry{value: atr, ts: time.Now()}
 	atrCacheMu.Unlock()
 	return atr, nil
+}
+
+// GetOKXCompletedMarkCandles returns only exchange-confirmed, closed mark-price
+// candles. Copy Guard uses it for structural invalidation levels; callers must
+// never derive a stop from the still-forming candle.
+func GetOKXCompletedMarkCandles(symbol, timeframe string, limit int) ([]Kline, error) {
+	return getOKXCompletedCandles(symbol, timeframe, limit, "mark-price-candles", false)
+}
+
+// GetOKXCompletedCandles returns completed execution-venue trade candles,
+// including volume. Copy Guard uses these only as a review wake-up signal;
+// mark-price candles remain the source for ATR and structural stop placement.
+func GetOKXCompletedCandles(symbol, timeframe string, limit int) ([]Kline, error) {
+	return getOKXCompletedCandles(symbol, timeframe, limit, "candles", true)
+}
+
+func getOKXCompletedCandles(symbol, timeframe string, limit int, endpoint string, includeVolume bool) ([]Kline, error) {
+	bar := map[string]string{"5m": "5m", "15m": "15m", "1h": "1H", "4h": "4H"}[strings.ToLower(timeframe)]
+	if bar == "" {
+		return nil, fmt.Errorf("unsupported OKX candle timeframe: %s", timeframe)
+	}
+	if limit <= 0 || limit > 100 {
+		limit = 100
+	}
+	instID := strings.TrimSuffix(strings.ToUpper(symbol), "USDT") + "-USDT-SWAP"
+	req, err := http.NewRequest(http.MethodGet, "https://www.okx.com/api/v5/market/"+endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	q := req.URL.Query()
+	q.Set("instId", instID)
+	q.Set("bar", bar)
+	q.Set("limit", strconv.Itoa(limit))
+	req.URL.RawQuery = q.Encode()
+	resp, err := getSharedAPIClient().client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("get OKX %s: %w", endpoint, err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode/100 != 2 {
+		return nil, fmt.Errorf("OKX %s HTTP %d", endpoint, resp.StatusCode)
+	}
+	var envelope struct {
+		Code string     `json:"code"`
+		Msg  string     `json:"msg"`
+		Data [][]string `json:"data"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return nil, err
+	}
+	if envelope.Code != "0" {
+		return nil, fmt.Errorf("OKX %s: %s", endpoint, envelope.Msg)
+	}
+	klines := make([]Kline, 0, len(envelope.Data))
+	now := time.Now().UnixMilli()
+	for _, row := range envelope.Data {
+		if len(row) < 5 || (len(row) > 5 && row[len(row)-1] == "0") {
+			continue
+		}
+		ts, _ := strconv.ParseInt(row[0], 10, 64)
+		if ts <= 0 || ts >= now {
+			continue
+		}
+		o, _ := strconv.ParseFloat(row[1], 64)
+		h, _ := strconv.ParseFloat(row[2], 64)
+		l, _ := strconv.ParseFloat(row[3], 64)
+		c, _ := strconv.ParseFloat(row[4], 64)
+		volume := float64(0)
+		if includeVolume && len(row) > 5 {
+			volume, _ = strconv.ParseFloat(row[5], 64)
+		}
+		if h <= 0 || l <= 0 || c <= 0 {
+			continue
+		}
+		klines = append(klines, Kline{OpenTime: ts, Open: o, High: h, Low: l, Close: c, Volume: volume})
+	}
+	sort.Slice(klines, func(i, j int) bool { return klines[i].OpenTime < klines[j].OpenTime })
+	if len(klines) == 0 {
+		return nil, fmt.Errorf("no completed OKX candles")
+	}
+	return klines, nil
 }

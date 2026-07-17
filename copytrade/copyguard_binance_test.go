@@ -100,6 +100,18 @@ func TestBinanceStoppedByRiskDetectedForV4(t *testing.T) {
 	e.stopRiskSuspectCount = make(map[string]int)
 
 	saveActiveMapping(t, st, posID, 0.02)
+	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{
+		TraderID: e.traderID, LeaderID: e.config.LeaderID, LeaderPosID: posID,
+		Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", Status: store.CopyGuardFollowing,
+		PolicySnapshot: "{}", LeaderEntryPrice: 2096.58, FollowerEntryPrice: 2096.58,
+		FollowerNotional: 41.9316, AccountEquity: 100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = st.CopyTrade().OpenCopyGuardAttempt(cycle.ID, 0, 2096.58, 41.9316, .02, 20); err != nil {
+		t.Fatal(err)
+	}
 
 	// 领航员仍持有该仓位
 	e.leaderState.Positions[posID] = binanceTestPosition(posID, 0.02)
@@ -124,6 +136,10 @@ func TestBinanceStoppedByRiskDetectedForV4(t *testing.T) {
 	}
 	if len(stopped) != 1 || stopped[0].LeaderPosID != posID {
 		t.Fatalf("expected posId %s marked stopped_by_risk, got %+v", posID, stopped)
+	}
+	cycle, err = st.CopyTrade().GetCopyGuardCycle(cycle.ID)
+	if err != nil || cycle.Status != store.CopyGuardStoppedWatching || cycle.StopCount != 1 {
+		t.Fatalf("stop ledger was not committed before mapping transition: cycle=%+v err=%v", cycle, err)
 	}
 }
 

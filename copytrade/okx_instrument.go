@@ -16,7 +16,8 @@ import (
 // ============================================================================
 // OKX 公开 instruments 接口（无需凭证）
 //
-// 用途：拿 tickSz（价格档位）做 SL 价对齐
+// 用途：拿 tickSz（价格档位）做 SL 价对齐，并用
+// lotSz × ctVal 得到以币数表示的最小仓位步长。
 //
 // 为什么不复用 trader/okx_trader.go 的 getInstrument？
 //   - trader 包通过 DecisionExecutor 接口被 copytrade 反向调用，
@@ -34,6 +35,8 @@ const okxPublicInstrumentsAPI = "https://www.okx.com/api/v5/public/instruments"
 
 type okxInstrumentCacheEntry struct {
 	tickSz float64
+	lotSz  float64
+	ctVal  float64
 	ts     time.Time
 }
 
@@ -52,6 +55,8 @@ type okxInstrumentResp struct {
 	Data []struct {
 		InstID string `json:"instId"`
 		TickSz string `json:"tickSz"`
+		LotSz  string `json:"lotSz"`
+		CtVal  string `json:"ctVal"`
 	} `json:"data"`
 }
 
@@ -66,8 +71,31 @@ type okxInstrumentResp struct {
 //
 // 用法：alignToTickSize(rawPrice, tickSz) 把任意价格对齐到档位
 func getOKXTickSize(symbol string) (float64, error) {
+	spec, err := getOKXInstrumentSpec(symbol)
+	if err != nil {
+		return 0, err
+	}
+	return spec.tickSz, nil
+}
+
+// getOKXBaseQuantityStep returns the smallest position quantity represented in
+// base-asset units. OKX reports lotSz in contracts while Copy Guard and the
+// trader adapter exchange base-asset quantities, hence lotSz * ctVal.
+func getOKXBaseQuantityStep(symbol string) (float64, error) {
+	spec, err := getOKXInstrumentSpec(symbol)
+	if err != nil {
+		return 0, err
+	}
+	step := spec.lotSz * spec.ctVal
+	if step <= 0 {
+		return 0, fmt.Errorf("invalid OKX base quantity step for %s: lotSz=%v ctVal=%v", symbol, spec.lotSz, spec.ctVal)
+	}
+	return step, nil
+}
+
+func getOKXInstrumentSpec(symbol string) (okxInstrumentCacheEntry, error) {
 	if symbol == "" {
-		return 0, fmt.Errorf("symbol is empty")
+		return okxInstrumentCacheEntry{}, fmt.Errorf("symbol is empty")
 	}
 
 	instID := convertSymbolToOKXInstID(symbol)
@@ -77,7 +105,7 @@ func getOKXTickSize(symbol string) (float64, error) {
 	if entry, ok := okxInstrumentCache[instID]; ok {
 		if time.Since(entry.ts) < okxInstrumentCacheTTL {
 			okxInstrumentCacheMu.RUnlock()
-			return entry.tickSz, nil
+			return entry, nil
 		}
 	}
 	okxInstrumentCacheMu.RUnlock()
@@ -85,40 +113,46 @@ func getOKXTickSize(symbol string) (float64, error) {
 	url := fmt.Sprintf("%s?instType=SWAP&instId=%s", okxPublicInstrumentsAPI, instID)
 	resp, err := okxInstrumentHTTPClient.Get(url)
 	if err != nil {
-		return 0, fmt.Errorf("get okx instrument failed: %w", err)
+		return okxInstrumentCacheEntry{}, fmt.Errorf("get okx instrument failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return 0, fmt.Errorf("okx instrument HTTP %d: %s", resp.StatusCode, string(body))
+		return okxInstrumentCacheEntry{}, fmt.Errorf("okx instrument HTTP %d: %s", resp.StatusCode, string(body))
 	}
 
 	var data okxInstrumentResp
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		return 0, fmt.Errorf("decode okx instrument failed: %w", err)
+		return okxInstrumentCacheEntry{}, fmt.Errorf("decode okx instrument failed: %w", err)
 	}
 
 	if data.Code != "0" {
-		return 0, fmt.Errorf("okx instrument API error: code=%s msg=%s", data.Code, data.Msg)
+		return okxInstrumentCacheEntry{}, fmt.Errorf("okx instrument API error: code=%s msg=%s", data.Code, data.Msg)
 	}
 
 	if len(data.Data) == 0 {
-		return 0, fmt.Errorf("okx instrument not found: %s", instID)
+		return okxInstrumentCacheEntry{}, fmt.Errorf("okx instrument not found: %s", instID)
 	}
 
 	tickSz, err := strconv.ParseFloat(data.Data[0].TickSz, 64)
 	if err != nil || tickSz <= 0 {
-		return 0, fmt.Errorf("invalid tickSz %q: %v", data.Data[0].TickSz, err)
+		return okxInstrumentCacheEntry{}, fmt.Errorf("invalid tickSz %q: %v", data.Data[0].TickSz, err)
 	}
+	lotSz, lotErr := strconv.ParseFloat(data.Data[0].LotSz, 64)
+	ctVal, ctErr := strconv.ParseFloat(data.Data[0].CtVal, 64)
+	if lotErr != nil || lotSz <= 0 || ctErr != nil || ctVal <= 0 {
+		return okxInstrumentCacheEntry{}, fmt.Errorf("invalid OKX quantity spec lotSz=%q ctVal=%q", data.Data[0].LotSz, data.Data[0].CtVal)
+	}
+	entry := okxInstrumentCacheEntry{tickSz: tickSz, lotSz: lotSz, ctVal: ctVal, ts: time.Now()}
 
 	// 写入缓存
 	okxInstrumentCacheMu.Lock()
-	okxInstrumentCache[instID] = okxInstrumentCacheEntry{tickSz: tickSz, ts: time.Now()}
+	okxInstrumentCache[instID] = entry
 	okxInstrumentCacheMu.Unlock()
 
-	logger.Debugf("📐 OKX tickSz | %s = %s", instID, data.Data[0].TickSz)
-	return tickSz, nil
+	logger.Debugf("📐 OKX instrument spec | %s tickSz=%s lotSz=%s ctVal=%s", instID, data.Data[0].TickSz, data.Data[0].LotSz, data.Data[0].CtVal)
+	return entry, nil
 }
 
 // convertSymbolToOKXInstID "BTCUSDT" → "BTC-USDT-SWAP"

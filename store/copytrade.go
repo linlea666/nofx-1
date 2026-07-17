@@ -28,9 +28,8 @@ type CopyTradeConfig struct {
 	BinanceCSRFToken string `json:"binance_csrf_token,omitempty"` // CSRF header csrftoken
 
 	// ============================================================
-	// Copy Guard（账户保护止损，v5：两层硬止损 + 可保护性状态机 + 确认式重入）
-	// 仅 OKX 路径生效（OKX 的 algo 条件单提供交易所托管的硬止损）
-	// HL / Binance 路径下这些字段被忽略，零影响向后兼容
+	// Copy Guard v7：波动/结构止损、完整保护状态机与 AI guarded 重入。
+	// OKX/Binance 可作为领航员数据源；保护能力由跟随执行交易所复核。
 	// v3 旧策略与噪音下限/周期熔断/反加仓铁律/价格容差等参数已于 v5 下线：
 	// 数据库旧列（risk_atr_enabled / risk_reentry_tolerance /
 	// risk_reentry_block_addback / risk_reentry_addback_tolerance）保留但
@@ -41,7 +40,7 @@ type CopyTradeConfig struct {
 	RiskStopLossEnabled bool `json:"risk_stop_loss_enabled"` // 默认 true
 
 	// 账户硬兜底（v5：单笔最多亏账户的百分比，任何模式下的最终封顶）
-	RiskAccountPct float64 `json:"risk_account_pct"` // 默认 0.10 (=10%)
+	RiskAccountPct float64 `json:"risk_account_pct"` // v7 单次尝试风险预算，默认 0.02 (=2%)
 
 	// ATR 基线（v5.2 抗噪主力线：止损距离 = k×ATR，与账户线取严）
 	RiskATRMultiplier float64 `json:"risk_atr_multiplier"` // 默认 2.0，范围 0.5-5
@@ -51,14 +50,27 @@ type CopyTradeConfig struct {
 	RiskLeverageFallback bool    `json:"risk_leverage_fallback"` // 默认 false
 	RiskLeverageMaxLoss  float64 `json:"risk_leverage_max_loss"` // 默认 0.2 (=20% 保证金，仅开启时生效)
 
-	// 二次进场（v5 确认式重入）
+	// 二次进场：新配置默认 ai_guarded，旧配置保留 legacy_rule。
 	RiskReentryEnabled bool    `json:"risk_reentry_enabled"`
 	RiskReentryRatio   float64 `json:"risk_reentry_ratio"` // × 被止损仓位名义，默认 0.5
+	// RiskReentryDecisionMode 决定止损后的重入决策来源。
+	// legacy_rule 仅为存量兼容；ai_guarded 由 AI 判断方向、代码执行风控；disabled 禁用重入。
+	RiskReentryDecisionMode string `json:"risk_reentry_decision_mode"`
 
-	// 人工重入（v5.1）：自动重入次数用尽（ATTEMPTS_EXHAUSTED）后，继续观察
-	// 合格重入信号；出现时落信号 + 邮件提醒，由用户在前端确认后系统代执行。
-	// 直接列存储（DEFAULT 1），新旧库均默认开启；区别于 policy JSON 字段
-	// （JSON 缺省反序列化为 false，无法表达"默认开"语义）。
+	// vNext 风险预算。RiskAccountPct 保留原 JSON/DB 名称以兼容旧客户端，
+	// 在新策略中语义明确为“单次尝试最大账户风险”。
+	RiskCycleLossBudgetPct     float64 `json:"risk_cycle_loss_budget_pct"`
+	RiskPortfolioLossBudgetPct float64 `json:"risk_portfolio_loss_budget_pct"`
+	RiskRoundTripFeeBPS        float64 `json:"risk_round_trip_fee_bps"`
+
+	// AI 持续观察调度预算（均持久化在 policy JSON 中）。
+	RiskAIConfidenceThreshold float64 `json:"risk_ai_confidence_threshold"`
+	RiskAIMinReviewSeconds    int     `json:"risk_ai_min_review_seconds"`
+	RiskAIDailyCallLimit      int     `json:"risk_ai_daily_call_limit"`
+	RiskAILifecycleCallLimit  int     `json:"risk_ai_lifecycle_call_limit"`
+	RiskNotificationLevel     string  `json:"risk_notification_level"`
+
+	// 历史人工重入字段仅为数据库/回滚兼容；v7 始终关闭且不再执行。
 	RiskManualReentryEnabled bool `json:"risk_manual_reentry_enabled"`
 
 	// Copy Guard v4+。独立存储于 copy_guard_policies，避免破坏 v3 配置表和旧版回滚。
@@ -78,9 +90,8 @@ type CopyTradeConfig struct {
 	RiskWatchTimeoutMinutes    int     `json:"risk_watch_timeout_minutes"`
 	RiskMigrationConfirmed     bool    `json:"risk_migration_confirmed"`
 	// RiskAddonBudgetPct: 加仓账户风险预算（v4）。跟随领航员加仓时预估
-	// "加仓后总敞口按当前止损距离全损"占账户权益的比例，超过该预算则记录
-	// ADDON_RISK_WARNING 告警事件。仅告警不拦截（兜底风控不干扰领航员的
-	// 开/加/减/平动作）。默认 0.15 (=15%)；1.0 = 不告警。
+	// "加仓后总敞口按当前止损距离全损"占账户权益的比例；v7 超限自动缩量，
+	// 低于最小下单量则拒绝。默认 0.15 (=15%)。
 	RiskAddonBudgetPct float64 `json:"risk_addon_budget_pct"`
 	// RiskReentryMinRecoveryATR: 重入最小恢复幅度（v4，单位 ATR 倍数）。
 	// 止损后价格必须从止损成交价向有利方向恢复至少该幅度才允许重入，
@@ -111,11 +122,11 @@ type CopyTradeConfig struct {
 //
 // v5.2 默认值选型（与 copytrade.CopyConfig.FillRiskDefaults 保持一致）：
 //   - RiskATRMultiplier 2.0：止损距离基线（k×ATR），抗噪主力线
-//   - RiskAccountPct 0.10：账户硬兜底，只锁灾难敞口，正常跟单不干扰
+//   - RiskAccountPct 0.02：v7 单次尝试风险预算（含费用与滑点）
 //   - RiskLeverageMaxLoss 0.20：仅当 RiskLeverageFallback 开启时的保证金封顶（默认关）
 func (c *CopyTradeConfig) FillRiskDefaults() {
 	if c.RiskAccountPct == 0 {
-		c.RiskAccountPct = 0.10
+		c.RiskAccountPct = 0.02
 	}
 	if c.RiskATRMultiplier == 0 {
 		// v5.2 抗噪：止损距离基线默认 2.0×ATR（与 copytrade.CopyConfig 保持一致）
@@ -129,6 +140,43 @@ func (c *CopyTradeConfig) FillRiskDefaults() {
 	}
 	if c.RiskReentryRatio == 0 {
 		c.RiskReentryRatio = 0.5
+	}
+	if c.RiskReentryDecisionMode == "" {
+		// 存量策略没有该字段时保持旧规则；新建配置由 API 的推荐默认值
+		// 显式写 ai_guarded，避免升级时静默改变真实交易行为。
+		c.RiskReentryDecisionMode = "legacy_rule"
+	}
+	if c.RiskCycleLossBudgetPct == 0 {
+		c.RiskCycleLossBudgetPct = 0.05
+		if c.RiskAccountPct > c.RiskCycleLossBudgetPct {
+			// 存量配置可能显式使用高于新推荐值的单次预算；补默认值时
+			// 只能向上兼容，不能生成 attempt > cycle 的非法组合。
+			c.RiskCycleLossBudgetPct = c.RiskAccountPct
+		}
+	}
+	if c.RiskPortfolioLossBudgetPct == 0 {
+		c.RiskPortfolioLossBudgetPct = 0.08
+		if c.RiskCycleLossBudgetPct > c.RiskPortfolioLossBudgetPct {
+			c.RiskPortfolioLossBudgetPct = c.RiskCycleLossBudgetPct
+		}
+	}
+	if c.RiskRoundTripFeeBPS == 0 {
+		c.RiskRoundTripFeeBPS = 12
+	}
+	if c.RiskAIConfidenceThreshold == 0 {
+		c.RiskAIConfidenceThreshold = 0.80
+	}
+	if c.RiskAIMinReviewSeconds == 0 {
+		c.RiskAIMinReviewSeconds = 300
+	}
+	if c.RiskAIDailyCallLimit == 0 {
+		c.RiskAIDailyCallLimit = 12
+	}
+	if c.RiskAILifecycleCallLimit == 0 {
+		c.RiskAILifecycleCallLimit = 30
+	}
+	if c.RiskNotificationLevel == "" {
+		c.RiskNotificationLevel = "important"
 	}
 	if c.RiskPolicyVersion >= 4 {
 		if c.RiskStopMode == "" {
@@ -165,6 +213,49 @@ func (c *CopyTradeConfig) FillRiskDefaults() {
 			c.RiskUnprotectableAction = "close"
 		}
 	}
+}
+
+// NewCopyGuardDefaults 是所有后端创建入口与 defaults API 的唯一默认值来源。
+// 存量配置读取仍走 FillRiskDefaults 的兼容语义，不会被静默切换到 AI。
+func NewCopyGuardDefaults() *CopyTradeConfig {
+	c := &CopyTradeConfig{
+		RiskStopLossEnabled:        true,
+		RiskAccountPct:             0.02,
+		RiskATRMultiplier:          2.0,
+		RiskATRTimeframe:           "1h",
+		RiskReentryEnabled:         true,
+		RiskReentryRatio:           0.50,
+		RiskReentryDecisionMode:    "ai_guarded",
+		RiskPolicyVersion:          4,
+		RiskStopMode:               "volatility_priority",
+		RiskATRPeriod:              14,
+		RiskATRCacheMaxAgeMinutes:  120,
+		RiskATRFallbackPct:         0.02,
+		RiskTriggerPriceType:       "mark",
+		RiskSlippageBufferBPS:      10,
+		RiskLiquidationBufferATR:   0.5,
+		RiskMaxReentries:           2,
+		RiskReentryBandATR:         0.5,
+		RiskReentryCooldownSeconds: 300,
+		RiskReentryMaxChaseATR:     0.5,
+		RiskReentryMaxATRExpansion: 2,
+		RiskWatchTimeoutMinutes:    4320,
+		RiskMigrationConfirmed:     true,
+		RiskAddonBudgetPct:         0.15,
+		RiskReentryMinRecoveryATR:  0.5,
+		RiskUnprotectableAction:    "close",
+		RiskCycleLossBudgetPct:     0.05,
+		RiskPortfolioLossBudgetPct: 0.08,
+		RiskRoundTripFeeBPS:        12,
+		RiskAIConfidenceThreshold:  0.80,
+		RiskAIMinReviewSeconds:     300,
+		RiskAIDailyCallLimit:       12,
+		RiskAILifecycleCallLimit:   30,
+		RiskNotificationLevel:      "important",
+		RiskManualReentryEnabled:   false,
+	}
+	c.FillRiskDefaults()
+	return c
 }
 
 // upgradeLegacyRiskPolicy v5：v3 旧止损策略已下线。存量 OKX + 启用止损但

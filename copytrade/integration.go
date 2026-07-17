@@ -67,6 +67,9 @@ type ClientOrderStatusProvider interface {
 type FreshPositionsProvider interface {
 	GetPositionsFresh() ([]map[string]interface{}, error)
 }
+type EmergencyPositionCloser interface {
+	ClosePositionMarket(symbol, side string) (string, error)
+}
 
 // ProtectiveStopCapabilityChecker lets Copy Guard probe whether the concrete
 // execution exchange (not the AutoTrader wrapper) can place exchange-managed
@@ -85,6 +88,7 @@ var (
 	_ ClientOrderStatusProvider       = (*trader.AutoTrader)(nil)
 	_ FreshPositionsProvider          = (*trader.AutoTrader)(nil)
 	_ ProtectiveStopCapabilityChecker = (*trader.AutoTrader)(nil)
+	_ EmergencyPositionCloser         = (*trader.AutoTrader)(nil)
 )
 
 // mappingFailureCircuitThreshold 跟单 active mapping 的连续失败熔断阈值。
@@ -112,13 +116,16 @@ type TraderIntegration struct {
 	protectiveQueryFailures map[int64]int
 	// lastV4Backfill rate-limits the lifecycle backfill sweep for positions
 	// followed before Copy Guard v4 was enabled.
-	lastV4Backfill time.Time
+	lastV4Backfill       time.Time
+	lastCycleSummaryScan time.Time
 	// lastProtectionEvent rate-limits repeated identical protection-issue
 	// events (poll runs every 3s; a stuck failure used to write thousands of
 	// duplicate rows per cycle). Guarded by protectionEventMu because
 	// markProtectionIssue runs from both the monitor and executor goroutines.
 	protectionEventMu   sync.Mutex
 	lastProtectionEvent map[string]time.Time
+	residualCloseLast   map[int64]time.Time
+	residualCloseTries  map[int64]int
 	cycleNumber         int // 跟单周期计数器
 }
 
@@ -138,6 +145,8 @@ func NewTraderIntegration(
 		lastAttemptReconcile:    make(map[int64]time.Time),
 		protectiveQueryFailures: make(map[int64]int),
 		lastProtectionEvent:     make(map[string]time.Time),
+		residualCloseLast:       make(map[int64]time.Time),
+		residualCloseTries:      make(map[int64]int),
 	}
 }
 
@@ -175,14 +184,23 @@ func (ti *TraderIntegration) StartCopyTrading() error {
 		BinanceCSRFToken: copyConfig.BinanceCSRFToken,
 
 		// Copy Guard 风控字段透传（v5：两层硬止损 + 可保护性状态机 + 确认式重入）
-		RiskStopLossEnabled:  copyConfig.RiskStopLossEnabled,
-		RiskAccountPct:       copyConfig.RiskAccountPct,
-		RiskATRMultiplier:    copyConfig.RiskATRMultiplier,
-		RiskATRTimeframe:     copyConfig.RiskATRTimeframe,
-		RiskLeverageFallback: copyConfig.RiskLeverageFallback,
-		RiskLeverageMaxLoss:  copyConfig.RiskLeverageMaxLoss,
-		RiskReentryEnabled:   copyConfig.RiskReentryEnabled,
-		RiskReentryRatio:     copyConfig.RiskReentryRatio,
+		RiskStopLossEnabled:        copyConfig.RiskStopLossEnabled,
+		RiskAccountPct:             copyConfig.RiskAccountPct,
+		RiskATRMultiplier:          copyConfig.RiskATRMultiplier,
+		RiskATRTimeframe:           copyConfig.RiskATRTimeframe,
+		RiskLeverageFallback:       copyConfig.RiskLeverageFallback,
+		RiskLeverageMaxLoss:        copyConfig.RiskLeverageMaxLoss,
+		RiskReentryEnabled:         copyConfig.RiskReentryEnabled,
+		RiskReentryRatio:           copyConfig.RiskReentryRatio,
+		RiskReentryDecisionMode:    copyConfig.RiskReentryDecisionMode,
+		RiskCycleLossBudgetPct:     copyConfig.RiskCycleLossBudgetPct,
+		RiskPortfolioLossBudgetPct: copyConfig.RiskPortfolioLossBudgetPct,
+		RiskRoundTripFeeBPS:        copyConfig.RiskRoundTripFeeBPS,
+		RiskAIConfidenceThreshold:  copyConfig.RiskAIConfidenceThreshold,
+		RiskAIMinReviewSeconds:     copyConfig.RiskAIMinReviewSeconds,
+		RiskAIDailyCallLimit:       copyConfig.RiskAIDailyCallLimit,
+		RiskAILifecycleCallLimit:   copyConfig.RiskAILifecycleCallLimit,
+		RiskNotificationLevel:      copyConfig.RiskNotificationLevel,
 
 		RiskManualReentryEnabled: copyConfig.RiskManualReentryEnabled,
 
@@ -360,6 +378,7 @@ func (ti *TraderIntegration) monitorV4ProtectiveStops() {
 			ti.recoverV4PendingStates()
 			ti.reconcileStoppedV4Attempts()
 			ti.reconcilePendingV4Accounting()
+			ti.notifyReconciledCycleSummaries()
 		}
 	}
 }
@@ -450,6 +469,88 @@ func (ti *TraderIntegration) reconcilePendingV4Accounting() {
 	for _, cycle := range cycles {
 		ti.reconcileV4CycleAccounting(cycle)
 	}
+}
+
+const cycleSummaryScanEvery = time.Minute
+
+// notifyReconciledCycleSummaries derives one non-critical summary email from
+// the canonical CYCLE_CLOSED_SUMMARY event. It runs after persistence and
+// reconciliation, outside every trading transaction. Delivery transitions are
+// written back as events so restarts do not resend a successfully delivered
+// summary and transient SMTP/queue failures remain retryable.
+func (ti *TraderIntegration) notifyReconciledCycleSummaries() {
+	if !ti.lastCycleSummaryScan.IsZero() && time.Since(ti.lastCycleSummaryScan) < cycleSummaryScanEvery {
+		return
+	}
+	ti.lastCycleSummaryScan = time.Now()
+	cycles, err := ti.store.CopyTrade().ListCopyGuardCyclesPendingSummaryEmail(ti.traderID, 25)
+	if err != nil {
+		logger.Warnf("⚠️ [%s] Copy Guard 周期汇总邮件扫描失败: %v", ti.traderID, err)
+		return
+	}
+	for _, cycle := range cycles {
+		ti.notifyCycleClosedSummary(cycle)
+	}
+}
+
+func (ti *TraderIntegration) notifyCycleClosedSummary(cycle *store.CopyGuardCycle) {
+	if cycle == nil || cycle.AccountingStatus != store.CopyGuardAccountingReconciled || cycle.ClosedAt == nil {
+		return
+	}
+	var policy store.CopyGuardPolicy
+	_ = json.Unmarshal([]byte(cycle.PolicySnapshot), &policy)
+	attemptNo := cycle.ReentryCount
+	generation := 0
+	key := fmt.Sprintf("CYCLE_CLOSED_SUMMARY|%s|%d|%d|%d", ti.traderID, cycle.ID, attemptNo, generation)
+	if policy.NotificationLevel == "critical" {
+		_ = ti.saveCycleSummaryEmailStatus(cycle, notifier.DeliveryDisabled, key, "notification level is critical")
+		return
+	}
+	attempts, err := ti.store.CopyTrade().ListCopyGuardAttempts(cycle.ID)
+	if err != nil {
+		logger.Warnf("⚠️ [%s] Copy Guard 周期汇总读取 attempt 失败 cycle=%d: %v", ti.traderID, cycle.ID, err)
+		return
+	}
+	stopOnly, first, second, reentry := 0.0, 0.0, 0.0, 0.0
+	for _, attempt := range attempts {
+		switch attempt.AttemptNo {
+		case 0:
+			stopOnly = attempt.PnL
+		case 1:
+			first = attempt.PnL
+			reentry += attempt.PnL
+		case 2:
+			second = attempt.PnL
+			reentry += attempt.PnL
+		default:
+			reentry += attempt.PnL
+		}
+	}
+	traderName := ti.traderDisplayName()
+	notifier.Notify(notifier.Alert{
+		Category: "copy_trade", TraderID: ti.traderID,
+		Title:   fmt.Sprintf("%s | Copy Guard 周期结束汇总 %s %s", traderName, cycle.Symbol, cycle.Side),
+		Body:    fmt.Sprintf("Trader Name: %s\nTrader ID: %s\nCycle: %d\nLeader Position: %s\nSymbol / Side: %s / %s\n\n实际 Copy Guard: %+.4f USDT\n无 Copy Guard 基线: %+.4f USDT\n只止损: %+.4f USDT\n第一次重入贡献: %+.4f USDT\n第二次重入贡献: %+.4f USDT\n全部重入贡献: %+.4f USDT\n净保护效果: %+.4f USDT\n手续费: %.4f USDT\n滑点: %.4f USDT\n对账状态: %s", traderName, ti.traderID, cycle.ID, cycle.LeaderPosID, cycle.Symbol, cycle.Side, cycle.ActualPnL, cycle.BaselinePnL, stopOnly, first, second, reentry, cycle.NetGuardEffect, cycle.Fees, cycle.Slippage, cycle.AccountingStatus),
+		RateKey: key, DedupKey: key,
+		Fields: map[string]string{"CycleID": fmt.Sprint(cycle.ID), "AttemptNo": fmt.Sprint(attemptNo), "Generation": fmt.Sprint(generation), "AccountingStatus": cycle.AccountingStatus},
+		StatusHook: func(status notifier.DeliveryStatus, deliveryErr error) {
+			if err := ti.saveCycleSummaryEmailStatus(cycle, status, key, errorString(deliveryErr)); err != nil {
+				logger.Warnf("⚠️ [%s] Copy Guard 邮件状态落库失败 cycle=%d status=%s: %v", ti.traderID, cycle.ID, status, err)
+			}
+		},
+	})
+}
+
+func (ti *TraderIntegration) saveCycleSummaryEmailStatus(cycle *store.CopyGuardCycle, status notifier.DeliveryStatus, key, detail string) error {
+	eventType := "CYCLE_SUMMARY_EMAIL_" + strings.ToUpper(string(status))
+	return ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: eventType, Metadata: map[string]interface{}{"attempt_no": cycle.ReentryCount, "decision_generation": 0, "dedup_key": key, "delivery_status": status, "detail": detail}})
+}
+
+func errorString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 // accountingDelayedAfter: a closed cycle still unreconciled after this long is
@@ -733,10 +834,9 @@ func (ti *TraderIntegration) pollV4ProtectiveStops() {
 		if posQty, ok := ti.followerPositionQuantity(cycle.Symbol, cycle.Side, cycle.MarginMode, false); ok && posQty > 0 {
 			baseQty = posQty
 		}
-		ratio := protectionRatio(live.Quantity, baseQty)
 		coverage := protectionCoverage(live.Quantity, baseQty)
 		if state == "live" {
-			if ratio < 0.999 || ratio > 1.001 {
+			if !protectionQuantityMatches(live.Quantity, baseQty, stored.QuantityStep) {
 				ti.markProtectionIssue(cycle, store.CopyGuardProtectionDegraded, "PROTECTION_COVERAGE_LOW", fmt.Errorf("protective quantity %.8f does not match position quantity %.8f", live.Quantity, baseQty), coverage, false)
 			} else if cycle.ProtectionStatus != store.CopyGuardProtectionVerified && cycle.ProtectionStatus != store.CopyGuardProtectionClamped {
 				// CLAMPED 也是"已保护"的健康态（保护质量降级但单子有效），
@@ -745,6 +845,19 @@ func (ti *TraderIntegration) pollV4ProtectiveStops() {
 				_ = ti.store.CopyTrade().UpdateCopyGuardProtectionHealth(cycle.ID, store.CopyGuardProtectionVerified, coverage, "", cycle.FollowerPosID, cycle.EntryOrderID, false)
 				_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "PROTECTION_RECOVERED", Price: live.TriggerPrice, Quantity: live.Quantity, Metadata: map[string]interface{}{"algo_id": live.AlgoID, "coverage": coverage}})
 				ti.notifyProtection(cycle, "Copy Guard 保护已恢复", "保护单已经重新验证有效。", "recovered")
+			}
+			// If the exchange protection succeeded but the one-shot candidate
+			// completion write failed, retry that audit commit from the normal
+			// protection poll. Querying ENTRY_PENDING first avoids repeatedly
+			// emitting anomalies for already-completed/missing candidates.
+			if protectionQuantityMatches(live.Quantity, baseQty, stored.QuantityStep) && ti.engine != nil && ti.engine.config != nil && ti.engine.config.RiskReentryDecisionMode == "ai_guarded" && cycle.Status == store.CopyGuardFollowingReentry {
+				if candidate, candidateErr := ti.store.ReentryAI().GetReentryCandidateByCycle(cycle.ID); candidateErr == nil && candidate.Status == store.ReentryCandidateEntryPending {
+					action := "open_long"
+					if cycle.Side == "short" {
+						action = "open_short"
+					}
+					ti.enforceAIReentryProtection(&decision.Decision{LeaderPosID: cycle.LeaderPosID, Symbol: cycle.Symbol, Action: action, MarginMode: cycle.MarginMode, EntryPrice: cycle.FollowerEntryPrice, PositionSizeUSD: cycle.FollowerNotional})
+				}
 			}
 			continue
 		}
@@ -756,9 +869,59 @@ func (ti *TraderIntegration) pollV4ProtectiveStops() {
 		if state != "effective" && state != "triggered" && state != "filled" {
 			continue
 		}
-		if cycle.Status == store.CopyGuardStoppedWatching {
+		// Crash window: the stop ledger may have committed while the local
+		// protective-order row was still "live". Detect the already-closed
+		// attempt before changing the cycle back to STOP_PENDING_FLAT.
+		alreadyRecorded := false
+		if attempts, attemptsErr := ti.store.CopyTrade().ListCopyGuardAttempts(cycle.ID); attemptsErr == nil {
+			for _, attempt := range attempts {
+				if attempt.AttemptNo == cycle.ReentryCount && attempt.Status == "STOPPED" && (attempt.StopAlgoID == "" || attempt.StopAlgoID == stored.AlgoID) {
+					alreadyRecorded = true
+					break
+				}
+			}
+		}
+		if alreadyRecorded {
+			_ = ti.store.CopyTrade().UpdateCopyGuardProtectiveOrderStatus(cycle.ID, state)
+			_ = ti.store.CopyTrade().UpdateCopyGuardProtectionHealth(cycle.ID, store.CopyGuardProtectionTriggered, 0, "", cycle.FollowerPosID, cycle.EntryOrderID, false)
 			continue
 		}
+		// 保护单触发不等于仓位已归零。先用 fresh 仓位确认，残仓可交易时
+		// reduce-only close-all；只有交易所确认 flat 后才允许进入重入观察。
+		if cycle.Status != store.CopyGuardStopPendingFlat && cycle.Status != store.CopyGuardStopPartial {
+			_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "STOP_PENDING_FLAT", Price: stored.TriggerPrice, Quantity: stored.Quantity, Metadata: map[string]interface{}{"algo_id": stored.AlgoID, "attempt_no": cycle.ReentryCount, "state": state}})
+		}
+		_ = ti.store.CopyTrade().UpdateCopyGuardObservation(cycle.ID, store.CopyGuardStopPendingFlat, cycle.LeaderEntryPrice, stored.TriggerPrice, 0)
+		remain, exists := ti.followerPositionQuantity(cycle.Symbol, cycle.Side, cycle.MarginMode, true)
+		if !exists {
+			ti.markProtectionIssue(cycle, store.CopyGuardProtectionUnknown, "PROTECTION_VERIFY_UNKNOWN", fmt.Errorf("cannot verify follower is flat after protective stop fired"), cycle.ProtectionCoverage, false)
+			continue
+		}
+		if remain > 0 {
+			_ = ti.store.CopyTrade().UpdateCopyGuardObservation(cycle.ID, store.CopyGuardStopPartial, cycle.LeaderEntryPrice, stored.TriggerPrice, 0)
+			notional := remain * stored.TriggerPrice
+			eventType := "STOP_PARTIAL"
+			if notional > 0 && notional < MinOrderValue {
+				eventType = "STOP_DUST_RESIDUAL"
+			}
+			if cycle.Status != store.CopyGuardStopPartial {
+				_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: eventType, Price: stored.TriggerPrice, Quantity: remain, Notional: notional, Metadata: map[string]interface{}{"algo_id": stored.AlgoID, "attempt_no": cycle.ReentryCount, "remaining_quantity": remain, "state": state}})
+				ti.notifyProtection(cycle, "Copy Guard 止损后仍有残仓", fmt.Sprintf("保护止损未完全平仓，剩余数量 %.8f（约 %.2f USDT）。系统将有限次执行 reduce-only 市价退出；归零前禁止重入。", remain, notional), fmt.Sprintf("stop_residual_attempt_%d", cycle.ReentryCount))
+			}
+			if closer, ok := ti.executor.(EmergencyPositionCloser); ok && ti.residualCloseTries[cycle.ID] < 3 && (ti.residualCloseLast[cycle.ID].IsZero() || time.Since(ti.residualCloseLast[cycle.ID]) >= 10*time.Second) {
+				ti.residualCloseLast[cycle.ID] = time.Now()
+				ti.residualCloseTries[cycle.ID]++
+				if orderID, closeErr := closer.ClosePositionMarket(cycle.Symbol, cycle.Side); closeErr != nil {
+					ti.notifyProtection(cycle, "Copy Guard 止损残仓未平", "保护止损部分成交后仍有残仓，自动 reduce-only 平仓失败: "+closeErr.Error(), "stop_residual_failed")
+					_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "GUARD_FORCED_EXIT_FAILED", Price: stored.TriggerPrice, Quantity: remain, Metadata: map[string]interface{}{"error": closeErr.Error(), "reason": "partial_stop_residual"}})
+				} else {
+					_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "FORCED_EXIT", Price: stored.TriggerPrice, Quantity: remain, Metadata: map[string]interface{}{"order_id": orderID, "reason": "partial_stop_residual"}})
+				}
+			}
+			continue
+		}
+		delete(ti.residualCloseLast, cycle.ID)
+		delete(ti.residualCloseTries, cycle.ID)
 		mapping, _ := ti.store.CopyTrade().GetMapping(ti.traderID, cycle.LeaderPosID)
 		pnl, size := float64(0), float64(0)
 		leader := ti.engine.buildLeaderPosMap()[cycle.LeaderPosID]
@@ -790,7 +953,12 @@ func (ti *TraderIntegration) pollV4ProtectiveStops() {
 		}
 		slippage := cycle.FollowerNotional * math.Abs(fillPrice-stored.TriggerPrice) / stored.TriggerPrice
 		stopPnL := cycle.FollowerNotional*move - fee
-		_ = ti.store.CopyTrade().RecordCopyGuardStop(cycle, atr, fillPrice, stopPnL, fee, slippage, stored.AlgoID, map[string]interface{}{"algo_id": stored.AlgoID, "state": state, "actual_order_id": live.ActualOrderID, "trigger_price": stored.TriggerPrice, "slippage": slippage, "quantity": stored.Quantity})
+		if recordErr := ti.store.CopyTrade().RecordCopyGuardStop(cycle, atr, fillPrice, stopPnL, fee, slippage, stored.AlgoID, map[string]interface{}{"algo_id": stored.AlgoID, "state": state, "actual_order_id": live.ActualOrderID, "trigger_price": stored.TriggerPrice, "slippage": slippage, "quantity": stored.Quantity}); recordErr != nil {
+			logger.Errorf("[CopyGuard] trader=%s cycle=%d attempt=%d event=STOP_PERSIST_FAILED reason=%v", ti.traderID, cycle.ID, cycle.ReentryCount, recordErr)
+			ti.notifyProtection(cycle, "Copy Guard 止损状态落库失败", "交易所已触发止损，但本地状态落库失败；系统保留保护单记录并继续重试，归零确认前禁止重入。错误: "+recordErr.Error(), fmt.Sprintf("stop_persist_failed_%d", cycle.ReentryCount))
+			continue
+		}
+		_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "STOP_FLAT_CONFIRMED", Price: fillPrice, Metadata: map[string]interface{}{"algo_id": stored.AlgoID, "attempt_no": cycle.ReentryCount, "state": state}})
 		// 快照止损时的领航员均价，供重入保守锚点使用（领航员数据不可得时跳过，
 		// checkReentryConditions 会退回实时均价）
 		if leader != nil && leader.EntryPrice > 0 {
@@ -817,6 +985,22 @@ func protectionRatio(protected, position float64) float64 {
 		return 0
 	}
 	return protected / position
+}
+
+// protectionQuantityMatches accepts the exchange rounding difference of one
+// base-quantity lot. New v7 orders persist lotSz*ctVal as quantityStep so this
+// remains deterministic after restart. Old rows have step=0 and retain the
+// legacy 0.1% tolerance until their protection is next rebuilt.
+func protectionQuantityMatches(protected, position, quantityStep float64) bool {
+	if protected <= 0 || position <= 0 {
+		return false
+	}
+	tolerance := quantityStep
+	if tolerance <= 0 {
+		tolerance = math.Max(position*0.001, 1e-8)
+	}
+	epsilon := math.Max(math.Max(math.Abs(protected), math.Abs(position))*1e-12, 1e-12)
+	return math.Abs(protected-position) <= tolerance+epsilon
 }
 
 func protectionRetryDelay(retries int) time.Duration {
@@ -991,11 +1175,16 @@ func (ti *TraderIntegration) handleUnprotectableCycle(cycle *store.CopyGuardCycl
 	if mapping, _ := ti.store.CopyTrade().GetMapping(ti.traderID, cycle.LeaderPosID); mapping != nil {
 		addCount = mapping.AddCount
 	}
-	_ = ti.store.CopyTrade().MarkStoppedByRisk(ti.traderID, cycle.LeaderPosID, pnl, size, addCount)
 	atr, _ := market.GetOKXATRWithMaxAge(cycle.Symbol, ti.engine.config.RiskATRTimeframe, ti.engine.config.RiskATRPeriod, riskATRCacheMaxAge(ti.engine.config))
-	_ = ti.store.CopyTrade().RecordCopyGuardStopObserved(cycle.ID, ti.traderID, cycle.ReentryCount, atr, price, quantity, map[string]interface{}{
+	if recordErr := ti.store.CopyTrade().RecordCopyGuardStopObserved(cycle.ID, ti.traderID, cycle.ReentryCount, atr, price, quantity, map[string]interface{}{
 		"confirmation": "guard_forced_exit", "error": message, "leader_pnl": pnl,
-	})
+	}); recordErr != nil {
+		logger.Errorf("[CopyGuard] trader=%s cycle=%d attempt=%d event=FORCED_EXIT_PERSIST_FAILED reason=%v", ti.traderID, cycle.ID, cycle.ReentryCount, recordErr)
+		ti.notifyProtection(cycle, "Copy Guard 已退出但账本落库失败", "仓位已强制退出，但本地止损账本提交失败；系统保持禁止重入并将在仓位缺失检测中重试。错误: "+recordErr.Error(), fmt.Sprintf("forced_exit_persist_%d", cycle.ReentryCount))
+		return
+	}
+	_ = ti.store.CopyTrade().MarkStoppedByRisk(ti.traderID, cycle.LeaderPosID, pnl, size, addCount)
+	_ = ti.store.ReentryAI().ConsumeCopyGuardRisk(cycle.ID, cycle.ReentryCount)
 	_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "GUARD_FORCED_EXIT", Price: price, Quantity: quantity, Metadata: map[string]interface{}{
 		"error": message, "leader_pos_id": cycle.LeaderPosID,
 	}})
@@ -1036,26 +1225,100 @@ func (ti *TraderIntegration) recoverV4PendingStates() {
 				continue
 			}
 			state := strings.ToUpper(getStringField(order, "status"))
+			executedQty := getFloatField(order, "executedQty")
+			// A canceled market order may still contain a partial fill. Any
+			// non-zero exchange quantity is a real position and must enter the
+			// protection barrier instead of being treated as a harmless failure.
+			if executedQty > 0 {
+				if recoverErr := ti.recoverFilledReentry(cycle, order); recoverErr != nil {
+					_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "REENTRY_RECOVERY_PENDING", Metadata: map[string]interface{}{"client_order_id": cycle.EntryOrderID, "state": state, "executed_quantity": executedQty, "error": recoverErr.Error()}})
+					ti.notifyProtection(cycle, "Copy Guard 重入成交恢复失败", "交易所确认已有成交，但恢复保护链失败，系统不会重复下单。错误: "+recoverErr.Error(), fmt.Sprintf("reentry-recovery-fill-%d", cycle.ReentryCount+1))
+				}
+				continue
+			}
 			switch state {
 			case "FILLED":
-				entry := getFloatField(order, "avgPrice")
-				qty := getFloatField(order, "executedQty")
-				notional := cycle.FollowerNotional
-				if entry > 0 && qty > 0 {
-					notional = entry * qty
-				}
-				_ = ti.store.CopyTrade().ActivateMappingAfterReentry(ti.traderID, cycle.LeaderPosID, entry, notional, 0)
-				_ = ti.store.CopyTrade().RecordCopyGuardReentryFilled(cycle, entry, notional, qty, 0, map[string]interface{}{"result": "filled", "client_order_id": cycle.EntryOrderID, "recovered_after_restart": true})
-				// v5.1：重启期间人工重入订单实际已成交 → 回写信号 EXECUTED
-				ti.markManualReentryOutcome(cycle.ID, store.ManualReentryStatusExecuted, "")
+				// A filled order without an executed quantity is not enough evidence
+				// to size protection. Keep it pending and escalate.
+				_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "REENTRY_RECOVERY_PENDING", Metadata: map[string]interface{}{"client_order_id": cycle.EntryOrderID, "state": state, "error": "filled order missing executed quantity"}})
 			case "CANCELED", "REJECTED", "FAILED":
-				_ = ti.store.CopyTrade().UpdateCopyGuardObservation(cycle.ID, store.CopyGuardStoppedWatching, cycle.LeaderEntryPrice, cycle.LastObservedPrice, 0)
+				attemptNo := cycle.ReentryCount + 1
+				_ = ti.store.ReentryAI().ReleaseCopyGuardRisk(cycle.ID, attemptNo)
+				status := store.CopyGuardStoppedWatching
+				if candidate, candidateErr := ti.store.ReentryAI().GetReentryCandidateByCycle(cycle.ID); candidateErr == nil && candidate.Status == store.ReentryCandidateEntryPending {
+					retry := ti.engine.config.RiskAIMinReviewSeconds
+					if retry < 300 {
+						retry = 300
+					}
+					_ = ti.store.ReentryAI().RejectReentryCandidatePreflight(candidate.ID, "exchange confirmed "+state, time.Duration(retry)*time.Second)
+					status = store.CopyGuardAIWaiting
+				}
+				_ = ti.store.CopyTrade().UpdateCopyGuardObservation(cycle.ID, status, cycle.LeaderEntryPrice, cycle.LastObservedPrice, 0)
 				_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "REENTRY_RECOVERED_AFTER_RESTART", Metadata: map[string]interface{}{"result": "failed", "state": state, "client_order_id": cycle.EntryOrderID}})
 				// v5.1：重启期间人工重入订单被取消/拒绝 → 回写信号 FAILED
 				ti.markManualReentryOutcome(cycle.ID, store.ManualReentryStatusFailed, "重启后确认订单为"+state)
 			}
 		}
 	}
+}
+
+// recoverFilledReentry converts an exchange-authoritative client-order lookup
+// into the normal lifecycle and immediately rebuilds/verifies protection. It is
+// used both after restart and after an ambiguous submit response.
+func (ti *TraderIntegration) recoverFilledReentry(cycle *store.CopyGuardCycle, order map[string]interface{}) error {
+	if cycle == nil || cycle.Status != store.CopyGuardReentryPending {
+		return fmt.Errorf("reentry cycle is no longer pending")
+	}
+	entry := getFloatField(order, "avgPrice")
+	executedQuantity := math.Abs(getFloatField(order, "executedQty"))
+	// executedQty is historical order evidence, not proof that the position is
+	// still open after a restart. A user/forced close in the crash window must
+	// not be resurrected into an active lifecycle. Protect the authoritative
+	// current position quantity (which may also be smaller after a partial exit).
+	quantity, positionKnown := ti.followerPositionQuantity(cycle.Symbol, cycle.Side, cycle.MarginMode, true)
+	if !positionKnown {
+		return fmt.Errorf("exchange fill exists but current follower position is unavailable")
+	}
+	if quantity <= 0 {
+		return fmt.Errorf("exchange fill quantity %.8f exists but current follower position is flat", executedQuantity)
+	}
+	if entry <= 0 {
+		if mgr, ok := ti.executor.(StopLossManager); ok {
+			entry, _ = mgr.GetMarketPrice(cycle.Symbol)
+		}
+	}
+	if entry <= 0 || quantity <= 0 {
+		return fmt.Errorf("exchange fill lacks a usable price or quantity")
+	}
+	notional := entry * quantity
+	leaderSize := float64(0)
+	if ti.engine != nil {
+		if leader := ti.engine.buildLeaderPosMap()[cycle.LeaderPosID]; leader != nil {
+			leaderSize = leader.Size
+		}
+	}
+	orderID := getStringField(order, "orderId")
+	if err := ti.store.CopyTrade().RecordCopyGuardReentryFilled(cycle, entry, notional, quantity, 0, map[string]interface{}{
+		"result":                  "filled",
+		"client_order_id":         cycle.EntryOrderID,
+		"exchange_order_id":       orderID,
+		"recovered_after_restart": true,
+		"activate_mapping":        true,
+		"leader_size":             leaderSize,
+	}); err != nil {
+		return err
+	}
+	ti.markManualReentryOutcome(cycle.ID, store.ManualReentryStatusExecuted, "")
+	action := "open_long"
+	if cycle.Side == "short" {
+		action = "open_short"
+	}
+	dec := &decision.Decision{Symbol: cycle.Symbol, Action: action, PositionSizeUSD: notional, MarginMode: cycle.MarginMode, Reasoning: "Copy trading reentry recovered", EntryPrice: entry, LeaderPosID: cycle.LeaderPosID, LeaderPosSize: leaderSize, ClientOrderID: cycle.EntryOrderID, ExchangeOrderID: orderID}
+	ti.refreshStopLossAfterExecute(dec)
+	if ti.engine != nil && ti.engine.config != nil && ti.engine.config.RiskReentryDecisionMode == "ai_guarded" {
+		ti.enforceAIReentryProtection(dec)
+	}
+	return nil
 }
 
 // Stop 停止跟单
@@ -1128,7 +1391,13 @@ func (ti *TraderIntegration) executeFullDecision(fullDec *decision.FullDecision)
 
 		// 执行交易（瞬态错误有界重试：限流/读失败等"保证未下单"错误不再一次定死）
 		startTime := time.Now()
-		err := ti.executeDecisionWithRetry(dec)
+		var err error
+		if ti.engine.config.RiskReentryDecisionMode == "ai_guarded" && strings.Contains(dec.Reasoning, "reentry") {
+			err = ti.validateAIReentryImmediatelyBeforeOrder(dec)
+		}
+		if err == nil {
+			err = ti.executeDecisionWithRetry(dec)
+		}
 
 		// 构建决策动作记录
 		action := store.DecisionAction{
@@ -1143,8 +1412,7 @@ func (ti *TraderIntegration) executeFullDecision(fullDec *decision.FullDecision)
 		if err != nil {
 			if ti.engine.config.RiskPolicyVersion >= 4 && strings.Contains(dec.Reasoning, "reentry") {
 				if cycle, cerr := ti.store.CopyTrade().GetOpenCopyGuardCycle(ti.traderID, dec.LeaderPosID); cerr == nil {
-					_ = ti.store.CopyTrade().UpdateCopyGuardObservation(cycle.ID, store.CopyGuardStoppedWatching, cycle.LeaderEntryPrice, cycle.LastObservedPrice, 0)
-					_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "REENTRY_FAILED", Metadata: map[string]interface{}{"error": err.Error()}})
+					ti.handleReentryExecutionFailure(cycle, err)
 					// v5.1：人工重入执行失败 → 信号回写 FAILED（周期无 EXECUTING
 					// 信号时为 no-op，自动重入路径零影响）
 					ti.markManualReentryOutcome(cycle.ID, store.ManualReentryStatusFailed, err.Error())
@@ -1223,13 +1491,32 @@ func (ti *TraderIntegration) executeFullDecision(fullDec *decision.FullDecision)
 			executionLogs = append(executionLogs, fmt.Sprintf("✅ %s %s 成功 (耗时 %dms)", dec.Action, dec.Symbol, duration))
 			ti.saveSignalLog(dec, "executed", "")
 
-			// 执行成功后更新仓位映射
-			ti.updatePositionMapping(dec)
+			// 执行成功后更新仓位映射。Copy Guard 重入必须把 mapping、cycle
+			// 和新 attempt 原子提交；提交失败时绝不能继续按一个错误 attempt
+			// 编号挂保护单，也不能把该成交伪装为完整成功。
+			postFillCommitted := true
+			if ti.engine.config.RiskPolicyVersion >= 4 && strings.Contains(dec.Reasoning, "reentry") {
+				if commitErr := ti.commitCopyGuardReentryFill(dec); commitErr != nil {
+					postFillCommitted = false
+					ti.handleReentryLifecycleCommitFailure(dec, commitErr)
+				}
+			} else {
+				ti.updatePositionMapping(dec)
+			}
 
-			// 🛑 v3 风控：开仓/加仓/部分减仓 → 用实际成交均价精确重挂 SL
-			// 平仓不重挂（仓位已经全清空）
-			// 设计：放在 mapping 更新后，保证后续 SL 触发对账能找到正确的 active mapping
-			ti.refreshStopLossAfterExecute(dec)
+			if postFillCommitted {
+				// 🛑 v3 风控：开仓/加仓/部分减仓 → 用实际成交均价精确重挂 SL
+				// 平仓不重挂（仓位已经全清空）
+				// 设计：放在 mapping 更新后，保证后续 SL 触发对账能找到正确的 active mapping
+				ti.refreshStopLossAfterExecute(dec)
+				if ti.engine.config.RiskReentryDecisionMode == "ai_guarded" {
+					if strings.Contains(dec.Reasoning, "reentry") {
+						ti.enforceAIReentryProtection(dec)
+					} else {
+						ti.enforceAIGuardedPositionProtection(dec)
+					}
+				}
+			}
 
 			// 🔧 成功一次即清零连续失败计数；下次再失败重新累计
 			if ti.store != nil && dec.LeaderPosID != "" {
@@ -1595,6 +1882,131 @@ func (ti *TraderIntegration) saveEquitySnapshot(totalEquity, availableBalance, u
 	}
 }
 
+func (ti *TraderIntegration) handleReentryExecutionFailure(cycle *store.CopyGuardCycle, executionErr error) {
+	if cycle == nil || executionErr == nil {
+		return
+	}
+	// A transport timeout after order submission is not a failed order. Keep the
+	// client-order lease, reservation and ENTRY_PENDING candidate intact until
+	// exchange lookup proves filled or terminal; releasing here could duplicate
+	// a real fill on the next AI review.
+	if isAmbiguousReentryExecutionError(executionErr) && !errors.Is(executionErr, errAIReentryOrderPreflight) {
+		metadata := map[string]interface{}{"error": executionErr.Error(), "attempt_no": cycle.ReentryCount + 1, "client_order_id": cycle.EntryOrderID}
+		if provider, ok := ti.executor.(ClientOrderStatusProvider); ok && cycle.EntryOrderID != "" {
+			if order, queryErr := provider.GetOrderStatusByClientID(cycle.Symbol, cycle.EntryOrderID); queryErr == nil {
+				state := strings.ToUpper(getStringField(order, "status"))
+				metadata["exchange_state"] = state
+				if getFloatField(order, "executedQty") > 0 {
+					if recoverErr := ti.recoverFilledReentry(cycle, order); recoverErr == nil {
+						return
+					} else {
+						metadata["recovery_error"] = recoverErr.Error()
+					}
+				} else if state == "CANCELED" || state == "REJECTED" || state == "FAILED" {
+					// Exchange authoritatively confirms no fill; normal safe-failure
+					// handling below may release the reservation.
+					goto safeFailure
+				}
+			} else {
+				metadata["lookup_error"] = queryErr.Error()
+			}
+		}
+		_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "REENTRY_RECOVERY_PENDING", Metadata: metadata})
+		ti.notifyProtection(cycle, "AI 重入订单状态不确定", "交易所返回不确定结果，系统保留幂等订单号并暂停重复入场，正在查询真实订单状态。错误: "+executionErr.Error(), fmt.Sprintf("ai_reentry_uncertain_%d", cycle.ReentryCount+1))
+		return
+	}
+
+safeFailure:
+	attemptNo := cycle.ReentryCount + 1
+	_ = ti.store.ReentryAI().ReleaseCopyGuardRisk(cycle.ID, attemptNo)
+	status := store.CopyGuardStoppedWatching
+	metadata := map[string]interface{}{"error": executionErr.Error(), "attempt_no": attemptNo}
+	if ti.engine != nil && ti.engine.config != nil && ti.engine.config.RiskReentryDecisionMode == "ai_guarded" {
+		status = store.CopyGuardAIWaiting
+		if candidate, err := ti.store.ReentryAI().GetReentryCandidateByCycle(cycle.ID); err == nil && candidate.Status == store.ReentryCandidateEntryPending {
+			retry := ti.engine.config.RiskAIMinReviewSeconds
+			if retry < 300 {
+				retry = 300
+			}
+			_ = ti.store.ReentryAI().RejectReentryCandidatePreflight(candidate.ID, "exchange entry failed: "+executionErr.Error(), time.Duration(retry)*time.Second)
+			metadata["candidate_id"] = candidate.ID
+			metadata["analysis_id"] = candidate.LastAnalysisID
+			metadata["decision_generation"] = candidate.DecisionGeneration
+		}
+	}
+	_ = ti.store.CopyTrade().UpdateCopyGuardObservation(cycle.ID, status, cycle.LeaderEntryPrice, cycle.LastObservedPrice, 0)
+	_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "REENTRY_FAILED", Metadata: metadata})
+}
+
+var errAIReentryOrderPreflight = errors.New("AI reentry final preflight rejected")
+
+func (ti *TraderIntegration) validateAIReentryImmediatelyBeforeOrder(dec *decision.Decision) error {
+	if dec == nil || ti.engine == nil || ti.engine.config == nil {
+		return fmt.Errorf("%w: execution context unavailable", errAIReentryOrderPreflight)
+	}
+	cycle, err := ti.store.CopyTrade().GetOpenCopyGuardCycle(ti.traderID, dec.LeaderPosID)
+	if err != nil || cycle.Status != store.CopyGuardReentryPending {
+		return fmt.Errorf("%w: cycle is no longer pending entry", errAIReentryOrderPreflight)
+	}
+	candidate, err := ti.store.ReentryAI().GetReentryCandidateByCycle(cycle.ID)
+	if err != nil || candidate.Status != store.ReentryCandidateEntryPending || candidate.ReentryCount != cycle.ReentryCount {
+		return fmt.Errorf("%w: candidate lease is stale", errAIReentryOrderPreflight)
+	}
+	if cycle.ReentryCount >= ti.engine.config.RiskMaxReentries {
+		return fmt.Errorf("%w: maximum reentry attempts reached", errAIReentryOrderPreflight)
+	}
+	if dec.PositionSizeUSD <= 0 || dec.PositionSizeUSD > candidate.MaxNotional*candidate.SizeFactor+math.Max(0.01, dec.PositionSizeUSD*1e-9) {
+		return fmt.Errorf("%w: queued notional exceeds AI deterministic cap", errAIReentryOrderPreflight)
+	}
+	analysis, err := ti.store.ReentryAI().GetReentryAnalysis(candidate.LastAnalysisID)
+	if err != nil || analysis.CandidateID != candidate.ID {
+		return fmt.Errorf("%w: candidate analysis unavailable", errAIReentryOrderPreflight)
+	}
+	ttl := candidate.DecisionTTLSeconds
+	if ttl < 15 || ttl > 60 {
+		ttl = 30
+	}
+	if age := time.Since(analysis.SnapshotAt); age < 0 || age > time.Duration(ttl)*time.Second {
+		return fmt.Errorf("%w: AI result expired before exchange submission", errAIReentryOrderPreflight)
+	}
+	leader := ti.engine.buildLeaderPosMap()[candidate.LeaderPosID]
+	if leader == nil || leader.Size <= 0 || (leader.Side != "" && string(leader.Side) != candidate.Side) {
+		return fmt.Errorf("%w: leader position closed or reversed", errAIReentryOrderPreflight)
+	}
+	price := leader.MarkPrice
+	if mgr, ok := ti.executor.(StopLossManager); ok {
+		if current, priceErr := mgr.GetMarketPrice(candidate.Symbol); priceErr == nil && current > 0 {
+			price = current
+		}
+	}
+	if price <= 0 || price < candidate.EntryPriceLow || price > candidate.EntryPriceHigh || candidate.ATR <= 0 || math.Abs(price-analysis.SnapshotPrice) > 0.25*candidate.ATR {
+		return fmt.Errorf("%w: price left the approved range or drift limit", errAIReentryOrderPreflight)
+	}
+	positions, err := ti.getFreshPositions()
+	if err != nil {
+		return fmt.Errorf("%w: follower position refresh failed: %v", errAIReentryOrderPreflight, err)
+	}
+	for _, pos := range positions {
+		if getStringField(pos, "symbol") == candidate.Symbol && strings.EqualFold(getStringField(pos, "side"), candidate.Side) && math.Abs(getFloatField(pos, "positionAmt", "quantity")) > 0 {
+			return fmt.Errorf("%w: follower already has the candidate position", errAIReentryOrderPreflight)
+		}
+	}
+	return nil
+}
+
+func isAmbiguousReentryExecutionError(err error) bool {
+	if err == nil || errors.Is(err, errAIReentryOrderPreflight) || isRetryableExecutionError(err) {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	for _, token := range []string{"timeout", "deadline exceeded", "context canceled", "unexpected eof", "connection reset", "broken pipe", "network is unreachable", "temporarily unavailable", "empty response"} {
+		if strings.Contains(message, token) {
+			return true
+		}
+	}
+	return false
+}
+
 // buildCopyTradeCoT 构建跟单的思维链描述
 func (ti *TraderIntegration) buildCopyTradeCoT(fullDec *decision.FullDecision) string {
 	var cot string
@@ -1932,6 +2344,81 @@ func buildActionDetail(dec *decision.Decision, errorMsg string) map[string]inter
 	return d
 }
 
+// commitCopyGuardReentryFill is the post-exchange transactional commit for a
+// reentry. The store changes the stopped mapping, cycle and new attempt in one
+// transaction so protection is never built against a half-committed lifecycle.
+func (ti *TraderIntegration) commitCopyGuardReentryFill(dec *decision.Decision) error {
+	cycle, err := ti.store.CopyTrade().GetOpenCopyGuardCycle(ti.traderID, dec.LeaderPosID)
+	if err != nil {
+		return err
+	}
+	quantity := 0.0
+	if dec.EntryPrice > 0 {
+		quantity = dec.PositionSizeUSD / dec.EntryPrice
+	}
+	metadata := map[string]interface{}{
+		"activate_mapping":  true,
+		"leader_size":       dec.LeaderPosSize,
+		"client_order_id":   dec.ClientOrderID,
+		"exchange_order_id": dec.ExchangeOrderID,
+	}
+	if err = ti.store.CopyTrade().RecordCopyGuardReentryFilled(cycle, dec.EntryPrice, dec.PositionSizeUSD, quantity, 0, metadata); err != nil {
+		return err
+	}
+	ti.markManualReentryOutcome(cycle.ID, store.ManualReentryStatusExecuted, "")
+	return nil
+}
+
+// handleReentryLifecycleCommitFailure handles the exceptional case where the
+// exchange filled an entry but the local lifecycle transaction could not be
+// committed. It never continues to protection using a stale attempt number.
+// The position is closed, the candidate is terminal, and the in-flight risk is
+// retained as consumed rather than incorrectly returned to the live budget.
+func (ti *TraderIntegration) handleReentryLifecycleCommitFailure(dec *decision.Decision, cause error) {
+	cycle, cycleErr := ti.store.CopyTrade().GetOpenCopyGuardCycle(ti.traderID, dec.LeaderPosID)
+	if cycleErr != nil {
+		logger.Errorf("[CopyGuard] trader=%s event=REENTRY_LIFECYCLE_COMMIT_FAILED reason=%v lifecycle_error=%v", ti.traderID, cause, cycleErr)
+		return
+	}
+	attemptNo := cycle.ReentryCount + 1
+	reason := "post-fill lifecycle commit failed: " + cause.Error()
+	metadata := map[string]interface{}{"attempt_no": attemptNo, "client_order_id": dec.ClientOrderID, "exchange_order_id": dec.ExchangeOrderID, "error": cause.Error()}
+	_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "REENTRY_RECOVERY_PENDING", Price: dec.EntryPrice, Notional: dec.PositionSizeUSD, Metadata: metadata})
+
+	closer, ok := ti.executor.(EmergencyPositionCloser)
+	if !ok {
+		metadata["forced_exit_error"] = "executor does not support emergency close"
+		_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "GUARD_FORCED_EXIT_FAILED", Metadata: metadata})
+		ti.notifyProtection(cycle, "AI 重入成交账本提交失败", reason+"；执行器不支持紧急平仓，系统已冻结本候选，禁止重复入场。", fmt.Sprintf("reentry_commit_failed_%d", attemptNo))
+		return
+	}
+	if _, closeErr := closer.ClosePositionMarket(cycle.Symbol, cycle.Side); closeErr != nil {
+		metadata["forced_exit_error"] = closeErr.Error()
+		_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "GUARD_FORCED_EXIT_FAILED", Metadata: metadata})
+		ti.notifyProtection(cycle, "AI 重入成交账本提交失败且退出失败", reason+"；强制退出失败: "+closeErr.Error(), fmt.Sprintf("reentry_commit_exit_failed_%d", attemptNo))
+		return
+	}
+	if qty, known := ti.followerPositionQuantity(cycle.Symbol, cycle.Side, cycle.MarginMode, true); !known || qty > 0 {
+		metadata["residual_quantity"] = qty
+		metadata["forced_exit_error"] = "position flatness not confirmed"
+		_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "GUARD_FORCED_EXIT_FAILED", Metadata: metadata})
+		ti.notifyProtection(cycle, "AI 重入异常退出待确认", reason+"；退出后未能确认仓位归零，系统保持冻结并禁止重复入场。", fmt.Sprintf("reentry_commit_flat_unknown_%d", attemptNo))
+		return
+	}
+	_ = ti.store.ReentryAI().ConsumeCopyGuardRisk(cycle.ID, attemptNo)
+	if candidate, candidateErr := ti.store.ReentryAI().GetReentryCandidateByCycle(cycle.ID); candidateErr == nil {
+		metadata["candidate_id"] = candidate.ID
+		_ = ti.store.ReentryAI().MarkReentryCandidateStatus(candidate.ID, store.ReentryCandidateInvalidated, reason)
+	}
+	status := store.CopyGuardStoppedWatching
+	if ti.engine.config.RiskReentryDecisionMode == "ai_guarded" {
+		status = store.CopyGuardAIAbandoned
+	}
+	_ = ti.store.CopyTrade().UpdateCopyGuardObservation(cycle.ID, status, cycle.LeaderEntryPrice, cycle.LastObservedPrice, 0)
+	_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "FORCED_EXIT", Price: dec.EntryPrice, Notional: dec.PositionSizeUSD, Metadata: metadata})
+	ti.notifyProtection(cycle, "AI 重入异常已强制退出", reason+"；仓位已确认归零，本候选已终止。", fmt.Sprintf("reentry_commit_forced_exit_%d", attemptNo))
+}
+
 // updatePositionMapping 更新仓位映射（执行成功后调用）
 // 根据 action 类型执行不同操作：
 //   - open_long/open_short: 保存新映射 或 加仓（根据数据库是否已有映射判断）
@@ -1943,22 +2430,6 @@ func (ti *TraderIntegration) updatePositionMapping(dec *decision.Decision) {
 	}
 
 	copyTradeStore := ti.store.CopyTrade()
-	if ti.engine.config.RiskPolicyVersion >= 4 && strings.Contains(dec.Reasoning, "reentry") {
-		if err := copyTradeStore.ActivateMappingAfterReentry(ti.traderID, dec.LeaderPosID, dec.EntryPrice, dec.PositionSizeUSD, dec.LeaderPosSize); err != nil {
-			logger.Errorf("❌ [%s] v4 重入成交后激活映射失败: %v", ti.traderID, err)
-			return
-		}
-		if cycle, err := copyTradeStore.GetOpenCopyGuardCycle(ti.traderID, dec.LeaderPosID); err == nil {
-			_ = copyTradeStore.UpdateCopyGuardExecutionOrder(cycle.ID, dec.ExchangeOrderID, "")
-			_ = copyTradeStore.RecordCopyGuardReentryFilled(cycle, dec.EntryPrice, dec.PositionSizeUSD, 0, 0, map[string]interface{}{"leader_size": dec.LeaderPosSize, "client_order_id": dec.ClientOrderID})
-			_ = copyTradeStore.UpdateCopyGuardAttemptIdentity(cycle.ID, cycle.ReentryCount+1, "", dec.ExchangeOrderID, "")
-			// v5.1：人工重入执行成功 → 信号回写 EXECUTED（无 EXECUTING 信号
-			// 时为 no-op，自动重入路径零影响）
-			ti.markManualReentryOutcome(cycle.ID, store.ManualReentryStatusExecuted, "")
-		}
-		return
-	}
-
 	// 从 action 推断操作类型
 	switch dec.Action {
 	case "open_long", "open_short":
@@ -2530,8 +3001,67 @@ func (ti *TraderIntegration) refreshStopLossAfterExecute(dec *decision.Decision)
 	slResult, err := calcStopLossPrice(ti.engine.config, slInput)
 	if err != nil {
 		logger.Warnf("⚠️ [%s] 重挂 SL：算法失败: %v | %s", ti.traderID, err, dec.Symbol)
+		if ti.engine.config.RiskReentryDecisionMode == "ai_guarded" {
+			ti.handleUnprotectableForDecision(dec, expectedSide, quantity, entryPrice, err)
+			return
+		}
 		ti.markProtectionIssueForDecision(dec, store.CopyGuardProtectionDegraded, "PROTECTION_DEGRADED", err, 0)
 		return
+	}
+	// AI-guarded entries, add-ons and reentries share the same actual-fill
+	// ProtectionPlan. The preflight plan is only an estimate; after execution we
+	// recompute from the real average entry and current completed-candle
+	// structure. A wider valid stop shrinks/rejects the position, never gets
+	// squeezed into market noise.
+	if ti.engine.config.RiskReentryDecisionMode == "ai_guarded" {
+		structure := structuralInvalidationPrice(dec.Symbol, side, entryPrice)
+		planATR := slResult.ATRValue
+		if planATR <= 0 && ti.engine.config.RiskATRMultiplier > 0 {
+			planATR = slResult.ATRDistance / ti.engine.config.RiskATRMultiplier
+		}
+		cycle, cycleErr := ti.store.CopyTrade().GetOpenCopyGuardCycle(ti.traderID, dec.LeaderPosID)
+		if cycleErr != nil {
+			ti.handleUnprotectableForDecision(dec, expectedSide, quantity, entryPrice, fmt.Errorf("risk cycle unavailable after fill: %w", cycleErr))
+			return
+		}
+		usage, usageErr := ti.store.ReentryAI().GetCopyGuardRiskUsageExcludingAttempt(ti.traderID, cycle.ID, cycle.ReentryCount)
+		availableRisk, capacityErr := AvailableCopyGuardRiskUSD(ti.engine.config, followerEquity, usage)
+		if usageErr != nil || capacityErr != nil {
+			if usageErr != nil {
+				capacityErr = usageErr
+			}
+			ti.handleUnprotectableForDecision(dec, expectedSide, quantity, entryPrice, fmt.Errorf("risk capacity unavailable after fill: %w", capacityErr))
+			return
+		}
+		plan, planErr := BuildProtectionPlan(ti.engine.config, side, entryPrice, planATR, structure, followerEquity, availableRisk/followerEquity, slInput.PositionValue)
+		if planErr != nil || plan.MaxNotional+math.Max(0.01, slInput.PositionValue*0.001) < slInput.PositionValue {
+			if planErr == nil {
+				planErr = fmt.Errorf("actual notional %.4f exceeds protected risk size %.4f", slInput.PositionValue, plan.MaxNotional)
+			}
+			ti.handleUnprotectableForDecision(dec, expectedSide, quantity, entryPrice, planErr)
+			return
+		}
+		governedBy := "atr"
+		if plan.StructureInvalidation > 0 && plan.StopDistance > slResult.ATRDistance+1e-9 {
+			governedBy = "structure"
+		}
+		friction := (ti.engine.config.RiskSlippageBufferBPS + ti.engine.config.RiskRoundTripFeeBPS) / 10000
+		expectedLoss := slInput.PositionValue * (plan.StopDistance/entryPrice + friction)
+		slResult.SLDistance = plan.StopDistance
+		slResult.ATRDistance = plan.ATR * ti.engine.config.RiskATRMultiplier
+		slResult.ATRValue = plan.ATR
+		slResult.GovernedBy = governedBy
+		slResult.ExpectedLossUSD = expectedLoss
+		slResult.ExpectedLossPct = expectedLoss / followerEquity
+		if margin := slInput.PositionValue / float64(leverage); margin > 0 {
+			slResult.ExpectedMarginLossPct = expectedLoss / margin
+		}
+		slResult.DistanceATRRatio = plan.StopDistance / plan.ATR
+		slResult, err = finalizeStopLossPrice(slInput, slResult, ti.engine.config.RiskLiquidationBufferATR)
+		if err != nil {
+			ti.handleUnprotectableForDecision(dec, expectedSide, quantity, entryPrice, err)
+			return
+		}
 	}
 	// v5 可保护性状态机：算不出可挂的止损价（clamp 后仍不可行 / 开仓即触发）
 	// → 不再无限重试，直接进入 GUARD_UNPROTECTABLE 处置（按配置平仓或标红裸跑）
@@ -2549,6 +3079,15 @@ func (ti *TraderIntegration) refreshStopLossAfterExecute(dec *decision.Decision)
 		ti.markProtectionIssueForDecision(dec, store.CopyGuardProtectionDegraded, "PROTECTION_DEGRADED", cause, 0)
 		return
 	}
+	if priceProvider, ok := ti.executor.(StopLossManager); ok {
+		if current, priceErr := priceProvider.GetMarketPrice(dec.Symbol); priceErr == nil && current > 0 {
+			crossed := (expectedSide == "long" && current <= slResult.SLPrice) || (expectedSide == "short" && current >= slResult.SLPrice)
+			if crossed {
+				ti.handleUnprotectableForDecision(dec, expectedSide, quantity, entryPrice, fmt.Errorf("stop %.8f already crossed by current price %.8f", slResult.SLPrice, current))
+				return
+			}
+		}
+	}
 	if slResult.LiquidationPriceIgnored {
 		logger.Warnf("⚠️ [%s] 强平价方向异常已忽略 | %s %s entry=%.4f liq=%.4f（继续按 ATR 挂保护单）", ti.traderID, dec.Symbol, expectedSide, entryPrice, liquidationPrice)
 		if cycle, cycleErr := ti.store.CopyTrade().GetOpenCopyGuardCycle(ti.traderID, dec.LeaderPosID); cycleErr == nil {
@@ -2556,6 +3095,102 @@ func (ti *TraderIntegration) refreshStopLossAfterExecute(dec *decision.Decision)
 		}
 	}
 	ti.upsertV4Protection(dec, expectedSide, quantity, entryPrice, slResult)
+}
+
+// enforceAIReentryProtection is the final commit barrier for AI reentry. A
+// filled order is not considered successful until a freshly verified stop
+// covers the whole position. If protection cannot be proven synchronously,
+// the deterministic layer exits immediately; the AI decision never gets to
+// leave an unprotected position running.
+func (ti *TraderIntegration) enforceAIReentryProtection(dec *decision.Decision) {
+	cycle, err := ti.store.CopyTrade().GetOpenCopyGuardCycle(ti.traderID, dec.LeaderPosID)
+	if err != nil {
+		return
+	}
+	candidate, candidateErr := ti.store.ReentryAI().GetReentryCandidateByCycle(cycle.ID)
+	protected := (cycle.ProtectionStatus == store.CopyGuardProtectionVerified || cycle.ProtectionStatus == store.CopyGuardProtectionClamped) && cycle.ProtectionCoverage >= 0.999
+	if protected {
+		// A protected position is safe to keep, but it is not an auditable AI
+		// success unless the exact ENTRY_PENDING candidate can be committed. Do
+		// not manufacture candidate=0 success mail when storage is missing.
+		if candidateErr != nil || candidate == nil {
+			reason := "AI reentry is protected but its candidate cannot be loaded"
+			if candidateErr != nil {
+				reason += ": " + candidateErr.Error()
+			}
+			_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "REENTRY_RECOVERY_PENDING", Metadata: map[string]interface{}{"attempt_no": cycle.ReentryCount, "reason": reason, "protection_coverage": cycle.ProtectionCoverage}})
+			ti.notifyProtection(cycle, "AI 重入保护成功但审计关联缺失", reason+"；仓位已有完整保护，系统不会重复入场，但需恢复候选关联。", fmt.Sprintf("reentry_candidate_missing_%d", cycle.ReentryCount))
+			return
+		}
+		if candidate.Status == store.ReentryCandidateReentered {
+			return
+		}
+		if candidate.Status != store.ReentryCandidateEntryPending {
+			reason := fmt.Sprintf("protected AI reentry has unexpected candidate status %s", candidate.Status)
+			_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "REENTRY_RECOVERY_PENDING", Metadata: map[string]interface{}{"attempt_no": cycle.ReentryCount, "candidate_id": candidate.ID, "reason": reason, "protection_coverage": cycle.ProtectionCoverage}})
+			ti.notifyProtection(cycle, "AI 重入候选状态异常", reason+"；仓位已有完整保护，系统不会重复入场。", fmt.Sprintf("reentry_candidate_state_%d", cycle.ReentryCount))
+			return
+		}
+		completed, completeErr := ti.store.ReentryAI().CompleteReentryCandidate(candidate.ID)
+		if completeErr != nil {
+			logger.Warnf("[CopyGuard] trader=%s cycle=%d candidate=%d event=AI_CANDIDATE_COMPLETE_FAILED reason=%v", ti.traderID, cycle.ID, candidate.ID, completeErr)
+			_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "REENTRY_RECOVERY_PENDING", Metadata: map[string]interface{}{"attempt_no": cycle.ReentryCount, "candidate_id": candidate.ID, "reason": "candidate completion failed", "error": completeErr.Error(), "protection_coverage": cycle.ProtectionCoverage}})
+			ti.notifyProtection(cycle, "AI 重入已保护但候选提交失败", "仓位已有完整保护；候选完成状态落库失败，保护巡检会继续幂等重试。错误: "+completeErr.Error(), fmt.Sprintf("reentry_candidate_complete_%d", cycle.ReentryCount))
+			return
+		}
+		if !completed {
+			return
+		}
+		generation := candidate.DecisionGeneration
+		candidateID := candidate.ID
+		attemptNo := cycle.ReentryCount
+		if !store.ShouldSendCopyGuardEmail(ti.engine.config.RiskNotificationLevel, "REENTRY_FILLED") {
+			return
+		}
+		key := fmt.Sprintf("REENTRY_FILLED|%s|%d|%d|%d", ti.traderID, cycle.ID, attemptNo, generation)
+		traderName := ti.traderDisplayName()
+		notifier.Notify(notifier.Alert{
+			Category: "copy_trade", TraderID: ti.traderID,
+			Title:   fmt.Sprintf("%s | AI 重入成交且保护生效 %s %s", traderName, cycle.Symbol, cycle.Side),
+			Body:    fmt.Sprintf("Trader Name: %s\nTrader ID: %s\nCycle: %d\nAttempt: %d\nCandidate: %d\nActual Notional: %.2f USDT\nStop Price: verified on exchange\nProtection Coverage: %.2f%%", traderName, ti.traderID, cycle.ID, attemptNo, candidateID, cycle.FollowerNotional, cycle.ProtectionCoverage*100),
+			RateKey: key, DedupKey: key,
+			Fields: map[string]string{"CycleID": fmt.Sprint(cycle.ID), "AttemptNo": fmt.Sprint(attemptNo), "CandidateID": fmt.Sprint(candidateID), "Generation": fmt.Sprint(generation), "ProtectionCoverage": fmt.Sprintf("%.4f", cycle.ProtectionCoverage)},
+		})
+		return
+	}
+
+	reason := fmt.Sprintf("AI reentry protection not verified (status=%s coverage=%.4f)", cycle.ProtectionStatus, cycle.ProtectionCoverage)
+	candidateID := int64(0)
+	if candidateErr == nil && candidate != nil {
+		candidateID = candidate.ID
+	}
+	if candidateErr == nil && candidate != nil {
+		_ = ti.store.ReentryAI().MarkReentryCandidateStatus(candidate.ID, store.ReentryCandidateInvalidated, reason)
+	}
+	closer, ok := ti.executor.(EmergencyPositionCloser)
+	if !ok {
+		_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "GUARD_FORCED_EXIT_FAILED", Metadata: map[string]interface{}{"attempt_no": cycle.ReentryCount, "candidate_id": candidateID, "reason": reason, "error": "executor does not support emergency close"}})
+		ti.notifyProtection(cycle, "AI 重入保护失败且无法自动退出", reason, fmt.Sprintf("ai_reentry_unprotected_%d", cycle.ReentryCount))
+		return
+	}
+	if _, closeErr := closer.ClosePositionMarket(cycle.Symbol, cycle.Side); closeErr != nil {
+		_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "GUARD_FORCED_EXIT_FAILED", Metadata: map[string]interface{}{"attempt_no": cycle.ReentryCount, "error": closeErr.Error(), "reason": reason}})
+		ti.notifyProtection(cycle, "AI 重入保护失败且强制退出失败", reason+": "+closeErr.Error(), fmt.Sprintf("ai_reentry_forced_exit_failed_%d", cycle.ReentryCount))
+		return
+	}
+	_ = ti.store.ReentryAI().ConsumeCopyGuardRisk(cycle.ID, cycle.ReentryCount)
+	_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "FORCED_EXIT", Price: dec.EntryPrice, Notional: dec.PositionSizeUSD, Metadata: map[string]interface{}{"attempt_no": cycle.ReentryCount, "candidate_id": candidateID, "reason": reason}})
+}
+
+func (ti *TraderIntegration) enforceAIGuardedPositionProtection(dec *decision.Decision) {
+	cycle, err := ti.store.CopyTrade().GetOpenCopyGuardCycle(ti.traderID, dec.LeaderPosID)
+	if err != nil || (cycle.Status != store.CopyGuardFollowing && cycle.Status != store.CopyGuardFollowingReentry) {
+		return
+	}
+	if (cycle.ProtectionStatus == store.CopyGuardProtectionVerified || cycle.ProtectionStatus == store.CopyGuardProtectionClamped) && cycle.ProtectionCoverage >= 0.999 {
+		return
+	}
+	ti.handleUnprotectableCycle(cycle, fmt.Errorf("new AI-guarded position is not fully protected (status=%s coverage=%.4f)", cycle.ProtectionStatus, cycle.ProtectionCoverage))
 }
 
 func (ti *TraderIntegration) upsertV4Protection(dec *decision.Decision, side string, quantity, entryPrice float64, result *StopLossCalcResult) {
@@ -2591,6 +3226,9 @@ func (ti *TraderIntegration) upsertV4Protection(dec *decision.Decision, side str
 	_ = ti.store.CopyTrade().UpdateCopyGuardFollowerPosition(cycle.ID, followerPosID, entryPrice, entryPrice*quantity)
 	_ = ti.store.CopyTrade().UpdateCopyGuardAttemptPosition(cycle.ID, cycle.ReentryCount, entryPrice, entryPrice*quantity, quantity, result.ATRValue)
 	_ = ti.store.CopyTrade().UpdateCopyGuardAttemptIdentity(cycle.ID, cycle.ReentryCount, followerPosID, cycle.EntryOrderID, "")
+	_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "PROTECTION_PENDING", Price: result.SLPrice, Quantity: quantity, Metadata: map[string]interface{}{
+		"attempt_no": cycle.ReentryCount, "planned_qty": quantity, "stop_price": result.SLPrice,
+	}})
 	req := trader.ProtectiveStopRequest{Symbol: dec.Symbol, PositionSide: side, MarginMode: dec.MarginMode, Quantity: quantity, TriggerPrice: result.SLPrice, TriggerType: ti.engine.config.RiskTriggerPriceType, ClientID: fmt.Sprintf("cg%da%d", cycle.ID, cycle.ReentryCount)}
 	stored, storedErr := ti.store.CopyTrade().GetCopyGuardProtectiveOrder(cycle.ID)
 	var live *trader.ProtectiveStopOrder
@@ -2632,7 +3270,7 @@ func (ti *TraderIntegration) upsertV4Protection(dec *decision.Decision, side str
 		if err != nil && trader.IsOKXAlgoAlreadyExists(err) {
 			// 51068: an algo with the same client id already exists on OKX.
 			// Adopt it instead of looping on failed placements.
-			adopted, adoptErr := ti.adoptProtectiveOrderByClientID(mgr, cycle, req, result.TickSize)
+			adopted, adoptErr := ti.adoptProtectiveOrderByClientID(mgr, cycle, req, result.TickSize, result.QuantityStep)
 			switch {
 			case adoptErr != nil:
 				err = fmt.Errorf("%v; adoption by client id failed: %v", err, adoptErr)
@@ -2675,17 +3313,26 @@ func (ti *TraderIntegration) upsertV4Protection(dec *decision.Decision, side str
 		ti.markProtectionIssue(cycle, status, event, verifyErr, 0, incrementRetry)
 		return
 	}
-	ratio := protectionRatio(verified.Quantity, quantity)
 	coverage := protectionCoverage(verified.Quantity, quantity)
-	valid := strings.EqualFold(verified.PositionSide, side) && (dec.MarginMode == "" || verified.MarginMode == "" || verified.MarginMode == dec.MarginMode) && math.Abs(verified.TriggerPrice-result.SLPrice) <= math.Max(result.TickSize, 1e-8) && ratio >= 0.999 && ratio <= 1.001 && strings.EqualFold(verified.State, "live")
+	valid := strings.EqualFold(verified.PositionSide, side) && (dec.MarginMode == "" || verified.MarginMode == "" || verified.MarginMode == dec.MarginMode) && math.Abs(verified.TriggerPrice-result.SLPrice) <= math.Max(result.TickSize, 1e-8) && protectionQuantityMatches(verified.Quantity, quantity, result.QuantityStep) && strings.EqualFold(verified.State, "live")
 	if !valid {
 		// Record what actually exists on OKX (not the requested quantity) so
 		// local tracking stays truthful while retries converge.
-		_ = ti.store.CopyTrade().UpsertCopyGuardProtectiveOrder(&store.CopyGuardProtectiveOrder{CycleID: cycle.ID, TraderID: ti.traderID, AlgoID: verified.AlgoID, AlgoClientID: verified.ClientID, Symbol: dec.Symbol, Side: side, MarginMode: dec.MarginMode, Quantity: verified.Quantity, TriggerPrice: verified.TriggerPrice, TriggerType: ti.engine.config.RiskTriggerPriceType, Status: strings.ToLower(verified.State)})
+		_ = ti.store.CopyTrade().UpsertCopyGuardProtectiveOrder(&store.CopyGuardProtectiveOrder{CycleID: cycle.ID, TraderID: ti.traderID, AlgoID: verified.AlgoID, AlgoClientID: verified.ClientID, Symbol: dec.Symbol, Side: side, MarginMode: dec.MarginMode, Quantity: verified.Quantity, QuantityStep: result.QuantityStep, TriggerPrice: verified.TriggerPrice, TriggerType: ti.engine.config.RiskTriggerPriceType, Status: strings.ToLower(verified.State)})
 		ti.markProtectionIssue(cycle, store.CopyGuardProtectionDegraded, "PROTECTION_DEGRADED", fmt.Errorf("protective stop verification mismatch state=%s coverage=%.4f", verified.State, coverage), coverage, incrementRetry)
 		return
 	}
-	_ = ti.store.CopyTrade().UpsertCopyGuardProtectiveOrder(&store.CopyGuardProtectiveOrder{CycleID: cycle.ID, TraderID: ti.traderID, AlgoID: verified.AlgoID, AlgoClientID: verified.ClientID, Symbol: dec.Symbol, Side: side, MarginMode: dec.MarginMode, Quantity: verified.Quantity, TriggerPrice: result.SLPrice, TriggerType: ti.engine.config.RiskTriggerPriceType, Status: "live"})
+	_ = ti.store.CopyTrade().UpsertCopyGuardProtectiveOrder(&store.CopyGuardProtectiveOrder{CycleID: cycle.ID, TraderID: ti.traderID, AlgoID: verified.AlgoID, AlgoClientID: verified.ClientID, Symbol: dec.Symbol, Side: side, MarginMode: dec.MarginMode, Quantity: verified.Quantity, QuantityStep: result.QuantityStep, TriggerPrice: result.SLPrice, TriggerType: ti.engine.config.RiskTriggerPriceType, Status: "live"})
+	if ti.engine.config.RiskReentryDecisionMode == "ai_guarded" {
+		equity := cycle.AccountEquity
+		if equity <= 0 {
+			equity = ti.getEquityFunc()()
+		}
+		if reserveErr := ti.store.ReentryAI().ReserveCopyGuardRisk(ti.traderID, cycle.ID, cycle.ReentryCount, result.ExpectedLossUSD, equity, ti.engine.config.RiskAccountPct, ti.engine.config.RiskCycleLossBudgetPct, ti.engine.config.RiskPortfolioLossBudgetPct); reserveErr != nil {
+			ti.handleUnprotectableForDecision(dec, side, quantity, entryPrice, fmt.Errorf("risk reservation failed after fill: %w", reserveErr))
+			return
+		}
+	}
 	// v5 可保护性状态机：clamp 挂出的保护单是"已保护但降级"，健康状态记
 	// CLAMPED（UI 醒目提示随时可能被扫损），不算 VERIFIED。
 	healthStatus, healthMsg := store.CopyGuardProtectionVerified, ""
@@ -2699,7 +3346,13 @@ func (ti *TraderIntegration) upsertV4Protection(dec *decision.Decision, side str
 	if entryPrice > 0 {
 		slDistancePct = result.SLDistance / entryPrice
 	}
-	_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "PROTECTIVE_STOP_ACTIVE", Price: result.SLPrice, Quantity: quantity, Metadata: map[string]interface{}{
+	_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "PROTECTION_ACTIVE", Price: result.SLPrice, Quantity: quantity, Metadata: map[string]interface{}{
+		"attempt_no":               cycle.ReentryCount,
+		"actual_qty":               verified.Quantity,
+		"planned_qty":              quantity,
+		"quantity_step":            result.QuantityStep,
+		"stop_price":               result.SLPrice,
+		"risk_budget":              result.ExpectedLossUSD,
 		"algo_id":                  live.AlgoID,
 		"expected_loss_pct":        result.ExpectedLossPct,
 		"expected_loss_usd":        result.ExpectedLossUSD,
@@ -2716,6 +3369,9 @@ func (ti *TraderIntegration) upsertV4Protection(dec *decision.Decision, side str
 		"leverage":                 dec.Leverage,
 		"account_equity":           cycle.AccountEquity,
 	}})
+	if ti.engine.config.RiskReentryDecisionMode == "ai_guarded" && cycle.Status == store.CopyGuardFollowingReentry {
+		ti.enforceAIReentryProtection(dec)
+	}
 	if result.Clamped {
 		_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "PROTECTION_CLAMPED", Price: result.SLPrice, Quantity: quantity, Metadata: map[string]interface{}{
 			"algo_id":         live.AlgoID,
@@ -2802,7 +3458,7 @@ func (ti *TraderIntegration) resolveProtectiveOrder(mgr ProtectiveStopManagerV4,
 //   - (nil, nil): the existing order is terminal (canceled/failed) and cannot
 //     be adopted; the caller should place with a fresh client id
 //   - (nil, err): lookup or amend failed; retry later
-func (ti *TraderIntegration) adoptProtectiveOrderByClientID(mgr ProtectiveStopManagerV4, cycle *store.CopyGuardCycle, req trader.ProtectiveStopRequest, tickSize float64) (*trader.ProtectiveStopOrder, error) {
+func (ti *TraderIntegration) adoptProtectiveOrderByClientID(mgr ProtectiveStopManagerV4, cycle *store.CopyGuardCycle, req trader.ProtectiveStopRequest, tickSize, quantityStep float64) (*trader.ProtectiveStopOrder, error) {
 	existing, err := mgr.GetProtectiveStopByClientID(req.ClientID, req.Symbol)
 	if err != nil {
 		return nil, err
@@ -2813,14 +3469,13 @@ func (ti *TraderIntegration) adoptProtectiveOrderByClientID(mgr ProtectiveStopMa
 	}
 	// Take over bookkeeping first so even a follow-up amend failure leaves the
 	// tracked algoId pointing at the real order (poll can then manage it).
-	_ = ti.store.CopyTrade().UpsertCopyGuardProtectiveOrder(&store.CopyGuardProtectiveOrder{CycleID: cycle.ID, TraderID: ti.traderID, AlgoID: existing.AlgoID, AlgoClientID: existing.ClientID, Symbol: req.Symbol, Side: req.PositionSide, MarginMode: req.MarginMode, Quantity: existing.Quantity, TriggerPrice: existing.TriggerPrice, TriggerType: req.TriggerType, Status: "live"})
+	_ = ti.store.CopyTrade().UpsertCopyGuardProtectiveOrder(&store.CopyGuardProtectiveOrder{CycleID: cycle.ID, TraderID: ti.traderID, AlgoID: existing.AlgoID, AlgoClientID: existing.ClientID, Symbol: req.Symbol, Side: req.PositionSide, MarginMode: req.MarginMode, Quantity: existing.Quantity, QuantityStep: quantityStep, TriggerPrice: existing.TriggerPrice, TriggerType: req.TriggerType, Status: "live"})
 	_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "PROTECTIVE_STOP_ADOPTED", Price: existing.TriggerPrice, Quantity: existing.Quantity, Metadata: map[string]interface{}{"algo_id": existing.AlgoID, "algo_client_id": existing.ClientID, "state": existing.State}})
 	if isProtectiveStopFired(existing.State) {
 		return existing, nil
 	}
-	ratio := protectionRatio(existing.Quantity, req.Quantity)
 	priceOK := math.Abs(existing.TriggerPrice-req.TriggerPrice) <= math.Max(tickSize, 1e-8)
-	if !priceOK || ratio < 0.999 || ratio > 1.001 {
+	if !priceOK || !protectionQuantityMatches(existing.Quantity, req.Quantity, quantityStep) {
 		if amendErr := mgr.AmendProtectiveStop(existing.AlgoID, req); amendErr != nil {
 			return nil, amendErr
 		}
@@ -3077,12 +3732,13 @@ func (ti *TraderIntegration) cancelV4Protection(dec *decision.Decision) {
 
 // sendStopLossTriggerAlert 发送账户保护止损触发邮件
 //
-// 限流：RateKey + DedupKey 都用 "sl_trigger|<traderID>|<posId>"
-//   - RateKey：60s 内同 posId 最多 1 封（防止频繁对账重发）
-//   - DedupKey：彻底去重（同 posId 一次性，理论上 SL 仅触发一次）
+// 去重按 cycle + attempt；同一领航员仓位的第二次止损不能被第一次压掉。
 //
 // 邮件正文：完整上下文，让用户能立刻判断后续动作（是否手动干预、是否启用二次进场等）
 func (ti *TraderIntegration) sendStopLossTriggerAlert(event *RiskEvent) {
+	if ti.engine != nil && ti.engine.config != nil && !store.ShouldSendCopyGuardEmail(ti.engine.config.RiskNotificationLevel, "STOP_FLAT_CONFIRMED") {
+		return
+	}
 	traderName := ti.traderDisplayName()
 	providerType := ""
 	leaderID := ""
@@ -3091,15 +3747,27 @@ func (ti *TraderIntegration) sendStopLossTriggerAlert(event *RiskEvent) {
 		leaderID = ti.engine.config.LeaderID
 	}
 
-	alertKey := fmt.Sprintf("sl_trigger|%s|%s", ti.traderID, event.LeaderPosID)
+	cycleID, attemptNo := event.CycleID, event.ReentryCount
+	if cycleID == 0 {
+		if cycle, err := ti.store.CopyTrade().GetOpenCopyGuardCycle(ti.traderID, event.LeaderPosID); err == nil {
+			cycleID, attemptNo = cycle.ID, cycle.ReentryCount
+		}
+	}
+	alertKey := fmt.Sprintf("STOP_FLAT_CONFIRMED|%s|%d|%d|0", ti.traderID, cycleID, attemptNo)
 
 	// 恢复条件文案（根据是否启用二次进场动态调整）
 	recoveryHint := "等领航员完全平掉旧 posId 后，下次他重新开仓时跟单系统自动恢复跟随"
 	if ti.engine != nil && ti.engine.config != nil && ti.engine.config.RiskReentryEnabled {
-		recoveryHint = fmt.Sprintf(
-			"已启用确认式二次进场：价格回归重入边界并连续确认、冷却期结束且重入后仓位可保护 → 自动按 %.0f%% 系数重入；\n"+
-				"  或等领航员完全平掉旧 posId，下次他新开仓时自动恢复跟随",
-			ti.engine.config.RiskReentryRatio*100)
+		if ti.engine.config.RiskReentryDecisionMode == "ai_guarded" {
+			recoveryHint = "仓位确认完全平仓后冷却 5 分钟，系统进入持久 AI 观察；\n" +
+				"  AI 只判断趋势反转与入场价值，下单前仍由确定性风控复核价格、仓位、风险预算和保护能力；\n" +
+				"  也会在领航员平仓、反向或观察到期时自动结束。"
+		} else {
+			recoveryHint = fmt.Sprintf(
+				"已启用旧规则重入：价格回归重入边界并连续确认、冷却期结束且重入后仓位可保护 → 自动按 %.0f%% 名义上限重入；\n"+
+					"  或等领航员完全平掉旧 posId，下次他新开仓时自动恢复跟随",
+				ti.engine.config.RiskReentryRatio*100)
+		}
 	}
 
 	body := fmt.Sprintf(
@@ -3148,6 +3816,8 @@ func (ti *TraderIntegration) sendStopLossTriggerAlert(event *RiskEvent) {
 			"LeaderPnL":   fmt.Sprintf("%.2f", event.LeaderPnL),
 			"LeaderSize":  fmt.Sprintf("%.6f", event.LeaderSize),
 			"AddCount":    fmt.Sprintf("%d", event.AddCount),
+			"CycleID":     fmt.Sprint(cycleID),
+			"AttemptNo":   fmt.Sprint(attemptNo),
 		},
 	})
 
@@ -3156,13 +3826,16 @@ func (ti *TraderIntegration) sendStopLossTriggerAlert(event *RiskEvent) {
 
 // sendReentryInitiatedAlert 发送二次进场决策已生成邮件
 //
-// 限流：RateKey + DedupKey 都用 "reentry|<traderID>|<posId>"
-//   - 同 posId 二次进场限 1 次（与判据 E 的 ReentryUsed 安全阀对应），DedupKey 彻底去重
+// legacy_rule 仍保留旧的“决策已生成”通知。ai_guarded 不发审批/建议邮件，
+// 只在成交并验证保护覆盖后由 enforceAIReentryProtection 发一封结果邮件。
 //
 // 注意：这是"决策已生成"告警。实际执行成功/失败的告警分别走：
 //   - 成功：executeFullDecision 成功分支（识别 reentry decision 后单独发 sendReentryExecutedAlert）
 //   - 失败：execFailureDedupKey 路径（普通跟单失败告警）
 func (ti *TraderIntegration) sendReentryInitiatedAlert(event *RiskEvent) {
+	if ti.engine != nil && ti.engine.config != nil && ti.engine.config.RiskReentryDecisionMode == "ai_guarded" {
+		return
+	}
 	traderName := ti.traderDisplayName()
 	providerType := ""
 	leaderID := ""
@@ -3175,7 +3848,13 @@ func (ti *TraderIntegration) sendReentryInitiatedAlert(event *RiskEvent) {
 		reentryRatio = ti.engine.config.RiskReentryRatio
 	}
 
-	alertKey := fmt.Sprintf("reentry|%s|%s", ti.traderID, event.LeaderPosID)
+	cycleID, attemptNo := event.CycleID, event.ReentryCount+1
+	if cycleID == 0 {
+		if cycle, err := ti.store.CopyTrade().GetOpenCopyGuardCycle(ti.traderID, event.LeaderPosID); err == nil {
+			cycleID, attemptNo = cycle.ID, cycle.ReentryCount+1
+		}
+	}
+	alertKey := fmt.Sprintf("REENTRY_REQUESTED|%s|%d|%d|0", ti.traderID, cycleID, attemptNo)
 
 	body := fmt.Sprintf(
 		"🔄 二次进场决策已触发 (Reentry Decision Initiated, Judge E)\n\n"+
@@ -3223,6 +3902,8 @@ func (ti *TraderIntegration) sendReentryInitiatedAlert(event *RiskEvent) {
 			"LeaderSize":        fmt.Sprintf("%.6f", event.LeaderSize),
 			"ReentryEntryPrice": fmt.Sprintf("%.4f", event.ReentryEntryPrice),
 			"ReentrySize":       fmt.Sprintf("%.2f", event.ReentrySize),
+			"CycleID":           fmt.Sprint(cycleID),
+			"AttemptNo":         fmt.Sprint(attemptNo),
 		},
 	})
 
@@ -3263,7 +3944,24 @@ func (ti *TraderIntegration) markManualReentryOutcome(cycleID int64, status, err
 	logger.Infof("✅ [%s] 人工重入信号结果已回写 | signal=%d cycle=%d status=%s", ti.traderID, sig.ID, cycleID, status)
 }
 
-// ConfirmManualReentry 用户确认人工重入信号 → 系统代执行。
+// ErrManualReentryRetired is returned by every compatibility entry point for
+// the removed per-order approval workflow. Keeping a typed error lets API and
+// older callers fail explicitly instead of ever reaching the legacy executor.
+var ErrManualReentryRetired = errors.New("manual reentry confirmation was retired in Copy Guard v7; use ai_guarded candidates")
+
+// ConfirmManualReentry is retained as a binary/source compatibility boundary;
+// v7 never permits it to execute a trade.
+func (ti *TraderIntegration) ConfirmManualReentry(_ int64, _ string, _ float64) error {
+	return ErrManualReentryRetired
+}
+
+// confirmManualReentryLegacy contains the old implementation only for reading
+// historical behavior while existing signal rows are migrated. It has no
+// callers and is deliberately not exported or connected to an API route.
+//
+// Deprecated: v7 uses ExecuteAIReentry after a scheduler decision.
+//
+// 用户确认人工重入信号 → 系统代执行。
 // overrideNotional：用户在确认弹窗中编辑后的执行金额；<=0 表示未编辑，用信号
 // 建议金额。允许范围 [最小下单额, 建议金额]——上界封在建议金额（首仓名义），
 // 保持"重入风险以首仓为界"的安全不变量。
@@ -3276,7 +3974,7 @@ func (ti *TraderIntegration) markManualReentryOutcome(cycleID int64, status, err
 // 幂等：ClaimManualReentrySignal 原子抢占（PENDING→EXECUTING），重复点击/
 // 并发确认只有一次生效。硬校验失败时回退 PENDING（可再次确认）或
 // INVALIDATED（根本性失效）。
-func (ti *TraderIntegration) ConfirmManualReentry(signalID int64, operator string, overrideNotional float64) error {
+func (ti *TraderIntegration) confirmManualReentryLegacy(signalID int64, operator string, overrideNotional float64) error {
 	if ti.engine == nil || ti.engine.config == nil {
 		return fmt.Errorf("跟单引擎未运行")
 	}
@@ -3400,6 +4098,237 @@ func (ti *TraderIntegration) ConfirmManualReentry(signalID int64, operator strin
 		return fmt.Errorf("执行通道繁忙，本次未提交，请稍后重试")
 	}
 	return nil
+}
+
+// ExecuteAIReentry 执行 ai_guarded 候选。AI 只能缩小 max_notional；本函数
+// 在提交决策前重新检查行情、仓位、领航员、保护可行性和三层风险预算。
+func (ti *TraderIntegration) ExecuteAIReentry(candidateID, analysisID int64) error {
+	if ti.engine == nil || ti.engine.config == nil {
+		return fmt.Errorf("跟单引擎未运行")
+	}
+	cfg := ti.engine.config
+	if cfg.RiskReentryDecisionMode != "ai_guarded" || !cfg.RiskReentryEnabled {
+		return fmt.Errorf("AI guarded reentry is not enabled")
+	}
+	rs := ti.store.ReentryAI()
+	candidate, err := rs.GetReentryCandidate(candidateID)
+	if err != nil {
+		return fmt.Errorf("候选不存在: %w", err)
+	}
+	if candidate.TraderID != ti.traderID || candidate.Status != store.ReentryCandidateEntryPending {
+		return fmt.Errorf("候选状态不允许执行: %s", candidate.Status)
+	}
+	analysis, err := rs.GetReentryAnalysis(analysisID)
+	if err != nil || analysis.CandidateID != candidate.ID || candidate.LastAnalysisID != analysis.ID {
+		return fmt.Errorf("AI 分析与候选不匹配")
+	}
+	ttl := candidate.DecisionTTLSeconds
+	if ttl < 15 || ttl > 60 {
+		ttl = 30
+	}
+	if age := time.Since(analysis.SnapshotAt); age < 0 || age > time.Duration(ttl)*time.Second {
+		_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: candidate.CycleID, TraderID: ti.traderID, Type: "AI_RESULT_STALE", Price: candidate.TriggerPrice, Metadata: map[string]interface{}{"candidate_id": candidate.ID, "analysis_id": analysis.ID, "attempt_no": candidate.ReentryCount + 1, "age_seconds": age.Seconds(), "ttl_seconds": ttl}})
+		return fmt.Errorf("AI 结果已过期: %s", age.Truncate(time.Second))
+	}
+	if !candidate.Protectable {
+		return fmt.Errorf("保护止损预检未通过")
+	}
+	cycle, err := ti.store.CopyTrade().GetOpenCopyGuardCycle(ti.traderID, candidate.LeaderPosID)
+	if err != nil || cycle.ID != candidate.CycleID {
+		return fmt.Errorf("保护周期已结束")
+	}
+	if candidate.ReentryCount != cycle.ReentryCount {
+		return fmt.Errorf("候选尝试次数已过期")
+	}
+	if cycle.ReentryCount >= cfg.RiskMaxReentries {
+		return fmt.Errorf("已达到最大重入次数")
+	}
+	switch cycle.Status {
+	case store.CopyGuardAIWatching, store.CopyGuardAIWaiting, store.CopyGuardAIReviewing, store.CopyGuardStoppedWatching:
+	default:
+		return fmt.Errorf("保护周期状态不允许重入: %s", cycle.Status)
+	}
+	leader := ti.engine.buildLeaderPosMap()[candidate.LeaderPosID]
+	if leader == nil || leader.Size <= 0 || (leader.Side != "" && string(leader.Side) != candidate.Side) {
+		return fmt.Errorf("领航员已平仓或反向")
+	}
+	positions, err := ti.getFreshPositions()
+	if err != nil {
+		return fmt.Errorf("查询跟随仓位失败: %w", err)
+	}
+	for _, pos := range positions {
+		if getStringField(pos, "symbol") == candidate.Symbol && getStringField(pos, "side") == candidate.Side && math.Abs(getFloatField(pos, "positionAmt", "quantity")) > 0 {
+			if candidate.MarginMode == "" || getStringField(pos, "marginMode", "mgnMode") == "" || getStringField(pos, "marginMode", "mgnMode") == candidate.MarginMode {
+				return fmt.Errorf("跟随账户已有同向仓位")
+			}
+		}
+	}
+	price := leader.MarkPrice
+	if mgr, ok := ti.executor.(StopLossManager); ok {
+		if p, e := mgr.GetMarketPrice(candidate.Symbol); e == nil && p > 0 {
+			price = p
+		}
+	}
+	if price <= 0 {
+		return fmt.Errorf("实时价格不可用")
+	}
+	if candidate.EntryPriceLow <= 0 || candidate.EntryPriceHigh < candidate.EntryPriceLow || price < candidate.EntryPriceLow || price > candidate.EntryPriceHigh {
+		return fmt.Errorf("实时价 %.8f 已离开 AI 入场区间 [%.8f, %.8f]", price, candidate.EntryPriceLow, candidate.EntryPriceHigh)
+	}
+	snapshotPrice := analysis.SnapshotPrice
+	if snapshotPrice <= 0 {
+		snapshotPrice = (candidate.EntryPriceLow + candidate.EntryPriceHigh) / 2
+	}
+	if candidate.ATR <= 0 || math.Abs(price-snapshotPrice) > 0.25*candidate.ATR {
+		return fmt.Errorf("价格相对 AI 快照漂移超过 0.25 ATR")
+	}
+	nominalCap := candidate.MaxNotional * candidate.SizeFactor
+	minNotional := cfg.MinTradeWarn
+	if minNotional <= 0 {
+		minNotional = 10
+	}
+	equity := ti.getEquityFunc()()
+	if equity <= 0 {
+		equity = cycle.AccountEquity
+	}
+	if equity <= 0 {
+		return fmt.Errorf("账户权益不可用")
+	}
+	side := SideLong
+	if candidate.Side == string(SideShort) {
+		side = SideShort
+	}
+	structure := structuralInvalidationPrice(candidate.Symbol, side, price)
+	usage, err := rs.GetCopyGuardRiskUsageExcludingAttempt(ti.traderID, cycle.ID, cycle.ReentryCount+1)
+	if err != nil {
+		return fmt.Errorf("风险占用查询失败: %w", err)
+	}
+	availableRisk, err := AvailableCopyGuardRiskUSD(cfg, equity, usage)
+	if err != nil {
+		return fmt.Errorf("风险预算不足: %w", err)
+	}
+	plan, err := BuildProtectionPlan(cfg, side, price, candidate.ATR, structure, equity, availableRisk/equity, nominalCap)
+	if err != nil {
+		return fmt.Errorf("保护计划失败: %w", err)
+	}
+	notional := plan.MaxNotional
+	if notional < minNotional {
+		return fmt.Errorf("风险缩量后名义 %.2f 低于最小下单额 %.2f", notional, minNotional)
+	}
+	attemptNo := cycle.ReentryCount + 1
+	if err := rs.ReserveCopyGuardRisk(ti.traderID, cycle.ID, attemptNo, plan.ExpectedLossUSD, equity, cfg.RiskAccountPct, cfg.RiskCycleLossBudgetPct, cfg.RiskPortfolioLossBudgetPct); err != nil {
+		return fmt.Errorf("风险预算拒绝: %w", err)
+	}
+	mapping, err := ti.store.CopyTrade().GetMapping(ti.traderID, candidate.LeaderPosID)
+	if err != nil || mapping.Status != "stopped_by_risk" {
+		_ = rs.ReleaseCopyGuardRisk(cycle.ID, attemptNo)
+		return fmt.Errorf("仓位映射不是止损观察态")
+	}
+	_ = ti.store.CopyTrade().UpdateCopyGuardObservation(cycle.ID, store.CopyGuardReentryPending, leader.EntryPrice, price, candidate.ATR)
+	_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "REENTRY_REQUESTED", Price: price, Notional: notional, Metadata: map[string]interface{}{"candidate_id": candidate.ID, "analysis_id": analysis.ID, "attempt_no": attemptNo, "decision_generation": candidate.DecisionGeneration, "size_factor": candidate.SizeFactor, "risk_budget": plan.ExpectedLossUSD, "max_risk_usd": plan.MaxRiskUSD, "stop_price": plan.StopPrice, "stop_distance": plan.StopDistance, "structure_invalidation": plan.StructureInvalidation}})
+	if !ti.engine.emitReentryDecision(mapping, leader, notional, price) {
+		_ = rs.ReleaseCopyGuardRisk(cycle.ID, attemptNo)
+		_ = ti.store.CopyTrade().UpdateCopyGuardObservation(cycle.ID, store.CopyGuardAIWaiting, leader.EntryPrice, price, candidate.ATR)
+		return fmt.Errorf("执行通道繁忙")
+	}
+	return nil
+}
+
+// ExecuteAIReentryForTrader 供 ReentryAdvisor 调用运行中的标准执行链。
+func ExecuteAIReentryForTrader(traderID string, candidateID, analysisID int64) error {
+	ti, ok := integrations[traderID]
+	if !ok || !ti.IsRunning() {
+		return fmt.Errorf("该交易员跟单未运行")
+	}
+	return ti.ExecuteAIReentry(candidateID, analysisID)
+}
+
+// GetExecutionMarketPriceForTrader exposes only a public market price from the
+// running follower exchange adapter. It never exposes account credentials or
+// private position data and lets the AI datapack label the execution venue as
+// the primary price source.
+func GetExecutionMarketPriceForTrader(traderID, symbol string) (float64, error) {
+	ti, ok := integrations[traderID]
+	if !ok || !ti.IsRunning() {
+		return 0, fmt.Errorf("copy trader is not running")
+	}
+	mgr, ok := ti.executor.(StopLossManager)
+	if !ok {
+		return 0, fmt.Errorf("executor does not provide market price")
+	}
+	price, err := mgr.GetMarketPrice(symbol)
+	if err != nil {
+		return 0, fmt.Errorf("execution market price unavailable: %w", err)
+	}
+	if price <= 0 {
+		return 0, fmt.Errorf("execution market returned a non-positive price")
+	}
+	return price, nil
+}
+
+type ExecutionRiskPosition struct {
+	Symbol      string  `json:"symbol"`
+	Side        string  `json:"side"`
+	MarginMode  string  `json:"margin_mode"`
+	Quantity    float64 `json:"quantity"`
+	EntryPrice  float64 `json:"entry_price"`
+	MarkPrice   float64 `json:"mark_price"`
+	NotionalUSD float64 `json:"notional_usd"`
+}
+
+type ExecutionRiskSnapshot struct {
+	EquityUSD             float64                 `json:"equity_usd"`
+	AttemptBudgetUSD      float64                 `json:"attempt_budget_usd"`
+	CycleRemainingUSD     float64                 `json:"cycle_remaining_usd"`
+	PortfolioRemainingUSD float64                 `json:"portfolio_remaining_usd"`
+	Positions             []ExecutionRiskPosition `json:"positions"`
+}
+
+// GetExecutionRiskSnapshotForTrader returns a credential-free private account
+// snapshot for the AI datapack. It is deliberately not an HTTP endpoint.
+func GetExecutionRiskSnapshotForTrader(traderID string, cycleID int64) (*ExecutionRiskSnapshot, error) {
+	ti, ok := integrations[traderID]
+	if !ok || !ti.IsRunning() || ti.engine == nil || ti.engine.config == nil {
+		return nil, fmt.Errorf("copy trader is not running")
+	}
+	equity := ti.getEquityFunc()()
+	if equity <= 0 {
+		return nil, fmt.Errorf("account equity unavailable")
+	}
+	cfg := ti.engine.config
+	usage, err := ti.store.ReentryAI().GetCopyGuardRiskUsage(traderID, cycleID)
+	if err != nil {
+		return nil, err
+	}
+	snapshot := &ExecutionRiskSnapshot{
+		EquityUSD: equity, AttemptBudgetUSD: equity * cfg.RiskAccountPct,
+		CycleRemainingUSD:     equity*cfg.RiskCycleLossBudgetPct - usage.CycleUsedUSD,
+		PortfolioRemainingUSD: equity*cfg.RiskPortfolioLossBudgetPct - usage.PortfolioUsedUSD,
+		Positions:             []ExecutionRiskPosition{},
+	}
+	if snapshot.CycleRemainingUSD < 0 {
+		snapshot.CycleRemainingUSD = 0
+	}
+	if snapshot.PortfolioRemainingUSD < 0 {
+		snapshot.PortfolioRemainingUSD = 0
+	}
+	positions, err := ti.getFreshPositions()
+	if err != nil {
+		return nil, err
+	}
+	for _, pos := range positions {
+		quantity := math.Abs(getFloatField(pos, "positionAmt", "quantity"))
+		if quantity <= 0 {
+			continue
+		}
+		entry := getFloatField(pos, "entryPrice", "entry_price")
+		mark := getFloatField(pos, "markPrice", "mark_price")
+		if mark <= 0 {
+			mark = entry
+		}
+		snapshot.Positions = append(snapshot.Positions, ExecutionRiskPosition{Symbol: getStringField(pos, "symbol"), Side: getStringField(pos, "side"), MarginMode: getStringField(pos, "marginMode", "mgnMode"), Quantity: quantity, EntryPrice: entry, MarkPrice: mark, NotionalUSD: quantity * mark})
+	}
+	return snapshot, nil
 }
 
 // sendManualReentrySignalAlert 人工重入信号邮件（小白可读）。

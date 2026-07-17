@@ -2150,6 +2150,25 @@ func (at *AutoTrader) emergencyClosePosition(symbol, side string) error {
 	return nil
 }
 
+// ClosePositionMarket exposes the same reduce-only close-all primitive to
+// Copy Guard for residual positions after a partially filled protective stop.
+func (at *AutoTrader) ClosePositionMarket(symbol, side string) (string, error) {
+	var order map[string]interface{}
+	var err error
+	switch side {
+	case "long":
+		order, err = at.trader.CloseLong(symbol, 0)
+	case "short":
+		order, err = at.trader.CloseShort(symbol, 0)
+	default:
+		return "", fmt.Errorf("unknown position direction: %s", side)
+	}
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprint(order["orderId"]), nil
+}
+
 // GetPeakPnLCache gets peak profit cache
 func (at *AutoTrader) GetPeakPnLCache() map[string]float64 {
 	at.peakPnLCacheMutex.RLock()

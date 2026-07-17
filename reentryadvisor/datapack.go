@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"nofx/copytrade"
 	"nofx/market"
 	"nofx/store"
 )
@@ -45,23 +46,25 @@ type DataPack struct {
 }
 
 type MetaSection struct {
-	SnapshotAt       string   `json:"snapshot_at"`
-	Symbol           string   `json:"symbol"`
-	Side             string   `json:"side"`
-	FuturesAvailable bool     `json:"binance_futures_available"`
-	SpotAvailable    bool     `json:"binance_spot_available"`
-	DataSources      string   `json:"data_sources"`
-	MissingFields    []string `json:"missing_fields,omitempty"`
-	Note             string   `json:"note,omitempty"`
+	SnapshotAt       string            `json:"snapshot_at"`
+	Symbol           string            `json:"symbol"`
+	Side             string            `json:"side"`
+	FuturesAvailable bool              `json:"binance_futures_available"`
+	SpotAvailable    bool              `json:"binance_spot_available"`
+	DataSources      string            `json:"data_sources"`
+	MissingFields    []string          `json:"missing_fields,omitempty"`
+	Note             string            `json:"note,omitempty"`
+	SourceTimestamps map[string]string `json:"source_timestamps,omitempty"`
 }
 
 type GuardSection struct {
-	SignalID   int64  `json:"signal_id"`
-	CycleID    int64  `json:"cycle_id"`
-	TraderID   string `json:"trader_id"`
-	Symbol     string `json:"symbol"`
-	Side       string `json:"side"`
-	MarginMode string `json:"margin_mode,omitempty"`
+	SignalID    int64  `json:"signal_id"`
+	CandidateID int64  `json:"candidate_id,omitempty"`
+	CycleID     int64  `json:"cycle_id"`
+	TraderID    string `json:"trader_id"`
+	Symbol      string `json:"symbol"`
+	Side        string `json:"side"`
+	MarginMode  string `json:"margin_mode,omitempty"`
 
 	AccountEquityAtCycleOpen float64 `json:"account_equity_at_cycle_open"`
 	RecommendedNotional      float64 `json:"recommended_notional_usdt"`
@@ -85,7 +88,99 @@ type GuardSection struct {
 	Attempts []AttemptEntry `json:"attempts"`
 	LastStop *LastStopInfo  `json:"last_stop,omitempty"`
 
-	Policy map[string]interface{} `json:"risk_policy"`
+	Policy              map[string]interface{}           `json:"risk_policy"`
+	ProtectionStatus    string                           `json:"protection_status"`
+	ProtectionCoverage  float64                          `json:"protection_coverage"`
+	ProtectionError     string                           `json:"protection_error,omitempty"`
+	CurrentAccount      *copytrade.ExecutionRiskSnapshot `json:"current_account,omitempty"`
+	PreviousAIDecisions []AIDecisionHistory              `json:"previous_ai_decisions,omitempty"`
+	RecentEvents        []GuardEventHistory              `json:"recent_events,omitempty"`
+	LeaderTimeline      []LeaderTimelinePoint            `json:"leader_timeline,omitempty"`
+}
+
+type AIDecisionHistory struct {
+	AnalysisID    int64    `json:"analysis_id"`
+	Decision      string   `json:"decision"`
+	Confidence    float64  `json:"confidence"`
+	SnapshotPrice float64  `json:"snapshot_price"`
+	SnapshotAt    string   `json:"snapshot_at"`
+	OutcomePnL    *float64 `json:"outcome_pnl,omitempty"`
+}
+
+type GuardEventHistory struct {
+	Type      string                 `json:"type"`
+	Price     float64                `json:"price"`
+	PnL       float64                `json:"pnl"`
+	Metadata  map[string]interface{} `json:"metadata,omitempty"`
+	CreatedAt string                 `json:"created_at"`
+}
+
+type LeaderTimelinePoint struct {
+	EntryPrice float64 `json:"entry_price"`
+	Size       float64 `json:"size"`
+	MarkPrice  float64 `json:"mark_price"`
+	ATR        float64 `json:"atr"`
+	CreatedAt  string  `json:"created_at"`
+}
+
+func buildDataPackForCandidate(st *store.Store, bn *binanceClient, c *store.CopyGuardReentryCandidate) (*DataPack, error) {
+	if c == nil {
+		return nil, fmt.Errorf("nil reentry candidate")
+	}
+	sig := &store.CopyGuardManualReentrySignal{ID: c.ID, CycleID: c.CycleID, TraderID: c.TraderID, LeaderPosID: c.LeaderPosID, Symbol: c.Symbol, Side: c.Side, MarginMode: c.MarginMode, TriggerPrice: c.TriggerPrice, ATR: c.ATR, DistanceATRRatio: c.DistanceATRRatio, RecommendedNotional: c.MaxNotional, StopCount: c.StopCount, ReentryCount: c.ReentryCount, LeaderSize: c.LeaderSize, LeaderEntryPrice: c.LeaderEntryPrice, Protectable: c.Protectable, Reason: "AI guarded candidate"}
+	pack, err := buildDataPack(st, bn, sig)
+	if err != nil {
+		return nil, err
+	}
+	pack.CopyGuard.CandidateID = c.ID
+	pack.CopyGuard.SignalID = 0
+	if cycle, cycleErr := st.CopyTrade().GetCopyGuardCycle(c.CycleID); cycleErr == nil {
+		pack.CopyGuard.ProtectionStatus = cycle.ProtectionStatus
+		pack.CopyGuard.ProtectionCoverage = cycle.ProtectionCoverage
+		pack.CopyGuard.ProtectionError = cycle.ProtectionError
+	}
+	if account, accountErr := copytrade.GetExecutionRiskSnapshotForTrader(c.TraderID, c.CycleID); accountErr == nil {
+		pack.CopyGuard.CurrentAccount = account
+	} else {
+		pack.Meta.MissingFields = append(pack.Meta.MissingFields, "execution_account_snapshot")
+	}
+	if history, historyErr := st.ReentryAI().ListReentryAnalysesByCycle(c.CycleID, 30); historyErr == nil {
+		for _, previous := range history {
+			pack.CopyGuard.PreviousAIDecisions = append(pack.CopyGuard.PreviousAIDecisions, AIDecisionHistory{AnalysisID: previous.ID, Decision: previous.Verdict, Confidence: previous.Confidence, SnapshotPrice: previous.SnapshotPrice, SnapshotAt: previous.SnapshotAt.UTC().Format(time.RFC3339), OutcomePnL: previous.OutcomePnL})
+		}
+	}
+	if events, eventErr := st.CopyTrade().ListCopyGuardEvents(c.CycleID); eventErr == nil {
+		start := 0
+		if len(events) > 50 {
+			start = len(events) - 50
+		}
+		for _, event := range events[start:] {
+			pack.CopyGuard.RecentEvents = append(pack.CopyGuard.RecentEvents, GuardEventHistory{Type: event.Type, Price: event.Price, PnL: event.PnL, Metadata: event.Metadata, CreatedAt: event.CreatedAt.UTC().Format(time.RFC3339)})
+		}
+	}
+	if samples, sampleErr := st.CopyTrade().ListCopyGuardWatchSamples(c.CycleID); sampleErr == nil {
+		start := 0
+		if len(samples) > 60 {
+			start = len(samples) - 60
+		}
+		for _, sample := range samples[start:] {
+			pack.CopyGuard.LeaderTimeline = append(pack.CopyGuard.LeaderTimeline, LeaderTimelinePoint{EntryPrice: sample.LeaderEntryPrice, Size: sample.LeaderSize, MarkPrice: sample.MarkPrice, ATR: sample.ATR, CreatedAt: sample.CreatedAt.UTC().Format(time.RFC3339)})
+		}
+	}
+	if executionPrice, priceErr := copytrade.GetExecutionMarketPriceForTrader(c.TraderID, c.Symbol); priceErr == nil && executionPrice > 0 {
+		pack.CopyGuard.TriggerPrice = executionPrice
+		if pack.Market == nil {
+			pack.Market = &MarketSection{Klines: map[string]*KlineSummary{}}
+		}
+		pack.Market.CurrentPrice = executionPrice
+		pack.Market.CurrentPriceSource = "follower_execution_exchange"
+		pack.Meta.DataSources = "follower_execution_exchange(price, primary) + okx_mark_price_atr + binance_public_market(auxiliary)"
+		if pack.Meta.SourceTimestamps == nil {
+			pack.Meta.SourceTimestamps = map[string]string{}
+		}
+		pack.Meta.SourceTimestamps["follower_execution_exchange"] = time.Now().UTC().Format(time.RFC3339)
+	}
+	return pack, nil
 }
 
 type LeaderInfo struct {
@@ -202,10 +297,11 @@ func buildDataPack(st *store.Store, bn *binanceClient, sig *store.CopyGuardManua
 
 	pack := &DataPack{
 		Meta: MetaSection{
-			SnapshotAt:  time.Now().UTC().Format(time.RFC3339),
-			Symbol:      sig.Symbol,
-			Side:        sig.Side,
-			DataSources: "binance_futures(fapi) + binance_spot + okx_mark_price_atr(与门控同源)",
+			SnapshotAt:       time.Now().UTC().Format(time.RFC3339),
+			Symbol:           sig.Symbol,
+			Side:             sig.Side,
+			DataSources:      "binance_futures(fapi) + binance_spot + okx_mark_price_atr(与门控同源)",
+			SourceTimestamps: map[string]string{"public_market_snapshot": time.Now().UTC().Format(time.RFC3339)},
 		},
 	}
 
@@ -373,6 +469,11 @@ func buildMarketSection(bn *binanceClient, symbol string, atr float64, meta *Met
 		return nil
 	}
 	meta.FuturesAvailable = true
+	closedPrimary := closedKlinesAt(primaryKlines, time.Now())
+	if len(closedPrimary) == 0 {
+		meta.MissingFields = append(meta.MissingFields, "closed_futures_klines_1h")
+		return nil
+	}
 
 	m := &MarketSection{
 		Klines:            map[string]*KlineSummary{},
@@ -381,13 +482,18 @@ func buildMarketSection(bn *binanceClient, symbol string, atr float64, meta *Met
 	}
 
 	// 多周期 K 线 + 量比 + 合约 CVD
-	futuresByTF := map[string][]market.Kline{"1h": primaryKlines}
+	futuresByTF := map[string][]market.Kline{"1h": closedPrimary}
 	for _, spec := range timeframeSpec {
 		klines := futuresByTF[spec.tf]
 		if klines == nil {
 			klines, err = bn.futuresKlines(symbol, spec.tf, spec.fetch)
 			if err != nil {
 				meta.MissingFields = append(meta.MissingFields, "futures_klines_"+spec.tf)
+				continue
+			}
+			klines = closedKlinesAt(klines, time.Now())
+			if len(klines) == 0 {
+				meta.MissingFields = append(meta.MissingFields, "closed_futures_klines_"+spec.tf)
 				continue
 			}
 			futuresByTF[spec.tf] = klines
@@ -419,6 +525,11 @@ func buildMarketSection(bn *binanceClient, symbol string, atr float64, meta *Met
 		if err != nil {
 			continue
 		}
+		klines = closedKlinesAt(klines, time.Now())
+		if len(klines) == 0 {
+			meta.MissingFields = append(meta.MissingFields, "closed_spot_klines_"+tf)
+			continue
+		}
 		spotOK = true
 		if cvd := summarizeCVD(klines); cvd != nil {
 			spotCVD[tf] = cvd
@@ -432,9 +543,9 @@ func buildMarketSection(bn *binanceClient, symbol string, atr float64, meta *Met
 	meta.SpotAvailable = spotOK
 	if spotOK {
 		m.SpotCVD = spotCVD
-		if spotQuote24h > 0 && len(primaryKlines) >= 24 {
+		if spotQuote24h > 0 && len(closedPrimary) >= 24 {
 			var contractQuote24h float64
-			for _, k := range primaryKlines[len(primaryKlines)-24:] {
+			for _, k := range closedPrimary[len(closedPrimary)-24:] {
 				contractQuote24h += k.QuoteVolume
 			}
 			if contractQuote24h > 0 {
@@ -556,6 +667,21 @@ func buildMarketSection(bn *binanceClient, symbol string, atr float64, meta *Met
 	}
 
 	return m
+}
+
+// closedKlinesAt excludes the exchange's currently forming candle from every
+// structural/volume/CVD input. Live execution price remains a separate field;
+// deterministic triggers and consecutive ABANDON confirmation must only use
+// completed bars.
+func closedKlinesAt(klines []market.Kline, now time.Time) []market.Kline {
+	cutoff := now.UnixMilli()
+	out := make([]market.Kline, 0, len(klines))
+	for _, kline := range klines {
+		if kline.CloseTime > 0 && kline.CloseTime < cutoff {
+			out = append(out, kline)
+		}
+	}
+	return out
 }
 
 // summarizeKlines 截取入包窗口并计算窗口涨跌幅 + 量比

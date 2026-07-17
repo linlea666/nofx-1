@@ -28,6 +28,14 @@ func TestCopyGuardCycleAndEventLedger(t *testing.T) {
 	if err := cs.RecordCopyGuardStop(cycle, 2, 98, -30, 1, 2, "algo-1", map[string]interface{}{"quantity": 10.0}); err != nil {
 		t.Fatal(err)
 	}
+	if err := cs.RecordCopyGuardStop(cycle, 2, 98, -30, 1, 2, "algo-1", map[string]interface{}{"quantity": 10.0}); err != nil {
+		t.Fatal(err)
+	}
+	idempotentCycle, _ := cs.GetCopyGuardCycle(cycle.ID)
+	idempotentEvents, _ := cs.ListCopyGuardEvents(cycle.ID)
+	if idempotentCycle.StopCount != 1 || idempotentCycle.ActualPnL != -30 || len(idempotentEvents) != 1 {
+		t.Fatalf("duplicate stop replay changed ledger: cycle=%+v events=%+v", idempotentCycle, idempotentEvents)
+	}
 	if err := cs.ReconcileCopyGuardAttempt(cycle.ID, 0, -25, 2, -1, 0); err != nil {
 		t.Fatal(err)
 	}
@@ -35,7 +43,17 @@ func TestCopyGuardCycleAndEventLedger(t *testing.T) {
 	if cycle.ActualPnL != -25 || cycle.Fees != 2 || cycle.FundingFee != -1 {
 		t.Fatalf("attempt reconciliation not reflected in cycle: %+v", cycle)
 	}
-	if err := cs.RecordCopyGuardReentryFilled(cycle, 99, 500, 5, 2, map[string]interface{}{}); err != nil {
+	if err := cs.UpdateCopyGuardObservation(cycle.ID, CopyGuardReentryPending, cycle.LeaderEntryPrice, cycle.LastObservedPrice, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := cs.SavePositionMapping(&CopyTradePositionMapping{TraderID: cycle.TraderID, LeaderPosID: cycle.LeaderPosID, LeaderID: cycle.LeaderID, Symbol: cycle.Symbol, Side: cycle.Side, MarginMode: cycle.MarginMode, OpenedAt: time.Now(), OpenPrice: 101, OpenSizeUSD: 1000, LastKnownSize: 10}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cs.MarkStoppedByRisk(cycle.TraderID, cycle.LeaderPosID, -30, 10, 0); err != nil {
+		t.Fatal(err)
+	}
+	cycle, _ = cs.GetCopyGuardCycle(cycle.ID)
+	if err := cs.RecordCopyGuardReentryFilled(cycle, 99, 500, 5, 2, map[string]interface{}{"activate_mapping": true, "leader_size": 8.0, "exchange_order_id": "reentry-order-1"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := cs.UpdateCopyGuardAttemptIdentity(cycle.ID, 1, "follower-pos-1", "entry-1", ""); err != nil {
@@ -48,8 +66,12 @@ func TestCopyGuardCycleAndEventLedger(t *testing.T) {
 	if got.Status != CopyGuardFollowingReentry || got.ReentryCount != 1 || got.StopCount != 1 {
 		t.Fatalf("unexpected cycle: %+v", got)
 	}
+	mapping, err := cs.GetActiveMapping(cycle.TraderID, cycle.LeaderPosID)
+	if err != nil || mapping == nil || mapping.OpenPrice != 99 || mapping.LastKnownSize != 8 {
+		t.Fatalf("reentry mapping was not committed atomically: mapping=%+v err=%v", mapping, err)
+	}
 	attempts, err := cs.ListCopyGuardAttempts(cycle.ID)
-	if err != nil || len(attempts) != 2 || attempts[0].FollowerPosID != "follower-pos-0" || attempts[1].FollowerPosID != "follower-pos-1" {
+	if err != nil || len(attempts) != 2 || attempts[0].FollowerPosID != "follower-pos-0" || attempts[1].FollowerPosID != "follower-pos-1" || attempts[1].EntryOrderID != "entry-1" {
 		t.Fatalf("attempt identities were overwritten: %+v, %v", attempts, err)
 	}
 	events, err := cs.ListCopyGuardEvents(cycle.ID)
@@ -73,6 +95,44 @@ func TestParseDBTimeSupportsSQLiteAndRFC3339(t *testing.T) {
 	}
 	if got, err := parseNullableDBTime(sql.NullString{}); err != nil || got != nil {
 		t.Fatalf("null timestamp = %v, %v", got, err)
+	}
+}
+
+func TestCopyGuardReentryFillRollsBackWithoutOwnedMapping(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "copyguard-reentry-atomic.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cs := st.CopyTrade()
+	cycle, err := cs.EnsureCopyGuardCycle(&CopyGuardCycle{TraderID: "trader-atomic", LeaderID: "leader", LeaderPosID: "pos-atomic", Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", Status: CopyGuardReentryPending, PolicySnapshot: "{}", LeaderEntryPrice: 100, FollowerEntryPrice: 100, FollowerNotional: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = cs.RecordCopyGuardReentryFilled(cycle, 101, 50, .5, 2, map[string]interface{}{"activate_mapping": true}); err == nil {
+		t.Fatal("reentry fill must fail when its stopped mapping is missing")
+	}
+	fresh, err := cs.GetCopyGuardCycle(cycle.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh.Status != CopyGuardReentryPending || fresh.ReentryCount != 0 {
+		t.Fatalf("failed atomic commit mutated cycle: %+v", fresh)
+	}
+	attempts, err := cs.ListCopyGuardAttempts(cycle.ID)
+	if err != nil || len(attempts) != 0 {
+		t.Fatalf("failed atomic commit created attempt: %+v err=%v", attempts, err)
+	}
+}
+
+func TestCopyGuardTailRiskUsesReconciledPnLPath(t *testing.T) {
+	maxDrawdown, worstLoss, cvar95 := copyGuardTailRisk([]float64{10, -4, -20, 8, -2})
+	if maxDrawdown != 24 || worstLoss != 20 || cvar95 != 20 {
+		t.Fatalf("tail risk = %.2f/%.2f/%.2f, want 24/20/20", maxDrawdown, worstLoss, cvar95)
+	}
+	maxDrawdown, worstLoss, cvar95 = copyGuardTailRisk([]float64{2, 3})
+	if maxDrawdown != 0 || worstLoss != 0 || cvar95 != 0 {
+		t.Fatalf("winning path must have zero loss tail metrics: %.2f/%.2f/%.2f", maxDrawdown, worstLoss, cvar95)
 	}
 }
 
@@ -148,6 +208,34 @@ func TestCopyGuardProtectionRetryIsAtomic(t *testing.T) {
 	}
 }
 
+func TestCopyGuardProtectiveOrderPersistsQuantityStep(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "copyguard-step.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cs := st.CopyTrade()
+	cycle, err := cs.EnsureCopyGuardCycle(&CopyGuardCycle{TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "pos-step", Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", Status: CopyGuardFollowing, PolicySnapshot: "{}"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := &CopyGuardProtectiveOrder{CycleID: cycle.ID, TraderID: "trader-1", AlgoID: "algo-step", AlgoClientID: "cg-step", Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", Quantity: 0.064, QuantityStep: 0.001, TriggerPrice: 1711.63, TriggerType: "mark", Status: "live"}
+	if err := cs.UpsertCopyGuardProtectiveOrder(want); err != nil {
+		t.Fatal(err)
+	}
+	got, err := cs.GetCopyGuardProtectiveOrder(cycle.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.QuantityStep != want.QuantityStep {
+		t.Fatalf("quantity step = %v, want %v", got.QuantityStep, want.QuantityStep)
+	}
+	active, err := cs.ListActiveCopyGuardProtectiveOrders("trader-1")
+	if err != nil || len(active) != 1 || active[0].QuantityStep != want.QuantityStep {
+		t.Fatalf("active protection lost quantity step: %+v, %v", active, err)
+	}
+}
+
 func TestExistingClosedCopyGuardCycleBecomesLegacyUnverified(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "copyguard-legacy.db")
 	st, err := New(path)
@@ -218,6 +306,10 @@ func TestCopyGuardProtectionHealthAndShadowLedger(t *testing.T) {
 	if got.BaselineRealizedPnL < 49.99 || got.BaselineRealizedPnL > 50.01 {
 		t.Fatalf("shadow partial close pnl = %v, want 50", got.BaselineRealizedPnL)
 	}
+	if err := cs.UpdateCopyGuardObservation(cycle.ID, CopyGuardReentryPending, got.LeaderEntryPrice, got.LastObservedPrice, 0); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = cs.GetCopyGuardCycle(cycle.ID)
 	if err := cs.RecordCopyGuardReentryFilled(got, 105, 500, 5, 2, map[string]interface{}{"test": true}); err != nil {
 		t.Fatal(err)
 	}
@@ -319,36 +411,34 @@ func TestMigratePolicyDefaults(t *testing.T) {
 		return p
 	}
 
-	// 低代次存量策略：max_chase/cooldown 仍是旧默认值 → 应迁移；
-	// max_reentries==2 不再被代次 4 规则降为 1（代次 5 已回退该规则）
+	// v7 cannot distinguish an old inherited value from an explicit choice, so
+	// every stored number must survive unchanged.
 	seed("t-old-defaults", CopyGuardPolicy{Version: 4, ReentryMaxChaseATR: 0, ReentryCooldownSec: 60, MaxReentries: 2, DefaultsVersion: 2})
 	// 低代次存量策略：用户显式改过 → 应保留
 	seed("t-custom", CopyGuardPolicy{Version: 4, ReentryMaxChaseATR: 1.2, ReentryCooldownSec: 900, MaxReentries: 3, DefaultsVersion: 2})
-	// 代次 4 行：被代次 4 规则降为 1 的 max_reentries → 代次 5 回补为 2；
-	// 已迁移过的 cooldown/chase 不得再动（fromVersion 守卫）
+	// Even a value previously produced by a migration is preserved.
 	seed("t-gen4-reduced", CopyGuardPolicy{Version: 4, ReentryMaxChaseATR: 0, ReentryCooldownSec: 60, MaxReentries: 1, DefaultsVersion: 4})
 	// 已是当前代次：即使值等于旧默认也不得再动（用户设回旧值的选择）
 	seed("t-current", CopyGuardPolicy{Version: 4, ReentryMaxChaseATR: 0, ReentryCooldownSec: 60, MaxReentries: 1, DefaultsVersion: copyGuardPolicyDefaultsVersion})
 
 	cs.migrateCopyGuardPolicyDefaults()
 
-	if p := load("t-old-defaults"); p.ReentryMaxChaseATR != 0.5 || p.ReentryCooldownSec != 300 || p.MaxReentries != 2 || p.DefaultsVersion != copyGuardPolicyDefaultsVersion {
-		t.Fatalf("old defaults must migrate to 0.5/300s with max_reentries kept at 2: %+v", p)
+	if p := load("t-old-defaults"); p.ReentryMaxChaseATR != 0 || p.ReentryCooldownSec != 60 || p.MaxReentries != 2 || p.ReentryDecisionMode != "legacy_rule" || p.DefaultsVersion != copyGuardPolicyDefaultsVersion {
+		t.Fatalf("v7 migration must preserve stored values and pin legacy mode: %+v", p)
 	}
 	if p := load("t-custom"); p.ReentryMaxChaseATR != 1.2 || p.ReentryCooldownSec != 900 || p.MaxReentries != 3 || p.DefaultsVersion != copyGuardPolicyDefaultsVersion {
 		t.Fatalf("explicit values must be preserved: %+v", p)
 	}
-	if p := load("t-gen4-reduced"); p.MaxReentries != 2 || p.ReentryMaxChaseATR != 0 || p.ReentryCooldownSec != 60 || p.DefaultsVersion != copyGuardPolicyDefaultsVersion {
-		t.Fatalf("gen4-reduced max_reentries must be restored to 2 without re-running older rules: %+v", p)
+	if p := load("t-gen4-reduced"); p.MaxReentries != 1 || p.ReentryMaxChaseATR != 0 || p.ReentryCooldownSec != 60 || p.ReentryDecisionMode != "legacy_rule" || p.DefaultsVersion != copyGuardPolicyDefaultsVersion {
+		t.Fatalf("v7 migration must not reinterpret prior values: %+v", p)
 	}
 	if p := load("t-current"); p.ReentryMaxChaseATR != 0 || p.ReentryCooldownSec != 60 || p.MaxReentries != 1 {
 		t.Fatalf("policies at the current version must not be rescanned: %+v", p)
 	}
 }
 
-// 代次 6（v5.2 止损抗噪）迁移：把主表 risk_atr_multiplier 1.5→2.0、
-// risk_leverage_fallback 1→0；仅匹配旧默认值，用户显式值（1.8/已关）保留；
-// 已达当前代次的策略不重扫。
+// v7 migration never rewrites main-table risk values; equality with an old
+// default is not proof that the user did not choose it explicitly.
 func TestMigratePolicyDefaultsGen6(t *testing.T) {
 	st, err := New(filepath.Join(t.TempDir(), "defaults-gen6.db"))
 	if err != nil {
@@ -384,7 +474,7 @@ func TestMigratePolicyDefaultsGen6(t *testing.T) {
 		return atr, lev
 	}
 
-	// 旧默认行：应迁移为 2.0 / 0
+	// Values equal to old defaults are still preserved.
 	seed("t-old", 5, 1.5, 1)
 	// 用户显式行：1.8 与已关闭 fallback 都不得被改
 	seed("t-custom", 5, 1.8, 0)
@@ -393,8 +483,8 @@ func TestMigratePolicyDefaultsGen6(t *testing.T) {
 
 	cs.migrateCopyGuardPolicyDefaults()
 
-	if atr, lev := loadCfg("t-old"); atr != 2.0 || lev != 0 {
-		t.Fatalf("旧默认行应迁移为 2.0/0，got atr=%.2f lev=%d", atr, lev)
+	if atr, lev := loadCfg("t-old"); atr != 1.5 || lev != 1 {
+		t.Fatalf("存量主表值不得自动覆盖，got atr=%.2f lev=%d", atr, lev)
 	}
 	if atr, lev := loadCfg("t-custom"); atr != 1.8 || lev != 0 {
 		t.Fatalf("用户显式值必须保留，got atr=%.2f lev=%d", atr, lev)

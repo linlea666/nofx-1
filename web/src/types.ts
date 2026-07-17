@@ -195,20 +195,29 @@ export interface CopyConfigRequest {
   binance_csrf_token?: string // CSRF header csrftoken
 
   // ============================================================
-  // 账户保护 / 止损兜底（Copy Guard v5）—— 仅 OKX 路径生效
+  // Copy Guard v7：可靠止损、风险预算与 AI guarded 重入
   // 所有字段可选，未传走后端默认值。
   // v3 遗留字段（risk_atr_enabled / risk_reentry_tolerance / 反加仓铁律 /
   // risk_stop_noise_floor_atr / risk_cycle_max_loss_pct）已随 v5 下线。
   // ============================================================
   risk_stop_loss_enabled?: boolean // 默认 true：启用账户保护硬止损
-  risk_account_pct?: number // 默认 0.10 (10%)：单笔最多亏账户的百分比（账户兜底线）
+  risk_account_pct?: number // 默认 0.02：单次尝试风险预算
+  risk_cycle_loss_budget_pct?: number
+  risk_portfolio_loss_budget_pct?: number
+  risk_round_trip_fee_bps?: number
   risk_atr_multiplier?: number // 默认 2.0：SL 距离基线 = k×ATR（1.0-3.0，抗噪主力线）
   risk_atr_timeframe?: string // 默认 "1h"：ATR 时间周期（"15m" / "1h" / "4h"）
   risk_leverage_fallback?: boolean // 默认 false：margin_cap 默认关（高杠杆下会压进噪音区）
   risk_leverage_max_loss?: number // 默认 0.2：仅 risk_leverage_fallback 开启时的保证金封顶
-  risk_reentry_enabled?: boolean // 默认 true（v4+）：止损后确认式重入
+  risk_reentry_enabled?: boolean // 默认 true：止损完全平仓后进入 AI 持续观察
   risk_reentry_ratio?: number // 默认 0.5：重入仓位系数（× 被止损仓位名义）
-  // v5.1 默认 true：自动重入次数用尽后，出现合格重入信号时邮件提醒人工确认（系统代执行）
+  risk_reentry_decision_mode?: 'ai_guarded' | 'legacy_rule' | 'disabled'
+  risk_ai_confidence_threshold?: number
+  risk_ai_min_review_seconds?: number
+  risk_ai_daily_call_limit?: number
+  risk_ai_lifecycle_call_limit?: number
+  risk_notification_level?: 'important' | 'critical' | 'verbose'
+  // 历史兼容字段；v7 固定 false，不再逐笔人工确认
   risk_manual_reentry_enabled?: boolean
 
   risk_policy_version?: number
@@ -226,8 +235,9 @@ export interface CopyConfigRequest {
   risk_reentry_max_atr_expansion?: number
   risk_watch_timeout_minutes?: number
   risk_migration_confirmed?: boolean
-  risk_addon_budget_pct?: number // 默认 0.15：加仓账户风险预算（v4.1 起仅告警不拦截；1.0=不告警）
+  risk_addon_budget_pct?: number // 默认 0.15：加仓超限自动缩量，低于最小量拒绝
   risk_high_risk_confirmed?: boolean
+  risk_extreme_risk_confirm_value?: number
 
   // v4.1 重入加严
   risk_reentry_min_recovery_atr?: number // 默认 0.5：重入前价格须从止损价恢复的最小幅度（ATR 倍数）
@@ -697,16 +707,25 @@ export interface CopyTradeConfig {
   // Binance Web 凭证（仅 provider_type=binance 时使用，明文返回，用于编辑表单回填）
   binance_p20t?: string
   binance_csrf_token?: string
-  // 账户保护 / 止损兜底（Copy Guard v5）—— 仅 OKX 路径生效，详见 CopyConfigRequest
+  // Copy Guard v7，详见 CopyConfigRequest
   risk_stop_loss_enabled?: boolean
   risk_account_pct?: number
+  risk_cycle_loss_budget_pct?: number
+  risk_portfolio_loss_budget_pct?: number
+  risk_round_trip_fee_bps?: number
   risk_atr_multiplier?: number
   risk_atr_timeframe?: string
   risk_leverage_fallback?: boolean
   risk_leverage_max_loss?: number
   risk_reentry_enabled?: boolean
   risk_reentry_ratio?: number
-  risk_manual_reentry_enabled?: boolean // v5.1 默认 true：自动重入用尽后人工重入提醒
+  risk_reentry_decision_mode?: 'ai_guarded' | 'legacy_rule' | 'disabled'
+  risk_ai_confidence_threshold?: number
+  risk_ai_min_review_seconds?: number
+  risk_ai_daily_call_limit?: number
+  risk_ai_lifecycle_call_limit?: number
+  risk_notification_level?: 'important' | 'critical' | 'verbose'
+  risk_manual_reentry_enabled?: boolean // 历史兼容字段；v7 固定 false
   risk_policy_version?: number
   risk_stop_mode?: 'volatility_priority' | 'account_hard_limit'
   risk_atr_period?: number
@@ -723,6 +742,8 @@ export interface CopyTradeConfig {
   risk_watch_timeout_minutes?: number
   risk_migration_confirmed?: boolean
   risk_addon_budget_pct?: number
+  risk_high_risk_confirmed?: boolean
+  risk_extreme_risk_confirm_value?: number
   // v4.1 重入加严
   risk_reentry_min_recovery_atr?: number
   risk_reentry_cooldown_escalation?: number
@@ -774,6 +795,9 @@ export interface CopyGuardSummary {
   false_kill_count: number // 误杀次数（分子）
   estimated_baseline_cycles: number // 基线仍为"最后观测价估算"的已对账周期数
   estimated_net_guard_effect: number // 上述周期贡献的净效果（含在 net_guard_effect 内）
+  max_realized_drawdown_usd: number // 已对账止损周期按结束顺序形成的真实盈亏路径最大回撤
+  worst_cycle_loss_usd: number // 已对账止损周期的最大单周期亏损绝对值
+  tail_loss_cvar_95_usd: number // 样本 95% 尾部平均损失；小样本时等于最差观测
   trend: Array<{
     date: string
     actual: number
@@ -878,7 +902,13 @@ export interface CopyGuardManualSignal {
   symbol: string
   side: string
   margin_mode: string
-  status: 'PENDING' | 'EXECUTING' | 'EXECUTED' | 'FAILED' | 'DISMISSED' | 'INVALIDATED'
+  status:
+    | 'PENDING'
+    | 'EXECUTING'
+    | 'EXECUTED'
+    | 'FAILED'
+    | 'DISMISSED'
+    | 'INVALIDATED'
   trigger_price: number // 信号触发时标记价
   atr: number
   distance_atr_ratio: number // 止损距离/ATR（噪音档参考，0=数据缺失）
@@ -899,14 +929,78 @@ export interface CopyGuardManualSignal {
   executed_at?: string
 }
 
+export interface CopyGuardAICandidate {
+  id: number
+  cycle_id: number
+  trader_id: string
+  leader_pos_id: string
+  symbol: string
+  side: string
+  margin_mode: string
+  status:
+    | 'WATCHING'
+    | 'REVIEWING'
+    | 'WAITING'
+    | 'ENTRY_PENDING'
+    | 'REENTERED'
+    | 'ABANDONED'
+    | 'EXPIRED'
+    | 'BUDGET_SUSPENDED'
+    | 'INVALIDATED'
+    | 'PAUSED'
+  trigger_price: number
+  atr: number
+  max_notional: number
+  stop_count: number
+  reentry_count: number
+  leader_size: number
+  leader_entry_price: number
+  last_stop_price: number
+  distance_atr_ratio: number
+  protectable: boolean
+  feature_hash: string
+  pending_trigger: string
+  decision_generation: number
+  review_count: number
+  failure_count: number
+  last_decision: string
+  regime: string
+  confidence: number
+  size_factor: number
+  entry_price_low: number
+  entry_price_high: number
+  attention_price_low: number
+  attention_price_high: number
+  last_analysis_id: number
+  last_error: string
+  snapshot_at: string
+  last_review_at?: string
+  next_review_at: string
+  created_at: string
+  closed_at?: string
+}
+
 // 重入 AI 助手：一次数据包快照 + 双 AI 结果载体（同信号可多条，重新生成产生新快照）
 export interface ReentryAIAnalysis {
   id: number
   signal_id: number
+  candidate_id: number
   trader_id: string
   cycle_id: number
   symbol: string
   side: string
+  attempt_no: number
+  decision_generation: number
+  call_status:
+    | 'PENDING'
+    | 'RUNNING'
+    | 'COMPLETED'
+    | 'INVALID'
+    | 'FAILED'
+    | 'PREPARE_FAILED'
+    | 'SKIPPED'
+  call_error?: string
+  data_hash: string
   system_prompt: string
   user_prompt: string
   datapack_json: string // 纯数据 JSON（喂外部 AI 用）
@@ -929,11 +1023,11 @@ export interface ReentryAIAnalysis {
 export interface ReentryAIConfig {
   enabled: boolean // 插件总开关（数据包自动生成）
   ai_enabled: boolean // 新信号自动触发内置 AI 分析
-  auto_entry_enabled: boolean // Phase 3：ENTER 且置信度达标时自动确认重入（依赖 ai_enabled）
+  auto_entry_enabled: boolean // ai_guarded 候选真实执行的全局安全开关（依赖 ai_enabled）
   provider: string
   model: string // ai_models 表的模型 ID（空=自动选默认）
   prompt_template: string // 自定义 System Prompt（空=内置默认）
-  confidence_threshold: number // 自动入场置信度门槛
+  confidence_threshold: number // AI 候选 ENTER_NOW 的全局最低置信度门槛
   timeout_seconds: number
 }
 
@@ -948,6 +1042,11 @@ export interface ReentryAIStats {
   internal_correct: number
   external_scored: number
   external_correct: number
+  candidate_analyses: number
+  candidate_decisions: Record<string, number>
+  candidate_call_statuses: Record<string, number>
+  candidate_scored: number
+  candidate_profitable: number
 }
 
 // 市场指标实时预览（A2，与信号无关；market 结构与数据包 market 段一致，

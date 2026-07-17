@@ -75,56 +75,52 @@ func TestParseAIVerdict(t *testing.T) {
 	}
 }
 
-// TestMaybeAutoEnterGuards Phase 3 自动入场的层层护栏：
-// 开关关 / 非 ENTER / 置信度不足 / 快照过时 / 执行链拒绝（引擎未运行）。
-func TestMaybeAutoEnterGuards(t *testing.T) {
-	st, err := store.New(filepath.Join(t.TempDir(), "autoentry.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
-	sig := newTestSignal(t, st, "ZZZNOSUCHCOINUSDT")
-	a := &Advisor{st: st, bn: newBinanceClient(), inflight: map[int64]bool{}}
-	analysis := &store.ReentryAIAnalysis{
-		ID: 1, SignalID: sig.ID, TraderID: sig.TraderID,
-		Symbol: sig.Symbol, Side: sig.Side, SnapshotAt: time.Now(),
-	}
-	enter := &parsedVerdict{Verdict: store.ReentryVerdictEnter, Confidence: 0.9}
+// TestLegacyAnalysisExecutionRetired ensures the old manual-signal analyzer can
+// never be interpreted as an execution route. auto_entry_enabled now only
+// gates scheduler-managed ai_guarded candidates.
+func TestLegacyAnalysisExecutionRetired(t *testing.T) {
 	cfg := &store.ReentryAIConfig{
 		Enabled: true, AIEnabled: true, AutoEntryEnabled: true,
 		ConfidenceThreshold: 0.7, TimeoutSeconds: 60,
 	}
-
-	// 开关关闭：不尝试
-	off := *cfg
-	off.AutoEntryEnabled = false
-	if note := a.maybeAutoEnter(analysis, &off, enter); note != "" {
-		t.Fatalf("disabled switch should skip, got %q", note)
-	}
-	// 非 ENTER：不尝试
-	wait := &parsedVerdict{Verdict: store.ReentryVerdictWait, Confidence: 0.99}
-	if note := a.maybeAutoEnter(analysis, cfg, wait); note != "" {
+	if note := legacyAnalysisExecutionNote(cfg, &parsedVerdict{Verdict: store.ReentryVerdictWait}); note != "" {
 		t.Fatalf("WAIT should skip, got %q", note)
 	}
-	// 置信度不足：留说明
-	low := &parsedVerdict{Verdict: store.ReentryVerdictEnter, Confidence: 0.5}
-	if note := a.maybeAutoEnter(analysis, cfg, low); !strings.Contains(note, "低于门槛") {
-		t.Fatalf("low confidence note = %q", note)
+	note := legacyAnalysisExecutionNote(cfg, &parsedVerdict{Verdict: store.ReentryVerdictEnter, Confidence: 0.99})
+	if !strings.Contains(note, "已废弃") || !strings.Contains(note, "仅用于历史审计") {
+		t.Fatalf("retired execution note = %q", note)
 	}
-	// 快照过时：留说明
-	stale := *analysis
-	stale.SnapshotAt = time.Now().Add(-time.Hour)
-	if note := a.maybeAutoEnter(&stale, cfg, enter); !strings.Contains(note, "过时") {
-		t.Fatalf("stale snapshot note = %q", note)
+}
+
+func TestAnalyzeAnalysisRejectsSchedulerManagedCandidate(t *testing.T) {
+	st, err := store.New(filepath.Join(t.TempDir(), "candidate-manual-trigger.db"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	// 全部护栏通过 → 走 ConfirmManualReentryForTrader（测试环境无运行中
-	// 引擎，被硬校验拒绝），信号保持 PENDING
-	note := a.maybeAutoEnter(analysis, cfg, enter)
-	if !strings.Contains(note, "自动入场未执行") {
-		t.Fatalf("engine-off note = %q", note)
+	defer st.Close()
+	analysis, err := st.ReentryAI().SaveReentryAnalysis(&store.ReentryAIAnalysis{
+		CandidateID: 42,
+		TraderID:    "trader-a",
+		CycleID:     7,
+		Symbol:      "BTCUSDT",
+		Side:        "long",
+		CallStatus:  "PENDING",
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
-	got, err := st.CopyTrade().GetManualReentrySignal(sig.ID)
-	if err != nil || got.Status != store.ManualReentryStatusPending {
-		t.Fatalf("signal should stay PENDING, got %+v err=%v", got, err)
+
+	defaultAdvisorMu.Lock()
+	previous := defaultAdvisor
+	defaultAdvisor = &Advisor{st: st, inflight: map[int64]bool{}, analyzeLast: map[int64]time.Time{}}
+	defaultAdvisorMu.Unlock()
+	t.Cleanup(func() {
+		defaultAdvisorMu.Lock()
+		defaultAdvisor = previous
+		defaultAdvisorMu.Unlock()
+	})
+
+	if err := AnalyzeAnalysis(analysis.ID); err == nil || !strings.Contains(err.Error(), "持久化调度器") {
+		t.Fatalf("scheduler-managed analysis should reject manual trigger, got %v", err)
 	}
 }

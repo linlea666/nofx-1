@@ -13,6 +13,7 @@ import {
 import { api } from '../lib/api'
 import type {
   AIModel,
+  CopyGuardAICandidate,
   CopyGuardCycle,
   CopyGuardManualSignal,
   ReentryAIAnalysis,
@@ -26,12 +27,20 @@ const money = (v: number) => `${v >= 0 ? '+' : ''}${v.toFixed(2)} USDT`
 const statusLabels: Record<string, string> = {
   FOLLOWING: '正常跟随',
   STOP_TRIGGERED: '止损已触发',
+  STOP_PENDING_FLAT: '止损退出确认中',
+  STOP_PARTIAL: '止损部分成交·继续退出',
+  STOP_FLAT_CONFIRMED: '止损已完全平仓',
+  AI_WATCHING: 'AI 持续观察',
+  AI_REVIEWING: 'AI 分析中',
+  AI_WAITING: 'AI 等待下一事件',
   STOPPED_WATCHING: '止损后观察',
   REENTRY_PENDING: '等待重入成交',
   FOLLOWING_REENTRY: '重入后跟随',
   LEADER_CLOSED: '领航员已平仓',
   LEADER_REVERSED: '领航员已反手',
-  ATTEMPTS_EXHAUSTED: '自动重入次数用尽·继续观察（可人工重入）',
+  ATTEMPTS_EXHAUSTED: '重入次数用尽',
+  AI_ABANDONED: 'AI 已确认放弃',
+  BUDGET_SUSPENDED: 'AI 调用额度耗尽',
   WATCH_TIMEOUT: '观察超时·等待领航员平仓',
   CYCLE_LOSS_CAPPED: '周期亏损熔断·等待领航员平仓（v5 前历史）',
   // 注：不可保护（裸跑）不是周期状态——follow 模式下周期保持 FOLLOWING，
@@ -80,6 +89,8 @@ const attemptLabels: Record<string, string> = {
 }
 const eventLabels: Record<string, string> = {
   INITIAL_ENTRY_FILLED: '首次跟随成交',
+  PROTECTION_PENDING: '保护单建立中',
+  PROTECTION_ACTIVE: '保护单已生效',
   PROTECTIVE_STOP_ACTIVE: '保护单已生效',
   PROTECTION_RETRY: '重试建立保护',
   PROTECTION_CREATE_FAILED: '保护单创建失败',
@@ -116,7 +127,7 @@ const eventLabels: Record<string, string> = {
   ADDON_SKIPPED_BUDGET: '加仓超预算被拦截（旧版）',
   CYCLE_LOSS_BREAKER: '周期亏损熔断触发',
   REENTRY_GATE_CHANGED: '重入门控条件变化',
-  REENTRY_WINDOW_COLLAPSED: '自动重入窗口不可行·转人工确认',
+  REENTRY_WINDOW_COLLAPSED: '旧规则重入窗口不可行',
   WATCH_RESUMED: '观察采样断档后恢复',
   WATCH_SUMMARY: '观察期收尾统计',
   // v5.1 人工重入
@@ -235,7 +246,9 @@ function InternalVerdictCard({ analysis }: { analysis: ReentryAIAnalysis }) {
       className={`space-y-2 rounded border p-3 ${verdictStyles[analysis.verdict] || 'border-[#2B3139]'}`}
     >
       <div className="flex flex-wrap items-center gap-3 text-sm font-medium">
-        <span>内置 AI 结论：{verdictLabels[analysis.verdict] || analysis.verdict}</span>
+        <span>
+          内置 AI 结论：{verdictLabels[analysis.verdict] || analysis.verdict}
+        </span>
         <span className="text-xs font-normal">
           置信度 {(analysis.confidence * 100).toFixed(0)}%
         </span>
@@ -258,8 +271,8 @@ function InternalVerdictCard({ analysis }: { analysis: ReentryAIAnalysis }) {
         </div>
       )}
       <div className="text-xs text-[#848E9C]">
-        未开启「AI 自动入场」时结论仅供参考，入场需人工点击「确认重入」；
-        开启后仅新信号的自动分析会按门槛自动执行，本弹窗手动分析永不自动入场。
+        这是旧信号的历史分析视图，不具备下单能力。真实重入只会由持久化 AI
+        候选调度器在重新校验价格、仓位、预算和保护能力后执行。
       </div>
     </div>
   )
@@ -303,7 +316,6 @@ function AnalysisModal({
     if (!analysis) return
     setExternalText(analysis.external_response)
     setExternalVerdict(analysis.external_verdict)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [analysisId])
 
   const doRegenerate = async () => {
@@ -402,8 +414,9 @@ function AnalysisModal({
               </div>
               {!analysis.market_data_available && (
                 <div className="rounded border border-[#F0B90B] bg-[#F0B90B]/10 p-3 text-xs text-[#F0B90B]">
-                  该币种无 Binance 市场数据，市场层缺失（仓位层数据完整）——请结合
-                  OKX 行情人工判断。
+                  该币种无 Binance
+                  市场数据，市场层缺失（仓位层数据完整）——请结合 OKX
+                  行情人工判断。
                 </div>
               )}
               {analysis.missing_fields && (
@@ -507,7 +520,11 @@ function AnalysisModal({
               disabled={busy}
               className="rounded bg-[#F0B90B] px-3 py-1 text-xs font-medium text-black hover:opacity-90 disabled:opacity-40"
             >
-              {busy ? '处理中…' : analyses.length === 0 ? '立即生成' : '重新生成（新快照）'}
+              {busy
+                ? '处理中…'
+                : analyses.length === 0
+                  ? '立即生成'
+                  : '重新生成（新快照）'}
             </button>
           </span>
         </div>
@@ -580,7 +597,7 @@ function AdvisorSettingsCard() {
       <summary className="cursor-pointer px-4 py-3 text-sm font-medium text-[#EAECEF]">
         🤖 重入 AI 助手设置与统计
         <span className="ml-2 text-xs font-normal text-[#848E9C]">
-          人工重入信号的决策数据包、内置 AI 分析与可选的 AI 自动入场
+          持续候选调度、内置 AI 分析与全局执行安全开关
         </span>
       </summary>
       <div className="space-y-4 border-t border-[#2B3139] p-4 text-sm">
@@ -596,9 +613,9 @@ function AdvisorSettingsCard() {
                   onChange={(e) => update({ enabled: e.target.checked })}
                 />
                 <span>
-                  启用插件
+                  启用候选调度
                   <span className="ml-1 text-xs text-[#848E9C]">
-                    （新信号自动生成决策数据包）
+                    （持久化观察、事件触发与额度控制）
                   </span>
                 </span>
               </label>
@@ -617,9 +634,9 @@ function AdvisorSettingsCard() {
                   }
                 />
                 <span>
-                  自动内置 AI 分析
+                  允许内置 AI 分析
                   <span className="ml-1 text-xs text-[#848E9C]">
-                    （新信号生成数据包后自动喂给内置模型并邮件通知结论）
+                    （WAIT 不发邮件，调用受候选额度与退避限制）
                   </span>
                 </span>
               </label>
@@ -670,9 +687,7 @@ function AdvisorSettingsCard() {
                       update({ auto_entry_enabled: e.target.checked })
                     }
                   />
-                  <span className="font-medium">
-                    AI 自动入场（Phase 3，高风险）
-                  </span>
+                  <span className="font-medium">AI 重入全局执行安全开关</span>
                 </label>
                 <label className="flex items-center gap-2 text-xs text-[#848E9C]">
                   置信度门槛
@@ -691,11 +706,8 @@ function AdvisorSettingsCard() {
                 </label>
               </div>
               <div className="text-xs leading-relaxed text-[#848E9C]">
-                开启后：新信号的内置 AI 结论为 ENTER
-                且置信度达到门槛时，系统将以操作者「ai:auto」自动确认重入（金额取
-                AI 建议与信号建议的较小值，上限仍封死在首仓名义）。
-                领航员持仓、方向一致、本地无同向仓位等全部硬校验依然生效；数据快照超过
-                10 分钟或任何校验失败都会放弃自动入场并在邮件中说明，信号保留给人工处理。
+                这是 ai_guarded 交易员配置的全局先决安全开关。开启后 AI
+                仍只能建议是否进场与缩小仓位；未完全平仓、快照陈旧、价格漂移、预算不足或保护不可用时，确定性风控会拒绝下单并回到观察。
                 {!cfg.ai_enabled && (
                   <span className="text-[#F0B90B]">
                     {' '}
@@ -705,7 +717,8 @@ function AdvisorSettingsCard() {
                 {cfg.auto_entry_enabled && (
                   <span className="text-[#F6465D]">
                     {' '}
-                    ⚠️ AI 判断可能出错，自动入场直接动用真实资金，请确保已理解全部风险并从小金额开始验证。
+                    ⚠️ AI
+                    判断可能出错，自动入场直接动用真实资金，请确保已理解全部风险并从小金额开始验证。
                   </span>
                 )}
               </div>
@@ -713,7 +726,8 @@ function AdvisorSettingsCard() {
             <div className="space-y-1">
               <div className="flex items-center justify-between text-xs text-[#848E9C]">
                 <span>
-                  自定义 System Prompt（留空使用内置默认；修改只影响之后生成的快照。注意保留
+                  自定义 System
+                  Prompt（留空使用内置默认；修改只影响之后生成的快照。注意保留
                   JSON 输出格式要求，否则内置分析无法解析结论）
                 </span>
                 {cfg.prompt_template && (
@@ -762,7 +776,8 @@ function AdvisorSettingsCard() {
                   .join(' · ')}
               </span>
               <span>
-                准确率 {accuracyText(stats.internal_scored, stats.internal_correct)}
+                准确率{' '}
+                {accuracyText(stats.internal_scored, stats.internal_correct)}
               </span>
               <span>
                 外部 AI：
@@ -771,19 +786,47 @@ function AdvisorSettingsCard() {
                   .join(' · ')}
               </span>
               <span>
-                准确率 {accuracyText(stats.external_scored, stats.external_correct)}
+                准确率{' '}
+                {accuracyText(stats.external_scored, stats.external_correct)}
               </span>
             </div>
             <div className="text-xs text-[#848E9C]">
-              评分口径：已执行信号的重入尝试闭合对账后回填净盈亏；ENTER
-              且盈利、SKIP 且亏损记为正确，WAIT 不计入。
+              上方为历史人工信号口径，仅作存量兼容。
             </div>
+            {stats.candidate_analyses > 0 && (
+              <div className="space-y-1 border-t border-[#2B3139] pt-2 text-xs text-[#B7BDC6]">
+                <div className="font-medium text-[#EAECEF]">
+                  AI 持续候选：{stats.candidate_analyses} 次完整调度
+                </div>
+                <div>
+                  决策：
+                  {['ENTER', 'WAIT', 'ABANDON']
+                    .map((v) => `${v} ${stats.candidate_decisions?.[v] || 0}`)
+                    .join(' · ')}
+                </div>
+                <div>
+                  调用状态：
+                  {['COMPLETED', 'INVALID', 'FAILED', 'PENDING']
+                    .map(
+                      (v) => `${v} ${stats.candidate_call_statuses?.[v] || 0}`
+                    )
+                    .join(' · ')}
+                </div>
+                <div className="text-[#848E9C]">
+                  WAIT、ABANDON、非法输出与失败调用全部保留；仅实际 ENTER 且
+                  attempt 已对账的 {stats.candidate_scored}
+                  条可回填真实盈亏，其中盈利 {stats.candidate_profitable}
+                  条。不会把未执行决策伪装成反事实盈亏。
+                </div>
+              </div>
+            )}
           </div>
         )}
         {history.length > 0 && (
           <div className="space-y-2 rounded bg-[#0B0E11] p-3">
             <div className="text-xs font-medium text-[#EAECEF]">
-              分析历史（最近 {history.length} 条快照，含已执行/已忽略信号，点击查看详情）
+              分析历史（最近 {history.length}{' '}
+              条快照，含已执行/已忽略信号，点击查看详情）
             </div>
             <div className="max-h-72 overflow-y-auto">
               <table className="w-full text-left text-xs">
@@ -802,11 +845,17 @@ function AdvisorSettingsCard() {
                     <tr
                       key={a.id}
                       onClick={() =>
-                        setViewing({ id: a.signal_id, symbol: a.symbol, side: a.side })
+                        setViewing({
+                          id: a.signal_id,
+                          symbol: a.symbol,
+                          side: a.side,
+                        })
                       }
                       className="cursor-pointer border-t border-[#181A20] hover:bg-[#181A20]"
                     >
-                      <td className="py-1.5 pr-3">{dateLabel(a.snapshot_at)}</td>
+                      <td className="py-1.5 pr-3">
+                        {dateLabel(a.snapshot_at)}
+                      </td>
                       <td className="py-1.5 pr-3">
                         {a.symbol} {sideLabel(a.side)}单
                       </td>
@@ -820,7 +869,8 @@ function AdvisorSettingsCard() {
                       </td>
                       <td className="py-1.5 pr-3">
                         {a.external_verdict
-                          ? verdictLabels[a.external_verdict] || a.external_verdict
+                          ? verdictLabels[a.external_verdict] ||
+                            a.external_verdict
                           : '—'}
                       </td>
                       <td className="py-1.5 pr-3">
@@ -873,7 +923,9 @@ function MarketPreviewCard() {
     if (s) setSymbol(s)
   }
   const m = preview?.market ?? null
-  const cvdLine = (cvd?: Record<string, { slope_recent: string; divergence_note?: string }>) =>
+  const cvdLine = (
+    cvd?: Record<string, { slope_recent: string; divergence_note?: string }>
+  ) =>
     cvd
       ? ['5m', '15m', '1h', '4h']
           .filter((tf) => cvd[tf])
@@ -918,7 +970,8 @@ function MarketPreviewCard() {
         )}
         {preview && !preview.futures_available && (
           <div className="rounded border border-[#F0B90B] bg-[#F0B90B]/10 p-3 text-xs text-[#F0B90B]">
-            {preview.symbol} 无 Binance 合约市场数据，无法预览（重入数据包对此类币种也会缺失市场层）。
+            {preview.symbol} 无 Binance
+            合约市场数据，无法预览（重入数据包对此类币种也会缺失市场层）。
           </div>
         )}
         {m && preview && (
@@ -926,7 +979,9 @@ function MarketPreviewCard() {
             <div className="grid gap-x-6 gap-y-1.5 text-xs text-[#B7BDC6] md:grid-cols-2">
               <span>
                 当前价 <span className="text-[#EAECEF]">{m.current_price}</span>
-                <span className="ml-1 text-[#848E9C]">（{m.current_price_source}）</span>
+                <span className="ml-1 text-[#848E9C]">
+                  （{m.current_price_source}）
+                </span>
               </span>
               <span>
                 ATR(OKX 1h){' '}
@@ -941,7 +996,8 @@ function MarketPreviewCard() {
                     {(m.funding.current_rate * 100).toFixed(4)}%
                   </span>
                   <span className="ml-1 text-[#848E9C]">
-                    （{m.funding.state} · 10 日分位 {m.funding.current_percentile_10d}% · 距结算{' '}
+                    （{m.funding.state} · 10 日分位{' '}
+                    {m.funding.current_percentile_10d}% · 距结算{' '}
                     {Math.round(m.funding.next_funding_minutes)} 分钟）
                   </span>
                 </span>
@@ -949,7 +1005,13 @@ function MarketPreviewCard() {
               {m.basis && (
                 <span>
                   基差{' '}
-                  <span className={m.basis.basis_pct >= 0 ? 'text-[#0ECB81]' : 'text-[#F6465D]'}>
+                  <span
+                    className={
+                      m.basis.basis_pct >= 0
+                        ? 'text-[#0ECB81]'
+                        : 'text-[#F6465D]'
+                    }
+                  >
                     {m.basis.basis_pct}%
                   </span>
                   <span className="ml-1 text-[#848E9C]">（正=升水）</span>
@@ -971,7 +1033,9 @@ function MarketPreviewCard() {
               {m.open_interest && (
                 <span>
                   价格×OI 解读{' '}
-                  <span className="text-[#EAECEF]">{m.open_interest.price_oi_read_4h}</span>
+                  <span className="text-[#EAECEF]">
+                    {m.open_interest.price_oi_read_4h}
+                  </span>
                 </span>
               )}
               {m.long_short_ratio && (
@@ -990,14 +1054,20 @@ function MarketPreviewCard() {
                 m.spot_to_contract_volume_ratio_24h > 0 && (
                   <span>
                     现货/合约成交额比(24h){' '}
-                    <span className="text-[#EAECEF]">{m.spot_to_contract_volume_ratio_24h}</span>
+                    <span className="text-[#EAECEF]">
+                      {m.spot_to_contract_volume_ratio_24h}
+                    </span>
                   </span>
                 )}
               <span>
-                合约 CVD 斜率 <span className="text-[#EAECEF]">{cvdLine(m.contract_cvd)}</span>
+                合约 CVD 斜率{' '}
+                <span className="text-[#EAECEF]">
+                  {cvdLine(m.contract_cvd)}
+                </span>
               </span>
               <span>
-                现货 CVD 斜率 <span className="text-[#EAECEF]">{cvdLine(m.spot_cvd)}</span>
+                现货 CVD 斜率{' '}
+                <span className="text-[#EAECEF]">{cvdLine(m.spot_cvd)}</span>
               </span>
               {m.klines &&
                 ['1h', '4h', '1d'].map(
@@ -1031,8 +1101,9 @@ function MarketPreviewCard() {
                           {m.support_resistance![tf].nearest_resistance || '—'}
                         </span>
                         <span className="ml-1 text-[#848E9C]">
-                          （距 {m.support_resistance![tf].support_distance_atr} /{' '}
-                          {m.support_resistance![tf].resistance_distance_atr} ATR）
+                          （距 {m.support_resistance![tf].support_distance_atr}{' '}
+                          / {m.support_resistance![tf].resistance_distance_atr}{' '}
+                          ATR）
                         </span>
                       </span>
                     )
@@ -1051,7 +1122,8 @@ function MarketPreviewCard() {
         )}
         {!symbol && (
           <div className="text-xs text-[#848E9C]">
-            输入 Binance 合约交易对（如 BTCUSDT、ETHUSDT）后点击查看。指标口径与重入决策数据包完全一致，可用于评估指标有效性、决定后续增删。
+            输入 Binance 合约交易对（如
+            BTCUSDT、ETHUSDT）后点击查看。指标口径与重入决策数据包完全一致，可用于评估指标有效性、决定后续增删。
           </div>
         )}
       </div>
@@ -1070,9 +1142,7 @@ function ManualSignalsBanner() {
   const [confirming, setConfirming] = useState<CopyGuardManualSignal | null>(
     null
   )
-  const [analyzing, setAnalyzing] = useState<CopyGuardManualSignal | null>(
-    null
-  )
+  const [analyzing, setAnalyzing] = useState<CopyGuardManualSignal | null>(null)
   const [confirmAmount, setConfirmAmount] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
@@ -1111,7 +1181,11 @@ function ManualSignalsBanner() {
     }
   }
   const doDismiss = async (sig: CopyGuardManualSignal) => {
-    if (!window.confirm(`忽略 ${sig.symbol} ${sideLabel(sig.side)}单的人工重入信号？忽略后本条信号不再提示（后续行情再次满足条件会生成新信号）。`))
+    if (
+      !window.confirm(
+        `忽略 ${sig.symbol} ${sideLabel(sig.side)}单的人工重入信号？忽略后本条信号不再提示（后续行情再次满足条件会生成新信号）。`
+      )
+    )
       return
     setBannerError('')
     try {
@@ -1129,7 +1203,10 @@ function ManualSignalsBanner() {
       {notice && (
         <div className="flex items-center justify-between border border-[#0ECB81] bg-[#0ECB81]/10 rounded-lg p-4 text-sm text-[#0ECB81]">
           <span>{notice}</span>
-          <button onClick={() => setNotice('')} className="ml-3 text-xs underline">
+          <button
+            onClick={() => setNotice('')}
+            className="ml-3 text-xs underline"
+          >
             关闭
           </button>
         </div>
@@ -1169,7 +1246,9 @@ function ManualSignalsBanner() {
                 已止损 {sig.stop_count} 次 / 已自动重入 {sig.reentry_count} 次
               </span>
               <span
-                className={sig.protectable ? 'text-[#0ECB81]' : 'text-[#F6465D]'}
+                className={
+                  sig.protectable ? 'text-[#0ECB81]' : 'text-[#F6465D]'
+                }
               >
                 {sig.protectable
                   ? '✓ 预计可挂保护止损'
@@ -1239,7 +1318,8 @@ function ManualSignalsBanner() {
                   className="w-28 rounded border border-[#2B3139] bg-[#0B0E11] px-2 py-1 text-[#EAECEF]"
                 />
                 <span className="text-xs text-[#848E9C]">
-                  USDT · 建议 {confirming.recommended_notional.toFixed(2)}（上限）
+                  USDT · 建议 {confirming.recommended_notional.toFixed(2)}
+                  （上限）
                 </span>
               </span>
               <span className="text-[#848E9C]">本周期已止损</span>
@@ -1287,6 +1367,146 @@ function ManualSignalsBanner() {
         </div>
       )}
     </>
+  )
+}
+
+// 旧组件保留一个发布周期供历史分析代码兼容，但不再挂载到页面；后端确认接口
+// 已返回 410，真实执行入口只有下方 AI candidate 面板。
+void ManualSignalsBanner
+
+function AICandidatesPanel() {
+  const { data, mutate } = useSWR<{
+    candidates: CopyGuardAICandidate[]
+    traderNames: Record<string, string>
+  }>(
+    'copy-guard-ai-candidates',
+    () =>
+      api.getCopyGuardAICandidates(
+        '?status=WATCHING,REVIEWING,WAITING,ENTRY_PENDING,PAUSED,BUDGET_SUSPENDED&limit=100'
+      ),
+    { refreshInterval: 15000 }
+  )
+  const [busy, setBusy] = useState<number | null>(null)
+  const candidates = data?.candidates ?? []
+  if (candidates.length === 0) return null
+
+  const operate = async (
+    candidate: CopyGuardAICandidate,
+    action: 'pause' | 'resume' | 'terminate'
+  ) => {
+    if (
+      action === 'terminate' &&
+      !window.confirm(
+        `终止 ${candidate.symbol} 的 AI 重入观察？终止后不会自动恢复。`
+      )
+    )
+      return
+    setBusy(candidate.id)
+    try {
+      if (action === 'pause') await api.pauseCopyGuardAICandidate(candidate.id)
+      if (action === 'resume')
+        await api.resumeCopyGuardAICandidate(candidate.id)
+      if (action === 'terminate')
+        await api.terminateCopyGuardAICandidate(candidate.id)
+      await mutate()
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  return (
+    <section className="rounded border border-[#2B3139] bg-[#181A20] p-4">
+      <div className="mb-3 flex items-center justify-between">
+        <div>
+          <h3 className="font-medium text-[#EAECEF]">AI 持续重入观察</h3>
+          <p className="text-xs text-[#848E9C]">
+            AI
+            只判断反转与入场价值；仓位、预算、价格漂移和保护能力由代码强制复核。
+          </p>
+        </div>
+        <span className="text-xs text-[#F0B90B]">
+          {candidates.length} 个候选
+        </span>
+      </div>
+      <div className="space-y-2">
+        {candidates.map((candidate) => (
+          <div
+            key={candidate.id}
+            className="rounded border border-[#2B3139] bg-[#0B0E11] p-3 text-xs"
+          >
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="font-medium text-[#EAECEF]">
+                {data?.traderNames[candidate.trader_id] ?? candidate.trader_id}{' '}
+                · {candidate.symbol} {sideLabel(candidate.side)} · 第{' '}
+                {candidate.reentry_count + 1} 次候选
+              </div>
+              <span className="rounded bg-[#2B3139] px-2 py-1 text-[#F0B90B]">
+                {candidate.status}
+              </span>
+            </div>
+            <div className="mt-2 grid gap-1 text-[#848E9C] md:grid-cols-3">
+              <span>
+                上次决策：{candidate.last_decision || '尚未分析'}{' '}
+                {candidate.confidence > 0
+                  ? `${(candidate.confidence * 100).toFixed(0)}%`
+                  : ''}
+              </span>
+              <span>
+                复查：{candidate.review_count}/30 · 下次{' '}
+                {new Date(candidate.next_review_at).toLocaleString()}
+              </span>
+              <span>
+                预计上限：{candidate.max_notional.toFixed(2)} USDT · factor{' '}
+                {(candidate.size_factor || 0).toFixed(2)}
+              </span>
+              <span>
+                入场区间：{candidate.entry_price_low || '—'} –{' '}
+                {candidate.entry_price_high || '—'}
+              </span>
+              <span>
+                关注区间：{candidate.attention_price_low || '—'} –{' '}
+                {candidate.attention_price_high || '—'}
+              </span>
+              <span>
+                保护：{candidate.protectable ? '可预检' : '不可保护'} · 止损参考{' '}
+                {candidate.last_stop_price || '—'}
+              </span>
+            </div>
+            {(candidate.pending_trigger || candidate.last_error) && (
+              <div className="mt-2 text-[#F6465D]">
+                {candidate.pending_trigger || candidate.last_error}
+              </div>
+            )}
+            <div className="mt-2 flex justify-end gap-2">
+              {candidate.status === 'PAUSED' ? (
+                <button
+                  disabled={busy === candidate.id}
+                  onClick={() => void operate(candidate, 'resume')}
+                  className="rounded bg-[#2B3139] px-3 py-1 disabled:opacity-40"
+                >
+                  恢复
+                </button>
+              ) : (
+                <button
+                  disabled={busy === candidate.id}
+                  onClick={() => void operate(candidate, 'pause')}
+                  className="rounded bg-[#2B3139] px-3 py-1 disabled:opacity-40"
+                >
+                  暂停
+                </button>
+              )}
+              <button
+                disabled={busy === candidate.id}
+                onClick={() => void operate(candidate, 'terminate')}
+                className="rounded bg-[#F6465D22] px-3 py-1 text-[#F6465D] disabled:opacity-40"
+              >
+                终止
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
   )
 }
 
@@ -1375,19 +1595,6 @@ export function CopyGuardPage() {
           leader_reductions?: number
         }
       | undefined
-  }, [detail])
-  // 从策略快照解析人工重入开关：ATTEMPTS_EXHAUSTED 时用于区分"可人工重入"
-  // 与"窗口不可行但人工提醒未开启"两种情形（含窗口塌缩转终态的场景）。
-  const manualReentryEnabled = useMemo(() => {
-    if (!detail?.cycle.policy_snapshot) return true
-    try {
-      const p = JSON.parse(detail.cycle.policy_snapshot) as {
-        risk_manual_reentry_enabled?: boolean
-      }
-      return p.risk_manual_reentry_enabled !== false
-    } catch {
-      return true
-    }
   }, [detail])
   const watchChart = useMemo(
     () =>
@@ -1493,7 +1700,7 @@ export function CopyGuardPage() {
           </button>
         </div>
       </div>
-      <ManualSignalsBanner />
+      <AICandidatesPanel />
       <AdvisorSettingsCard />
       <MarketPreviewCard />
       <div className="grid md:grid-cols-5 gap-3">
@@ -1596,8 +1803,8 @@ export function CopyGuardPage() {
         0 && (
         <div className="border border-[#F0B90B] bg-[#F0B90B]/10 rounded-lg p-4 text-sm text-[#F0B90B]">
           当前有 {summary?.accounting_pending_count ?? 0} 个周期正在自动对账，
-          {summary?.accounting_delayed_count ?? 0}{' '}
-          个周期因 OKX 数据延迟系统继续自动重试。这些周期暂不计入保护效果，无需人工处理。
+          {summary?.accounting_delayed_count ?? 0} 个周期因 OKX
+          数据延迟系统继续自动重试。这些周期暂不计入保护效果，无需人工处理。
         </div>
       )}
       {(summary?.accounting_unrecoverable_count ?? 0) > 0 && (
@@ -1643,6 +1850,18 @@ export function CopyGuardPage() {
         <Metric label="第1次重入" value={summary?.reentry_first ?? 0} />
         <Metric label="第2次重入" value={summary?.reentry_second ?? 0} />
         <Metric label="第3次及以上" value={summary?.reentry_third_plus ?? 0} />
+        <Metric
+          label="真实路径最大回撤"
+          value={money(-(summary?.max_realized_drawdown_usd ?? 0))}
+        />
+        <Metric
+          label="最差单周期"
+          value={money(-(summary?.worst_cycle_loss_usd ?? 0))}
+        />
+        <Metric
+          label="尾部损失 CVaR95"
+          value={money(-(summary?.tail_loss_cvar_95_usd ?? 0))}
+        />
         <Metric
           label="重入成功率"
           value={
@@ -1884,13 +2103,7 @@ export function CopyGuardPage() {
             />
             <Metric
               label="生命周期状态"
-              value={
-                localized(statusLabels, detail.cycle.status) +
-                (detail.cycle.status === 'ATTEMPTS_EXHAUSTED' &&
-                !manualReentryEnabled
-                  ? '（自动重入窗口不可行，人工提醒未开启）'
-                  : '')
-              }
+              value={localized(statusLabels, detail.cycle.status)}
             />
             <Metric
               label="对账状态"
@@ -2104,7 +2317,8 @@ export function CopyGuardPage() {
                     ? `：${localized(gateLabels, String(e.metadata.from ?? ''))} → ${localized(gateLabels, String(e.metadata.to ?? ''))}`
                     : ''}
                   {count > 1 ? ` ×${count}` : ''}
-                  {e.type === 'PROTECTIVE_STOP_ACTIVE' &&
+                  {(e.type === 'PROTECTIVE_STOP_ACTIVE' ||
+                    e.type === 'PROTECTION_ACTIVE') &&
                   e.metadata &&
                   (e.metadata.governed_by === 'margin_cap' ||
                     e.metadata.governed_by === 'account_cap' ||
