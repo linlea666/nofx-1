@@ -77,7 +77,10 @@ type CopyTradeConfig struct {
 	RiskManualReentryEnabled bool `json:"risk_manual_reentry_enabled"`
 
 	// Copy Guard v4+。独立存储于 copy_guard_policies，避免破坏 v3 配置表和旧版回滚。
-	RiskPolicyVersion          int     `json:"risk_policy_version"`
+	RiskPolicyVersion int `json:"risk_policy_version"`
+	// RiskStopMode 兼容字段：v4 曾区分止损模式，现 ComputeRiskDistanceV4 统一
+	// 双通道取更远口径，该值不再影响计算（仅 ValidateRiskPolicyV4 做枚举校验、
+	// 序列化保持向后兼容）。固定写 "volatility_priority"。
 	RiskStopMode               string  `json:"risk_stop_mode"`
 	RiskATRPeriod              int     `json:"risk_atr_period"`
 	RiskATRCacheMaxAgeMinutes  int     `json:"risk_atr_cache_max_age_minutes"`
@@ -91,7 +94,9 @@ type CopyTradeConfig struct {
 	RiskReentryMaxChaseATR     float64 `json:"risk_reentry_max_chase_atr"`
 	RiskReentryMaxATRExpansion float64 `json:"risk_reentry_max_atr_expansion"`
 	RiskWatchTimeoutMinutes    int     `json:"risk_watch_timeout_minutes"`
-	RiskMigrationConfirmed     bool    `json:"risk_migration_confirmed"`
+	// RiskMigrationConfirmed 升级书签：v3→v4 升级完成时置 true，业务运行时
+	// 不读取（无任何门控），仅供审计/回滚排查确认该配置已完成迁移。
+	RiskMigrationConfirmed bool `json:"risk_migration_confirmed"`
 	// RiskAddonBudgetPct: 加仓账户风险预算（v4）。跟随领航员加仓时预估
 	// "加仓后总敞口按当前止损距离全损"占账户权益的比例；v7 超限自动缩量，
 	// 低于最小下单量则拒绝。默认 0.15 (=15%)。
@@ -228,6 +233,9 @@ func (c *CopyTradeConfig) FillRiskDefaults() {
 // 存量配置读取仍走 FillRiskDefaults 的兼容语义，不会被静默切换到 AI。
 func NewCopyGuardDefaults() *CopyTradeConfig {
 	c := &CopyTradeConfig{
+		// 最小跟单金额默认 12 USDT（预留交易所 10 USDT 最小名义 + 精度损失
+		// 余量），与引擎侧 fallback（copytrade.DefaultMinTradeNotional）统一。
+		MinTradeWarn:               12,
 		RiskStopLossEnabled:        true,
 		RiskAccountPct:             0.02,
 		RiskATRMultiplier:          2.0,
@@ -267,13 +275,15 @@ func NewCopyGuardDefaults() *CopyTradeConfig {
 	return c
 }
 
-// upgradeLegacyRiskPolicy v5：v3 旧止损策略已下线。存量 OKX + 启用止损但
-// 仍是 v3（version<4）的配置在读取时强制升级为 v4（Copy Guard 启用标记），
-// 并把 v3 时代的激进默认值（账户线 50%、保证金 50%）归零，交由
-// FillRiskDefaults 填充 v5 默认（0.10 / 0.20）；用户显式改过的其他值保留。
+// upgradeLegacyRiskPolicy v5：v3 旧止损策略已下线。存量 Copy Guard 数据源
+// （OKX / Binance，与 copytrade.SupportsCopyGuard 对齐；store 不能反向依赖
+// copytrade 包，故此处内联集合）+ 启用止损但仍是 v3（version<4）的配置在
+// 读取时强制升级为 v4（Copy Guard 启用标记），并把 v3 时代的激进默认值
+// （账户线 50%、保证金 50%）归零，交由 FillRiskDefaults 填充 v7 默认
+// （RiskAccountPct=0.02 / RiskLeverageMaxLoss=0.20）；用户显式改过的其他值保留。
 // 只改内存值，下次保存时随 saveCopyGuardPolicy 持久化。
 func upgradeLegacyRiskPolicy(c *CopyTradeConfig) {
-	if c == nil || c.ProviderType != "okx" || !c.RiskStopLossEnabled || c.RiskPolicyVersion >= 4 {
+	if c == nil || !RiskPolicyUpgradeSupported(c.ProviderType) || !c.RiskStopLossEnabled || c.RiskPolicyVersion >= 4 {
 		return
 	}
 	c.RiskPolicyVersion = 4
@@ -284,6 +294,13 @@ func upgradeLegacyRiskPolicy(c *CopyTradeConfig) {
 	if c.RiskLeverageMaxLoss == 0.5 {
 		c.RiskLeverageMaxLoss = 0
 	}
+}
+
+// RiskPolicyUpgradeSupported 与 copytrade.SupportsCopyGuard 保持同一集合
+// （OKX / Binance）。store 是底层包不能 import copytrade，由
+// copytrade 侧的一致性测试锁定两者不漂移。
+func RiskPolicyUpgradeSupported(providerType string) bool {
+	return providerType == "okx" || providerType == "binance"
 }
 
 func (s *CopyTradeStore) initTables() error {

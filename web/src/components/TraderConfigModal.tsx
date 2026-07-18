@@ -226,6 +226,8 @@ interface FormState {
   copy_ratio: number
   copy_sync_leverage: boolean
   copy_sync_margin_mode: boolean // 同步保证金模式（OKX 区分全仓/逐仓）
+  copy_min_trade_warn: number // 最小跟单金额（USDT），低于此金额跳过加仓/预警
+  copy_max_trade_warn: number // 最大跟单金额预警（USDT），0=不预警
   copy_binance_source_mode: BinanceSourceMode
   copy_binance_top_trader_id: string
   // Binance Web 私有接口凭证（仅 copy_provider_type=binance 时使用）
@@ -315,6 +317,8 @@ export function TraderConfigModal({
     copy_ratio: 1.0,
     copy_sync_leverage: true,
     copy_sync_margin_mode: true, // 默认同步保证金模式
+    copy_min_trade_warn: 12, // 与后端 NewCopyGuardDefaults / DefaultMinTradeNotional 一致
+    copy_max_trade_warn: 0,
     copy_binance_source_mode: 'copy_management',
     copy_binance_top_trader_id: '',
     copy_binance_p20t: '',
@@ -462,6 +466,8 @@ export function TraderConfigModal({
             copy_ratio: cfg.copy_ratio,
             copy_sync_leverage: cfg.sync_leverage,
             copy_sync_margin_mode: cfg.sync_margin_mode ?? true, // 默认 true
+            copy_min_trade_warn: cfg.min_trade_warn ?? 12,
+            copy_max_trade_warn: cfg.max_trade_warn ?? 0,
             copy_binance_p20t: cfg.binance_p20t ?? '',
             copy_binance_csrf_token: cfg.binance_csrf_token ?? '',
             // 风控字段回填（× 100 转百分比展示，与 store.FillRiskDefaults 保持一致）
@@ -627,6 +633,8 @@ export function TraderConfigModal({
         copy_ratio: 1.0,
         copy_sync_leverage: true,
         copy_sync_margin_mode: true, // 默认同步保证金模式
+        copy_min_trade_warn: 12,
+        copy_max_trade_warn: 0,
         copy_binance_source_mode: 'copy_management',
         copy_binance_top_trader_id: '',
         copy_binance_p20t: '',
@@ -789,6 +797,33 @@ export function TraderConfigModal({
         window.alert('跟单模式必须填写领航员 ID / 地址')
         return
       }
+      // M19：Binance 数据源必须至少有一份可用凭证（全局共享凭证，或本交易员
+      // 的降级凭证 p20t+csrftoken 齐全），否则保存出的配置启动后必然认证失败。
+      if (
+        formData.copy_provider_type === 'binance' &&
+        !binanceGlobalCreds &&
+        !(
+          formData.copy_binance_p20t.trim() &&
+          formData.copy_binance_csrf_token.trim()
+        )
+      ) {
+        window.alert(
+          'Binance 数据源缺少登录凭证：请先在「Binance 共享凭证」中配置全局凭证后再保存'
+        )
+        return
+      }
+      // M18：跟单金额阈值合法性（max=0 表示不预警，允许）
+      if (
+        formData.copy_min_trade_warn < 0 ||
+        formData.copy_max_trade_warn < 0 ||
+        (formData.copy_max_trade_warn > 0 &&
+          formData.copy_max_trade_warn < formData.copy_min_trade_warn)
+      ) {
+        window.alert(
+          '跟单金额阈值无效：最小金额不能为负，最大金额须为 0（不预警）或不小于最小金额'
+        )
+        return
+      }
     }
 
     setIsSaving(true)
@@ -830,6 +865,8 @@ export function TraderConfigModal({
           copy_ratio: formData.copy_ratio,
           sync_leverage: formData.copy_sync_leverage,
           sync_margin_mode: formData.copy_sync_margin_mode, // 同步保证金模式（仅 OKX 生效）
+          min_trade_warn: formData.copy_min_trade_warn,
+          max_trade_warn: formData.copy_max_trade_warn,
         }
         // 账户保护 v5 风控（Copy Guard）支持 OKX 与 Binance 领航员数据源：
         // 不支持的数据源（Hyperliquid）不携带任何 risk_* 字段（含
@@ -919,6 +956,11 @@ export function TraderConfigModal({
   }
 
   const selectedStrategy = strategies.find((s) => s.id === formData.strategy_id)
+
+  // M17：跟单运行中禁止切换数据源 / Binance 领航员模式。运行中的引擎按旧来源
+  // 持有 seenFills、仓位映射与 Copy Guard 周期，热切换来源身份会产生孤儿映射
+  // 与误信号；必须先停止跟单再改。
+  const sourceSwitchLocked = isEditMode && !!traderData?.is_running
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50 backdrop-blur-sm p-4 overflow-y-auto">
@@ -1214,10 +1256,11 @@ export function TraderConfigModal({
                     <div className="flex gap-2">
                       <button
                         type="button"
+                        disabled={sourceSwitchLocked}
                         onClick={() =>
                           handleInputChange('copy_provider_type', 'hyperliquid')
                         }
-                        className={`flex-1 px-3 py-2 rounded text-sm ${
+                        className={`flex-1 px-3 py-2 rounded text-sm disabled:cursor-not-allowed disabled:opacity-50 ${
                           formData.copy_provider_type === 'hyperliquid'
                             ? 'bg-[#F0B90B] text-black'
                             : 'bg-[#0B0E11] text-[#848E9C] border border-[#2B3139]'
@@ -1227,10 +1270,11 @@ export function TraderConfigModal({
                       </button>
                       <button
                         type="button"
+                        disabled={sourceSwitchLocked}
                         onClick={() =>
                           handleInputChange('copy_provider_type', 'okx')
                         }
-                        className={`flex-1 px-3 py-2 rounded text-sm ${
+                        className={`flex-1 px-3 py-2 rounded text-sm disabled:cursor-not-allowed disabled:opacity-50 ${
                           formData.copy_provider_type === 'okx'
                             ? 'bg-[#F0B90B] text-black'
                             : 'bg-[#0B0E11] text-[#848E9C] border border-[#2B3139]'
@@ -1240,10 +1284,11 @@ export function TraderConfigModal({
                       </button>
                       <button
                         type="button"
+                        disabled={sourceSwitchLocked}
                         onClick={() =>
                           handleInputChange('copy_provider_type', 'binance')
                         }
-                        className={`flex-1 px-3 py-2 rounded text-sm ${
+                        className={`flex-1 px-3 py-2 rounded text-sm disabled:cursor-not-allowed disabled:opacity-50 ${
                           formData.copy_provider_type === 'binance'
                             ? 'bg-[#F0B90B] text-black'
                             : 'bg-[#0B0E11] text-[#848E9C] border border-[#2B3139]'
@@ -1252,6 +1297,11 @@ export function TraderConfigModal({
                         Binance
                       </button>
                     </div>
+                    {sourceSwitchLocked && (
+                      <p className="mt-1 text-xs text-[#F0B90B]">
+                        交易员正在运行，切换数据源前请先停止跟单（运行中热切换会产生孤儿仓位映射与误信号）
+                      </p>
+                    )}
                   </div>
 
                   {formData.copy_provider_type === 'binance' && (
@@ -1262,13 +1312,14 @@ export function TraderConfigModal({
                       <div className="grid grid-cols-2 gap-2">
                         <button
                           type="button"
+                          disabled={sourceSwitchLocked}
                           onClick={() =>
                             handleInputChange(
                               'copy_binance_source_mode',
                               'copy_management'
                             )
                           }
-                          className={`rounded border p-3 text-left transition-colors ${
+                          className={`rounded border p-3 text-left transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
                             formData.copy_binance_source_mode ===
                             'copy_management'
                               ? 'border-[#F0B90B] bg-[#F0B90B14]'
@@ -1291,13 +1342,14 @@ export function TraderConfigModal({
                         </button>
                         <button
                           type="button"
+                          disabled={sourceSwitchLocked}
                           onClick={() =>
                             handleInputChange(
                               'copy_binance_source_mode',
                               'smart_money'
                             )
                           }
-                          className={`rounded border p-3 text-left transition-colors ${
+                          className={`rounded border p-3 text-left transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
                             formData.copy_binance_source_mode === 'smart_money'
                               ? 'border-[#F0B90B] bg-[#F0B90B14]'
                               : 'border-[#2B3139] bg-[#0B0E11]'
@@ -1442,10 +1494,18 @@ export function TraderConfigModal({
                             </span>
                           )}
                         </div>
+                      ) : formData.copy_binance_p20t.trim() &&
+                        formData.copy_binance_csrf_token.trim() ? (
+                        /* S11：全局凭证缺失但存在交易员级降级凭证时，
+                           不能用"无法读取领航员数据"否定降级路径 */
+                        <div className="text-xs text-[#F0B90B] flex items-center gap-1.5">
+                          <AlertCircle className="w-3.5 h-3.5" />
+                          全局凭证未配置，当前使用本交易员保存的降级凭证（建议迁移到全局共享凭证统一管理）
+                        </div>
                       ) : (
                         <div className="text-xs text-[#F6465D] flex items-center gap-1.5">
                           <AlertCircle className="w-3.5 h-3.5" />
-                          全局凭证尚未配置，本交易员无法读取领航员数据
+                          全局凭证与本交易员降级凭证均未配置，本交易员无法读取领航员数据
                         </div>
                       )}
 
@@ -1487,6 +1547,57 @@ export function TraderConfigModal({
                     <p className="text-xs text-[#848E9C] mt-1">
                       100% = 等比例跟单 | 200% = 双倍仓位 | 50% = 半仓跟单
                     </p>
+                  </div>
+
+                  {/* 跟单金额阈值（M18：min/max_trade_warn 透传） */}
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="text-sm text-[#EAECEF] block mb-2">
+                        最小跟单金额 (USDT)
+                      </label>
+                      <input
+                        type="number"
+                        min="0"
+                        step="1"
+                        value={formData.copy_min_trade_warn}
+                        onChange={(e) =>
+                          handleInputChange(
+                            'copy_min_trade_warn',
+                            e.target.value === ''
+                              ? 0
+                              : parseFloat(e.target.value)
+                          )
+                        }
+                        className="w-full px-3 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF] focus:border-[#F0B90B] focus:outline-none"
+                      />
+                      <p className="text-xs text-[#848E9C] mt-1">
+                        低于此金额的加仓跳过（等待累积），开仓自动补足到该金额；留
+                        0 使用默认 12
+                      </p>
+                    </div>
+                    <div>
+                      <label className="text-sm text-[#EAECEF] block mb-2">
+                        大额预警阈值 (USDT)
+                      </label>
+                      <input
+                        type="number"
+                        min="0"
+                        step="1"
+                        value={formData.copy_max_trade_warn}
+                        onChange={(e) =>
+                          handleInputChange(
+                            'copy_max_trade_warn',
+                            e.target.value === ''
+                              ? 0
+                              : parseFloat(e.target.value)
+                          )
+                        }
+                        className="w-full px-3 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF] focus:border-[#F0B90B] focus:outline-none"
+                      />
+                      <p className="text-xs text-[#848E9C] mt-1">
+                        单笔跟单金额高于此值时记录预警（仍执行）；0 = 不预警
+                      </p>
+                    </div>
                   </div>
 
                   {/* Sync Leverage */}

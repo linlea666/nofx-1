@@ -40,9 +40,10 @@ const (
 	CopyGuardAccountingOpen       = "OPEN"
 	CopyGuardAccountingPending    = "PENDING"
 	CopyGuardAccountingReconciled = "RECONCILED"
-	// DELAYED: OKX has not returned the matching position history yet; the
-	// system keeps retrying automatically. This replaces the former
-	// NEEDS_REVIEW state whose wording wrongly demanded manual action.
+	// DELAYED: the execution exchange (OKX position history / Binance closed
+	// PnL) has not returned matching settlement data yet; the system keeps
+	// retrying automatically. This replaces the former NEEDS_REVIEW state
+	// whose wording wrongly demanded manual action.
 	CopyGuardAccountingDelayed = "DELAYED"
 	// UNRECOVERABLE: permanently missing identifiers or data; automatic
 	// reconciliation stopped and the user is told to inspect the logs.
@@ -1081,7 +1082,8 @@ func (s *CopyTradeStore) CloseCopyGuardCycle(id int64, status string, actual, ba
 }
 
 // BeginCopyGuardAccounting closes the trading lifecycle while keeping financial
-// settlement pending until OKX returns a terminal fill and position history.
+// settlement pending until the execution exchange returns terminal
+// fill/settlement data (OKX position history / Binance closed PnL).
 func (s *CopyTradeStore) BeginCopyGuardAccounting(id int64, status, exitOrderID string, baseline float64) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -1109,8 +1111,9 @@ func (s *CopyTradeStore) BeginCopyGuardAccounting(id int64, status, exitOrderID 
 	return tx.Commit()
 }
 
-// MarkCopyGuardAccountingDelayed flags a cycle whose OKX settlement data is
-// late; automatic reconciliation keeps retrying (DELAYED cycles stay in
+// MarkCopyGuardAccountingDelayed flags a cycle whose execution-exchange
+// settlement data (OKX position history / Binance closed PnL) is late;
+// automatic reconciliation keeps retrying (DELAYED cycles stay in
 // ListCopyGuardCyclesPendingAccounting).
 func (s *CopyTradeStore) MarkCopyGuardAccountingDelayed(id int64, message string) error {
 	_, err := s.db.Exec(`UPDATE copy_guard_cycles SET accounting_status=?,accounting_error=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND accounting_status IN (?,?)`, CopyGuardAccountingDelayed, message, id, CopyGuardAccountingPending, CopyGuardAccountingDelayed)
@@ -1538,8 +1541,8 @@ type CopyGuardSummary struct {
 	ClampedCount           int `json:"clamped_count"`
 	UnprotectableCount     int `json:"unprotectable_count"`
 	AccountingPendingCount int `json:"accounting_pending_count"`
-	// AccountingDelayedCount: cycles whose OKX settlement data is late; the
-	// system keeps retrying automatically (formerly "needs review").
+	// AccountingDelayedCount: cycles whose execution-exchange settlement data
+	// is late; the system keeps retrying automatically (formerly "needs review").
 	AccountingDelayedCount       int     `json:"accounting_delayed_count"`
 	AccountingUnrecoverableCount int     `json:"accounting_unrecoverable_count"`
 	LegacyUnverifiedCount        int     `json:"legacy_unverified_count"`

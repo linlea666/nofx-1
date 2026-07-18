@@ -275,8 +275,8 @@ export function CopyEventLogPage() {
       </div>
 
       <p className="text-xs text-[#5E6673]">
-        提示：止损介入 / 二次入场 / 人工接手 / AI 接收 / 保护等风控事件仅 OKX
-        Copy Guard 产生； Hyperliquid / Binance
+        提示：止损介入 / 二次入场 / 人工接手 / AI 接收 / 保护等风控事件由 OKX 与
+        Binance 领航员的 Copy Guard 产生；Hyperliquid
         仅有开仓/加仓/减仓/平仓动作与执行错误事件。单个仓位的细致全程记录请见
         Copy Guard 页面。
       </p>

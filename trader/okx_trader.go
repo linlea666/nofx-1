@@ -990,9 +990,14 @@ func (t *OKXTrader) openLong(symbol string, quantity float64, leverage int, canc
 	}
 
 	// Set leverage for long direction only (don't affect existing short positions)
-	// 失败不阻断（可能是"已是目标杠杆"等良性响应），但升级为 WARN：
-	// 跟单模式下杠杆未同步意味着实际风险敞口与领航员偏离，需要人工关注
+	// 良性"已是目标杠杆"已在 setLeverageForSide 内放行，走到 err != nil 是真失败。
+	// M12：跟单路径（idempotent，带 clOrdId）fail-closed，对齐 Binance copy
+	// 路径——杠杆未同步就下单会让风险敞口偏离领航员、保证金计算失真；
+	// AI 路径保持 WARN 不阻断（杠杆偏差由决策层自行兜底）。
 	if err := t.setLeverageForSide(symbol, leverage, "long"); err != nil {
+		if idempotent {
+			return nil, fmt.Errorf("refusing to open copy-trade long with unsynced leverage: %w", err)
+		}
 		logger.Warnf("  ⚠️ Failed to set leverage %dx for %s long (继续下单，实际杠杆可能为旧值): %v", leverage, symbol, err)
 	}
 
@@ -1108,8 +1113,11 @@ func (t *OKXTrader) openShort(symbol string, quantity float64, leverage int, can
 	}
 
 	// Set leverage for short direction only (don't affect existing long positions)
-	// 同 openLong：失败不阻断但升级为 WARN
+	// 同 openLong（M12）：跟单路径 fail-closed，AI 路径 WARN 不阻断
 	if err := t.setLeverageForSide(symbol, leverage, "short"); err != nil {
+		if idempotent {
+			return nil, fmt.Errorf("refusing to open copy-trade short with unsynced leverage: %w", err)
+		}
 		logger.Warnf("  ⚠️ Failed to set leverage %dx for %s short (继续下单，实际杠杆可能为旧值): %v", leverage, symbol, err)
 	}
 
@@ -1234,6 +1242,10 @@ func (t *OKXTrader) closeLong(symbol string, quantity float64, cancelExisting bo
 		return nil, err
 	}
 	logger.Infof("🔍 OKX CloseLong searching positions: symbol=%s, targetMgnMode=%s, count=%d", symbol, tdMode, len(positions))
+	// M14：显式 found 标志。此前 quantity>0 时不校验仓位是否存在，
+	// 无匹配仓位仍会下 reduce 单（交易所拒单是好情况，单向持仓模式下
+	// 可能反向开仓）；quantity==0 的全平路径行为不变。
+	found := false
 	for _, pos := range positions {
 		if pos["symbol"] == symbol && pos["side"] == "long" {
 			posMgnMode, _ := pos["mgnMode"].(string)
@@ -1245,11 +1257,12 @@ func (t *OKXTrader) closeLong(symbol string, quantity float64, cancelExisting bo
 			if quantity == 0 {
 				quantity = pos["positionAmt"].(float64)
 			}
+			found = true
 			logger.Infof("📊 Found matching long position: mgnMode=%s, quantity=%.4f", posMgnMode, quantity)
 			break
 		}
 	}
-	if quantity == 0 {
+	if !found || quantity == 0 {
 		return nil, fmt.Errorf("long position not found for %s (mgnMode=%s)", symbol, tdMode)
 	}
 
@@ -1362,6 +1375,8 @@ func (t *OKXTrader) closeShort(symbol string, quantity float64, cancelExisting b
 		return nil, err
 	}
 	logger.Infof("🔍 OKX CloseShort searching positions: symbol=%s, targetMgnMode=%s, count=%d", symbol, tdMode, len(positions))
+	// M14：同 closeLong，quantity>0 也必须确认存在匹配仓位后才可下 reduce 单
+	found := false
 	for _, pos := range positions {
 		if pos["symbol"] == symbol && pos["side"] == "short" {
 			posMgnMode, _ := pos["mgnMode"].(string)
@@ -1373,11 +1388,12 @@ func (t *OKXTrader) closeShort(symbol string, quantity float64, cancelExisting b
 			if quantity == 0 {
 				quantity = pos["positionAmt"].(float64)
 			}
+			found = true
 			logger.Infof("📊 Found matching short position: mgnMode=%s, quantity=%.4f", posMgnMode, quantity)
 			break
 		}
 	}
-	if quantity == 0 {
+	if !found || quantity == 0 {
 		return nil, fmt.Errorf("short position not found for %s (mgnMode=%s)", symbol, tdMode)
 	}
 

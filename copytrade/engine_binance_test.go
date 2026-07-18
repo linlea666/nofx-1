@@ -52,6 +52,7 @@ type binancePollTestProvider struct {
 	fills       []Fill
 	fillsErr    error
 	state       *AccountState
+	stateErr    error
 	history     []BinancePositionHistoryRecord
 	fillsCalls  int
 	stateCalls  int
@@ -68,6 +69,9 @@ func (p *binancePollTestProvider) GetFills(_ string, _ time.Time) ([]Fill, error
 
 func (p *binancePollTestProvider) GetAccountState(_ string) (*AccountState, error) {
 	p.stateCalls++
+	if p.stateErr != nil {
+		return nil, p.stateErr
+	}
 	if p.state == nil {
 		return &AccountState{TotalEquity: 1000, Positions: map[string]*Position{}}, nil
 	}

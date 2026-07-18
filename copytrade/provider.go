@@ -371,7 +371,7 @@ func (p *OKXProvider) GetFills(uniqueName string, since time.Time) ([]Fill, erro
 			return nil, fmt.Errorf("OKX API error: %s", resp.Msg)
 		}
 		if len(resp.Data) == 0 {
-			break
+			return fills, nil
 		}
 
 		oldestMs := endMs
@@ -401,14 +401,21 @@ func (p *OKXProvider) GetFills(uniqueName string, since time.Time) ([]Fill, erro
 			fills = append(fills, fill)
 		}
 
-		// 不满一页 = 窗口已拉完；或右边界无法继续前移（同毫秒批量成交）时停止
-		if len(resp.Data) < okxFillsPageLimit || oldestMs <= sinceMs || oldestMs >= endMs {
-			break
+		// 不满一页或已推进到窗口左边界 = 窗口已拉完
+		if len(resp.Data) < okxFillsPageLimit || oldestMs <= sinceMs {
+			return fills, nil
+		}
+		// 满页但右边界无法前移（同毫秒批量成交超过单页上限）：继续查询只会
+		// 拿到同一页，窗口内仍有成交未拉到。fail-closed：返回错误让引擎跳过
+		// 本轮（不消费不完整窗口，避免静默漏单），下轮重试。
+		if oldestMs >= endMs {
+			return nil, fmt.Errorf("OKX fills pagination stalled at %dms with a full page; refusing to consume an incomplete window", oldestMs)
 		}
 		endMs = oldestMs
 	}
 
-	return fills, nil
+	// 分页保护上限用尽时最后一页仍是满页：窗口未拉完，同样 fail-closed。
+	return nil, fmt.Errorf("OKX fills pagination exceeded %d pages with the window still incomplete; retry next poll", okxFillsMaxPages)
 }
 
 // OKXLeaderPositionHistoryRecord 领航员公共历史仓位（只读补强）。
@@ -543,6 +550,13 @@ func (p *OKXProvider) GetAccountState(uniqueName string) (*AccountState, error) 
 					side = SideShort
 					size = math.Abs(size)
 				}
+			}
+
+			// M3：过滤 size==0 的仓位（刚平仓的残影条目），与其它 Provider
+			// 对齐。不过滤会让引擎把已平仓位当作仍存在，且 net 模式下
+			// size==0 无法归一出方向，会以 side="net" 污染快照。
+			if size == 0 {
+				continue
 			}
 
 			var key string

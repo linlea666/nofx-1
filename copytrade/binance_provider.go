@@ -137,18 +137,19 @@ type BinanceProvider struct {
 	csrfToken  string                   // 旧版本本地凭证（向后兼容路径）
 
 	// 内部状态（线程安全）
-	mu             sync.Mutex
-	leaderUserID   string          // 从持仓接口 id 字段（如 "1239518824_ETHUSDT_LONG"）首次解析获得
-	seenFillKeys   map[string]bool // (time|symbol|side|price|qty|posSide) 五元组指纹去重
-	seenKeysExpiry time.Time       // 指纹缓存过期时间（>24h 清理）
+	mu           sync.Mutex
+	leaderUserID string // 从持仓接口 id 字段（如 "1239518824_ETHUSDT_LONG"）首次解析获得
 
 	// detail 接口缓存：marginBalance + copyPortfolioId（同一次调用同时拿到，绑定缓存）
 	//   - marginBalance: 60s TTL，作为领航员权益（state.TotalEquity）
-	//   - copyPortfolioID: 长期缓存（直到下次 detail 成功刷新），用于调持仓/成交接口
+	//   - copyPortfolioID: 与 marginBalance 同一 60s TTL（用户解除/重建跟单关系后
+	//     copyPortfolioId 会变化，永不过期的缓存会让持仓/成交接口打到旧关系上）；
+	//     TTL 过期后刷新失败时沿用旧值降级（与 marginBalance stale 模式一致）
 	mbValue         float64   // 最近一次成功拉到的 marginBalance
 	mbFetchedAt     time.Time // 拉取时间，距今 < TTL 视为有效
 	mbValid         bool      // 是否曾成功拉到过 marginBalance
 	copyPortfolioID string    // 用户对该领航员的跟单关系 ID（用于 user-position / trade-history）
+	cpidFetchedAt   time.Time // copyPortfolioID 拉取时间，距今 < binanceCopyDetailTTL 视为新鲜
 
 	// copy-portfolio/detail-list 接口缓存（按 leadPortfolioId 索引）
 	//   - 用于解决"镜像价值/领航员权益"量纲错配 → 改用"镜像价值/跟随者权益"严格对齐
@@ -171,11 +172,9 @@ type BinanceProvider struct {
 // 推荐：生产代码使用 NewBinanceProviderWithLoader 启用热加载。
 func NewBinanceProvider(p20t, csrfToken string) *BinanceProvider {
 	return &BinanceProvider{
-		client:         &http.Client{Timeout: 15 * time.Second},
-		p20t:           strings.TrimSpace(p20t),
-		csrfToken:      strings.TrimSpace(csrfToken),
-		seenFillKeys:   make(map[string]bool),
-		seenKeysExpiry: time.Now().Add(24 * time.Hour),
+		client:    &http.Client{Timeout: 15 * time.Second},
+		p20t:      strings.TrimSpace(p20t),
+		csrfToken: strings.TrimSpace(csrfToken),
 	}
 }
 
@@ -195,13 +194,11 @@ func NewBinanceProviderWithLoader(
 		label = DefaultBinanceCredentialsLabel
 	}
 	return &BinanceProvider{
-		client:         &http.Client{Timeout: 15 * time.Second},
-		credLoader:     loader,
-		credLabel:      label,
-		p20t:           strings.TrimSpace(fallbackP20T),
-		csrfToken:      strings.TrimSpace(fallbackCSRF),
-		seenFillKeys:   make(map[string]bool),
-		seenKeysExpiry: time.Now().Add(24 * time.Hour),
+		client:     &http.Client{Timeout: 15 * time.Second},
+		credLoader: loader,
+		credLabel:  label,
+		p20t:       strings.TrimSpace(fallbackP20T),
+		csrfToken:  strings.TrimSpace(fallbackCSRF),
 	}
 }
 
@@ -462,14 +459,10 @@ func (p *BinanceProvider) GetFills(leadPortfolioID string, since time.Time) ([]F
 	sinceMs := since.UnixMilli()
 	var fills []Fill
 
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	// 定期清理指纹缓存，防止内存累积
-	if time.Now().After(p.seenKeysExpiry) {
-		p.seenFillKeys = make(map[string]bool)
-		p.seenKeysExpiry = time.Now().Add(24 * time.Hour)
-	}
+	// 单次调用内去重（同一响应里的重复记录）。跨轮持久去重统一收敛到
+	// Engine 的 seenFills（以 fill.ID=五元组指纹为键）：Provider 层若持久
+	// 去重，引擎 UnmarkSeen 释放的信号在下一轮会被这里拦截，重放机制失效。
+	seen := make(map[string]bool, len(resp.Data.List))
 
 	for _, tr := range resp.Data.List {
 		// 时间过滤
@@ -479,10 +472,10 @@ func (p *BinanceProvider) GetFills(leadPortfolioID string, since time.Time) ([]F
 
 		// 五元组指纹去重（Binance 成交无 fillId/orderId）
 		fp := fillFingerprint(tr)
-		if p.seenFillKeys[fp] {
+		if seen[fp] {
 			continue
 		}
-		p.seenFillKeys[fp] = true
+		seen[fp] = true
 
 		symbol := normalizeBinanceContractSymbol(tr.Symbol)
 		if symbol == "" {
@@ -600,9 +593,11 @@ func (p *BinanceProvider) getAccountBaseInfo() ([]byte, int, error) {
 // resolveCopyPortfolioID 解析 leadPortfolioId → copyPortfolioId
 //
 // 流程：
-//   - 优先返回内存缓存（用户跟单关系一般稳定，长期有效）
-//   - 缓存为空时调 detail 刷新（同时填充 marginBalance 缓存，避免后续重复调）
-//   - detail 失败 / hasCopy=false / copyPortfolioId 为空 → 返回错误，调用者无法继续
+//   - 缓存新鲜（< binanceCopyDetailTTL）→ 直接返回；用户解除/重建跟单关系后
+//     copyPortfolioId 会变化，永不过期的缓存会让持仓/成交接口打到旧关系上
+//   - 缓存过期或为空时调 detail 刷新（同时填充 marginBalance 缓存）
+//   - 刷新失败但有旧缓存 → 沿用旧值降级（与 marginBalance stale 模式一致）
+//   - 首次失败 / hasCopy=false / copyPortfolioId 为空 → 返回错误，调用者无法继续
 //
 // 返回错误时上层不能降级，因为没有 copyPortfolioId 持仓/成交接口根本无法调用
 func (p *BinanceProvider) resolveCopyPortfolioID(leadPortfolioID string) (string, error) {
@@ -612,13 +607,18 @@ func (p *BinanceProvider) resolveCopyPortfolioID(leadPortfolioID string) (string
 
 	p.mu.Lock()
 	cached := p.copyPortfolioID
+	fresh := cached != "" && time.Since(p.cpidFetchedAt) < binanceCopyDetailTTL
 	p.mu.Unlock()
-	if cached != "" {
+	if fresh {
 		return cached, nil
 	}
 
 	mb, cpid, err := p.fetchLeaderDetail(leadPortfolioID)
 	if err != nil {
+		if cached != "" {
+			logger.Warnf("⚠️ Binance detail 刷新 copyPortfolioId 失败，沿用旧缓存 | leadPortfolioId=%s err=%v", leadPortfolioID, err)
+			return cached, nil
+		}
 		return "", err
 	}
 	if cpid == "" {
@@ -630,6 +630,7 @@ func (p *BinanceProvider) resolveCopyPortfolioID(leadPortfolioID string) (string
 
 	p.mu.Lock()
 	p.copyPortfolioID = cpid
+	p.cpidFetchedAt = time.Now()
 	if mb > 0 {
 		p.mbValue = mb
 		p.mbFetchedAt = time.Now()
@@ -666,6 +667,7 @@ func (p *BinanceProvider) resolveLeaderEquity(leadPortfolioID string, totalNotio
 		p.mbValid = true
 		if cpid != "" {
 			p.copyPortfolioID = cpid // 顺便刷新 copyPortfolioId（防用户解除/重建跟单关系）
+			p.cpidFetchedAt = time.Now()
 		}
 		p.mu.Unlock()
 		return mb, "fresh"

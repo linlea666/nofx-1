@@ -381,6 +381,17 @@ func (p *BinanceSmartMoneyProvider) GetAccountState(leaderID string) (*AccountSt
 		} else {
 			continue
 		}
+		// M7：amount 符号是方向权威，但若接口显式声明的 side 与符号矛盾，
+		// 说明字段语义可能已变更（例如改为 amount 恒正 + side 定向）。
+		// 此时静默信任 amount 会把所有空头方向判反，必须 fail-closed，
+		// 拒绝整个快照，等待人工确认接口语义。
+		if declared := strings.ToUpper(strings.TrimSpace(raw.Side)); declared == "LONG" || declared == "SHORT" {
+			if (declared == "LONG") != (side == SideLong) {
+				err = fmt.Errorf("binance smart money position %s: declared side %q conflicts with amount %v sign", symbol, raw.Side, amount)
+				p.setObservation(SourceHealthObservation{Status: "ERROR", TraderName: profile.TraderName, Error: err.Error(), CheckedAt: checkedAt})
+				return nil, err
+			}
+		}
 		size := math.Abs(amount)
 		if size == 0 {
 			continue
@@ -430,7 +441,14 @@ func (p *BinanceSmartMoneyProvider) GetAccountState(leaderID string) (*AccountSt
 		}
 	}
 	p.setObservation(SourceHealthObservation{Status: "HEALTHY", TraderName: profile.TraderName, CompleteSnapshot: true, CheckedAt: checkedAt})
-	p.rememberCompletePositionCount(len(state.Positions))
+	// M5：只在快照非空时更新基线。空快照确认后若立即把基线归零并清空
+	// candidate，下一轮空快照将不再携带 EmptySnapshotConfirmed 标记；
+	// 引擎层（confirmSmartMoneyEmptySnapshot）会因此再跑一轮完整确认
+	// 窗口（双层窗口串联，双倍延迟）。保留基线与 candidate：后续空快照
+	// 由 confirmEmptySnapshot 立即复确认，直到仓位重新出现才重置基线。
+	if len(state.Positions) > 0 {
+		p.rememberCompletePositionCount(len(state.Positions))
+	}
 	return state, nil
 }
 

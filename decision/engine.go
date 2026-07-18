@@ -149,6 +149,10 @@ type Decision struct {
 	EntryPrice float64 `json:"entry_price,omitempty"` // 入场价格（跟单时记录领航员成交价）
 
 	// 跟单专用字段
+	// IsCopyTrade 显式标记跟单决策。执行层（auto_trader）此前只靠
+	// Reasoning 文案包含 "Copy trading" 判定，文案调整会静默破坏跟单
+	// 执行路径；判定改为 IsCopyTrade || 旧文案匹配（向后兼容）。
+	IsCopyTrade          bool    `json:"is_copy_trade,omitempty"`
 	LeaderPosID          string  `json:"leader_pos_id,omitempty"`   // 领航员仓位 ID（用于映射追踪）
 	LeaderPosSize        float64 `json:"leader_pos_size,omitempty"` // 领航员当前持仓数量（用于 lastKnownSize 追踪）
 	ClientOrderID        string  `json:"client_order_id,omitempty"` // Copy Guard 幂等执行与重启恢复

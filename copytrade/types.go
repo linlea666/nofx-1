@@ -68,7 +68,21 @@ const (
 	// MinOrderValue 最小订单价值（适用于 Hyperliquid 等有此限制的交易所）
 	// 减仓价值低于此值时跳过，等待后续全平
 	MinOrderValue = 10.0
+
+	// DefaultMinTradeNotional 最小跟单/重入金额兜底（USDT）。
+	// 用户未配置 MinTradeWarn（<=0）时的统一 fallback：交易所最小名义
+	// 普遍为 10 USDT，取 12 预留精度损失余量。此前散落 10/12 两种硬编码，
+	// 与 store.NewCopyGuardDefaults 的默认值（12）统一（M18）。
+	DefaultMinTradeNotional = 12.0
 )
+
+// minTradeNotionalOrDefault 返回配置的最小跟单金额阈值，未配置时用统一兜底。
+func minTradeNotionalOrDefault(configured float64) float64 {
+	if configured > 0 {
+		return configured
+	}
+	return DefaultMinTradeNotional
+}
 
 // SideType 持仓方向
 type SideType string
@@ -154,7 +168,7 @@ type TradeSignal struct {
 	// 领航员账户快照（用于比例计算）
 	LeaderEquity   float64   // 领航员总权益
 	LeaderPosition *Position // 该币种的持仓（如有）
-	LeaderPosID    string    // 领航员仓位 ID（OKX 独有，用于精确匹配）
+	LeaderPosID    string    // 领航员仓位键（OKX 原生 posId / Binance 合成稳定生命周期键），用于精确匹配
 }
 
 // CopyConfig 跟单配置
@@ -204,7 +218,7 @@ type CopyConfig struct {
 	RiskManualReentryEnabled bool `json:"risk_manual_reentry_enabled"`
 
 	RiskPolicyVersion          int     `json:"risk_policy_version"` // >=4 = Copy Guard 启用标记（v3 行为已下线）
-	RiskStopMode               string  `json:"risk_stop_mode"`
+	RiskStopMode               string  `json:"risk_stop_mode"`      // 兼容字段：不再影响计算（见 store.CopyTradeConfig.RiskStopMode）
 	RiskATRPeriod              int     `json:"risk_atr_period"`
 	RiskATRCacheMaxAgeMinutes  int     `json:"risk_atr_cache_max_age_minutes"`
 	RiskATRFallbackPct         float64 `json:"risk_atr_fallback_pct"`
@@ -374,9 +388,6 @@ const (
 	// RiskEventReentryInitiated 二次进场决策已生成（判据 E 满足后）
 	// 注意：仅"决策生成"事件，不代表"执行成功"。实际执行成功的告警由 integration 在 executeFullDecision 内发
 	RiskEventReentryInitiated RiskEventType = "reentry_initiated"
-	// RiskEventManualReentrySignal 人工重入信号（v5.1）：自动重入次数用尽后
-	// 出现合格重入信号，已落库等待用户确认；integration 层发邮件提醒
-	RiskEventManualReentrySignal RiskEventType = "manual_reentry_signal"
 )
 
 // RiskEvent 风控事件（用于 engine → integration 的告警通知）
@@ -393,23 +404,14 @@ type RiskEvent struct {
 	LeaderSize float64 // SL 触发时领航员持仓数量
 	AddCount   int     // SL 触发时跟单系统已跟随的加仓次数（审计用）
 
-	// 重入快照（Type=RiskEventReentryInitiated / RiskEventManualReentrySignal 有效）
-	ReentryEntryPrice float64 // 重入入场价基准（manual：信号触发价）
-	ReentrySize       float64 // 重入金额（USDT）（manual：建议重入名义）
+	// 重入快照（Type=RiskEventReentryInitiated 有效）
+	ReentryEntryPrice float64 // 重入入场价基准
+	ReentrySize       float64 // 重入金额（USDT）
 
-	// 人工重入信号快照（仅 Type=RiskEventManualReentrySignal 有效）
-	ManualSignalID   int64   // copy_guard_manual_reentry_signals.id
-	CycleID          int64   // 所属 Copy Guard 周期
-	StopCount        int     // 周期累计止损次数
-	ReentryCount     int     // 周期已自动重入次数
-	Protectable      bool    // 可保护性预检（仅提示，不拦截人工确认）
-	NoiseRatio       float64 // 止损距离/ATR（噪音档参考，0=数据缺失）
-	CurrentATR       float64 // 信号触发时 ATR
-	LastStopPrice    float64 // 最近一次止损成交价（0=数据缺失）
-	EstStopDistance  float64 // 预算止损距离（供邮件展示建议止损价，0=未预检）
-	ChaseLimit       float64 // 自动路径追价上限（0=未计算；人工路径忽略但用于提示）
-	ChaseExceededBy  float64 // 当前价超出追价上限的幅度（>0 表示强反转追入）
-	WindowInfeasible bool    // 自动重入窗口是否已塌缩为空集
+	// 周期上下文（告警去重按 cycle + attempt）
+	CycleID      int64 // 所属 Copy Guard 周期
+	StopCount    int   // 周期累计止损次数
+	ReentryCount int   // 周期已自动重入次数
 }
 
 // PositionKey 生成仓位的唯一键 (不含保证金模式，向后兼容)

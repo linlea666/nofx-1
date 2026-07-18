@@ -3,6 +3,11 @@
 **用途：** 供新会话 AI 或维护者快速了解 Copy Guard（CG）子系统背景、近期交付、设计约束与已知问题。  
 **最后更新：** 2026-07-06（对应提交 `b92d30c`）
 
+> **⚠️ v7 时效性说明（2026-07-18）：** 本文为 v5.1 时代的历史快照，以下内容已过时：
+>
+> 1. Copy Guard 已不再是 OKX 专用——Binance 领航员数据源同样支持（口径以 `copytrade.SupportsCopyGuard` 为准）。
+> 2. **v5.1 人工重入已于 v7 退役**：不再生成新的人工重入信号，重入决策统一走 `ai_guarded` 候选（`ExecuteAIReentry`）。文中的 `emitManualReentrySignal`、`manualSignalParams`、`firstAttemptNotional`、`manualReentryMinNotionalHeadroom`、`sendManualReentrySignalAlert`、`confirmManualReentryLegacy` 等符号已从代码中删除；`ConfirmManualReentry` 仅作为兼容边界保留（恒返回 `ErrManualReentryRetired`，API 返回 410）。第 3 节数据流与第 4 节索引中的人工重入部分仅供理解历史数据（存量信号行、`GUARD_MANUAL_REENTRY_*` 事件）使用。
+
 ---
 
 ## 1. 项目是什么

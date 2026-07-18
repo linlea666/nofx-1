@@ -17,9 +17,10 @@ import (
 // 设计哲学：跟单平时 100% 跟随领航员，不主动止盈/分批/干预；
 // 仅在「价格反向走到风险线」时由交易所托管的 algo 条件单兜底平仓。
 //
-// 算法（calcStopLossPrice → ComputeRiskDistanceV4）：三项纯取严（min）
-//   - ATR 基线：噪音参考线（默认 1.5×ATR_1h_14），不再放宽硬 cap
-//   - 仓位保证金止损：日常主力线（默认 20% 保证金）
+// 算法（calcStopLossPrice → ComputeRiskDistanceV4）：各项纯取严（min）
+//   - ATR 基线：噪音参考线（默认 RiskATRMultiplier=2.0 × ATR_1h_14），不再放宽硬 cap
+//   - 仓位保证金止损（margin cap）：仅 RiskLeverageFallback 开启时参与（默认关，
+//     开启时默认 20% 保证金）
 //   - 风险预算：单次尝试默认最多亏账户的 RiskAccountPct（v7 默认 2%）
 //
 // 由 SupportsCopyGuard 的数据源（OKX / Binance 领航员）在 v4+ 配置下调用；
@@ -728,8 +729,8 @@ func (e *Engine) checkReentryConditions() {
 		}
 		// 窗口空集时自动路径已把周期持久化为 ATTEMPTS_EXHAUSTED（见
 		// checkReentryConditions A 层）。此处让持久化终态回灌内存态，否则下一
-		// tick 内存不认、manualMode 永远进不来——自动重入次数虽未达上限，但可行
-		// 窗口已不存在=实质用尽，同样应交人工确认接管。
+		// tick 内存不认、又重新进入自动观察——自动重入次数虽未达上限，但可行
+		// 窗口已不存在=实质用尽，须保持终态呈现并短路后续门控。
 		if e.config.RiskReentryEnabled && v4Cycle.Status == store.CopyGuardAttemptsExhausted {
 			terminalWatchStatus = store.CopyGuardAttemptsExhausted
 		}
@@ -794,24 +795,13 @@ func (e *Engine) checkReentryConditions() {
 			terminalWatchStatus = store.CopyGuardAttemptsExhausted
 		}
 
-		// v5.1 人工重入模式：自动重入次数用尽（ATTEMPTS_EXHAUSTED）且开关开启
-		// 时，不终止观察，继续复用下方完整门控链（冷却/边界/连续确认/金额），
-		// 只把触发点从 emitReentryDecision 换成"落信号 + 邮件提醒人工确认"。
-		// WATCH_TIMEOUT 与噪音档禁入的短路保持不变（人工重入同样尊重这两个
-		// 根本性约束）。
-		// v7 retires per-order human approval. The legacy-rule path remains only
-		// for existing automatic rules; exhausted attempts never create a manual
-		// execution signal. Existing PENDING rows are migrated to durable AI
-		// candidates at startup and the old confirm endpoint returns 410.
-		manualMode := false
-		// 门控链里的观察态写库：人工模式下周期保持 ATTEMPTS_EXHAUSTED（自动
-		// 重入确已用尽，是对 UI 的真实呈现），非人工模式沿用 STOPPED_WATCHING
+		// v7 retires per-order human approval（v5.1 manualMode 死链已随 L1
+		// 清理删除）：exhausted attempts never create a manual execution
+		// signal. Existing PENDING rows are migrated to durable AI candidates
+		// at startup and the old confirm endpoint returns 410.
 		watchStatus := store.CopyGuardStoppedWatching
-		if manualMode {
-			watchStatus = store.CopyGuardAttemptsExhausted
-		}
 
-		if !e.config.RiskReentryEnabled || (terminalWatchStatus != "" && !manualMode) || noiseDisabled {
+		if !e.config.RiskReentryEnabled || terminalWatchStatus != "" || noiseDisabled {
 			mark := leaderPos.MarkPrice
 			if mark <= 0 {
 				mark = leaderPos.EntryPrice
@@ -939,7 +929,7 @@ func (e *Engine) checkReentryConditions() {
 		// leader 平仓/反手、冷却期（chaseLimit=0）、noiseDisabled 均已在前面提前
 		// continue；到此必为"应继续自动观察但可行区间不存在"。
 		windowInfeasible := reentryWindowInfeasible(mapping.Side, reentryBoundary, chaseLimit, reentryAnchor)
-		if windowInfeasible && !manualMode {
+		if windowInfeasible {
 			_ = e.store.CopyTrade().UpdateCopyGuardObservation(v4Cycle.ID, store.CopyGuardAttemptsExhausted, entryRef, markPrice, currentATR)
 			e.recordWatchSample(v4Cycle, leaderPos, markPrice, currentATR, reentryBoundary, chaseLimit, watchGateReentryWindowInfeasible)
 			_ = e.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: v4Cycle.ID, TraderID: e.traderID, Type: "REENTRY_WINDOW_COLLAPSED", Price: markPrice, Metadata: map[string]interface{}{
@@ -956,10 +946,7 @@ func (e *Engine) checkReentryConditions() {
 			delete(e.reentryCandidateTicks, mapping.LeaderPosID)
 			continue
 		}
-		// 人工路径：chase 是自动路径专用护栏（防机器人追太远）；人工路径的价值恰
-		// 是"价格强反转越过追价上限时提醒人来判断"，故 manualMode 下 chase 不阻断
-		// 信号，但价格回归/连续确认/金额/可保护性提示等其余门槛一律不降。
-		conditionsMet := priceReturned && !(beyondChase && !manualMode)
+		conditionsMet := priceReturned && !beyondChase
 		// 首轮观察（尚无上一 tick 价格）只记录观测、不计确认：重启后的第一
 		// 个 tick 状态不完整，直接计数会把重启前的行情当作已确认。
 		if v4Cycle.LastObservedPrice <= 0 {
@@ -1010,38 +997,19 @@ func (e *Engine) checkReentryConditions() {
 		}
 		reentrySize := stoppedNotional * e.config.RiskReentryRatio
 		// 最小金额阈值：低于交易所最小订单价值会导致下单失败 → 触发熔断；
-		// 优先级用配置的 MinTradeWarn（与开仓金额最小阈值同一概念），未配置时用 10 USDT 兜底
-		minReentry := e.config.MinTradeWarn
-		if minReentry <= 0 {
-			minReentry = 10.0
+		// 优先级用配置的 MinTradeWarn（与开仓金额最小阈值同一概念），未配置时统一兜底
+		minReentry := minTradeNotionalOrDefault(e.config.MinTradeWarn)
+		if reentrySize <= 0 {
+			logger.Warnf("⚠️ [%s] 重入金额非正(%.4f)，跳过 | posId=%s", e.traderID, reentrySize, mapping.LeaderPosID)
+			e.recordWatchSample(v4Cycle, leaderPos, markPrice, currentATR, reentryBoundary, chaseLimit, watchGateMinNotional)
+			delete(e.reentryCandidateTicks, mapping.LeaderPosID)
+			continue
 		}
-		if manualMode {
-			// v5.2 人工重入建议金额：按首仓名义全额（不随止损次数衰减）。
-			// 几何衰减是自动路径的无人值守安全设计（cycle-15 事故约束）；
-			// 人工路径由用户最终确认把关，衰减到微名义会让反转捕获失去意义，
-			// 且会被下方 MIN_NOTIONAL 护栏整条吞掉信号——cycle-41 实盘中第 3
-			// 次止损后建议额 4.18 < 10，信号/邮件永远发不出，错过领航员反转。
-			if first := e.firstAttemptNotional(v4Cycle); first > 0 {
-				reentrySize = first
-			}
-			// 低于最小下单额时抬到 门槛×1.2（留滑点/手续费余地）。人工模式下
-			// 金额护栏只兜底、不拦截：拦截即重现"信号发不出"的死锁。
-			if reentrySize < minReentry {
-				reentrySize = minReentry * manualReentryMinNotionalHeadroom
-			}
-		} else {
-			if reentrySize <= 0 {
-				logger.Warnf("⚠️ [%s] 重入金额非正(%.4f)，跳过 | posId=%s", e.traderID, reentrySize, mapping.LeaderPosID)
-				e.recordWatchSample(v4Cycle, leaderPos, markPrice, currentATR, reentryBoundary, chaseLimit, watchGateMinNotional)
-				delete(e.reentryCandidateTicks, mapping.LeaderPosID)
-				continue
-			}
-			if reentrySize < minReentry {
-				logger.Infof("⏭️ [%s] 重入金额 %.2f < 阈值 %.2f，跳过本次（条件保持，下轮再判） | posId=%s",
-					e.traderID, reentrySize, minReentry, mapping.LeaderPosID)
-				e.recordWatchSample(v4Cycle, leaderPos, markPrice, currentATR, reentryBoundary, chaseLimit, watchGateMinNotional)
-				continue
-			}
+		if reentrySize < minReentry {
+			logger.Infof("⏭️ [%s] 重入金额 %.2f < 阈值 %.2f，跳过本次（条件保持，下轮再判） | posId=%s",
+				e.traderID, reentrySize, minReentry, mapping.LeaderPosID)
+			e.recordWatchSample(v4Cycle, leaderPos, markPrice, currentATR, reentryBoundary, chaseLimit, watchGateMinNotional)
+			continue
 		}
 		// v5 可保护性预检：预算"重入成交后按当前配置算出的止损距离"是否连
 		// 极紧止损都挂不出（distance < 0.1% 即 OpenImmediateHit）。强平价在
@@ -1051,8 +1019,6 @@ func (e *Engine) checkReentryConditions() {
 		if equityForCheck <= 0 {
 			equityForCheck = v4Cycle.AccountEquity
 		}
-		protectable := true
-		estStopDistance := float64(0)
 		if equityForCheck > 0 {
 			atrBaseline := currentATR
 			if e.config.RiskATRMultiplier > 0 {
@@ -1060,34 +1026,11 @@ func (e *Engine) checkReentryConditions() {
 			}
 			precheck, precheckErr := ComputeRiskDistanceV4(e.config, markPrice, reentrySize, equityForCheck, atrBaseline, leaderPos.Leverage)
 			if precheckErr != nil || precheck.Distance/markPrice < 0.001 {
-				protectable = false
-				if !manualMode {
-					logger.Warnf("⚠️ [%s] 重入可保护性预检未通过（预算止损距离过近/计算失败），本轮不重入 | posId=%s err=%v", e.traderID, mapping.LeaderPosID, precheckErr)
-					e.recordWatchSample(v4Cycle, leaderPos, markPrice, currentATR, reentryBoundary, chaseLimit, watchGateUnprotectable)
-					delete(e.reentryCandidateTicks, mapping.LeaderPosID)
-					continue
-				}
-				// 人工模式：可保护性只提示不拦截（用户已被告知风险且人工确认
-				// 最高优先；成交后若确实不可保护，v5 状态机按
-				// risk_unprotectable_action 兜底处置）
-			} else {
-				estStopDistance = precheck.Distance
+				logger.Warnf("⚠️ [%s] 重入可保护性预检未通过（预算止损距离过近/计算失败），本轮不重入 | posId=%s err=%v", e.traderID, mapping.LeaderPosID, precheckErr)
+				e.recordWatchSample(v4Cycle, leaderPos, markPrice, currentATR, reentryBoundary, chaseLimit, watchGateUnprotectable)
+				delete(e.reentryCandidateTicks, mapping.LeaderPosID)
+				continue
 			}
-		}
-
-		// v5.1 人工模式触发点：门控链全部通过 → 落信号 + 邮件提醒，
-		// 不自动下单（等待用户在前端确认后由 integration 层代执行）
-		if manualMode {
-			e.emitManualReentrySignal(mapping, leaderPos, v4Cycle, manualSignalParams{
-				markPrice: markPrice, atr: currentATR, noiseRatio: noiseRatio,
-				reentryBoundary: reentryBoundary, reentrySize: reentrySize,
-				stopFillPrice: attemptStopFillPrice(stoppedAttempt), protectable: protectable,
-				estStopDistance: estStopDistance, chaseLimit: chaseLimit,
-				requiredRecovery: requiredRecovery, windowInfeasible: windowInfeasible,
-			})
-			e.recordWatchSample(v4Cycle, leaderPos, markPrice, currentATR, reentryBoundary, chaseLimit, watchGateManualReentrySignal)
-			delete(e.reentryCandidateTicks, mapping.LeaderPosID)
-			continue
 		}
 
 		// ============================================================
@@ -1409,23 +1352,6 @@ func (e *Engine) findStoppedAttempt(cycle *store.CopyGuardCycle) *store.CopyGuar
 	return nil
 }
 
-// firstAttemptNotional 周期首仓（attempt_no=0）的名义价值，人工重入建议金额
-// 的基准（不随止损次数几何衰减）。attempt 数据缺失（旧数据/回填周期）时回退
-// 周期跟随名义；再缺失返回 0，由调用方决定兜底。
-func (e *Engine) firstAttemptNotional(cycle *store.CopyGuardCycle) float64 {
-	if cycle == nil || e.store == nil {
-		return 0
-	}
-	if attempts, err := e.store.CopyTrade().ListCopyGuardAttempts(cycle.ID); err == nil {
-		for _, attempt := range attempts {
-			if attempt.AttemptNo == 0 && attempt.Notional > 0 {
-				return attempt.Notional
-			}
-		}
-	}
-	return cycle.FollowerNotional
-}
-
 // attemptStopFillPrice 被止损 attempt 的止损成交价（数据缺失返回 0）
 func attemptStopFillPrice(attempt *store.CopyGuardAttempt) float64 {
 	if attempt == nil {
@@ -1450,128 +1376,6 @@ func reentryWindowInfeasible(side string, reentryBoundary, chaseLimit, anchor fl
 		return reentryBoundary > chaseLimit+eps
 	}
 	return reentryBoundary < chaseLimit-eps
-}
-
-// manualSignalParams 人工重入信号的市场快照参数（emitManualReentrySignal 入参）
-type manualSignalParams struct {
-	markPrice       float64 // 信号触发时标记价
-	atr             float64 // 当前 ATR
-	noiseRatio      float64 // 止损距离/ATR（0=数据缺失）
-	reentryBoundary float64 // 重入穿越边界
-	reentrySize     float64 // 建议重入名义（USDT）
-	stopFillPrice   float64 // 最近一次止损成交价（0=数据缺失）
-	estStopDistance float64 // 预算止损距离（0=未预检/预检失败）
-	protectable     bool    // 可保护性预检结果
-	// 追价上限与窗口可行性：人工路径忽略 chase，但需向用户明示"价格已超出自动
-	// 追价上限、属强反转追入"，便于知情决策。
-	chaseLimit       float64 // 自动路径追价上限（0=未计算）
-	requiredRecovery float64 // 本次要求的价格恢复幅度（价格单位）
-	windowInfeasible bool    // 自动重入窗口是否已塌缩为空集
-}
-
-// emitManualReentrySignal v5.1 人工重入信号触发点：门控链全部通过后落库
-// PENDING 信号（同周期已有 PENDING 时幂等刷新市场快照），并按邮件冷却
-// （store.ManualReentryAlertCooldown）推 RiskEvent 给 integration 层发提醒。
-// 事件 GUARD_MANUAL_REENTRY_SIGNAL 与邮件同步写入（只在提醒沿写，避免
-// 每 N tick 重触发刷屏事件流）。
-func (e *Engine) emitManualReentrySignal(mapping *store.CopyTradePositionMapping, leaderPos *Position, cycle *store.CopyGuardCycle, p manualSignalParams) {
-	// 配额护栏：同周期信号总量上限（正常同周期只滚动维护一条 PENDING，
-	// 达到上限说明信号被反复忽略/执行失败，防御性停止生成）
-	n, err := e.store.CopyTrade().CountManualReentrySignalsForCycle(cycle.ID)
-	if err != nil {
-		logger.Warnf("⚠️ [%s] 人工重入信号配额查询失败: %v | cycle=%d", e.traderID, err, cycle.ID)
-		return
-	}
-	if n >= store.ManualReentryMaxSignalsPerCycle {
-		logger.Warnf("⚠️ [%s] 人工重入信号达单周期上限(%d)，不再生成 | cycle=%d", e.traderID, store.ManualReentryMaxSignalsPerCycle, cycle.ID)
-		return
-	}
-
-	sig, err := e.store.CopyTrade().SaveManualReentrySignal(&store.CopyGuardManualReentrySignal{
-		CycleID:             cycle.ID,
-		TraderID:            e.traderID,
-		LeaderPosID:         mapping.LeaderPosID,
-		Symbol:              mapping.Symbol,
-		Side:                mapping.Side,
-		MarginMode:          mapping.MarginMode,
-		TriggerPrice:        p.markPrice,
-		ATR:                 p.atr,
-		DistanceATRRatio:    p.noiseRatio,
-		ReentryBoundary:     p.reentryBoundary,
-		RecommendedNotional: p.reentrySize,
-		StopCount:           cycle.StopCount,
-		ReentryCount:        cycle.ReentryCount,
-		LeaderSize:          leaderPos.Size,
-		LeaderEntryPrice:    leaderPos.EntryPrice,
-		Protectable:         p.protectable,
-		Reason: fmt.Sprintf("自动重入次数已用尽(%d/%d)，价格回归重入边界并通过连续确认",
-			cycle.ReentryCount, e.config.RiskMaxReentries),
-	})
-	if err != nil {
-		logger.Warnf("⚠️ [%s] 人工重入信号落库失败: %v | cycle=%d", e.traderID, err, cycle.ID)
-		return
-	}
-
-	// 邮件冷却：新信号（从未提醒过）立即提醒；既有信号距上次提醒不足冷却
-	// 时间则只刷新快照不重复提醒
-	if sig.LastAlertAt != nil && time.Since(*sig.LastAlertAt) < store.ManualReentryAlertCooldown {
-		return
-	}
-	if err := e.store.CopyTrade().MarkManualReentrySignalAlerted(sig.ID); err != nil {
-		logger.Warnf("⚠️ [%s] 人工重入信号提醒时间落库失败: %v | signal=%d", e.traderID, err, sig.ID)
-	}
-	// chase 超限幅度：人工路径忽略追价上限，但记录"超出多少"供前端/邮件明示
-	chaseExceededBy := float64(0)
-	if p.chaseLimit > 0 {
-		if mapping.Side == "short" {
-			chaseExceededBy = p.chaseLimit - p.markPrice
-		} else {
-			chaseExceededBy = p.markPrice - p.chaseLimit
-		}
-		if chaseExceededBy < 0 {
-			chaseExceededBy = 0
-		}
-	}
-	_ = e.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: e.traderID, Type: "GUARD_MANUAL_REENTRY_SIGNAL", Price: p.markPrice, Notional: p.reentrySize, Metadata: map[string]interface{}{
-		"signal_id":         sig.ID,
-		"stop_count":        cycle.StopCount,
-		"reentry_count":     cycle.ReentryCount,
-		"noise_ratio":       p.noiseRatio,
-		"protectable":       p.protectable,
-		"reentry_boundary":  p.reentryBoundary,
-		"est_stop_distance": p.estStopDistance,
-		"last_stop_price":   p.stopFillPrice,
-		"current_atr":       p.atr,
-		"chase_limit":       p.chaseLimit,
-		"chase_exceeded_by": chaseExceededBy,
-		"window_infeasible": p.windowInfeasible,
-		"required_recovery": p.requiredRecovery,
-	}})
-	logger.Infof("📣 [%s] 人工重入信号已生成，等待用户确认 | cycle=%d signal=%d %s %s 价格=%.4f 建议金额=%.2f 可保护=%v",
-		e.traderID, cycle.ID, sig.ID, mapping.Symbol, mapping.Side, p.markPrice, p.reentrySize, p.protectable)
-	e.emitRiskEvent(&RiskEvent{
-		Type:              RiskEventManualReentrySignal,
-		Timestamp:         time.Now(),
-		Symbol:            mapping.Symbol,
-		Side:              mapping.Side,
-		MarginMode:        mapping.MarginMode,
-		LeaderPosID:       mapping.LeaderPosID,
-		LeaderSize:        leaderPos.Size,
-		ReentryEntryPrice: p.markPrice,
-		ReentrySize:       p.reentrySize,
-		ManualSignalID:    sig.ID,
-		CycleID:           cycle.ID,
-		StopCount:         cycle.StopCount,
-		ReentryCount:      cycle.ReentryCount,
-		Protectable:       p.protectable,
-		NoiseRatio:        p.noiseRatio,
-		CurrentATR:        p.atr,
-		LastStopPrice:     p.stopFillPrice,
-		EstStopDistance:   p.estStopDistance,
-		ChaseLimit:        p.chaseLimit,
-		ChaseExceededBy:   chaseExceededBy,
-		WindowInfeasible:  p.windowInfeasible,
-	})
 }
 
 // stopDistanceATRRatio 止损时的实际止损距离 / 当时 ATR（v5 重入自适应加严的
@@ -1611,15 +1415,10 @@ const (
 	watchGateMinNotional      = "MIN_NOTIONAL"           // 重入金额低于最小阈值
 	watchGateUnprotectable    = "REENTRY_UNPROTECTABLE"  // v5：预算重入后止损不可行，不重入
 	watchGateReentryTriggered = "REENTRY_TRIGGERED"      // 全部条件满足，已请求重入
-	// v5.1：自动重入用尽后门控链全部通过，已落人工重入信号（等待用户确认）
-	watchGateManualReentrySignal = "MANUAL_REENTRY_SIGNAL"
 	// 自动重入价格窗口塌缩为空集（恢复下界越过追价上限）→ 自动重入实质用尽
 	watchGateReentryWindowInfeasible = "REENTRY_WINDOW_INFEASIBLE"
 	watchSampleInterval              = 60 * time.Second // 固定间隔采样（gate 不变时）
 	watchResumeGapMultiplier         = 5                // 采样断档 > 间隔×该倍数 → 记 WATCH_RESUMED
-	// 人工重入建议金额低于最小下单额时抬到 门槛×该系数（滑点/手续费余地），
-	// 与 ConfirmManualReentry 的执行侧兜底保持同一常量。
-	manualReentryMinNotionalHeadroom = 1.2
 )
 
 // recordWatchSample 观察期采样：固定间隔必采 + 门控原因变化立即补采。

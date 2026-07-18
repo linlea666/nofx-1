@@ -65,7 +65,7 @@ type CopyTradeEvent struct {
 	MarginMode    string                 `json:"margin_mode"`
 	LeaderPosID   string                 `json:"leader_pos_id"`
 	FollowerPosID string                 `json:"follower_pos_id"`
-	CycleID       int64                  `json:"cycle_id"` // 关联 copy_guard_cycles（OKX 有值，其它为 0）
+	CycleID       int64                  `json:"cycle_id"` // 关联 copy_guard_cycles（Copy Guard 数据源 OKX/Binance 有值，其它为 0）
 	SignalID      string                 `json:"signal_id"`
 	Status        string                 `json:"status"` // success | failed | skipped | ""
 	Price         float64                `json:"price"`
@@ -254,9 +254,10 @@ func appendCopyEventFilter(q string, args []interface{}, filter CopyEventFilter)
 }
 
 // ============================================================================
-// Seam B：把 OKX Copy Guard 风控/保护/接手/对账事件镜像到统一跟单事件日志
+// Seam B：把 Copy Guard 风控/保护/接手/对账事件镜像到统一跟单事件日志
 //
-// copy_guard_events 是 OKX 专属的按 cycle 归属的风控事件流。它有两类写入源：
+// copy_guard_events 是 Copy Guard 数据源（OKX/Binance）按 cycle 归属的风控
+// 事件流。它有两类写入源：
 //   1. SaveCopyGuardEvent（多数事件）
 //   2. RecordCopyGuardStop / RecordCopyGuardStopObserved /
 //      RecordCopyGuardReentryFilled（在事务内直接 INSERT，STOP_TRIGGERED /

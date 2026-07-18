@@ -108,7 +108,7 @@ const eventLabels: Record<string, string> = {
   ACCOUNTING_IDENTITY_CAPTURE_FAILED: '跟单仓位识别失败',
   ACCOUNTING_RECONCILED: '实际盈亏已对账',
   ACCOUNTING_NEEDS_REVIEW: '对账延迟（历史事件）',
-  ACCOUNTING_DELAYED: 'OKX 数据延迟，自动重试中',
+  ACCOUNTING_DELAYED: '交易所结算数据延迟，自动重试中',
   ACCOUNTING_UNRECOVERABLE: '对账数据不可自动恢复',
   PROTECTIVE_STOP_ADOPTED: '接管已存在的保护单',
   PROTECTIVE_STOP_TERMINAL: '保护单已自然终结',
@@ -2134,7 +2134,7 @@ export function CopyGuardPage() {
             (summary?.unknown_count ?? 0) +
             (summary?.degraded_count ?? 0)}{' '}
           个活跃仓位的保护单正在自动重试建立/验证。若持续超过 10
-          分钟系统会发送升级告警，届时建议人工检查 OKX。
+          分钟系统会发送升级告警，届时建议人工检查执行交易所。
         </div>
       )}
       {(summary?.accounting_pending_count ?? 0) +
@@ -2142,8 +2142,8 @@ export function CopyGuardPage() {
         0 && (
         <div className="border border-[#F0B90B] bg-[#F0B90B]/10 rounded-lg p-4 text-sm text-[#F0B90B]">
           当前有 {summary?.accounting_pending_count ?? 0} 个周期正在自动对账，
-          {summary?.accounting_delayed_count ?? 0} 个周期因 OKX
-          数据延迟系统继续自动重试。这些周期暂不计入保护效果，无需人工处理。
+          {summary?.accounting_delayed_count ?? 0}{' '}
+          个周期因执行交易所结算数据延迟系统继续自动重试。这些周期暂不计入保护效果，无需人工处理。
         </div>
       )}
       {(summary?.accounting_unrecoverable_count ?? 0) > 0 && (

@@ -222,6 +222,8 @@ export interface CopyConfigRequest {
   copy_ratio: number
   sync_leverage: boolean
   sync_margin_mode?: boolean // 同步保证金模式（OKX 区分全仓/逐仓）
+  min_trade_warn?: number // 最小跟单金额阈值（USDT），低于此金额跳过/预警；未传保留存量值
+  max_trade_warn?: number // 最大跟单金额预警阈值（USDT），0=不预警；未传保留存量值
   // Binance Web 凭证（仅 provider_type=binance 时使用）
   binance_p20t?: string // 登录 cookie p20t
   binance_csrf_token?: string // CSRF header csrftoken
@@ -280,7 +282,7 @@ export interface CopyConfigRequest {
 
   // v5 可保护性状态机 / 噪音档重入
   risk_unprotectable_action?: 'close' | 'follow' // 默认 close：确认不可保护时立即离场；follow=标红裸跑并周期性复查
-  risk_reentry_noise_override?: boolean // 默认 false：距离/ATR<1 的噪音档仍允许重入（默认该档禁止重入）
+  risk_reentry_noise_override?: boolean // 默认 false：距离/ATR<0.3 的噪音档仍允许重入（默认该档禁止重入）
 }
 
 export interface UpdateModelConfigRequest {
@@ -922,7 +924,7 @@ export interface CopyTradeEvent {
   margin_mode: string
   leader_pos_id: string
   follower_pos_id: string
-  cycle_id: number // 关联 Copy Guard 周期（OKX 有值，其它为 0）
+  cycle_id: number // 关联 Copy Guard 周期（OKX/Binance 有值，Hyperliquid 为 0）
   signal_id: string
   status: string // success | failed | skipped | ''
   price: number

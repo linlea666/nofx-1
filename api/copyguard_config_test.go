@@ -34,8 +34,8 @@ func TestValidateRiskConfirmation(t *testing.T) {
 }
 
 func TestApplyCopyConfigRiskFieldsV4DefaultsAndExplicitZero(t *testing.T) {
-	// Copy Guard 风控字段仅 OKX 生效：config 必须带 ProviderType=okx
-	// 才会进入透传分支（非 OKX 会被整体剥离，见下一个用例）
+	// Copy Guard 风控字段对 SupportsCopyGuard 数据源（OKX/Binance）生效；
+	// 本用例只覆盖 OKX。不支持的 provider 会被整体剥离（见下一个用例）
 	cfg := store.NewCopyGuardDefaults()
 	cfg.ProviderType = "okx"
 	applyCopyConfigRiskFields(cfg, &CopyConfigReq{RiskPolicyVersion: 4})

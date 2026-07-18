@@ -43,8 +43,9 @@ func TestSmartMoneyProviderFullPaginationAndExactSettlementAssets(t *testing.T) 
 	}
 	positions = append(positions,
 		map[string]interface{}{"symbol": "BTCUSDT", "side": "LONG", "amount": "0.1", "markPrice": "60000", "entryPrice": "59000", "leverage": "5"},
-		// side is deliberately stale/conflicting: amount sign is authoritative.
-		map[string]interface{}{"symbol": "BTCUSDC", "side": "LONG", "amount": "-0.2", "markPrice": "60000", "entryPrice": "61000", "leverage": "10"},
+		// side omitted: amount sign alone must derive the direction (M7 只在
+		// side 显式声明且与符号矛盾时 fail-closed).
+		map[string]interface{}{"symbol": "BTCUSDC", "amount": "-0.2", "markPrice": "60000", "entryPrice": "61000", "leverage": "10"},
 		map[string]interface{}{"symbol": "BTCUSD1", "side": "LONG", "amount": "0.3", "markPrice": "60000", "entryPrice": "58000", "leverage": "3"},
 	)
 	page1, _ := json.Marshal(positions[:9])
@@ -325,6 +326,30 @@ func TestSmartMoneyProviderRejectsPositionWithoutAmountDirection(t *testing.T) {
 	}
 	if p.LastSourceHealthObservation().CompleteSnapshot {
 		t.Fatal("invalid position snapshot must never be marked complete")
+	}
+}
+
+// M7：接口显式声明的 side 与 amount 符号矛盾时必须 fail-closed（可能是
+// 字段语义变更，静默信任 amount 会把方向判反），拒绝整个快照。
+func TestSmartMoneyProviderFailsClosedOnSideAmountConflict(t *testing.T) {
+	p := NewBinanceSmartMoneyProvider("p", "c")
+	p.client.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch {
+		case strings.Contains(req.URL.Path, "query-positions"):
+			return smartHTTPResponse(200, `{"code":"000000","data":{"total":1,"list":[{"symbol":"BTCUSDT","side":"SHORT","amount":"0.5","markPrice":"100"}]}}`), nil
+		case req.URL.Path == "/fapi/v1/exchangeInfo":
+			return smartHTTPResponse(200, `{"symbols":[{"symbol":"BTCUSDT","baseAsset":"BTC","quoteAsset":"USDT","marginAsset":"USDT","contractType":"PERPETUAL","status":"TRADING"}]}`), nil
+		default:
+			return smartHTTPResponse(200, `{"code":"000000","data":{"enable":true,"sharingPosition":true,"umMarginBalance":"100"}}`), nil
+		}
+	})
+
+	state, err := p.GetAccountState("5082050984257986817")
+	if err == nil || state != nil || !strings.Contains(err.Error(), "conflicts with amount") {
+		t.Fatalf("side/amount conflict must fail closed: state=%+v err=%v", state, err)
+	}
+	if obs := p.LastSourceHealthObservation(); obs.Status != "ERROR" || obs.CompleteSnapshot {
+		t.Fatalf("conflict snapshot must record an ERROR observation: %+v", obs)
 	}
 }
 

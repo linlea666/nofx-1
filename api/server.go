@@ -437,6 +437,11 @@ type CopyConfigReq struct {
 	CopyRatio      float64 `json:"copy_ratio"`       // Copy ratio (1.0 = 100%)
 	SyncLeverage   bool    `json:"sync_leverage"`    // Whether to sync leverage
 	SyncMarginMode *bool   `json:"sync_margin_mode"` // Whether to sync margin mode (OKX: cross/isolated)
+	// 最小/最大跟单金额阈值（USDT）。指针区分"未传"（保留存量/默认值）与
+	// 显式 0（max=0 表示不预警）。此前请求结构缺这两个字段，前端传值被
+	// JSON unmarshal 静默丢弃，配置形同虚设（M18）。
+	MinTradeWarn *float64 `json:"min_trade_warn,omitempty"`
+	MaxTradeWarn *float64 `json:"max_trade_warn,omitempty"`
 
 	// Binance Web 凭证（仅 ProviderType=binance 时使用，明文存储）
 	BinanceP20T        string `json:"binance_p20t,omitempty"`       // 登录 cookie p20t
@@ -978,6 +983,12 @@ func (s *Server) handleCreateTrader(c *gin.Context) {
 		copyConfig.CopyRatio = req.CopyConfig.CopyRatio
 		copyConfig.SyncLeverage = req.CopyConfig.SyncLeverage
 		copyConfig.SyncMarginMode = syncMarginMode
+		if req.CopyConfig.MinTradeWarn != nil {
+			copyConfig.MinTradeWarn = *req.CopyConfig.MinTradeWarn
+		}
+		if req.CopyConfig.MaxTradeWarn != nil {
+			copyConfig.MaxTradeWarn = *req.CopyConfig.MaxTradeWarn
+		}
 		copyConfig.Enabled = false
 		copyConfig.BinanceP20T = req.CopyConfig.BinanceP20T
 		copyConfig.BinanceCSRFToken = req.CopyConfig.BinanceCSRFToken
@@ -1234,6 +1245,12 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 			copyConfig.CopyRatio = req.CopyConfig.CopyRatio
 			copyConfig.SyncLeverage = req.CopyConfig.SyncLeverage
 			copyConfig.SyncMarginMode = syncMarginMode
+			if req.CopyConfig.MinTradeWarn != nil {
+				copyConfig.MinTradeWarn = *req.CopyConfig.MinTradeWarn
+			}
+			if req.CopyConfig.MaxTradeWarn != nil {
+				copyConfig.MaxTradeWarn = *req.CopyConfig.MaxTradeWarn
+			}
 			copyConfig.BinanceP20T = resolveCredentialUpdate(req.CopyConfig.BinanceP20T, existingP20T)
 			copyConfig.BinanceCSRFToken = resolveCredentialUpdate(req.CopyConfig.BinanceCSRFToken, existingCSRF)
 			copyConfig.BinanceSourceMode = req.CopyConfig.BinanceSourceMode

@@ -925,11 +925,12 @@ func TestReentryWindowNotJudgedDuringCooldown(t *testing.T) {
 	}
 }
 
-// manualMode + 价格越过追价上限但已回归下界：忽略 chase，连续确认后生成 PENDING
+// v7 退役：即便开关为 true、价格越过追价上限且已回归下界（退役前会生成
+// PENDING 人工信号的场景），也永不生成信号、不 emit 决策
 func TestRetiredManualModeDoesNotSignalOnRecovery(t *testing.T) {
 	e, st := newReentryTestEngine(t)
 	e.config.RiskManualReentryEnabled = true
-	e.config.RiskMaxReentries = 0 // ReentryCount(0)>=0 → 直接 ATTEMPTS_EXHAUSTED → manualMode
+	e.config.RiskMaxReentries = 0 // ReentryCount(0)>=0 → 直接 ATTEMPTS_EXHAUSTED（终态短路）
 	e.config.RiskReentryMinRecoveryATR = 0.5
 	e.config.RiskReentryMaxChaseATR = 0.5 // 窗口 [1683,1717]
 	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700)
@@ -973,14 +974,12 @@ func TestManualModeNoSignalWhenPriceNotReturned(t *testing.T) {
 }
 
 // ============================================================================
-// B. 人工重入金额（cycle-41）：自动路径名义几何衰减到 < 最小下单额时，
-//    MIN_NOTIONAL 护栏曾把人工信号整条吞掉（信号/邮件永远发不出）。
-//    人工路径改为：建议金额 = 首仓名义全额；< 最小下单额时抬到 门槛×1.2。
+// B. 人工重入已于 v7 退役：以下用例复用退役前的场景脚手架（cycle-41 等），
+//    断言 RiskManualReentryEnabled=true 也永远不生成人工信号 / 不 emit 决策。
 // ============================================================================
 
-// 复刻 cycle-41：3 次止损、名义衰减 100→50→8，自动重入次数用尽转人工。
-// 旧逻辑建议额 = 8×0.5 = 4 < 10 → 信号被 MIN_NOTIONAL 吞掉；
-// 新逻辑必须发出 PENDING 信号且建议额 = 首仓名义 100。
+// 复刻 cycle-41 场景：3 次止损、名义衰减 100→50→8，自动重入次数用尽。
+// v7 退役后即便开关为 true 也不得复活人工信号路径。
 func TestRetiredManualModeDoesNotReviveAfterMultipleStops(t *testing.T) {
 	e, st := newReentryTestEngine(t)
 	e.config.RiskManualReentryEnabled = true // RiskMaxReentries=2（脚手架默认）
@@ -1028,11 +1027,12 @@ func TestRetiredManualModeDoesNotReviveAfterMultipleStops(t *testing.T) {
 	}
 }
 
-// 首仓名义本身 < 最小下单额：建议额抬到 门槛×1.2（默认 10→12），信号仍必须发出
+// v7 退役：首仓名义 < 最小下单额（退役前会抬到 门槛×1.2 并发信号的场景），
+// 也永不生成兜底金额的人工信号
 func TestRetiredManualModeDoesNotCreateMinimumSizedSignal(t *testing.T) {
 	e, st := newReentryTestEngine(t)
 	e.config.RiskManualReentryEnabled = true
-	e.config.RiskMaxReentries = 0 // reentry_count(0)>=0 → 直接用尽 → manualMode
+	e.config.RiskMaxReentries = 0 // reentry_count(0)>=0 → 直接用尽（终态短路）
 	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700)
 	// 首仓名义压到 5（< 门槛 10）
 	if _, err := st.DB().Exec(`UPDATE copy_guard_attempts SET notional=5 WHERE cycle_id=? AND attempt_no=0`, cycle.ID); err != nil {

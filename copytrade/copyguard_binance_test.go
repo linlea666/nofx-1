@@ -22,6 +22,11 @@ func TestSupportsCopyGuardPredicate(t *testing.T) {
 		if got := SupportsCopyGuard(provider); got != want {
 			t.Fatalf("SupportsCopyGuard(%s)=%v want %v", provider, got, want)
 		}
+		// S10：store 侧的 v3→v4 升级谓词必须与本谓词保持同一集合，
+		// 否则前端按 SupportsCopyGuard 展示 Copy Guard 已启用而后端不升级。
+		if got := store.RiskPolicyUpgradeSupported(string(provider)); got != want {
+			t.Fatalf("store.RiskPolicyUpgradeSupported(%s)=%v diverges from SupportsCopyGuard=%v", provider, got, want)
+		}
 	}
 }
 

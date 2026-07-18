@@ -86,7 +86,7 @@ type Engine struct {
 	// v3 风控：账户保护止损疑似计数（防 GetPositions API 抖动误判）
 	// key = leaderPosID，value = 连续疑似 SL 触发的次数
 	// 达到 stopRiskSuspectThreshold 后才正式标 stopped_by_risk
-	// 仅 OKX 路径使用；checkStoppedByRisk 内部访问，与 poll 串行执行无需额外锁
+	// SupportsCopyGuard（OKX/Binance）数据源使用；checkStoppedByRisk 内部访问，与 poll 串行执行无需额外锁
 	stopRiskSuspectCount map[string]int
 
 	// v4 加仓预算：ADDON_RISK_WARNING 事件/告警限频（key = leaderPosID）
@@ -803,40 +803,43 @@ func (e *Engine) poll() {
 		// Binance 成交历史会延迟数分钟；实时持仓快照才是开仓/加仓/减仓/平仓的主信号。
 		// 成交历史仍保留为兜底，但只在快照没有检测到变化时处理，避免迟到成交重复触发。
 		if err := e.syncLeaderState(); err != nil {
-			logger.Warnf("⚠️ [%s] Binance 实时持仓同步失败: %v", e.traderID, err)
-		} else {
-			snapshotFills := e.detectBinancePositionSnapshotFills()
-			// 🔑 关键去重：snapshot fill.ID 形如
-			//   "binance_snapshot|<posId>|<action>|<previousSize>|<currentSize>"
-			// 在"领航员已平 / 跟随者本地无对应仓位 / 执行失败 mapping 未回收"
-			// 的死锁场景下，每轮 poll 都会生成完全相同 ID 的 close 信号。
-			// 第三步循环已经 markSeen，但此处直接 `newFills = snapshotFills`
-			// 跳过了第一步 isSeen 过滤，导致每 3s 重复处理。
-			// 这里显式过滤一次，保证去重链路完整。
-			var freshSnapshotFills []Fill
-			for _, fill := range snapshotFills {
-				if !e.isSeen(fill.ID) {
-					freshSnapshotFills = append(freshSnapshotFills, fill)
-				}
+			// fail-closed：同步失败时快照对账无法进行，本轮不得继续消费
+			// trade-history 兜底成交——否则会在过期 leaderState 上做决策，
+			// 且第三步的 markSeen 会让这批成交永久丢失。信号下轮重取。
+			logger.Warnf("⚠️ [%s] Binance 实时持仓同步失败，本轮跳过信号处理: %v", e.traderID, err)
+			return
+		}
+		snapshotFills := e.detectBinancePositionSnapshotFills()
+		// 🔑 关键去重：snapshot fill.ID 形如
+		//   "binance_snapshot|<posId>|<action>|<previousSize>|<currentSize>"
+		// 在"领航员已平 / 跟随者本地无对应仓位 / 执行失败 mapping 未回收"
+		// 的死锁场景下，每轮 poll 都会生成完全相同 ID 的 close 信号。
+		// 第三步循环已经 markSeen，但此处直接 `newFills = snapshotFills`
+		// 跳过了第一步 isSeen 过滤，导致每 3s 重复处理。
+		// 这里显式过滤一次，保证去重链路完整。
+		var freshSnapshotFills []Fill
+		for _, fill := range snapshotFills {
+			if !e.isSeen(fill.ID) {
+				freshSnapshotFills = append(freshSnapshotFills, fill)
 			}
-			if len(freshSnapshotFills) > 0 {
-				logger.Infof("📡 [%s] Binance 实时持仓发现 %d 条信号（原始 %d 条，去重保留 %d 条）",
-					e.traderID, len(freshSnapshotFills), len(snapshotFills), len(freshSnapshotFills))
-				for _, fill := range newFills {
-					e.markSeen(fill.ID)
-				}
-				newFills = freshSnapshotFills
-			} else if len(snapshotFills) > 0 {
-				logger.Debugf("📡 [%s] Binance 快照检测到 %d 条信号但全部为重复（已 seen），跳过",
-					e.traderID, len(snapshotFills))
-				// 同样把 trade-history 路径迟到的 fills 标记 seen，避免后续路径重复处理
-				for _, fill := range newFills {
-					e.markSeen(fill.ID)
-				}
-				newFills = nil
-			} else if len(newFills) > 0 {
-				logger.Debugf("📡 [%s] Binance 快照无变化，处理 %d 条成交历史信号", e.traderID, len(newFills))
+		}
+		if len(freshSnapshotFills) > 0 {
+			logger.Infof("📡 [%s] Binance 实时持仓发现 %d 条信号（原始 %d 条，去重保留 %d 条）",
+				e.traderID, len(freshSnapshotFills), len(snapshotFills), len(freshSnapshotFills))
+			for _, fill := range newFills {
+				e.markSeen(fill.ID)
 			}
+			newFills = freshSnapshotFills
+		} else if len(snapshotFills) > 0 {
+			logger.Debugf("📡 [%s] Binance 快照检测到 %d 条信号但全部为重复（已 seen），跳过",
+				e.traderID, len(snapshotFills))
+			// 同样把 trade-history 路径迟到的 fills 标记 seen，避免后续路径重复处理
+			for _, fill := range newFills {
+				e.markSeen(fill.ID)
+			}
+			newFills = nil
+		} else if len(newFills) > 0 {
+			logger.Debugf("📡 [%s] Binance 快照无变化，处理 %d 条成交历史信号", e.traderID, len(newFills))
 		}
 	} else if len(newFills) > 0 {
 		if err := e.syncLeaderState(); err != nil {
@@ -1712,10 +1715,7 @@ func (e *Engine) processSignal(signal *TradeSignal) {
 		} else if matchResult.Action == ActionAdd {
 			copySize = e.limitAddonRiskBudget(signal, matchResult.PosID, copySize)
 		}
-		minAddon := e.config.MinTradeWarn
-		if minAddon <= 0 {
-			minAddon = MinOrderValue
-		}
+		minAddon := minTradeNotionalOrDefault(e.config.MinTradeWarn)
 		if copySize < minAddon {
 			logger.Warnf("🚫 [%s] 入场风险预算不足或低于最小下单额，拒绝本次%s | %s", e.traderID, matchResult.Action, fill.Symbol)
 			e.stats.SignalsSkipped++
@@ -1830,6 +1830,7 @@ func (e *Engine) buildDecisionV2(signal *TradeSignal, match *SignalMatchResult, 
 	dec := decision.Decision{
 		Symbol:        fill.Symbol,
 		Action:        e.mapAction(match.Action, fill.PositionSide),
+		IsCopyTrade:   true,
 		Reasoning:     fmt.Sprintf("Copy trading: %s following %s leader %s", match.Action, e.config.ProviderType, e.config.LeaderID),
 		EntryPrice:    fill.Price,
 		LeaderPosID:   match.PosID,
@@ -2202,10 +2203,7 @@ func (e *Engine) calculateCopySizeByPositionChange(signal *TradeSignal, match *S
 	//   - ActionOpen：保留 boost（开仓只发生一次，必须达到交易所最小起步金额）
 	//   - ActionAdd ：copySize < threshold → 直接置零（信号被跳过，不更新 last_known_size，
 	//                  等领航员后续加仓累积到 threshold 以上再跟），保持长期比例镜像
-	minTradeThreshold := e.config.MinTradeWarn
-	if minTradeThreshold <= 0 {
-		minTradeThreshold = 12.0 // 默认最小 12 USDT，预留精度损失余量
-	}
+	minTradeThreshold := minTradeNotionalOrDefault(e.config.MinTradeWarn)
 	if copySize > 0 && copySize < minTradeThreshold {
 		if match.Action == ActionAdd {
 			// 跳过：让 processSignal 看到 copySize==0 + add 信号 → 不生成决策
@@ -2552,7 +2550,7 @@ func (e *Engine) syncLeaderState() error {
 	// 同时处理 stopped_by_risk → closed（v3 风控恢复机制）
 	e.checkIgnoredPositionsClosed()
 
-	// 🔑 v3 风控：SL 触发对账 + 二次进场监控（仅 OKX）
+	// 🔑 风控：SL 触发对账 + 二次进场监控（SupportsCopyGuard 数据源）
 	// 调用时机：领航员状态刚同步完，本地持仓由 getFollowerPositions() 实时取
 	// 设计原则：放在 syncLeaderState 末尾，保证所有 active mapping 的对账用最新数据
 	// Copy Guard risk reconciliation runs for supported data sources on v4+

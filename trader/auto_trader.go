@@ -1023,6 +1023,67 @@ func (at *AutoTrader) ExecuteDecision(d *decision.Decision) error {
 // 调用方用 errors.Is 识别后按"跳过"处理（不更新 mapping、不告警、不熔断）。
 var ErrPartialCloseSkipped = errors.New("partial close skipped (no order placed)")
 
+// deriveHalvedRetryClientOrderID 为保证金不足的减半重试生成派生幂等 ID：
+// 原 ID 追加 "h1" 后缀（超长时截断原 ID 保留后缀，按 OKX clOrdId 32 字符
+// 上限取最严格值）。初次失败单可能已在交易所留下零成交终态记录并永久占用
+// 原 clOrdId，复用原 ID 会被幂等去重挡住，导致减半重试必然拿回死单。
+func deriveHalvedRetryClientOrderID(base string) string {
+	if base == "" {
+		return ""
+	}
+	const suffix = "h1"
+	const maxLen = 32
+	if len(base)+len(suffix) > maxLen {
+		base = base[:maxLen-len(suffix)]
+	}
+	return base + suffix
+}
+
+// partialCloseQuantityStep 返回执行交易所的最小数量步长（base 资产单位），
+// 用于预判部分减仓在交易所取整后是否会退化为全平。无法精确解析时返回 0。
+func (at *AutoTrader) partialCloseQuantityStep(symbol string) float64 {
+	resolver, ok := at.trader.(ExecutionInstrumentResolver)
+	if !ok {
+		return 0
+	}
+	inst, err := resolver.ResolveExecutionInstrument(symbol)
+	if err != nil || inst == nil || inst.BaseQuantityStep <= 0 {
+		return 0
+	}
+	return inst.BaseQuantityStep
+}
+
+// guardPartialCloseQuantity 拦截"部分减仓被取整后覆盖全仓"的情况：
+// 交易所会把下单数量向上取整到最小步长（OKX 张数），当 ctVal 较大时
+// （如 ctVal=1 的币种）0.5 张上取整到 1 张即等于全平。优先用精确合约
+// 步长预判；解析不可用时回退旧的 0.02 硬阈值（兼容原行为）。
+// 接近全平（CloseRatio>=0.9）时不拦截，允许直接执行。
+func (at *AutoTrader) guardPartialCloseQuantity(symbol string, totalQuantity, closeQuantity, closeRatio float64) error {
+	if closeRatio >= 0.9 {
+		return nil
+	}
+	const stepEpsilon = 1e-9
+	if step := at.partialCloseQuantityStep(symbol); step > 0 {
+		rounded := math.Ceil(closeQuantity/step-stepEpsilon) * step
+		if rounded >= totalQuantity-stepEpsilon {
+			logger.Warnf("  ⚠️ 减仓量 %.8f 取整到步长 %.8f 后 (%.8f) 覆盖全仓 %.8f，跳过本次减仓",
+				closeQuantity, step, rounded, totalQuantity)
+			return fmt.Errorf("%w: 减仓量 %.8f 取整到步长 %.8f 后覆盖全仓 %.8f",
+				ErrPartialCloseSkipped, closeQuantity, step, totalQuantity)
+		}
+		return nil
+	}
+	// 兜底：无精确步长时沿用旧的固定阈值（约 2 张 ctVal≈0.01 的合约）
+	const minPositionForPartialClose = 0.02
+	if totalQuantity < minPositionForPartialClose {
+		logger.Warnf("  ⚠️ 仓位太小 (%.4f < %.4f)，无法按 %.0f%% 比例减仓，跳过本次操作",
+			totalQuantity, minPositionForPartialClose, closeRatio*100)
+		return fmt.Errorf("%w: 仓位 %.4f 过小无法按 %.0f%% 减仓",
+			ErrPartialCloseSkipped, totalQuantity, closeRatio*100)
+	}
+	return nil
+}
+
 // fillCopyTradeMarginMode 跟单开仓决策缺省 MarginMode 时回填交易员自身配置。
 // 缺省来源：SyncMarginMode=false（引擎主动清空）或数据源未提供模式。
 // 回填后重复仓位检查、SetMarginMode、mapping 记录、Copy Guard 保护单 tdMode
@@ -1117,8 +1178,8 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 		return fmt.Errorf("failed to get positions: %w", err)
 	}
 
-	// 检查是否为跟单操作（Reasoning 包含 "Copy trading"）
-	isCopyTrade := strings.Contains(decision.Reasoning, "Copy trading")
+	// 检查是否为跟单操作（显式 IsCopyTrade 标志；旧 Reasoning 文案匹配向后兼容）
+	isCopyTrade := decision.IsCopyTrade || strings.Contains(decision.Reasoning, "Copy trading")
 	// 检查是否为加仓操作（跟单加仓时 Reasoning 包含 "add"）
 	isAddPosition := isCopyTrade && strings.Contains(strings.ToLower(decision.Reasoning), "add")
 
@@ -1276,9 +1337,12 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 		if isCopyTrade && isInsufficientMarginError(err) {
 			retryQty := quantity * 0.5
 			retrySize := actualPositionSize * 0.5
+			// 派生幂等 ID：初次失败单可能已在交易所留下零成交终态记录并永久
+			// 占用原 clOrdId，复用原 ID 会被幂等去重挡住导致重试必然失败。
+			retryClientID := deriveHalvedRetryClientOrderID(decision.ClientOrderID)
 			logger.Warnf("  🔁 [%s] 跟单开多保证金不足，减半重试一次 | qty=%.4f→%.4f USD=%.2f→%.2f | 原err=%v",
 				decision.Symbol, quantity, retryQty, actualPositionSize, retrySize, err)
-			order2, err2 := at.openLongOrder(isCopyTrade, decision.Symbol, retryQty, decision.Leverage, decision.ClientOrderID)
+			order2, err2 := at.openLongOrder(isCopyTrade, decision.Symbol, retryQty, decision.Leverage, retryClientID)
 			if err2 != nil {
 				return fmt.Errorf("open long retry-halved failed: initial=%v retry=%v", err, err2)
 			}
@@ -1287,6 +1351,7 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 			actualPositionSize = retrySize
 			actionRecord.Quantity = quantity
 			decision.PositionSizeUSD = actualPositionSize
+			decision.ClientOrderID = retryClientID // 下游确认/对账须按实际下单 ID
 			logger.Infof("  ✓ [%s] 跟单开多减半重试成功 | qty=%.4f USD=%.2f", decision.Symbol, quantity, actualPositionSize)
 		} else {
 			return err
@@ -1336,8 +1401,8 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 		return fmt.Errorf("failed to get positions: %w", err)
 	}
 
-	// 检查是否为跟单操作（Reasoning 包含 "Copy trading"）
-	isCopyTrade := strings.Contains(decision.Reasoning, "Copy trading")
+	// 检查是否为跟单操作（显式 IsCopyTrade 标志；旧 Reasoning 文案匹配向后兼容）
+	isCopyTrade := decision.IsCopyTrade || strings.Contains(decision.Reasoning, "Copy trading")
 	// 检查是否为加仓操作（跟单加仓时 Reasoning 包含 "add"）
 	isAddPosition := isCopyTrade && strings.Contains(strings.ToLower(decision.Reasoning), "add")
 
@@ -1483,9 +1548,12 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 		if isCopyTrade && isInsufficientMarginError(err) {
 			retryQty := quantity * 0.5
 			retrySize := actualPositionSize * 0.5
+			// 派生幂等 ID：同 executeOpenLongWithRecord，避免与初次失败单共用
+			// clOrdId 被交易所幂等去重挡住。
+			retryClientID := deriveHalvedRetryClientOrderID(decision.ClientOrderID)
 			logger.Warnf("  🔁 [%s] 跟单开空保证金不足，减半重试一次 | qty=%.4f→%.4f USD=%.2f→%.2f | 原err=%v",
 				decision.Symbol, quantity, retryQty, actualPositionSize, retrySize, err)
-			order2, err2 := at.openShortOrder(isCopyTrade, decision.Symbol, retryQty, decision.Leverage, decision.ClientOrderID)
+			order2, err2 := at.openShortOrder(isCopyTrade, decision.Symbol, retryQty, decision.Leverage, retryClientID)
 			if err2 != nil {
 				return fmt.Errorf("open short retry-halved failed: initial=%v retry=%v", err, err2)
 			}
@@ -1494,6 +1562,7 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 			actualPositionSize = retrySize
 			actionRecord.Quantity = quantity
 			decision.PositionSizeUSD = actualPositionSize
+			decision.ClientOrderID = retryClientID // 下游确认/对账须按实际下单 ID
 			logger.Infof("  ✓ [%s] 跟单开空减半重试成功 | qty=%.4f USD=%.2f", decision.Symbol, quantity, actualPositionSize)
 		} else {
 			return err
@@ -1535,8 +1604,8 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 func (at *AutoTrader) executeCloseLongWithRecord(decision *decision.Decision, actionRecord *store.DecisionAction) error {
 	logger.Infof("  🔄 Close long: %s", decision.Symbol)
 
-	// 检查是否为跟单操作
-	isCopyTrade := strings.Contains(decision.Reasoning, "Copy trading")
+	// 检查是否为跟单操作（显式 IsCopyTrade 标志；旧 Reasoning 文案匹配向后兼容）
+	isCopyTrade := decision.IsCopyTrade || strings.Contains(decision.Reasoning, "Copy trading")
 
 	// Get current price
 	// 跟单模式：使用交易所自己的 API 获取价格（避免 Binance 交易对不兼容问题）
@@ -1574,8 +1643,8 @@ func (at *AutoTrader) executeCloseLongWithRecord(decision *decision.Decision, ac
 	// Get entry price and quantity from exchange API (most accurate)
 	var entryPrice float64
 	var totalQuantity float64
-	positions, err := at.trader.GetPositions()
-	if err == nil {
+	positions, posErr := at.trader.GetPositions()
+	if posErr == nil {
 		for _, pos := range positions {
 			// 根据 marginMode 精确匹配仓位
 			if pos["symbol"] == decision.Symbol && pos["side"] == "long" {
@@ -1600,22 +1669,24 @@ func (at *AutoTrader) executeCloseLongWithRecord(decision *decision.Decision, ac
 
 	// Calculate close quantity based on CloseRatio
 	closeQuantity := float64(0) // 0 = close all
-	if decision.CloseRatio > 0 && decision.CloseRatio < 1 && totalQuantity > 0 {
+	partialCloseIntent := decision.CloseRatio > 0 && decision.CloseRatio < 1
+	if partialCloseIntent {
+		// 🔒 部分减仓意图下 quantity=0 会被交易所理解为"全平"。
+		// 读仓失败或仓位未匹配时禁止带 0 下单（fail-closed 交上层重试），
+		// 否则部分减仓会静默退化成全平。全平意图（CloseRatio==0/1）保持
+		// 原有 quantity=0 语义不变。
+		if posErr != nil {
+			return fmt.Errorf("partial close requires live position data: %w", posErr)
+		}
+		if totalQuantity <= 0 {
+			return fmt.Errorf("%w: 未找到匹配的多头仓位，无法按 %.0f%% 减仓",
+				ErrPartialCloseSkipped, decision.CloseRatio*100)
+		}
 		closeQuantity = totalQuantity * decision.CloseRatio
 		logger.Infof("  📊 Partial close: %.0f%% of %.4f = %.4f", decision.CloseRatio*100, totalQuantity, closeQuantity)
 
-		// 🆕 边界检查 1：仓位太小无法按比例减仓
-		// 当仓位很小时，由于最小下单量（1张合约）约束，减仓可能导致意外全平
-		// 例如：仓位 0.01 BNB（1张），减仓50% = 0.005，但向上取整到1张 → 全平
-		// 为避免这种情况，当仓位 < 阈值且不是接近全平时，跳过减仓
-		const minPositionForPartialClose = 0.02 // 约2张合约的阈值
-		if totalQuantity < minPositionForPartialClose && decision.CloseRatio < 0.9 {
-			logger.Warnf("  ⚠️ 仓位太小 (%.4f < %.4f)，无法按 %.0f%% 比例减仓，跳过本次操作",
-				totalQuantity, minPositionForPartialClose, decision.CloseRatio*100)
-			// 返回 sentinel 错误而非 nil：伪装成功会让跟单侧误更新
-			// lastKnownSize/减仓计数并按空执行重挂止损单
-			return fmt.Errorf("%w: 仓位 %.4f 过小无法按 %.0f%% 减仓",
-				ErrPartialCloseSkipped, totalQuantity, decision.CloseRatio*100)
+		if err := at.guardPartialCloseQuantity(decision.Symbol, totalQuantity, closeQuantity, decision.CloseRatio); err != nil {
+			return err
 		}
 
 		// 🆕 边界检查 2：价值检查（仅 Hyperliquid：最小订单价值 $10 硬约束）
@@ -1665,8 +1736,8 @@ func (at *AutoTrader) executeCloseLongWithRecord(decision *decision.Decision, ac
 func (at *AutoTrader) executeCloseShortWithRecord(decision *decision.Decision, actionRecord *store.DecisionAction) error {
 	logger.Infof("  🔄 Close short: %s", decision.Symbol)
 
-	// 检查是否为跟单操作
-	isCopyTrade := strings.Contains(decision.Reasoning, "Copy trading")
+	// 检查是否为跟单操作（显式 IsCopyTrade 标志；旧 Reasoning 文案匹配向后兼容）
+	isCopyTrade := decision.IsCopyTrade || strings.Contains(decision.Reasoning, "Copy trading")
 
 	// Get current price
 	// 跟单模式：使用交易所自己的 API 获取价格（避免 Binance 交易对不兼容问题）
@@ -1704,8 +1775,8 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *decision.Decision, a
 	// Get entry price and quantity from exchange API (most accurate)
 	var entryPrice float64
 	var totalQuantity float64
-	positions, err := at.trader.GetPositions()
-	if err == nil {
+	positions, posErr := at.trader.GetPositions()
+	if posErr == nil {
 		for _, pos := range positions {
 			// 根据 marginMode 精确匹配仓位
 			if pos["symbol"] == decision.Symbol && pos["side"] == "short" {
@@ -1734,21 +1805,22 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *decision.Decision, a
 
 	// Calculate close quantity based on CloseRatio
 	closeQuantity := float64(0) // 0 = close all
-	if decision.CloseRatio > 0 && decision.CloseRatio < 1 && totalQuantity > 0 {
+	partialCloseIntent := decision.CloseRatio > 0 && decision.CloseRatio < 1
+	if partialCloseIntent {
+		// 🔒 同 executeCloseLongWithRecord：部分减仓意图下禁止带 0 下单，
+		// 读仓失败/仓位未匹配都必须 fail-closed，防止退化成全平。
+		if posErr != nil {
+			return fmt.Errorf("partial close requires live position data: %w", posErr)
+		}
+		if totalQuantity <= 0 {
+			return fmt.Errorf("%w: 未找到匹配的空头仓位，无法按 %.0f%% 减仓",
+				ErrPartialCloseSkipped, decision.CloseRatio*100)
+		}
 		closeQuantity = totalQuantity * decision.CloseRatio
 		logger.Infof("  📊 Partial close: %.0f%% of %.4f = %.4f", decision.CloseRatio*100, totalQuantity, closeQuantity)
 
-		// 🆕 边界检查 1：仓位太小无法按比例减仓
-		// 当仓位很小时，由于最小下单量（1张合约）约束，减仓可能导致意外全平
-		// 例如：仓位 0.01 BNB（1张），减仓50% = 0.005，但向上取整到1张 → 全平
-		// 为避免这种情况，当仓位 < 阈值且不是接近全平时，跳过减仓
-		const minPositionForPartialClose = 0.02 // 约2张合约的阈值
-		if totalQuantity < minPositionForPartialClose && decision.CloseRatio < 0.9 {
-			logger.Warnf("  ⚠️ 仓位太小 (%.4f < %.4f)，无法按 %.0f%% 比例减仓，跳过本次操作",
-				totalQuantity, minPositionForPartialClose, decision.CloseRatio*100)
-			// 同 executeCloseLongWithRecord：sentinel 错误，禁止伪装成功
-			return fmt.Errorf("%w: 仓位 %.4f 过小无法按 %.0f%% 减仓",
-				ErrPartialCloseSkipped, totalQuantity, decision.CloseRatio*100)
+		if err := at.guardPartialCloseQuantity(decision.Symbol, totalQuantity, closeQuantity, decision.CloseRatio); err != nil {
+			return err
 		}
 
 		// 🆕 边界检查 2：价值检查（仅 Hyperliquid：最小订单价值 $10 硬约束）
