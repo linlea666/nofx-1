@@ -439,8 +439,10 @@ type CopyConfigReq struct {
 	SyncMarginMode *bool   `json:"sync_margin_mode"` // Whether to sync margin mode (OKX: cross/isolated)
 
 	// Binance Web 凭证（仅 ProviderType=binance 时使用，明文存储）
-	BinanceP20T      string `json:"binance_p20t,omitempty"`       // 登录 cookie p20t
-	BinanceCSRFToken string `json:"binance_csrf_token,omitempty"` // CSRF header csrftoken
+	BinanceP20T        string `json:"binance_p20t,omitempty"`       // 登录 cookie p20t
+	BinanceCSRFToken   string `json:"binance_csrf_token,omitempty"` // CSRF header csrftoken
+	BinanceSourceMode  string `json:"binance_source_mode,omitempty"`
+	BinanceTopTraderID string `json:"binance_top_trader_id,omitempty"`
 
 	// Copy Guard v7 风控与 AI guarded 重入配置
 	// 字段含义详见 store.CopyTradeConfig
@@ -740,6 +742,19 @@ func (s *Server) handleCreateTrader(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "legacy_rule is retired for new traders; use ai_guarded or disabled"})
 		return
 	}
+	if req.DecisionMode == "copy_trade" && req.CopyConfig != nil {
+		candidate := &store.CopyTradeConfig{
+			ProviderType: req.CopyConfig.ProviderType, LeaderID: req.CopyConfig.LeaderID,
+			BinanceSourceMode: req.CopyConfig.BinanceSourceMode, BinanceTopTraderID: req.CopyConfig.BinanceTopTraderID,
+		}
+		if err := prepareCopyTradeSource(nil, candidate, nil); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		req.CopyConfig.LeaderID = candidate.LeaderID
+		req.CopyConfig.BinanceSourceMode = candidate.BinanceSourceMode
+		req.CopyConfig.BinanceTopTraderID = candidate.BinanceTopTraderID
+	}
 
 	// Validate leverage values
 	if req.BTCETHLeverage < 0 || req.BTCETHLeverage > 50 {
@@ -966,6 +981,12 @@ func (s *Server) handleCreateTrader(c *gin.Context) {
 		copyConfig.Enabled = false
 		copyConfig.BinanceP20T = req.CopyConfig.BinanceP20T
 		copyConfig.BinanceCSRFToken = req.CopyConfig.BinanceCSRFToken
+		copyConfig.BinanceSourceMode = req.CopyConfig.BinanceSourceMode
+		copyConfig.BinanceTopTraderID = req.CopyConfig.BinanceTopTraderID
+		if err := prepareCopyTradeSource(s.store, copyConfig, nil); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
 
 		// v3 风控字段透传（修复 bug：之前 CopyConfigReq 无 risk_* 字段，前端传值被 JSON unmarshal 静默丢弃）
 		applyCopyConfigRiskFields(copyConfig, req.CopyConfig)
@@ -1087,6 +1108,26 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Trader does not exist"})
 		return
 	}
+	if req.DecisionMode == "copy_trade" && req.CopyConfig != nil {
+		existingCopyCfg, _ := s.store.CopyTrade().GetByTraderID(traderID)
+		candidate := store.NewCopyGuardDefaults()
+		if existingCopyCfg != nil {
+			clone := *existingCopyCfg
+			candidate = &clone
+		}
+		candidate.TraderID = traderID
+		candidate.ProviderType = req.CopyConfig.ProviderType
+		candidate.LeaderID = req.CopyConfig.LeaderID
+		candidate.BinanceSourceMode = req.CopyConfig.BinanceSourceMode
+		candidate.BinanceTopTraderID = req.CopyConfig.BinanceTopTraderID
+		if err := prepareCopyTradeSource(s.store, candidate, existingCopyCfg); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		req.CopyConfig.LeaderID = candidate.LeaderID
+		req.CopyConfig.BinanceSourceMode = candidate.BinanceSourceMode
+		req.CopyConfig.BinanceTopTraderID = candidate.BinanceTopTraderID
+	}
 
 	// Set default values
 	isCrossMargin := existingTrader.IsCrossMargin // Keep original value
@@ -1195,6 +1236,8 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 			copyConfig.SyncMarginMode = syncMarginMode
 			copyConfig.BinanceP20T = resolveCredentialUpdate(req.CopyConfig.BinanceP20T, existingP20T)
 			copyConfig.BinanceCSRFToken = resolveCredentialUpdate(req.CopyConfig.BinanceCSRFToken, existingCSRF)
+			copyConfig.BinanceSourceMode = req.CopyConfig.BinanceSourceMode
+			copyConfig.BinanceTopTraderID = req.CopyConfig.BinanceTopTraderID
 
 			// v3 风控字段透传（修复 bug：之前 CopyConfigReq 无 risk_* 字段，前端传值被 JSON unmarshal 静默丢弃）
 			applyCopyConfigRiskFields(copyConfig, req.CopyConfig)
@@ -1217,6 +1260,10 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 				}
 			}
 			if err := validateAIGuardedPrerequisites(s.store, copyConfig); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+			if err := prepareCopyTradeSource(s.store, copyConfig, existingCopyCfg); err != nil {
 				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 				return
 			}
@@ -2265,8 +2312,21 @@ func (s *Server) handleGetTraderConfig(c *gin.Context) {
 				"min_trade_warn":   cfg.MinTradeWarn,
 				"max_trade_warn":   cfg.MaxTradeWarn,
 				// 凭证脱敏返回（保存路径识别掩码值为"未修改"，见 resolveCredentialUpdate）
-				"binance_p20t":       store.MaskSecret(cfg.BinanceP20T),
-				"binance_csrf_token": store.MaskSecret(cfg.BinanceCSRFToken),
+				"binance_p20t":          store.MaskSecret(cfg.BinanceP20T),
+				"binance_csrf_token":    store.MaskSecret(cfg.BinanceCSRFToken),
+				"binance_source_mode":   cfg.BinanceSourceMode,
+				"binance_top_trader_id": cfg.BinanceTopTraderID,
+				"source_generation":     cfg.SourceGeneration,
+			}
+			if health, healthErr := s.store.CopyTrade().GetSourceHealth(traderID); healthErr == nil && health != nil &&
+				health.SourceGeneration == cfg.SourceGeneration && health.LeaderID == cfg.LeaderID &&
+				health.SourceMode == cfg.BinanceSourceMode {
+				healthCopy := *health
+				healthCopy.LastError = sanitizeSourceHealthError(healthCopy.LastError)
+				if unsupported, listErr := s.store.CopyTrade().ListUnsupportedExecutionInstruments(traderID); listErr == nil {
+					healthCopy.UnsupportedContracts = unsupported
+				}
+				copyConfig["source_health"] = &healthCopy
 			}
 		}
 	}

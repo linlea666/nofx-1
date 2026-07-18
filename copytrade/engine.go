@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -54,6 +55,11 @@ type Engine struct {
 	leaderStateMu     sync.RWMutex
 	lastStateSync     time.Time
 	stateSyncInterval time.Duration
+	// smartEmptySnapshotCandidateAt is an engine-level confirmation guard that
+	// survives provider-cache uncertainty within a running process. It is used
+	// when persisted follower state exists, including the first poll after a
+	// process restart where provider memory has no previous position count.
+	smartEmptySnapshotCandidateAt time.Time
 	// lastBaselineRefresh 限频 refreshEstimatedBaselines（每分钟一次）
 	lastBaselineRefresh time.Time
 
@@ -325,6 +331,34 @@ func (e *Engine) InitIgnoredPositions() error {
 		return fmt.Errorf("store not initialized")
 	}
 
+	if e.isSmartMoneyMode() {
+		generation := e.config.SourceGeneration
+		if generation <= 0 {
+			generation = 1
+		}
+		complete, err := e.store.CopyTrade().IsSourceBaselineComplete(e.traderID, e.config.LeaderID, string(e.config.BinanceSourceMode), generation)
+		if err != nil {
+			return fmt.Errorf("查询 Smart Money 来源基线失败: %w", err)
+		}
+		if complete {
+			logger.Infof("📊 [%s] Smart Money 来源代次 %d 已完成首次基线，跳过重复初始化", e.traderID, generation)
+			return nil
+		}
+		state, err := e.provider.GetAccountState(e.config.LeaderID)
+		if err != nil {
+			e.recordSmartMoneySourceHealth()
+			e.reportBinanceCredentialsExpired(err, "InitIgnoredPositions")
+			return fmt.Errorf("获取 Smart Money 首次完整仓位失败: %w", err)
+		}
+		e.recordSmartMoneySourceHealth()
+		positions := sourceBaselinePositions(state)
+		if err := e.store.CopyTrade().InitializeSourceBaseline(e.traderID, e.config.LeaderID, string(e.config.BinanceSourceMode), generation, positions); err != nil {
+			return fmt.Errorf("原子写入 Smart Money 首次基线失败: %w", err)
+		}
+		logger.Infof("✅ [%s] Smart Money 来源代次 %d 首次基线完成 | 持仓=%d", e.traderID, generation, len(positions))
+		return nil
+	}
+
 	hasMappings, err := e.store.CopyTrade().HasMappingsForLeader(e.traderID, e.config.LeaderID)
 	if err != nil {
 		return fmt.Errorf("查询已有映射失败: %w", err)
@@ -337,9 +371,11 @@ func (e *Engine) InitIgnoredPositions() error {
 	// 获取领航员当前所有持仓
 	state, err := e.provider.GetAccountState(e.config.LeaderID)
 	if err != nil {
+		e.recordSmartMoneySourceHealth()
 		e.reportBinanceCredentialsExpired(err, "InitIgnoredPositions")
 		return fmt.Errorf("获取领航员持仓失败: %w", err)
 	}
+	e.recordSmartMoneySourceHealth()
 
 	if state == nil || len(state.Positions) == 0 {
 		logger.Infof("📊 [%s] 领航员当前无持仓，无需标记历史仓位", e.traderID)
@@ -377,6 +413,225 @@ func (e *Engine) InitIgnoredPositions() error {
 	}
 
 	logger.Infof("✅ [%s] 历史仓位初始化完成 | 共标记 %d 个仓位为 ignored", e.traderID, ignoredCount)
+	return nil
+}
+
+func sourceBaselinePositions(state *AccountState) []store.CopyTradeBaselinePosition {
+	if state == nil {
+		return nil
+	}
+	positions := make([]store.CopyTradeBaselinePosition, 0, len(state.Positions))
+	for key, position := range state.Positions {
+		if position == nil || position.Size <= 0 {
+			continue
+		}
+		posID := position.PosID
+		if posID == "" {
+			posID = key
+		}
+		positions = append(positions, store.CopyTradeBaselinePosition{
+			LeaderPosID: posID, Symbol: position.Symbol, Side: string(position.Side), MarginMode: position.MarginMode, Size: position.Size,
+		})
+	}
+	return positions
+}
+
+func (e *Engine) isSmartMoneyMode() bool {
+	return e.config != nil &&
+		e.config.ProviderType == ProviderBinance &&
+		e.config.BinanceSourceMode == BinanceSourceSmartMoney
+}
+
+// recordSmartMoneySourceHealth persists the provider observation and owns the
+// notification edge. It returns true only when a previously unhealthy source
+// recovered with a complete snapshot.
+func (e *Engine) recordSmartMoneySourceHealth() bool {
+	if !e.isSmartMoneyMode() || e.store == nil {
+		return false
+	}
+	provider, ok := e.provider.(SourceHealthObservationProvider)
+	if !ok {
+		return false
+	}
+	obs := provider.LastSourceHealthObservation()
+	if obs.CheckedAt.IsZero() {
+		return false
+	}
+	generation := e.config.SourceGeneration
+	if generation <= 0 {
+		generation = 1
+	}
+	health, transitioned, err := e.store.CopyTrade().RecordSourceHealthObservation(
+		e.traderID,
+		e.config.LeaderID,
+		string(e.config.BinanceSourceMode),
+		generation,
+		store.SourceHealthObservation{
+			Status:           obs.Status,
+			TraderName:       obs.TraderName,
+			Error:            obs.Error,
+			CompleteSnapshot: obs.CompleteSnapshot,
+			CheckedAt:        obs.CheckedAt,
+		},
+	)
+	if err != nil {
+		logger.Warnf("⚠️ [%s] 保存 Smart Money 数据源健康状态失败: %v", e.traderID, err)
+		return false
+	}
+
+	recovered := transitioned && health.Status == store.SourceHealthHealthy && health.PreviousStatus != ""
+	now := time.Now()
+	shouldNotify := recovered || health.Status != store.SourceHealthHealthy &&
+		(transitioned || health.LastNotifiedAt == nil || now.Sub(*health.LastNotifiedAt) >= time.Hour)
+	// AUTH_FAILED already uses the global Binance credential notification, which
+	// lists every affected trader. Persist it here but avoid sending a duplicate.
+	if shouldNotify && health.Status != store.SourceHealthAuthFailed {
+		e.notifySmartMoneySourceHealth(health, recovered, now)
+		if err := e.store.CopyTrade().MarkSourceHealthNotified(e.traderID, now); err != nil {
+			logger.Warnf("⚠️ [%s] 更新 Smart Money 健康状态通知时间失败: %v", e.traderID, err)
+		}
+	}
+	return recovered
+}
+
+func (e *Engine) notifySmartMoneySourceHealth(health *store.CopyTradeSourceHealth, recovered bool, now time.Time) {
+	if health == nil {
+		return
+	}
+	traderName := e.traderID
+	executionExchange := "unknown"
+	activeMappings := "none"
+	protectionSummary := "none"
+	if e.store != nil {
+		traderName = e.store.Trader().ResolveDisplayName(e.traderID)
+		if configuredTrader, err := e.store.Trader().GetByID(e.traderID); err == nil && configuredTrader.ExchangeID != "" {
+			executionExchange = configuredTrader.ExchangeID
+		}
+		if mappings, err := e.store.CopyTrade().ListActiveMappings(e.traderID); err == nil && len(mappings) > 0 {
+			parts := make([]string, 0, len(mappings))
+			for _, mapping := range mappings {
+				if mapping == nil {
+					continue
+				}
+				sourceSymbol := mapping.SourceSymbol
+				if sourceSymbol == "" {
+					sourceSymbol = mapping.Symbol
+				}
+				executionSymbol := mapping.ExecutionSymbol
+				if executionSymbol == "" {
+					executionSymbol = mapping.Symbol
+				}
+				parts = append(parts, fmt.Sprintf("%s/%s->%s", sourceSymbol, mapping.Side, executionSymbol))
+			}
+			if len(parts) > 0 {
+				activeMappings = strings.Join(parts, ", ")
+			}
+		}
+		if orders, err := e.store.CopyTrade().ListActiveCopyGuardProtectiveOrders(e.traderID); err == nil && len(orders) > 0 {
+			pending := 0
+			for _, order := range orders {
+				if order.ReplacementPending {
+					pending++
+				}
+			}
+			protectionSummary = fmt.Sprintf("%d active, %d replacement pending", len(orders), pending)
+		}
+	}
+	title := fmt.Sprintf("Binance 公开领航员数据源已冻结（%s）", health.Status)
+	severity := store.CopyEventSeverityError
+	status := "failed"
+	if recovered {
+		title = "Binance 公开领航员数据源已恢复"
+		severity = store.CopyEventSeverityInfo
+		status = "success"
+	}
+	lastComplete := "从未完整同步"
+	if health.LastCompleteSnapshotAt != nil {
+		lastComplete = health.LastCompleteSnapshotAt.Format(time.RFC3339)
+	}
+	body := fmt.Sprintf("领航员: %s (%s)\n交易员: %s\n执行交易所: %s\n状态: %s\n最后完整快照: %s\n活动映射: %s\n保护状态: %s\n连续失败: %d\n原因: %s\n处理: 冻结新开/加仓/减仓/平仓同步，已有仓位 Copy Guard 继续运行，不会把数据不可见视为全平。",
+		health.TraderName, health.LeaderID, traderName, executionExchange, health.Status, lastComplete, activeMappings, protectionSummary, health.ConsecutiveFailures, health.LastError)
+	if recovered {
+		body = fmt.Sprintf("领航员: %s (%s)\n交易员: %s\n执行交易所: %s\n状态: HEALTHY\n完整快照: %s\n活动映射: %s\n保护状态: %s\n处理: 私密期间的减仓/平仓会立即同步；新仓/加仓只重建基线，不追单。",
+			health.TraderName, health.LeaderID, traderName, executionExchange, lastComplete, activeMappings, protectionSummary)
+	}
+	bucket := now.Unix() / 3600
+	dedup := fmt.Sprintf("source_health|%s|%s|%d", e.traderID, health.Status, bucket)
+	if recovered {
+		dedup = fmt.Sprintf("source_health|%s|recovered|%d", e.traderID, now.Unix())
+	}
+	notifier.Notify(notifier.Alert{
+		Time: now, Category: "copy_trade", TraderID: e.traderID, TraderName: traderName,
+		Title: title, Body: body, RateKey: dedup, DedupKey: dedup,
+		Fields: map[string]string{"LeaderID": health.LeaderID, "ExecutionExchange": executionExchange, "SourceStatus": health.Status, "LastCompleteSnapshot": lastComplete, "ActiveMappings": activeMappings, "Protection": protectionSummary},
+	})
+	if err := e.store.CopyTrade().LogCopyEvent(&store.CopyTradeEvent{
+		TraderID: e.traderID, LeaderID: health.LeaderID, ProviderType: string(ProviderBinance),
+		Category: store.CopyEventCategoryError, EventType: "SOURCE_HEALTH_" + health.Status,
+		Severity: severity, Status: status, Summary: title,
+		Detail:   map[string]interface{}{"source_mode": health.SourceMode, "last_complete_snapshot": lastComplete, "consecutive_failures": health.ConsecutiveFailures, "error": health.LastError},
+		DedupKey: dedup, CreatedAt: now,
+	}); err != nil {
+		logger.Warnf("⚠️ [%s] 保存 Smart Money 健康状态事件失败: %v", e.traderID, err)
+	}
+}
+
+// rebaselineSmartMoneyRecovery deliberately absorbs only risk-increasing
+// changes that happened while the source was hidden. Existing mappings keep
+// their old size when the leader reduced or closed, so the next snapshot emits
+// the required risk-reducing action.
+func (e *Engine) rebaselineSmartMoneyRecovery(state *AccountState) error {
+	if !e.isSmartMoneyMode() || e.store == nil || state == nil {
+		return nil
+	}
+	if err := e.store.CopyTrade().RebaselineSourceRecovery(e.traderID, e.config.LeaderID, sourceBaselinePositions(state)); err != nil {
+		return fmt.Errorf("Smart Money 恢复基线事务失败: %w", err)
+	}
+	return nil
+}
+
+func (e *Engine) smartMoneyRecoveryRequired(checkedAt time.Time) (bool, error) {
+	if !e.isSmartMoneyMode() || e.store == nil {
+		return false, nil
+	}
+	health, err := e.store.CopyTrade().GetSourceHealth(e.traderID)
+	if err != nil {
+		return false, err
+	}
+	if health == nil {
+		return false, nil
+	}
+	if health.Status != store.SourceHealthHealthy || health.LastCompleteSnapshotAt == nil {
+		return true, nil
+	}
+	return checkedAt.Sub(*health.LastCompleteSnapshotAt) > time.Minute, nil
+}
+
+func (e *Engine) confirmSmartMoneyEmptySnapshot(state *AccountState, now time.Time) error {
+	if !e.isSmartMoneyMode() || e.store == nil || state == nil || len(state.Positions) > 0 {
+		e.smartEmptySnapshotCandidateAt = time.Time{}
+		return nil
+	}
+	if state.EmptySnapshotConfirmed {
+		e.smartEmptySnapshotCandidateAt = time.Time{}
+		return nil
+	}
+	live, err := e.store.CopyTrade().HasLiveSourceState(e.traderID)
+	if err != nil {
+		return fmt.Errorf("check persisted follower state before accepting empty Smart Money snapshot: %w", err)
+	}
+	if !live {
+		e.smartEmptySnapshotCandidateAt = time.Time{}
+		return nil
+	}
+	if e.smartEmptySnapshotCandidateAt.IsZero() {
+		e.smartEmptySnapshotCandidateAt = now
+		return ErrBinanceSmartMoneyEmptyUnconfirmed
+	}
+	if now.Sub(e.smartEmptySnapshotCandidateAt) < smartMoneyEmptyConfirmDelay {
+		return ErrBinanceSmartMoneyEmptyUnconfirmed
+	}
+	e.smartEmptySnapshotCandidateAt = time.Time{}
 	return nil
 }
 
@@ -664,7 +919,15 @@ func (e *Engine) detectBinancePositionSnapshotFills() []Fill {
 			continue
 		}
 		if mapping == nil {
-			fills = append(fills, e.buildBinanceSnapshotFill(posID, pos.Symbol, pos.Side, ActionOpen, pos.Size, e.positionSignalPrice(pos), 0, pos.Size))
+			revision := int64(0)
+			if e.isSmartMoneyMode() {
+				revision, err = e.store.CopyTrade().GetSourceSnapshotRevision(e.traderID, posID)
+				if err != nil {
+					logger.Warnf("⚠️ [%s] Smart Money 查询快照修订号失败: %v (posId=%s)", e.traderID, err, posID)
+					continue
+				}
+			}
+			fills = append(fills, e.buildBinanceSnapshotFillForPosition(pos, posID, ActionOpen, pos.Size, 0, pos.Size, revision))
 			continue
 		}
 		if mapping.Status == "ignored" {
@@ -678,14 +941,14 @@ func (e *Engine) detectBinancePositionSnapshotFills() []Fill {
 		lastKnownSize := mapping.LastKnownSize
 		if pos.Size > lastKnownSize+binancePositionSizeEpsilon {
 			sizeDelta := pos.Size - lastKnownSize
-			fills = append(fills, e.buildBinanceSnapshotFill(posID, pos.Symbol, pos.Side, ActionAdd, sizeDelta, e.positionSignalPrice(pos), lastKnownSize, pos.Size))
+			fills = append(fills, e.buildBinanceSnapshotFillForPosition(pos, posID, ActionAdd, sizeDelta, lastKnownSize, pos.Size, mapping.SourceRevision))
 		} else if lastKnownSize > pos.Size+binancePositionSizeEpsilon {
 			sizeDelta := lastKnownSize - pos.Size
 			action := ActionReduce
 			if pos.Size < lastKnownSize*NearZeroThreshold {
 				action = ActionClose
 			}
-			fills = append(fills, e.buildBinanceSnapshotFill(posID, pos.Symbol, pos.Side, action, sizeDelta, e.positionSignalPrice(pos), lastKnownSize, pos.Size))
+			fills = append(fills, e.buildBinanceSnapshotFillForPosition(pos, posID, action, sizeDelta, lastKnownSize, pos.Size, mapping.SourceRevision))
 		}
 	}
 
@@ -710,13 +973,60 @@ func (e *Engine) detectBinancePositionSnapshotFills() []Fill {
 			e.binanceCloseSignalPrice(mapping),
 			mapping.LastKnownSize,
 			0,
+			mapping.SourceRevision,
 		))
 	}
 
+	sort.Slice(fills, func(i, j int) bool {
+		leftPriority := binanceSnapshotActionPriority(fills[i].Action)
+		rightPriority := binanceSnapshotActionPriority(fills[j].Action)
+		if leftPriority != rightPriority {
+			return leftPriority < rightPriority
+		}
+		if fills[i].Symbol != fills[j].Symbol {
+			return fills[i].Symbol < fills[j].Symbol
+		}
+		if fills[i].PositionSide != fills[j].PositionSide {
+			return fills[i].PositionSide < fills[j].PositionSide
+		}
+		return fills[i].ID < fills[j].ID
+	})
 	return fills
 }
 
-func (e *Engine) buildBinanceSnapshotFill(posID, symbol string, side SideType, action ActionType, size, price, previousSize, currentSize float64) Fill {
+func binanceSnapshotActionPriority(action ActionType) int {
+	switch action {
+	case ActionClose:
+		return 0
+	case ActionReduce:
+		return 1
+	case ActionOpen:
+		return 2
+	case ActionAdd:
+		return 3
+	default:
+		return 4
+	}
+}
+
+func (e *Engine) buildBinanceSnapshotFillForPosition(pos *Position, posID string, action ActionType, size, previousSize, currentSize float64, sourceRevision int64) Fill {
+	fill := e.buildBinanceSnapshotFill(posID, pos.Symbol, pos.Side, action, size, e.positionSignalPrice(pos), previousSize, currentSize, sourceRevision)
+	if !e.isSmartMoneyMode() || pos == nil {
+		return fill
+	}
+	fill.RawValue = math.Abs(size * fill.Price)
+	fill.ValueCurrency = pos.ValueCurrency
+	fill.ValueUSDValid = pos.ValueUSDValid
+	fill.ValueError = pos.ValueError
+	if pos.ValueUSDValid && pos.RawPositionValue > 0 && pos.PositionValue > 0 {
+		fill.Value = fill.RawValue * (pos.PositionValue / pos.RawPositionValue)
+	} else {
+		fill.Value = 0
+	}
+	return fill
+}
+
+func (e *Engine) buildBinanceSnapshotFill(posID, symbol string, side SideType, action ActionType, size, price, previousSize, currentSize float64, sourceRevision int64) Fill {
 	if size < 0 {
 		size = -size
 	}
@@ -733,9 +1043,20 @@ func (e *Engine) buildBinanceSnapshotFill(posID, symbol string, side SideType, a
 		tradeSide = "sell"
 	}
 
+	fillID := fmt.Sprintf("binance_snapshot|%s|%s|%.8f|%.8f",
+		posID, action, previousSize, currentSize)
+	if e.isSmartMoneyMode() {
+		// Smart Money synthesizes signals from current-position snapshots, so
+		// the same numeric transition can legitimately recur. The persisted
+		// acknowledgement revision stays stable across a crash/retry and only
+		// advances after the prior transition is accepted. Source generation
+		// also prevents identity reuse after a configured source change.
+		fillID = fmt.Sprintf("binance_snapshot|smart|g%d|r%d|%s|%s|%.8f|%.8f",
+			e.config.SourceGeneration, sourceRevision, posID, action, previousSize, currentSize)
+	}
+
 	return Fill{
-		ID: fmt.Sprintf("binance_snapshot|%s|%s|%.8f|%.8f",
-			posID, action, previousSize, currentSize),
+		ID:           fillID,
 		Symbol:       symbol,
 		Side:         tradeSide,
 		PositionSide: side,
@@ -832,12 +1153,16 @@ func binanceHistorySideMatches(raw string, side SideType) bool {
 
 // SignalMatchResult 信号匹配结果
 type SignalMatchResult struct {
-	ShouldFollow   bool       // 是否跟随
-	Reason         string     // 原因
-	Action         ActionType // 实际动作类型
-	PosID          string     // 领航员仓位 ID
-	MarginMode     string     // 保证金模式
-	LeaderPosition *Position  // 领航员仓位（可能为 nil，表示已平仓）
+	ShouldFollow         bool       // 是否跟随
+	Reason               string     // 原因
+	Action               ActionType // 实际动作类型
+	PosID                string     // 领航员仓位 ID
+	MarginMode           string     // 保证金模式
+	LeaderPosition       *Position  // 领航员仓位（可能为 nil，表示已平仓）
+	SourceSymbol         string     // 活动映射保存的源合约
+	ExecutionSymbol      string     // 活动映射保存的精确执行合约
+	SourceQuoteAsset     string     // 源合约报价币种
+	ExecutionSettleAsset string     // 执行合约结算币种
 }
 
 // matchSignalWithMapping 统一信号匹配（核心方法）
@@ -871,7 +1196,22 @@ func (e *Engine) matchSignalWithMapping(signal *TradeSignal) *SignalMatchResult 
 	// ============================================================
 	// 场景 2: 减仓/平仓信号（反向查找法）
 	// ============================================================
-	return e.matchCloseReduceSignal(signal, leaderPosMap)
+	result := e.matchCloseReduceSignal(signal, leaderPosMap)
+	if result.ShouldFollow && result.PosID != "" {
+		mapping, err := e.store.CopyTrade().GetMapping(e.traderID, result.PosID)
+		if err != nil {
+			logger.Warnf("⚠️ [%s] 查询风险降低执行合约映射失败: %v", e.traderID, err)
+		} else if mapping != nil && mapping.Status == store.MappingStatusActive {
+			result.SourceSymbol = mapping.SourceSymbol
+			if result.SourceSymbol == "" {
+				result.SourceSymbol = mapping.Symbol
+			}
+			result.ExecutionSymbol = mapping.ExecutionSymbol
+			result.SourceQuoteAsset = mapping.SourceQuoteAsset
+			result.ExecutionSettleAsset = mapping.ExecutionSettleAsset
+		}
+	}
+	return result
 }
 
 // buildLeaderPosMap 构建领航员持仓映射 (posId -> Position)
@@ -1057,12 +1397,16 @@ func (e *Engine) matchOpenAddSignal(signal *TradeSignal, leaderPosMap map[string
 		logger.Infof("📊 [%s] 精确匹配加仓 | posId=%s mgnMode=%s size增加=%.4f → 跟随加仓",
 			e.traderID, posID, addMapping.MarginMode, maxSizeIncrease)
 		return &SignalMatchResult{
-			ShouldFollow:   true,
-			Reason:         fmt.Sprintf("已跟随仓位(posId=%s)，加仓", posID),
-			Action:         ActionAdd,
-			PosID:          posID,
-			MarginMode:     addMapping.MarginMode,
-			LeaderPosition: addPosition,
+			ShouldFollow:         true,
+			Reason:               fmt.Sprintf("已跟随仓位(posId=%s)，加仓", posID),
+			Action:               ActionAdd,
+			PosID:                posID,
+			MarginMode:           addMapping.MarginMode,
+			LeaderPosition:       addPosition,
+			SourceSymbol:         addMapping.SourceSymbol,
+			ExecutionSymbol:      addMapping.ExecutionSymbol,
+			SourceQuoteAsset:     addMapping.SourceQuoteAsset,
+			ExecutionSettleAsset: addMapping.ExecutionSettleAsset,
 		}
 	}
 
@@ -1112,12 +1456,16 @@ func (e *Engine) matchOpenAddSignal(signal *TradeSignal, leaderPosMap map[string
 		logger.Infof("📊 [%s] 唯一 active 仓位 | posId=%s status=active → 加仓",
 			e.traderID, posID)
 		return &SignalMatchResult{
-			ShouldFollow:   true,
-			Reason:         fmt.Sprintf("已跟随仓位(posId=%s)，加仓", posID),
-			Action:         ActionAdd,
-			PosID:          posID,
-			MarginMode:     singleActiveMapping.MarginMode,
-			LeaderPosition: singleActivePos,
+			ShouldFollow:         true,
+			Reason:               fmt.Sprintf("已跟随仓位(posId=%s)，加仓", posID),
+			Action:               ActionAdd,
+			PosID:                posID,
+			MarginMode:           singleActiveMapping.MarginMode,
+			LeaderPosition:       singleActivePos,
+			SourceSymbol:         singleActiveMapping.SourceSymbol,
+			ExecutionSymbol:      singleActiveMapping.ExecutionSymbol,
+			SourceQuoteAsset:     singleActiveMapping.SourceQuoteAsset,
+			ExecutionSettleAsset: singleActiveMapping.ExecutionSettleAsset,
 		}
 	}
 
@@ -1287,6 +1635,15 @@ func (e *Engine) processSignal(signal *TradeSignal) {
 	// ========================================
 	if err := e.syncLeaderState(); err != nil {
 		logger.Warnf("⚠️ [%s] 领航员状态同步失败: %v", e.traderID, err)
+		if e.isSmartMoneyMode() {
+			// The snapshot may have been generated immediately before the leader
+			// hid positions or the credential expired. Never process it against
+			// cached state; release the dedup key so a complete healthy snapshot
+			// can replay the risk-reducing change after recovery.
+			e.UnmarkSeen(fill.ID)
+			e.stats.SignalsSkipped++
+			return
+		}
 	}
 
 	// 重新构建 signal 以获取最新的 LeaderEquity
@@ -1308,6 +1665,10 @@ func (e *Engine) processSignal(signal *TradeSignal) {
 	// 回填匹配结果到 signal（供后续逻辑使用）
 	signal.LeaderPosID = matchResult.PosID
 	signal.LeaderPosition = matchResult.LeaderPosition
+	if e.blockInvalidSmartMoneyRiskIncrease(signal, matchResult) {
+		e.stats.SignalsSkipped++
+		return
+	}
 
 	// ========================================
 	// Step 3: 计算跟单仓位（基于持仓变化量）
@@ -1395,6 +1756,67 @@ func (e *Engine) processSignal(signal *TradeSignal) {
 	}
 }
 
+// blockInvalidSmartMoneyRiskIncrease enforces the value/conversion fail-closed
+// boundary. A missing catalog entry or FX rate can never authorize an open or
+// add, while reduce/close remains available from the persisted exact mapping.
+func (e *Engine) blockInvalidSmartMoneyRiskIncrease(signal *TradeSignal, match *SignalMatchResult) bool {
+	if !e.isSmartMoneyMode() || signal == nil || signal.Fill == nil || match == nil {
+		return false
+	}
+	if match.Action != ActionOpen && match.Action != ActionAdd {
+		return false
+	}
+	fill := signal.Fill
+	if fill.ValueUSDValid && fill.Value > 0 {
+		return false
+	}
+	reason := strings.TrimSpace(fill.ValueError)
+	if reason == "" {
+		reason = "USD value conversion is unavailable"
+	}
+	logger.Warnf("🚫 [%s] Smart Money 禁止风险增加 | %s %s | %s", e.traderID, match.Action, fill.Symbol, reason)
+
+	if e.store != nil && match.LeaderPosition != nil {
+		pos := match.LeaderPosition
+		mapping, err := e.store.CopyTrade().GetMapping(e.traderID, match.PosID)
+		if err != nil {
+			logger.Warnf("⚠️ [%s] 查询 Smart Money 基线映射失败: %v", e.traderID, err)
+		} else if mapping == nil || mapping.Status == store.MappingStatusClosed {
+			if err := e.store.CopyTrade().RebaselineIgnoredPosition(e.traderID, e.config.LeaderID, match.PosID, pos.Symbol, string(pos.Side), pos.MarginMode, pos.Size); err != nil {
+				logger.Warnf("⚠️ [%s] 保存 Smart Money 已跳过仓位基线失败: %v", e.traderID, err)
+			}
+		} else if mapping.Status == store.MappingStatusActive && pos.Size > mapping.LastKnownSize {
+			if err := e.store.CopyTrade().UpdateLastKnownSize(e.traderID, match.PosID, pos.Size); err != nil {
+				logger.Warnf("⚠️ [%s] 更新 Smart Money 已跳过加仓基线失败: %v", e.traderID, err)
+			}
+		}
+	}
+
+	traderName := e.traderID
+	if e.store != nil {
+		traderName = e.store.Trader().ResolveDisplayName(e.traderID)
+	}
+	dedup := fmt.Sprintf("smart_money_value|%s|%s|%s|%d", e.traderID, fill.Symbol, match.Action, time.Now().Unix()/3600)
+	notifier.Notify(notifier.Alert{
+		Time: time.Now(), Category: "copy_trade", TraderID: e.traderID, TraderName: traderName,
+		Title:   fmt.Sprintf("Smart Money 已跳过 %s 风险增加", fill.Symbol),
+		Body:    fmt.Sprintf("领航员: %s\n合约: %s\n动作: %s\n原因: %s\n处理: 本次不开仓/不加仓并重建基线；后续减仓、平仓仍允许。", e.config.LeaderID, fill.Symbol, match.Action, reason),
+		RateKey: dedup, DedupKey: dedup,
+	})
+	if e.store != nil {
+		if err := e.store.CopyTrade().LogCopyEvent(&store.CopyTradeEvent{
+			TraderID: e.traderID, LeaderID: e.config.LeaderID, ProviderType: string(ProviderBinance),
+			Category: store.CopyEventCategoryError, EventType: "SOURCE_VALUE_UNAVAILABLE",
+			Severity: store.CopyEventSeverityWarn, Symbol: fill.Symbol, Side: string(fill.PositionSide), LeaderPosID: match.PosID,
+			SignalID: fill.ID, Status: "skipped", Summary: "Smart Money 风险增加因合约目录或汇率不可用被拒绝",
+			Detail: map[string]interface{}{"action": match.Action, "value_currency": fill.ValueCurrency, "reason": reason}, DedupKey: dedup,
+		}); err != nil {
+			logger.Warnf("⚠️ [%s] 保存 Smart Money 价值异常事件失败: %v", e.traderID, err)
+		}
+	}
+	return true
+}
+
 // buildDecisionV2 构建决策（使用统一匹配结果）
 func (e *Engine) buildDecisionV2(signal *TradeSignal, match *SignalMatchResult, copySize float64) decision.Decision {
 	fill := signal.Fill
@@ -1414,6 +1836,16 @@ func (e *Engine) buildDecisionV2(signal *TradeSignal, match *SignalMatchResult, 
 		LeaderPosSize: leaderPosSize,    // 传递领航员当前持仓数量
 		MarginMode:    match.MarginMode, // 直接使用匹配结果中的 marginMode
 		SourceFillID:  fill.ID,          // 执行瞬态失败时用于释放去重标记重放
+		SourceSymbol:  fill.Symbol,
+		ValueCurrency: fill.ValueCurrency,
+	}
+	if match.SourceSymbol != "" {
+		dec.SourceSymbol = match.SourceSymbol
+	}
+	dec.ExecutionSymbol = match.ExecutionSymbol
+	dec.ExecutionSettleAsset = match.ExecutionSettleAsset
+	if dec.ValueCurrency == "" {
+		dec.ValueCurrency = match.SourceQuoteAsset
 	}
 
 	// SyncMarginMode=false：新开仓不同步领航员的全仓/逐仓模式，
@@ -1634,7 +2066,7 @@ func (e *Engine) calculateCopySizeByPositionChange(signal *TradeSignal, match *S
 	// 让网络抖动等临时失败不会回退到错误量纲。
 	leaderEquity := signal.LeaderEquity
 	anchorSource := "leader_equity"
-	if e.config.ProviderType == ProviderBinance {
+	if e.config.ProviderType == ProviderBinance && e.config.BinanceSourceMode != BinanceSourceSmartMoney {
 		anchorEquity, src, anchorErr := e.resolveBinanceAnchorEquity()
 		if anchorErr == nil && anchorEquity > 0 {
 			leaderEquity = anchorEquity
@@ -1676,8 +2108,14 @@ func (e *Engine) calculateCopySizeByPositionChange(signal *TradeSignal, match *S
 		return 0, warnings
 	}
 
-	// 跟随者账户权益
+	// Smart Money sizing is defined against total follower equity, not
+	// available balance. Existing providers keep their historical balance
+	// anchor for backward compatibility; only the new source uses the explicit
+	// equity callback injected by TraderIntegration.
 	followerEquity := e.getFollowerBalance()
+	if e.isSmartMoneyMode() && e.getFollowerEquity != nil {
+		followerEquity = e.getFollowerEquity()
+	}
 	if followerEquity <= 0 {
 		warnings = append(warnings, Warning{
 			Timestamp: time.Now(),
@@ -2071,9 +2509,29 @@ Following leader's %s action on %s.
 func (e *Engine) syncLeaderState() error {
 	state, err := e.provider.GetAccountState(e.config.LeaderID)
 	if err != nil {
+		e.recordSmartMoneySourceHealth()
 		e.reportBinanceCredentialsExpired(err, "syncLeaderState")
 		return err
 	}
+	checkedAt := time.Now()
+	if state != nil && !state.Timestamp.IsZero() {
+		checkedAt = state.Timestamp
+	}
+	if err := e.confirmSmartMoneyEmptySnapshot(state, checkedAt); err != nil {
+		return err
+	}
+	recoveryRequired, err := e.smartMoneyRecoveryRequired(checkedAt)
+	if err != nil {
+		return fmt.Errorf("check Smart Money recovery state: %w", err)
+	}
+	if recoveryRequired {
+		if err := e.rebaselineSmartMoneyRecovery(state); err != nil {
+			// Do not persist the provider's HEALTHY observation or install this
+			// snapshot until every no-chase baseline write succeeds atomically.
+			return err
+		}
+	}
+	e.recordSmartMoneySourceHealth()
 
 	e.leaderStateMu.Lock()
 	e.leaderState = state

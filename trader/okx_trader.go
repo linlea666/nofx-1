@@ -278,14 +278,22 @@ type OKXTrader struct {
 
 // OKXInstrument OKX instrument info
 type OKXInstrument struct {
-	InstID   string  // Instrument ID
-	CtVal    float64 // Contract value
-	CtMult   float64 // Contract multiplier
-	LotSz    float64 // Minimum order size
-	MinSz    float64 // Minimum order size
-	MaxMktSz float64 // Maximum market order size
-	TickSz   float64 // Minimum price increment
-	CtType   string  // Contract type
+	InstID     string  // Instrument ID
+	InstType   string  // Instrument type (SWAP)
+	CtVal      float64 // Contract value
+	CtMult     float64 // Contract multiplier
+	LotSz      float64 // Minimum order size
+	MinSz      float64 // Minimum order size
+	MaxMktSz   float64 // Maximum market order size
+	TickSz     float64 // Minimum price increment
+	CtType     string  // Contract type
+	State      string
+	BaseCcy    string
+	QuoteCcy   string
+	SettleCcy  string
+	CtValCcy   string
+	Uly        string
+	InstFamily string
 }
 
 // OKXResponse OKX API response
@@ -420,9 +428,78 @@ func (t *OKXTrader) doRequest(method, path string, body interface{}) ([]byte, er
 // convertSymbol converts generic symbol to OKX format
 // e.g. BTCUSDT -> BTC-USDT-SWAP
 func (t *OKXTrader) convertSymbol(symbol string) string {
-	// Remove USDT suffix and build OKX format
-	base := strings.TrimSuffix(symbol, "USDT")
-	return fmt.Sprintf("%s-USDT-SWAP", base)
+	instID, _, _, err := parseOKXExecutionSymbol(symbol)
+	if err != nil {
+		return strings.ToUpper(strings.TrimSpace(symbol))
+	}
+	return instID
+}
+
+func parseOKXExecutionSymbol(symbol string) (instID, base, quote string, err error) {
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	parts := strings.Split(symbol, "-")
+	if len(parts) == 3 && parts[2] == "SWAP" && parts[0] != "" && parts[1] != "" {
+		return symbol, parts[0], parts[1], nil
+	}
+	for _, candidate := range []string{"USDT", "USDC", "USD1"} {
+		if strings.HasSuffix(symbol, candidate) && len(symbol) > len(candidate) {
+			base = strings.TrimSuffix(symbol, candidate)
+			return fmt.Sprintf("%s-%s-SWAP", base, candidate), base, candidate, nil
+		}
+	}
+	return "", "", "", fmt.Errorf("%w: cannot determine exact quote asset for %s", ErrExecutionInstrumentUnsupported, symbol)
+}
+
+func (t *OKXTrader) ResolveExecutionInstrument(symbol string) (*ExecutionInstrument, error) {
+	instID, base, quote, err := parseOKXExecutionSymbol(symbol)
+	if err != nil {
+		return nil, err
+	}
+	inst, err := t.getInstrument(symbol)
+	if err != nil {
+		return nil, fmt.Errorf("%w: OKX %s: %v", ErrExecutionInstrumentUnsupported, instID, err)
+	}
+	if !okxSwapCatalogIdentityMatches(inst, instID, base, quote) {
+		return nil, fmt.Errorf("%w: OKX catalog identity mismatch for %s (type=%s state=%s base=%s quote=%s settle=%s ctValCcy=%s uly=%s family=%s)",
+			ErrExecutionInstrumentUnsupported, instID, inst.InstType, inst.State, inst.BaseCcy, inst.QuoteCcy,
+			inst.SettleCcy, inst.CtValCcy, inst.Uly, inst.InstFamily)
+	}
+	if inst.CtVal <= 0 || inst.LotSz <= 0 || inst.MinSz <= 0 || inst.TickSz <= 0 {
+		return nil, fmt.Errorf("%w: incomplete OKX precision metadata for %s", ErrExecutionInstrumentUnsupported, instID)
+	}
+	if !strings.EqualFold(inst.CtType, "linear") {
+		return nil, fmt.Errorf("%w: unsupported OKX contract type %q for %s", ErrExecutionInstrumentUnsupported, inst.CtType, instID)
+	}
+	return &ExecutionInstrument{SourceSymbol: base + quote, NativeSymbol: instID, BaseAsset: base, QuoteAsset: quote, SettleAsset: quote, MarketType: "SWAP", ContractType: inst.CtType, Status: inst.State, PriceTickSize: inst.TickSz, BaseQuantityStep: inst.LotSz * inst.CtVal}, nil
+}
+
+// OKX leaves baseCcy/quoteCcy empty for derivatives. The exact derivative
+// identity is carried by instId plus settleCcy, with ctValCcy/uly/instFamily
+// providing optional corroboration. Treat populated optional fields as hard
+// constraints, but never require SPOT-only fields for a SWAP.
+func okxSwapCatalogIdentityMatches(inst *OKXInstrument, instID, base, quote string) bool {
+	if inst == nil || !strings.EqualFold(inst.InstID, instID) ||
+		!strings.EqualFold(inst.InstType, "SWAP") || !strings.EqualFold(inst.State, "live") ||
+		!strings.EqualFold(inst.SettleCcy, quote) {
+		return false
+	}
+	if inst.BaseCcy != "" && !strings.EqualFold(inst.BaseCcy, base) {
+		return false
+	}
+	if inst.QuoteCcy != "" && !strings.EqualFold(inst.QuoteCcy, quote) {
+		return false
+	}
+	if inst.CtValCcy != "" && !strings.EqualFold(inst.CtValCcy, base) {
+		return false
+	}
+	wantFamily := base + "-" + quote
+	if inst.Uly != "" && !strings.EqualFold(inst.Uly, wantFamily) {
+		return false
+	}
+	if inst.InstFamily != "" && !strings.EqualFold(inst.InstFamily, wantFamily) {
+		return false
+	}
+	return true
 }
 
 // convertSymbolBack converts OKX format back to generic symbol
@@ -726,14 +803,22 @@ func (t *OKXTrader) getInstrument(symbol string) (*OKXInstrument, error) {
 	}
 
 	var instruments []struct {
-		InstId   string `json:"instId"`
-		CtVal    string `json:"ctVal"`
-		CtMult   string `json:"ctMult"`
-		LotSz    string `json:"lotSz"`
-		MinSz    string `json:"minSz"`
-		MaxMktSz string `json:"maxMktSz"` // Maximum market order size
-		TickSz   string `json:"tickSz"`
-		CtType   string `json:"ctType"`
+		InstId     string `json:"instId"`
+		InstType   string `json:"instType"`
+		CtVal      string `json:"ctVal"`
+		CtMult     string `json:"ctMult"`
+		LotSz      string `json:"lotSz"`
+		MinSz      string `json:"minSz"`
+		MaxMktSz   string `json:"maxMktSz"` // Maximum market order size
+		TickSz     string `json:"tickSz"`
+		CtType     string `json:"ctType"`
+		State      string `json:"state"`
+		BaseCcy    string `json:"baseCcy"`
+		QuoteCcy   string `json:"quoteCcy"`
+		SettleCcy  string `json:"settleCcy"`
+		CtValCcy   string `json:"ctValCcy"`
+		Uly        string `json:"uly"`
+		InstFamily string `json:"instFamily"`
 	}
 
 	if err := json.Unmarshal(data, &instruments); err != nil {
@@ -754,6 +839,7 @@ func (t *OKXTrader) getInstrument(symbol string) (*OKXInstrument, error) {
 
 	instrument := &OKXInstrument{
 		InstID:   inst.InstId,
+		InstType: inst.InstType,
 		CtVal:    ctVal,
 		CtMult:   ctMult,
 		LotSz:    lotSz,
@@ -761,6 +847,8 @@ func (t *OKXTrader) getInstrument(symbol string) (*OKXInstrument, error) {
 		MaxMktSz: maxMktSz,
 		TickSz:   tickSz,
 		CtType:   inst.CtType,
+		State:    inst.State, BaseCcy: inst.BaseCcy, QuoteCcy: inst.QuoteCcy, SettleCcy: inst.SettleCcy,
+		CtValCcy: inst.CtValCcy, Uly: inst.Uly, InstFamily: inst.InstFamily,
 	}
 
 	// Update cache
@@ -887,6 +975,15 @@ func (t *OKXTrader) OpenLongPreservingOrdersWithClientID(symbol string, quantity
 }
 
 func (t *OKXTrader) openLong(symbol string, quantity float64, leverage int, cancelExisting bool, clientOrderID string) (map[string]interface{}, error) {
+	idempotent := clientOrderID != ""
+	if clientOrderID == "" {
+		clientOrderID = genOkxClOrdID()
+	}
+	if idempotent {
+		if existing, found, err := t.lookupIdempotentOKXOrder(symbol, clientOrderID); err != nil || found {
+			return existing, err
+		}
+	}
 	// Cancel old orders
 	if cancelExisting {
 		t.CancelAllOrders(symbol)
@@ -921,9 +1018,6 @@ func (t *OKXTrader) openLong(symbol string, quantity float64, leverage int, canc
 		szStr = t.formatSize(sz, inst)
 	}
 
-	if clientOrderID == "" {
-		clientOrderID = genOkxClOrdID()
-	}
 	body := map[string]interface{}{
 		"instId":  instId,
 		"tdMode":  t.getMgnMode(), // 使用当前设置的保证金模式
@@ -937,6 +1031,13 @@ func (t *OKXTrader) openLong(symbol string, quantity float64, leverage int, canc
 
 	data, err := t.doRequest("POST", okxOrderPath, body)
 	if err != nil {
+		if idempotent {
+			if existing, found, lookupErr := t.lookupIdempotentOKXOrder(symbol, clientOrderID); found {
+				return existing, lookupErr
+			} else if lookupErr != nil {
+				return nil, fmt.Errorf("failed to open long position: %v; post-error lookup: %w", err, lookupErr)
+			}
+		}
 		return nil, fmt.Errorf("failed to open long position: %w", err)
 	}
 
@@ -955,6 +1056,13 @@ func (t *OKXTrader) openLong(symbol string, quantity float64, leverage int, canc
 		msg := "unknown error"
 		if len(orders) > 0 {
 			msg = orders[0].SMsg
+		}
+		if idempotent {
+			if existing, found, lookupErr := t.lookupIdempotentOKXOrder(symbol, clientOrderID); found {
+				return existing, lookupErr
+			} else if lookupErr != nil {
+				return nil, fmt.Errorf("failed to open long position: %s; response lookup: %w", msg, lookupErr)
+			}
 		}
 		return nil, fmt.Errorf("failed to open long position: %s", msg)
 	}
@@ -985,6 +1093,15 @@ func (t *OKXTrader) OpenShortPreservingOrdersWithClientID(symbol string, quantit
 }
 
 func (t *OKXTrader) openShort(symbol string, quantity float64, leverage int, cancelExisting bool, clientOrderID string) (map[string]interface{}, error) {
+	idempotent := clientOrderID != ""
+	if clientOrderID == "" {
+		clientOrderID = genOkxClOrdID()
+	}
+	if idempotent {
+		if existing, found, err := t.lookupIdempotentOKXOrder(symbol, clientOrderID); err != nil || found {
+			return existing, err
+		}
+	}
 	// Cancel old orders
 	if cancelExisting {
 		t.CancelAllOrders(symbol)
@@ -1018,9 +1135,6 @@ func (t *OKXTrader) openShort(symbol string, quantity float64, leverage int, can
 		szStr = t.formatSize(sz, inst)
 	}
 
-	if clientOrderID == "" {
-		clientOrderID = genOkxClOrdID()
-	}
 	body := map[string]interface{}{
 		"instId":  instId,
 		"tdMode":  t.getMgnMode(), // 使用当前设置的保证金模式
@@ -1034,6 +1148,13 @@ func (t *OKXTrader) openShort(symbol string, quantity float64, leverage int, can
 
 	data, err := t.doRequest("POST", okxOrderPath, body)
 	if err != nil {
+		if idempotent {
+			if existing, found, lookupErr := t.lookupIdempotentOKXOrder(symbol, clientOrderID); found {
+				return existing, lookupErr
+			} else if lookupErr != nil {
+				return nil, fmt.Errorf("failed to open short position: %v; post-error lookup: %w", err, lookupErr)
+			}
+		}
 		return nil, fmt.Errorf("failed to open short position: %w", err)
 	}
 
@@ -1052,6 +1173,13 @@ func (t *OKXTrader) openShort(symbol string, quantity float64, leverage int, can
 		msg := "unknown error"
 		if len(orders) > 0 {
 			msg = orders[0].SMsg
+		}
+		if idempotent {
+			if existing, found, lookupErr := t.lookupIdempotentOKXOrder(symbol, clientOrderID); found {
+				return existing, lookupErr
+			} else if lookupErr != nil {
+				return nil, fmt.Errorf("failed to open short position: %s; response lookup: %w", msg, lookupErr)
+			}
 		}
 		return nil, fmt.Errorf("failed to open short position: %s", msg)
 	}
@@ -1082,6 +1210,15 @@ func (t *OKXTrader) CloseLongPreservingOrdersWithClientID(symbol string, quantit
 }
 
 func (t *OKXTrader) closeLong(symbol string, quantity float64, cancelExisting bool, clientOrderID string) (map[string]interface{}, error) {
+	idempotent := clientOrderID != ""
+	if clientOrderID == "" {
+		clientOrderID = genOkxClOrdID()
+	}
+	if idempotent {
+		if existing, found, err := t.lookupIdempotentOKXOrder(symbol, clientOrderID); err != nil || found {
+			return existing, err
+		}
+	}
 	instId := t.convertSymbol(symbol)
 
 	// Get instrument info for contract conversion
@@ -1124,9 +1261,6 @@ func (t *OKXTrader) closeLong(symbol string, quantity float64, cancelExisting bo
 	logger.Infof("🔻 OKX close long: symbol=%s, quantity=%.6f, ctVal=%.6f, contracts=%.2f, szStr=%s",
 		symbol, quantity, inst.CtVal, contracts, szStr)
 
-	if clientOrderID == "" {
-		clientOrderID = genOkxClOrdID()
-	}
 	body := map[string]interface{}{
 		"instId":  instId,
 		"tdMode":  tdMode, // 使用仓位实际的保证金模式
@@ -1140,6 +1274,13 @@ func (t *OKXTrader) closeLong(symbol string, quantity float64, cancelExisting bo
 
 	data, err := t.doRequest("POST", okxOrderPath, body)
 	if err != nil {
+		if idempotent {
+			if existing, found, lookupErr := t.lookupIdempotentOKXOrder(symbol, clientOrderID); found {
+				return existing, lookupErr
+			} else if lookupErr != nil {
+				return nil, fmt.Errorf("failed to close long position: %v; post-error lookup: %w", err, lookupErr)
+			}
+		}
 		return nil, fmt.Errorf("failed to close long position: %w", err)
 	}
 
@@ -1157,6 +1298,13 @@ func (t *OKXTrader) closeLong(symbol string, quantity float64, cancelExisting bo
 		msg := "unknown error"
 		if len(orders) > 0 {
 			msg = orders[0].SMsg
+		}
+		if idempotent {
+			if existing, found, lookupErr := t.lookupIdempotentOKXOrder(symbol, clientOrderID); found {
+				return existing, lookupErr
+			} else if lookupErr != nil {
+				return nil, fmt.Errorf("failed to close long position: %s; response lookup: %w", msg, lookupErr)
+			}
 		}
 		return nil, fmt.Errorf("failed to close long position: %s", msg)
 	}
@@ -1190,6 +1338,15 @@ func (t *OKXTrader) CloseShortPreservingOrdersWithClientID(symbol string, quanti
 }
 
 func (t *OKXTrader) closeShort(symbol string, quantity float64, cancelExisting bool, clientOrderID string) (map[string]interface{}, error) {
+	idempotent := clientOrderID != ""
+	if clientOrderID == "" {
+		clientOrderID = genOkxClOrdID()
+	}
+	if idempotent {
+		if existing, found, err := t.lookupIdempotentOKXOrder(symbol, clientOrderID); err != nil || found {
+			return existing, err
+		}
+	}
 	instId := t.convertSymbol(symbol)
 
 	// Get instrument info for contract conversion
@@ -1237,9 +1394,6 @@ func (t *OKXTrader) closeShort(symbol string, quantity float64, cancelExisting b
 	logger.Infof("🔻 OKX close short: symbol=%s, quantity=%.6f, ctVal=%.6f, contracts=%.2f, szStr=%s",
 		symbol, quantity, inst.CtVal, contracts, szStr)
 
-	if clientOrderID == "" {
-		clientOrderID = genOkxClOrdID()
-	}
 	body := map[string]interface{}{
 		"instId":  instId,
 		"tdMode":  tdMode, // 使用仓位实际的保证金模式
@@ -1255,6 +1409,13 @@ func (t *OKXTrader) closeShort(symbol string, quantity float64, cancelExisting b
 
 	data, err := t.doRequest("POST", okxOrderPath, body)
 	if err != nil {
+		if idempotent {
+			if existing, found, lookupErr := t.lookupIdempotentOKXOrder(symbol, clientOrderID); found {
+				return existing, lookupErr
+			} else if lookupErr != nil {
+				return nil, fmt.Errorf("failed to close short position: %v; post-error lookup: %w", err, lookupErr)
+			}
+		}
 		return nil, fmt.Errorf("failed to close short position: %w", err)
 	}
 
@@ -1274,6 +1435,13 @@ func (t *OKXTrader) closeShort(symbol string, quantity float64, cancelExisting b
 			msg = fmt.Sprintf("sCode=%s, sMsg=%s", orders[0].SCode, orders[0].SMsg)
 		}
 		logger.Infof("❌ OKX failed to close short position: %s, response: %s", msg, string(data))
+		if idempotent {
+			if existing, found, lookupErr := t.lookupIdempotentOKXOrder(symbol, clientOrderID); found {
+				return existing, lookupErr
+			} else if lookupErr != nil {
+				return nil, fmt.Errorf("failed to close short position: %s; response lookup: %w", msg, lookupErr)
+			}
+		}
 		return nil, fmt.Errorf("failed to close short position: %s", msg)
 	}
 
@@ -1572,6 +1740,43 @@ func (t *OKXTrader) GetOrderStatusByClientID(symbol, clientOrderID string) (map[
 	instID := t.convertSymbol(symbol)
 	path := fmt.Sprintf("/api/v5/trade/order?instId=%s&clOrdId=%s", instID, clientOrderID)
 	return t.getOrderStatus(symbol, path)
+}
+
+// lookupIdempotentOKXOrder resolves a deterministic clOrdId before submission
+// and after ambiguous POST failures. A terminal zero-fill id is never reused:
+// callers must advance their durable source revision before issuing new risk.
+func (t *OKXTrader) lookupIdempotentOKXOrder(symbol, clientOrderID string) (map[string]interface{}, bool, error) {
+	order, err := t.GetOrderStatusByClientID(symbol, clientOrderID)
+	if err != nil {
+		text := strings.ToLower(err.Error())
+		if strings.Contains(text, "order not found") || strings.Contains(text, "order does not exist") || strings.Contains(text, "51603") {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("query OKX order by client id %s: %w", clientOrderID, err)
+	}
+	if order == nil {
+		return nil, false, fmt.Errorf("query OKX order by client id %s returned empty order", clientOrderID)
+	}
+	order["clOrdId"] = clientOrderID
+	state := strings.ToUpper(fmt.Sprint(order["status"]))
+	executed := 0.0
+	switch value := order["executedQty"].(type) {
+	case float64:
+		executed = value
+	case float32:
+		executed = float64(value)
+	case string:
+		executed, _ = strconv.ParseFloat(value, 64)
+	}
+	if executed > 0 || state == "NEW" || state == "PARTIALLY_FILLED" || state == "FILLED" {
+		return order, true, nil
+	}
+	switch state {
+	case "CANCELED", "CANCELLED", "REJECTED", "FAILED", "EXPIRED":
+		return nil, true, fmt.Errorf("OKX client order id %s is terminal (%s) with zero fill", clientOrderID, state)
+	default:
+		return nil, true, fmt.Errorf("OKX client order id %s has unrecognized state %q and zero fill", clientOrderID, state)
+	}
 }
 
 func (t *OKXTrader) getOrderStatus(symbol, path string) (map[string]interface{}, error) {

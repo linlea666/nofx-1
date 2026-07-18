@@ -36,6 +36,8 @@ type StopLossCalcInput struct {
 	PositionValue    float64  // 仓位价值（USD，= entryPrice × size）
 	FollowerEquity   float64  // 跟随者账户权益（USD）
 	LiquidationPrice float64  // 跟随者强平价；0 表示交易所未返回
+	PriceTickSize    float64  // 执行交易所精确价格步长；0 时仅兼容旧 OKX 路径
+	BaseQuantityStep float64  // 执行交易所精确基础币数量步长
 }
 
 // StopLossCalcResult 止损价计算结果（含完整决策追踪，便于日志和调试）
@@ -377,14 +379,20 @@ func finalizeStopLossPrice(input *StopLossCalcInput, result *StopLossCalcResult,
 		result.OpenImmediateHit = true
 		return result, nil
 	}
-	spec, specErr := getOKXInstrumentSpec(input.Symbol)
-	tickSz := spec.tickSz
-	if specErr != nil {
-		// 不阻断：alignToTickSize 对 tickSz=0 会原样返回价格，止损价仍有效，
-		// 只是可能未对齐档位（交易所会自行处理）。留 WARN 便于发现接口异常。
-		logger.Warnf("⚠️ 获取 %s 合约规格失败（止损价不做档位对齐）: %v", input.Symbol, specErr)
+	tickSz := input.PriceTickSize
+	if tickSz > 0 && input.BaseQuantityStep > 0 {
+		result.QuantityStep = input.BaseQuantityStep
 	} else {
-		result.QuantityStep = spec.lotSz * spec.ctVal
+		// Backward-compatible path for existing OKX-only calculations and unit
+		// tests. Production AutoTrader integrations inject the resolved target
+		// venue specification before a protective order is placed.
+		spec, specErr := getOKXInstrumentSpec(input.Symbol)
+		tickSz = spec.tickSz
+		if specErr != nil {
+			logger.Warnf("⚠️ 获取 %s 合约规格失败（止损价不做档位对齐）: %v", input.Symbol, specErr)
+		} else {
+			result.QuantityStep = spec.lotSz * spec.ctVal
+		}
 	}
 	result.TickSize = tickSz
 	if input.Side == SideLong {

@@ -926,7 +926,7 @@ func (h *CopyTradeHandler) DismissManualSignal(c *gin.Context) {
 // CopyTradeConfigRequest 跟单配置请求
 type CopyTradeConfigRequest struct {
 	ProviderType   string  `json:"provider_type" binding:"required,oneof=hyperliquid okx binance"`
-	LeaderID       string  `json:"leader_id" binding:"required"`
+	LeaderID       string  `json:"leader_id"`
 	CopyRatio      float64 `json:"copy_ratio" binding:"required,gt=0"`
 	SyncLeverage   bool    `json:"sync_leverage"`
 	SyncMarginMode bool    `json:"sync_margin_mode"`
@@ -935,8 +935,10 @@ type CopyTradeConfigRequest struct {
 	Enabled        bool    `json:"enabled"`
 
 	// Binance Web 凭证（仅 ProviderType=binance 时使用）
-	BinanceP20T      string `json:"binance_p20t"`
-	BinanceCSRFToken string `json:"binance_csrf_token"`
+	BinanceP20T        string `json:"binance_p20t"`
+	BinanceCSRFToken   string `json:"binance_csrf_token"`
+	BinanceSourceMode  string `json:"binance_source_mode"`
+	BinanceTopTraderID string `json:"binance_top_trader_id"`
 
 	// ============================================================
 	// Copy Guard v7 风控与 AI guarded 重入配置
@@ -1011,10 +1013,30 @@ func (h *CopyTradeHandler) GetConfig(c *gin.Context) {
 		return
 	}
 
+	var sourceHealth interface{}
+	if health, healthErr := h.store.CopyTrade().GetSourceHealth(traderID); healthErr == nil && health != nil &&
+		health.SourceGeneration == config.SourceGeneration && health.LeaderID == config.LeaderID &&
+		health.SourceMode == config.BinanceSourceMode {
+		copy := *health
+		copy.LastError = sanitizeSourceHealthError(copy.LastError)
+		if unsupported, listErr := h.store.CopyTrade().ListUnsupportedExecutionInstruments(traderID); listErr == nil {
+			copy.UnsupportedContracts = unsupported
+		}
+		sourceHealth = &copy
+	}
 	c.JSON(http.StatusOK, gin.H{
-		"config": maskedCopyTradeConfig(config),
-		"status": copytrade.IsCopyTradingRunning(traderID),
+		"config":        maskedCopyTradeConfig(config),
+		"status":        copytrade.IsCopyTradingRunning(traderID),
+		"source_health": sourceHealth,
 	})
+}
+
+func sanitizeSourceHealthError(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) > 300 {
+		value = value[:300] + "..."
+	}
+	return value
 }
 
 // GetRiskDefaults 返回新交易员 Copy Guard 推荐默认值。前端不得再复制一份常量。
@@ -1081,8 +1103,10 @@ func (h *CopyTradeHandler) SaveConfig(c *gin.Context) {
 		MaxTradeWarn:   req.MaxTradeWarn,
 		Enabled:        req.Enabled,
 		// GET 接口已脱敏返回凭证；编辑回传的掩码值/空值不覆盖已存明文
-		BinanceP20T:      resolveCredentialUpdate(req.BinanceP20T, existingP20T),
-		BinanceCSRFToken: resolveCredentialUpdate(req.BinanceCSRFToken, existingCSRF),
+		BinanceP20T:        resolveCredentialUpdate(req.BinanceP20T, existingP20T),
+		BinanceCSRFToken:   resolveCredentialUpdate(req.BinanceCSRFToken, existingCSRF),
+		BinanceSourceMode:  req.BinanceSourceMode,
+		BinanceTopTraderID: req.BinanceTopTraderID,
 	}
 
 	// 风控字段透传（指针类型，未传则使用旧值或默认值）
@@ -1207,6 +1231,14 @@ func (h *CopyTradeHandler) SaveConfig(c *gin.Context) {
 	}
 	if err := copytrade.ValidateStoredRiskPolicy(config); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := prepareCopyTradeSource(h.store, config, existing); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if copyTradeSourceIdentityChanged(existing, config) && copytrade.IsCopyTradingRunning(traderID) {
+		c.JSON(http.StatusConflict, gin.H{"error": "跟单引擎仍在运行；切换领航员数据源前请先停止跟单，保存后再重新启动"})
 		return
 	}
 
@@ -1382,6 +1414,15 @@ func applyCopyGuardV4Request(c, old *store.CopyTradeConfig, r *CopyTradeConfigRe
 // @Router /api/copytrade/config/{trader_id} [delete]
 func (h *CopyTradeHandler) DeleteConfig(c *gin.Context) {
 	traderID := c.Param("trader_id")
+	live, err := h.store.CopyTrade().HasLiveSourceState(traderID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to verify active copy-trade state"})
+		return
+	}
+	if live {
+		c.JSON(http.StatusConflict, gin.H{"error": "当前仍有活动跟单映射、持仓保护或 Copy Guard 周期，不能删除配置；请先安全清理旧来源"})
+		return
+	}
 
 	// 先停止跟单
 	if copytrade.IsCopyTradingRunning(traderID) {

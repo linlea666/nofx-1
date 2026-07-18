@@ -9,10 +9,17 @@ import (
 // ProviderType 数据源类型
 type ProviderType string
 
+// BinanceSourceMode selects the Binance leader data surface without coupling
+// it to the follower execution exchange.
+type BinanceSourceMode string
+
 const (
 	ProviderHyperliquid ProviderType = "hyperliquid"
 	ProviderOKX         ProviderType = "okx"
 	ProviderBinance     ProviderType = "binance"
+
+	BinanceSourceCopyManagement BinanceSourceMode = "copy_management"
+	BinanceSourceSmartMoney     BinanceSourceMode = "smart_money"
 )
 
 // SupportsCopyGuard reports whether a leader data source is eligible for Copy
@@ -74,16 +81,20 @@ const (
 
 // Fill 成交记录（标准化结构）
 type Fill struct {
-	ID           string     // 唯一标识 (HL: tid, OKX: ordId)
-	Symbol       string     // 交易对 (BTCUSDT 格式)
-	Side         string     // "buy" | "sell"
-	PositionSide SideType   // "long" | "short"
-	Action       ActionType // "open" | "close" | "add" | "reduce"
-	Price        float64    // 成交价格
-	Size         float64    // 成交数量
-	Value        float64    // 成交价值 (USDT)
-	Timestamp    time.Time  // 成交时间
-	ClosedPnL    float64    // 平仓盈亏 (如有)
+	ID            string     // 唯一标识 (HL: tid, OKX: ordId)
+	Symbol        string     // 交易对 (BTCUSDT 格式)
+	Side          string     // "buy" | "sell"
+	PositionSide  SideType   // "long" | "short"
+	Action        ActionType // "open" | "close" | "add" | "reduce"
+	Price         float64    // 成交价格
+	Size          float64    // 成交数量
+	Value         float64    // USD 归一价值；旧数据源保持原 USDT 语义
+	RawValue      float64    // 源合约报价币种名义价值
+	ValueCurrency string     // RawValue 币种（USDT/USDC/USD1）；空表示旧数据源 USDT
+	ValueUSDValid bool       // Value 是否完成显式 USD 归一；旧数据源通过 ValueCurrency=="" 兼容
+	ValueError    string     // 归一失败原因（开仓/加仓必须 fail closed）
+	Timestamp     time.Time  // 成交时间
+	ClosedPnL     float64    // 平仓盈亏 (如有)
 
 	// 原始数据（调试用）
 	Raw interface{} `json:"-"`
@@ -91,24 +102,47 @@ type Fill struct {
 
 // Position 持仓信息
 type Position struct {
-	Symbol        string
-	Side          SideType // "long" | "short"
-	Size          float64  // 持仓数量
-	EntryPrice    float64  // 开仓均价
-	MarkPrice     float64  // 标记价格
-	Leverage      int      // 杠杆
-	MarginMode    string   // "cross" | "isolated"
-	UnrealizedPnL float64
-	PositionValue float64 // 仓位价值
-	PosID         string  // OKX 仓位唯一标识（用于精确匹配）
+	Symbol           string
+	Side             SideType // "long" | "short"
+	Size             float64  // 持仓数量
+	EntryPrice       float64  // 开仓均价
+	MarkPrice        float64  // 标记价格
+	Leverage         int      // 杠杆
+	MarginMode       string   // "cross" | "isolated"
+	UnrealizedPnL    float64
+	PositionValue    float64        // USD 归一仓位价值；旧数据源保持原语义
+	RawPositionValue float64        // 源报价币种仓位价值
+	ValueCurrency    string         // 源报价币种
+	ValueUSDValid    bool           // 是否已成功归一到 USD
+	ValueError       string         // 价值归一或合约目录校验失败原因
+	Instrument       *InstrumentRef // 精确的源合约身份
+	PosID            string         // OKX 仓位唯一标识（用于精确匹配）
+}
+
+// InstrumentRef is the source-of-truth contract identity. Symbol formatting
+// and USD value conversion are deliberately separate: converting value never
+// authorizes substituting a USDC/USD1 contract with USDT.
+type InstrumentRef struct {
+	SourceSymbol string `json:"source_symbol"`
+	BaseAsset    string `json:"base_asset"`
+	QuoteAsset   string `json:"quote_asset"`
+	MarginAsset  string `json:"margin_asset"`
+	MarketType   string `json:"market_type"`
+	ContractType string `json:"contract_type"`
+	Status       string `json:"status"`
+}
+
+func (f Fill) HasNormalizedUSDValue() bool {
+	return f.ValueCurrency == "" || f.ValueUSDValid
 }
 
 // AccountState 账户状态
 type AccountState struct {
-	TotalEquity      float64              // 总权益
-	AvailableBalance float64              // 可用余额
-	Positions        map[string]*Position // 当前持仓 (symbol_side -> position)
-	Timestamp        time.Time
+	TotalEquity            float64              // 总权益
+	AvailableBalance       float64              // 可用余额
+	Positions              map[string]*Position // 当前持仓 (symbol_side -> position)
+	Timestamp              time.Time
+	EmptySnapshotConfirmed bool // Provider 已完成连续空仓与最新可见性确认
 }
 
 // TradeSignal 交易信号（经过处理的成交事件）
@@ -137,8 +171,11 @@ type CopyConfig struct {
 
 	// Binance Web 私有接口凭证（仅 ProviderType=binance 时使用）
 	// 由用户从浏览器开发者工具中抓取，会过期，过期时通过邮件告警
-	BinanceP20T      string `json:"binance_p20t,omitempty"`       // 登录 cookie p20t
-	BinanceCSRFToken string `json:"binance_csrf_token,omitempty"` // CSRF header csrftoken
+	BinanceP20T        string            `json:"binance_p20t,omitempty"`       // 登录 cookie p20t
+	BinanceCSRFToken   string            `json:"binance_csrf_token,omitempty"` // CSRF header csrftoken
+	BinanceSourceMode  BinanceSourceMode `json:"binance_source_mode,omitempty"`
+	BinanceTopTraderID string            `json:"binance_top_trader_id,omitempty"`
+	SourceGeneration   int               `json:"source_generation,omitempty"`
 
 	// ============================================================
 	// Copy Guard v7：波动/结构止损、完整保护状态机与 AI guarded 重入。

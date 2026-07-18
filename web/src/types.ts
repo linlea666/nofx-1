@@ -183,6 +183,38 @@ export interface CreateTraderRequest {
   copy_config?: CopyConfigRequest // Copy trade config (required when decision_mode is "copy_trade")
 }
 
+export type BinanceSourceMode = 'copy_management' | 'smart_money'
+
+export type CopyTradeSourceHealthStatus =
+  | 'HEALTHY'
+  | 'PRIVATE'
+  | 'DISABLED'
+  | 'AUTH_FAILED'
+  | 'DEGRADED'
+  | 'STALE'
+
+export interface CopyTradeSourceHealth {
+  trader_id: string
+  leader_id: string
+  source_mode: string
+  source_generation: number
+  status: CopyTradeSourceHealthStatus
+  previous_status?: CopyTradeSourceHealthStatus
+  trader_name?: string
+  last_checked_at?: string
+  last_complete_snapshot_at?: string
+  last_transition_at?: string
+  consecutive_failures: number
+  last_error?: string
+  unsupported_contracts?: Array<{
+    leader_pos_id: string
+    source_symbol: string
+    execution_venue?: string
+    reason: string
+    last_seen_at: string
+  }>
+}
+
 // Copy config request (simplified version for creating traders)
 export interface CopyConfigRequest {
   provider_type: CopyTradeProvider
@@ -193,6 +225,8 @@ export interface CopyConfigRequest {
   // Binance Web 凭证（仅 provider_type=binance 时使用）
   binance_p20t?: string // 登录 cookie p20t
   binance_csrf_token?: string // CSRF header csrftoken
+  binance_source_mode?: BinanceSourceMode
+  binance_top_trader_id?: string
 
   // ============================================================
   // Copy Guard v7：可靠止损、风险预算与 AI guarded 重入
@@ -707,6 +741,9 @@ export interface CopyTradeConfig {
   // Binance Web 凭证（仅 provider_type=binance 时使用，明文返回，用于编辑表单回填）
   binance_p20t?: string
   binance_csrf_token?: string
+  binance_source_mode?: BinanceSourceMode
+  binance_top_trader_id?: string
+  source_generation?: number
   // Copy Guard v7，详见 CopyConfigRequest
   risk_stop_loss_enabled?: boolean
   risk_account_pct?: number
@@ -753,6 +790,12 @@ export interface CopyTradeConfig {
   risk_reentry_noise_override?: boolean
   created_at?: string
   updated_at?: string
+}
+
+export interface CopyTradeConfigResponse {
+  config: CopyTradeConfig
+  status: boolean
+  source_health?: CopyTradeSourceHealth | null
 }
 
 export interface CopyGuardSummary {

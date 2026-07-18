@@ -236,6 +236,88 @@ func TestHandleBenignCloseFailureClosesMappingAndAvoidsDeadlock(t *testing.T) {
 	}
 }
 
+type livePositionExecutor struct {
+	positions []map[string]interface{}
+}
+
+func (e *livePositionExecutor) ExecuteDecision(*decision.Decision) error { return nil }
+func (e *livePositionExecutor) GetAccountInfo() (map[string]interface{}, error) {
+	return nil, nil
+}
+func (e *livePositionExecutor) GetPositions() ([]map[string]interface{}, error) {
+	return e.positions, nil
+}
+func (e *livePositionExecutor) GetPositionsFresh() ([]map[string]interface{}, error) {
+	return e.positions, nil
+}
+
+func TestBenignCloseTextCannotCloseMappingWhilePositionStillExists(t *testing.T) {
+	st, err := store.New(filepath.Join(t.TempDir(), "nofx-benign-close-live.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	const traderID = "test-trader"
+	const posID = "smart_leader_BTCUSDC_long"
+	if err := st.CopyTrade().SavePositionMapping(&store.CopyTradePositionMapping{
+		TraderID: traderID, LeaderPosID: posID, LeaderID: "leader",
+		Symbol: "BTCUSDC", SourceSymbol: "BTCUSDC", ExecutionSymbol: "BTC-USDC-SWAP",
+		Side: "long", MarginMode: "cross", OpenedAt: time.Now(), LastKnownSize: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	engine := &Engine{config: &CopyConfig{ProviderType: ProviderBinance}, seenFills: map[string]time.Time{"close-fill": time.Now()}}
+	ti := &TraderIntegration{
+		traderID: traderID,
+		store:    st,
+		engine:   engine,
+		executor: &livePositionExecutor{positions: []map[string]interface{}{{
+			"symbol": "BTCUSDC", "side": "long", "mgnMode": "cross", "positionAmt": 1.0,
+		}}},
+	}
+	dec := &decision.Decision{
+		Action: "close_long", Symbol: "BTCUSDC", SourceSymbol: "BTCUSDC",
+		ExecutionSymbol: "BTC-USDC-SWAP", LeaderPosID: posID, SourceFillID: "close-fill", MarginMode: "cross",
+	}
+	closeErr := errors.New("long position not found for BTC-USDC-SWAP")
+	if !ti.isBenignCloseError(dec, closeErr) || ti.benignCloseConfirmedFlat(dec) {
+		t.Fatal("error text may be a candidate, but a fresh live position must prevent silent_close")
+	}
+	ti.handleRiskReductionRetry(dec, closeErr, "test")
+
+	mapping, err := st.CopyTrade().GetActiveMapping(traderID, posID)
+	if err != nil || mapping == nil {
+		t.Fatalf("live position must retain its active mapping: mapping=%+v err=%v", mapping, err)
+	}
+	if engine.isSeen("close-fill") {
+		t.Fatal("unconfirmed risk reduction must release the fill for retry")
+	}
+}
+
+func TestBenignCloseMappingFailureReleasesFillForRetry(t *testing.T) {
+	st, err := store.New(filepath.Join(t.TempDir(), "nofx-benign-close-db-failure.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const fillID = "close-fill-db-retry"
+	engine := &Engine{
+		config:    &CopyConfig{ProviderType: ProviderBinance},
+		seenFills: map[string]time.Time{fillID: time.Now()},
+	}
+	ti := &TraderIntegration{traderID: "trader", store: st, engine: engine}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ti.handleBenignCloseFailure(&decision.Decision{
+		Action: "close_long", Symbol: "BTCUSDT",
+		LeaderPosID: "leader-position", SourceFillID: fillID,
+	}, errors.New("long position not found"))
+	if engine.isSeen(fillID) {
+		t.Fatal("failed mapping close must release the snapshot fill for the next poll")
+	}
+}
+
 // TestIncrementMappingFailureAccumulatesAndResetsCorrectly 验证 store 层
 // IncrementMappingFailure + ResetMappingFailure 的基本语义。
 func TestIncrementMappingFailureAccumulatesAndResetsCorrectly(t *testing.T) {

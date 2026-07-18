@@ -161,6 +161,15 @@ func (s *Store) initTables() error {
 	if err := s.CopyTrade().initCopyEventTable(); err != nil {
 		return fmt.Errorf("failed to initialize copy trade event table: %w", err)
 	}
+	if err := s.CopyTrade().initSourceHealthTable(); err != nil {
+		return fmt.Errorf("failed to initialize copy trade source health table: %w", err)
+	}
+	if err := s.CopyTrade().initSourceBaselineTable(); err != nil {
+		return fmt.Errorf("failed to initialize copy trade source baseline table: %w", err)
+	}
+	if err := s.CopyTrade().initUnsupportedExecutionInstrumentTable(); err != nil {
+		return fmt.Errorf("failed to initialize unsupported execution instrument table: %w", err)
+	}
 	if err := s.BinanceCreds().initTables(); err != nil {
 		return fmt.Errorf("failed to initialize binance credentials tables: %w", err)
 	}

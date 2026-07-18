@@ -11,6 +11,32 @@ import (
 // invalidate local state or trigger re-creation.
 var ErrProtectiveStopNotFound = errors.New("protective stop not found")
 
+var ErrExecutionInstrumentUnsupported = errors.New("execution instrument unsupported")
+
+// ExecutionInstrument keeps contract identity separate from USD value
+// normalization. An execution venue may only accept an exact base+quote/settle
+// match; it must never silently substitute USDC/USD1 with USDT.
+type ExecutionInstrument struct {
+	SourceSymbol string
+	NativeSymbol string
+	BaseAsset    string
+	QuoteAsset   string
+	SettleAsset  string
+	MarketType   string
+	ContractType string
+	Status       string
+	// PriceTickSize and BaseQuantityStep are expressed in the units used by
+	// Copy Guard: quote-asset price and base-asset quantity respectively.
+	// Keeping them on the resolved execution contract prevents Binance stops
+	// from accidentally using OKX precision metadata.
+	PriceTickSize    float64
+	BaseQuantityStep float64
+}
+
+type ExecutionInstrumentResolver interface {
+	ResolveExecutionInstrument(symbol string) (*ExecutionInstrument, error)
+}
+
 // ClosedPnLRecord represents a single closed position record from exchange
 type ClosedPnLRecord struct {
 	Symbol             string  // Trading pair (e.g., "BTCUSDT")
@@ -37,6 +63,7 @@ type ClosedPnLRecord struct {
 // Used for reconstructing position history with unified algorithm
 type TradeRecord struct {
 	TradeID      string    // Unique trade ID from exchange
+	OrderID      string    // Exchange order ID; multiple fills may share it
 	Symbol       string    // Trading pair (e.g., "BTCUSDT")
 	Side         string    // "BUY" or "SELL"
 	PositionSide string    // "LONG", "SHORT", or "BOTH" (for one-way mode)
@@ -45,6 +72,12 @@ type TradeRecord struct {
 	RealizedPnL  float64   // Realized PnL (non-zero for closing trades)
 	Fee          float64   // Trading fee/commission
 	Time         time.Time // Trade execution time
+}
+
+// ClosedPnLBySymbolProvider provides an exact symbol-scoped reconciliation
+// path for venues (such as Binance) that do not expose a stable position ID.
+type ClosedPnLBySymbolProvider interface {
+	GetClosedPnLBySymbol(symbol string, start time.Time, limit int) ([]ClosedPnLRecord, error)
 }
 
 type ProtectiveStopRequest struct {
@@ -77,6 +110,19 @@ type ProtectiveStopManager interface {
 	GetProtectiveStop(algoID, symbol string) (*ProtectiveStopOrder, error)
 	GetProtectiveStopByClientID(clientID, symbol string) (*ProtectiveStopOrder, error)
 	CancelProtectiveStop(algoID, symbol string) error
+}
+
+// ProtectiveStopEnsureResult represents a safe replacement. If retiring is
+// non-nil, the new current order is already live but the old order could not
+// yet be confirmed terminal; callers must persist and monitor both IDs.
+type ProtectiveStopEnsureResult struct {
+	Current            *ProtectiveStopOrder
+	Retiring           *ProtectiveStopOrder
+	ReplacementPending bool
+}
+
+type ProtectiveStopEnsurer interface {
+	EnsureProtectiveStop(existing *ProtectiveStopOrder, req ProtectiveStopRequest) (*ProtectiveStopEnsureResult, error)
 }
 
 // CopyTradeOrderExecutor lets copy trading preserve unrelated pending/algo orders.

@@ -7,6 +7,10 @@ import type {
   DecisionMode,
   CopyTradeProvider,
   CopyTradeConfig,
+  CopyTradeConfigResponse,
+  CopyTradeSourceHealth,
+  CopyTradeSourceHealthStatus,
+  BinanceSourceMode,
   BinanceCredentialsView,
 } from '../types'
 import { useLanguage } from '../contexts/LanguageContext'
@@ -39,6 +43,142 @@ function getShortName(fullName: string): string {
 // Hyperliquid 无稳定的仓位级 posId，不进入 Copy Guard 状态机。
 function copyGuardCapableProvider(provider: CopyTradeProvider): boolean {
   return provider === 'okx' || provider === 'binance'
+}
+
+function normalizeTopTraderID(value: string): string | null {
+  let candidate = value.trim()
+  if (!candidate) return null
+
+  try {
+    const parsed = new URL(candidate)
+    const host = parsed.hostname.toLowerCase()
+    if (host !== 'binance.com' && !host.endsWith('.binance.com')) return null
+    const parts = parsed.pathname.split('/').filter(Boolean)
+    const profileIndex = parts.findIndex(
+      (part, index) => part === 'smart-money' && parts[index + 1] === 'profile'
+    )
+    if (profileIndex < 0 || profileIndex + 3 !== parts.length) return null
+    candidate = parts[profileIndex + 2]?.trim() ?? ''
+  } catch {
+    // 纯 topTraderId 不是 URL，直接按字符串继续校验。
+  }
+
+  return /^\d{19}$/.test(candidate) ? candidate : null
+}
+
+const SOURCE_HEALTH_META: Record<
+  CopyTradeSourceHealthStatus,
+  { label: string; textClass: string; backgroundClass: string }
+> = {
+  HEALTHY: {
+    label: '公开状态正常',
+    textClass: 'text-[#0ECB81]',
+    backgroundClass: 'bg-[#0ECB811A] border-[#0ECB8144]',
+  },
+  PRIVATE: {
+    label: '仓位已设为私密',
+    textClass: 'text-[#F6465D]',
+    backgroundClass: 'bg-[#F6465D1A] border-[#F6465D44]',
+  },
+  DISABLED: {
+    label: '领航员已停用',
+    textClass: 'text-[#F6465D]',
+    backgroundClass: 'bg-[#F6465D1A] border-[#F6465D44]',
+  },
+  AUTH_FAILED: {
+    label: '登录凭证失效',
+    textClass: 'text-[#F6465D]',
+    backgroundClass: 'bg-[#F6465D1A] border-[#F6465D44]',
+  },
+  DEGRADED: {
+    label: '数据源连续失败',
+    textClass: 'text-[#F0B90B]',
+    backgroundClass: 'bg-[#F0B90B14] border-[#F0B90B44]',
+  },
+  STALE: {
+    label: '完整快照已过期',
+    textClass: 'text-[#F6465D]',
+    backgroundClass: 'bg-[#F6465D1A] border-[#F6465D44]',
+  },
+}
+
+function formatSourceHealthTime(value?: string): string {
+  if (!value) return '尚未取得'
+  const parsed = new Date(value)
+  if (Number.isNaN(parsed.getTime())) return value
+  return parsed.toLocaleString('zh-CN', { hour12: false })
+}
+
+function sourceHealthFrozen(status: CopyTradeSourceHealthStatus): boolean {
+  return ['PRIVATE', 'DISABLED', 'AUTH_FAILED', 'STALE'].includes(status)
+}
+
+function SmartMoneySourceHealthCard({
+  health,
+}: {
+  health: CopyTradeSourceHealth | null
+}) {
+  if (!health) {
+    return (
+      <div className="rounded border border-[#2B3139] bg-[#0B0E11] p-3 text-xs text-[#848E9C]">
+        尚无公开状态记录。交易员启动并取得首个完整仓位快照后，这里会显示同步状态。
+      </div>
+    )
+  }
+
+  const meta = SOURCE_HEALTH_META[health.status]
+  const frozen = sourceHealthFrozen(health.status)
+
+  return (
+    <div className={`rounded border p-3 space-y-2 ${meta.backgroundClass}`}>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <span className={`flex items-center gap-1.5 text-sm ${meta.textClass}`}>
+          {health.status === 'HEALTHY' ? (
+            <CheckCircle2 className="h-4 w-4" />
+          ) : (
+            <AlertCircle className="h-4 w-4" />
+          )}
+          {meta.label}
+        </span>
+        {health.trader_name && (
+          <span className="text-xs text-[#EAECEF]">{health.trader_name}</span>
+        )}
+      </div>
+      <div className="grid gap-1 text-[11px] text-[#848E9C] sm:grid-cols-2">
+        <span>最后检查：{formatSourceHealthTime(health.last_checked_at)}</span>
+        <span>
+          最后完整快照：
+          {formatSourceHealthTime(health.last_complete_snapshot_at)}
+        </span>
+      </div>
+      {health.last_error && (
+        <p className="break-words text-[11px] text-[#F6465D]">
+          原因：{health.last_error}
+        </p>
+      )}
+      {!!health.unsupported_contracts?.length && (
+        <div className="rounded border border-[#F0B90B]/40 bg-[#F0B90B]/5 p-2 text-[11px] text-[#F0B90B]">
+          <div className="mb-1 font-medium">执行交易所暂不支持的精确合约</div>
+          {health.unsupported_contracts.map((item) => (
+            <div key={item.leader_pos_id} className="break-words">
+              {item.source_symbol}：{item.reason}
+            </div>
+          ))}
+        </div>
+      )}
+      {frozen && (
+        <p className="text-[11px] leading-relaxed text-[#F6465D]">
+          数据源信号已冻结：不会把不可见仓位当作全平，也不会自动平掉本地已有仓位；已有
+          Copy Guard 保护会继续维护。
+        </p>
+      )}
+      {health.status === 'DEGRADED' && (
+        <p className="text-[11px] leading-relaxed text-[#F0B90B]">
+          当前完整快照获取失败，系统不会基于不完整数据生成新的仓位变更信号。
+        </p>
+      )}
+    </div>
+  )
 }
 
 // 交易所注册链接配置
@@ -86,6 +226,8 @@ interface FormState {
   copy_ratio: number
   copy_sync_leverage: boolean
   copy_sync_margin_mode: boolean // 同步保证金模式（OKX 区分全仓/逐仓）
+  copy_binance_source_mode: BinanceSourceMode
+  copy_binance_top_trader_id: string
   // Binance Web 私有接口凭证（仅 copy_provider_type=binance 时使用）
   copy_binance_p20t: string
   copy_binance_csrf_token: string
@@ -173,6 +315,8 @@ export function TraderConfigModal({
     copy_ratio: 1.0,
     copy_sync_leverage: true,
     copy_sync_margin_mode: true, // 默认同步保证金模式
+    copy_binance_source_mode: 'copy_management',
+    copy_binance_top_trader_id: '',
     copy_binance_p20t: '',
     copy_binance_csrf_token: '',
     // 账户保护 v5 风控默认值（与后端 store.FillRiskDefaults 保持一致）
@@ -223,6 +367,8 @@ export function TraderConfigModal({
   const [strategies, setStrategies] = useState<Strategy[]>([])
   const [isFetchingBalance, setIsFetchingBalance] = useState(false)
   const [balanceFetchError, setBalanceFetchError] = useState<string>('')
+  const [sourceHealth, setSourceHealth] =
+    useState<CopyTradeSourceHealth | null>(null)
 
   // Binance 全局凭证状态（仅 provider=binance 时拉取，作为状态展示）
   const [binanceGlobalCreds, setBinanceGlobalCreds] =
@@ -290,12 +436,14 @@ export function TraderConfigModal({
     const fetchCopyTradeConfig = async () => {
       if (!isEditMode || !traderData?.trader_id) return
       setLoadedLegacyReentry(false)
+      setSourceHealth(null)
       try {
-        const result = await httpClient.get<{ config: CopyTradeConfig }>(
+        const result = await httpClient.get<CopyTradeConfigResponse>(
           `/api/copytrade/config/${traderData.trader_id}`
         )
         if (result.success && result.data?.config) {
           const cfg = result.data.config
+          setSourceHealth(result.data.source_health ?? null)
           setLoadedLegacyReentry(
             cfg.risk_reentry_decision_mode === 'legacy_rule'
           )
@@ -304,7 +452,13 @@ export function TraderConfigModal({
           setFormData((prev) => ({
             ...prev,
             copy_provider_type: cfg.provider_type as CopyTradeProvider,
-            copy_leader_id: cfg.leader_id,
+            copy_leader_id:
+              cfg.binance_source_mode === 'smart_money' ? '' : cfg.leader_id,
+            copy_binance_source_mode:
+              cfg.binance_source_mode ?? 'copy_management',
+            copy_binance_top_trader_id:
+              cfg.binance_top_trader_id ||
+              (cfg.binance_source_mode === 'smart_money' ? cfg.leader_id : ''),
             copy_ratio: cfg.copy_ratio,
             copy_sync_leverage: cfg.sync_leverage,
             copy_sync_margin_mode: cfg.sync_margin_mode ?? true, // 默认 true
@@ -385,6 +539,7 @@ export function TraderConfigModal({
       } catch (error) {
         // 没有跟单配置，保持当前状态
         setLoadedLegacyReentry(false)
+        setSourceHealth(null)
         console.log('No copy trade config found')
       }
     }
@@ -457,6 +612,7 @@ export function TraderConfigModal({
       }))
     } else if (!isEditMode) {
       setLoadedLegacyReentry(false)
+      setSourceHealth(null)
       setFormData({
         trader_name: '',
         ai_model: availableModels[0]?.id || '',
@@ -471,6 +627,8 @@ export function TraderConfigModal({
         copy_ratio: 1.0,
         copy_sync_leverage: true,
         copy_sync_margin_mode: true, // 默认同步保证金模式
+        copy_binance_source_mode: 'copy_management',
+        copy_binance_top_trader_id: '',
         copy_binance_p20t: '',
         copy_binance_csrf_token: '',
         // 风控默认值（与 useState 初始值保持一致）
@@ -520,6 +678,14 @@ export function TraderConfigModal({
   if (!isOpen) return null
 
   const handleInputChange = (field: keyof FormState, value: any) => {
+    if (
+      field === 'copy_provider_type' ||
+      field === 'copy_binance_source_mode' ||
+      field === 'copy_binance_top_trader_id'
+    ) {
+      // 表单中的来源身份已偏离已加载配置，避免继续展示旧来源的健康状态。
+      setSourceHealth(null)
+    }
     setFormData((prev) => ({ ...prev, [field]: value }))
   }
 
@@ -603,14 +769,26 @@ export function TraderConfigModal({
       highRiskConfirmed = true
     }
 
-    // 跟单模式领航员 ID 必填：旧逻辑在 leader_id 为空时静默不带 copy_config，
-    // 交易员被保存为"跟单模式但无跟单配置"的半成品状态
-    if (
-      formData.decision_mode === 'copy_trade' &&
-      !formData.copy_leader_id.trim()
-    ) {
-      window.alert('跟单模式必须填写领航员 ID / 地址')
-      return
+    let normalizedTopTraderID: string | null = null
+    if (formData.decision_mode === 'copy_trade') {
+      const isSmartMoney =
+        formData.copy_provider_type === 'binance' &&
+        formData.copy_binance_source_mode === 'smart_money'
+      if (isSmartMoney) {
+        normalizedTopTraderID = normalizeTopTraderID(
+          formData.copy_binance_top_trader_id
+        )
+        if (!normalizedTopTraderID) {
+          window.alert(
+            '公开领航员模式必须填写有效的 Smart Money 主页 URL 或 19 位纯数字 topTraderId'
+          )
+          return
+        }
+      } else if (!formData.copy_leader_id.trim()) {
+        // 旧逻辑在 leader_id 为空时静默不带 copy_config，会保存出半成品配置。
+        window.alert('跟单模式必须填写领航员 ID / 地址')
+        return
+      }
     }
 
     setIsSaving(true)
@@ -637,11 +815,18 @@ export function TraderConfigModal({
         saveData.initial_balance = formData.initial_balance
       }
 
-      // 如果是跟单模式，包含跟单配置
-      if (formData.decision_mode === 'copy_trade' && formData.copy_leader_id) {
+      // 如果是跟单模式，包含跟单配置。Smart Money 使用独立 topTraderId，
+      // 绝不与已跟单模式的 portfolioId 混用。
+      if (formData.decision_mode === 'copy_trade') {
+        const isSmartMoney =
+          formData.copy_provider_type === 'binance' &&
+          formData.copy_binance_source_mode === 'smart_money'
+        const leaderID = isSmartMoney
+          ? normalizedTopTraderID!
+          : formData.copy_leader_id.trim()
         saveData.copy_config = {
           provider_type: formData.copy_provider_type,
-          leader_id: formData.copy_leader_id,
+          leader_id: leaderID,
           copy_ratio: formData.copy_ratio,
           sync_leverage: formData.copy_sync_leverage,
           sync_margin_mode: formData.copy_sync_margin_mode, // 同步保证金模式（仅 OKX 生效）
@@ -708,6 +893,11 @@ export function TraderConfigModal({
         }
         // Binance 数据源额外携带 Web 私有接口凭证
         if (formData.copy_provider_type === 'binance') {
+          saveData.copy_config.binance_source_mode =
+            formData.copy_binance_source_mode
+          saveData.copy_config.binance_top_trader_id = isSmartMoney
+            ? normalizedTopTraderID!
+            : undefined
           saveData.copy_config.binance_p20t = formData.copy_binance_p20t.trim()
           saveData.copy_config.binance_csrf_token =
             formData.copy_binance_csrf_token.trim()
@@ -1064,37 +1254,142 @@ export function TraderConfigModal({
                     </div>
                   </div>
 
-                  {/* Leader ID */}
+                  {formData.copy_provider_type === 'binance' && (
+                    <div>
+                      <label className="text-sm text-[#EAECEF] block mb-2">
+                        Binance 领航员模式
+                      </label>
+                      <div className="grid grid-cols-2 gap-2">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            handleInputChange(
+                              'copy_binance_source_mode',
+                              'copy_management'
+                            )
+                          }
+                          className={`rounded border p-3 text-left transition-colors ${
+                            formData.copy_binance_source_mode ===
+                            'copy_management'
+                              ? 'border-[#F0B90B] bg-[#F0B90B14]'
+                              : 'border-[#2B3139] bg-[#0B0E11]'
+                          }`}
+                        >
+                          <span
+                            className={`block text-sm font-medium ${
+                              formData.copy_binance_source_mode ===
+                              'copy_management'
+                                ? 'text-[#F0B90B]'
+                                : 'text-[#EAECEF]'
+                            }`}
+                          >
+                            已跟单领航员
+                          </span>
+                          <span className="mt-1 block text-[11px] leading-relaxed text-[#848E9C]">
+                            从 Binance 跟单管理读取，需要当前账号已跟单该领航员
+                          </span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            handleInputChange(
+                              'copy_binance_source_mode',
+                              'smart_money'
+                            )
+                          }
+                          className={`rounded border p-3 text-left transition-colors ${
+                            formData.copy_binance_source_mode === 'smart_money'
+                              ? 'border-[#F0B90B] bg-[#F0B90B14]'
+                              : 'border-[#2B3139] bg-[#0B0E11]'
+                          }`}
+                        >
+                          <span
+                            className={`block text-sm font-medium ${
+                              formData.copy_binance_source_mode ===
+                              'smart_money'
+                                ? 'text-[#F0B90B]'
+                                : 'text-[#EAECEF]'
+                            }`}
+                          >
+                            公开领航员
+                          </span>
+                          <span className="mt-1 block text-[11px] leading-relaxed text-[#848E9C]">
+                            无需先实际跟单，仍使用 Binance 共享登录凭证
+                          </span>
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Leader source identity */}
                   <div>
                     <label className="text-sm text-[#EAECEF] block mb-2">
-                      {formData.copy_provider_type === 'binance'
-                        ? '领航员 PortfolioId'
-                        : '领航员地址'}
+                      {formData.copy_provider_type === 'binance' &&
+                      formData.copy_binance_source_mode === 'smart_money'
+                        ? 'Smart Money 主页 / TopTraderId'
+                        : formData.copy_provider_type === 'binance'
+                          ? '领航员 PortfolioId'
+                          : '领航员地址'}
                       <span className="text-red-500"> *</span>
                     </label>
                     <input
                       type="text"
-                      value={formData.copy_leader_id}
+                      value={
+                        formData.copy_provider_type === 'binance' &&
+                        formData.copy_binance_source_mode === 'smart_money'
+                          ? formData.copy_binance_top_trader_id
+                          : formData.copy_leader_id
+                      }
                       onChange={(e) =>
-                        handleInputChange('copy_leader_id', e.target.value)
+                        handleInputChange(
+                          formData.copy_provider_type === 'binance' &&
+                            formData.copy_binance_source_mode === 'smart_money'
+                            ? 'copy_binance_top_trader_id'
+                            : 'copy_leader_id',
+                          e.target.value
+                        )
                       }
                       className="w-full px-3 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF] focus:border-[#F0B90B] focus:outline-none font-mono text-sm"
                       placeholder={
                         formData.copy_provider_type === 'hyperliquid'
                           ? '0x...'
-                          : formData.copy_provider_type === 'binance'
-                            ? '领航员主页 portfolioId (如 5008318166959365632)'
-                            : 'UniqueName (如 F2BCA22ABBB69F57)'
+                          : formData.copy_provider_type === 'binance' &&
+                              formData.copy_binance_source_mode ===
+                                'smart_money'
+                            ? 'https://www.binance.com/zh-CN/smart-money/profile/5082050984257986817'
+                            : formData.copy_provider_type === 'binance'
+                              ? '领航员主页 portfolioId (如 5008318166959365632)'
+                              : 'UniqueName (如 F2BCA22ABBB69F57)'
                       }
                     />
                     <p className="text-xs text-[#848E9C] mt-1">
                       {formData.copy_provider_type === 'hyperliquid'
                         ? 'Hyperliquid 钱包地址 (0x开头)'
-                        : formData.copy_provider_type === 'binance'
-                          ? '填领航员主页 URL 末尾的 portfolioId（不是跟单订单里的关系 ID）。前提：你的账户已经在 Binance 上跟单了该领航员'
-                          : 'OKX 交易员 uniqueName (交易员页面 URL 中的参数)'}
+                        : formData.copy_provider_type === 'binance' &&
+                            formData.copy_binance_source_mode === 'smart_money'
+                          ? '可粘贴 Smart Money 主页完整 URL 或纯数字 topTraderId。系统以公开的当前仓位完整快照为实时权威数据。'
+                          : formData.copy_provider_type === 'binance'
+                            ? '填领航员主页 URL 末尾的 portfolioId（不是跟单订单里的关系 ID）。前提：你的账户已经在 Binance 上跟单了该领航员'
+                            : 'OKX 交易员 uniqueName (交易员页面 URL 中的参数)'}
                     </p>
                   </div>
+
+                  {formData.copy_provider_type === 'binance' &&
+                    formData.copy_binance_source_mode === 'smart_money' && (
+                      <div className="space-y-2">
+                        <div className="flex items-start gap-2 rounded border border-[#F0B90B44] bg-[#F0B90B0D] p-3">
+                          <AlertCircle className="mt-0.5 h-4 w-4 flex-shrink-0 text-[#F0B90B]" />
+                          <p className="text-[11px] leading-relaxed text-[#B7BDC6]">
+                            公开领航员可随时关闭仓位分享。检测到私密、停用、凭证失效或完整快照过期时，系统会冻结该来源并发送邮件；
+                            <span className="text-[#F0B90B]">
+                              不会自动平掉本地已有仓位
+                            </span>
+                            ，已有 Copy Guard 保护仍会继续维护。
+                          </p>
+                        </div>
+                        <SmartMoneySourceHealthCard health={sourceHealth} />
+                      </div>
+                    )}
 
                   {/* Binance 全局共享凭证状态卡（v2 凭证全局化） */}
                   {/* 旧字段 copy_binance_p20t/copy_binance_csrf_token 仍保留在 formData 中

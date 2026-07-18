@@ -292,7 +292,8 @@ func (s *CopyTradeStore) initCopyGuardTables() error {
 			cycle_id INTEGER PRIMARY KEY, trader_id TEXT NOT NULL, algo_id TEXT NOT NULL,
 			algo_client_id TEXT DEFAULT '', symbol TEXT NOT NULL, side TEXT NOT NULL, margin_mode TEXT NOT NULL,
 			quantity REAL NOT NULL, quantity_step REAL DEFAULT 0, trigger_price REAL NOT NULL, trigger_type TEXT NOT NULL,
-			status TEXT NOT NULL, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+			status TEXT NOT NULL, previous_algo_id TEXT DEFAULT '', previous_algo_client_id TEXT DEFAULT '',
+			replacement_pending BOOLEAN DEFAULT 0, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		);
 		CREATE TABLE IF NOT EXISTS copy_guard_watch_samples (
 			id INTEGER PRIMARY KEY AUTOINCREMENT, cycle_id INTEGER NOT NULL, trader_id TEXT NOT NULL,
@@ -339,6 +340,9 @@ func (s *CopyTradeStore) initCopyGuardTables() error {
 			`ALTER TABLE copy_guard_cycles ADD COLUMN leader_entry_at_stop REAL DEFAULT 0`,
 			`ALTER TABLE copy_guard_watch_samples ADD COLUMN attempt_no INTEGER NOT NULL DEFAULT 0`,
 			`ALTER TABLE copy_guard_protective_orders ADD COLUMN quantity_step REAL DEFAULT 0`,
+			`ALTER TABLE copy_guard_protective_orders ADD COLUMN previous_algo_id TEXT DEFAULT ''`,
+			`ALTER TABLE copy_guard_protective_orders ADD COLUMN previous_algo_client_id TEXT DEFAULT ''`,
+			`ALTER TABLE copy_guard_protective_orders ADD COLUMN replacement_pending BOOLEAN DEFAULT 0`,
 		}
 		for _, migration := range migrations {
 			_, _ = s.db.Exec(migration)
@@ -360,32 +364,40 @@ func (s *CopyTradeStore) initCopyGuardTables() error {
 }
 
 type CopyGuardProtectiveOrder struct {
-	CycleID      int64   `json:"cycle_id"`
-	TraderID     string  `json:"trader_id"`
-	AlgoID       string  `json:"algo_id"`
-	AlgoClientID string  `json:"algo_client_id"`
-	Symbol       string  `json:"symbol"`
-	Side         string  `json:"side"`
-	MarginMode   string  `json:"margin_mode"`
-	Quantity     float64 `json:"quantity"`
-	QuantityStep float64 `json:"quantity_step"`
-	TriggerPrice float64 `json:"trigger_price"`
-	TriggerType  string  `json:"trigger_type"`
-	Status       string  `json:"status"`
+	CycleID              int64   `json:"cycle_id"`
+	TraderID             string  `json:"trader_id"`
+	AlgoID               string  `json:"algo_id"`
+	AlgoClientID         string  `json:"algo_client_id"`
+	Symbol               string  `json:"symbol"`
+	Side                 string  `json:"side"`
+	MarginMode           string  `json:"margin_mode"`
+	Quantity             float64 `json:"quantity"`
+	QuantityStep         float64 `json:"quantity_step"`
+	TriggerPrice         float64 `json:"trigger_price"`
+	TriggerType          string  `json:"trigger_type"`
+	Status               string  `json:"status"`
+	PreviousAlgoID       string  `json:"previous_algo_id,omitempty"`
+	PreviousAlgoClientID string  `json:"previous_algo_client_id,omitempty"`
+	ReplacementPending   bool    `json:"replacement_pending"`
 }
 
 func (s *CopyTradeStore) UpsertCopyGuardProtectiveOrder(o *CopyGuardProtectiveOrder) error {
 	if o == nil {
 		return fmt.Errorf("nil protective order")
 	}
-	_, err := s.db.Exec(`INSERT INTO copy_guard_protective_orders(cycle_id,trader_id,algo_id,algo_client_id,symbol,side,margin_mode,quantity,quantity_step,trigger_price,trigger_type,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(cycle_id) DO UPDATE SET algo_id=excluded.algo_id,algo_client_id=excluded.algo_client_id,quantity=excluded.quantity,quantity_step=excluded.quantity_step,trigger_price=excluded.trigger_price,trigger_type=excluded.trigger_type,status=excluded.status,updated_at=CURRENT_TIMESTAMP`, o.CycleID, o.TraderID, o.AlgoID, o.AlgoClientID, o.Symbol, o.Side, o.MarginMode, o.Quantity, o.QuantityStep, o.TriggerPrice, o.TriggerType, o.Status)
+	_, err := s.db.Exec(`INSERT INTO copy_guard_protective_orders(cycle_id,trader_id,algo_id,algo_client_id,symbol,side,margin_mode,quantity,quantity_step,trigger_price,trigger_type,status,previous_algo_id,previous_algo_client_id,replacement_pending) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(cycle_id) DO UPDATE SET algo_id=excluded.algo_id,algo_client_id=excluded.algo_client_id,quantity=excluded.quantity,quantity_step=excluded.quantity_step,trigger_price=excluded.trigger_price,trigger_type=excluded.trigger_type,status=excluded.status,previous_algo_id=excluded.previous_algo_id,previous_algo_client_id=excluded.previous_algo_client_id,replacement_pending=excluded.replacement_pending,updated_at=CURRENT_TIMESTAMP`, o.CycleID, o.TraderID, o.AlgoID, o.AlgoClientID, o.Symbol, o.Side, o.MarginMode, o.Quantity, o.QuantityStep, o.TriggerPrice, o.TriggerType, o.Status, o.PreviousAlgoID, o.PreviousAlgoClientID, o.ReplacementPending)
 	return err
 }
 
 func (s *CopyTradeStore) GetCopyGuardProtectiveOrder(cycleID int64) (*CopyGuardProtectiveOrder, error) {
 	var o CopyGuardProtectiveOrder
-	err := s.db.QueryRow(`SELECT cycle_id,trader_id,algo_id,algo_client_id,symbol,side,margin_mode,quantity,quantity_step,trigger_price,trigger_type,status FROM copy_guard_protective_orders WHERE cycle_id=?`, cycleID).Scan(&o.CycleID, &o.TraderID, &o.AlgoID, &o.AlgoClientID, &o.Symbol, &o.Side, &o.MarginMode, &o.Quantity, &o.QuantityStep, &o.TriggerPrice, &o.TriggerType, &o.Status)
+	err := s.db.QueryRow(`SELECT cycle_id,trader_id,algo_id,algo_client_id,symbol,side,margin_mode,quantity,quantity_step,trigger_price,trigger_type,status,COALESCE(previous_algo_id,''),COALESCE(previous_algo_client_id,''),COALESCE(replacement_pending,0) FROM copy_guard_protective_orders WHERE cycle_id=?`, cycleID).Scan(&o.CycleID, &o.TraderID, &o.AlgoID, &o.AlgoClientID, &o.Symbol, &o.Side, &o.MarginMode, &o.Quantity, &o.QuantityStep, &o.TriggerPrice, &o.TriggerType, &o.Status, &o.PreviousAlgoID, &o.PreviousAlgoClientID, &o.ReplacementPending)
 	return &o, err
+}
+
+func (s *CopyTradeStore) CompleteCopyGuardProtectiveReplacement(cycleID int64) error {
+	_, err := s.db.Exec(`UPDATE copy_guard_protective_orders SET previous_algo_id='',previous_algo_client_id='',replacement_pending=0,updated_at=CURRENT_TIMESTAMP WHERE cycle_id=?`, cycleID)
+	return err
 }
 
 func (s *CopyTradeStore) UpdateCopyGuardProtectiveOrderStatus(cycleID int64, status string) error {
@@ -394,7 +406,7 @@ func (s *CopyTradeStore) UpdateCopyGuardProtectiveOrderStatus(cycleID int64, sta
 }
 
 func (s *CopyTradeStore) ListActiveCopyGuardProtectiveOrders(traderID string) ([]*CopyGuardProtectiveOrder, error) {
-	rows, err := s.db.Query(`SELECT cycle_id,trader_id,algo_id,algo_client_id,symbol,side,margin_mode,quantity,quantity_step,trigger_price,trigger_type,status FROM copy_guard_protective_orders WHERE trader_id=? AND status='live'`, traderID)
+	rows, err := s.db.Query(`SELECT cycle_id,trader_id,algo_id,algo_client_id,symbol,side,margin_mode,quantity,quantity_step,trigger_price,trigger_type,status,COALESCE(previous_algo_id,''),COALESCE(previous_algo_client_id,''),COALESCE(replacement_pending,0) FROM copy_guard_protective_orders WHERE trader_id=? AND (status='live' OR replacement_pending=1)`, traderID)
 	if err != nil {
 		return nil, err
 	}
@@ -402,7 +414,7 @@ func (s *CopyTradeStore) ListActiveCopyGuardProtectiveOrders(traderID string) ([
 	out := []*CopyGuardProtectiveOrder{}
 	for rows.Next() {
 		var o CopyGuardProtectiveOrder
-		if err := rows.Scan(&o.CycleID, &o.TraderID, &o.AlgoID, &o.AlgoClientID, &o.Symbol, &o.Side, &o.MarginMode, &o.Quantity, &o.QuantityStep, &o.TriggerPrice, &o.TriggerType, &o.Status); err != nil {
+		if err := rows.Scan(&o.CycleID, &o.TraderID, &o.AlgoID, &o.AlgoClientID, &o.Symbol, &o.Side, &o.MarginMode, &o.Quantity, &o.QuantityStep, &o.TriggerPrice, &o.TriggerType, &o.Status, &o.PreviousAlgoID, &o.PreviousAlgoClientID, &o.ReplacementPending); err != nil {
 			return nil, err
 		}
 		out = append(out, &o)

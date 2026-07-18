@@ -7,6 +7,7 @@ import (
 	"math"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -50,14 +51,24 @@ var (
 
 // okxInstrumentResp OKX 公开 instruments API 响应
 type okxInstrumentResp struct {
-	Code string `json:"code"`
-	Msg  string `json:"msg"`
-	Data []struct {
-		InstID string `json:"instId"`
-		TickSz string `json:"tickSz"`
-		LotSz  string `json:"lotSz"`
-		CtVal  string `json:"ctVal"`
-	} `json:"data"`
+	Code string             `json:"code"`
+	Msg  string             `json:"msg"`
+	Data []okxInstrumentRow `json:"data"`
+}
+
+type okxInstrumentRow struct {
+	InstID     string `json:"instId"`
+	InstType   string `json:"instType"`
+	State      string `json:"state"`
+	BaseCcy    string `json:"baseCcy"`
+	QuoteCcy   string `json:"quoteCcy"`
+	SettleCcy  string `json:"settleCcy"`
+	CtValCcy   string `json:"ctValCcy"`
+	Uly        string `json:"uly"`
+	InstFamily string `json:"instFamily"`
+	TickSz     string `json:"tickSz"`
+	LotSz      string `json:"lotSz"`
+	CtVal      string `json:"ctVal"`
 }
 
 // getOKXTickSize 获取 OKX SWAP 合约的价格档位（tickSz）
@@ -99,6 +110,9 @@ func getOKXInstrumentSpec(symbol string) (okxInstrumentCacheEntry, error) {
 	}
 
 	instID := convertSymbolToOKXInstID(symbol)
+	if instID == "" {
+		return okxInstrumentCacheEntry{}, fmt.Errorf("cannot determine exact OKX settlement asset for %q", symbol)
+	}
 
 	// 命中缓存
 	okxInstrumentCacheMu.RLock()
@@ -134,15 +148,24 @@ func getOKXInstrumentSpec(symbol string) (okxInstrumentCacheEntry, error) {
 	if len(data.Data) == 0 {
 		return okxInstrumentCacheEntry{}, fmt.Errorf("okx instrument not found: %s", instID)
 	}
-
-	tickSz, err := strconv.ParseFloat(data.Data[0].TickSz, 64)
-	if err != nil || tickSz <= 0 {
-		return okxInstrumentCacheEntry{}, fmt.Errorf("invalid tickSz %q: %v", data.Data[0].TickSz, err)
+	wantParts := strings.Split(instID, "-")
+	row := data.Data[0]
+	if len(wantParts) != 3 || !okxInstrumentRowMatchesSwap(row, instID, wantParts[0], wantParts[1]) {
+		return okxInstrumentCacheEntry{}, fmt.Errorf(
+			"okx instrument identity mismatch for %s: instId=%s type=%s state=%s base=%s quote=%s settle=%s ctValCcy=%s uly=%s family=%s",
+			instID, row.InstID, row.InstType, row.State, row.BaseCcy, row.QuoteCcy, row.SettleCcy,
+			row.CtValCcy, row.Uly, row.InstFamily,
+		)
 	}
-	lotSz, lotErr := strconv.ParseFloat(data.Data[0].LotSz, 64)
-	ctVal, ctErr := strconv.ParseFloat(data.Data[0].CtVal, 64)
+
+	tickSz, err := strconv.ParseFloat(row.TickSz, 64)
+	if err != nil || tickSz <= 0 {
+		return okxInstrumentCacheEntry{}, fmt.Errorf("invalid tickSz %q: %v", row.TickSz, err)
+	}
+	lotSz, lotErr := strconv.ParseFloat(row.LotSz, 64)
+	ctVal, ctErr := strconv.ParseFloat(row.CtVal, 64)
 	if lotErr != nil || lotSz <= 0 || ctErr != nil || ctVal <= 0 {
-		return okxInstrumentCacheEntry{}, fmt.Errorf("invalid OKX quantity spec lotSz=%q ctVal=%q", data.Data[0].LotSz, data.Data[0].CtVal)
+		return okxInstrumentCacheEntry{}, fmt.Errorf("invalid OKX quantity spec lotSz=%q ctVal=%q", row.LotSz, row.CtVal)
 	}
 	entry := okxInstrumentCacheEntry{tickSz: tickSz, lotSz: lotSz, ctVal: ctVal, ts: time.Now()}
 
@@ -151,23 +174,48 @@ func getOKXInstrumentSpec(symbol string) (okxInstrumentCacheEntry, error) {
 	okxInstrumentCache[instID] = entry
 	okxInstrumentCacheMu.Unlock()
 
-	logger.Debugf("📐 OKX instrument spec | %s tickSz=%s lotSz=%s ctVal=%s", instID, data.Data[0].TickSz, data.Data[0].LotSz, data.Data[0].CtVal)
+	logger.Debugf("📐 OKX instrument spec | %s tickSz=%s lotSz=%s ctVal=%s", instID, row.TickSz, row.LotSz, row.CtVal)
 	return entry, nil
 }
 
-// convertSymbolToOKXInstID "BTCUSDT" → "BTC-USDT-SWAP"
-//
-// 规则：以 USDT 结尾的统一格式 → OKX SWAP 永续合约
-// 设计上跟单只跑 OKX SWAP，所以这个转换足够覆盖
+func okxInstrumentRowMatchesSwap(row okxInstrumentRow, instID, base, quote string) bool {
+	if !strings.EqualFold(row.InstID, instID) || !strings.EqualFold(row.InstType, "SWAP") ||
+		!strings.EqualFold(row.State, "live") || !strings.EqualFold(row.SettleCcy, quote) {
+		return false
+	}
+	if row.BaseCcy != "" && !strings.EqualFold(row.BaseCcy, base) {
+		return false
+	}
+	if row.QuoteCcy != "" && !strings.EqualFold(row.QuoteCcy, quote) {
+		return false
+	}
+	if row.CtValCcy != "" && !strings.EqualFold(row.CtValCcy, base) {
+		return false
+	}
+	wantFamily := base + "-" + quote
+	if row.Uly != "" && !strings.EqualFold(row.Uly, wantFamily) {
+		return false
+	}
+	if row.InstFamily != "" && !strings.EqualFold(row.InstFamily, wantFamily) {
+		return false
+	}
+	return true
+}
+
+// convertSymbolToOKXInstID preserves the source settlement asset. USD value
+// normalization is never allowed to rewrite USDC/USD1 contracts to USDT.
 func convertSymbolToOKXInstID(symbol string) string {
-	if len(symbol) < 4 {
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	parts := strings.Split(symbol, "-")
+	if len(parts) == 3 && parts[0] != "" && parts[1] != "" && parts[2] == "SWAP" {
 		return symbol
 	}
-	// 末尾是 USDT 的标准格式
-	if symbol[len(symbol)-4:] == "USDT" {
-		return symbol[:len(symbol)-4] + "-USDT-SWAP"
+	for _, quote := range []string{"USDT", "USDC", "USD1"} {
+		if strings.HasSuffix(symbol, quote) && len(symbol) > len(quote) {
+			return symbol[:len(symbol)-len(quote)] + "-" + quote + "-SWAP"
+		}
 	}
-	return symbol
+	return ""
 }
 
 // alignToTickSize 把价格对齐到价格档位

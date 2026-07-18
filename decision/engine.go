@@ -149,11 +149,15 @@ type Decision struct {
 	EntryPrice float64 `json:"entry_price,omitempty"` // 入场价格（跟单时记录领航员成交价）
 
 	// 跟单专用字段
-	LeaderPosID     string  `json:"leader_pos_id,omitempty"`   // 领航员仓位 ID（用于映射追踪）
-	LeaderPosSize   float64 `json:"leader_pos_size,omitempty"` // 领航员当前持仓数量（用于 lastKnownSize 追踪）
-	ClientOrderID   string  `json:"client_order_id,omitempty"` // Copy Guard 幂等执行与重启恢复
-	ExchangeOrderID string  `json:"exchange_order_id,omitempty"`
-	SourceFillID    string  `json:"source_fill_id,omitempty"` // 产生该决策的领航员 fill ID（瞬态失败后释放去重标记重放用）
+	LeaderPosID          string  `json:"leader_pos_id,omitempty"`   // 领航员仓位 ID（用于映射追踪）
+	LeaderPosSize        float64 `json:"leader_pos_size,omitempty"` // 领航员当前持仓数量（用于 lastKnownSize 追踪）
+	ClientOrderID        string  `json:"client_order_id,omitempty"` // Copy Guard 幂等执行与重启恢复
+	ExchangeOrderID      string  `json:"exchange_order_id,omitempty"`
+	SourceFillID         string  `json:"source_fill_id,omitempty"` // 产生该决策的领航员 fill ID（瞬态失败后释放去重标记重放用）
+	SourceSymbol         string  `json:"source_symbol,omitempty"`
+	ExecutionSymbol      string  `json:"execution_symbol,omitempty"`
+	ValueCurrency        string  `json:"value_currency,omitempty"`
+	ExecutionSettleAsset string  `json:"execution_settle_asset,omitempty"`
 }
 
 // FullDecision AI's complete decision (including chain of thought)

@@ -79,6 +79,20 @@ func NewProviderWithLoader(config *CopyConfig, loader BinanceCredentialsLoader) 
 	case ProviderOKX:
 		return NewOKXProvider(), nil
 	case ProviderBinance:
+		mode := config.BinanceSourceMode
+		if mode == "" {
+			mode = BinanceSourceCopyManagement
+		}
+		if mode != BinanceSourceCopyManagement && mode != BinanceSourceSmartMoney {
+			return nil, fmt.Errorf("unsupported Binance source mode: %s", mode)
+		}
+		if mode == BinanceSourceSmartMoney {
+			if loader != nil {
+				return NewBinanceSmartMoneyProviderWithLoader(loader, DefaultBinanceCredentialsLabel,
+					config.BinanceP20T, config.BinanceCSRFToken), nil
+			}
+			return NewBinanceSmartMoneyProvider(config.BinanceP20T, config.BinanceCSRFToken), nil
+		}
 		if loader != nil {
 			// 启用全局凭证 + 旧字段降级（迁移过渡期）
 			return NewBinanceProviderWithLoader(loader, DefaultBinanceCredentialsLabel,

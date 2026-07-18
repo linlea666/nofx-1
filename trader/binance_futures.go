@@ -3,8 +3,11 @@ package trader
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"math"
 	"nofx/hook"
 	"nofx/logger"
 	"strconv"
@@ -12,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/adshao/go-binance/v2/common"
 	"github.com/adshao/go-binance/v2/futures"
 )
 
@@ -59,6 +63,19 @@ type FuturesTrader struct {
 
 	// Cache validity period (15 seconds)
 	cacheDuration time.Duration
+
+	instrumentsCache      map[string]*binanceExecutionInstrument
+	instrumentsCacheTime  time.Time
+	instrumentsCacheMutex sync.RWMutex
+}
+
+type binanceExecutionInstrument struct {
+	ExecutionInstrument
+	StepSize    float64
+	MinQuantity float64
+	MaxQuantity float64
+	TickSize    float64
+	MinNotional float64
 }
 
 // NewFuturesTrader creates futures trader
@@ -73,8 +90,9 @@ func NewFuturesTrader(apiKey, secretKey string, userId string) *FuturesTrader {
 	// Sync time to avoid "Timestamp ahead" error
 	syncBinanceServerTime(client)
 	trader := &FuturesTrader{
-		client:        client,
-		cacheDuration: 15 * time.Second, // 15-second cache
+		client:           client,
+		cacheDuration:    15 * time.Second, // 15-second cache
+		instrumentsCache: make(map[string]*binanceExecutionInstrument),
 	}
 
 	// Set dual-side position mode (Hedge Mode)
@@ -195,6 +213,8 @@ func (t *FuturesTrader) GetPositions() ([]map[string]interface{}, error) {
 		posMap["unRealizedProfit"], _ = strconv.ParseFloat(pos.UnRealizedProfit, 64)
 		posMap["leverage"], _ = strconv.ParseFloat(pos.Leverage, 64)
 		posMap["liquidationPrice"], _ = strconv.ParseFloat(pos.LiquidationPrice, 64)
+		posMap["marginMode"] = pos.MarginType
+		posMap["mgnMode"] = pos.MarginType
 		// Note: Binance SDK doesn't expose updateTime field, will fallback to local tracking
 
 		// Determine direction
@@ -531,6 +551,420 @@ func (t *FuturesTrader) CloseShort(symbol string, quantity float64) (map[string]
 	result["symbol"] = order.Symbol
 	result["status"] = order.Status
 	return result, nil
+}
+
+func (t *FuturesTrader) OpenLongPreservingOrders(symbol string, quantity float64, leverage int) (map[string]interface{}, error) {
+	return t.OpenLongPreservingOrdersWithClientID(symbol, quantity, leverage, getBrOrderID())
+}
+
+func (t *FuturesTrader) OpenShortPreservingOrders(symbol string, quantity float64, leverage int) (map[string]interface{}, error) {
+	return t.OpenShortPreservingOrdersWithClientID(symbol, quantity, leverage, getBrOrderID())
+}
+
+func (t *FuturesTrader) CloseLongPreservingOrders(symbol string, quantity float64) (map[string]interface{}, error) {
+	return t.CloseLongPreservingOrdersWithClientID(symbol, quantity, getBrOrderID())
+}
+
+func (t *FuturesTrader) CloseShortPreservingOrders(symbol string, quantity float64) (map[string]interface{}, error) {
+	return t.CloseShortPreservingOrdersWithClientID(symbol, quantity, getBrOrderID())
+}
+
+func (t *FuturesTrader) OpenLongPreservingOrdersWithClientID(symbol string, quantity float64, leverage int, clientOrderID string) (map[string]interface{}, error) {
+	return t.createCopyMarketOrder(symbol, quantity, leverage, futures.SideTypeBuy, futures.PositionSideTypeLong, clientOrderID, false)
+}
+
+func (t *FuturesTrader) OpenShortPreservingOrdersWithClientID(symbol string, quantity float64, leverage int, clientOrderID string) (map[string]interface{}, error) {
+	return t.createCopyMarketOrder(symbol, quantity, leverage, futures.SideTypeSell, futures.PositionSideTypeShort, clientOrderID, false)
+}
+
+func (t *FuturesTrader) CloseLongPreservingOrdersWithClientID(symbol string, quantity float64, clientOrderID string) (map[string]interface{}, error) {
+	return t.createCopyMarketOrder(symbol, quantity, 0, futures.SideTypeSell, futures.PositionSideTypeLong, clientOrderID, true)
+}
+
+func (t *FuturesTrader) CloseShortPreservingOrdersWithClientID(symbol string, quantity float64, clientOrderID string) (map[string]interface{}, error) {
+	return t.createCopyMarketOrder(symbol, quantity, 0, futures.SideTypeBuy, futures.PositionSideTypeShort, clientOrderID, true)
+}
+
+func (t *FuturesTrader) createCopyMarketOrder(symbol string, quantity float64, leverage int, side futures.SideType, positionSide futures.PositionSideType, clientOrderID string, closing bool) (map[string]interface{}, error) {
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	var instrument *binanceExecutionInstrument
+	var err error
+	if closing {
+		// A reduction must keep using the exact execution symbol already stored
+		// on the mapping. If the live catalog is temporarily unavailable, stale
+		// metadata for that exact symbol is safe for quantity formatting; deriving
+		// or substituting another quote asset is not.
+		instrument, err = t.resolveBinanceInstrumentForReduction(symbol)
+	} else {
+		instrument, err = t.resolveBinanceInstrument(symbol)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if clientOrderID == "" {
+		return nil, errors.New("copy trade client order id is required")
+	}
+	if len(clientOrderID) > 36 {
+		return nil, fmt.Errorf("copy trade client order id exceeds Binance limit")
+	}
+	if existing, found, err := t.findOrderByClientID(symbol, clientOrderID); err != nil {
+		return nil, fmt.Errorf("query idempotent Binance order: %w", err)
+	} else if found {
+		return adoptBinanceCopyOrder(existing)
+	}
+	if closing && quantity == 0 {
+		positions, err := t.GetPositionsFresh()
+		if err != nil {
+			return nil, err
+		}
+		wantedSide := strings.ToLower(string(positionSide))
+		for _, pos := range positions {
+			if binanceMapString(pos, "symbol") == symbol && binanceMapString(pos, "side") == wantedSide {
+				quantity = math.Abs(binanceMapFloat(pos, "positionAmt"))
+				break
+			}
+		}
+		if quantity == 0 {
+			return nil, fmt.Errorf("no %s position found for %s", wantedSide, symbol)
+		}
+	}
+	if !closing {
+		if err := t.SetLeverage(symbol, leverage); err != nil {
+			return nil, err
+		}
+	}
+	quantityStr, err := formatBinanceMarketQuantity(instrument, symbol, math.Abs(quantity))
+	if err != nil {
+		return nil, err
+	}
+	if !closing {
+		quantityFloat, _ := strconv.ParseFloat(quantityStr, 64)
+		if err := t.CheckMinNotional(symbol, quantityFloat); err != nil {
+			return nil, err
+		}
+	}
+	order, err := t.client.NewCreateOrderService().Symbol(symbol).Side(side).PositionSide(positionSide).
+		Type(futures.OrderTypeMarket).Quantity(quantityStr).NewClientOrderID(clientOrderID).Do(context.Background())
+	if err != nil {
+		// An ambiguous response may still have reached Binance. Resolve by the
+		// stable client ID before surfacing an error, never submit a second order.
+		if existing, found, queryErr := t.findOrderByClientID(symbol, clientOrderID); queryErr == nil && found {
+			result, adoptionErr := adoptBinanceCopyOrder(existing)
+			if adoptionErr == nil {
+				return result, nil
+			}
+			return nil, fmt.Errorf("create Binance copy trade order returned an ambiguous error and the client id is unusable: %w", adoptionErr)
+		}
+		return nil, fmt.Errorf("create Binance copy trade order: %w", err)
+	}
+	t.invalidatePositionsCache()
+	return binanceCreateOrderResult(order), nil
+}
+
+// adoptBinanceCopyOrder validates the result of an idempotency lookup. A live
+// order or an order with a real execution can be safely adopted. A terminal
+// zero-fill order permanently consumed the client ID but did not perform the
+// decision, so treating it as success would silently lose the copy action.
+func adoptBinanceCopyOrder(order *futures.Order) (map[string]interface{}, error) {
+	if order == nil {
+		return nil, errors.New("Binance client order lookup returned no order")
+	}
+	executedQty, err := strconv.ParseFloat(strings.TrimSpace(order.ExecutedQuantity), 64)
+	if err != nil && strings.TrimSpace(order.ExecutedQuantity) != "" {
+		return nil, fmt.Errorf("Binance client order %s has invalid executed quantity %q", order.ClientOrderID, order.ExecutedQuantity)
+	}
+	if executedQty > 0 {
+		return binanceOrderResult(order), nil
+	}
+	if order.Status == futures.OrderStatusTypeNew {
+		return binanceOrderResult(order), nil
+	}
+	return nil, fmt.Errorf("Binance client order %s is %s with zero executed quantity", order.ClientOrderID, order.Status)
+}
+
+func binanceMapString(values map[string]interface{}, key string) string {
+	value, _ := values[key].(string)
+	return value
+}
+
+func binanceMapFloat(values map[string]interface{}, key string) float64 {
+	switch value := values[key].(type) {
+	case float64:
+		return value
+	case float32:
+		return float64(value)
+	case int:
+		return float64(value)
+	case string:
+		parsed, _ := strconv.ParseFloat(value, 64)
+		return parsed
+	default:
+		return 0
+	}
+}
+
+func (t *FuturesTrader) findOrderByClientID(symbol, clientOrderID string) (*futures.Order, bool, error) {
+	order, err := t.client.NewGetOrderService().Symbol(symbol).OrigClientOrderID(clientOrderID).Do(context.Background())
+	if err != nil {
+		if isBinanceOrderNotFound(err) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	return order, true, nil
+}
+
+func isBinanceOrderNotFound(err error) bool {
+	var apiErr *common.APIError
+	if errors.As(err, &apiErr) && (apiErr.Code == -2013 || apiErr.Code == -2011) {
+		return true
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "order does not exist") || strings.Contains(text, "unknown order")
+}
+
+func binanceOrderResult(order *futures.Order) map[string]interface{} {
+	avgPrice, _ := strconv.ParseFloat(order.AvgPrice, 64)
+	executedQty, _ := strconv.ParseFloat(order.ExecutedQuantity, 64)
+	return map[string]interface{}{
+		"orderId": strconv.FormatInt(order.OrderID, 10), "clOrdId": order.ClientOrderID,
+		"symbol": order.Symbol, "status": string(order.Status), "avgPrice": avgPrice,
+		"executedQty": executedQty, "side": string(order.Side), "type": string(order.Type),
+		"time": order.Time, "updateTime": order.UpdateTime, "commission": 0.0,
+	}
+}
+
+func binanceCreateOrderResult(order *futures.CreateOrderResponse) map[string]interface{} {
+	avgPrice, _ := strconv.ParseFloat(order.AvgPrice, 64)
+	executedQty, _ := strconv.ParseFloat(order.ExecutedQuantity, 64)
+	return map[string]interface{}{
+		"orderId": strconv.FormatInt(order.OrderID, 10), "clOrdId": order.ClientOrderID,
+		"symbol": order.Symbol, "status": string(order.Status), "avgPrice": avgPrice,
+		"executedQty": executedQty, "side": string(order.Side), "type": string(order.Type),
+		"updateTime": order.UpdateTime, "commission": 0.0,
+	}
+}
+
+func (t *FuturesTrader) invalidatePositionsCache() {
+	t.positionsCacheMutex.Lock()
+	t.cachedPositions = nil
+	t.positionsCacheTime = time.Time{}
+	t.positionsCacheMutex.Unlock()
+}
+
+func (t *FuturesTrader) GetPositionsFresh() ([]map[string]interface{}, error) {
+	t.invalidatePositionsCache()
+	return t.GetPositions()
+}
+
+func (t *FuturesTrader) PlaceProtectiveStop(req ProtectiveStopRequest) (*ProtectiveStopOrder, error) {
+	if _, err := t.resolveBinanceInstrument(req.Symbol); err != nil {
+		return nil, err
+	}
+	if req.ClientID == "" || len(req.ClientID) > 36 {
+		return nil, fmt.Errorf("invalid Binance protective stop client id")
+	}
+	// Binance permanently reserves client algo ids, including terminal orders.
+	// Walk a deterministic chain derived from the terminal exchange order so a
+	// retry adopts the same live replacement instead of inventing a new order.
+	baseClientID := req.ClientID
+	for attempt := 0; attempt < 4; attempt++ {
+		existing, err := t.GetProtectiveStopByClientID(req.ClientID, req.Symbol)
+		if err == nil {
+			if existing != nil && strings.EqualFold(existing.State, "live") {
+				return existing, nil
+			}
+			if existing == nil {
+				return nil, fmt.Errorf("query Binance protective stop returned an empty order")
+			}
+			req.ClientID = deriveBinanceProtectiveClientID(baseClientID, fmt.Sprintf("terminal|%s|%s|%s|%.12f|%.12f|%s|%d", existing.AlgoID, existing.State, req.PositionSide, req.Quantity, req.TriggerPrice, req.TriggerType, attempt))
+			continue
+		}
+		if !errors.Is(err, ErrProtectiveStopNotFound) {
+			return nil, fmt.Errorf("query Binance protective stop before create: %w", err)
+		}
+		break
+	}
+	positionSide, side, err := binanceProtectiveSides(req.PositionSide)
+	if err != nil {
+		return nil, err
+	}
+	workingType := futures.WorkingTypeContractPrice
+	if strings.EqualFold(req.TriggerType, "mark") || strings.EqualFold(req.TriggerType, "mark_price") {
+		workingType = futures.WorkingTypeMarkPrice
+	}
+	created, err := t.client.NewCreateAlgoOrderService().Symbol(strings.ToUpper(req.Symbol)).Side(side).
+		PositionSide(positionSide).Type(futures.AlgoOrderTypeStopMarket).
+		TriggerPrice(strconv.FormatFloat(req.TriggerPrice, 'f', -1, 64)).WorkingType(workingType).
+		ClosePosition(true).ClientAlgoId(req.ClientID).Do(context.Background())
+	if err != nil {
+		if existing, queryErr := t.GetProtectiveStopByClientID(req.ClientID, req.Symbol); queryErr == nil && existing != nil && strings.EqualFold(existing.State, "live") {
+			return existing, nil
+		}
+		return nil, fmt.Errorf("create Binance protective stop: %w", err)
+	}
+	quantity := req.Quantity
+	return &ProtectiveStopOrder{
+		AlgoID: strconv.FormatInt(created.AlgoId, 10), ClientID: created.ClientAlgoId, Symbol: created.Symbol,
+		PositionSide: strings.ToLower(string(created.PositionSide)), MarginMode: req.MarginMode,
+		Quantity: quantity, TriggerPrice: parseBinanceFloat(created.TriggerPrice), TriggerType: req.TriggerType,
+		State: normalizeBinanceAlgoState(created.AlgoStatus),
+	}, nil
+}
+
+// AmendProtectiveStop is deliberately unsupported: Binance Algo orders have
+// no amend API. Copy Guard calls EnsureProtectiveStop, which safely creates and
+// verifies a replacement before retiring the old order.
+func (t *FuturesTrader) AmendProtectiveStop(_ string, _ ProtectiveStopRequest) error {
+	return errors.New("Binance protective stops require safe replacement")
+}
+
+func (t *FuturesTrader) EnsureProtectiveStop(existing *ProtectiveStopOrder, req ProtectiveStopRequest) (*ProtectiveStopEnsureResult, error) {
+	if existing == nil || existing.AlgoID == "" {
+		current, err := t.PlaceProtectiveStop(req)
+		return &ProtectiveStopEnsureResult{Current: current}, err
+	}
+	if strings.TrimSpace(req.ClientID) == "" {
+		return &ProtectiveStopEnsureResult{Retiring: existing}, errors.New("Binance replacement protective stop client id is required")
+	}
+	req.ClientID = deriveBinanceProtectiveClientID(req.ClientID, fmt.Sprintf("replace|%s|%s|%s|%.12f|%.12f|%s", existing.AlgoID, req.Symbol, req.PositionSide, req.Quantity, req.TriggerPrice, req.TriggerType))
+	current, err := t.PlaceProtectiveStop(req)
+	if err != nil {
+		return &ProtectiveStopEnsureResult{Retiring: existing}, fmt.Errorf("create replacement protective stop: %w", err)
+	}
+	if current == nil || current.AlgoID == "" || current.AlgoID == existing.AlgoID {
+		return &ProtectiveStopEnsureResult{Retiring: existing}, fmt.Errorf("replacement protective stop did not create a distinct exchange order")
+	}
+	verified, err := t.GetProtectiveStop(current.AlgoID, req.Symbol)
+	if err != nil || verified == nil || !strings.EqualFold(verified.State, "live") {
+		if err == nil {
+			if verified == nil {
+				err = errors.New("replacement query returned no order")
+			} else {
+				err = fmt.Errorf("replacement state=%s", verified.State)
+			}
+		}
+		// The new identifier is deterministic and can be adopted on the next
+		// retry, but it must not enter replacement_pending until a query has
+		// confirmed it live. Otherwise the recovery loop could retire the last
+		// known-good stop while the replacement is still unknown.
+		return &ProtectiveStopEnsureResult{Current: current, Retiring: existing}, fmt.Errorf("replacement protective stop not confirmed live: %w", err)
+	}
+	// Do not cancel the old order here. The integration must first persist both
+	// identifiers as replacement_pending, then retire the old order. This closes
+	// the crash window between exchange mutation and durable recovery state.
+	return &ProtectiveStopEnsureResult{Current: verified, Retiring: existing, ReplacementPending: true}, nil
+}
+
+func deriveBinanceProtectiveClientID(base, material string) string {
+	digest := sha256.Sum256([]byte(material))
+	suffix := fmt.Sprintf("r%x", digest[:5])
+	if len(base)+len(suffix) > 36 {
+		base = base[:36-len(suffix)]
+	}
+	return base + suffix
+}
+
+func binanceProtectiveSides(side string) (futures.PositionSideType, futures.SideType, error) {
+	switch strings.ToLower(strings.TrimSpace(side)) {
+	case "long":
+		return futures.PositionSideTypeLong, futures.SideTypeSell, nil
+	case "short":
+		return futures.PositionSideTypeShort, futures.SideTypeBuy, nil
+	default:
+		return "", "", fmt.Errorf("invalid protective position side %q", side)
+	}
+}
+
+func (t *FuturesTrader) GetProtectiveStop(algoID, symbol string) (*ProtectiveStopOrder, error) {
+	id, err := strconv.ParseInt(algoID, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid Binance algo id %q", algoID)
+	}
+	order, err := t.client.NewGetAlgoOrderService().AlgoID(id).Do(context.Background())
+	if err != nil {
+		if isBinanceOrderNotFound(err) {
+			return nil, fmt.Errorf("Binance algo %s: %w", algoID, ErrProtectiveStopNotFound)
+		}
+		return nil, err
+	}
+	return t.binanceAlgoToProtective(order, symbol)
+}
+
+func (t *FuturesTrader) GetProtectiveStopByClientID(clientID, symbol string) (*ProtectiveStopOrder, error) {
+	order, err := t.client.NewGetAlgoOrderService().ClientAlgoID(clientID).Do(context.Background())
+	if err != nil {
+		if isBinanceOrderNotFound(err) {
+			return nil, fmt.Errorf("Binance algo client %s: %w", clientID, ErrProtectiveStopNotFound)
+		}
+		return nil, err
+	}
+	return t.binanceAlgoToProtective(order, symbol)
+}
+
+func (t *FuturesTrader) binanceAlgoToProtective(order *futures.GetAlgoOrderResp, expectedSymbol string) (*ProtectiveStopOrder, error) {
+	if order == nil {
+		return nil, errors.New("empty Binance algo order")
+	}
+	if expectedSymbol != "" && !strings.EqualFold(order.Symbol, expectedSymbol) {
+		return nil, fmt.Errorf("Binance algo symbol mismatch: got %s want %s", order.Symbol, expectedSymbol)
+	}
+	quantity := parseBinanceFloat(order.Quantity)
+	if order.ClosePosition && quantity <= 0 {
+		positions, err := t.GetPositionsFresh()
+		if err != nil {
+			return nil, fmt.Errorf("validate Binance closePosition coverage: %w", err)
+		}
+		wantedSide := strings.ToLower(string(order.PositionSide))
+		for _, pos := range positions {
+			if strings.EqualFold(binanceMapString(pos, "symbol"), order.Symbol) && strings.EqualFold(binanceMapString(pos, "side"), wantedSide) {
+				quantity = math.Abs(binanceMapFloat(pos, "positionAmt"))
+				break
+			}
+		}
+	}
+	triggerType := "contract"
+	if order.WorkingType == futures.WorkingTypeMarkPrice {
+		triggerType = "mark"
+	}
+	return &ProtectiveStopOrder{
+		AlgoID: strconv.FormatInt(order.AlgoId, 10), ClientID: order.ClientAlgoId, Symbol: order.Symbol,
+		PositionSide: strings.ToLower(string(order.PositionSide)), Quantity: quantity,
+		TriggerPrice: parseBinanceFloat(order.TriggerPrice), TriggerType: triggerType,
+		State: normalizeBinanceAlgoState(order.AlgoStatus), ActualOrderID: order.ActualOrderId,
+	}, nil
+}
+
+func (t *FuturesTrader) CancelProtectiveStop(algoID, _ string) error {
+	id, err := strconv.ParseInt(algoID, 10, 64)
+	if err != nil {
+		return fmt.Errorf("invalid Binance algo id %q", algoID)
+	}
+	_, err = t.client.NewCancelAlgoOrderService().AlgoID(id).Do(context.Background())
+	if err != nil && isBinanceOrderNotFound(err) {
+		return fmt.Errorf("Binance algo %s: %w", algoID, ErrProtectiveStopNotFound)
+	}
+	return err
+}
+
+func normalizeBinanceAlgoState(status string) string {
+	switch strings.ToUpper(strings.TrimSpace(status)) {
+	case "NEW", "ACCEPTED", "WORKING":
+		return "live"
+	case "TRIGGERED", "FINISHED", "FILLED":
+		return "effective"
+	case "CANCELED", "CANCELLED":
+		return "canceled"
+	case "FAILED", "EXPIRED", "REJECTED":
+		return "order_failed"
+	default:
+		return "unknown"
+	}
+}
+
+func parseBinanceFloat(value string) float64 {
+	parsed, _ := strconv.ParseFloat(value, 64)
+	return parsed
 }
 
 // CancelStopLossOrders cancels only stop-loss orders (doesn't affect take-profit orders)
@@ -873,53 +1307,178 @@ func (t *FuturesTrader) SetTakeProfit(symbol string, positionSide string, quanti
 
 // GetMinNotional gets minimum notional value (Binance requirement)
 func (t *FuturesTrader) GetMinNotional(symbol string) float64 {
-	// Use conservative default value of 10 USDT to ensure order passes exchange validation
-	return 10.0
+	inst, err := t.resolveBinanceInstrument(symbol)
+	if err != nil {
+		return 0
+	}
+	return inst.MinNotional
 }
 
 // CheckMinNotional checks if order meets minimum notional value requirement
 func (t *FuturesTrader) CheckMinNotional(symbol string, quantity float64) error {
+	inst, err := t.resolveBinanceInstrument(symbol)
+	if err != nil {
+		return err
+	}
 	price, err := t.GetMarketPrice(symbol)
 	if err != nil {
 		return fmt.Errorf("failed to get market price: %w", err)
 	}
 
 	notionalValue := quantity * price
-	minNotional := t.GetMinNotional(symbol)
+	minNotional := inst.MinNotional
 
 	if notionalValue < minNotional {
 		return fmt.Errorf(
-			"order amount %.2f USDT is below minimum requirement %.2f USDT (quantity: %.4f, price: %.4f)",
-			notionalValue, minNotional, quantity, price,
+			"order amount %.2f %s is below minimum requirement %.2f %s (quantity: %.4f, price: %.4f)",
+			notionalValue, inst.QuoteAsset, minNotional, inst.QuoteAsset, quantity, price,
 		)
 	}
 
 	return nil
 }
 
-// GetSymbolPrecision gets the quantity precision for a trading pair
-func (t *FuturesTrader) GetSymbolPrecision(symbol string) (int, error) {
-	exchangeInfo, err := t.client.NewExchangeInfoService().Do(context.Background())
+func (t *FuturesTrader) ResolveExecutionInstrument(symbol string) (*ExecutionInstrument, error) {
+	inst, err := t.resolveBinanceInstrument(symbol)
 	if err != nil {
-		return 0, fmt.Errorf("failed to get trading rules: %w", err)
+		return nil, err
 	}
+	copy := inst.ExecutionInstrument
+	return &copy, nil
+}
 
-	for _, s := range exchangeInfo.Symbols {
-		if s.Symbol == symbol {
-			// Get precision from LOT_SIZE filter
-			for _, filter := range s.Filters {
-				if filter["filterType"] == "LOT_SIZE" {
-					stepSize := filter["stepSize"].(string)
-					precision := calculatePrecision(stepSize)
-					logger.Infof("  %s quantity precision: %d (stepSize: %s)", symbol, precision, stepSize)
-					return precision, nil
-				}
+func (t *FuturesTrader) resolveBinanceInstrument(symbol string) (*binanceExecutionInstrument, error) {
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	if symbol == "" {
+		return nil, fmt.Errorf("%w: empty Binance symbol", ErrExecutionInstrumentUnsupported)
+	}
+	t.instrumentsCacheMutex.RLock()
+	if inst := t.instrumentsCache[symbol]; validBinanceReductionInstrument(inst, symbol) && inst.MinNotional > 0 && time.Since(t.instrumentsCacheTime) < 5*time.Minute {
+		copy := *inst
+		t.instrumentsCacheMutex.RUnlock()
+		return &copy, nil
+	}
+	t.instrumentsCacheMutex.RUnlock()
+
+	if err := t.refreshBinanceInstrumentCatalog(); err != nil {
+		return nil, err
+	}
+	t.instrumentsCacheMutex.RLock()
+	inst := t.instrumentsCache[symbol]
+	if !validBinanceReductionInstrument(inst, symbol) || inst.MinNotional <= 0 {
+		t.instrumentsCacheMutex.RUnlock()
+		return nil, fmt.Errorf("%w: Binance contract %s is missing, non-TRADING, unsupported type, or lacks precision/minimum-notional metadata", ErrExecutionInstrumentUnsupported, symbol)
+	}
+	copy := *inst
+	t.instrumentsCacheMutex.RUnlock()
+	return &copy, nil
+}
+
+func (t *FuturesTrader) refreshBinanceInstrumentCatalog() error {
+	info, err := t.client.NewExchangeInfoService().Do(context.Background())
+	if err != nil {
+		return fmt.Errorf("%w: load Binance USD-M catalog: %v", ErrExecutionInstrumentUnsupported, err)
+	}
+	catalog := make(map[string]*binanceExecutionInstrument, len(info.Symbols))
+	for _, item := range info.Symbols {
+		contractType := string(item.ContractType)
+		if item.Status != "TRADING" || contractType != "PERPETUAL" && contractType != "TRADIFI_PERPETUAL" {
+			continue
+		}
+		var lotStepSize, lotMinQuantity, lotMaxQuantity float64
+		var marketStepSize, marketMinQuantity, marketMaxQuantity float64
+		var tickSize, minNotional float64
+		hasMarketLotSize := false
+		for _, filter := range item.Filters {
+			filterType, _ := filter["filterType"].(string)
+			switch filterType {
+			case "LOT_SIZE":
+				lotStepSize, _ = strconv.ParseFloat(fmt.Sprint(filter["stepSize"]), 64)
+				lotMinQuantity, _ = strconv.ParseFloat(fmt.Sprint(filter["minQty"]), 64)
+				lotMaxQuantity, _ = strconv.ParseFloat(fmt.Sprint(filter["maxQty"]), 64)
+			case "MARKET_LOT_SIZE":
+				hasMarketLotSize = true
+				marketStepSize, _ = strconv.ParseFloat(fmt.Sprint(filter["stepSize"]), 64)
+				marketMinQuantity, _ = strconv.ParseFloat(fmt.Sprint(filter["minQty"]), 64)
+				marketMaxQuantity, _ = strconv.ParseFloat(fmt.Sprint(filter["maxQty"]), 64)
+			case "PRICE_FILTER":
+				tickSize, _ = strconv.ParseFloat(fmt.Sprint(filter["tickSize"]), 64)
+			case "MIN_NOTIONAL":
+				minNotional, _ = strconv.ParseFloat(fmt.Sprint(filter["notional"]), 64)
 			}
 		}
+		// MARKET_LOT_SIZE is authoritative for MARKET orders. Older/test
+		// catalogs may omit it, in which case LOT_SIZE remains the compatible
+		// fallback. Once present, its precision and limits must win.
+		stepSize, minQuantity, maxQuantity := lotStepSize, lotMinQuantity, lotMaxQuantity
+		if hasMarketLotSize {
+			stepSize, minQuantity, maxQuantity = marketStepSize, marketMinQuantity, marketMaxQuantity
+		}
+		// Min-notional is an opening constraint, not a requirement for reducing
+		// an existing position. Keep otherwise complete instruments in the cache
+		// so a close can proceed even if that filter is temporarily absent.
+		if item.BaseAsset == "" || item.QuoteAsset == "" || item.MarginAsset == "" || stepSize <= 0 || minQuantity <= 0 || tickSize <= 0 || hasMarketLotSize && maxQuantity <= 0 {
+			continue
+		}
+		catalog[item.Symbol] = &binanceExecutionInstrument{
+			ExecutionInstrument: ExecutionInstrument{SourceSymbol: item.Symbol, NativeSymbol: item.Symbol, BaseAsset: item.BaseAsset, QuoteAsset: item.QuoteAsset, SettleAsset: item.MarginAsset, MarketType: "UM", ContractType: contractType, Status: item.Status, PriceTickSize: tickSize, BaseQuantityStep: stepSize},
+			StepSize:            stepSize, MinQuantity: minQuantity, MaxQuantity: maxQuantity, TickSize: tickSize, MinNotional: minNotional,
+		}
 	}
+	t.instrumentsCacheMutex.Lock()
+	t.instrumentsCache = catalog
+	t.instrumentsCacheTime = time.Now()
+	t.instrumentsCacheMutex.Unlock()
+	return nil
+}
 
-	logger.Infof("  ⚠ %s precision information not found, using default precision 3", symbol)
-	return 3, nil // Default precision is 3
+func validBinanceReductionInstrument(item *binanceExecutionInstrument, symbol string) bool {
+	return item != nil && item.SourceSymbol == symbol && item.NativeSymbol == symbol &&
+		item.BaseAsset != "" && item.QuoteAsset != "" && item.SettleAsset != "" &&
+		item.StepSize > 0 && item.MinQuantity > 0
+}
+
+// resolveBinanceInstrumentForReduction prefers metadata cached for the exact
+// stored symbol. A reduction must not depend on refreshing a public catalog,
+// and a failed refresh must not evict the only known-safe close metadata. When
+// there is no exact cache entry, the normal live validation is still required.
+// No symbol or quote-asset derivation is performed here.
+func (t *FuturesTrader) resolveBinanceInstrumentForReduction(symbol string) (*binanceExecutionInstrument, error) {
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	if symbol == "" {
+		return nil, fmt.Errorf("%w: empty Binance symbol", ErrExecutionInstrumentUnsupported)
+	}
+	t.instrumentsCacheMutex.RLock()
+	var cached *binanceExecutionInstrument
+	if item := t.instrumentsCache[symbol]; validBinanceReductionInstrument(item, symbol) {
+		copy := *item
+		cached = &copy
+	}
+	t.instrumentsCacheMutex.RUnlock()
+	if cached != nil {
+		return cached, nil
+	}
+	if err := t.refreshBinanceInstrumentCatalog(); err != nil {
+		return nil, fmt.Errorf("%w: no exact cached Binance metadata for risk reduction of %s: %v", ErrExecutionInstrumentUnsupported, symbol, err)
+	}
+	t.instrumentsCacheMutex.RLock()
+	item := t.instrumentsCache[symbol]
+	if !validBinanceReductionInstrument(item, symbol) {
+		t.instrumentsCacheMutex.RUnlock()
+		return nil, fmt.Errorf("%w: Binance contract %s lacks exact market quantity metadata for risk reduction", ErrExecutionInstrumentUnsupported, symbol)
+	}
+	copy := *item
+	t.instrumentsCacheMutex.RUnlock()
+	return &copy, nil
+}
+
+// GetSymbolPrecision gets the quantity precision from the validated catalog.
+func (t *FuturesTrader) GetSymbolPrecision(symbol string) (int, error) {
+	inst, err := t.resolveBinanceInstrument(symbol)
+	if err != nil {
+		return 0, err
+	}
+	return calculatePrecision(strconv.FormatFloat(inst.StepSize, 'f', -1, 64)), nil
 }
 
 // calculatePrecision calculates precision from stepSize
@@ -967,12 +1526,25 @@ func trimTrailingZeros(s string) string {
 
 // FormatQuantity formats quantity to correct precision
 func (t *FuturesTrader) FormatQuantity(symbol string, quantity float64) (string, error) {
-	precision, err := t.GetSymbolPrecision(symbol)
+	inst, err := t.resolveBinanceInstrument(symbol)
 	if err != nil {
-		// If retrieval fails, use default format
-		return fmt.Sprintf("%.3f", quantity), nil
+		return "", err
 	}
+	return formatBinanceMarketQuantity(inst, symbol, quantity)
+}
 
+func formatBinanceMarketQuantity(inst *binanceExecutionInstrument, symbol string, quantity float64) (string, error) {
+	if inst == nil || inst.StepSize <= 0 || inst.MinQuantity <= 0 {
+		return "", fmt.Errorf("%w: Binance market quantity metadata is incomplete for %s", ErrExecutionInstrumentUnsupported, symbol)
+	}
+	quantity = math.Floor((quantity+inst.StepSize*1e-9)/inst.StepSize) * inst.StepSize
+	if quantity < inst.MinQuantity {
+		return "", fmt.Errorf("quantity %.12f is below Binance minimum %.12f for %s", quantity, inst.MinQuantity, symbol)
+	}
+	if inst.MaxQuantity > 0 && quantity > inst.MaxQuantity {
+		return "", fmt.Errorf("quantity %.12f exceeds Binance market maximum %.12f for %s", quantity, inst.MaxQuantity, symbol)
+	}
+	precision := calculatePrecision(strconv.FormatFloat(inst.StepSize, 'f', -1, 64))
 	format := fmt.Sprintf("%%.%df", precision)
 	return fmt.Sprintf(format, quantity), nil
 }
@@ -1028,6 +1600,17 @@ func (t *FuturesTrader) GetOrderStatus(symbol string, orderID string) (map[strin
 	result["commission"] = 0.0
 
 	return result, nil
+}
+
+func (t *FuturesTrader) GetOrderStatusByClientID(symbol, clientOrderID string) (map[string]interface{}, error) {
+	order, found, err := t.findOrderByClientID(strings.ToUpper(strings.TrimSpace(symbol)), clientOrderID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get Binance order by client id: %w", err)
+	}
+	if !found {
+		return nil, fmt.Errorf("order not found")
+	}
+	return binanceOrderResult(order), nil
 }
 
 // GetClosedPnL retrieves recent closing trades from Binance Futures
@@ -1087,6 +1670,92 @@ func (t *FuturesTrader) GetClosedPnL(startTime time.Time, limit int) ([]ClosedPn
 	}
 
 	return records, nil
+}
+
+// GetClosedPnLBySymbol uses Binance account trades rather than the delayed
+// income feed. Binance has no stable futures position id, so Copy Guard uses
+// this symbol-scoped path and its own side/time/quantity filters.
+func (t *FuturesTrader) GetClosedPnLBySymbol(symbol string, startTime time.Time, limit int) ([]ClosedPnLRecord, error) {
+	trades, err := t.GetTradesForSymbol(strings.ToUpper(strings.TrimSpace(symbol)), startTime, limit)
+	if err != nil {
+		return nil, err
+	}
+	return buildBinanceClosedPnLRecords(trades, limit), nil
+}
+
+func buildBinanceClosedPnLRecords(trades []TradeRecord, limit int) []ClosedPnLRecord {
+	type aggregate struct {
+		record   ClosedPnLRecord
+		notional float64
+	}
+	byOrder := make(map[string]*aggregate)
+	orderKeys := make([]string, 0)
+	for _, trade := range trades {
+		positionSide := strings.ToUpper(strings.TrimSpace(trade.PositionSide))
+		tradeSide := strings.ToUpper(strings.TrimSpace(trade.Side))
+		position := ""
+		switch {
+		case positionSide == "LONG" && tradeSide == "SELL":
+			position = "long"
+		case positionSide == "SHORT" && tradeSide == "BUY":
+			position = "short"
+		case (positionSide == "BOTH" || positionSide == "") && trade.RealizedPnL != 0 && tradeSide == "SELL":
+			position = "long"
+		case (positionSide == "BOTH" || positionSide == "") && trade.RealizedPnL != 0 && tradeSide == "BUY":
+			position = "short"
+		default:
+			continue
+		}
+		if trade.Quantity <= 0 || trade.Price <= 0 {
+			continue
+		}
+		orderID := trade.OrderID
+		if orderID == "" {
+			orderID = trade.TradeID
+		}
+		key := orderID + "|" + position
+		agg := byOrder[key]
+		if agg == nil {
+			agg = &aggregate{record: ClosedPnLRecord{
+				Symbol: trade.Symbol, Side: position, EntryTime: trade.Time, ExitTime: trade.Time,
+				OrderID: orderID, CloseType: "unknown",
+			}}
+			byOrder[key] = agg
+			orderKeys = append(orderKeys, key)
+		}
+		agg.notional += trade.Price * trade.Quantity
+		agg.record.Quantity += trade.Quantity
+		agg.record.QuantityCoins += trade.Quantity
+		agg.record.RealizedPnL += trade.RealizedPnL
+		agg.record.Fee += trade.Fee
+		if trade.Time.Before(agg.record.EntryTime) {
+			agg.record.EntryTime = trade.Time
+		}
+		if trade.Time.After(agg.record.ExitTime) {
+			agg.record.ExitTime = trade.Time
+		}
+	}
+	if limit <= 0 || limit > len(orderKeys) {
+		limit = len(orderKeys)
+	}
+	records := make([]ClosedPnLRecord, 0, limit)
+	for _, key := range orderKeys {
+		agg := byOrder[key]
+		if agg == nil || agg.record.Quantity <= 0 {
+			continue
+		}
+		agg.record.ExitPrice = agg.notional / agg.record.Quantity
+		if agg.record.Side == "long" {
+			agg.record.EntryPrice = agg.record.ExitPrice - agg.record.RealizedPnL/agg.record.Quantity
+		} else {
+			agg.record.EntryPrice = agg.record.ExitPrice + agg.record.RealizedPnL/agg.record.Quantity
+		}
+		records = append(records, agg.record)
+		if len(records) >= limit {
+			break
+		}
+	}
+	return records
 }
 
 // GetTrades retrieves trade history from Binance Futures using Income API
@@ -1160,6 +1829,7 @@ func (t *FuturesTrader) GetTradesForSymbol(symbol string, startTime time.Time, l
 
 		trade := TradeRecord{
 			TradeID:      strconv.FormatInt(at.ID, 10),
+			OrderID:      strconv.FormatInt(at.OrderID, 10),
 			Symbol:       at.Symbol,
 			Side:         string(at.Side),
 			PositionSide: string(at.PositionSide),

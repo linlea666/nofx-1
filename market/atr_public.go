@@ -217,7 +217,10 @@ func getOKXCompletedCandles(symbol, timeframe string, limit int, endpoint string
 	if limit <= 0 || limit > 100 {
 		limit = 100
 	}
-	instID := strings.TrimSuffix(strings.ToUpper(symbol), "USDT") + "-USDT-SWAP"
+	instID, err := formatOKXSwapInstrumentID(symbol)
+	if err != nil {
+		return nil, err
+	}
 	req, err := http.NewRequest(http.MethodGet, "https://www.okx.com/api/v5/market/"+endpoint, nil)
 	if err != nil {
 		return nil, err
@@ -278,4 +281,21 @@ func getOKXCompletedCandles(symbol, timeframe string, limit int, endpoint string
 		return nil, fmt.Errorf("no completed OKX candles")
 	}
 	return klines, nil
+}
+
+// formatOKXSwapInstrumentID keeps the requested settlement asset. ATR may
+// legitimately fall back when OKX has no matching contract, but it must never
+// query a fabricated USDT contract for a USDC/USD1 source symbol.
+func formatOKXSwapInstrumentID(symbol string) (string, error) {
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	parts := strings.Split(symbol, "-")
+	if len(parts) == 3 && parts[0] != "" && parts[1] != "" && parts[2] == "SWAP" {
+		return symbol, nil
+	}
+	for _, quote := range []string{"USDT", "USDC", "USD1"} {
+		if strings.HasSuffix(symbol, quote) && len(symbol) > len(quote) {
+			return symbol[:len(symbol)-len(quote)] + "-" + quote + "-SWAP", nil
+		}
+	}
+	return "", fmt.Errorf("cannot determine exact OKX settlement asset for %q", symbol)
 }

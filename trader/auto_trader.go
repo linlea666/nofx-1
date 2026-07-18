@@ -855,6 +855,43 @@ func (at *AutoTrader) SupportsProtectiveStops() bool {
 	return ok
 }
 
+func (at *AutoTrader) ValidateCopyGuardCapabilities() error {
+	checks := []struct {
+		name string
+		ok   bool
+	}{
+		{"protective stop management", implementsTraderCapability[ProtectiveStopManager](at.trader)},
+		{"uncached position refresh", implementsTraderCapability[FreshPositionProvider](at.trader)},
+		{"client order lookup", implementsTraderCapability[ClientOrderStatusProvider](at.trader)},
+		{"idempotent preserving copy orders", implementsTraderCapability[CopyTradeIdempotentOrderExecutor](at.trader)},
+		{"exact execution instrument resolution", implementsTraderCapability[ExecutionInstrumentResolver](at.trader)},
+	}
+	for _, check := range checks {
+		if !check.ok {
+			return fmt.Errorf("execution exchange does not support %s", check.name)
+		}
+	}
+	_, byPosition := at.trader.(ClosedPnLByPositionProvider)
+	_, bySymbol := at.trader.(ClosedPnLBySymbolProvider)
+	if !byPosition && !bySymbol {
+		return fmt.Errorf("execution exchange does not support precise closed PnL reconciliation")
+	}
+	return nil
+}
+
+func implementsTraderCapability[T any](value interface{}) bool {
+	_, ok := value.(T)
+	return ok
+}
+
+func (at *AutoTrader) ResolveExecutionInstrument(symbol string) (*ExecutionInstrument, error) {
+	resolver, ok := at.trader.(ExecutionInstrumentResolver)
+	if !ok {
+		return nil, fmt.Errorf("%w: exchange has no exact instrument resolver", ErrExecutionInstrumentUnsupported)
+	}
+	return resolver.ResolveExecutionInstrument(symbol)
+}
+
 func (at *AutoTrader) PlaceProtectiveStop(req ProtectiveStopRequest) (*ProtectiveStopOrder, error) {
 	mgr, ok := at.trader.(ProtectiveStopManager)
 	if !ok {
@@ -868,6 +905,23 @@ func (at *AutoTrader) AmendProtectiveStop(algoID string, req ProtectiveStopReque
 		return fmt.Errorf("exchange does not support precise protective stops")
 	}
 	return mgr.AmendProtectiveStop(algoID, req)
+}
+func (at *AutoTrader) EnsureProtectiveStop(existing *ProtectiveStopOrder, req ProtectiveStopRequest) (*ProtectiveStopEnsureResult, error) {
+	if ensurer, ok := at.trader.(ProtectiveStopEnsurer); ok {
+		return ensurer.EnsureProtectiveStop(existing, req)
+	}
+	mgr, ok := at.trader.(ProtectiveStopManager)
+	if !ok {
+		return nil, fmt.Errorf("exchange does not support precise protective stops")
+	}
+	if existing == nil || existing.AlgoID == "" {
+		placed, err := mgr.PlaceProtectiveStop(req)
+		return &ProtectiveStopEnsureResult{Current: placed}, err
+	}
+	if err := mgr.AmendProtectiveStop(existing.AlgoID, req); err != nil {
+		return nil, err
+	}
+	return &ProtectiveStopEnsureResult{Current: &ProtectiveStopOrder{AlgoID: existing.AlgoID, ClientID: existing.ClientID, Symbol: req.Symbol, PositionSide: req.PositionSide, MarginMode: req.MarginMode, Quantity: req.Quantity, TriggerPrice: req.TriggerPrice, TriggerType: req.TriggerType, State: "live"}}, nil
 }
 func (at *AutoTrader) GetProtectiveStop(algoID, symbol string) (*ProtectiveStopOrder, error) {
 	mgr, ok := at.trader.(ProtectiveStopManager)
@@ -906,6 +960,23 @@ func (at *AutoTrader) GetClosedPnLByPositionID(symbol, posID string, limit int) 
 		return nil, fmt.Errorf("exchange does not support closed PnL lookup by position id")
 	}
 	return p.GetClosedPnLByPositionID(symbol, posID, limit)
+}
+func (at *AutoTrader) GetClosedPnLBySymbol(symbol string, start time.Time, limit int) ([]ClosedPnLRecord, error) {
+	p, ok := at.trader.(ClosedPnLBySymbolProvider)
+	if ok {
+		return p.GetClosedPnLBySymbol(symbol, start, limit)
+	}
+	records, err := at.trader.GetClosedPnL(start, limit)
+	if err != nil {
+		return nil, err
+	}
+	filtered := make([]ClosedPnLRecord, 0, len(records))
+	for _, record := range records {
+		if strings.EqualFold(record.Symbol, symbol) {
+			filtered = append(filtered, record)
+		}
+	}
+	return filtered, nil
 }
 func (at *AutoTrader) GetOrderStatus(symbol, orderID string) (map[string]interface{}, error) {
 	return at.trader.GetOrderStatus(symbol, orderID)
@@ -2155,11 +2226,24 @@ func (at *AutoTrader) emergencyClosePosition(symbol, side string) error {
 func (at *AutoTrader) ClosePositionMarket(symbol, side string) (string, error) {
 	var order map[string]interface{}
 	var err error
+	// Copy Guard must not use the normal Binance close path because that path
+	// intentionally clears every pending/algo order for the symbol. Prefer the
+	// copy-trade primitive, which only submits the requested reduce order and
+	// leaves unrelated user/strategy orders untouched.
+	copyExecutor, preservesOrders := at.trader.(CopyTradeOrderExecutor)
 	switch side {
 	case "long":
-		order, err = at.trader.CloseLong(symbol, 0)
+		if preservesOrders {
+			order, err = copyExecutor.CloseLongPreservingOrders(symbol, 0)
+		} else {
+			order, err = at.trader.CloseLong(symbol, 0)
+		}
 	case "short":
-		order, err = at.trader.CloseShort(symbol, 0)
+		if preservesOrders {
+			order, err = copyExecutor.CloseShortPreservingOrders(symbol, 0)
+		} else {
+			order, err = at.trader.CloseShort(symbol, 0)
+		}
 	default:
 		return "", fmt.Errorf("unknown position direction: %s", side)
 	}

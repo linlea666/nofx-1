@@ -26,7 +26,6 @@ package copytrade
 //   - 复用工具函数 parseFloat / normalizeSymbol
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -299,7 +298,10 @@ func (p *BinanceProvider) GetAccountState(leadPortfolioID string) (*AccountState
 		// 第一次解析时记录 leader userId（用于 Fill 拼装 PosID）
 		p.captureLeaderUserID(rp.ID)
 
-		symbol := normalizeSymbol(rp.Symbol)
+		symbol := normalizeBinanceContractSymbol(rp.Symbol)
+		if symbol == "" {
+			continue
+		}
 
 		// 方向映射：LONG/SHORT 直接映射；BOTH 模式按 positionAmount 正负号判断
 		side := mapBinanceSide(rp.PositionSide)
@@ -482,7 +484,10 @@ func (p *BinanceProvider) GetFills(leadPortfolioID string, since time.Time) ([]F
 		}
 		p.seenFillKeys[fp] = true
 
-		symbol := normalizeSymbol(tr.Symbol)
+		symbol := normalizeBinanceContractSymbol(tr.Symbol)
+		if symbol == "" {
+			continue
+		}
 		side := strings.ToLower(tr.Side) // BUY -> buy, SELL -> sell
 		posSide := mapBinanceSide(tr.PositionSide)
 		// BOTH（单向持仓）模式：positionSide=BOTH 时无法从 fill 自身判断方向，
@@ -512,6 +517,13 @@ func (p *BinanceProvider) GetFills(leadPortfolioID string, since time.Time) ([]F
 	}
 
 	return fills, nil
+}
+
+// normalizeBinanceContractSymbol preserves the exact contract returned by
+// Binance. Appending USDT is unsafe now that the same base can settle in USDT,
+// USDC or USD1; malformed/bare values must fail closed downstream.
+func normalizeBinanceContractSymbol(symbol string) string {
+	return strings.ToUpper(strings.TrimSpace(symbol))
 }
 
 // GetPositionHistory 获取 Binance 已平仓仓位历史。
@@ -572,43 +584,8 @@ func (p *BinanceProvider) postCopyTrade(url string, body interface{}) ([]byte, e
 	if err != nil {
 		return nil, err
 	}
-
-	payload, err := json.Marshal(body)
-	if err != nil {
-		return nil, err
-	}
-
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(payload))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("content-type", "application/json")
-	req.Header.Set("csrftoken", csrf)
-	req.Header.Set("clienttype", "web")
-	req.Header.Set("user-agent", "Mozilla/5.0 (compatible; NOFX/1.0)")
-	req.Header.Set("accept", "*/*")
-	req.AddCookie(&http.Cookie{Name: "p20t", Value: p20t})
-
-	resp, err := p.client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("binance request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	rawBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("binance read body failed: %w", err)
-	}
-
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return nil, ErrBinanceCredentialsExpired
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("binance http %d: %s", resp.StatusCode, truncate(string(rawBody), 200))
-	}
-
-	return rawBody, nil
+	raw, _, err := binanceWebRequest(p.client, p20t, csrf, http.MethodPost, url, body)
+	return raw, err
 }
 
 func (p *BinanceProvider) getAccountBaseInfo() ([]byte, int, error) {
@@ -617,27 +594,7 @@ func (p *BinanceProvider) getAccountBaseInfo() ([]byte, int, error) {
 		return nil, 0, err
 	}
 
-	req, err := http.NewRequest(http.MethodGet, BinanceAccountBaseInfoAPI, nil)
-	if err != nil {
-		return nil, 0, err
-	}
-	req.Header.Set("accept", "*/*")
-	req.Header.Set("clienttype", "web")
-	req.Header.Set("csrftoken", csrf)
-	req.Header.Set("user-agent", "Mozilla/5.0 (compatible; NOFX/1.0)")
-	req.AddCookie(&http.Cookie{Name: "p20t", Value: p20t})
-
-	resp, err := p.client.Do(req)
-	if err != nil {
-		return nil, 0, fmt.Errorf("binance account status request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	rawBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, resp.StatusCode, fmt.Errorf("binance account status read body failed: %w", err)
-	}
-	return rawBody, resp.StatusCode, nil
+	return binanceWebRequest(p.client, p20t, csrf, http.MethodGet, BinanceAccountBaseInfoAPI, nil)
 }
 
 // resolveCopyPortfolioID 解析 leadPortfolioId → copyPortfolioId
