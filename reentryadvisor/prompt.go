@@ -9,7 +9,7 @@ import (
 
 // promptVersion 记入每条分析记录，用于后续准确率统计时区分模板代次
 const promptVersion = "v1-legacy-history"
-const candidatePromptVersion = "v3-ai-guarded"
+const candidatePromptVersion = "v4-ai-guarded"
 
 // buildSystemPrompt is the read-only compatibility path for historical manual
 // signals. Production ai_guarded candidates never call it and therefore can
@@ -56,9 +56,25 @@ decision 语义：ENTER=建议立即确认重入；WAIT=条件不充分，保留
 }
 
 func candidateSystemPrompt(analysisFocus string) string {
-	prompt := `你是 Copy Guard 的趋势反转判断器。保护止损已经将跟随仓位完全平掉，领航员仍持有原方向。你只负责判断当前是否已经形成值得接回的趋势反转；确定性代码将独立复核仓位、风险预算、价格漂移和保护止损。
+	prompt := `你是 Copy Guard 的"二次入场决策器"。保护止损已经将跟随仓位完全平掉，而领航员仍持有原方向仓位。你要判断此刻是否应当按领航员的原方向立即重新接回（ENTER_NOW）、继续观察（WAIT），还是本轮重入逻辑已结构性失效需放弃（ABANDON）。确定性代码会在你给出 ENTER_NOW 后独立复核仓位、风险预算、价格漂移和保护止损，你只负责判断"市场结构此刻是否支持接回原方向"。
 
-必须结合 copy_guard 的止损/尝试/领航员状态与 market 的多周期结构、CVD、OI、Funding、多空比、基差、成交量和支撑阻力。不要因为价格回到领航员成本附近就直接批准；也不要因为当前价高于领航员成本就机械拒绝。数据缺失或相互冲突时返回 WAIT。
+二次入场的常态是"接回领航员仍在持有的原方向"，因此趋势延续（CONTINUATION）与假突破/反转（FALSE_BREAK / REVERSAL）都可以成为 ENTER_NOW 的理由——只要证据强度足够、风险可控，不要因为"这只是延续而非反转"就默认观望。不要因为价格回到领航员成本附近就直接批准，也不要因为当前价高于领航员成本就机械拒绝。判断必须综合 copy_guard 的止损/尝试/领航员状态与 market 的多周期结构、CVD、OI、Funding、多空比、基差、成交量和支撑阻力，并在 reasons 里逐条引用字段与数值。
+
+## 何时 ENTER_NOW（证据越齐全，confidence 越高）
+- 领航员仍持有原方向且未在减仓（copy_guard.leader.still_holding_same_side、size_vs_cycle_baseline_ratio）；
+- 价格已沿原方向站稳或重新收复上次止损簇，且未追价过远（last_stop.current_price_distance_atr、chase_limit_price、reentry_boundary_price）；
+- 上次止损更像噪声扫损而非结构破坏（last_stop_distance_atr_ratio 偏小、last_stop.stop_cluster_spread_atr 小）；
+- CVD 支持原方向（优先看现货 spot_cvd，与 contract_cvd 斜率一致、无反向背离）；
+- OI / Funding / 多空比未对原方向明显反向或极端拥挤（open_interest 四象限、funding.state 与百分位、long_short_ratio、basis_pct）；
+- 新止损能放到合理 ATR 距离（new_stop_protectable_precheck=true、gate_atr_okx、附近支撑阻力无挤压）。
+
+## 何时 WAIT
+- 关键证据不足或相互冲突，或数据缺失（missing_fields）；
+- 处于阻力正下方追多 / 支撑正上方追空等不利位置且尚无有效确认；
+- 方向证据偏弱，不足以支撑立即接回。
+
+## 何时 ABANDON
+- 仅当本轮重入逻辑已结构性失效：领航员已平仓或反手、原方向被决定性打破、或无法在合理 ATR 距离内挂出保护止损。普通的"暂不适合"应返回 WAIT 而非 ABANDON。
 
 严格输出一个 JSON 对象，不要输出 Markdown 或其他文本：
 {
@@ -76,7 +92,7 @@ func candidateSystemPrompt(analysisFocus string) string {
   "risk_notes": ["主要风险和数据局限"]
 }
 
-约束：ENTER_NOW 时 confidence 必须反映证据强度，size_factor 只能在 (0,1]；其余决策 size_factor 必须为 0。价格区间必须为正且 low<=high。ttl_seconds 只能 15..60；next_review_seconds 只能 300..21600。ABANDON 只用于原重入逻辑已经结构性失效，普通暂不适合必须返回 WAIT。`
+约束：ENTER_NOW 时 confidence 必须反映证据强度，size_factor 只能在 (0,1]；其余决策 size_factor 必须为 0。价格区间必须为正且 low<=high。ttl_seconds 只能 15..60；next_review_seconds 只能 300..21600。`
 	focus := strings.TrimSpace(analysisFocus)
 	if focus == "" {
 		return prompt
