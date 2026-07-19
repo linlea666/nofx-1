@@ -98,10 +98,19 @@ func parseOptionalSQLiteTime(v sql.NullString) *time.Time {
 	if !v.Valid || strings.TrimSpace(v.String) == "" {
 		return nil
 	}
-	// go-sqlite3 renders DATETIME values both with and without fractional
-	// seconds. Notification timestamps are commonly second-aligned, while
-	// polling timestamps usually carry nanoseconds, so both variants must be
-	// accepted or persisted health silently loses its last-known times.
+	// 历史遗留：早期版本把 time.Time 直接绑给驱动，落库为 Go String() 格式并
+	// 带单调时钟后缀（"… +0800 CST m=+77990.894116101"）。该后缀让所有布局
+	// 解析失败 → LastCompleteSnapshotAt 恒为 nil → Smart Money 每轮都误判
+	// "断供恢复"并把新开仓吸收进 no-chase 基线（GLWUSDT 漏跟单根因）。
+	// 剥离后缀让旧行无需修库即可自愈；新写入已统一为规范 UTC 格式。
+	value := v.String
+	if idx := strings.Index(value, " m=+"); idx > 0 {
+		value = value[:idx]
+	} else if idx := strings.Index(value, " m=-"); idx > 0 {
+		value = value[:idx]
+	}
+	// DATETIME 文本可能带或不带小数秒：通知时间常为整秒，轮询时间常带纳秒，
+	// 两种变体都必须接受，否则持久化健康状态会静默丢失最后已知时间。
 	for _, layout := range []string{
 		"2006-01-02 15:04:05.999999999-07:00",
 		"2006-01-02 15:04:05-07:00",
@@ -111,11 +120,23 @@ func parseOptionalSQLiteTime(v sql.NullString) *time.Time {
 		"2006-01-02 15:04:05",
 		time.RFC3339Nano,
 	} {
-		if parsed, err := time.Parse(layout, v.String); err == nil {
+		if parsed, err := time.Parse(layout, value); err == nil {
 			return &parsed
 		}
 	}
 	return nil
+}
+
+// sourceHealthTimeLayout 是健康表时间列的规范落库格式（UTC、可含纳秒）。
+// 必须显式格式化后再绑定：modernc/sqlite 对裸 time.Time 会以 Go String()
+// 落库，带单调时钟后缀导致读取解析失败（见 parseOptionalSQLiteTime）。
+const sourceHealthTimeLayout = "2006-01-02 15:04:05.999999999"
+
+func formatSourceHealthTime(t *time.Time) interface{} {
+	if t == nil || t.IsZero() {
+		return nil
+	}
+	return t.UTC().Format(sourceHealthTimeLayout)
 }
 
 const sourceHealthColumns = `trader_id, leader_id, source_mode, source_generation,
@@ -218,8 +239,8 @@ func (s *CopyTradeStore) RecordSourceHealthObservation(traderID, leaderID, sourc
 			last_notified_at=excluded.last_notified_at,
 			consecutive_failures=excluded.consecutive_failures, last_error=excluded.last_error
 	`, current.TraderID, current.LeaderID, current.SourceMode, current.SourceGeneration,
-		current.Status, current.PreviousStatus, current.TraderName, current.LastCheckedAt,
-		current.LastCompleteSnapshotAt, current.LastTransitionAt, current.LastNotifiedAt,
+		current.Status, current.PreviousStatus, current.TraderName, formatSourceHealthTime(current.LastCheckedAt),
+		formatSourceHealthTime(current.LastCompleteSnapshotAt), formatSourceHealthTime(current.LastTransitionAt), formatSourceHealthTime(current.LastNotifiedAt),
 		current.ConsecutiveFailures, current.LastError)
 	if err != nil {
 		return nil, false, fmt.Errorf("save source health: %w", err)
@@ -228,6 +249,6 @@ func (s *CopyTradeStore) RecordSourceHealthObservation(traderID, leaderID, sourc
 }
 
 func (s *CopyTradeStore) MarkSourceHealthNotified(traderID string, at time.Time) error {
-	_, err := s.db.Exec(`UPDATE copy_trade_source_health SET last_notified_at=? WHERE trader_id=?`, at, traderID)
+	_, err := s.db.Exec(`UPDATE copy_trade_source_health SET last_notified_at=? WHERE trader_id=?`, formatSourceHealthTime(&at), traderID)
 	return err
 }

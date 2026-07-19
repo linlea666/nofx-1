@@ -104,6 +104,80 @@ func TestSmartMoneyRecoveryAbsorbsNewRiskButPreservesReductions(t *testing.T) {
 	}
 }
 
+type smartObservingProvider struct {
+	state *AccountState
+	obs   SourceHealthObservation
+}
+
+func (p *smartObservingProvider) GetFills(string, time.Time) ([]Fill, error) { return nil, nil }
+func (p *smartObservingProvider) GetAccountState(string) (*AccountState, error) {
+	return p.state, nil
+}
+func (p *smartObservingProvider) Type() ProviderType { return ProviderBinance }
+func (p *smartObservingProvider) LastSourceHealthObservation() SourceHealthObservation {
+	return p.obs
+}
+
+// TestSmartMoneyHealthySteadyStateDoesNotAbsorbNewPosition 复现 GLWUSDT 漏跟
+// 单根因的引擎级回归：健康状态下相邻两轮快照之间出现的新仓位，必须走开仓
+// 信号路径，绝不能被"断供恢复 rebaseline"吸收为 ignored 基线。旧实现因
+// 健康表时间戳落库损坏（LastCompleteSnapshotAt 读回恒 nil）导致每轮都误判
+// 需要恢复，新仓在信号生成前就被吸收。
+func TestSmartMoneyHealthySteadyStateDoesNotAbsorbNewPosition(t *testing.T) {
+	e, st := newTestCopyTradeEngine(t, ProviderBinance)
+	e.config.BinanceSourceMode = BinanceSourceSmartMoney
+	e.config.SourceGeneration = 1
+	e.config.LeaderID = "5082050984257986817"
+
+	existing := makeSmartPosition("smart_old", "BTCUSDC", 2, true)
+	provider := &smartObservingProvider{
+		state: &AccountState{
+			TotalEquity: 1000,
+			Positions:   map[string]*Position{existing.PosID: existing},
+			Timestamp:   time.Now(), // 故意保留单调时钟，与生产一致
+		},
+		obs: SourceHealthObservation{Status: "HEALTHY", CompleteSnapshot: true, CheckedAt: time.Now()},
+	}
+	e.provider = provider
+
+	// 第一轮：建立 HEALTHY 健康记录与完整快照时间
+	if err := e.syncLeaderState(); err != nil {
+		t.Fatalf("first healthy sync: %v", err)
+	}
+
+	// 第二轮（3 秒后的下一次轮询）：领航员新开 GLWUSDT
+	newPos := makeSmartPosition("smart_glw", "GLWUSDT", 500, true)
+	next := time.Now()
+	provider.state = &AccountState{
+		TotalEquity: 1000,
+		Positions:   map[string]*Position{existing.PosID: existing, newPos.PosID: newPos},
+		Timestamp:   next,
+	}
+	provider.obs = SourceHealthObservation{Status: "HEALTHY", CompleteSnapshot: true, CheckedAt: next}
+	if err := e.syncLeaderState(); err != nil {
+		t.Fatalf("second healthy sync: %v", err)
+	}
+
+	mapping, err := st.CopyTrade().GetMapping(e.traderID, newPos.PosID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mapping != nil {
+		t.Fatalf("healthy steady-state new position must not be absorbed into baseline: %+v", mapping)
+	}
+
+	fills := e.detectBinancePositionSnapshotFills()
+	var open *Fill
+	for i := range fills {
+		if fills[i].Symbol == "GLWUSDT" && fills[i].Action == ActionOpen {
+			open = &fills[i]
+		}
+	}
+	if open == nil || open.Size != 500 {
+		t.Fatalf("new position must emit an open signal, fills=%+v", fills)
+	}
+}
+
 func TestSmartMoneyDirectionReversalClosesBeforeOpening(t *testing.T) {
 	e, st := newTestCopyTradeEngine(t, ProviderBinance)
 	e.config.BinanceSourceMode = BinanceSourceSmartMoney
