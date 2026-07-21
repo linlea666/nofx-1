@@ -3,7 +3,37 @@ package store
 import (
 	"path/filepath"
 	"testing"
+	"time"
 )
+
+func TestReentryAICompletionPersistsModelTimeline(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "timeline.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	rs := st.ReentryAI()
+	a, err := rs.SaveReentryAnalysis(&ReentryAIAnalysis{CandidateID: 9, TraderID: "t1", CycleID: 7, Symbol: "BTCUSDT", Side: "short"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rs.MarkReentryAnalysisRunning(a.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := rs.CompleteReentryInternalResult(a.ID, `{}`, ReentryVerdictEnter, .8, `{}`, 45); err != nil {
+		t.Fatal(err)
+	}
+	got, err := rs.GetReentryAnalysis(a.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ModelStartedAt == nil || got.ModelCompletedAt == nil || got.DecisionExpiresAt == nil {
+		t.Fatalf("model timeline incomplete: %+v", got)
+	}
+	if delta := got.DecisionExpiresAt.Sub(*got.ModelCompletedAt); delta < 44*time.Second || delta > 46*time.Second {
+		t.Fatalf("decision TTL delta=%v, want 45s", delta)
+	}
+}
 
 func TestReentryAIAnalysisLifecycle(t *testing.T) {
 	st, err := New(filepath.Join(t.TempDir(), "reentry_ai.db"))

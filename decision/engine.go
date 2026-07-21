@@ -158,6 +158,14 @@ type Decision struct {
 	ClientOrderID        string  `json:"client_order_id,omitempty"` // Copy Guard 幂等执行与重启恢复
 	ExchangeOrderID      string  `json:"exchange_order_id,omitempty"`
 	SourceFillID         string  `json:"source_fill_id,omitempty"` // 产生该决策的领航员 fill ID（瞬态失败后释放去重标记重放用）
+	ExecutionIntentID    int64   `json:"execution_intent_id,omitempty"`
+	SourceRevision       int64   `json:"source_revision,omitempty"`
+	RequestedQuantity    float64 `json:"requested_quantity,omitempty"`
+	QuantizedQuantity    float64 `json:"quantized_quantity,omitempty"`
+	FilledQuantity       float64 `json:"filled_quantity,omitempty"`
+	ExecutionStatus      string  `json:"execution_status,omitempty"`
+	ExecutionReasonCode  string  `json:"execution_reason_code,omitempty"`
+	QuantityStepOverride bool    `json:"quantity_step_override,omitempty"`
 	SourceSymbol         string  `json:"source_symbol,omitempty"`
 	ExecutionSymbol      string  `json:"execution_symbol,omitempty"`
 	ValueCurrency        string  `json:"value_currency,omitempty"`

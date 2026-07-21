@@ -350,6 +350,30 @@ func (s *ReentryAIStore) RejectReentryCandidatePreflight(id int64, message strin
 	return nil
 }
 
+// DeferReentryCandidateUnactionable records deterministic inability to trade
+// without charging model quota or treating it as an AI/system failure.
+func (s *ReentryAIStore) DeferReentryCandidateUnactionable(candidateID, analysisID int64, message string, retry time.Duration) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if analysisID > 0 {
+		if _, err = tx.Exec(`UPDATE reentry_ai_analyses SET call_status='UNACTIONABLE',call_error=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND candidate_id=? AND call_status='PENDING'`, message, analysisID, candidateID); err != nil {
+			return err
+		}
+	}
+	res, err := tx.Exec(`UPDATE copy_guard_reentry_candidates SET status=?,review_count=CASE WHEN status=? THEN max(review_count-1,0) ELSE review_count END,last_error=?,next_review_at=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND status IN (?,?,?)`,
+		ReentryCandidateWaiting, ReentryCandidateReviewing, message, time.Now().Add(retry).UTC(), candidateID, ReentryCandidateWatching, ReentryCandidateWaiting, ReentryCandidateReviewing)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return fmt.Errorf("candidate is no longer actionable")
+	}
+	return tx.Commit()
+}
+
 // FailReentryCandidateBeforeModel returns a claimed review that failed during
 // datapack/model-client preparation. Because no model request was made, it
 // remains fully audited but does not consume daily or lifecycle call quota.
@@ -614,6 +638,17 @@ func (s *ReentryAIStore) ListReentryCandidatesByTraders(traderIDs []string, stat
 // ReserveCopyGuardRisk 在同一 SQLite 事务内校验并预留单次、周期和组合风险，
 // 防止多个交易员的 AI 决策同时通过各自的内存检查。
 func (s *ReentryAIStore) ReserveCopyGuardRisk(traderID string, cycleID int64, attemptNo int, riskUSD, equity, attemptPct, cyclePct, portfolioPct float64) error {
+	return s.reserveCopyGuardRisk(traderID, cycleID, attemptNo, riskUSD, equity, attemptPct, cyclePct, portfolioPct, false)
+}
+
+// ReserveCopyGuardRiskFollowFirst permits only the discrete execution-step
+// exception selected by the operator: the attempt target may be exceeded, but
+// cycle and account-portfolio budgets remain hard transactional limits.
+func (s *ReentryAIStore) ReserveCopyGuardRiskFollowFirst(traderID string, cycleID int64, attemptNo int, riskUSD, equity, attemptPct, cyclePct, portfolioPct float64) error {
+	return s.reserveCopyGuardRisk(traderID, cycleID, attemptNo, riskUSD, equity, attemptPct, cyclePct, portfolioPct, true)
+}
+
+func (s *ReentryAIStore) reserveCopyGuardRisk(traderID string, cycleID int64, attemptNo int, riskUSD, equity, attemptPct, cyclePct, portfolioPct float64, allowAttemptStepOverride bool) error {
 	if riskUSD <= 0 || equity <= 0 {
 		return fmt.Errorf("invalid risk reservation")
 	}
@@ -637,7 +672,7 @@ func (s *ReentryAIStore) ReserveCopyGuardRisk(traderID string, cycleID int64, at
 	if err = tx.QueryRow(`SELECT COALESCE(SUM(risk_usd),0) FROM copy_guard_risk_reservations WHERE account_key=? AND status='ACTIVE' AND NOT (cycle_id=? AND attempt_no=?)`, accountKey, cycleID, attemptNo).Scan(&portfolioUsed); err != nil {
 		return err
 	}
-	if riskUSD > equity*attemptPct+1e-9 {
+	if !allowAttemptStepOverride && riskUSD > equity*attemptPct+1e-9 {
 		return fmt.Errorf("attempt risk %.4f exceeds %.4f", riskUSD, equity*attemptPct)
 	}
 	if cycleUsed+riskUSD > equity*cyclePct+1e-9 {

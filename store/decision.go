@@ -57,19 +57,29 @@ type PositionSnapshot struct {
 
 // DecisionAction decision action
 type DecisionAction struct {
-	Action     string    `json:"action"`
-	Symbol     string    `json:"symbol"`
-	Quantity   float64   `json:"quantity"`
-	Leverage   int       `json:"leverage"`
-	Price      float64   `json:"price"`
-	StopLoss   float64   `json:"stop_loss,omitempty"`   // Stop loss price
-	TakeProfit float64   `json:"take_profit,omitempty"` // Take profit price
-	Confidence int       `json:"confidence,omitempty"`  // AI confidence (0-100)
-	Reasoning  string    `json:"reasoning,omitempty"`   // Brief reasoning
-	OrderID    int64     `json:"order_id"`
-	Timestamp  time.Time `json:"timestamp"`
-	Success    bool      `json:"success"`
-	Error      string    `json:"error"`
+	Action              string    `json:"action"`
+	Symbol              string    `json:"symbol"`
+	Quantity            float64   `json:"quantity"`
+	Leverage            int       `json:"leverage"`
+	Price               float64   `json:"price"`
+	StopLoss            float64   `json:"stop_loss,omitempty"`   // Stop loss price
+	TakeProfit          float64   `json:"take_profit,omitempty"` // Take profit price
+	Confidence          int       `json:"confidence,omitempty"`  // AI confidence (0-100)
+	Reasoning           string    `json:"reasoning,omitempty"`   // Brief reasoning
+	OrderID             int64     `json:"order_id"`
+	Timestamp           time.Time `json:"timestamp"`
+	Success             bool      `json:"success"`
+	Error               string    `json:"error"`
+	ExecutionIntentID   int64     `json:"execution_intent_id,omitempty"`
+	SourceFillID        string    `json:"source_fill_id,omitempty"`
+	LeaderPosID         string    `json:"leader_pos_id,omitempty"`
+	SourceRevision      int64     `json:"source_revision,omitempty"`
+	RequestedQuantity   float64   `json:"requested_quantity,omitempty"`
+	QuantizedQuantity   float64   `json:"quantized_quantity,omitempty"`
+	FilledQuantity      float64   `json:"filled_quantity,omitempty"`
+	ExchangeOrderID     string    `json:"exchange_order_id,omitempty"`
+	ExecutionStatus     string    `json:"execution_status,omitempty"`
+	ExecutionReasonCode string    `json:"execution_reason_code,omitempty"`
 }
 
 // Statistics statistics information

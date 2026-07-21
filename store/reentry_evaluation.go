@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-const ReentryDecisionEvaluationVersion = 1
+const ReentryDecisionEvaluationVersion = 2
 
 const (
 	ReentryMarketReversal     = "REVERSAL_CONFIRMED"
@@ -32,6 +32,7 @@ type ReentryAIDecisionEvaluation struct {
 	Horizon            string     `json:"horizon"`
 	EvaluationVersion  int        `json:"evaluation_version"`
 	EvaluationStatus   string     `json:"evaluation_status"`
+	DataQuality        string     `json:"data_quality"`
 	MarketOutcome      string     `json:"market_outcome"`
 	DecisionOutcome    string     `json:"decision_outcome"`
 	Actionability      string     `json:"actionability"`
@@ -47,6 +48,10 @@ type ReentryAIDecisionEvaluation struct {
 	CoverageRatio      float64    `json:"coverage_ratio"`
 	MaxGapSeconds      float64    `json:"max_gap_seconds"`
 	ActualExecuted     bool       `json:"actual_executed"`
+	ExecutionRequested bool       `json:"execution_requested"`
+	ExecutionSubmitted bool       `json:"execution_submitted"`
+	ExecutionFilled    bool       `json:"execution_filled"`
+	ExecutionProtected bool       `json:"execution_protected"`
 	ActualPnL          *float64   `json:"actual_pnl,omitempty"`
 	EvaluationLatency  float64    `json:"evaluation_latency_seconds"`
 	CreatedAt          time.Time  `json:"created_at"`
@@ -68,6 +73,7 @@ func (s *ReentryAIStore) initReentryDecisionEvaluationTable() error {
 			horizon TEXT NOT NULL DEFAULT '',
 			evaluation_version INTEGER NOT NULL DEFAULT 1,
 			evaluation_status TEXT NOT NULL DEFAULT 'FINAL',
+			data_quality TEXT NOT NULL DEFAULT 'UNSCORABLE',
 			market_outcome TEXT NOT NULL DEFAULT '',
 			decision_outcome TEXT NOT NULL DEFAULT '',
 			actionability TEXT NOT NULL DEFAULT '',
@@ -83,6 +89,10 @@ func (s *ReentryAIStore) initReentryDecisionEvaluationTable() error {
 			coverage_ratio REAL NOT NULL DEFAULT 0,
 			max_gap_seconds REAL NOT NULL DEFAULT 0,
 			actual_executed BOOLEAN NOT NULL DEFAULT 0,
+			execution_requested BOOLEAN NOT NULL DEFAULT 0,
+			execution_submitted BOOLEAN NOT NULL DEFAULT 0,
+			execution_filled BOOLEAN NOT NULL DEFAULT 0,
+			execution_protected BOOLEAN NOT NULL DEFAULT 0,
 			actual_pnl REAL,
 			evaluation_latency_seconds REAL NOT NULL DEFAULT 0,
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -92,17 +102,25 @@ func (s *ReentryAIStore) initReentryDecisionEvaluationTable() error {
 		CREATE INDEX IF NOT EXISTS idx_reentry_ai_eval_cycle ON reentry_ai_decision_evaluations(cycle_id,analysis_id);
 		CREATE INDEX IF NOT EXISTS idx_reentry_ai_eval_trader_outcome ON reentry_ai_decision_evaluations(trader_id,decision_outcome);
 	`)
-	return err
+	if err != nil {
+		return err
+	}
+	_, _ = s.db.Exec(`ALTER TABLE reentry_ai_decision_evaluations ADD COLUMN data_quality TEXT NOT NULL DEFAULT 'UNSCORABLE'`)
+	_, _ = s.db.Exec(`ALTER TABLE reentry_ai_decision_evaluations ADD COLUMN execution_requested BOOLEAN NOT NULL DEFAULT 0`)
+	_, _ = s.db.Exec(`ALTER TABLE reentry_ai_decision_evaluations ADD COLUMN execution_submitted BOOLEAN NOT NULL DEFAULT 0`)
+	_, _ = s.db.Exec(`ALTER TABLE reentry_ai_decision_evaluations ADD COLUMN execution_filled BOOLEAN NOT NULL DEFAULT 0`)
+	_, _ = s.db.Exec(`ALTER TABLE reentry_ai_decision_evaluations ADD COLUMN execution_protected BOOLEAN NOT NULL DEFAULT 0`)
+	return nil
 }
 
-const reentryEvaluationColumns = `id,analysis_id,candidate_id,trader_id,trader_name_snapshot,cycle_id,attempt_no,decision_generation,decision,horizon,evaluation_version,evaluation_status,market_outcome,decision_outcome,actionability,reason,reference_price,reference_atr,mfe_atr,mae_atr,first_reversal_at,window_start_at,window_end_at,sample_count,coverage_ratio,max_gap_seconds,actual_executed,actual_pnl,evaluation_latency_seconds,created_at,updated_at`
+const reentryEvaluationColumns = `id,analysis_id,candidate_id,trader_id,trader_name_snapshot,cycle_id,attempt_no,decision_generation,decision,horizon,evaluation_version,evaluation_status,data_quality,market_outcome,decision_outcome,actionability,reason,reference_price,reference_atr,mfe_atr,mae_atr,first_reversal_at,window_start_at,window_end_at,sample_count,coverage_ratio,max_gap_seconds,actual_executed,execution_requested,execution_submitted,execution_filled,execution_protected,actual_pnl,evaluation_latency_seconds,created_at,updated_at`
 
 func scanReentryDecisionEvaluation(row rowScanner) (*ReentryAIDecisionEvaluation, error) {
 	var e ReentryAIDecisionEvaluation
 	var reversal sql.NullString
 	var pnl sql.NullFloat64
 	var start, end, created, updated string
-	if err := row.Scan(&e.ID, &e.AnalysisID, &e.CandidateID, &e.TraderID, &e.TraderNameSnapshot, &e.CycleID, &e.AttemptNo, &e.DecisionGeneration, &e.Decision, &e.Horizon, &e.EvaluationVersion, &e.EvaluationStatus, &e.MarketOutcome, &e.DecisionOutcome, &e.Actionability, &e.Reason, &e.ReferencePrice, &e.ReferenceATR, &e.MFEATR, &e.MAEATR, &reversal, &start, &end, &e.SampleCount, &e.CoverageRatio, &e.MaxGapSeconds, &e.ActualExecuted, &pnl, &e.EvaluationLatency, &created, &updated); err != nil {
+	if err := row.Scan(&e.ID, &e.AnalysisID, &e.CandidateID, &e.TraderID, &e.TraderNameSnapshot, &e.CycleID, &e.AttemptNo, &e.DecisionGeneration, &e.Decision, &e.Horizon, &e.EvaluationVersion, &e.EvaluationStatus, &e.DataQuality, &e.MarketOutcome, &e.DecisionOutcome, &e.Actionability, &e.Reason, &e.ReferencePrice, &e.ReferenceATR, &e.MFEATR, &e.MAEATR, &reversal, &start, &end, &e.SampleCount, &e.CoverageRatio, &e.MaxGapSeconds, &e.ActualExecuted, &e.ExecutionRequested, &e.ExecutionSubmitted, &e.ExecutionFilled, &e.ExecutionProtected, &pnl, &e.EvaluationLatency, &created, &updated); err != nil {
 		return nil, err
 	}
 	var err error
@@ -135,6 +153,9 @@ func (s *ReentryAIStore) SaveReentryDecisionEvaluation(e *ReentryAIDecisionEvalu
 	if e.EvaluationVersion <= 0 {
 		e.EvaluationVersion = ReentryDecisionEvaluationVersion
 	}
+	if e.DataQuality == "" {
+		e.DataQuality = "UNSCORABLE"
+	}
 	var reversal interface{}
 	if e.FirstReversalAt != nil {
 		reversal = e.FirstReversalAt.UTC()
@@ -144,9 +165,9 @@ func (s *ReentryAIStore) SaveReentryDecisionEvaluation(e *ReentryAIDecisionEvalu
 		pnl = *e.ActualPnL
 	}
 	res, err := s.db.Exec(`INSERT OR IGNORE INTO reentry_ai_decision_evaluations
-		(analysis_id,candidate_id,trader_id,trader_name_snapshot,cycle_id,attempt_no,decision_generation,decision,horizon,evaluation_version,evaluation_status,market_outcome,decision_outcome,actionability,reason,reference_price,reference_atr,mfe_atr,mae_atr,first_reversal_at,window_start_at,window_end_at,sample_count,coverage_ratio,max_gap_seconds,actual_executed,actual_pnl,evaluation_latency_seconds)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		e.AnalysisID, e.CandidateID, e.TraderID, e.TraderNameSnapshot, e.CycleID, e.AttemptNo, e.DecisionGeneration, e.Decision, e.Horizon, e.EvaluationVersion, e.EvaluationStatus, e.MarketOutcome, e.DecisionOutcome, e.Actionability, e.Reason, e.ReferencePrice, e.ReferenceATR, e.MFEATR, e.MAEATR, reversal, e.WindowStartAt.UTC(), e.WindowEndAt.UTC(), e.SampleCount, e.CoverageRatio, e.MaxGapSeconds, e.ActualExecuted, pnl, e.EvaluationLatency)
+		(analysis_id,candidate_id,trader_id,trader_name_snapshot,cycle_id,attempt_no,decision_generation,decision,horizon,evaluation_version,evaluation_status,data_quality,market_outcome,decision_outcome,actionability,reason,reference_price,reference_atr,mfe_atr,mae_atr,first_reversal_at,window_start_at,window_end_at,sample_count,coverage_ratio,max_gap_seconds,actual_executed,execution_requested,execution_submitted,execution_filled,execution_protected,actual_pnl,evaluation_latency_seconds)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		e.AnalysisID, e.CandidateID, e.TraderID, e.TraderNameSnapshot, e.CycleID, e.AttemptNo, e.DecisionGeneration, e.Decision, e.Horizon, e.EvaluationVersion, e.EvaluationStatus, e.DataQuality, e.MarketOutcome, e.DecisionOutcome, e.Actionability, e.Reason, e.ReferencePrice, e.ReferenceATR, e.MFEATR, e.MAEATR, reversal, e.WindowStartAt.UTC(), e.WindowEndAt.UTC(), e.SampleCount, e.CoverageRatio, e.MaxGapSeconds, e.ActualExecuted, e.ExecutionRequested, e.ExecutionSubmitted, e.ExecutionFilled, e.ExecutionProtected, pnl, e.EvaluationLatency)
 	if err != nil {
 		return nil, false, err
 	}
@@ -199,7 +220,7 @@ func (s *ReentryAIStore) ListClosedCyclesPendingAIEvaluation(limit int) ([]int64
 	rows, err := s.db.Query(`SELECT DISTINCT a.cycle_id FROM reentry_ai_analyses a
 		JOIN copy_guard_cycles c ON c.id=a.cycle_id
 		WHERE a.candidate_id>0 AND a.call_status='COMPLETED' AND a.verdict<>'' AND c.closed_at IS NOT NULL
-		AND NOT EXISTS (SELECT 1 FROM reentry_ai_decision_evaluations e WHERE e.analysis_id=a.id AND e.evaluation_version=?)
+		AND NOT EXISTS (SELECT 1 FROM reentry_ai_decision_evaluations e WHERE e.analysis_id=a.id AND e.evaluation_version=? AND e.horizon='LEADER_FINAL')
 		ORDER BY a.cycle_id LIMIT ?`, ReentryDecisionEvaluationVersion, limit)
 	if err != nil {
 		return nil, err

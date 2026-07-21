@@ -93,11 +93,13 @@ func TestEvaluateCyclePersistsImmutableOutcomeAndEventsOnce(t *testing.T) {
 		}
 	}
 	evaluations, err := st.ReentryAI().ListReentryDecisionEvaluationsByCycle(cycle.ID)
-	if err != nil || len(evaluations) != 1 {
+	if err != nil || len(evaluations) != 3 {
 		t.Fatalf("immutable evaluation count=%d err=%v", len(evaluations), err)
 	}
-	if evaluations[0].TraderNameSnapshot != "主账户-A" || evaluations[0].DecisionOutcome != "UNSCORABLE" {
-		t.Fatalf("unexpected evaluation: %+v", evaluations[0])
+	for _, evaluation := range evaluations {
+		if evaluation.TraderNameSnapshot != "主账户-A" || evaluation.DecisionOutcome != "UNSCORABLE" || evaluation.DataQuality != "UNSCORABLE" {
+			t.Fatalf("unexpected evaluation: %+v", evaluation)
+		}
 	}
 	stats, err := st.ReentryAI().GetReentryAIStats([]string{"trader-1"})
 	if err != nil || stats.CandidateEvaluated != 1 || stats.CandidateUnscorable != 1 || stats.CandidateEvaluationOutcomes["UNSCORABLE"] != 1 {

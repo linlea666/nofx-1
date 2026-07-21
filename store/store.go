@@ -155,6 +155,9 @@ func (s *Store) initTables() error {
 	if err := s.CopyTrade().initPositionMappingTable(); err != nil {
 		return fmt.Errorf("failed to initialize copy trade position mapping table: %w", err)
 	}
+	if err := s.CopyTrade().initExecutionIntentTable(); err != nil {
+		return fmt.Errorf("failed to initialize copy trade execution intent table: %w", err)
+	}
 	if err := s.CopyTrade().initCopyGuardTables(); err != nil {
 		return fmt.Errorf("failed to initialize copy guard tables: %w", err)
 	}

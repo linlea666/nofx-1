@@ -29,8 +29,11 @@ type ExecutionInstrument struct {
 	// Copy Guard: quote-asset price and base-asset quantity respectively.
 	// Keeping them on the resolved execution contract prevents Binance stops
 	// from accidentally using OKX precision metadata.
-	PriceTickSize    float64
-	BaseQuantityStep float64
+	PriceTickSize      float64
+	BaseQuantityStep   float64
+	NativeQuantityStep float64
+	MinBaseQuantity    float64
+	MinNotional        float64
 }
 
 type ExecutionInstrumentResolver interface {

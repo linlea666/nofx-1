@@ -96,9 +96,8 @@ func TestBuildDataPackGuardLayerWithMarketUnavailable(t *testing.T) {
 	if g.LastStop == nil || g.LastStop.Price != 3360 || g.LastStop.DistanceFromCurrentATR <= 0 {
 		t.Fatalf("last stop = %+v", g.LastStop)
 	}
-	// 领航员仍持仓；BaselineLeaderSize 由引擎运行期写入（EnsureCopyGuardCycle
-	// 不落该列），本测试未经引擎 → 基线未知，ratio 应为 0（不误算）
-	if !g.Leader.StillHolding || g.Leader.SizeVsCycleBaseline != 0 {
+	// 周期创建即持久化基线，AI 数据包必须显式标明 ratio 可用。
+	if !g.Leader.StillHolding || !g.Leader.SizeVsCycleBaselineAvailable || g.Leader.SizeVsCycleBaseline != 0.75 {
 		t.Fatalf("leader = %+v", g.Leader)
 	}
 	// 空单且价格低于领航员均价 → 领航员浮盈为正

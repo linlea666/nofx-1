@@ -9,11 +9,13 @@ package reentryadvisor
 import (
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
 
 	"nofx/copyguardmetrics"
+	"nofx/copytrade"
 	"nofx/logger"
 	"nofx/store"
 )
@@ -171,6 +173,28 @@ func (a *Advisor) pollAICandidates(cfg *store.ReentryAIConfig) {
 		if err != nil || traderCfg.RiskReentryDecisionMode != "ai_guarded" || !traderCfg.RiskReentryEnabled {
 			continue
 		}
+		minNotional := traderCfg.MinTradeWarn
+		if minNotional <= 0 {
+			minNotional = copytrade.DefaultMinTradeNotional
+		}
+		unactionableCode := ""
+		unactionableMessage := ""
+		switch {
+		case !candidate.Protectable:
+			unactionableCode, unactionableMessage = "PROTECTION_UNAVAILABLE", "deterministic protection precheck unavailable"
+		case candidate.MaxNotional < minNotional:
+			unactionableCode, unactionableMessage = "MIN_NOTIONAL", fmt.Sprintf("maximum executable notional %.2f is below minimum %.2f", candidate.MaxNotional, minNotional)
+		}
+		if unactionableCode != "" {
+			retry := time.Duration(traderCfg.RiskAIMinReviewSeconds) * time.Second
+			if retry < 5*time.Minute {
+				retry = 5 * time.Minute
+			}
+			_ = a.st.ReentryAI().DeferReentryCandidateUnactionable(candidate.ID, 0, unactionableMessage, retry)
+			a.updateCandidateCycleStatus(candidate, store.CopyGuardAIWaiting)
+			a.recordCandidateEvent(candidate, "AI_CANDIDATE_UNACTIONABLE", candidate.TriggerPrice, candidate.MaxNotional, map[string]interface{}{"reason_code": unactionableCode, "reason": unactionableMessage})
+			continue
+		}
 		claimed, ok, err := a.st.ReentryAI().ClaimReentryCandidateReview(candidate.ID, time.Duration(traderCfg.RiskAIMinReviewSeconds)*time.Second, traderCfg.RiskAIDailyCallLimit, traderCfg.RiskAILifecycleCallLimit)
 		if err != nil {
 			logger.Warnf("[ReentryAdvisor] 候选 %d 领取失败: %v", candidate.ID, err)
@@ -195,13 +219,22 @@ func (a *Advisor) pollAICandidates(cfg *store.ReentryAIConfig) {
 			if failed != nil {
 				analysisID = failed.ID
 			}
-			_ = a.st.ReentryAI().FailReentryCandidateBeforeModel(claimed.ID, analysisID, err.Error(), candidateFailureBackoff(claimed.FailureCount+1))
+			if errors.Is(err, errCandidateUnactionable) {
+				_ = a.st.ReentryAI().DeferReentryCandidateUnactionable(claimed.ID, analysisID, err.Error(), 5*time.Minute)
+			} else {
+				_ = a.st.ReentryAI().FailReentryCandidateBeforeModel(claimed.ID, analysisID, err.Error(), candidateFailureBackoff(claimed.FailureCount+1))
+			}
 			a.updateCandidateCycleStatus(claimed, store.CopyGuardAIWaiting)
+			eventType := "AI_REVIEW_FAILED"
 			detail := map[string]interface{}{"error": err.Error(), "stage": "datapack"}
+			if errors.Is(err, errCandidateUnactionable) {
+				eventType = "AI_CANDIDATE_UNACTIONABLE"
+				detail["reason_code"] = "DATA_UNAVAILABLE"
+			}
 			if failed != nil {
 				detail["analysis_id"] = failed.ID
 			}
-			a.recordCandidateEvent(claimed, "AI_REVIEW_FAILED", 0, 0, detail)
+			a.recordCandidateEvent(claimed, eventType, 0, 0, detail)
 			if claimed.FailureCount+1 == 3 {
 				a.notifyCandidateImportant(claimed, "AI_REVIEW_FAILED", "AI 候选数据连续生成失败", "行情或数据包连续不可用，候选将按退避策略继续等待。")
 			}
@@ -228,6 +261,8 @@ func (a *Advisor) pollAICandidates(cfg *store.ReentryAIConfig) {
 	}
 }
 
+var errCandidateUnactionable = errors.New("AI candidate is deterministically unactionable")
+
 func (a *Advisor) updateCandidateCycleStatus(c *store.CopyGuardReentryCandidate, status string) {
 	if a == nil || a.st == nil || c == nil {
 		return
@@ -249,6 +284,9 @@ func (a *Advisor) generateForCandidate(c *store.CopyGuardReentryCandidate, cfg *
 	pack, err := buildDataPackForCandidate(a.st, a.bn, c)
 	if err != nil {
 		return nil, err
+	}
+	if !pack.CopyGuard.ReentryBoundaryAvailable || !pack.CopyGuard.ChaseLimitAvailable || !pack.CopyGuard.Leader.SizeVsCycleBaselineAvailable {
+		return nil, fmt.Errorf("%w: critical baseline or reentry boundary is unavailable", errCandidateUnactionable)
 	}
 	b, err := json.MarshalIndent(pack, "", "  ")
 	if err != nil {

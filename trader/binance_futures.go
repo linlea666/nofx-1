@@ -1421,7 +1421,7 @@ func (t *FuturesTrader) refreshBinanceInstrumentCatalog() error {
 			continue
 		}
 		catalog[item.Symbol] = &binanceExecutionInstrument{
-			ExecutionInstrument: ExecutionInstrument{SourceSymbol: item.Symbol, NativeSymbol: item.Symbol, BaseAsset: item.BaseAsset, QuoteAsset: item.QuoteAsset, SettleAsset: item.MarginAsset, MarketType: "UM", ContractType: contractType, Status: item.Status, PriceTickSize: tickSize, BaseQuantityStep: stepSize},
+			ExecutionInstrument: ExecutionInstrument{SourceSymbol: item.Symbol, NativeSymbol: item.Symbol, BaseAsset: item.BaseAsset, QuoteAsset: item.QuoteAsset, SettleAsset: item.MarginAsset, MarketType: "UM", ContractType: contractType, Status: item.Status, PriceTickSize: tickSize, BaseQuantityStep: stepSize, NativeQuantityStep: stepSize, MinBaseQuantity: minQuantity, MinNotional: minNotional},
 			StepSize:            stepSize, MinQuantity: minQuantity, MaxQuantity: maxQuantity, TickSize: tickSize, MinNotional: minNotional,
 		}
 	}

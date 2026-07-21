@@ -282,6 +282,8 @@ var copyGuardEventSpecs = map[string]CopyGuardEventSpec{
 	"STOP_FLAT_CONFIRMED":              {CopyEventCategoryStopLoss, CopyEventSeverityWarn, "important", true},
 	"STOP_DUST_RESIDUAL":               {CopyEventCategoryStopLoss, CopyEventSeverityError, "critical", true},
 	"AI_CANDIDATE_CREATED":             {CopyEventCategoryTakeover, CopyEventSeverityInfo, "verbose", true},
+	"AI_CANDIDATE_UNACTIONABLE":        {CopyEventCategoryTakeover, CopyEventSeverityInfo, "verbose", true},
+	"REENTRY_SUBMITTED":                {CopyEventCategoryTakeover, CopyEventSeverityInfo, "verbose", true},
 	"AI_REVIEW_WAIT":                   {CopyEventCategoryTakeover, CopyEventSeverityInfo, "verbose", true},
 	"AI_REVIEW_REQUESTED":              {CopyEventCategoryTakeover, CopyEventSeverityInfo, "verbose", true},
 	"AI_REVIEW_ENTER":                  {CopyEventCategoryTakeover, CopyEventSeverityInfo, "verbose", true},

@@ -1727,6 +1727,9 @@ func (e *Engine) processSignal(signal *TradeSignal) {
 	// Step 4: 构造 Decision
 	// ========================================
 	dec := e.buildDecisionV2(signal, matchResult, copySize)
+	if !e.reserveExecutionIntent(&dec) {
+		return
+	}
 
 	// ========================================
 	// Step 5: 推送决策
@@ -1751,9 +1754,64 @@ func (e *Engine) processSignal(signal *TradeSignal) {
 		// 释放去重标记让下轮 poll 重放（fill 仍在回看窗口内时可恢复），
 		// 并升级为 ERROR：这是会造成漏单的严重拥塞信号。
 		e.UnmarkSeen(fill.ID)
+		if dec.ExecutionIntentID > 0 && e.store != nil {
+			_ = e.store.CopyTrade().UpdateExecutionIntent(dec.ExecutionIntentID, store.ExecutionIntentFailed, "DECISION_CHANNEL_BUSY", "decision channel is full before execution", "", 0, 0, 0)
+		}
 		logger.Errorf("❌ [%s] 决策通道已满，丢弃决策并释放去重标记等待重放 | %s %s fillID=%s",
 			e.traderID, dec.Action, dec.Symbol, fill.ID)
 	}
+}
+
+// reserveExecutionIntent closes the gap between source matching and exchange
+// acknowledgement. Until the mapping advances, every fill for the same leader
+// position observes the same next revision and therefore collapses to one
+// durable intent instead of queuing duplicate opens/reduces.
+func (e *Engine) reserveExecutionIntent(dec *decision.Decision) bool {
+	if dec == nil || e.store == nil || dec.LeaderPosID == "" || dec.Action == "hold" {
+		return true
+	}
+	revision := int64(1)
+	if mapping, err := e.store.CopyTrade().GetMapping(e.traderID, dec.LeaderPosID); err != nil {
+		logger.Errorf("❌ [%s] 查询执行意图修订号失败 | posId=%s: %v", e.traderID, dec.LeaderPosID, err)
+		if dec.SourceFillID != "" {
+			e.UnmarkSeen(dec.SourceFillID)
+		}
+		return false
+	} else if mapping != nil {
+		revision = mapping.SourceRevision + 1
+		if revision <= 0 {
+			revision = 1
+		}
+	}
+	side := "long"
+	if strings.HasSuffix(dec.Action, "short") {
+		side = "short"
+	}
+	intent, claimed, err := e.store.CopyTrade().ReserveExecutionIntent(&store.CopyTradeExecutionIntent{
+		TraderID: e.traderID, LeaderPosID: dec.LeaderPosID, SourceRevision: revision,
+		SourceFillID: dec.SourceFillID, Action: dec.Action, Symbol: dec.Symbol, Side: side,
+		MarginMode: dec.MarginMode, LeaderTargetSize: dec.LeaderPosSize,
+		RequestedNotional: dec.PositionSizeUSD, ClientOrderID: dec.ClientOrderID,
+	})
+	if err != nil {
+		logger.Errorf("❌ [%s] 预留执行意图失败 | posId=%s action=%s: %v", e.traderID, dec.LeaderPosID, dec.Action, err)
+		if dec.SourceFillID != "" {
+			e.UnmarkSeen(dec.SourceFillID)
+		}
+		return false
+	}
+	if !claimed {
+		logger.Infof("⏭️ [%s] 同仓位过渡已有执行意图，合并重复 fill | intent=%d posId=%s rev=%d action=%s fill=%s",
+			e.traderID, intent.ID, dec.LeaderPosID, revision, dec.Action, dec.SourceFillID)
+		return false
+	}
+	dec.ExecutionIntentID = intent.ID
+	dec.SourceRevision = revision
+	dec.ExecutionStatus = store.ExecutionIntentReserved
+	if intent.ClientOrderID != "" {
+		dec.ClientOrderID = intent.ClientOrderID
+	}
+	return true
 }
 
 // blockInvalidSmartMoneyRiskIncrease enforces the value/conversion fail-closed
@@ -1921,7 +1979,9 @@ func (e *Engine) buildDecisionV2(signal *TradeSignal, match *SignalMatchResult, 
 			return dec
 		}
 
-		// 边界保护：减仓超过阈值时，直接全量平仓
+		// 边界保护：单次减仓超过阈值时，直接全量平仓。
+		// 不再在交易所确认前累加 accumulated_reduce_ratio：微量减仓按
+		// 用户策略明确忽略，可执行减仓由 mapping 的源修订号确认。
 		if ratio >= FullCloseThreshold {
 			logger.Infof("📊 [%s] 减仓比例 %.1f%% ≥ %.0f%%，转为全量平仓", e.traderID, ratio*100, FullCloseThreshold*100)
 			dec.CloseRatio = 0
@@ -1932,40 +1992,12 @@ func (e *Engine) buildDecisionV2(signal *TradeSignal, match *SignalMatchResult, 
 			dec.Action = e.mapAction(ActionClose, fill.PositionSide)
 			dec.Reasoning = fmt.Sprintf("Copy trading: close (reduce %.0f%% → full close) following %s leader %s",
 				ratio*100, e.config.ProviderType, e.config.LeaderID)
-			// 清除累积减仓比例
-			if e.store != nil {
-				e.store.CopyTrade().ClearAccumulatedReduceRatio(e.traderID, match.PosID)
-			}
 		} else {
-			// 🆕 累积减仓检测：当累积减仓超过 90% 时，触发全平
-			accumulatedRatio := e.getAccumulatedReduceRatio(match.PosID)
-			newAccumulated := accumulatedRatio + ratio
-
-			if newAccumulated >= AccumulatedCloseThreshold {
-				// 累积减仓超过阈值，转为全平
-				logger.Infof("📊 [%s] 累积减仓 %.1f%% (本次 %.1f%% + 历史 %.1f%%) ≥ %.0f%%，转为全量平仓",
-					e.traderID, newAccumulated*100, ratio*100, accumulatedRatio*100, AccumulatedCloseThreshold*100)
-				dec.CloseRatio = 0
-				// 同上：全平语义必须用 close_* action（撤保护单 + 关 mapping + 周期收尾）
-				dec.Action = e.mapAction(ActionClose, fill.PositionSide)
-				dec.Reasoning = fmt.Sprintf("Copy trading: close (accumulated reduce %.0f%% → full close) following %s leader %s",
-					newAccumulated*100, e.config.ProviderType, e.config.LeaderID)
-				// 清除累积减仓比例
-				if e.store != nil {
-					e.store.CopyTrade().ClearAccumulatedReduceRatio(e.traderID, match.PosID)
-				}
-			} else {
-				// 正常减仓：更新累积比例
-				dec.CloseRatio = ratio
-				dec.Reasoning = fmt.Sprintf("Copy trading: reduce %.0f%% following %s leader %s",
-					ratio*100, e.config.ProviderType, e.config.LeaderID)
-				logger.Infof("📊 [%s] 部分平仓 %.1f%% marginMode=%s (累积 %.1f%%)",
-					e.traderID, ratio*100, dec.MarginMode, newAccumulated*100)
-				// 更新累积减仓比例
-				if e.store != nil {
-					e.store.CopyTrade().UpdateAccumulatedReduceRatio(e.traderID, match.PosID, newAccumulated)
-				}
-			}
+			dec.CloseRatio = ratio
+			dec.Reasoning = fmt.Sprintf("Copy trading: reduce %.0f%% following %s leader %s",
+				ratio*100, e.config.ProviderType, e.config.LeaderID)
+			logger.Infof("📊 [%s] 部分平仓 %.3f%% marginMode=%s（不累积微量减仓）",
+				e.traderID, ratio*100, dec.MarginMode)
 		}
 	}
 
@@ -1975,10 +2007,6 @@ func (e *Engine) buildDecisionV2(signal *TradeSignal, match *SignalMatchResult, 
 	if match.Action == ActionClose {
 		dec.CloseRatio = 0 // 0 = 全量平仓
 		logger.Infof("📊 [%s] 全量平仓 marginMode=%s", e.traderID, dec.MarginMode)
-		// 🔑 清除累积减仓比例（避免残留影响下次开仓）
-		if e.store != nil {
-			e.store.CopyTrade().ClearAccumulatedReduceRatio(e.traderID, match.PosID)
-		}
 	}
 
 	// 🔐 决策级稳定 clOrdId（重试/重放幂等的最后一道硬闸）：

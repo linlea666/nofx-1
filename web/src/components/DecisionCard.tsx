@@ -78,6 +78,49 @@ function getConfidenceColor(confidence: number | undefined): string {
   return '#F6465D'
 }
 
+function executionLifecycle(action: DecisionAction): string[] {
+  if (!action.execution_intent_id) return []
+  if (action.execution_status === 'SKIPPED') {
+    return [`已识别`, `未下单：${action.execution_reason_code || 'SKIPPED'}`]
+  }
+  const steps = ['已识别', '已预留']
+  const submitted = [
+    'SUBMITTED',
+    'FILLED',
+    'PROTECTED',
+    'RECONCILING',
+  ].includes(action.execution_status || '')
+  if (submitted || action.exchange_order_id) steps.push('已提交')
+  if (
+    (action.filled_quantity || 0) > 0 ||
+    ['FILLED', 'PROTECTED'].includes(action.execution_status || '')
+  ) {
+    steps.push('已成交')
+  }
+  switch (action.execution_status) {
+    case 'PROTECTED':
+      steps.push(
+        action.execution_reason_code === 'PROTECTION_CLAMPED'
+          ? '保护成功（已收紧）'
+          : '保护成功'
+      )
+      break
+    case 'RECONCILING':
+      steps.push(
+        `对账/保护中${action.execution_reason_code ? `：${action.execution_reason_code}` : ''}`
+      )
+      break
+    case 'FAILED':
+      steps.push(
+        action.execution_reason_code === 'GUARD_UNPROTECTABLE_EXITED'
+          ? '保护失败，已风控退出'
+          : `执行失败${action.execution_reason_code ? `：${action.execution_reason_code}` : ''}`
+      )
+      break
+  }
+  return steps
+}
+
 // Single Action Card Component
 function ActionCard({
   action,
@@ -89,6 +132,7 @@ function ActionCard({
   const config = ACTION_CONFIG[action.action] || ACTION_CONFIG.wait
   const isLong = action.action.includes('long')
   const isOpen = action.action.includes('open')
+  const lifecycle = executionLifecycle(action)
 
   return (
     <div
@@ -257,6 +301,17 @@ function ActionCard({
       )}
 
       {/* Reasoning */}
+      {lifecycle.length > 0 && (
+        <div className="mt-3 flex flex-wrap items-center gap-1 border-t border-[#2B3139] pt-3 text-xs text-[#B7BDC6]">
+          {lifecycle.map((step, index) => (
+            <span key={`${step}-${index}`}>
+              {index > 0 && <span className="mr-1 text-[#5E6673]">→</span>}
+              {step}
+            </span>
+          ))}
+        </div>
+      )}
+
       {action.reasoning && (
         <div className="mt-3 pt-3" style={{ borderTop: '1px solid #2B3139' }}>
           <div className="text-xs line-clamp-2" style={{ color: '#848E9C' }}>

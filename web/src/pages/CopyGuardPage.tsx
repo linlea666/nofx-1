@@ -638,7 +638,8 @@ function CandidateAnalysisModal({
                       {evaluation.market_outcome}
                     </span>
                     <span>
-                      可执行性：{evaluation.actionability} · 评价 v
+                      窗口：{evaluation.horizon} · 数据：
+                      {evaluation.data_quality} · 评价 v
                       {evaluation.evaluation_version}
                     </span>
                     <span>
@@ -2605,6 +2606,10 @@ export function CopyGuardPage() {
                 <Metric
                   label="决策 / 可评分 / 不可评分"
                   value={`${detail.ai_effect_summary.total_decisions} / ${detail.ai_effect_summary.scorable_decisions} / ${detail.ai_effect_summary.unscorable_decisions}`}
+                />
+                <Metric
+                  label="ENTER → 请求 → 提交 → 成交 → 保护"
+                  value={`${detail.ai_effect_summary.enter_decisions} → ${detail.ai_effect_summary.execution_requested} → ${detail.ai_effect_summary.execution_submitted} → ${detail.ai_effect_summary.execution_filled} → ${detail.ai_effect_summary.execution_protected}`}
                 />
                 <Metric
                   label="错过反转 / 正确放弃"

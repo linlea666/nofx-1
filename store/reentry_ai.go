@@ -65,12 +65,15 @@ type ReentryAIAnalysis struct {
 	ExternalResponse string `json:"external_response"`
 	ExternalVerdict  string `json:"external_verdict"`
 
-	PromptVersion string     `json:"prompt_version"`
-	SnapshotPrice float64    `json:"snapshot_price"`
-	SnapshotAt    time.Time  `json:"snapshot_at"`
-	OutcomePnL    *float64   `json:"outcome_pnl,omitempty"` // 周期闭合后回填（Phase 2）
-	CreatedAt     time.Time  `json:"created_at"`
-	UpdatedAt     *time.Time `json:"updated_at,omitempty"`
+	PromptVersion     string     `json:"prompt_version"`
+	SnapshotPrice     float64    `json:"snapshot_price"`
+	SnapshotAt        time.Time  `json:"snapshot_at"`
+	ModelStartedAt    *time.Time `json:"model_started_at,omitempty"`
+	ModelCompletedAt  *time.Time `json:"model_completed_at,omitempty"`
+	DecisionExpiresAt *time.Time `json:"decision_expires_at,omitempty"`
+	OutcomePnL        *float64   `json:"outcome_pnl,omitempty"` // 周期闭合后回填（Phase 2）
+	CreatedAt         time.Time  `json:"created_at"`
+	UpdatedAt         *time.Time `json:"updated_at,omitempty"`
 }
 
 // ReentryAIConfig 全局配置（单行，id 恒为 1）
@@ -120,6 +123,9 @@ func (s *ReentryAIStore) initTables() error {
 			prompt_version TEXT DEFAULT '',
 			snapshot_price REAL DEFAULT 0,
 			snapshot_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			model_started_at DATETIME,
+			model_completed_at DATETIME,
+			decision_expires_at DATETIME,
 			outcome_pnl REAL,
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 			updated_at DATETIME
@@ -150,6 +156,9 @@ func (s *ReentryAIStore) initTables() error {
 	s.db.Exec(`ALTER TABLE reentry_ai_analyses ADD COLUMN call_status TEXT NOT NULL DEFAULT 'PENDING'`)
 	s.db.Exec(`ALTER TABLE reentry_ai_analyses ADD COLUMN call_error TEXT NOT NULL DEFAULT ''`)
 	s.db.Exec(`ALTER TABLE reentry_ai_analyses ADD COLUMN data_hash TEXT NOT NULL DEFAULT ''`)
+	s.db.Exec(`ALTER TABLE reentry_ai_analyses ADD COLUMN model_started_at DATETIME`)
+	s.db.Exec(`ALTER TABLE reentry_ai_analyses ADD COLUMN model_completed_at DATETIME`)
+	s.db.Exec(`ALTER TABLE reentry_ai_analyses ADD COLUMN decision_expires_at DATETIME`)
 	s.db.Exec(`UPDATE reentry_ai_analyses SET call_status=CASE WHEN verdict<>'' THEN 'COMPLETED' WHEN raw_response<>'' THEN 'INVALID' ELSE call_status END WHERE call_status='PENDING'`)
 	s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_reentry_ai_analyses_candidate ON reentry_ai_analyses(candidate_id,id)`)
 	// 早期建表缺列时老库补列（重复执行报 duplicate column 忽略）
@@ -168,18 +177,18 @@ func (s *ReentryAIStore) initTables() error {
 const reentryAnalysisColumns = `id, signal_id, candidate_id, trader_id, cycle_id, symbol, side, attempt_no, decision_generation, call_status, call_error, data_hash,
 	system_prompt, user_prompt, datapack_json, market_data_available, missing_fields,
 	raw_response, verdict, confidence, reasons, external_response, external_verdict,
-	prompt_version, snapshot_price, snapshot_at, outcome_pnl, created_at, updated_at`
+	prompt_version, snapshot_price, snapshot_at, model_started_at, model_completed_at, decision_expires_at, outcome_pnl, created_at, updated_at`
 
 func scanReentryAnalysis(row rowScanner) (*ReentryAIAnalysis, error) {
 	var a ReentryAIAnalysis
 	var snapshot, created string
-	var updated sql.NullString
+	var modelStarted, modelCompleted, decisionExpires, updated sql.NullString
 	var outcome sql.NullFloat64
 	if err := row.Scan(&a.ID, &a.SignalID, &a.CandidateID, &a.TraderID, &a.CycleID, &a.Symbol, &a.Side,
 		&a.AttemptNo, &a.DecisionGeneration, &a.CallStatus, &a.CallError, &a.DataHash,
 		&a.SystemPrompt, &a.UserPrompt, &a.DatapackJSON, &a.MarketDataAvailable, &a.MissingFields,
 		&a.RawResponse, &a.Verdict, &a.Confidence, &a.Reasons, &a.ExternalResponse, &a.ExternalVerdict,
-		&a.PromptVersion, &a.SnapshotPrice, &snapshot, &outcome, &created, &updated); err != nil {
+		&a.PromptVersion, &a.SnapshotPrice, &snapshot, &modelStarted, &modelCompleted, &decisionExpires, &outcome, &created, &updated); err != nil {
 		return nil, err
 	}
 	var err error
@@ -188,6 +197,15 @@ func scanReentryAnalysis(row rowScanner) (*ReentryAIAnalysis, error) {
 	}
 	if a.CreatedAt, err = parseDBTime(created); err != nil {
 		return nil, fmt.Errorf("reentry analysis %d created_at: %w", a.ID, err)
+	}
+	if a.ModelStartedAt, err = parseNullableDBTime(modelStarted); err != nil {
+		return nil, fmt.Errorf("reentry analysis %d model_started_at: %w", a.ID, err)
+	}
+	if a.ModelCompletedAt, err = parseNullableDBTime(modelCompleted); err != nil {
+		return nil, fmt.Errorf("reentry analysis %d model_completed_at: %w", a.ID, err)
+	}
+	if a.DecisionExpiresAt, err = parseNullableDBTime(decisionExpires); err != nil {
+		return nil, fmt.Errorf("reentry analysis %d decision_expires_at: %w", a.ID, err)
 	}
 	if a.UpdatedAt, err = parseNullableDBTime(updated); err != nil {
 		return nil, fmt.Errorf("reentry analysis %d updated_at: %w", a.ID, err)
@@ -347,6 +365,12 @@ func (s *ReentryAIStore) UpdateReentryExternal(id int64, externalResponse, exter
 // UpdateReentryInternalResult 写入内置 AI 分析结果（Phase 2）。
 // verdict 允许空串（表示原始回复解析失败，仅存 raw 供人工查看）。
 func (s *ReentryAIStore) UpdateReentryInternalResult(id int64, rawResponse, verdict string, confidence float64, reasons string) error {
+	return s.CompleteReentryInternalResult(id, rawResponse, verdict, confidence, reasons, 30)
+}
+
+// CompleteReentryInternalResult completes a model call and starts the decision
+// TTL at model completion, rather than consuming it while the model is running.
+func (s *ReentryAIStore) CompleteReentryInternalResult(id int64, rawResponse, verdict string, confidence float64, reasons string, ttlSeconds int) error {
 	switch verdict {
 	case "", ReentryVerdictEnter, ReentryVerdictWait, ReentryVerdictSkip, ReentryVerdictAbandon:
 	default:
@@ -358,8 +382,12 @@ func (s *ReentryAIStore) UpdateReentryInternalResult(id int64, rawResponse, verd
 		callStatus = "INVALID"
 		callError = "model response did not match the strict schema"
 	}
-	res, err := s.db.Exec(`UPDATE reentry_ai_analyses SET raw_response=?, verdict=?, confidence=?, reasons=?,call_status=?,call_error=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
-		rawResponse, verdict, confidence, reasons, callStatus, callError, id)
+	if ttlSeconds < 15 || ttlSeconds > 60 {
+		ttlSeconds = 30
+	}
+	res, err := s.db.Exec(`UPDATE reentry_ai_analyses SET raw_response=?, verdict=?, confidence=?, reasons=?,call_status=?,call_error=?,
+		model_completed_at=CURRENT_TIMESTAMP, decision_expires_at=datetime(CURRENT_TIMESTAMP, ?), updated_at=CURRENT_TIMESTAMP WHERE id=?`,
+		rawResponse, verdict, confidence, reasons, callStatus, callError, fmt.Sprintf("+%d seconds", ttlSeconds), id)
 	if err != nil {
 		return err
 	}
@@ -385,7 +413,7 @@ func (s *ReentryAIStore) MarkReentryAnalysisFailed(id int64, message string) err
 }
 
 func (s *ReentryAIStore) MarkReentryAnalysisRunning(id int64) error {
-	res, err := s.db.Exec(`UPDATE reentry_ai_analyses SET call_status='RUNNING',call_error='',updated_at=CURRENT_TIMESTAMP WHERE id=? AND candidate_id>0 AND call_status='PENDING'`, id)
+	res, err := s.db.Exec(`UPDATE reentry_ai_analyses SET call_status='RUNNING',call_error='',model_started_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=? AND candidate_id>0 AND call_status='PENDING'`, id)
 	if err != nil {
 		return err
 	}
@@ -580,7 +608,7 @@ func (s *ReentryAIStore) GetReentryAIStats(traderIDs []string) (*ReentryAIStats,
 		return nil, err
 	}
 	evalArgs := append(append([]interface{}{}, args...), ReentryDecisionEvaluationVersion)
-	evalRows, err := s.db.Query(`SELECT decision_outcome,market_outcome,COUNT(*) FROM reentry_ai_decision_evaluations WHERE trader_id IN (`+marks+`) AND evaluation_version=? GROUP BY decision_outcome,market_outcome`, evalArgs...)
+	evalRows, err := s.db.Query(`SELECT decision_outcome,market_outcome,COUNT(*) FROM reentry_ai_decision_evaluations WHERE trader_id IN (`+marks+`) AND evaluation_version=? AND horizon='LEADER_FINAL' GROUP BY decision_outcome,market_outcome`, evalArgs...)
 	if err != nil {
 		return nil, err
 	}

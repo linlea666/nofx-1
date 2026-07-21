@@ -1023,6 +1023,10 @@ func (at *AutoTrader) ExecuteDecision(d *decision.Decision) error {
 // 调用方用 errors.Is 识别后按"跳过"处理（不更新 mapping、不告警、不熔断）。
 var ErrPartialCloseSkipped = errors.New("partial close skipped (no order placed)")
 
+// ErrPartialCloseSubLot is a successful source acknowledgement with no
+// exchange order: the requested reduction is smaller than one executable lot.
+var ErrPartialCloseSubLot = fmt.Errorf("%w: %w", ErrPartialCloseSkipped, ErrQuantitySubLot)
+
 // deriveHalvedRetryClientOrderID 为保证金不足的减半重试生成派生幂等 ID：
 // 原 ID 追加 "h1" 后缀（超长时截断原 ID 保留后缀，按 OKX clOrdId 32 字符
 // 上限取最严格值）。初次失败单可能已在交易所留下零成交终态记录并永久占用
@@ -1053,35 +1057,73 @@ func (at *AutoTrader) partialCloseQuantityStep(symbol string) float64 {
 	return inst.BaseQuantityStep
 }
 
+func (at *AutoTrader) quantizeCopyOpenQuantity(dec *decision.Decision, currentPrice, requested float64) (float64, error) {
+	resolver, ok := at.trader.(ExecutionInstrumentResolver)
+	if !ok {
+		// Compatibility for non-Copy-Guard executors and lightweight adapters.
+		// Copy Guard v4 validates this capability at startup, so protected live
+		// copy trading never takes this fallback.
+		dec.RequestedQuantity = requested
+		dec.QuantizedQuantity = requested
+		dec.PositionSizeUSD = requested * currentPrice
+		return requested, nil
+	}
+	inst, err := resolver.ResolveExecutionInstrument(dec.Symbol)
+	if err != nil {
+		return 0, err
+	}
+	q, err := QuantizeOrderIntent(inst, requested, QuantityRiskIncrease)
+	if err != nil {
+		return 0, err
+	}
+	if inst.MinNotional > 0 && q.Quantized*currentPrice+1e-9 < inst.MinNotional {
+		return 0, fmt.Errorf("quantized notional %.4f is below exchange minimum %.4f", q.Quantized*currentPrice, inst.MinNotional)
+	}
+	dec.RequestedQuantity = requested
+	dec.QuantizedQuantity = q.Quantized
+	dec.QuantityStepOverride = q.StepOverride
+	dec.PositionSizeUSD = q.Quantized * currentPrice
+	return q.Quantized, nil
+}
+
 // guardPartialCloseQuantity 拦截"部分减仓被取整后覆盖全仓"的情况：
 // 交易所会把下单数量向上取整到最小步长（OKX 张数），当 ctVal 较大时
 // （如 ctVal=1 的币种）0.5 张上取整到 1 张即等于全平。优先用精确合约
 // 步长预判；解析不可用时回退旧的 0.02 硬阈值（兼容原行为）。
 // 接近全平（CloseRatio>=0.9）时不拦截，允许直接执行。
-func (at *AutoTrader) guardPartialCloseQuantity(symbol string, totalQuantity, closeQuantity, closeRatio float64) error {
-	if closeRatio >= 0.9 {
-		return nil
-	}
+func (at *AutoTrader) guardPartialCloseQuantity(symbol string, totalQuantity, closeQuantity, closeRatio float64) (float64, error) {
 	const stepEpsilon = 1e-9
-	if step := at.partialCloseQuantityStep(symbol); step > 0 {
-		rounded := math.Ceil(closeQuantity/step-stepEpsilon) * step
-		if rounded >= totalQuantity-stepEpsilon {
-			logger.Warnf("  ⚠️ 减仓量 %.8f 取整到步长 %.8f 后 (%.8f) 覆盖全仓 %.8f，跳过本次减仓",
-				closeQuantity, step, rounded, totalQuantity)
-			return fmt.Errorf("%w: 减仓量 %.8f 取整到步长 %.8f 后覆盖全仓 %.8f",
-				ErrPartialCloseSkipped, closeQuantity, step, totalQuantity)
+	resolver, hasResolver := at.trader.(ExecutionInstrumentResolver)
+	if hasResolver {
+		inst, err := resolver.ResolveExecutionInstrument(symbol)
+		if err == nil && inst != nil && inst.BaseQuantityStep > 0 {
+			quantized, qErr := QuantizeOrderIntent(inst, closeQuantity, QuantityRiskReduce)
+			if errors.Is(qErr, ErrQuantitySubLot) {
+				logger.Infof("  ⏭️ 减仓量 %.8f 不足最小可执行数量 %.8f，记录并忽略到领航员最终平仓", closeQuantity, inst.MinBaseQuantity)
+				return 0, fmt.Errorf("%w: 减仓量 %.8f 不足一个交易步长 %.8f", ErrPartialCloseSubLot, closeQuantity, inst.BaseQuantityStep)
+			}
+			if qErr != nil {
+				return 0, qErr
+			}
+			rounded := quantized.Quantized
+			if rounded >= totalQuantity-stepEpsilon {
+				logger.Warnf("  ⚠️ 减仓量 %.8f 取整到步长 %.8f 后 (%.8f) 覆盖全仓 %.8f，跳过本次减仓",
+					closeQuantity, inst.BaseQuantityStep, rounded, totalQuantity)
+				return 0, fmt.Errorf("%w: 减仓量 %.8f 取整到步长 %.8f 后覆盖全仓 %.8f",
+					ErrPartialCloseSkipped, closeQuantity, inst.BaseQuantityStep, totalQuantity)
+			}
+			return rounded, nil
 		}
-		return nil
 	}
 	// 兜底：无精确步长时沿用旧的固定阈值（约 2 张 ctVal≈0.01 的合约）
 	const minPositionForPartialClose = 0.02
 	if totalQuantity < minPositionForPartialClose {
 		logger.Warnf("  ⚠️ 仓位太小 (%.4f < %.4f)，无法按 %.0f%% 比例减仓，跳过本次操作",
 			totalQuantity, minPositionForPartialClose, closeRatio*100)
-		return fmt.Errorf("%w: 仓位 %.4f 过小无法按 %.0f%% 减仓",
+		return 0, fmt.Errorf("%w: 仓位 %.4f 过小无法按 %.0f%% 减仓",
 			ErrPartialCloseSkipped, totalQuantity, closeRatio*100)
 	}
-	return nil
+	return closeQuantity, nil
 }
 
 // fillCopyTradeMarginMode 跟单开仓决策缺省 MarginMode 时回填交易员自身配置。
@@ -1303,8 +1345,16 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 		logger.Infof("  📊 跟单模式，跳过最小仓位和最大仓位检查")
 	}
 
-	// Calculate quantity with adjusted position size
+	// Calculate quantity with adjusted position size. Copy trading resolves the
+	// exact execution contract and quantizes once before the adapter sees it.
 	quantity := actualPositionSize / currentPrice
+	if isCopyTrade {
+		quantity, err = at.quantizeCopyOpenQuantity(decision, currentPrice, quantity)
+		if err != nil {
+			return fmt.Errorf("copy open quantity preflight: %w", err)
+		}
+		actualPositionSize = decision.PositionSizeUSD
+	}
 	actionRecord.Quantity = quantity
 	actionRecord.Price = currentPrice
 
@@ -1335,8 +1385,14 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 		//   - 非跟单（AI 决策已有自己的余额预扣逻辑）
 		//   - 非保证金错误（如 size below minSz、风控拒单等，减半通常无济于事）
 		if isCopyTrade && isInsufficientMarginError(err) {
-			retryQty := quantity * 0.5
-			retrySize := actualPositionSize * 0.5
+			retryQty, quantizeErr := at.quantizeCopyOpenQuantity(decision, currentPrice, quantity*0.5)
+			if quantizeErr != nil {
+				return fmt.Errorf("open long retry quantity invalid: initial=%v quantize=%v", err, quantizeErr)
+			}
+			if retryQty >= quantity-1e-12 {
+				return err
+			}
+			retrySize := decision.PositionSizeUSD
 			// 派生幂等 ID：初次失败单可能已在交易所留下零成交终态记录并永久
 			// 占用原 clOrdId，复用原 ID 会被幂等去重挡住导致重试必然失败。
 			retryClientID := deriveHalvedRetryClientOrderID(decision.ClientOrderID)
@@ -1365,6 +1421,7 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 	}
 
 	logger.Infof("  ✓ Position opened successfully, order ID: %v, quantity: %.4f", order["orderId"], quantity)
+	decision.FilledQuantity = quantity
 
 	// Record order to database and poll for confirmation
 	at.recordAndConfirmOrder(order, decision.Symbol, "open_long", quantity, currentPrice, decision.Leverage, 0)
@@ -1524,8 +1581,16 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 		logger.Infof("  📊 跟单模式，跳过最小仓位和最大仓位检查")
 	}
 
-	// Calculate quantity with adjusted position size
+	// Calculate quantity with adjusted position size. Copy trading resolves the
+	// exact execution contract and quantizes once before the adapter sees it.
 	quantity := actualPositionSize / currentPrice
+	if isCopyTrade {
+		quantity, err = at.quantizeCopyOpenQuantity(decision, currentPrice, quantity)
+		if err != nil {
+			return fmt.Errorf("copy open quantity preflight: %w", err)
+		}
+		actualPositionSize = decision.PositionSizeUSD
+	}
 	actionRecord.Quantity = quantity
 	actionRecord.Price = currentPrice
 
@@ -1546,8 +1611,14 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 		// 🔁 PR-4 / 修复 E'：跟单开空保证金不足，自动减半重试一次。逻辑与 OpenLong 对称。
 		// 详见 executeOpenLongWithRecord 中相同位置的注释。
 		if isCopyTrade && isInsufficientMarginError(err) {
-			retryQty := quantity * 0.5
-			retrySize := actualPositionSize * 0.5
+			retryQty, quantizeErr := at.quantizeCopyOpenQuantity(decision, currentPrice, quantity*0.5)
+			if quantizeErr != nil {
+				return fmt.Errorf("open short retry quantity invalid: initial=%v quantize=%v", err, quantizeErr)
+			}
+			if retryQty >= quantity-1e-12 {
+				return err
+			}
+			retrySize := decision.PositionSizeUSD
 			// 派生幂等 ID：同 executeOpenLongWithRecord，避免与初次失败单共用
 			// clOrdId 被交易所幂等去重挡住。
 			retryClientID := deriveHalvedRetryClientOrderID(decision.ClientOrderID)
@@ -1576,6 +1647,7 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 	}
 
 	logger.Infof("  ✓ Position opened successfully, order ID: %v, quantity: %.4f", order["orderId"], quantity)
+	decision.FilledQuantity = quantity
 
 	// Record order to database and poll for confirmation
 	at.recordAndConfirmOrder(order, decision.Symbol, "open_short", quantity, currentPrice, decision.Leverage, 0)
@@ -1685,9 +1757,13 @@ func (at *AutoTrader) executeCloseLongWithRecord(decision *decision.Decision, ac
 		closeQuantity = totalQuantity * decision.CloseRatio
 		logger.Infof("  📊 Partial close: %.0f%% of %.4f = %.4f", decision.CloseRatio*100, totalQuantity, closeQuantity)
 
-		if err := at.guardPartialCloseQuantity(decision.Symbol, totalQuantity, closeQuantity, decision.CloseRatio); err != nil {
-			return err
+		quantizedClose, guardErr := at.guardPartialCloseQuantity(decision.Symbol, totalQuantity, closeQuantity, decision.CloseRatio)
+		if guardErr != nil {
+			return guardErr
 		}
+		closeQuantity = quantizedClose
+		decision.RequestedQuantity = totalQuantity * decision.CloseRatio
+		decision.QuantizedQuantity = closeQuantity
 
 		// 🆕 边界检查 2：价值检查（仅 Hyperliquid：最小订单价值 $10 硬约束）
 		// 其他交易所（OKX/Binance 等）无此限制，误伤会导致小仓减仓永远被跳过、
@@ -1726,8 +1802,10 @@ func (at *AutoTrader) executeCloseLongWithRecord(decision *decision.Decision, ac
 
 	if closeQuantity > 0 {
 		logger.Infof("  ✓ Position partially closed: %.4f (%.0f%%)", closeQuantity, decision.CloseRatio*100)
+		decision.FilledQuantity = closeQuantity
 	} else {
 		logger.Infof("  ✓ Position closed successfully")
+		decision.FilledQuantity = totalQuantity
 	}
 	return nil
 }
@@ -1819,9 +1897,13 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *decision.Decision, a
 		closeQuantity = totalQuantity * decision.CloseRatio
 		logger.Infof("  📊 Partial close: %.0f%% of %.4f = %.4f", decision.CloseRatio*100, totalQuantity, closeQuantity)
 
-		if err := at.guardPartialCloseQuantity(decision.Symbol, totalQuantity, closeQuantity, decision.CloseRatio); err != nil {
-			return err
+		quantizedClose, guardErr := at.guardPartialCloseQuantity(decision.Symbol, totalQuantity, closeQuantity, decision.CloseRatio)
+		if guardErr != nil {
+			return guardErr
 		}
+		closeQuantity = quantizedClose
+		decision.RequestedQuantity = totalQuantity * decision.CloseRatio
+		decision.QuantizedQuantity = closeQuantity
 
 		// 🆕 边界检查 2：价值检查（仅 Hyperliquid：最小订单价值 $10 硬约束）
 		// 如果接近全平（>90%），不跳过，让它尝试执行
@@ -1858,8 +1940,10 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *decision.Decision, a
 
 	if closeQuantity > 0 {
 		logger.Infof("  ✓ Position partially closed: %.4f (%.0f%%)", closeQuantity, decision.CloseRatio*100)
+		decision.FilledQuantity = closeQuantity
 	} else {
 		logger.Infof("  ✓ Position closed successfully")
+		decision.FilledQuantity = totalQuantity
 	}
 	return nil
 }

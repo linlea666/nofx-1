@@ -1031,20 +1031,27 @@ func TestBinanceSnapshotDifferentSizeStillTriggers(t *testing.T) {
 
 	// 第一次 poll：应该产生 reduce 决策
 	e.poll()
+	var first decision.Decision
 	select {
 	case dec := <-e.decisionCh:
-		if got := dec.Decisions[0]; got.Action != "reduce_long" {
+		first = dec.Decisions[0]
+		if got := first; got.Action != "reduce_long" {
 			t.Fatalf("expected reduce_long, got %+v", got)
 		}
 	default:
 		t.Fatalf("expected reduce decision")
 	}
 
-	// 改变持仓再 poll：fill.ID 因 previousSize/currentSize 变化而不同 → 应再次触发
-	// 注：实际 LastKnownSize 在 trader 执行成功后才会更新，此处只验证 ID 变化时去重不误伤
+	// 模拟交易所确认和 mapping 推进。新执行意图边界要求：
+	// 确认前同仓位的不同 fill 也必须合并；确认后新 size 变化才是新修订。
+	if err := st.CopyTrade().UpdateExecutionIntent(first.ExecutionIntentID, store.ExecutionIntentFilled, "", "", "", 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CopyTrade().UpdateLastKnownSize(e.traderID, posID, 0.01); err != nil {
+		t.Fatal(err)
+	}
+	// 改变持仓再 poll：上一修订已确认，应再次触发。
 	provider.state.Positions[posID] = binanceTestPosition(posID, 0.005) // 继续减
-	// 第二次 poll 因为 mapping.LastKnownSize 还是 0.02（执行链路在此 mock 不更新），
-	// 但 currentSize 已从 0.01 变为 0.005 → fill.ID 不同 → 应再次产生决策
 	e.poll()
 	select {
 	case <-e.decisionCh:

@@ -58,6 +58,23 @@ export interface DecisionAction {
   timestamp: string
   success: boolean
   error?: string
+  execution_intent_id?: number
+  source_fill_id?: string
+  leader_pos_id?: string
+  source_revision?: number
+  requested_quantity?: number
+  quantized_quantity?: number
+  filled_quantity?: number
+  exchange_order_id?: string
+  execution_status?:
+    | 'RESERVED'
+    | 'SUBMITTED'
+    | 'FILLED'
+    | 'PROTECTED'
+    | 'SKIPPED'
+    | 'FAILED'
+    | 'RECONCILING'
+  execution_reason_code?: string
 }
 
 export interface AccountSnapshot {
@@ -1048,6 +1065,7 @@ export interface ReentryAIAnalysis {
     | 'INVALID'
     | 'FAILED'
     | 'PREPARE_FAILED'
+    | 'UNACTIONABLE'
     | 'SKIPPED'
   call_error?: string
   data_hash: string
@@ -1064,6 +1082,9 @@ export interface ReentryAIAnalysis {
   external_verdict: '' | 'ENTER' | 'WAIT' | 'SKIP'
   prompt_version: string
   snapshot_at: string
+  model_started_at?: string
+  model_completed_at?: string
+  decision_expires_at?: string
   outcome_pnl?: number
   created_at: string
   updated_at?: string
@@ -1081,9 +1102,10 @@ export interface ReentryAIDecisionEvaluation {
   attempt_no: number
   decision_generation: number
   decision: string
-  horizon: 'NEXT_DECISION' | 'ATTEMPT_CLOSE' | 'TERMINAL'
+  horizon: '30_MINUTES' | '2_HOURS' | 'LEADER_FINAL'
   evaluation_version: number
   evaluation_status: string
+  data_quality: 'VERIFIED' | 'ESTIMATED' | 'UNSCORABLE'
   market_outcome:
     | 'REVERSAL_CONFIRMED'
     | 'CONTINUED_AGAINST'
@@ -1103,6 +1125,10 @@ export interface ReentryAIDecisionEvaluation {
   coverage_ratio: number
   max_gap_seconds: number
   actual_executed: boolean
+  execution_requested: boolean
+  execution_submitted: boolean
+  execution_filled: boolean
+  execution_protected: boolean
   actual_pnl?: number
   evaluation_latency_seconds: number
   created_at: string
@@ -1121,6 +1147,11 @@ export interface CopyGuardAIEffectSummary {
   missed_reversals: number
   correct_abandons: number
   risk_gate_saved_losses: number
+  enter_decisions: number
+  execution_requested: number
+  execution_submitted: number
+  execution_filled: number
+  execution_protected: number
   actual_reentry_pnl: number
   final_decision: string
   final_decision_outcome: string

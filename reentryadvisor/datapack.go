@@ -76,13 +76,15 @@ type GuardSection struct {
 	ATRAtCycleEntry  float64 `json:"atr_at_cycle_entry"`
 	ATRExpansionPct  float64 `json:"atr_expansion_vs_entry_pct"` // 当前 ATR 相对首仓时的扩张幅度
 
-	StopCount        int     `json:"stop_count"`
-	AutoReentryCount int     `json:"auto_reentry_count"`
-	DistanceATRRatio float64 `json:"last_stop_distance_atr_ratio"` // 止损距离/ATR（<0.3 为噪音档）
-	ReentryBoundary  float64 `json:"reentry_boundary_price"`
-	ChaseLimit       float64 `json:"chase_limit_price,omitempty"` // 最近观察采样的追价上限（0=未知）
-	Protectable      bool    `json:"new_stop_protectable_precheck"`
-	SignalReason     string  `json:"signal_reason"`
+	StopCount                int     `json:"stop_count"`
+	AutoReentryCount         int     `json:"auto_reentry_count"`
+	DistanceATRRatio         float64 `json:"last_stop_distance_atr_ratio"` // 止损距离/ATR（<0.3 为噪音档）
+	ReentryBoundary          float64 `json:"reentry_boundary_price"`
+	ReentryBoundaryAvailable bool    `json:"reentry_boundary_available"`
+	ChaseLimit               float64 `json:"chase_limit_price,omitempty"`
+	ChaseLimitAvailable      bool    `json:"chase_limit_available"`
+	Protectable              bool    `json:"new_stop_protectable_precheck"`
+	SignalReason             string  `json:"signal_reason"`
 
 	Leader   LeaderInfo     `json:"leader"`
 	Attempts []AttemptEntry `json:"attempts"`
@@ -184,12 +186,13 @@ func buildDataPackForCandidate(st *store.Store, bn *binanceClient, c *store.Copy
 }
 
 type LeaderInfo struct {
-	StillHolding        bool    `json:"still_holding_same_side"`
-	Size                float64 `json:"position_size"`
-	EntryPrice          float64 `json:"entry_price"`
-	EntryAtCycleOpen    float64 `json:"entry_price_at_cycle_open"`
-	UnrealizedPnLPct    float64 `json:"unrealized_pnl_pct_est"`
-	SizeVsCycleBaseline float64 `json:"size_vs_cycle_baseline_ratio"` // 当前仓位/周期基线仓位（>1=加过仓）
+	StillHolding                 bool    `json:"still_holding_same_side"`
+	Size                         float64 `json:"position_size"`
+	EntryPrice                   float64 `json:"entry_price"`
+	EntryAtCycleOpen             float64 `json:"entry_price_at_cycle_open"`
+	UnrealizedPnLPct             float64 `json:"unrealized_pnl_pct_est"`
+	SizeVsCycleBaseline          float64 `json:"size_vs_cycle_baseline_ratio"` // 当前仓位/周期基线仓位（>1=加过仓）
+	SizeVsCycleBaselineAvailable bool    `json:"size_vs_cycle_baseline_available"`
 }
 
 type AttemptEntry struct {
@@ -351,6 +354,9 @@ func buildDataPack(st *store.Store, bn *binanceClient, sig *store.CopyGuardManua
 
 	// 最近观察采样：追价上限（chase_limit 不在信号快照里，从采样表补）
 	if sample, err := st.CopyTrade().GetLatestCopyGuardWatchSample(sig.CycleID); err == nil && sample != nil {
+		if sample.ReentryBoundary > 0 {
+			guard.ReentryBoundary = sample.ReentryBoundary
+		}
 		guard.ChaseLimit = sample.ChaseLimit
 	} else if err != nil && err != sql.ErrNoRows {
 		pack.Meta.MissingFields = append(pack.Meta.MissingFields, "chase_limit")
@@ -401,6 +407,18 @@ func buildDataPack(st *store.Store, bn *binanceClient, sig *store.CopyGuardManua
 	}
 	if cycle.BaselineLeaderSize > 0 {
 		guard.Leader.SizeVsCycleBaseline = round(sig.LeaderSize/cycle.BaselineLeaderSize, 3)
+		guard.Leader.SizeVsCycleBaselineAvailable = true
+	}
+	guard.ReentryBoundaryAvailable = guard.ReentryBoundary > 0
+	guard.ChaseLimitAvailable = guard.ChaseLimit > 0
+	if !guard.ReentryBoundaryAvailable {
+		pack.Meta.MissingFields = append(pack.Meta.MissingFields, "reentry_boundary")
+	}
+	if !guard.ChaseLimitAvailable {
+		pack.Meta.MissingFields = append(pack.Meta.MissingFields, "chase_limit")
+	}
+	if !guard.Leader.SizeVsCycleBaselineAvailable {
+		pack.Meta.MissingFields = append(pack.Meta.MissingFields, "baseline_leader_size")
 	}
 
 	// 止损簇分析：上次止损价距当前价（沿持仓方向为正）+ 各次止损价最大间距

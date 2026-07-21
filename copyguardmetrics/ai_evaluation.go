@@ -12,9 +12,9 @@ import (
 )
 
 const (
-	evaluationHorizonNextDecision = "NEXT_DECISION"
-	evaluationHorizonAttemptClose = "ATTEMPT_CLOSE"
-	evaluationHorizonTerminal     = "TERMINAL"
+	evaluationHorizon30Minutes = "30_MINUTES"
+	evaluationHorizon2Hours    = "2_HOURS"
+	evaluationHorizonTerminal  = "LEADER_FINAL"
 )
 
 type AIEffectSummary struct {
@@ -29,6 +29,11 @@ type AIEffectSummary struct {
 	MissedReversals       int            `json:"missed_reversals"`
 	CorrectAbandons       int            `json:"correct_abandons"`
 	RiskGateSavedLosses   int            `json:"risk_gate_saved_losses"`
+	EnterDecisions        int            `json:"enter_decisions"`
+	ExecutionRequested    int            `json:"execution_requested"`
+	ExecutionSubmitted    int            `json:"execution_submitted"`
+	ExecutionFilled       int            `json:"execution_filled"`
+	ExecutionProtected    int            `json:"execution_protected"`
 	ActualReentryPnL      float64        `json:"actual_reentry_pnl"`
 	FinalDecision         string         `json:"final_decision"`
 	FinalDecisionOutcome  string         `json:"final_decision_outcome"`
@@ -103,23 +108,14 @@ func EvaluateCycleAIDecisions(st *store.Store, cycleID int64) (*AIEffectSummary,
 
 	insertedTerminal := false
 	for i, analysis := range analyses {
-		end := *cycle.ClosedAt
-		horizon := evaluationHorizonTerminal
 		var next *store.ReentryAIAnalysis
 		if i+1 < len(analyses) && analyses[i+1].CandidateID == analysis.CandidateID {
 			next = analyses[i+1]
-			end = next.SnapshotAt
-			horizon = evaluationHorizonNextDecision
 		}
 		attempt, requested := requestedAttempt(events, attempts, analysis)
-		actualExecuted := requested && attempt != nil && attempt.ClosedAt != nil && attempt.Reconciled
-		if actualExecuted {
-			end = *attempt.ClosedAt
-			horizon = evaluationHorizonAttemptClose
-		}
-		if end.Before(analysis.SnapshotAt) {
-			end = analysis.SnapshotAt
-		}
+		actualExecuted := requested && attempt != nil
+		submitted := hasEventForAnalysis(events, "REENTRY_SUBMITTED", analysis.ID)
+		protected := actualExecuted && hasEventForAttempt(events, "PROTECTION_ACTIVE", analysis.AttemptNo)
 		pack := evaluationDatapack{}
 		_ = json.Unmarshal([]byte(analysis.DatapackJSON), &pack)
 		atr := pack.CopyGuard.GateATR
@@ -134,46 +130,76 @@ func EvaluateCycleAIDecisions(st *store.Store, cycleID int64) (*AIEffectSummary,
 		if preflightRejected {
 			actionability = "PREFLIGHT_REJECTED"
 		}
-		path := evaluatePath(samples, analysis.AttemptNo-1, cycle.Side, analysis.SnapshotPrice, atr, analysis.SnapshotAt, end, expectedInterval)
-		decisionOutcome := classifyDecisionOutcome(analysis, next, path.marketOutcome, actionability, actualExecuted, attempt, hasLaterExecutedAttempt(events, attempts, analysis))
-		var actualPnL *float64
-		if actualExecuted {
-			value := attempt.PnL
-			actualPnL = &value
+		horizons := []struct {
+			name     string
+			duration time.Duration
+		}{
+			{name: evaluationHorizon30Minutes, duration: 30 * time.Minute},
+			{name: evaluationHorizon2Hours, duration: 2 * time.Hour},
+			{name: evaluationHorizonTerminal},
 		}
-		evaluation := &store.ReentryAIDecisionEvaluation{
-			AnalysisID: analysis.ID, CandidateID: analysis.CandidateID, TraderID: analysis.TraderID,
-			TraderNameSnapshot: traderName, CycleID: analysis.CycleID, AttemptNo: analysis.AttemptNo,
-			DecisionGeneration: analysis.DecisionGeneration, Decision: analysis.Verdict, Horizon: horizon,
-			EvaluationVersion: store.ReentryDecisionEvaluationVersion, EvaluationStatus: "FINAL",
-			MarketOutcome: path.marketOutcome, DecisionOutcome: decisionOutcome, Actionability: actionability,
-			Reason: path.reason, ReferencePrice: analysis.SnapshotPrice, ReferenceATR: atr,
-			MFEATR: path.mfeATR, MAEATR: path.maeATR, FirstReversalAt: path.firstReversalAt,
-			WindowStartAt: analysis.SnapshotAt, WindowEndAt: end, SampleCount: path.sampleCount,
-			CoverageRatio: path.coverage, MaxGapSeconds: path.maxGapSeconds,
-			ActualExecuted: actualExecuted, ActualPnL: actualPnL, EvaluationLatency: end.Sub(analysis.SnapshotAt).Seconds(),
-		}
-		saved, inserted, saveErr := st.ReentryAI().SaveReentryDecisionEvaluation(evaluation)
-		if saveErr != nil {
-			return nil, saveErr
-		}
-		if inserted {
-			if i == len(analyses)-1 {
-				insertedTerminal = true
+		for _, horizon := range horizons {
+			end := *cycle.ClosedAt
+			status := "FINAL"
+			if horizon.duration > 0 {
+				fixedEnd := analysis.SnapshotAt.Add(horizon.duration)
+				if fixedEnd.Before(end) {
+					end = fixedEnd
+				} else {
+					status = "TRUNCATED_AT_LEADER_CLOSE"
+				}
 			}
-			_ = st.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{
-				CycleID: cycleID, TraderID: cycle.TraderID, Type: "AI_DECISION_OUTCOME_FINALIZED",
-				Price: analysis.SnapshotPrice, PnL: valueOrZero(actualPnL),
-				Metadata: map[string]interface{}{
-					"evaluation_id": saved.ID, "evaluation_version": saved.EvaluationVersion,
-					"analysis_id": analysis.ID, "candidate_id": analysis.CandidateID,
-					"attempt_no": analysis.AttemptNo, "decision_generation": analysis.DecisionGeneration,
-					"decision": analysis.Verdict, "market_outcome": saved.MarketOutcome,
-					"decision_outcome": saved.DecisionOutcome, "actionability": saved.Actionability,
-					"mfe_atr": saved.MFEATR, "mae_atr": saved.MAEATR,
-					"coverage_ratio": saved.CoverageRatio, "trader_name_snapshot": traderName,
-				},
-			})
+			if end.Before(analysis.SnapshotAt) {
+				end = analysis.SnapshotAt
+			}
+			path := evaluatePath(samples, analysis.AttemptNo-1, cycle.Side, analysis.SnapshotPrice, atr, analysis.SnapshotAt, end, expectedInterval)
+			dataQuality := "VERIFIED"
+			if path.marketOutcome == store.ReentryMarketInsufficient {
+				dataQuality = "UNSCORABLE"
+			}
+			var classifiedAttempt *store.CopyGuardAttempt
+			var actualPnL *float64
+			if horizon.name == evaluationHorizonTerminal && actualExecuted && attempt.ClosedAt != nil && attempt.Reconciled {
+				classifiedAttempt = attempt
+				value := attempt.PnL
+				actualPnL = &value
+			}
+			decisionOutcome := classifyDecisionOutcome(analysis, next, path.marketOutcome, actionability, actualExecuted, classifiedAttempt, hasLaterExecutedAttempt(events, attempts, analysis))
+			evaluation := &store.ReentryAIDecisionEvaluation{
+				AnalysisID: analysis.ID, CandidateID: analysis.CandidateID, TraderID: analysis.TraderID,
+				TraderNameSnapshot: traderName, CycleID: analysis.CycleID, AttemptNo: analysis.AttemptNo,
+				DecisionGeneration: analysis.DecisionGeneration, Decision: analysis.Verdict, Horizon: horizon.name,
+				EvaluationVersion: store.ReentryDecisionEvaluationVersion, EvaluationStatus: status, DataQuality: dataQuality,
+				MarketOutcome: path.marketOutcome, DecisionOutcome: decisionOutcome, Actionability: actionability,
+				Reason: path.reason, ReferencePrice: analysis.SnapshotPrice, ReferenceATR: atr,
+				MFEATR: path.mfeATR, MAEATR: path.maeATR, FirstReversalAt: path.firstReversalAt,
+				WindowStartAt: analysis.SnapshotAt, WindowEndAt: end, SampleCount: path.sampleCount,
+				CoverageRatio: path.coverage, MaxGapSeconds: path.maxGapSeconds,
+				ActualExecuted: actualExecuted, ActualPnL: actualPnL, EvaluationLatency: end.Sub(analysis.SnapshotAt).Seconds(),
+				ExecutionRequested: requested, ExecutionSubmitted: submitted, ExecutionFilled: actualExecuted, ExecutionProtected: protected,
+			}
+			saved, inserted, saveErr := st.ReentryAI().SaveReentryDecisionEvaluation(evaluation)
+			if saveErr != nil {
+				return nil, saveErr
+			}
+			if inserted && horizon.name == evaluationHorizonTerminal {
+				if i == len(analyses)-1 {
+					insertedTerminal = true
+				}
+				_ = st.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{
+					CycleID: cycleID, TraderID: cycle.TraderID, Type: "AI_DECISION_OUTCOME_FINALIZED",
+					Price: analysis.SnapshotPrice, PnL: valueOrZero(actualPnL),
+					Metadata: map[string]interface{}{
+						"evaluation_id": saved.ID, "evaluation_version": saved.EvaluationVersion,
+						"analysis_id": analysis.ID, "candidate_id": analysis.CandidateID, "horizon": saved.Horizon,
+						"attempt_no": analysis.AttemptNo, "decision_generation": analysis.DecisionGeneration,
+						"decision": analysis.Verdict, "market_outcome": saved.MarketOutcome,
+						"decision_outcome": saved.DecisionOutcome, "actionability": saved.Actionability,
+						"data_quality": saved.DataQuality, "mfe_atr": saved.MFEATR, "mae_atr": saved.MAEATR,
+						"coverage_ratio": saved.CoverageRatio, "trader_name_snapshot": traderName,
+					},
+				})
+			}
 		}
 	}
 
@@ -191,7 +217,10 @@ func EvaluateCycleAIDecisions(st *store.Store, cycleID int64) (*AIEffectSummary,
 				"scorable_decisions": summary.ScorableDecisions, "unscorable_decisions": summary.UnscorableDecisions,
 				"missed_reversals": summary.MissedReversals, "correct_abandons": summary.CorrectAbandons,
 				"risk_gate_saved_losses": summary.RiskGateSavedLosses, "actual_reentry_pnl": summary.ActualReentryPnL,
-				"final_decision": summary.FinalDecision, "final_decision_outcome": summary.FinalDecisionOutcome,
+				"enter_decisions": summary.EnterDecisions, "execution_requested": summary.ExecutionRequested,
+				"execution_submitted": summary.ExecutionSubmitted, "execution_filled": summary.ExecutionFilled,
+				"execution_protected": summary.ExecutionProtected,
+				"final_decision":      summary.FinalDecision, "final_decision_outcome": summary.FinalDecisionOutcome,
 				"trader_name_snapshot": traderName,
 			},
 		})
@@ -315,6 +344,16 @@ func classifyDecisionOutcome(analysis, next *store.ReentryAIAnalysis, marketOutc
 	if marketOutcome == store.ReentryMarketInsufficient {
 		return "UNSCORABLE"
 	}
+	if analysis.Verdict == store.ReentryVerdictEnter && actualExecuted {
+		switch marketOutcome {
+		case store.ReentryMarketReversal:
+			return "ENTER_EXECUTED_FAVORABLE"
+		case store.ReentryMarketAgainst:
+			return "ENTER_EXECUTED_ADVERSE"
+		default:
+			return "ENTER_EXECUTED_INCONCLUSIVE"
+		}
+	}
 	switch analysis.Verdict {
 	case store.ReentryVerdictEnter:
 		if actionability == "PREFLIGHT_REJECTED" {
@@ -406,6 +445,18 @@ func hasEventForAnalysis(events []*store.CopyGuardEvent, eventType string, analy
 	return false
 }
 
+func hasEventForAttempt(events []*store.CopyGuardEvent, eventType string, attemptNo int) bool {
+	for _, event := range events {
+		if event == nil || event.Type != eventType {
+			continue
+		}
+		if value, ok := metadataInt(event.Metadata, "attempt_no"); ok && value == attemptNo {
+			return true
+		}
+	}
+	return false
+}
+
 func metadataInt64(metadata map[string]interface{}, key string) (int64, bool) {
 	if metadata == nil {
 		return 0, false
@@ -450,10 +501,25 @@ func summarizeCycle(cycle *store.CopyGuardCycle, attempts []*store.CopyGuardAtte
 		}
 	}
 	for _, evaluation := range evaluations {
-		if evaluation == nil || evaluation.EvaluationVersion != store.ReentryDecisionEvaluationVersion {
+		if evaluation == nil || evaluation.EvaluationVersion != store.ReentryDecisionEvaluationVersion || evaluation.Horizon != evaluationHorizonTerminal {
 			continue
 		}
 		summary.TotalDecisions++
+		if evaluation.Decision == store.ReentryVerdictEnter {
+			summary.EnterDecisions++
+		}
+		if evaluation.ExecutionRequested {
+			summary.ExecutionRequested++
+		}
+		if evaluation.ExecutionSubmitted {
+			summary.ExecutionSubmitted++
+		}
+		if evaluation.ExecutionFilled {
+			summary.ExecutionFilled++
+		}
+		if evaluation.ExecutionProtected {
+			summary.ExecutionProtected++
+		}
 		summary.DecisionCounts[evaluation.Decision]++
 		summary.DecisionOutcomeCounts[evaluation.DecisionOutcome]++
 		summary.MarketOutcomeCounts[evaluation.MarketOutcome]++

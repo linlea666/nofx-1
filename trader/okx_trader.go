@@ -470,7 +470,7 @@ func (t *OKXTrader) ResolveExecutionInstrument(symbol string) (*ExecutionInstrum
 	if !strings.EqualFold(inst.CtType, "linear") {
 		return nil, fmt.Errorf("%w: unsupported OKX contract type %q for %s", ErrExecutionInstrumentUnsupported, inst.CtType, instID)
 	}
-	return &ExecutionInstrument{SourceSymbol: base + quote, NativeSymbol: instID, BaseAsset: base, QuoteAsset: quote, SettleAsset: quote, MarketType: "SWAP", ContractType: inst.CtType, Status: inst.State, PriceTickSize: inst.TickSz, BaseQuantityStep: inst.LotSz * inst.CtVal}, nil
+	return &ExecutionInstrument{SourceSymbol: base + quote, NativeSymbol: instID, BaseAsset: base, QuoteAsset: quote, SettleAsset: quote, MarketType: "SWAP", ContractType: inst.CtType, Status: inst.State, PriceTickSize: inst.TickSz, BaseQuantityStep: inst.LotSz * inst.CtVal, NativeQuantityStep: inst.LotSz, MinBaseQuantity: inst.MinSz * inst.CtVal}, nil
 }
 
 // OKX leaves baseCcy/quoteCcy empty for derivatives. The exact derivative
@@ -1736,7 +1736,7 @@ func (t *OKXTrader) formatSize(sz float64, inst *OKXInstrument) string {
 
 	// 小数精度时：如果 sz > 0 但格式化后可能为 "0"，也需要处理
 	formatted := fmt.Sprintf(fmt.Sprintf("%%.%df", precision), sz)
-	if formatted == "0" && sz > 0 {
+	if strings.Trim(formatted, "0.") == "" && sz > 0 {
 		// 向上取整到最小单位 lotSz
 		logger.Infof("  ⚠️ 合约数 %.6f 不足最小单位 %.6f，向上取整", sz, inst.LotSz)
 		return fmt.Sprintf(fmt.Sprintf("%%.%df", precision), inst.LotSz)

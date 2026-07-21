@@ -271,3 +271,20 @@ func TestAvailableCopyGuardRiskUsesSmallestRemainingBudget(t *testing.T) {
 		t.Fatal("exhausted portfolio budget must reject sizing")
 	}
 }
+
+func TestAvailableCopyGuardFollowFirstIgnoresAttemptButKeepsHardCaps(t *testing.T) {
+	c := &CopyConfig{RiskAccountPct: .02, RiskCycleLossBudgetPct: .05, RiskPortfolioLossBudgetPct: .08}
+	available, err := AvailableCopyGuardFollowFirstRiskUSD(c, 100, store.CopyGuardRiskUsage{CycleUsedUSD: 2.98, PortfolioUsedUSD: 5.5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if available < 2.019999 || available > 2.020001 {
+		t.Fatalf("available=%v, want 2.02 cycle remaining", available)
+	}
+	if _, err := AvailableCopyGuardFollowFirstRiskUSD(c, 100, store.CopyGuardRiskUsage{CycleUsedUSD: 5}); err == nil {
+		t.Fatal("cycle hard cap must remain enforced")
+	}
+	if _, err := AvailableCopyGuardFollowFirstRiskUSD(c, 100, store.CopyGuardRiskUsage{PortfolioUsedUSD: 8}); err == nil {
+		t.Fatal("portfolio hard cap must remain enforced")
+	}
+}

@@ -397,7 +397,7 @@ func (a *Advisor) runAnalysis(analysisID int64, autoTriggered bool) {
 	if pv == nil {
 		pv = &parsedVerdict{} // 解析失败：verdict 留空，仅存 raw
 	}
-	if saveErr := a.st.ReentryAI().UpdateReentryInternalResult(analysis.ID, raw, pv.Verdict, pv.Confidence, pv.ReasonsJSON); saveErr != nil {
+	if saveErr := a.st.ReentryAI().CompleteReentryInternalResult(analysis.ID, raw, pv.Verdict, pv.Confidence, pv.ReasonsJSON, pv.TTLSeconds); saveErr != nil {
 		logger.Warnf("[ReentryAdvisor] AI 结果落库失败 (analysis=%d): %v", analysisID, saveErr)
 		a.failCandidateAnalysis(candidateID, analysisID, "AI result persistence failed: "+saveErr.Error(), 0)
 		return
@@ -495,7 +495,7 @@ func (a *Advisor) finishCandidateAnalysis(analysis *store.ReentryAIAnalysis, cfg
 		return nil
 	}
 	if pv.Confidence < traderCfg.RiskAIConfidenceThreshold {
-		a.recordCandidateEvent(c, "REENTRY_PREFLIGHT_REJECTED", c.TriggerPrice, 0, map[string]interface{}{"analysis_id": analysis.ID, "reason": "confidence_below_threshold", "confidence": pv.Confidence, "required_confidence": traderCfg.RiskAIConfidenceThreshold})
+		a.recordCandidateEvent(c, "REENTRY_PREFLIGHT_REJECTED", c.TriggerPrice, 0, map[string]interface{}{"analysis_id": analysis.ID, "reason_code": "AI_CONFIDENCE_LOW", "reason": "confidence_below_threshold", "confidence": pv.Confidence, "required_confidence": traderCfg.RiskAIConfidenceThreshold})
 		a.updateCandidateCycleStatus(c, store.CopyGuardAIWaiting)
 		return nil
 	}
@@ -503,9 +503,38 @@ func (a *Advisor) finishCandidateAnalysis(analysis *store.ReentryAIAnalysis, cfg
 		logger.Warnf("[ReentryAdvisor] AI 重入预检拒绝 candidate=%d: %v", c.ID, err)
 		_ = a.st.ReentryAI().RejectReentryCandidatePreflight(c.ID, err.Error(), time.Duration(traderCfg.RiskAIMinReviewSeconds)*time.Second)
 		a.updateCandidateCycleStatus(c, store.CopyGuardAIWaiting)
-		a.recordCandidateEvent(c, "REENTRY_PREFLIGHT_REJECTED", c.TriggerPrice, 0, map[string]interface{}{"analysis_id": analysis.ID, "error": err.Error()})
+		a.recordCandidateEvent(c, "REENTRY_PREFLIGHT_REJECTED", c.TriggerPrice, 0, map[string]interface{}{"analysis_id": analysis.ID, "reason_code": classifyAIReentryPreflightError(err), "error": err.Error()})
 	}
 	return nil
+}
+
+func classifyAIReentryPreflightError(err error) string {
+	if err == nil {
+		return ""
+	}
+	message := strings.ToLower(err.Error())
+	checks := []struct {
+		code   string
+		tokens []string
+	}{
+		{"SNAPSHOT_STALE", []string{"过期", "expired", "stale"}},
+		{"PRICE_OUT_OF_RANGE", []string{"入场区间", "approved range", "0.25 atr", "漂移"}},
+		{"MIN_NOTIONAL", []string{"最小下单额", "minimum notional", "below minimum"}},
+		{"RISK_CAP", []string{"风险预算", "risk budget", "risk cap", "exceeds ai deterministic cap"}},
+		{"POSITION_EXISTS", []string{"已有同向仓位", "already has", "position exists"}},
+		{"PROTECTION_UNAVAILABLE", []string{"保护止损", "保护计划", "protection"}},
+		{"LEADER_CLOSED", []string{"领航员已平仓", "leader position closed", "reversed"}},
+		{"CYCLE_STATE_CHANGED", []string{"周期已结束", "状态不允许", "尝试次数已过期", "cycle"}},
+		{"EXECUTION_BUSY", []string{"执行通道繁忙", "channel"}},
+	}
+	for _, check := range checks {
+		for _, token := range check.tokens {
+			if strings.Contains(message, token) {
+				return check.code
+			}
+		}
+	}
+	return "PREFLIGHT_REJECTED"
 }
 
 // candidateClosed5mCandleKey returns the actual last completed 5m candle from

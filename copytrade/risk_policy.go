@@ -62,6 +62,23 @@ func AvailableCopyGuardRiskUSD(c *CopyConfig, equity float64, usage store.CopyGu
 	return available, nil
 }
 
+// AvailableCopyGuardFollowFirstRiskUSD is used only after a resolved exchange
+// quantity step increased a non-zero copy intent. It intentionally omits the
+// per-attempt target while preserving cycle and portfolio hard limits.
+func AvailableCopyGuardFollowFirstRiskUSD(c *CopyConfig, equity float64, usage store.CopyGuardRiskUsage) (float64, error) {
+	if c == nil || equity <= 0 {
+		return 0, fmt.Errorf("invalid follow-first risk capacity input")
+	}
+	available := equity*c.RiskCycleLossBudgetPct - usage.CycleUsedUSD
+	if portfolio := equity*c.RiskPortfolioLossBudgetPct - usage.PortfolioUsedUSD; portfolio < available {
+		available = portfolio
+	}
+	if available <= 1e-9 {
+		return 0, fmt.Errorf("copy guard cycle/portfolio hard risk budget exhausted")
+	}
+	return available, nil
+}
+
 // BuildProtectionPlan keeps market structure and risk sizing in one contract
 // shared by initial entries, add-ons and AI reentries. A wide valid stop always
 // shrinks notional; it is never squeezed merely to fit the account budget.
@@ -167,8 +184,8 @@ func ComputeRiskDistanceV4(c *CopyConfig, entryPrice, positionNotional, accountE
 	}
 	r.ExpectedLossUSD = positionNotional*r.Distance/entryPrice + positionNotional*frictionRate
 	r.ExpectedLossPct = r.ExpectedLossUSD / accountEquity
-	if c.RiskReentryDecisionMode == "ai_guarded" && c.RiskAccountPct > 0 && r.ExpectedLossPct > c.RiskAccountPct+1e-9 {
-		return RiskDistanceResult{}, fmt.Errorf("ATR/structure stop risk %.4f exceeds attempt budget %.4f; shrink position", r.ExpectedLossPct, c.RiskAccountPct)
+	if c.RiskReentryDecisionMode == "ai_guarded" && c.RiskCycleLossBudgetPct > 0 && r.ExpectedLossPct > c.RiskCycleLossBudgetPct+1e-9 {
+		return RiskDistanceResult{}, fmt.Errorf("ATR/structure stop risk %.4f exceeds cycle hard budget %.4f", r.ExpectedLossPct, c.RiskCycleLossBudgetPct)
 	}
 	if margin := positionNotional / float64(leverage); margin > 0 {
 		r.ExpectedMarginLossPct = r.ExpectedLossUSD / margin

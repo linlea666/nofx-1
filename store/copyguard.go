@@ -576,6 +576,9 @@ func (s *CopyTradeStore) EnsureCopyGuardCycle(c *CopyGuardCycle) (*CopyGuardCycl
 	var existing int64
 	err := s.db.QueryRow(`SELECT id FROM copy_guard_cycles WHERE trader_id=? AND leader_pos_id=? AND closed_at IS NULL ORDER BY id DESC LIMIT 1`, c.TraderID, c.LeaderPosID).Scan(&existing)
 	if err == nil {
+		if c.BaselineLeaderSize > 0 {
+			_, _ = s.db.Exec(`UPDATE copy_guard_cycles SET baseline_leader_size=? WHERE id=? AND baseline_leader_size<=0`, c.BaselineLeaderSize, existing)
+		}
 		return s.GetCopyGuardCycle(existing)
 	}
 	if err != sql.ErrNoRows {
@@ -584,13 +587,21 @@ func (s *CopyTradeStore) EnsureCopyGuardCycle(c *CopyGuardCycle) (*CopyGuardCycl
 	if c.ProtectionStatus == "" {
 		c.ProtectionStatus = CopyGuardProtectionPending
 	}
-	res, err := s.db.Exec(`INSERT INTO copy_guard_cycles(trader_id,leader_id,leader_pos_id,symbol,side,margin_mode,status,policy_snapshot,leader_entry_price,follower_entry_price,follower_notional,baseline_notional,account_equity,atr_at_entry,last_observed_price,protection_status,baseline_version,pending_since) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,2,CURRENT_TIMESTAMP)`,
-		c.TraderID, c.LeaderID, c.LeaderPosID, c.Symbol, c.Side, c.MarginMode, c.Status, c.PolicySnapshot, c.LeaderEntryPrice, c.FollowerEntryPrice, c.FollowerNotional, c.FollowerNotional, c.AccountEquity, c.ATRAtEntry, c.LastObservedPrice, c.ProtectionStatus)
+	res, err := s.db.Exec(`INSERT INTO copy_guard_cycles(trader_id,leader_id,leader_pos_id,symbol,side,margin_mode,status,policy_snapshot,leader_entry_price,follower_entry_price,follower_notional,baseline_notional,baseline_leader_size,account_equity,atr_at_entry,last_observed_price,protection_status,baseline_version,pending_since) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,2,CURRENT_TIMESTAMP)`,
+		c.TraderID, c.LeaderID, c.LeaderPosID, c.Symbol, c.Side, c.MarginMode, c.Status, c.PolicySnapshot, c.LeaderEntryPrice, c.FollowerEntryPrice, c.FollowerNotional, c.FollowerNotional, c.BaselineLeaderSize, c.AccountEquity, c.ATRAtEntry, c.LastObservedPrice, c.ProtectionStatus)
 	if err != nil {
 		return nil, err
 	}
 	id, _ := res.LastInsertId()
 	return s.GetCopyGuardCycle(id)
+}
+
+func (s *CopyTradeStore) InitializeCopyGuardLeaderBaseline(id int64, leaderSize float64) error {
+	if id <= 0 || leaderSize <= 0 {
+		return nil
+	}
+	_, err := s.db.Exec(`UPDATE copy_guard_cycles SET baseline_leader_size=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND baseline_leader_size<=0`, leaderSize, id)
+	return err
 }
 
 func (s *CopyTradeStore) GetCopyGuardCycle(id int64) (*CopyGuardCycle, error) {

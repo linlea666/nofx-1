@@ -889,39 +889,13 @@ func (e *Engine) checkReentryConditions() {
 		//     按倍率^N 加严；v5 谨慎档再 ×1.5），取两者更严
 		//   - 追价上限：锚点 ± maxChase × ATR，超出即"行情跑远"
 		// 止损成交价缺失（旧数据）时降级为纯带宽边界。
-		reentryBoundary := reentryAnchor
-		requiredRecovery := float64(0)
-		beyondChase := false
-		chaseLimit := float64(0)
-		if e.config.RiskReentryMinRecoveryATR > 0 && stoppedAttempt != nil && stoppedAttempt.ExitPrice > 0 {
-			recoveryEsc := e.config.RiskReentryRecoveryEscalation
-			if recoveryEsc < 1 {
-				recoveryEsc = 1
-			}
-			requiredRecovery = currentATR * e.config.RiskReentryMinRecoveryATR * math.Pow(recoveryEsc, float64(v4Cycle.ReentryCount))
-			if cautious {
-				// v5 谨慎档：止损距离 < 0.5×ATR（易扫损配置），恢复门槛 ×1.5
-				requiredRecovery *= 1.5
-			}
+		stopPrice := float64(0)
+		if stoppedAttempt != nil {
+			stopPrice = stoppedAttempt.ExitPrice
 		}
-		priceReturned := false
-		if mapping.Side == string(SideLong) {
-			reentryBoundary -= currentATR * e.config.RiskReentryBandATR
-			if requiredRecovery > 0 {
-				reentryBoundary = math.Max(reentryBoundary, stoppedAttempt.ExitPrice+requiredRecovery)
-			}
-			chaseLimit = reentryAnchor + currentATR*e.config.RiskReentryMaxChaseATR
-			beyondChase = markPrice > chaseLimit
-			priceReturned = markPrice >= reentryBoundary
-		} else {
-			reentryBoundary += currentATR * e.config.RiskReentryBandATR
-			if requiredRecovery > 0 {
-				reentryBoundary = math.Min(reentryBoundary, stoppedAttempt.ExitPrice-requiredRecovery)
-			}
-			chaseLimit = reentryAnchor - currentATR*e.config.RiskReentryMaxChaseATR
-			beyondChase = markPrice < chaseLimit
-			priceReturned = markPrice <= reentryBoundary
-		}
+		reentryBoundary, chaseLimit, requiredRecovery := e.reentryObservationBounds(mapping.Side, reentryAnchor, currentATR, stopPrice, v4Cycle.ReentryCount, cautious)
+		priceReturned := (mapping.Side == string(SideLong) && markPrice >= reentryBoundary) || (mapping.Side != string(SideLong) && markPrice <= reentryBoundary)
+		beyondChase := (mapping.Side == string(SideLong) && markPrice > chaseLimit) || (mapping.Side != string(SideLong) && markPrice < chaseLimit)
 		// A 层——自动重入窗口可行性不变量：恢复下界越过追价上限时可行区间为空集
 		// （多单 下界>上界；空单 下界<上界；epsilon 相对容差避免裸浮点误判）。
 		// 自动路径下窗口空集意味着自动重入永远打不出，判定为"实质用尽"→ 持久化
@@ -1124,6 +1098,11 @@ func (e *Engine) handleAIGuardedReentry(mapping *store.CopyTradePositionMapping,
 	if atr <= 0 {
 		return
 	}
+	if cycle.BaselineLeaderSize <= 0 && leaderPos.Size > 0 {
+		if err := e.store.CopyTrade().InitializeCopyGuardLeaderBaseline(cycle.ID, leaderPos.Size); err == nil {
+			cycle.BaselineLeaderSize = leaderPos.Size
+		}
+	}
 	stoppedNotional, lastStop, noiseRatio := cycle.FollowerNotional, float64(0), float64(0)
 	if stoppedAttempt != nil {
 		if stoppedAttempt.Notional > 0 {
@@ -1132,6 +1111,18 @@ func (e *Engine) handleAIGuardedReentry(mapping *store.CopyTradePositionMapping,
 		lastStop = attemptStopFillPrice(stoppedAttempt)
 		noiseRatio = stopDistanceATRRatio(cycle, stoppedAttempt)
 	}
+	reentryAnchor := leaderPos.EntryPrice
+	if reentryAnchor <= 0 {
+		reentryAnchor = mark
+	}
+	if cycle.LeaderEntryAtStop > 0 {
+		if mapping.Side == string(SideLong) {
+			reentryAnchor = math.Max(reentryAnchor, cycle.LeaderEntryAtStop)
+		} else {
+			reentryAnchor = math.Min(reentryAnchor, cycle.LeaderEntryAtStop)
+		}
+	}
+	reentryBoundary, chaseLimit, _ := e.reentryObservationBounds(mapping.Side, reentryAnchor, atr, lastStop, cycle.ReentryCount, noiseRatio > 0 && noiseRatio < reentryNoiseCautiousRatio)
 	nominalCap := stoppedNotional * e.config.RiskReentryRatio
 	maxNotional := nominalCap
 	equity := followerEquity
@@ -1237,10 +1228,44 @@ func (e *Engine) handleAIGuardedReentry(mapping *store.CopyTradePositionMapping,
 	if coolingDown {
 		gate = watchGateCooldown
 	}
-	e.recordWatchSample(cycle, leaderPos, mark, atr, 0, 0, gate)
+	e.recordWatchSample(cycle, leaderPos, mark, atr, reentryBoundary, chaseLimit, gate)
 	if beforeErr != nil {
 		_ = e.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: e.traderID, Type: "AI_CANDIDATE_CREATED", Price: mark, Notional: maxNotional, Metadata: map[string]interface{}{"candidate_id": candidate.ID, "attempt_no": cycle.ReentryCount + 1, "next_review_at": candidate.NextReviewAt, "protectable": protectable, "feature_hash": featureHash}})
 	}
+}
+
+// reentryObservationBounds is the single deterministic definition used by
+// both legacy rule reentry and ai_guarded datapacks. Unknown inputs remain
+// invalid (zero), so callers can mark them unavailable instead of teaching AI
+// that an unknown boundary is a real price of zero.
+func (e *Engine) reentryObservationBounds(side string, anchor, atr, lastStop float64, reentryCount int, cautious bool) (boundary, chaseLimit, requiredRecovery float64) {
+	if e == nil || e.config == nil || anchor <= 0 || atr <= 0 {
+		return 0, 0, 0
+	}
+	recoveryEsc := e.config.RiskReentryRecoveryEscalation
+	if recoveryEsc < 1 {
+		recoveryEsc = 1
+	}
+	if e.config.RiskReentryMinRecoveryATR > 0 && lastStop > 0 {
+		requiredRecovery = atr * e.config.RiskReentryMinRecoveryATR * math.Pow(recoveryEsc, float64(reentryCount))
+		if cautious {
+			requiredRecovery *= 1.5
+		}
+	}
+	if side == string(SideLong) {
+		boundary = anchor - atr*e.config.RiskReentryBandATR
+		if requiredRecovery > 0 {
+			boundary = math.Max(boundary, lastStop+requiredRecovery)
+		}
+		chaseLimit = anchor + atr*e.config.RiskReentryMaxChaseATR
+		return boundary, chaseLimit, requiredRecovery
+	}
+	boundary = anchor + atr*e.config.RiskReentryBandATR
+	if requiredRecovery > 0 {
+		boundary = math.Min(boundary, lastStop-requiredRecovery)
+	}
+	chaseLimit = anchor - atr*e.config.RiskReentryMaxChaseATR
+	return boundary, chaseLimit, requiredRecovery
 }
 
 func copyGuardCycleStatusForCandidate(candidateStatus string) string {
