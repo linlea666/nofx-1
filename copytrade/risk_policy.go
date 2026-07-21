@@ -79,6 +79,18 @@ func AvailableCopyGuardFollowFirstRiskUSD(c *CopyConfig, equity float64, usage s
 	return available, nil
 }
 
+// IsSingleStepFollowFirstOverflow recognizes only the discrete exchange-step
+// excess approved by the follow-first policy. Anything wider than one base
+// quantity step remains a normal risk-cap failure.
+func IsSingleStepFollowFirstOverflow(actualNotional, normalMaxNotional, baseQuantityStep, entryPrice float64) bool {
+	if actualNotional <= 0 || normalMaxNotional <= 0 || baseQuantityStep <= 0 || entryPrice <= 0 {
+		return false
+	}
+	tolerance := math.Max(0.01, actualNotional*0.001)
+	excess := actualNotional - normalMaxNotional
+	return excess > tolerance && excess <= baseQuantityStep*entryPrice+tolerance
+}
+
 // BuildProtectionPlan keeps market structure and risk sizing in one contract
 // shared by initial entries, add-ons and AI reentries. A wide valid stop always
 // shrinks notional; it is never squeezed merely to fit the account budget.

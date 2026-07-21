@@ -176,9 +176,13 @@ func (t *OKXTrader) getProtectiveStopFromPaths(paths []string, symbol string, no
 			OrdID           string `json:"ordId"`
 		}
 		if json.Unmarshal(data, &rows) == nil && len(rows) > 0 {
-			q, _ := strconv.ParseFloat(rows[0].Sz, 64)
-			if inst, instErr := t.getInstrument(symbol); instErr == nil && inst.CtVal > 0 {
-				q *= inst.CtVal
+			contracts, parseErr := strconv.ParseFloat(rows[0].Sz, 64)
+			if parseErr != nil {
+				return nil, fmt.Errorf("parse OKX protective quantity %q: %w", rows[0].Sz, parseErr)
+			}
+			q, quantityErr := t.okxContractsToBaseQuantity(symbol, contracts)
+			if quantityErr != nil {
+				return nil, fmt.Errorf("resolve OKX protective quantity: %w", quantityErr)
 			}
 			px, _ := strconv.ParseFloat(rows[0].SlTriggerPx, 64)
 			return &ProtectiveStopOrder{AlgoID: rows[0].AlgoID, ClientID: rows[0].AlgoClOrdID, Symbol: symbol, PositionSide: rows[0].PosSide, MarginMode: rows[0].TdMode, Quantity: q, TriggerPrice: px, TriggerType: rows[0].SlTriggerPxType, State: rows[0].State, ActualOrderID: rows[0].OrdID}, nil
@@ -188,6 +192,21 @@ func (t *OKXTrader) getProtectiveStopFromPaths(paths []string, symbol string, no
 		return nil, fmt.Errorf("protective stop query failed: %w", lastQueryErr)
 	}
 	return nil, fmt.Errorf("%s: %w", notFound, ErrProtectiveStopNotFound)
+}
+
+// okxContractsToBaseQuantity is the single strict unit-conversion boundary for
+// OKX derivatives. Returning raw contracts when instrument metadata is
+// temporarily unavailable mixes native contracts with base-asset quantities
+// and can turn a healthy protective stop into a false coverage failure.
+func (t *OKXTrader) okxContractsToBaseQuantity(symbol string, contracts float64) (float64, error) {
+	inst, err := t.getInstrument(symbol)
+	if err != nil {
+		return 0, fmt.Errorf("instrument metadata unavailable for %s: %w", symbol, err)
+	}
+	if inst.CtVal <= 0 {
+		return 0, fmt.Errorf("invalid contract value for %s", symbol)
+	}
+	return contracts * inst.CtVal, nil
 }
 
 func (t *OKXTrader) CancelProtectiveStop(algoID, symbol string) error {
@@ -652,12 +671,11 @@ func (t *OKXTrader) GetPositions() ([]map[string]interface{}, error) {
 
 		// Convert contract count to actual position amount (in base asset)
 		// positionAmt = contractCount * ctVal
-		inst, err := t.getInstrument(symbol)
-		posAmt := contractCount
-		if err == nil && inst.CtVal > 0 {
-			posAmt = contractCount * inst.CtVal
-			logger.Debugf("  📊 OKX position %s: contracts=%.4f, ctVal=%.6f, posAmt=%.6f", symbol, contractCount, inst.CtVal, posAmt)
+		posAmt, quantityErr := t.okxContractsToBaseQuantity(symbol, contractCount)
+		if quantityErr != nil {
+			return nil, fmt.Errorf("resolve OKX position quantity: %w", quantityErr)
 		}
+		logger.Debugf("  📊 OKX position %s: contracts=%.4f, posAmt=%.6f", symbol, contractCount, posAmt)
 
 		// Parse timestamps
 		cTime, _ := strconv.ParseInt(pos.CTime, 10, 64)

@@ -3576,6 +3576,7 @@ func (ti *TraderIntegration) refreshStopLossAfterExecute(dec *decision.Decision)
 	// Protective order precision belongs to the execution contract, not the
 	// source venue. AutoTrader exposes the underlying Binance/OKX resolver, so
 	// BTCUSDC and BTCUSD1 retain their exact settlement asset and tick/step.
+	var executionInstrument *trader.ExecutionInstrument
 	if resolver, ok := ti.executor.(trader.ExecutionInstrumentResolver); ok {
 		inst, resolveErr := resolver.ResolveExecutionInstrument(dec.Symbol)
 		if resolveErr != nil || inst == nil || inst.PriceTickSize <= 0 || inst.BaseQuantityStep <= 0 {
@@ -3587,6 +3588,7 @@ func (ti *TraderIntegration) refreshStopLossAfterExecute(dec *decision.Decision)
 		}
 		slInput.PriceTickSize = inst.PriceTickSize
 		slInput.BaseQuantityStep = inst.BaseQuantityStep
+		executionInstrument = inst
 	}
 
 	slResult, err := calcStopLossPrice(ti.engine.config, slInput)
@@ -3616,8 +3618,9 @@ func (ti *TraderIntegration) refreshStopLossAfterExecute(dec *decision.Decision)
 			return
 		}
 		usage, usageErr := ti.store.ReentryAI().GetCopyGuardRiskUsageExcludingAttempt(ti.traderID, cycle.ID, cycle.ReentryCount)
+		useFollowFirst := dec.QuantityStepOverride
 		availableRisk, capacityErr := AvailableCopyGuardRiskUSD(ti.engine.config, followerEquity, usage)
-		if dec.QuantityStepOverride {
+		if useFollowFirst {
 			availableRisk, capacityErr = AvailableCopyGuardFollowFirstRiskUSD(ti.engine.config, followerEquity, usage)
 		}
 		if usageErr != nil || capacityErr != nil {
@@ -3628,6 +3631,22 @@ func (ti *TraderIntegration) refreshStopLossAfterExecute(dec *decision.Decision)
 			return
 		}
 		plan, planErr := BuildProtectionPlan(ti.engine.config, side, entryPrice, planATR, structure, followerEquity, availableRisk/followerEquity, slInput.PositionValue)
+		// On restart the transient Decision flag is unavailable. Reconstruct the
+		// approved exception only when the real position exceeds the normal plan
+		// by no more than one resolved execution quantity step, then re-run the
+		// plan against the cycle/portfolio hard limits.
+		if !useFollowFirst && planErr == nil && executionInstrument != nil && IsSingleStepFollowFirstOverflow(slInput.PositionValue, plan.MaxNotional, executionInstrument.BaseQuantityStep, entryPrice) {
+			useFollowFirst = true
+			dec.QuantityStepOverride = true
+			availableRisk, capacityErr = AvailableCopyGuardFollowFirstRiskUSD(ti.engine.config, followerEquity, usage)
+			if capacityErr == nil {
+				plan, planErr = BuildProtectionPlan(ti.engine.config, side, entryPrice, planATR, structure, followerEquity, availableRisk/followerEquity, slInput.PositionValue)
+			}
+		}
+		if capacityErr != nil {
+			ti.handleUnprotectableForDecision(dec, expectedSide, quantity, entryPrice, fmt.Errorf("risk capacity unavailable after fill: %w", capacityErr))
+			return
+		}
 		if planErr != nil || plan.MaxNotional+math.Max(0.01, slInput.PositionValue*0.001) < slInput.PositionValue {
 			if planErr == nil {
 				planErr = fmt.Errorf("actual notional %.4f exceeds protected risk size %.4f", slInput.PositionValue, plan.MaxNotional)

@@ -69,6 +69,9 @@ func TestGetProtectiveStopErrorClassification(t *testing.T) {
 			if strings.Contains(path, "orders-algo-pending") {
 				return 200, `{"code":"0","msg":"","data":[{"algoId":"999","algoClOrdId":"cg10a0","posSide":"long","tdMode":"cross","sz":"1","slTriggerPx":"1711.63","slTriggerPxType":"mark","state":"live","ordId":""}]}`
 			}
+			if strings.Contains(path, "instruments") {
+				return 200, `{"code":"0","msg":"","data":[{"instId":"ETH-USDT-SWAP","ctVal":"0.1"}]}`
+			}
 			return 200, `{"code":"0","msg":"","data":[]}`
 		})
 		order, err := trader.GetProtectiveStopByClientID("cg10a0", "ETHUSDT")
@@ -78,7 +81,41 @@ func TestGetProtectiveStopErrorClassification(t *testing.T) {
 		if order.AlgoID != "999" || order.State != "live" || order.ClientID != "cg10a0" {
 			t.Fatalf("unexpected order: %+v", order)
 		}
+		if order.Quantity != 0.1 {
+			t.Fatalf("protective quantity=%v want base quantity 0.1", order.Quantity)
+		}
 	})
+	t.Run("quantity conversion fails closed without instrument metadata", func(t *testing.T) {
+		trader := newOKXTestServer(t, func(path string) (int, string) {
+			if strings.Contains(path, "orders-algo-pending") {
+				return 200, `{"code":"0","msg":"","data":[{"algoId":"999","algoClOrdId":"cg10a0","posSide":"long","tdMode":"cross","sz":"1","slTriggerPx":"1711.63","state":"live"}]}`
+			}
+			if strings.Contains(path, "instruments") {
+				return 200, `{"code":"50011","msg":"rate limited","data":[]}`
+			}
+			return 200, `{"code":"0","msg":"","data":[]}`
+		})
+		_, err := trader.GetProtectiveStopByClientID("cg10a0", "ETHUSDT")
+		if err == nil || errors.Is(err, ErrProtectiveStopNotFound) {
+			t.Fatalf("missing quantity metadata must stay unknown, got %v", err)
+		}
+	})
+}
+
+func TestGetPositionsQuantityConversionFailsClosedWithoutInstrumentMetadata(t *testing.T) {
+	trader := newOKXTestServer(t, func(path string) (int, string) {
+		switch {
+		case strings.Contains(path, "/account/positions"):
+			return 200, `{"code":"0","msg":"","data":[{"instId":"ETH-USDT-SWAP","posSide":"long","pos":"2","avgPx":"1700","markPx":"1710","mgnMode":"cross"}]}`
+		case strings.Contains(path, "instruments"):
+			return 200, `{"code":"50011","msg":"rate limited","data":[]}`
+		default:
+			return 200, `{"code":"0","msg":"","data":[]}`
+		}
+	})
+	if _, err := trader.GetPositions(); err == nil {
+		t.Fatal("position query must fail closed instead of returning raw contracts")
+	}
 }
 
 // TestGetProtectiveStopQueryParams reproduces the live failure where OKX
