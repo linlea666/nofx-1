@@ -77,6 +77,10 @@ func TestEvaluateCyclePersistsImmutableOutcomeAndEventsOnce(t *testing.T) {
 	if err := st.ReentryAI().UpdateReentryInternalResult(analysis.ID, `{}`, store.ReentryVerdictAbandon, .9, `{}`); err != nil {
 		t.Fatal(err)
 	}
+	completed, err := st.ReentryAI().GetReentryAnalysis(analysis.ID)
+	if err != nil || completed.ModelCompletedAt == nil {
+		t.Fatalf("completed analysis missing model timestamp: %+v err=%v", completed, err)
+	}
 	// SQLite timestamps are second-granularity; ensure the terminal decision
 	// window is positive without reaching into Store internals.
 	time.Sleep(1100 * time.Millisecond)
@@ -99,6 +103,9 @@ func TestEvaluateCyclePersistsImmutableOutcomeAndEventsOnce(t *testing.T) {
 	for _, evaluation := range evaluations {
 		if evaluation.TraderNameSnapshot != "主账户-A" || evaluation.DecisionOutcome != "UNSCORABLE" || evaluation.DataQuality != "UNSCORABLE" {
 			t.Fatalf("unexpected evaluation: %+v", evaluation)
+		}
+		if !evaluation.WindowStartAt.Equal(*completed.ModelCompletedAt) {
+			t.Fatalf("evaluation used stale pre-model snapshot time: start=%s completed=%s", evaluation.WindowStartAt, *completed.ModelCompletedAt)
 		}
 	}
 	stats, err := st.ReentryAI().GetReentryAIStats([]string{"trader-1"})

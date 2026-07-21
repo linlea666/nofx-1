@@ -57,7 +57,10 @@ func (t *OKXTrader) PlaceProtectiveStop(req ProtectiveStopRequest) (*ProtectiveS
 	if err != nil {
 		return nil, err
 	}
-	sz := t.formatSize(req.Quantity/inst.CtVal, inst)
+	sz, err := t.formatSizeExact(req.Quantity/inst.CtVal, inst)
+	if err != nil {
+		return nil, err
+	}
 	side, posSide := "sell", "long"
 	if strings.EqualFold(req.PositionSide, "short") {
 		side, posSide = "buy", "short"
@@ -99,7 +102,11 @@ func (t *OKXTrader) AmendProtectiveStop(algoID string, req ProtectiveStopRequest
 	// amend-algos takes a single JSON object (unlike cancel-algos, which takes
 	// an array); sending an array is rejected with 50002 "Incorrect json data
 	// format" and the amend never succeeds.
-	body := map[string]interface{}{"instId": t.convertSymbol(req.Symbol), "algoId": algoID, "newSz": t.formatSize(req.Quantity/inst.CtVal, inst), "newSlTriggerPx": strconv.FormatFloat(req.TriggerPrice, 'f', -1, 64), "newSlOrdPx": "-1"}
+	newSize, err := t.formatSizeExact(req.Quantity/inst.CtVal, inst)
+	if err != nil {
+		return err
+	}
+	body := map[string]interface{}{"instId": t.convertSymbol(req.Symbol), "algoId": algoID, "newSz": newSize, "newSlTriggerPx": strconv.FormatFloat(req.TriggerPrice, 'f', -1, 64), "newSlOrdPx": "-1"}
 	data, err := t.doRequest("POST", okxAmendAlgoPath, body)
 	if err != nil {
 		return err
@@ -290,6 +297,7 @@ type OKXTrader struct {
 	instrumentsCache      map[string]*OKXInstrument
 	instrumentsCacheTime  time.Time
 	instrumentsCacheMutex sync.RWMutex
+	instrumentsLoadMutex  sync.Mutex
 
 	// Cache duration
 	cacheDuration time.Duration
@@ -812,9 +820,21 @@ func (t *OKXTrader) getInstrument(symbol string) (*OKXInstrument, error) {
 		return inst, nil
 	}
 	t.instrumentsCacheMutex.RUnlock()
+	t.instrumentsLoadMutex.Lock()
+	defer t.instrumentsLoadMutex.Unlock()
+	// Another goroutine may have populated the shared catalog while this one
+	// waited. Recheck before issuing a public API request.
+	t.instrumentsCacheMutex.RLock()
+	if inst, ok := t.instrumentsCache[instId]; ok && time.Since(t.instrumentsCacheTime) < 5*time.Minute {
+		t.instrumentsCacheMutex.RUnlock()
+		return inst, nil
+	}
+	t.instrumentsCacheMutex.RUnlock()
 
-	// Get instrument info
-	path := fmt.Sprintf("%s?instType=SWAP&instId=%s", okxInstrumentsPath, instId)
+	// Load the complete SWAP catalog once. Cold start previously issued one
+	// request per held symbol and regularly hit OKX 50011 before protection was
+	// rebuilt.
+	path := fmt.Sprintf("%s?instType=SWAP", okxInstrumentsPath)
 	data, err := t.doRequest("GET", path, nil)
 	if err != nil {
 		return nil, err
@@ -847,34 +867,26 @@ func (t *OKXTrader) getInstrument(symbol string) (*OKXInstrument, error) {
 		return nil, fmt.Errorf("instrument info not found: %s", instId)
 	}
 
-	inst := instruments[0]
-	ctVal, _ := strconv.ParseFloat(inst.CtVal, 64)
-	ctMult, _ := strconv.ParseFloat(inst.CtMult, 64)
-	lotSz, _ := strconv.ParseFloat(inst.LotSz, 64)
-	minSz, _ := strconv.ParseFloat(inst.MinSz, 64)
-	maxMktSz, _ := strconv.ParseFloat(inst.MaxMktSz, 64)
-	tickSz, _ := strconv.ParseFloat(inst.TickSz, 64)
-
-	instrument := &OKXInstrument{
-		InstID:   inst.InstId,
-		InstType: inst.InstType,
-		CtVal:    ctVal,
-		CtMult:   ctMult,
-		LotSz:    lotSz,
-		MinSz:    minSz,
-		MaxMktSz: maxMktSz,
-		TickSz:   tickSz,
-		CtType:   inst.CtType,
-		State:    inst.State, BaseCcy: inst.BaseCcy, QuoteCcy: inst.QuoteCcy, SettleCcy: inst.SettleCcy,
-		CtValCcy: inst.CtValCcy, Uly: inst.Uly, InstFamily: inst.InstFamily,
+	loaded := make(map[string]*OKXInstrument, len(instruments))
+	for _, inst := range instruments {
+		ctVal, _ := strconv.ParseFloat(inst.CtVal, 64)
+		ctMult, _ := strconv.ParseFloat(inst.CtMult, 64)
+		lotSz, _ := strconv.ParseFloat(inst.LotSz, 64)
+		minSz, _ := strconv.ParseFloat(inst.MinSz, 64)
+		maxMktSz, _ := strconv.ParseFloat(inst.MaxMktSz, 64)
+		tickSz, _ := strconv.ParseFloat(inst.TickSz, 64)
+		loaded[inst.InstId] = &OKXInstrument{InstID: inst.InstId, InstType: inst.InstType, CtVal: ctVal, CtMult: ctMult, LotSz: lotSz, MinSz: minSz, MaxMktSz: maxMktSz, TickSz: tickSz, CtType: inst.CtType, State: inst.State, BaseCcy: inst.BaseCcy, QuoteCcy: inst.QuoteCcy, SettleCcy: inst.SettleCcy, CtValCcy: inst.CtValCcy, Uly: inst.Uly, InstFamily: inst.InstFamily}
 	}
-
-	// Update cache
 	t.instrumentsCacheMutex.Lock()
-	t.instrumentsCache[instId] = instrument
+	for key, inst := range loaded {
+		t.instrumentsCache[key] = inst
+	}
 	t.instrumentsCacheTime = time.Now()
 	t.instrumentsCacheMutex.Unlock()
-
+	instrument := loaded[instId]
+	if instrument == nil {
+		return nil, fmt.Errorf("instrument info not found: %s", instId)
+	}
 	return instrument, nil
 }
 
@@ -1031,6 +1043,12 @@ func (t *OKXTrader) openLong(symbol string, quantity float64, leverage int, canc
 	// sz = quantity / ctVal (number of contracts = asset amount / asset per contract)
 	sz := quantity / inst.CtVal
 	szStr := t.formatSize(sz, inst)
+	if idempotent {
+		szStr, err = t.formatSizeExact(sz, inst)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	logger.Infof("  📊 OKX OpenLong: quantity=%.6f, ctVal=%.6f, contracts=%.2f", quantity, inst.CtVal, sz)
 
@@ -1039,6 +1057,12 @@ func (t *OKXTrader) openLong(symbol string, quantity float64, leverage int, canc
 		logger.Infof("  ⚠️ OKX market order size %.2f exceeds max %.2f, reducing to max", sz, inst.MaxMktSz)
 		sz = inst.MaxMktSz
 		szStr = t.formatSize(sz, inst)
+		if idempotent {
+			szStr, err = t.formatSizeExact(sz, inst)
+			if err != nil {
+				return nil, err
+			}
+		}
 	}
 
 	body := map[string]interface{}{
@@ -1151,6 +1175,12 @@ func (t *OKXTrader) openShort(symbol string, quantity float64, leverage int, can
 	// sz = quantity / ctVal (number of contracts = asset amount / asset per contract)
 	sz := quantity / inst.CtVal
 	szStr := t.formatSize(sz, inst)
+	if idempotent {
+		szStr, err = t.formatSizeExact(sz, inst)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	logger.Infof("  📊 OKX OpenShort: quantity=%.6f, ctVal=%.6f, contracts=%.2f", quantity, inst.CtVal, sz)
 
@@ -1159,6 +1189,12 @@ func (t *OKXTrader) openShort(symbol string, quantity float64, leverage int, can
 		logger.Infof("  ⚠️ OKX market order size %.2f exceeds max %.2f, reducing to max", sz, inst.MaxMktSz)
 		sz = inst.MaxMktSz
 		szStr = t.formatSize(sz, inst)
+		if idempotent {
+			szStr, err = t.formatSizeExact(sz, inst)
+			if err != nil {
+				return nil, err
+			}
+		}
 	}
 
 	body := map[string]interface{}{
@@ -1288,6 +1324,12 @@ func (t *OKXTrader) closeLong(symbol string, quantity float64, cancelExisting bo
 	// contracts = quantity / ctVal
 	contracts := quantity / inst.CtVal
 	szStr := t.formatSize(contracts, inst)
+	if idempotent {
+		szStr, err = t.formatSizeExact(contracts, inst)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	logger.Infof("🔻 OKX close long: symbol=%s, quantity=%.6f, ctVal=%.6f, contracts=%.2f, szStr=%s",
 		symbol, quantity, inst.CtVal, contracts, szStr)
@@ -1424,6 +1466,12 @@ func (t *OKXTrader) closeShort(symbol string, quantity float64, cancelExisting b
 	// contracts = quantity / ctVal
 	contracts := quantity / inst.CtVal
 	szStr := t.formatSize(contracts, inst)
+	if idempotent {
+		szStr, err = t.formatSizeExact(contracts, inst)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	logger.Infof("🔻 OKX close short: symbol=%s, quantity=%.6f, ctVal=%.6f, contracts=%.2f, szStr=%s",
 		symbol, quantity, inst.CtVal, contracts, szStr)
@@ -1761,6 +1809,26 @@ func (t *OKXTrader) formatSize(sz float64, inst *OKXInstrument) string {
 	}
 
 	return formatted
+}
+
+// formatSizeExact is used by every durable copy-trade and Copy Guard order.
+// Quantity policy belongs to QuantizeOrderIntent; the adapter may serialize an
+// exact native lot but must never silently round it up or down.
+func (t *OKXTrader) formatSizeExact(sz float64, inst *OKXInstrument) (string, error) {
+	if inst == nil || inst.LotSz <= 0 || sz <= 0 {
+		return "", fmt.Errorf("invalid OKX native quantity %.12f", sz)
+	}
+	units := sz / inst.LotSz
+	roundedUnits := math.Round(units)
+	tolerance := math.Max(1e-9, math.Abs(units)*1e-9)
+	if math.Abs(units-roundedUnits) > tolerance {
+		return "", fmt.Errorf("OKX native quantity %.12f is not an exact lot multiple %.12f", sz, inst.LotSz)
+	}
+	quantized := roundedUnits * inst.LotSz
+	if quantized+1e-12 < inst.MinSz {
+		return "", fmt.Errorf("OKX native quantity %.12f is below minimum %.12f", quantized, inst.MinSz)
+	}
+	return t.formatSize(quantized, inst), nil
 }
 
 // GetOrderStatus gets order status

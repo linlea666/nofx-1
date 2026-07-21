@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -21,28 +22,171 @@ const (
 // relationship; intents describe the individual exchange mutation that moves
 // that relationship forward.
 type CopyTradeExecutionIntent struct {
-	ID                int64     `json:"id"`
-	TraderID          string    `json:"trader_id"`
-	LeaderPosID       string    `json:"leader_pos_id"`
-	SourceRevision    int64     `json:"source_revision"`
-	SourceFillID      string    `json:"source_fill_id"`
-	Action            string    `json:"action"`
-	Symbol            string    `json:"symbol"`
-	Side              string    `json:"side"`
-	MarginMode        string    `json:"margin_mode"`
-	LeaderTargetSize  float64   `json:"leader_target_size"`
-	RequestedNotional float64   `json:"requested_notional"`
-	RequestedQuantity float64   `json:"requested_quantity"`
-	QuantizedQuantity float64   `json:"quantized_quantity"`
-	FilledQuantity    float64   `json:"filled_quantity"`
-	ClientOrderID     string    `json:"client_order_id"`
-	ExchangeOrderID   string    `json:"exchange_order_id"`
-	Status            string    `json:"status"`
-	ReasonCode        string    `json:"reason_code"`
-	LastError         string    `json:"last_error"`
-	FailureCounted    bool      `json:"failure_counted"`
-	CreatedAt         time.Time `json:"created_at"`
-	UpdatedAt         time.Time `json:"updated_at"`
+	ID                 int64      `json:"id"`
+	TraderID           string     `json:"trader_id"`
+	LeaderPosID        string     `json:"leader_pos_id"`
+	SourceRevision     int64      `json:"source_revision"`
+	SourceFillID       string     `json:"source_fill_id"`
+	SourceKind         string     `json:"source_kind"`
+	CanonicalKey       string     `json:"canonical_key"`
+	CycleID            int64      `json:"cycle_id,omitempty"`
+	CandidateID        int64      `json:"candidate_id,omitempty"`
+	AnalysisID         int64      `json:"analysis_id,omitempty"`
+	AttemptNo          int        `json:"attempt_no,omitempty"`
+	DecisionGeneration int        `json:"decision_generation,omitempty"`
+	Action             string     `json:"action"`
+	Symbol             string     `json:"symbol"`
+	Side               string     `json:"side"`
+	MarginMode         string     `json:"margin_mode"`
+	LeaderTargetSize   float64    `json:"leader_target_size"`
+	RequestedNotional  float64    `json:"requested_notional"`
+	RequestedQuantity  float64    `json:"requested_quantity"`
+	QuantizedQuantity  float64    `json:"quantized_quantity"`
+	FilledQuantity     float64    `json:"filled_quantity"`
+	ClientOrderID      string     `json:"client_order_id"`
+	ExchangeOrderID    string     `json:"exchange_order_id"`
+	ExchangeState      string     `json:"exchange_state"`
+	Status             string     `json:"status"`
+	ReasonCode         string     `json:"reason_code"`
+	LastError          string     `json:"last_error"`
+	FailureCounted     bool       `json:"failure_counted"`
+	CreatedAt          time.Time  `json:"created_at"`
+	UpdatedAt          time.Time  `json:"updated_at"`
+	SubmittedAt        *time.Time `json:"submitted_at,omitempty"`
+	FilledAt           *time.Time `json:"filled_at,omitempty"`
+	ProtectedAt        *time.Time `json:"protected_at,omitempty"`
+	TerminalAt         *time.Time `json:"terminal_at,omitempty"`
+}
+
+type LeaderExecutionCommit struct {
+	IntentID             int64
+	TraderID             string
+	LeaderID             string
+	LeaderPosID          string
+	SourceRevision       int64
+	Action               string
+	IsAdd                bool
+	Symbol               string
+	Side                 string
+	MarginMode           string
+	SourceSymbol         string
+	ExecutionSymbol      string
+	SourceQuoteAsset     string
+	ExecutionSettleAsset string
+	LeaderTargetSize     float64
+	FillPrice            float64
+	FilledQuantity       float64
+	FilledNotional       float64
+	ExchangeOrderID      string
+	ExchangeState        string
+}
+
+// CommitLeaderExecutionFill is the single acknowledgement boundary for a
+// leader-driven mutation. The durable intent and mapping revision advance in
+// one SQLite transaction only after the exchange provides a real fill.
+func (s *CopyTradeStore) CommitLeaderExecutionFill(c LeaderExecutionCommit) error {
+	if c.IntentID <= 0 || c.TraderID == "" || c.LeaderPosID == "" || c.SourceRevision <= 0 || c.FilledQuantity <= 0 {
+		return fmt.Errorf("invalid acknowledged leader execution commit")
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var intentStatus string
+	if err = tx.QueryRow(`SELECT status FROM copy_trade_execution_intents WHERE id=? AND trader_id=? AND leader_pos_id=? AND source_revision=?`, c.IntentID, c.TraderID, c.LeaderPosID, c.SourceRevision).Scan(&intentStatus); err != nil {
+		return err
+	}
+	if intentStatus == ExecutionIntentFilled || intentStatus == ExecutionIntentProtected {
+		return tx.Commit()
+	}
+	if intentStatus != ExecutionIntentSubmitted && intentStatus != ExecutionIntentReconciling && intentStatus != ExecutionIntentReserved {
+		return fmt.Errorf("intent %d cannot commit fill from %s", c.IntentID, intentStatus)
+	}
+	var currentRevision int64
+	var mappingStatus, mappingSide string
+	err = tx.QueryRow(`SELECT COALESCE(source_revision,0),status,side FROM copy_trade_position_mappings WHERE trader_id=? AND leader_pos_id=?`, c.TraderID, c.LeaderPosID).Scan(&currentRevision, &mappingStatus, &mappingSide)
+	if err != nil && err != sql.ErrNoRows {
+		return err
+	}
+	if err == nil && currentRevision >= c.SourceRevision {
+		_, err = tx.Exec(`UPDATE copy_trade_execution_intents SET status='FILLED',filled_quantity=?,exchange_order_id=CASE WHEN ?<>'' THEN ? ELSE exchange_order_id END,exchange_state=?,filled_at=COALESCE(filled_at,CURRENT_TIMESTAMP),updated_at=CURRENT_TIMESTAMP WHERE id=?`, c.FilledQuantity, c.ExchangeOrderID, c.ExchangeOrderID, c.ExchangeState, c.IntentID)
+		if err != nil {
+			return err
+		}
+		return tx.Commit()
+	}
+	if currentRevision != c.SourceRevision-1 {
+		return fmt.Errorf("mapping revision conflict for %s: current=%d expected=%d", c.LeaderPosID, currentRevision, c.SourceRevision-1)
+	}
+	open := c.Action == "open_long" || c.Action == "open_short"
+	reduce := c.Action == "reduce_long" || c.Action == "reduce_short"
+	closeAction := c.Action == "close_long" || c.Action == "close_short"
+	switch {
+	case open && err == sql.ErrNoRows:
+		_, err = tx.Exec(`INSERT INTO copy_trade_position_mappings
+			(trader_id,leader_pos_id,leader_id,symbol,source_symbol,execution_symbol,source_quote_asset,execution_settle_asset,source_revision,side,margin_mode,status,opened_at,open_price,open_size_usd,last_known_size,add_count,reduce_count,updated_at)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,'active',CURRENT_TIMESTAMP,?,?,?,0,0,CURRENT_TIMESTAMP)`,
+			c.TraderID, c.LeaderPosID, c.LeaderID, c.Symbol, c.SourceSymbol, c.ExecutionSymbol, c.SourceQuoteAsset, c.ExecutionSettleAsset, c.SourceRevision, c.Side, c.MarginMode, c.FillPrice, c.FilledNotional, c.LeaderTargetSize)
+	case open && (mappingStatus == MappingStatusClosed || mappingStatus == MappingStatusIgnored):
+		_, err = tx.Exec(`UPDATE copy_trade_position_mappings SET leader_id=?,symbol=?,source_symbol=?,execution_symbol=?,source_quote_asset=?,execution_settle_asset=?,source_revision=?,side=?,margin_mode=?,status='active',opened_at=CURRENT_TIMESTAMP,closed_at=NULL,close_price=0,open_price=?,open_size_usd=?,last_known_size=?,add_count=0,reduce_count=0,updated_at=CURRENT_TIMESTAMP WHERE trader_id=? AND leader_pos_id=?`,
+			c.LeaderID, c.Symbol, c.SourceSymbol, c.ExecutionSymbol, c.SourceQuoteAsset, c.ExecutionSettleAsset, c.SourceRevision, c.Side, c.MarginMode, c.FillPrice, c.FilledNotional, c.LeaderTargetSize, c.TraderID, c.LeaderPosID)
+	case open && mappingStatus == MappingStatusActive && strings.EqualFold(mappingSide, c.Side):
+		addIncrement := 0
+		if c.IsAdd {
+			addIncrement = 1
+		}
+		_, err = tx.Exec(`UPDATE copy_trade_position_mappings SET source_revision=?,last_known_size=?,add_count=add_count+?,updated_at=CURRENT_TIMESTAMP WHERE trader_id=? AND leader_pos_id=? AND status='active'`, c.SourceRevision, c.LeaderTargetSize, addIncrement, c.TraderID, c.LeaderPosID)
+	case reduce && mappingStatus == MappingStatusActive:
+		_, err = tx.Exec(`UPDATE copy_trade_position_mappings SET source_revision=?,last_known_size=?,reduce_count=reduce_count+1,updated_at=CURRENT_TIMESTAMP WHERE trader_id=? AND leader_pos_id=? AND status='active'`, c.SourceRevision, c.LeaderTargetSize, c.TraderID, c.LeaderPosID)
+	case closeAction && mappingStatus == MappingStatusActive:
+		_, err = tx.Exec(`UPDATE copy_trade_position_mappings SET source_revision=?,status='closed',closed_at=CURRENT_TIMESTAMP,close_price=?,last_known_size=0,updated_at=CURRENT_TIMESTAMP WHERE trader_id=? AND leader_pos_id=? AND status='active'`, c.SourceRevision, c.FillPrice, c.TraderID, c.LeaderPosID)
+	default:
+		return fmt.Errorf("mapping state %s/%s cannot apply %s revision %d", mappingStatus, mappingSide, c.Action, c.SourceRevision)
+	}
+	if err != nil {
+		return err
+	}
+	res, err := tx.Exec(`UPDATE copy_trade_execution_intents SET status='FILLED',filled_quantity=?,exchange_order_id=CASE WHEN ?<>'' THEN ? ELSE exchange_order_id END,exchange_state=?,filled_at=COALESCE(filled_at,CURRENT_TIMESTAMP),updated_at=CURRENT_TIMESTAMP WHERE id=? AND status IN ('RESERVED','SUBMITTED','RECONCILING')`, c.FilledQuantity, c.ExchangeOrderID, c.ExchangeOrderID, c.ExchangeState, c.IntentID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return fmt.Errorf("intent %d fill commit lost state race", c.IntentID)
+	}
+	return tx.Commit()
+}
+
+func (s *CopyTradeStore) CommitSkippedSubLot(intentID int64, traderID, leaderPosID string, sourceRevision int64, leaderTargetSize float64) error {
+	if intentID <= 0 || traderID == "" || leaderPosID == "" || sourceRevision <= 0 || leaderTargetSize < 0 {
+		return fmt.Errorf("invalid skipped sub-lot commit")
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`UPDATE copy_trade_position_mappings SET last_known_size=?,source_revision=?,updated_at=CURRENT_TIMESTAMP WHERE trader_id=? AND leader_pos_id=? AND status='active' AND COALESCE(source_revision,0)=?`, leaderTargetSize, sourceRevision, traderID, leaderPosID, sourceRevision-1)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		var current int64
+		if scanErr := tx.QueryRow(`SELECT COALESCE(source_revision,0) FROM copy_trade_position_mappings WHERE trader_id=? AND leader_pos_id=?`, traderID, leaderPosID).Scan(&current); scanErr != nil || current < sourceRevision {
+			return fmt.Errorf("skipped sub-lot mapping revision conflict: current=%d expected=%d", current, sourceRevision-1)
+		}
+	}
+	res, err = tx.Exec(`UPDATE copy_trade_execution_intents SET status='SKIPPED',reason_code='SKIPPED_SUBLOT',last_error='',terminal_at=COALESCE(terminal_at,CURRENT_TIMESTAMP),updated_at=CURRENT_TIMESTAMP WHERE id=? AND status IN ('RESERVED','SUBMITTED')`, intentID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		var status string
+		if scanErr := tx.QueryRow(`SELECT status FROM copy_trade_execution_intents WHERE id=?`, intentID).Scan(&status); scanErr != nil || status != ExecutionIntentSkipped {
+			return fmt.Errorf("skipped sub-lot intent %d lost state race", intentID)
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *CopyTradeStore) initExecutionIntentTable() error {
@@ -53,6 +197,13 @@ func (s *CopyTradeStore) initExecutionIntentTable() error {
 			leader_pos_id TEXT NOT NULL,
 			source_revision INTEGER NOT NULL,
 			source_fill_id TEXT DEFAULT '',
+			source_kind TEXT NOT NULL DEFAULT 'LEADER_TRANSITION',
+			canonical_key TEXT NOT NULL DEFAULT '',
+			cycle_id INTEGER NOT NULL DEFAULT 0,
+			candidate_id INTEGER NOT NULL DEFAULT 0,
+			analysis_id INTEGER NOT NULL DEFAULT 0,
+			attempt_no INTEGER NOT NULL DEFAULT 0,
+			decision_generation INTEGER NOT NULL DEFAULT 0,
 			action TEXT NOT NULL,
 			symbol TEXT DEFAULT '',
 			side TEXT DEFAULT '',
@@ -64,19 +215,44 @@ func (s *CopyTradeStore) initExecutionIntentTable() error {
 			filled_quantity REAL DEFAULT 0,
 			client_order_id TEXT DEFAULT '',
 			exchange_order_id TEXT DEFAULT '',
+			exchange_state TEXT DEFAULT '',
 			status TEXT NOT NULL DEFAULT 'RESERVED',
 			reason_code TEXT DEFAULT '',
 			last_error TEXT DEFAULT '',
 			failure_counted BOOLEAN NOT NULL DEFAULT 0,
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			submitted_at DATETIME,
+			filled_at DATETIME,
+			protected_at DATETIME,
+			terminal_at DATETIME,
 			UNIQUE(trader_id, leader_pos_id, source_revision, action)
 		)
 	`)
 	if err != nil {
 		return err
 	}
-	_, _ = s.db.Exec(`ALTER TABLE copy_trade_execution_intents ADD COLUMN failure_counted BOOLEAN NOT NULL DEFAULT 0`)
+	columns := []struct{ name, definition string }{
+		{"failure_counted", "BOOLEAN NOT NULL DEFAULT 0"},
+		{"source_kind", "TEXT NOT NULL DEFAULT 'LEADER_TRANSITION'"},
+		{"canonical_key", "TEXT NOT NULL DEFAULT ''"},
+		{"cycle_id", "INTEGER NOT NULL DEFAULT 0"},
+		{"candidate_id", "INTEGER NOT NULL DEFAULT 0"},
+		{"analysis_id", "INTEGER NOT NULL DEFAULT 0"},
+		{"attempt_no", "INTEGER NOT NULL DEFAULT 0"},
+		{"decision_generation", "INTEGER NOT NULL DEFAULT 0"},
+		{"exchange_state", "TEXT DEFAULT ''"},
+		{"submitted_at", "DATETIME"}, {"filled_at", "DATETIME"},
+		{"protected_at", "DATETIME"}, {"terminal_at", "DATETIME"},
+	}
+	for _, column := range columns {
+		if err := ensureSQLiteColumn(s.db, "copy_trade_execution_intents", column.name, column.definition); err != nil {
+			return fmt.Errorf("migrate copy_trade_execution_intents.%s: %w", column.name, err)
+		}
+	}
+	if _, err = s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_copy_intent_canonical ON copy_trade_execution_intents(canonical_key) WHERE canonical_key<>''`); err != nil {
+		return err
+	}
 	_, err = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_copy_intent_trader_status ON copy_trade_execution_intents(trader_id,status,updated_at)`)
 	return err
 }
@@ -89,6 +265,9 @@ func (s *CopyTradeStore) ReserveExecutionIntent(intent *CopyTradeExecutionIntent
 	if intent == nil || intent.TraderID == "" || intent.LeaderPosID == "" || intent.SourceRevision <= 0 || intent.Action == "" {
 		return nil, false, fmt.Errorf("invalid copy trade execution intent")
 	}
+	if intent.SourceKind == "" {
+		intent.SourceKind = "LEADER_TRANSITION"
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return nil, false, err
@@ -96,10 +275,11 @@ func (s *CopyTradeStore) ReserveExecutionIntent(intent *CopyTradeExecutionIntent
 	defer tx.Rollback()
 	res, err := tx.Exec(`
 		INSERT OR IGNORE INTO copy_trade_execution_intents
-			(trader_id,leader_pos_id,source_revision,source_fill_id,action,symbol,side,margin_mode,
+			(trader_id,leader_pos_id,source_revision,source_fill_id,source_kind,canonical_key,cycle_id,candidate_id,analysis_id,attempt_no,decision_generation,action,symbol,side,margin_mode,
 			 leader_target_size,requested_notional,requested_quantity,quantized_quantity,client_order_id,status)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'RESERVED')
-	`, intent.TraderID, intent.LeaderPosID, intent.SourceRevision, intent.SourceFillID, intent.Action,
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'RESERVED')
+	`, intent.TraderID, intent.LeaderPosID, intent.SourceRevision, intent.SourceFillID, intent.SourceKind, intent.CanonicalKey,
+		intent.CycleID, intent.CandidateID, intent.AnalysisID, intent.AttemptNo, intent.DecisionGeneration, intent.Action,
 		intent.Symbol, intent.Side, intent.MarginMode, intent.LeaderTargetSize, intent.RequestedNotional,
 		intent.RequestedQuantity, intent.QuantizedQuantity, intent.ClientOrderID)
 	if err != nil {
@@ -110,10 +290,14 @@ func (s *CopyTradeStore) ReserveExecutionIntent(intent *CopyTradeExecutionIntent
 	if !claimed {
 		res, err = tx.Exec(`
 			UPDATE copy_trade_execution_intents SET
-				source_fill_id=?,symbol=?,side=?,margin_mode=?,leader_target_size=?,requested_notional=?,
-				requested_quantity=?,quantized_quantity=?,client_order_id=CASE WHEN client_order_id='' THEN ? ELSE client_order_id END,status='RESERVED',reason_code='',last_error='',updated_at=CURRENT_TIMESTAMP
+				source_fill_id=?,cycle_id=?,candidate_id=?,analysis_id=?,attempt_no=?,decision_generation=?,symbol=?,side=?,margin_mode=?,leader_target_size=?,requested_notional=?,
+				requested_quantity=?,quantized_quantity=?,client_order_id=CASE WHEN client_order_id='' THEN ? ELSE client_order_id END,
+				status='RESERVED',reason_code='',last_error='',failure_counted=0,terminal_at=NULL,updated_at=CURRENT_TIMESTAMP
 			WHERE trader_id=? AND leader_pos_id=? AND source_revision=? AND action=? AND status='FAILED'
-		`, intent.SourceFillID, intent.Symbol, intent.Side, intent.MarginMode, intent.LeaderTargetSize,
+			  AND submitted_at IS NULL AND COALESCE(exchange_order_id,'')=''
+			  AND reason_code IN ('PRE_SUBMIT','DECISION_CHANNEL_BUSY','STARTUP_REPLAY_REQUIRED')
+		`, intent.SourceFillID, intent.CycleID, intent.CandidateID, intent.AnalysisID, intent.AttemptNo, intent.DecisionGeneration,
+			intent.Symbol, intent.Side, intent.MarginMode, intent.LeaderTargetSize,
 			intent.RequestedNotional, intent.RequestedQuantity, intent.QuantizedQuantity, intent.ClientOrderID,
 			intent.TraderID, intent.LeaderPosID, intent.SourceRevision, intent.Action)
 		if err != nil {
@@ -122,7 +306,7 @@ func (s *CopyTradeStore) ReserveExecutionIntent(intent *CopyTradeExecutionIntent
 		affected, _ = res.RowsAffected()
 		claimed = affected == 1
 	}
-	stored, err := getExecutionIntentTx(tx, intent.TraderID, intent.LeaderPosID, intent.SourceRevision, intent.Action)
+	stored, err := getExecutionIntentTx(tx, intent.TraderID, intent.LeaderPosID, intent.SourceRevision, intent.Action, intent.CanonicalKey)
 	if err != nil {
 		return nil, false, err
 	}
@@ -132,24 +316,36 @@ func (s *CopyTradeStore) ReserveExecutionIntent(intent *CopyTradeExecutionIntent
 	return stored, claimed, nil
 }
 
-func getExecutionIntentTx(tx *sql.Tx, traderID, leaderPosID string, sourceRevision int64, action string) (*CopyTradeExecutionIntent, error) {
+func getExecutionIntentTx(tx *sql.Tx, traderID, leaderPosID string, sourceRevision int64, action, canonicalKey string) (*CopyTradeExecutionIntent, error) {
+	where := `trader_id=? AND leader_pos_id=? AND source_revision=? AND action=?`
+	args := []interface{}{traderID, leaderPosID, sourceRevision, action}
+	if canonicalKey != "" {
+		where = `canonical_key=? OR (` + where + `)`
+		args = append([]interface{}{canonicalKey}, args...)
+	}
 	row := tx.QueryRow(`SELECT id,trader_id,leader_pos_id,source_revision,COALESCE(source_fill_id,''),action,
+		COALESCE(source_kind,'LEADER_TRANSITION'),COALESCE(canonical_key,''),
+		COALESCE(cycle_id,0),COALESCE(candidate_id,0),COALESCE(analysis_id,0),COALESCE(attempt_no,0),COALESCE(decision_generation,0),
 		COALESCE(symbol,''),COALESCE(side,''),COALESCE(margin_mode,''),COALESCE(leader_target_size,0),
 		COALESCE(requested_notional,0),COALESCE(requested_quantity,0),COALESCE(quantized_quantity,0),
 		COALESCE(filled_quantity,0),COALESCE(client_order_id,''),COALESCE(exchange_order_id,''),status,
-		COALESCE(reason_code,''),COALESCE(last_error,''),COALESCE(failure_counted,0),created_at,updated_at
-		FROM copy_trade_execution_intents WHERE trader_id=? AND leader_pos_id=? AND source_revision=? AND action=?`,
-		traderID, leaderPosID, sourceRevision, action)
+		COALESCE(exchange_state,''),COALESCE(reason_code,''),COALESCE(last_error,''),COALESCE(failure_counted,0),created_at,updated_at,
+		submitted_at,filled_at,protected_at,terminal_at
+		FROM copy_trade_execution_intents WHERE `+where+` ORDER BY CASE WHEN canonical_key=? THEN 0 ELSE 1 END LIMIT 1`, append(args, canonicalKey)...)
 	return scanExecutionIntent(row)
 }
 
 func scanExecutionIntent(scanner interface{ Scan(...interface{}) error }) (*CopyTradeExecutionIntent, error) {
 	var x CopyTradeExecutionIntent
 	var created, updated string
+	var submitted, filled, protected, terminal sql.NullString
 	if err := scanner.Scan(&x.ID, &x.TraderID, &x.LeaderPosID, &x.SourceRevision, &x.SourceFillID, &x.Action,
+		&x.SourceKind, &x.CanonicalKey,
+		&x.CycleID, &x.CandidateID, &x.AnalysisID, &x.AttemptNo, &x.DecisionGeneration,
 		&x.Symbol, &x.Side, &x.MarginMode, &x.LeaderTargetSize, &x.RequestedNotional, &x.RequestedQuantity,
 		&x.QuantizedQuantity, &x.FilledQuantity, &x.ClientOrderID, &x.ExchangeOrderID, &x.Status,
-		&x.ReasonCode, &x.LastError, &x.FailureCounted, &created, &updated); err != nil {
+		&x.ExchangeState, &x.ReasonCode, &x.LastError, &x.FailureCounted, &created, &updated,
+		&submitted, &filled, &protected, &terminal); err != nil {
 		return nil, err
 	}
 	var err error
@@ -159,6 +355,18 @@ func scanExecutionIntent(scanner interface{ Scan(...interface{}) error }) (*Copy
 	if x.UpdatedAt, err = parseDBTime(updated); err != nil {
 		return nil, err
 	}
+	if x.SubmittedAt, err = parseNullableDBTime(submitted); err != nil {
+		return nil, err
+	}
+	if x.FilledAt, err = parseNullableDBTime(filled); err != nil {
+		return nil, err
+	}
+	if x.ProtectedAt, err = parseNullableDBTime(protected); err != nil {
+		return nil, err
+	}
+	if x.TerminalAt, err = parseNullableDBTime(terminal); err != nil {
+		return nil, err
+	}
 	return &x, nil
 }
 
@@ -166,14 +374,52 @@ func (s *CopyTradeStore) UpdateExecutionIntent(id int64, status, reasonCode, las
 	if id <= 0 || status == "" {
 		return fmt.Errorf("invalid execution intent transition")
 	}
-	_, err := s.db.Exec(`UPDATE copy_trade_execution_intents SET status=?,reason_code=?,last_error=?,
+	res, err := s.db.Exec(`UPDATE copy_trade_execution_intents SET status=?,reason_code=?,last_error=?,
 		exchange_order_id=CASE WHEN ?<>'' THEN ? ELSE exchange_order_id END,
 		requested_quantity=CASE WHEN ?>0 THEN ? ELSE requested_quantity END,
 		quantized_quantity=CASE WHEN ?>0 THEN ? ELSE quantized_quantity END,
 		filled_quantity=CASE WHEN ?>0 THEN ? ELSE filled_quantity END,
-		updated_at=CURRENT_TIMESTAMP WHERE id=?`, status, reasonCode, lastError,
-		exchangeOrderID, exchangeOrderID, requestedQty, requestedQty, quantizedQty, quantizedQty, filledQty, filledQty, id)
+		submitted_at=CASE WHEN ?='SUBMITTED' THEN COALESCE(submitted_at,CURRENT_TIMESTAMP) ELSE submitted_at END,
+		filled_at=CASE WHEN ?='FILLED' THEN COALESCE(filled_at,CURRENT_TIMESTAMP) ELSE filled_at END,
+		protected_at=CASE WHEN ?='PROTECTED' THEN COALESCE(protected_at,CURRENT_TIMESTAMP) ELSE protected_at END,
+		terminal_at=CASE WHEN ? IN ('SKIPPED','FAILED') THEN COALESCE(terminal_at,CURRENT_TIMESTAMP) ELSE terminal_at END,
+		updated_at=CURRENT_TIMESTAMP WHERE id=? AND (`+validExecutionIntentTransitionSQL()+`)`, status, reasonCode, lastError,
+		exchangeOrderID, exchangeOrderID, requestedQty, requestedQty, quantizedQty, quantizedQty, filledQty, filledQty,
+		status, status, status, status, id, status, status, status, status, status)
+	if err != nil {
+		return err
+	}
+	updated, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if updated == 1 {
+		return nil
+	}
+	var current string
+	if err := s.db.QueryRow(`SELECT status FROM copy_trade_execution_intents WHERE id=?`, id).Scan(&current); err != nil {
+		return err
+	}
+	if current == status {
+		return nil
+	}
+	return fmt.Errorf("invalid execution intent transition %s -> %s for intent %d", current, status, id)
+}
+
+func (s *CopyTradeStore) UpdateExecutionIntentExchangeState(id int64, exchangeState string) error {
+	if id <= 0 || strings.TrimSpace(exchangeState) == "" {
+		return nil
+	}
+	_, err := s.db.Exec(`UPDATE copy_trade_execution_intents SET exchange_state=?,updated_at=CURRENT_TIMESTAMP WHERE id=?`, strings.ToUpper(strings.TrimSpace(exchangeState)), id)
 	return err
+}
+
+func validExecutionIntentTransitionSQL() string {
+	return `(status=? OR
+		(status='RESERVED' AND ? IN ('SUBMITTED','FILLED','SKIPPED','FAILED','RECONCILING')) OR
+		(status='SUBMITTED' AND ? IN ('FILLED','FAILED','RECONCILING')) OR
+		(status='RECONCILING' AND ? IN ('FILLED','FAILED','RECONCILING')) OR
+		(status='FILLED' AND ? IN ('PROTECTED','FAILED','RECONCILING')))`
 }
 
 // MarkExecutionIntentFailureCounted makes the mapping circuit breaker count a
@@ -192,10 +438,13 @@ func (s *CopyTradeStore) MarkExecutionIntentFailureCounted(id int64) (bool, erro
 
 func (s *CopyTradeStore) ListUnfinishedExecutionIntents(traderID string) ([]*CopyTradeExecutionIntent, error) {
 	rows, err := s.db.Query(`SELECT id,trader_id,leader_pos_id,source_revision,COALESCE(source_fill_id,''),action,
+		COALESCE(source_kind,'LEADER_TRANSITION'),COALESCE(canonical_key,''),
+		COALESCE(cycle_id,0),COALESCE(candidate_id,0),COALESCE(analysis_id,0),COALESCE(attempt_no,0),COALESCE(decision_generation,0),
 		COALESCE(symbol,''),COALESCE(side,''),COALESCE(margin_mode,''),COALESCE(leader_target_size,0),
 		COALESCE(requested_notional,0),COALESCE(requested_quantity,0),COALESCE(quantized_quantity,0),
 		COALESCE(filled_quantity,0),COALESCE(client_order_id,''),COALESCE(exchange_order_id,''),status,
-		COALESCE(reason_code,''),COALESCE(last_error,''),COALESCE(failure_counted,0),created_at,updated_at
+		COALESCE(exchange_state,''),COALESCE(reason_code,''),COALESCE(last_error,''),COALESCE(failure_counted,0),created_at,updated_at,
+		submitted_at,filled_at,protected_at,terminal_at
 		FROM copy_trade_execution_intents WHERE trader_id=? AND status IN ('RESERVED','SUBMITTED','RECONCILING') ORDER BY id`, traderID)
 	if err != nil {
 		return nil, err

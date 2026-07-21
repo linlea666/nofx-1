@@ -82,6 +82,10 @@ func (p *binancePollTestProvider) Type() ProviderType {
 	return ProviderBinance
 }
 
+type okxPollTestProvider struct{ *binancePollTestProvider }
+
+func (p *okxPollTestProvider) Type() ProviderType { return ProviderOKX }
+
 func (p *binancePollTestProvider) GetPositionHistory(_ string) ([]BinancePositionHistoryRecord, error) {
 	p.historyCall++
 	return p.history, nil
@@ -284,6 +288,39 @@ func TestBinancePollStillUsesSnapshotWhenTradeHistoryFails(t *testing.T) {
 		}
 	default:
 		t.Fatalf("expected snapshot decision despite trade-history error")
+	}
+}
+
+func TestOKXPollCoalescesSamePositionFillsIntoOneAuthoritativeTransition(t *testing.T) {
+	const posID = "okx-leader_ETHUSDT_long"
+	e, _ := newTestCopyTradeEngine(t, ProviderOKX)
+	e.config.MinTradeWarn = 1
+	base := &binancePollTestProvider{
+		fills: []Fill{
+			{ID: "fill-1", Symbol: "ETHUSDT", Side: "sell", PositionSide: SideShort, Action: ActionOpen, Price: 2000, Size: 0.01, Value: 20, Timestamp: time.Now().Add(-time.Second)},
+			{ID: "fill-2", Symbol: "ETHUSDT", Side: "sell", PositionSide: SideShort, Action: ActionOpen, Price: 1999, Size: 0.02, Value: 40, Timestamp: time.Now()},
+		},
+		state: &AccountState{TotalEquity: 1000, Positions: map[string]*Position{
+			posID: {PosID: posID, Symbol: "ETHUSDT", Side: SideShort, Size: 0.03, EntryPrice: 1999.33, MarkPrice: 1999, Leverage: 10, MarginMode: "cross", PositionValue: 59.97},
+		}},
+	}
+	e.provider = &okxPollTestProvider{binancePollTestProvider: base}
+	e.poll()
+	if !e.isSeen("fill-1") || !e.isSeen("fill-2") {
+		t.Fatal("raw OKX fills were not acknowledged after authoritative snapshot merge")
+	}
+	select {
+	case full := <-e.decisionCh:
+		if len(full.Decisions) != 1 || full.Decisions[0].LeaderPosID != posID || full.Decisions[0].Action != "open_short" || full.Decisions[0].LeaderPosSize != 0.03 {
+			t.Fatalf("unexpected merged decision: %+v", full.Decisions)
+		}
+	default:
+		t.Fatal("expected one coalesced OKX snapshot decision")
+	}
+	select {
+	case extra := <-e.decisionCh:
+		t.Fatalf("same-position OKX fills produced duplicate decision: %+v", extra.Decisions)
+	default:
 	}
 }
 

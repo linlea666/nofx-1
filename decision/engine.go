@@ -152,24 +152,26 @@ type Decision struct {
 	// IsCopyTrade 显式标记跟单决策。执行层（auto_trader）此前只靠
 	// Reasoning 文案包含 "Copy trading" 判定，文案调整会静默破坏跟单
 	// 执行路径；判定改为 IsCopyTrade || 旧文案匹配（向后兼容）。
-	IsCopyTrade          bool    `json:"is_copy_trade,omitempty"`
-	LeaderPosID          string  `json:"leader_pos_id,omitempty"`   // 领航员仓位 ID（用于映射追踪）
-	LeaderPosSize        float64 `json:"leader_pos_size,omitempty"` // 领航员当前持仓数量（用于 lastKnownSize 追踪）
-	ClientOrderID        string  `json:"client_order_id,omitempty"` // Copy Guard 幂等执行与重启恢复
-	ExchangeOrderID      string  `json:"exchange_order_id,omitempty"`
-	SourceFillID         string  `json:"source_fill_id,omitempty"` // 产生该决策的领航员 fill ID（瞬态失败后释放去重标记重放用）
-	ExecutionIntentID    int64   `json:"execution_intent_id,omitempty"`
-	SourceRevision       int64   `json:"source_revision,omitempty"`
-	RequestedQuantity    float64 `json:"requested_quantity,omitempty"`
-	QuantizedQuantity    float64 `json:"quantized_quantity,omitempty"`
-	FilledQuantity       float64 `json:"filled_quantity,omitempty"`
-	ExecutionStatus      string  `json:"execution_status,omitempty"`
-	ExecutionReasonCode  string  `json:"execution_reason_code,omitempty"`
-	QuantityStepOverride bool    `json:"quantity_step_override,omitempty"`
-	SourceSymbol         string  `json:"source_symbol,omitempty"`
-	ExecutionSymbol      string  `json:"execution_symbol,omitempty"`
-	ValueCurrency        string  `json:"value_currency,omitempty"`
-	ExecutionSettleAsset string  `json:"execution_settle_asset,omitempty"`
+	IsCopyTrade           bool    `json:"is_copy_trade,omitempty"`
+	LeaderPosID           string  `json:"leader_pos_id,omitempty"`   // 领航员仓位 ID（用于映射追踪）
+	LeaderPosSize         float64 `json:"leader_pos_size,omitempty"` // 领航员当前持仓数量（用于 lastKnownSize 追踪）
+	ClientOrderID         string  `json:"client_order_id,omitempty"` // Copy Guard 幂等执行与重启恢复
+	ExchangeOrderID       string  `json:"exchange_order_id,omitempty"`
+	SourceFillID          string  `json:"source_fill_id,omitempty"` // 产生该决策的领航员 fill ID（瞬态失败后释放去重标记重放用）
+	ExecutionIntentID     int64   `json:"execution_intent_id,omitempty"`
+	SourceRevision        int64   `json:"source_revision,omitempty"`
+	RequestedQuantity     float64 `json:"requested_quantity,omitempty"`
+	QuantizedQuantity     float64 `json:"quantized_quantity,omitempty"`
+	FilledQuantity        float64 `json:"filled_quantity,omitempty"`
+	ExchangeOrderState    string  `json:"exchange_order_state,omitempty"`
+	ExchangeFillConfirmed bool    `json:"exchange_fill_confirmed,omitempty"`
+	ExecutionStatus       string  `json:"execution_status,omitempty"`
+	ExecutionReasonCode   string  `json:"execution_reason_code,omitempty"`
+	QuantityStepOverride  bool    `json:"quantity_step_override,omitempty"`
+	SourceSymbol          string  `json:"source_symbol,omitempty"`
+	ExecutionSymbol       string  `json:"execution_symbol,omitempty"`
+	ValueCurrency         string  `json:"value_currency,omitempty"`
+	ExecutionSettleAsset  string  `json:"execution_settle_asset,omitempty"`
 }
 
 // FullDecision AI's complete decision (including chain of thought)

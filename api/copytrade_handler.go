@@ -43,8 +43,8 @@ func validateAIGuardedPrerequisites(st *store.Store, cfg *store.CopyTradeConfig)
 		return nil
 	}
 	aiCfg, err := st.ReentryAI().GetReentryAIConfig()
-	if err != nil || !aiCfg.Enabled || !aiCfg.AIEnabled || !aiCfg.AutoEntryEnabled {
-		return fmt.Errorf("ai_guarded requires enabled Reentry AI analysis and global AI execution safety switch")
+	if err != nil || !aiCfg.Enabled || !aiCfg.AIEnabled {
+		return fmt.Errorf("ai_guarded requires enabled Reentry AI analysis")
 	}
 	if aiCfg.Model != "" {
 		model, modelErr := st.AIModel().GetByID(aiCfg.Model)

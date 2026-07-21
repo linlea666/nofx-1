@@ -1050,7 +1050,7 @@ func (e *Engine) checkReentryConditions() {
 		delete(e.stopRiskSuspectCount, mapping.LeaderPosID)
 
 		// 推一个 Open 决策出去
-		if !e.emitReentryDecision(mapping, leaderPos, reentrySize, markPrice) {
+		if !e.emitReentryDecision(mapping, leaderPos, reentrySize, markPrice, nil) {
 			_ = e.store.CopyTrade().UpdateCopyGuardObservation(v4Cycle.ID, store.CopyGuardStoppedWatching, entryRef, markPrice, currentATR)
 		}
 	}
@@ -1646,7 +1646,7 @@ func emitWatchSummary(cs *store.CopyTradeStore, traderID string, cycle *store.Co
 }
 
 // emitReentryDecision 构造并推送一个二次进场的 Open 决策
-func (e *Engine) emitReentryDecision(mapping *store.CopyTradePositionMapping, leaderPos *Position, copySize, entryPrice float64) bool {
+func (e *Engine) emitReentryDecision(mapping *store.CopyTradePositionMapping, leaderPos *Position, copySize, entryPrice float64, intent *store.CopyTradeExecutionIntent) bool {
 	if leaderPos == nil {
 		return false
 	}
@@ -1709,6 +1709,13 @@ func (e *Engine) emitReentryDecision(mapping *store.CopyTradePositionMapping, le
 	// 重启恢复 recoverV4PendingStates 也按 cgr ID 对账），不能被此处抢占。
 	// 且重入虚拟 fill ID 含纳秒时间戳，本身不具备跨次重放的稳定性。
 	dec.ClientOrderID = ""
+	if intent != nil {
+		dec.ExecutionIntentID = intent.ID
+		dec.SourceRevision = intent.SourceRevision
+		dec.SourceFillID = intent.SourceFillID
+		dec.ClientOrderID = intent.ClientOrderID
+		dec.ExecutionStatus = intent.Status
+	}
 
 	fullDec := &decision.FullDecision{
 		SystemPrompt:        e.buildSystemPromptLog(),
@@ -1741,6 +1748,9 @@ func (e *Engine) emitReentryDecision(mapping *store.CopyTradePositionMapping, le
 		})
 		return true
 	default:
+		if intent != nil && e.store != nil {
+			_ = e.store.CopyTrade().UpdateExecutionIntent(intent.ID, store.ExecutionIntentFailed, "DECISION_CHANNEL_BUSY", "reentry decision channel is full before execution", "", 0, 0, 0)
+		}
 		logger.Warnf("⚠️ [%s] 决策通道已满，二次进场决策被丢弃 | posId=%s", e.traderID, mapping.LeaderPosID)
 		return false
 	}

@@ -2,6 +2,7 @@ package reentryadvisor
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -499,8 +500,22 @@ func (a *Advisor) finishCandidateAnalysis(analysis *store.ReentryAIAnalysis, cfg
 		a.updateCandidateCycleStatus(c, store.CopyGuardAIWaiting)
 		return nil
 	}
+	if !cfg.AutoEntryEnabled {
+		reviewAfter := time.Duration(traderCfg.RiskAIMinReviewSeconds) * time.Second
+		if reviewAfter <= 0 {
+			reviewAfter = 5 * time.Minute
+		}
+		_ = a.st.ReentryAI().RejectReentryCandidatePreflight(c.ID, "global AI execution disabled", reviewAfter)
+		a.updateCandidateCycleStatus(c, store.CopyGuardAIWaiting)
+		a.recordCandidateEvent(c, "ENTER_APPROVED_EXECUTION_DISABLED", c.TriggerPrice, 0, map[string]interface{}{"analysis_id": analysis.ID, "reason_code": "EXECUTION_DISABLED", "reason": "global AI execution disabled"})
+		return nil
+	}
 	if err := copytrade.ExecuteAIReentryForTrader(c.TraderID, c.ID, analysis.ID); err != nil {
 		logger.Warnf("[ReentryAdvisor] AI 重入预检拒绝 candidate=%d: %v", c.ID, err)
+		if errors.Is(err, copytrade.ErrAIReentryAlreadyReserved) {
+			a.recordCandidateEvent(c, "REENTRY_RECONCILIATION_PENDING", c.TriggerPrice, 0, map[string]interface{}{"analysis_id": analysis.ID, "reason_code": "INTENT_ALREADY_RESERVED", "error": err.Error()})
+			return nil
+		}
 		_ = a.st.ReentryAI().RejectReentryCandidatePreflight(c.ID, err.Error(), time.Duration(traderCfg.RiskAIMinReviewSeconds)*time.Second)
 		a.updateCandidateCycleStatus(c, store.CopyGuardAIWaiting)
 		a.recordCandidateEvent(c, "REENTRY_PREFLIGHT_REJECTED", c.TriggerPrice, 0, map[string]interface{}{"analysis_id": analysis.ID, "reason_code": classifyAIReentryPreflightError(err), "error": err.Error()})

@@ -247,7 +247,7 @@ func TestAlgoRequestBodyShapes(t *testing.T) {
 	})
 	trader := NewOKXTrader("k", "s", "p")
 
-	if err := trader.AmendProtectiveStop("algo-1", ProtectiveStopRequest{Symbol: "ETHUSDT", PositionSide: "short", Quantity: 0.082, TriggerPrice: 1765.77, TriggerType: "mark"}); err != nil {
+	if err := trader.AmendProtectiveStop("algo-1", ProtectiveStopRequest{Symbol: "ETHUSDT", PositionSide: "short", Quantity: 0.1, TriggerPrice: 1765.77, TriggerType: "mark"}); err != nil {
 		t.Fatalf("AmendProtectiveStop: %v", err)
 	}
 	amendBody := bodies["/api/v5/trade/amend-algos"]

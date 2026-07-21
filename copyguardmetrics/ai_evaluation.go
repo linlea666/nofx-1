@@ -108,6 +108,7 @@ func EvaluateCycleAIDecisions(st *store.Store, cycleID int64) (*AIEffectSummary,
 
 	insertedTerminal := false
 	for i, analysis := range analyses {
+		decisionAt := analysisDecisionAt(analysis)
 		var next *store.ReentryAIAnalysis
 		if i+1 < len(analyses) && analyses[i+1].CandidateID == analysis.CandidateID {
 			next = analyses[i+1]
@@ -142,17 +143,17 @@ func EvaluateCycleAIDecisions(st *store.Store, cycleID int64) (*AIEffectSummary,
 			end := *cycle.ClosedAt
 			status := "FINAL"
 			if horizon.duration > 0 {
-				fixedEnd := analysis.SnapshotAt.Add(horizon.duration)
+				fixedEnd := decisionAt.Add(horizon.duration)
 				if fixedEnd.Before(end) {
 					end = fixedEnd
 				} else {
 					status = "TRUNCATED_AT_LEADER_CLOSE"
 				}
 			}
-			if end.Before(analysis.SnapshotAt) {
-				end = analysis.SnapshotAt
+			if end.Before(decisionAt) {
+				end = decisionAt
 			}
-			path := evaluatePath(samples, analysis.AttemptNo-1, cycle.Side, analysis.SnapshotPrice, atr, analysis.SnapshotAt, end, expectedInterval)
+			path := evaluatePath(samples, analysis.AttemptNo-1, cycle.Side, analysis.SnapshotPrice, atr, decisionAt, end, expectedInterval)
 			dataQuality := "VERIFIED"
 			if path.marketOutcome == store.ReentryMarketInsufficient {
 				dataQuality = "UNSCORABLE"
@@ -173,9 +174,9 @@ func EvaluateCycleAIDecisions(st *store.Store, cycleID int64) (*AIEffectSummary,
 				MarketOutcome: path.marketOutcome, DecisionOutcome: decisionOutcome, Actionability: actionability,
 				Reason: path.reason, ReferencePrice: analysis.SnapshotPrice, ReferenceATR: atr,
 				MFEATR: path.mfeATR, MAEATR: path.maeATR, FirstReversalAt: path.firstReversalAt,
-				WindowStartAt: analysis.SnapshotAt, WindowEndAt: end, SampleCount: path.sampleCount,
+				WindowStartAt: decisionAt, WindowEndAt: end, SampleCount: path.sampleCount,
 				CoverageRatio: path.coverage, MaxGapSeconds: path.maxGapSeconds,
-				ActualExecuted: actualExecuted, ActualPnL: actualPnL, EvaluationLatency: end.Sub(analysis.SnapshotAt).Seconds(),
+				ActualExecuted: actualExecuted, ActualPnL: actualPnL, EvaluationLatency: end.Sub(decisionAt).Seconds(),
 				ExecutionRequested: requested, ExecutionSubmitted: submitted, ExecutionFilled: actualExecuted, ExecutionProtected: protected,
 			}
 			saved, inserted, saveErr := st.ReentryAI().SaveReentryDecisionEvaluation(evaluation)
@@ -416,8 +417,9 @@ func requestedAttempt(events []*store.CopyGuardEvent, attempts []*store.CopyGuar
 }
 
 func hasLaterExecutedAttempt(events []*store.CopyGuardEvent, attempts []*store.CopyGuardAttempt, analysis *store.ReentryAIAnalysis) *store.CopyGuardAttempt {
+	decisionAt := analysisDecisionAt(analysis)
 	for _, event := range events {
-		if event == nil || event.Type != "REENTRY_REQUESTED" || event.CreatedAt.Before(analysis.SnapshotAt) {
+		if event == nil || event.Type != "REENTRY_REQUESTED" || event.CreatedAt.Before(decisionAt) {
 			continue
 		}
 		attemptNo, ok := metadataInt(event.Metadata, "attempt_no")
@@ -431,6 +433,16 @@ func hasLaterExecutedAttempt(events []*store.CopyGuardEvent, attempts []*store.C
 		}
 	}
 	return nil
+}
+
+func analysisDecisionAt(analysis *store.ReentryAIAnalysis) time.Time {
+	if analysis != nil && analysis.ModelCompletedAt != nil && !analysis.ModelCompletedAt.IsZero() {
+		return *analysis.ModelCompletedAt
+	}
+	if analysis != nil {
+		return analysis.SnapshotAt
+	}
+	return time.Time{}
 }
 
 func hasEventForAnalysis(events []*store.CopyGuardEvent, eventType string, analysisID int64) bool {

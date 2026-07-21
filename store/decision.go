@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -78,6 +79,7 @@ type DecisionAction struct {
 	QuantizedQuantity   float64   `json:"quantized_quantity,omitempty"`
 	FilledQuantity      float64   `json:"filled_quantity,omitempty"`
 	ExchangeOrderID     string    `json:"exchange_order_id,omitempty"`
+	ExchangeOrderState  string    `json:"exchange_order_state,omitempty"`
 	ExecutionStatus     string    `json:"execution_status,omitempty"`
 	ExecutionReasonCode string    `json:"execution_reason_code,omitempty"`
 }
@@ -376,11 +378,50 @@ func (s *DecisionStore) scanDecisionRecord(rows *sql.Rows) (*DecisionRecord, err
 	return &record, nil
 }
 
-// fillRecordDetails fills associated data for decision record (old associated tables removed, this function kept for compatibility)
-// Note: Account snapshot, position snapshot, decision action data are no longer stored in decision related tables
-// - For equity data use EquityStore.GetLatest()
-// - For order data use OrderStore
+// fillRecordDetails overlays the durable execution-intent terminal state on
+// the immutable decision payload. Protection/reconciliation may finish after
+// the decision row is inserted; without this overlay the dashboard can keep a
+// stale green "open succeeded" card after a later forced exit.
 func (s *DecisionStore) fillRecordDetails(record *DecisionRecord) {
-	// Old associated tables removed, no longer need to fill
-	// AccountState, Positions, Decisions fields will remain at zero values
+	if record == nil || len(record.Decisions) == 0 {
+		return
+	}
+	overall := true
+	errors := make([]string, 0)
+	for i := range record.Decisions {
+		action := &record.Decisions[i]
+		if action.ExecutionIntentID <= 0 {
+			if !action.Success {
+				overall = false
+			}
+			continue
+		}
+		var status, reason, lastError, exchangeOrderID, exchangeOrderState string
+		var requested, quantized, filled float64
+		err := s.db.QueryRow(`SELECT status,COALESCE(reason_code,''),COALESCE(last_error,''),COALESCE(exchange_order_id,''),COALESCE(exchange_state,''),COALESCE(requested_quantity,0),COALESCE(quantized_quantity,0),COALESCE(filled_quantity,0) FROM copy_trade_execution_intents WHERE id=?`, action.ExecutionIntentID).
+			Scan(&status, &reason, &lastError, &exchangeOrderID, &exchangeOrderState, &requested, &quantized, &filled)
+		if err != nil {
+			overall = false
+			continue
+		}
+		action.ExecutionStatus = status
+		action.ExecutionReasonCode = reason
+		action.ExchangeOrderID = exchangeOrderID
+		action.ExchangeOrderState = exchangeOrderState
+		action.RequestedQuantity = requested
+		action.QuantizedQuantity = quantized
+		action.FilledQuantity = filled
+		action.Success = status == ExecutionIntentFilled || status == ExecutionIntentProtected || status == ExecutionIntentSkipped
+		if !action.Success {
+			overall = false
+			if lastError != "" {
+				action.Error = lastError
+				errors = append(errors, lastError)
+			}
+		}
+	}
+	record.Success = overall
+	if len(errors) > 0 {
+		record.ErrorMessage = strings.Join(errors, "; ")
+	}
 }

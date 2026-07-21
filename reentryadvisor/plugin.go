@@ -138,7 +138,7 @@ func (a *Advisor) pollOnce() {
 	if !cfg.Enabled {
 		return
 	}
-	if cfg.AIEnabled && cfg.AutoEntryEnabled {
+	if cfg.AIEnabled {
 		a.pollAICandidates(cfg)
 	}
 

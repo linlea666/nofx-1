@@ -66,6 +66,7 @@ export interface DecisionAction {
   quantized_quantity?: number
   filled_quantity?: number
   exchange_order_id?: string
+  exchange_order_state?: string
   execution_status?:
     | 'RESERVED'
     | 'SUBMITTED'

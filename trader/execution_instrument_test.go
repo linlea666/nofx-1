@@ -203,7 +203,11 @@ func newOKXCatalogTestTrader(t *testing.T, instruments map[string]map[string]str
 		}
 		instID := req.URL.Query().Get("instId")
 		data := []map[string]string{}
-		if instrument := instruments[instID]; instrument != nil {
+		if instID == "" {
+			for _, instrument := range instruments {
+				data = append(data, instrument)
+			}
+		} else if instrument := instruments[instID]; instrument != nil {
 			data = append(data, instrument)
 		}
 		return instrumentJSONResponse(t, map[string]interface{}{"code": "0", "msg": "", "data": data}), nil

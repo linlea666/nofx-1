@@ -779,7 +779,7 @@ func (e *Engine) poll() {
 	if err != nil {
 		e.reportBinanceCredentialsExpired(err, "poll/GetFills")
 		logger.Warnf("⚠️ [%s] 获取成交记录失败: %v", e.traderID, err)
-		if e.config.ProviderType != ProviderBinance {
+		if e.config.ProviderType != ProviderBinance && e.config.ProviderType != ProviderOKX {
 			return
 		}
 		fills = nil
@@ -843,6 +843,10 @@ func (e *Engine) poll() {
 		}
 	} else if len(newFills) > 0 {
 		if err := e.syncLeaderState(); err != nil {
+			if e.config.ProviderType == ProviderOKX {
+				logger.Warnf("⚠️ [%s] OKX 权威持仓同步失败，本轮保留成交等待重放: %v", e.traderID, err)
+				return
+			}
 			logger.Warnf("⚠️ [%s] 处理信号前同步状态失败: %v（使用缓存）", e.traderID, err)
 		} else {
 			logger.Debugf("📡 [%s] 收到 %d 条新成交，已同步领航员持仓", e.traderID, len(newFills))
@@ -852,7 +856,37 @@ func (e *Engine) poll() {
 		if (e.config.ProviderType == ProviderOKX && e.config.RiskPolicyVersion >= 4) || time.Since(e.lastStateSync) > e.stateSyncInterval {
 			if err := e.syncLeaderState(); err != nil {
 				logger.Warnf("⚠️ [%s] 定时状态同步失败: %v", e.traderID, err)
+				if e.config.ProviderType == ProviderOKX {
+					return
+				}
 			}
+		}
+	}
+
+	// OKX also needs the authoritative position-snapshot path. Previously only
+	// Binance synthesized state deltas; OKX startup then marked the last five
+	// minutes of fills as seen and permanently lost changes made while NOFX was
+	// down. The current snapshot collapses every same-position fill in this poll
+	// into one final target transition.
+	if e.config.ProviderType == ProviderOKX {
+		snapshotFills := e.detectBinancePositionSnapshotFills()
+		freshSnapshotFills := make([]Fill, 0, len(snapshotFills))
+		for _, fill := range snapshotFills {
+			if !e.isSeen(fill.ID) {
+				freshSnapshotFills = append(freshSnapshotFills, fill)
+			}
+		}
+		if len(freshSnapshotFills) > 0 {
+			for _, fill := range newFills {
+				e.markSeen(fill.ID)
+			}
+			newFills = freshSnapshotFills
+			logger.Infof("📡 [%s] OKX 持仓快照合并为 %d 条最终状态变化", e.traderID, len(newFills))
+		} else if len(snapshotFills) > 0 {
+			for _, fill := range newFills {
+				e.markSeen(fill.ID)
+			}
+			newFills = nil
 		}
 	}
 
@@ -895,10 +929,10 @@ func (e *Engine) buildSignal(fill *Fill) *TradeSignal {
 	return signal
 }
 
-// detectBinancePositionSnapshotFills 基于 Binance 当前持仓和本地映射生成兜底信号。
-// 这是 Binance 专属逻辑：Binance 在本系统里只是信号源，实际执行仍走 NOFX trader。
+// detectBinancePositionSnapshotFills 基于当前领航员持仓和本地 mapping 生成
+// 权威状态变化。函数名为历史兼容保留；当前支持 Binance 和 OKX。
 func (e *Engine) detectBinancePositionSnapshotFills() []Fill {
-	if e.store == nil || e.config == nil || e.config.ProviderType != ProviderBinance {
+	if e.store == nil || e.config == nil || (e.config.ProviderType != ProviderBinance && e.config.ProviderType != ProviderOKX) {
 		return nil
 	}
 
@@ -918,7 +952,7 @@ func (e *Engine) detectBinancePositionSnapshotFills() []Fill {
 
 		mapping, err := e.store.CopyTrade().GetMapping(e.traderID, posID)
 		if err != nil {
-			logger.Warnf("⚠️ [%s] Binance 持仓兜底查询映射失败: %v (posId=%s)", e.traderID, err, posID)
+			logger.Warnf("⚠️ [%s] %s 持仓兜底查询映射失败: %v (posId=%s)", e.traderID, e.config.ProviderType, err, posID)
 			continue
 		}
 		if mapping == nil {
@@ -934,7 +968,7 @@ func (e *Engine) detectBinancePositionSnapshotFills() []Fill {
 			continue
 		}
 		if mapping.Status == "ignored" {
-			logger.Debugf("📊 [%s] Binance 历史仓位仍在持仓中 | posId=%s → 持仓兜底跳过", e.traderID, posID)
+			logger.Debugf("📊 [%s] %s 历史仓位仍在持仓中 | posId=%s → 持仓兜底跳过", e.traderID, e.config.ProviderType, posID)
 			continue
 		}
 		if mapping.Status != "active" {
@@ -957,7 +991,7 @@ func (e *Engine) detectBinancePositionSnapshotFills() []Fill {
 
 	activeMappings, err := e.store.CopyTrade().ListActiveMappings(e.traderID)
 	if err != nil {
-		logger.Warnf("⚠️ [%s] Binance 持仓兜底读取 active 映射失败: %v", e.traderID, err)
+		logger.Warnf("⚠️ [%s] %s 持仓兜底读取 active 映射失败: %v", e.traderID, e.config.ProviderType, err)
 		return fills
 	}
 	for _, mapping := range activeMappings {
@@ -1046,8 +1080,8 @@ func (e *Engine) buildBinanceSnapshotFill(posID, symbol string, side SideType, a
 		tradeSide = "sell"
 	}
 
-	fillID := fmt.Sprintf("binance_snapshot|%s|%s|%.8f|%.8f",
-		posID, action, previousSize, currentSize)
+	sourcePrefix := strings.ToLower(string(e.config.ProviderType)) + "_snapshot"
+	fillID := fmt.Sprintf("%s|%s|%s|%.8f|%.8f", sourcePrefix, posID, action, previousSize, currentSize)
 	if e.isSmartMoneyMode() {
 		// Smart Money synthesizes signals from current-position snapshots, so
 		// the same numeric transition can legitimately recur. The persisted
@@ -1787,9 +1821,12 @@ func (e *Engine) reserveExecutionIntent(dec *decision.Decision) bool {
 	if strings.HasSuffix(dec.Action, "short") {
 		side = "short"
 	}
+	canonicalKey := fmt.Sprintf("leader|%s|%s|%d", e.traderID, dec.LeaderPosID, revision)
+	dec.ClientOrderID = stableClientOrderID(e.traderID, canonicalKey, dec.Action)
 	intent, claimed, err := e.store.CopyTrade().ReserveExecutionIntent(&store.CopyTradeExecutionIntent{
 		TraderID: e.traderID, LeaderPosID: dec.LeaderPosID, SourceRevision: revision,
-		SourceFillID: dec.SourceFillID, Action: dec.Action, Symbol: dec.Symbol, Side: side,
+		SourceFillID: dec.SourceFillID, SourceKind: "LEADER_TRANSITION", CanonicalKey: canonicalKey,
+		Action: dec.Action, Symbol: dec.Symbol, Side: side,
 		MarginMode: dec.MarginMode, LeaderTargetSize: dec.LeaderPosSize,
 		RequestedNotional: dec.PositionSizeUSD, ClientOrderID: dec.ClientOrderID,
 	})

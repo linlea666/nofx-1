@@ -10,6 +10,7 @@ import (
 	"nofx/market"
 	"nofx/mcp"
 	"nofx/store"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -1008,7 +1009,11 @@ func (at *AutoTrader) ExecuteDecision(d *decision.Decision) error {
 	// Execute the decision
 	err := at.executeDecisionWithRecord(d, actionRecord)
 	if err != nil {
-		logger.Errorf("[%s] External decision execution failed: %v", at.name, err)
+		if errors.Is(err, ErrPartialCloseSkipped) {
+			logger.Infof("[%s] External decision intentionally skipped without order: %v", at.name, err)
+		} else {
+			logger.Errorf("[%s] External decision execution failed: %v", at.name, err)
+		}
 		return err
 	}
 
@@ -1202,8 +1207,17 @@ func captureDecisionOrderIDs(d *decision.Decision, order map[string]interface{})
 	if d == nil || order == nil {
 		return
 	}
-	if id, ok := order["orderId"].(string); ok {
-		d.ExchangeOrderID = id
+	if raw, ok := order["orderId"]; ok {
+		switch id := raw.(type) {
+		case string:
+			d.ExchangeOrderID = id
+		case int64:
+			d.ExchangeOrderID = strconv.FormatInt(id, 10)
+		case int:
+			d.ExchangeOrderID = strconv.Itoa(id)
+		case float64:
+			d.ExchangeOrderID = strconv.FormatFloat(id, 'f', 0, 64)
+		}
 	}
 	if id, ok := order["clOrdId"].(string); ok && id != "" {
 		d.ClientOrderID = id
@@ -1420,11 +1434,19 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 		actionRecord.OrderID = orderID
 	}
 
-	logger.Infof("  ✓ Position opened successfully, order ID: %v, quantity: %.4f", order["orderId"], quantity)
-	decision.FilledQuantity = quantity
-
+	logger.Infof("  🟡 Position open order accepted, awaiting fill confirmation: order ID=%v quantity=%.4f", order["orderId"], quantity)
 	// Record order to database and poll for confirmation
-	at.recordAndConfirmOrder(order, decision.Symbol, "open_long", quantity, currentPrice, decision.Leverage, 0)
+	filled, fillPrice, state, confirmed := at.recordAndConfirmOrder(order, decision.Symbol, "open_long", quantity, currentPrice, decision.Leverage, 0)
+	decision.ExchangeOrderState, decision.ExchangeFillConfirmed = state, confirmed
+	if confirmed {
+		decision.FilledQuantity = filled
+		if fillPrice > 0 {
+			decision.EntryPrice = fillPrice
+			decision.PositionSizeUSD = fillPrice * filled
+		} else {
+			decision.PositionSizeUSD = currentPrice * filled
+		}
+	}
 
 	// Record position opening time
 	posKey := decision.Symbol + "_long"
@@ -1646,11 +1668,19 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 		actionRecord.OrderID = orderID
 	}
 
-	logger.Infof("  ✓ Position opened successfully, order ID: %v, quantity: %.4f", order["orderId"], quantity)
-	decision.FilledQuantity = quantity
-
+	logger.Infof("  🟡 Position open order accepted, awaiting fill confirmation: order ID=%v quantity=%.4f", order["orderId"], quantity)
 	// Record order to database and poll for confirmation
-	at.recordAndConfirmOrder(order, decision.Symbol, "open_short", quantity, currentPrice, decision.Leverage, 0)
+	filled, fillPrice, state, confirmed := at.recordAndConfirmOrder(order, decision.Symbol, "open_short", quantity, currentPrice, decision.Leverage, 0)
+	decision.ExchangeOrderState, decision.ExchangeFillConfirmed = state, confirmed
+	if confirmed {
+		decision.FilledQuantity = filled
+		if fillPrice > 0 {
+			decision.EntryPrice = fillPrice
+			decision.PositionSizeUSD = fillPrice * filled
+		} else {
+			decision.PositionSizeUSD = currentPrice * filled
+		}
+	}
 
 	// Record position opening time
 	posKey := decision.Symbol + "_short"
@@ -1798,14 +1828,23 @@ func (at *AutoTrader) executeCloseLongWithRecord(decision *decision.Decision, ac
 	}
 
 	// Record order to database and poll for confirmation
-	at.recordAndConfirmOrder(order, decision.Symbol, "close_long", recordQuantity, currentPrice, 0, entryPrice)
+	filled, _, state, confirmed := at.recordAndConfirmOrder(order, decision.Symbol, "close_long", recordQuantity, currentPrice, 0, entryPrice)
+	decision.ExchangeOrderState, decision.ExchangeFillConfirmed = state, confirmed
 
 	if closeQuantity > 0 {
-		logger.Infof("  ✓ Position partially closed: %.4f (%.0f%%)", closeQuantity, decision.CloseRatio*100)
-		decision.FilledQuantity = closeQuantity
+		if confirmed {
+			logger.Infof("  ✓ Position partially closed: %.4f (%.0f%%)", filled, decision.CloseRatio*100)
+			decision.FilledQuantity = filled
+		} else {
+			logger.Infof("  🟡 Partial-close order accepted, awaiting fill confirmation: %.4f", closeQuantity)
+		}
 	} else {
-		logger.Infof("  ✓ Position closed successfully")
-		decision.FilledQuantity = totalQuantity
+		if confirmed {
+			logger.Infof("  ✓ Position closed successfully")
+			decision.FilledQuantity = filled
+		} else {
+			logger.Infof("  🟡 Close order accepted, awaiting fill confirmation")
+		}
 	}
 	return nil
 }
@@ -1936,14 +1975,23 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *decision.Decision, a
 	}
 
 	// Record order to database and poll for confirmation
-	at.recordAndConfirmOrder(order, decision.Symbol, "close_short", recordQuantity, currentPrice, 0, entryPrice)
+	filled, _, state, confirmed := at.recordAndConfirmOrder(order, decision.Symbol, "close_short", recordQuantity, currentPrice, 0, entryPrice)
+	decision.ExchangeOrderState, decision.ExchangeFillConfirmed = state, confirmed
 
 	if closeQuantity > 0 {
-		logger.Infof("  ✓ Position partially closed: %.4f (%.0f%%)", closeQuantity, decision.CloseRatio*100)
-		decision.FilledQuantity = closeQuantity
+		if confirmed {
+			logger.Infof("  ✓ Position partially closed: %.4f (%.0f%%)", filled, decision.CloseRatio*100)
+			decision.FilledQuantity = filled
+		} else {
+			logger.Infof("  🟡 Partial-close order accepted, awaiting fill confirmation: %.4f", closeQuantity)
+		}
 	} else {
-		logger.Infof("  ✓ Position closed successfully")
-		decision.FilledQuantity = totalQuantity
+		if confirmed {
+			logger.Infof("  ✓ Position closed successfully")
+			decision.FilledQuantity = filled
+		} else {
+			logger.Infof("  🟡 Close order accepted, awaiting fill confirmation")
+		}
 	}
 	return nil
 }
@@ -2451,9 +2499,9 @@ func (at *AutoTrader) ClearPeakPnLCache(symbol, side string) {
 // recordAndConfirmOrder polls order status for actual fill data and records position
 // action: open_long, open_short, close_long, close_short
 // entryPrice: entry price when closing (0 when opening)
-func (at *AutoTrader) recordAndConfirmOrder(orderResult map[string]interface{}, symbol, action string, quantity float64, price float64, leverage int, entryPrice float64) {
+func (at *AutoTrader) recordAndConfirmOrder(orderResult map[string]interface{}, symbol, action string, quantity float64, price float64, leverage int, entryPrice float64) (float64, float64, string, bool) {
 	if at.store == nil {
-		return
+		return 0, 0, "", false
 	}
 
 	// Get order ID (supports multiple types)
@@ -2486,9 +2534,11 @@ func (at *AutoTrader) recordAndConfirmOrder(orderResult map[string]interface{}, 
 	}
 
 	// Poll order status to get actual fill price, quantity and fee
-	var actualPrice = price  // fallback to market price
-	var actualQty = quantity // fallback to requested quantity
+	var actualPrice float64
+	var actualQty float64
 	var fee float64
+	var finalState string
+	confirmed := false
 
 	// Wait for order to be filled and get actual fill data
 	time.Sleep(500 * time.Millisecond)
@@ -2496,7 +2546,8 @@ func (at *AutoTrader) recordAndConfirmOrder(orderResult map[string]interface{}, 
 		status, err := at.trader.GetOrderStatus(symbol, orderID)
 		if err == nil {
 			statusStr, _ := status["status"].(string)
-			if statusStr == "FILLED" {
+			finalState = strings.ToUpper(statusStr)
+			if finalState == "FILLED" {
 				// Get actual fill price
 				if avgPrice, ok := status["avgPrice"].(float64); ok && avgPrice > 0 {
 					actualPrice = avgPrice
@@ -2510,20 +2561,34 @@ func (at *AutoTrader) recordAndConfirmOrder(orderResult map[string]interface{}, 
 					fee = commission
 				}
 				logger.Infof("  ✅ Order filled: avgPrice=%.6f, qty=%.6f, fee=%.6f", actualPrice, actualQty, fee)
+				confirmed = actualQty > 0
 				break
-			} else if statusStr == "CANCELED" || statusStr == "EXPIRED" || statusStr == "REJECTED" {
-				logger.Infof("  ⚠️ Order %s, skipping position record", statusStr)
-				return
+			} else if finalState == "CANCELED" || finalState == "CANCELLED" || finalState == "EXPIRED" || finalState == "REJECTED" || finalState == "FAILED" {
+				if execQty, ok := status["executedQty"].(float64); ok && execQty > 0 {
+					actualQty, confirmed = execQty, true
+					if avgPrice, ok := status["avgPrice"].(float64); ok && avgPrice > 0 {
+						actualPrice = avgPrice
+					}
+				} else {
+					logger.Infof("  ⚠️ Order %s, skipping position record", finalState)
+					return 0, 0, finalState, false
+				}
+				break
 			}
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
 
+	if !confirmed {
+		logger.Warnf("  ⏳ Order fill not yet confirmed (ID: %s, state: %s); deferring mapping and position record", orderID, finalState)
+		return 0, 0, finalState, false
+	}
 	logger.Infof("  📝 Recording position (ID: %s, action: %s, price: %.6f, qty: %.6f, fee: %.4f)",
 		orderID, action, actualPrice, actualQty, fee)
 
 	// Record position change with actual fill data
 	at.recordPositionChange(orderID, symbol, positionSide, action, actualQty, actualPrice, leverage, entryPrice, fee)
+	return actualQty, actualPrice, finalState, true
 }
 
 // recordPositionChange records position change (create record on open, update record on close)

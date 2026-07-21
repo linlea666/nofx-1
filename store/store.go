@@ -6,7 +6,9 @@ import (
 	"database/sql"
 	"fmt"
 	"nofx/logger"
+	"strings"
 	"sync"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -14,6 +16,10 @@ import (
 // Store unified data storage interface
 type Store struct {
 	db *sql.DB
+	// instanceLock is held for the lifetime of the Store. Trading against one
+	// SQLite database from two NOFX processes can duplicate exchange mutations,
+	// so startup waits for the previous process to release ownership.
+	instanceLock *processLock
 
 	// Sub-stores (lazy initialization)
 	user         *UserStore
@@ -38,6 +44,17 @@ type Store struct {
 
 // New creates new Store instance
 func New(dbPath string) (*Store, error) {
+	lock, err := acquireProcessLock(dbPath, 30*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("failed to acquire database process lock: %w", err)
+	}
+	releaseLock := true
+	defer func() {
+		if releaseLock {
+			_ = lock.Close()
+		}
+	}()
+
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
@@ -46,6 +63,13 @@ func New(dbPath string) (*Store, error) {
 	// SQLite configuration
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
+	// busy_timeout is connection-local and must be installed before any pragma
+	// that may need a database lock. The old order changed journal_mode first,
+	// so an overlapping service restart failed immediately with SQLITE_BUSY.
+	if _, err := db.Exec("PRAGMA busy_timeout = 30000"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to set busy_timeout: %w", err)
+	}
 
 	// Enable foreign key constraints
 	if _, err := db.Exec(`PRAGMA foreign_keys = ON`); err != nil {
@@ -55,7 +79,7 @@ func New(dbPath string) (*Store, error) {
 
 	// Use DELETE mode (traditional mode) to ensure Docker bind mount compatibility
 	// Note: WAL mode causes data sync issues on macOS Docker
-	if _, err := db.Exec("PRAGMA journal_mode=DELETE"); err != nil {
+	if err := ensureSQLiteDeleteJournalMode(db, 30*time.Second); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("failed to set journal_mode: %w", err)
 	}
@@ -66,13 +90,7 @@ func New(dbPath string) (*Store, error) {
 		return nil, fmt.Errorf("failed to set synchronous: %w", err)
 	}
 
-	// Set busy_timeout
-	if _, err := db.Exec("PRAGMA busy_timeout = 5000"); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("failed to set busy_timeout: %w", err)
-	}
-
-	s := &Store{db: db}
+	s := &Store{db: db, instanceLock: lock}
 
 	// Initialize all table structures
 	if err := s.initTables(); err != nil {
@@ -87,7 +105,66 @@ func New(dbPath string) (*Store, error) {
 	}
 
 	logger.Info("✅ Database enabled DELETE mode and FULL sync")
+	releaseLock = false
 	return s, nil
+}
+
+func ensureSQLiteDeleteJournalMode(db *sql.DB, timeout time.Duration) error {
+	var mode string
+	if err := db.QueryRow("PRAGMA journal_mode").Scan(&mode); err != nil {
+		return err
+	}
+	if strings.EqualFold(mode, "delete") {
+		return nil
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		var selected string
+		err := db.QueryRow("PRAGMA journal_mode=DELETE").Scan(&selected)
+		if err == nil {
+			if !strings.EqualFold(selected, "delete") {
+				return fmt.Errorf("SQLite selected unexpected journal mode %q", selected)
+			}
+			return nil
+		}
+		message := strings.ToLower(err.Error())
+		if (!strings.Contains(message, "database is locked") && !strings.Contains(message, "sqlite_busy")) || time.Now().After(deadline) {
+			return err
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+}
+
+// ensureSQLiteColumn performs an additive migration without hiding real I/O or
+// schema errors. Many legacy migrations ignored every ALTER error, which can
+// leave a production database partially upgraded and fail only on a trade.
+func ensureSQLiteColumn(db *sql.DB, table, column, definition string) error {
+	rows, err := db.Query("PRAGMA table_info(" + table + ")")
+	if err != nil {
+		return err
+	}
+	found := false
+	for rows.Next() {
+		var cid int
+		var name, dataType string
+		var notNull, primaryKey int
+		var defaultValue interface{}
+		if err := rows.Scan(&cid, &name, &dataType, &notNull, &defaultValue, &primaryKey); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if strings.EqualFold(name, column) {
+			found = true
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if found {
+		return nil
+	}
+	_, err = db.Exec("ALTER TABLE " + table + " ADD COLUMN " + column + " " + definition)
+	return err
 }
 
 // NewFromDB creates Store from existing database connection
@@ -341,7 +418,20 @@ func (s *Store) ReentryAI() *ReentryAIStore {
 
 // Close closes database connection
 func (s *Store) Close() error {
-	return s.db.Close()
+	if s == nil {
+		return nil
+	}
+	var dbErr error
+	if s.db != nil {
+		dbErr = s.db.Close()
+	}
+	if s.instanceLock != nil {
+		if lockErr := s.instanceLock.Close(); dbErr == nil {
+			dbErr = lockErr
+		}
+		s.instanceLock = nil
+	}
+	return dbErr
 }
 
 // DB gets underlying database connection (for legacy code compatibility, gradually deprecated)
