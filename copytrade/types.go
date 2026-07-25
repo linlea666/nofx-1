@@ -205,6 +205,7 @@ type CopyConfig struct {
 	RiskReentryEnabled         bool    `json:"risk_reentry_enabled"`
 	RiskReentryRatio           float64 `json:"risk_reentry_ratio"` // × 被止损仓位名义
 	RiskReentryDecisionMode    string  `json:"risk_reentry_decision_mode"`
+	RiskReentryMinNotional     float64 `json:"risk_reentry_min_notional"`
 	RiskCycleLossBudgetPct     float64 `json:"risk_cycle_loss_budget_pct"`
 	RiskPortfolioLossBudgetPct float64 `json:"risk_portfolio_loss_budget_pct"`
 	RiskRoundTripFeeBPS        float64 `json:"risk_round_trip_fee_bps"`

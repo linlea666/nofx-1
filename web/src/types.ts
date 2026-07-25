@@ -266,6 +266,7 @@ export interface CopyConfigRequest {
   risk_reentry_enabled?: boolean // 默认 true：止损完全平仓后进入 AI 持续观察
   risk_reentry_ratio?: number // 默认 0.5：重入仓位系数（× 被止损仓位名义）
   risk_reentry_decision_mode?: 'ai_guarded' | 'legacy_rule' | 'disabled'
+  risk_reentry_min_notional?: number // 0=使用交易所合约最小名义，不继承预警阈值
   risk_ai_confidence_threshold?: number
   risk_ai_min_review_seconds?: number
   risk_ai_daily_call_limit?: number
@@ -777,6 +778,7 @@ export interface CopyTradeConfig {
   risk_reentry_enabled?: boolean
   risk_reentry_ratio?: number
   risk_reentry_decision_mode?: 'ai_guarded' | 'legacy_rule' | 'disabled'
+  risk_reentry_min_notional?: number
   risk_ai_confidence_threshold?: number
   risk_ai_min_review_seconds?: number
   risk_ai_daily_call_limit?: number
@@ -858,6 +860,7 @@ export interface CopyGuardSummary {
   false_kill_count: number // 误杀次数（分子）
   estimated_baseline_cycles: number // 基线仍为"最后观测价估算"的已对账周期数
   estimated_net_guard_effect: number // 上述周期贡献的净效果（含在 net_guard_effect 内）
+  unscorable_baseline_cycles: number // 缺少有效领航员离场价，不进入保护效果统计
   max_realized_drawdown_usd: number // 已对账止损周期按结束顺序形成的真实盈亏路径最大回撤
   worst_cycle_loss_usd: number // 已对账止损周期的最大单周期亏损绝对值
   tail_loss_cvar_95_usd: number // 样本 95% 尾部平均损失；小样本时等于最差观测
@@ -1202,6 +1205,10 @@ export interface ReentryAIStats {
   candidate_profitable: number
   candidate_evaluated: number
   candidate_unscorable: number
+  candidate_execution_requested: number
+  candidate_execution_submitted: number
+  candidate_execution_filled: number
+  candidate_execution_protected: number
   candidate_evaluation_outcomes: Record<string, number>
   candidate_market_outcomes: Record<string, number>
 }

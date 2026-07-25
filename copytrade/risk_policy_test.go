@@ -195,6 +195,10 @@ func TestValidateRiskPolicyV4(t *testing.T) {
 	if err := ValidateRiskPolicyV4(c); err != nil {
 		t.Fatal(err)
 	}
+	c.RiskReentryMinNotional = -1
+	if err := ValidateRiskPolicyV4(c); err == nil {
+		t.Fatal("negative explicit reentry minimum must be rejected")
+	}
 }
 
 func TestValidateRiskPolicyAIReviewLimitsAreIndependent(t *testing.T) {

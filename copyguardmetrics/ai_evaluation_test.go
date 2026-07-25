@@ -49,6 +49,37 @@ func TestClassifyDecisionOutcomeSeparatesMissedReversalAndRiskGate(t *testing.T)
 	}
 }
 
+func TestSummaryUsesEvidenceQualityNotOutcomeLabelForDenominator(t *testing.T) {
+	cycle := &store.CopyGuardCycle{ID: 9}
+	evaluations := []*store.ReentryAIDecisionEvaluation{
+		{
+			EvaluationVersion: store.ReentryDecisionEvaluationVersion,
+			Horizon:           evaluationHorizonTerminal,
+			Decision:          store.ReentryVerdictWait,
+			DecisionOutcome:   "WAIT_APPROPRIATE",
+			MarketOutcome:     store.ReentryMarketInsufficient,
+			DataQuality:       "UNSCORABLE",
+		},
+	}
+	summary := SummarizeCycleAIEffects(cycle, nil, evaluations)
+	if summary.TotalDecisions != 1 || summary.ScorableDecisions != 0 || summary.UnscorableDecisions != 1 {
+		t.Fatalf("unverified evidence entered decision-quality denominator: %+v", summary)
+	}
+}
+
+func TestLaterExecutionOutsideFixedWindowIsNotAttributed(t *testing.T) {
+	start := time.Unix(1_800_000_000, 0).UTC()
+	analysis := &store.ReentryAIAnalysis{AttemptNo: 1, ModelCompletedAt: &start}
+	attempt := &store.CopyGuardAttempt{AttemptNo: 1}
+	event := &store.CopyGuardEvent{
+		Type: "REENTRY_REQUESTED", CreatedAt: start.Add(31 * time.Minute),
+		Metadata: map[string]interface{}{"attempt_no": float64(1)},
+	}
+	if got := hasLaterExecutedAttemptWithin([]*store.CopyGuardEvent{event}, []*store.CopyGuardAttempt{attempt}, analysis, start.Add(30*time.Minute)); got != nil {
+		t.Fatalf("execution after 30-minute horizon was attributed to the earlier decision: %+v", got)
+	}
+}
+
 func TestEvaluateCyclePersistsImmutableOutcomeAndEventsOnce(t *testing.T) {
 	st, err := store.New(filepath.Join(t.TempDir(), "evaluation.db"))
 	if err != nil {

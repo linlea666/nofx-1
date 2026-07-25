@@ -1,6 +1,7 @@
 package store
 
 import (
+	"database/sql"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -546,6 +547,159 @@ func TestConcurrentPortfolioReservationCannotPierceBudget(t *testing.T) {
 	}
 }
 
+func TestExecutionIntentRiskReservationPromotesWithoutDoubleCounting(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "intent-risk.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	for _, trader := range []*Trader{
+		{ID: "a", UserID: "u", Name: "a", ExchangeID: "shared"},
+		{ID: "b", UserID: "u", Name: "b", ExchangeID: "shared"},
+	} {
+		if err := st.Trader().Create(trader); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rs := st.ReentryAI()
+	if err := rs.ReserveCopyGuardIntentRisk("a", 77, 0, 0, 5, 100, .05, .05, .08, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := rs.ReserveCopyGuardRisk("b", 102, 0, 4, 100, .05, .05, .08); err == nil {
+		t.Fatal("pre-submit intent risk must participate in the shared account cap")
+	}
+	promoted, err := rs.PromoteCopyGuardIntentRisk("a", 77, 101, 0, 5, 100, .05, .05, .08, false)
+	if err != nil || !promoted {
+		t.Fatalf("promotion failed: promoted=%v err=%v", promoted, err)
+	}
+	usage, err := rs.GetCopyGuardRiskUsage("a", 101)
+	if err != nil || usage.CycleUsedUSD != 5 || usage.PortfolioUsedUSD != 5 {
+		t.Fatalf("promotion double-counted or lost risk: usage=%+v err=%v", usage, err)
+	}
+	if err := rs.ReleaseCopyGuardIntentRisk(77); err != nil {
+		t.Fatal(err)
+	}
+	usage, err = rs.GetCopyGuardRiskUsage("a", 101)
+	if err != nil || usage.CycleUsedUSD != 5 || usage.PortfolioUsedUSD != 5 {
+		t.Fatalf("releasing promoted intent changed cycle risk: usage=%+v err=%v", usage, err)
+	}
+}
+
+func TestRiskReservationAdditiveMigrationIsIdempotent(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "legacy-risk-reservation.db")
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = raw.Exec(`CREATE TABLE copy_guard_risk_reservations (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,trader_id TEXT NOT NULL,account_key TEXT NOT NULL DEFAULT '',
+		cycle_id INTEGER NOT NULL,attempt_no INTEGER NOT NULL,risk_usd REAL NOT NULL,status TEXT NOT NULL DEFAULT 'ACTIVE',
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,released_at DATETIME,UNIQUE(cycle_id,attempt_no)
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	_ = raw.Close()
+	for pass := 0; pass < 2; pass++ {
+		st, openErr := New(dbPath)
+		if openErr != nil {
+			t.Fatalf("migration pass %d: %v", pass, openErr)
+		}
+		if pass == 0 {
+			if reserveErr := st.ReentryAI().ReserveCopyGuardIntentRisk("a", 88, 0, 0, 2, 100, .02, .05, .08, false); reserveErr != nil {
+				t.Fatalf("migrated intent reservation unusable: %v", reserveErr)
+			}
+		}
+		if closeErr := st.Close(); closeErr != nil {
+			t.Fatal(closeErr)
+		}
+	}
+}
+
+func TestOutcomeCleanupRequiresPositiveCrossAnalysisEvidence(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "outcome-cleanup.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	rs := st.ReentryAI()
+	contaminated, err := rs.SaveReentryAnalysis(&ReentryAIAnalysis{CandidateID: 10, TraderID: "a", CycleID: 1, AttemptNo: 1, CallStatus: "COMPLETED"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	exact, err := rs.SaveReentryAnalysis(&ReentryAIAnalysis{CandidateID: 10, TraderID: "a", CycleID: 1, AttemptNo: 1, CallStatus: "COMPLETED"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := rs.SaveReentryAnalysis(&ReentryAIAnalysis{CandidateID: 20, TraderID: "a", CycleID: 2, AttemptNo: 1, CallStatus: "COMPLETED"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = st.DB().Exec(`UPDATE reentry_ai_analyses SET outcome_pnl=1 WHERE id IN (?,?,?)`, contaminated.ID, exact.ID, legacy.ID); err != nil {
+		t.Fatal(err)
+	}
+	intent, claimed, err := st.CopyTrade().ReserveExecutionIntent(&CopyTradeExecutionIntent{
+		TraderID: "a", LeaderPosID: "p", SourceRevision: 1, SourceKind: "AI_REENTRY",
+		CanonicalKey: "ai|a|1", CycleID: 1, CandidateID: 10, AnalysisID: exact.ID,
+		AttemptNo: 1, Action: "open_long",
+	})
+	if err != nil || !claimed {
+		t.Fatalf("reserve exact intent claimed=%v err=%v", claimed, err)
+	}
+	if err = st.CopyTrade().UpdateExecutionIntent(intent.ID, ExecutionIntentFilled, "", "", "order", 1, 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err = rs.initTables(); err != nil {
+		t.Fatal(err)
+	}
+	contaminated, _ = rs.GetReentryAnalysis(contaminated.ID)
+	exact, _ = rs.GetReentryAnalysis(exact.ID)
+	legacy, _ = rs.GetReentryAnalysis(legacy.ID)
+	if contaminated.OutcomePnL != nil {
+		t.Fatalf("proven cross-analysis contamination was retained: %+v", contaminated)
+	}
+	if exact.OutcomePnL == nil || legacy.OutcomePnL == nil {
+		t.Fatalf("exact or unprovable legacy outcomes were destructively cleared: exact=%+v legacy=%+v", exact, legacy)
+	}
+}
+
+func TestExecutionIntentAddReservationHoldsOnlyRiskDelta(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "intent-add-risk.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	for _, trader := range []*Trader{
+		{ID: "a", UserID: "u", Name: "a", ExchangeID: "shared"},
+		{ID: "b", UserID: "u", Name: "b", ExchangeID: "shared"},
+	} {
+		if err := st.Trader().Create(trader); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rs := st.ReentryAI()
+	if err := rs.ReserveCopyGuardRisk("a", 101, 0, 3, 100, .05, .08, .08); err != nil {
+		t.Fatal(err)
+	}
+	if err := rs.ReserveCopyGuardIntentRisk("a", 78, 101, 0, 5, 100, .05, .08, .08, false); err != nil {
+		t.Fatal(err)
+	}
+	usage, err := rs.GetCopyGuardRiskUsage("a", 101)
+	if err != nil || usage.PortfolioUsedUSD != 5 {
+		t.Fatalf("existing risk plus temporary delta must equal target: usage=%+v err=%v", usage, err)
+	}
+	if err := rs.ReserveCopyGuardRisk("b", 102, 0, 4, 100, .05, .08, .08); err == nil {
+		t.Fatal("concurrent trader pierced portfolio cap while add was pending")
+	}
+	promoted, err := rs.PromoteCopyGuardIntentRisk("a", 78, 101, 0, 5, 100, .05, .08, .08, false)
+	if err != nil || !promoted {
+		t.Fatalf("add promotion failed: promoted=%v err=%v", promoted, err)
+	}
+	usage, err = rs.GetCopyGuardRiskUsage("a", 101)
+	if err != nil || usage.CycleUsedUSD != 5 || usage.PortfolioUsedUSD != 5 {
+		t.Fatalf("add promotion did not replace prior attempt: usage=%+v err=%v", usage, err)
+	}
+}
+
 func TestCycleCloseReleasesRiskReservation(t *testing.T) {
 	st, err := New(filepath.Join(t.TempDir(), "reservation-close.db"))
 	if err != nil {
@@ -568,5 +722,84 @@ func TestCycleCloseReleasesRiskReservation(t *testing.T) {
 	usage, err := st.ReentryAI().GetCopyGuardRiskUsage("trader-a", cycle.ID)
 	if err != nil || usage.CycleUsedUSD != 0 || usage.PortfolioUsedUSD != 0 {
 		t.Fatalf("closed cycle leaked risk budget: usage=%+v err=%v", usage, err)
+	}
+}
+
+func TestCandidateFeatureRefreshCannotShortenFailureBackoff(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "candidate-backoff.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	rs := st.ReentryAI()
+	candidate, err := rs.EnsureReentryCandidate(&CopyGuardReentryCandidate{
+		CycleID: 9001, TraderID: "trader-a", LeaderPosID: "pos-a", Symbol: "ETHUSDT",
+		Side: "long", FeatureHash: "v1", PendingTrigger: "INITIAL",
+	}, time.Now().Add(-time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, ok, err := rs.ClaimReentryCandidateReview(candidate.ID, time.Second, 10, 10)
+	if err != nil || !ok || claimed == nil {
+		t.Fatalf("claim ok=%v candidate=%+v err=%v", ok, claimed, err)
+	}
+	if err = rs.FailReentryCandidateReview(candidate.ID, "upstream timeout", time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	before, err := rs.GetReentryCandidate(candidate.ID)
+	if err != nil || before.FailureBackoffUntil == nil {
+		t.Fatalf("failure backoff missing: candidate=%+v err=%v", before, err)
+	}
+	refreshed, err := rs.EnsureReentryCandidate(&CopyGuardReentryCandidate{
+		CycleID: 9001, TraderID: "trader-a", LeaderPosID: "pos-a", Symbol: "ETHUSDT",
+		Side: "long", FeatureHash: "v2", PendingTrigger: "PRICE_BUCKET_CHANGED",
+	}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refreshed.NextReviewAt.Before(before.FailureBackoffUntil.Add(-time.Second)) {
+		t.Fatalf("feature refresh shortened failure backoff: next=%v backoff=%v", refreshed.NextReviewAt, before.FailureBackoffUntil)
+	}
+	due, err := rs.ListDueReentryCandidates(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(due) != 0 {
+		t.Fatalf("backed-off candidate became due: %+v", due)
+	}
+}
+
+func TestUnactionableEventDedupeKeepsReasonChangesAndHeartbeat(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "candidate-event-dedupe.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	rs := st.ReentryAI()
+	candidate, err := rs.EnsureReentryCandidate(&CopyGuardReentryCandidate{
+		CycleID: 9002, TraderID: "trader-a", LeaderPosID: "pos-b", Symbol: "BTCUSDT",
+		Side: "short", FeatureHash: "v1",
+	}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := rs.ShouldRecordReentryCandidateUnactionable(candidate.ID, "MIN_NOTIONAL", time.Hour)
+	if err != nil || !record {
+		t.Fatalf("first event record=%v err=%v", record, err)
+	}
+	record, err = rs.ShouldRecordReentryCandidateUnactionable(candidate.ID, "MIN_NOTIONAL", time.Hour)
+	if err != nil || record {
+		t.Fatalf("duplicate event record=%v err=%v", record, err)
+	}
+	record, err = rs.ShouldRecordReentryCandidateUnactionable(candidate.ID, "RISK_CAP", time.Hour)
+	if err != nil || !record {
+		t.Fatalf("reason change record=%v err=%v", record, err)
+	}
+	if _, err = st.DB().Exec(`UPDATE copy_guard_reentry_candidates SET last_unactionable_event_at=datetime('now','-2 hours') WHERE id=?`, candidate.ID); err != nil {
+		t.Fatal(err)
+	}
+	record, err = rs.ShouldRecordReentryCandidateUnactionable(candidate.ID, "RISK_CAP", time.Hour)
+	if err != nil || !record {
+		t.Fatalf("heartbeat event record=%v err=%v", record, err)
 	}
 }

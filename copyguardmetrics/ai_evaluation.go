@@ -96,6 +96,16 @@ func EvaluateCycleAIDecisions(st *store.Store, cycleID int64) (*AIEffectSummary,
 	if err != nil {
 		return nil, err
 	}
+	intents, err := st.CopyTrade().ListExecutionIntentsByCycle(cycleID)
+	if err != nil {
+		return nil, err
+	}
+	intentsByAnalysis := make(map[int64]*store.CopyTradeExecutionIntent, len(intents))
+	for _, intent := range intents {
+		if intent != nil && intent.AnalysisID > 0 {
+			intentsByAnalysis[intent.AnalysisID] = intent
+		}
+	}
 	samples, err := st.CopyTrade().ListCopyGuardWatchSamples(cycleID)
 	if err != nil {
 		return nil, err
@@ -109,14 +119,11 @@ func EvaluateCycleAIDecisions(st *store.Store, cycleID int64) (*AIEffectSummary,
 	insertedTerminal := false
 	for i, analysis := range analyses {
 		decisionAt := analysisDecisionAt(analysis)
+		executionIntent := intentsByAnalysis[analysis.ID]
 		var next *store.ReentryAIAnalysis
 		if i+1 < len(analyses) && analyses[i+1].CandidateID == analysis.CandidateID {
 			next = analyses[i+1]
 		}
-		attempt, requested := requestedAttempt(events, attempts, analysis)
-		actualExecuted := requested && attempt != nil
-		submitted := hasEventForAnalysis(events, "REENTRY_SUBMITTED", analysis.ID)
-		protected := actualExecuted && hasEventForAttempt(events, "PROTECTION_ACTIVE", analysis.AttemptNo)
 		pack := evaluationDatapack{}
 		_ = json.Unmarshal([]byte(analysis.DatapackJSON), &pack)
 		atr := pack.CopyGuard.GateATR
@@ -126,10 +133,6 @@ func EvaluateCycleAIDecisions(st *store.Store, cycleID int64) (*AIEffectSummary,
 		actionability := "NOT_ACTIONABLE"
 		if pack.CopyGuard.Protectable && pack.CopyGuard.RecommendedNotional > 0 && pack.CopyGuard.Leader.StillHolding {
 			actionability = "ACTIONABLE_SNAPSHOT"
-		}
-		preflightRejected := hasEventForAnalysis(events, "REENTRY_PREFLIGHT_REJECTED", analysis.ID)
-		if preflightRejected {
-			actionability = "PREFLIGHT_REJECTED"
 		}
 		horizons := []struct {
 			name     string
@@ -153,10 +156,27 @@ func EvaluateCycleAIDecisions(st *store.Store, cycleID int64) (*AIEffectSummary,
 			if end.Before(decisionAt) {
 				end = decisionAt
 			}
+			horizonActionability := actionability
+			if hasEventForAnalysisWithin(events, "REENTRY_PREFLIGHT_REJECTED", analysis.ID, end) {
+				horizonActionability = "PREFLIGHT_REJECTED"
+			}
+			attempt, requestedByEvent := requestedAttemptWithin(events, attempts, analysis, end)
+			requested := requestedByEvent || executionIntentWithin(executionIntent, executionIntentCreated, end)
+			submitted := hasEventForAnalysisWithin(events, "REENTRY_SUBMITTED", analysis.ID, end) || executionIntentWithin(executionIntent, executionIntentSubmitted, end)
+			filledByIntent := executionIntent != nil && executionIntent.FilledQuantity > 0 && executionIntentWithin(executionIntent, executionIntentFilled, end)
+			actualExecuted := (filledByIntent || (executionIntent == nil && requestedByEvent)) && attempt != nil
+			protected := actualExecuted && (executionIntentWithin(executionIntent, executionIntentProtected, end) || (executionIntent == nil && hasEventForAttemptWithin(events, "PROTECTION_ACTIVE", analysis.AttemptNo, end)))
 			path := evaluatePath(samples, analysis.AttemptNo-1, cycle.Side, analysis.SnapshotPrice, atr, decisionAt, end, expectedInterval)
 			dataQuality := "VERIFIED"
 			if path.marketOutcome == store.ReentryMarketInsufficient {
 				dataQuality = "UNSCORABLE"
+			}
+			executionDataQuality := "NOT_APPLICABLE"
+			if analysis.Verdict == store.ReentryVerdictEnter {
+				executionDataQuality = "UNSCORABLE"
+				if executionIntent != nil || requested || submitted || hasEventForAnalysisWithin(events, "REENTRY_PREFLIGHT_REJECTED", analysis.ID, end) {
+					executionDataQuality = "VERIFIED"
+				}
 			}
 			var classifiedAttempt *store.CopyGuardAttempt
 			var actualPnL *float64
@@ -165,13 +185,17 @@ func EvaluateCycleAIDecisions(st *store.Store, cycleID int64) (*AIEffectSummary,
 				value := attempt.PnL
 				actualPnL = &value
 			}
-			decisionOutcome := classifyDecisionOutcome(analysis, next, path.marketOutcome, actionability, actualExecuted, classifiedAttempt, hasLaterExecutedAttempt(events, attempts, analysis))
+			nextInWindow := next
+			if nextInWindow != nil && analysisDecisionAt(nextInWindow).After(end) {
+				nextInWindow = nil
+			}
+			decisionOutcome := classifyDecisionOutcome(analysis, nextInWindow, path.marketOutcome, horizonActionability, actualExecuted, classifiedAttempt, hasLaterExecutedAttemptWithin(events, attempts, analysis, end))
 			evaluation := &store.ReentryAIDecisionEvaluation{
 				AnalysisID: analysis.ID, CandidateID: analysis.CandidateID, TraderID: analysis.TraderID,
 				TraderNameSnapshot: traderName, CycleID: analysis.CycleID, AttemptNo: analysis.AttemptNo,
 				DecisionGeneration: analysis.DecisionGeneration, Decision: analysis.Verdict, Horizon: horizon.name,
-				EvaluationVersion: store.ReentryDecisionEvaluationVersion, EvaluationStatus: status, DataQuality: dataQuality,
-				MarketOutcome: path.marketOutcome, DecisionOutcome: decisionOutcome, Actionability: actionability,
+				EvaluationVersion: store.ReentryDecisionEvaluationVersion, EvaluationStatus: status, DataQuality: dataQuality, ExecutionDataQuality: executionDataQuality,
+				MarketOutcome: path.marketOutcome, DecisionOutcome: decisionOutcome, Actionability: horizonActionability,
 				Reason: path.reason, ReferencePrice: analysis.SnapshotPrice, ReferenceATR: atr,
 				MFEATR: path.mfeATR, MAEATR: path.maeATR, FirstReversalAt: path.firstReversalAt,
 				WindowStartAt: decisionAt, WindowEndAt: end, SampleCount: path.sampleCount,
@@ -196,7 +220,7 @@ func EvaluateCycleAIDecisions(st *store.Store, cycleID int64) (*AIEffectSummary,
 						"attempt_no": analysis.AttemptNo, "decision_generation": analysis.DecisionGeneration,
 						"decision": analysis.Verdict, "market_outcome": saved.MarketOutcome,
 						"decision_outcome": saved.DecisionOutcome, "actionability": saved.Actionability,
-						"data_quality": saved.DataQuality, "mfe_atr": saved.MFEATR, "mae_atr": saved.MAEATR,
+						"data_quality": saved.DataQuality, "execution_data_quality": saved.ExecutionDataQuality, "mfe_atr": saved.MFEATR, "mae_atr": saved.MAEATR,
 						"coverage_ratio": saved.CoverageRatio, "trader_name_snapshot": traderName,
 					},
 				})
@@ -404,8 +428,8 @@ func classifyDecisionOutcome(analysis, next *store.ReentryAIAnalysis, marketOutc
 	}
 }
 
-func requestedAttempt(events []*store.CopyGuardEvent, attempts []*store.CopyGuardAttempt, analysis *store.ReentryAIAnalysis) (*store.CopyGuardAttempt, bool) {
-	if !hasEventForAnalysis(events, "REENTRY_REQUESTED", analysis.ID) {
+func requestedAttemptWithin(events []*store.CopyGuardEvent, attempts []*store.CopyGuardAttempt, analysis *store.ReentryAIAnalysis, end time.Time) (*store.CopyGuardAttempt, bool) {
+	if !hasEventForAnalysisWithin(events, "REENTRY_REQUESTED", analysis.ID, end) {
 		return nil, false
 	}
 	for _, attempt := range attempts {
@@ -416,10 +440,10 @@ func requestedAttempt(events []*store.CopyGuardEvent, attempts []*store.CopyGuar
 	return nil, true
 }
 
-func hasLaterExecutedAttempt(events []*store.CopyGuardEvent, attempts []*store.CopyGuardAttempt, analysis *store.ReentryAIAnalysis) *store.CopyGuardAttempt {
+func hasLaterExecutedAttemptWithin(events []*store.CopyGuardEvent, attempts []*store.CopyGuardAttempt, analysis *store.ReentryAIAnalysis, end time.Time) *store.CopyGuardAttempt {
 	decisionAt := analysisDecisionAt(analysis)
 	for _, event := range events {
-		if event == nil || event.Type != "REENTRY_REQUESTED" || event.CreatedAt.Before(decisionAt) {
+		if event == nil || event.Type != "REENTRY_REQUESTED" || event.CreatedAt.Before(decisionAt) || event.CreatedAt.After(end) {
 			continue
 		}
 		attemptNo, ok := metadataInt(event.Metadata, "attempt_no")
@@ -446,8 +470,15 @@ func analysisDecisionAt(analysis *store.ReentryAIAnalysis) time.Time {
 }
 
 func hasEventForAnalysis(events []*store.CopyGuardEvent, eventType string, analysisID int64) bool {
+	return hasEventForAnalysisWithin(events, eventType, analysisID, time.Time{})
+}
+
+func hasEventForAnalysisWithin(events []*store.CopyGuardEvent, eventType string, analysisID int64, end time.Time) bool {
 	for _, event := range events {
 		if event == nil || event.Type != eventType {
+			continue
+		}
+		if !end.IsZero() && event.CreatedAt.After(end) {
 			continue
 		}
 		if id, ok := metadataInt64(event.Metadata, "analysis_id"); ok && id == analysisID {
@@ -458,8 +489,15 @@ func hasEventForAnalysis(events []*store.CopyGuardEvent, eventType string, analy
 }
 
 func hasEventForAttempt(events []*store.CopyGuardEvent, eventType string, attemptNo int) bool {
+	return hasEventForAttemptWithin(events, eventType, attemptNo, time.Time{})
+}
+
+func hasEventForAttemptWithin(events []*store.CopyGuardEvent, eventType string, attemptNo int, end time.Time) bool {
 	for _, event := range events {
 		if event == nil || event.Type != eventType {
+			continue
+		}
+		if !end.IsZero() && event.CreatedAt.After(end) {
 			continue
 		}
 		if value, ok := metadataInt(event.Metadata, "attempt_no"); ok && value == attemptNo {
@@ -467,6 +505,33 @@ func hasEventForAttempt(events []*store.CopyGuardEvent, eventType string, attemp
 		}
 	}
 	return false
+}
+
+type executionIntentTimeKind int
+
+const (
+	executionIntentCreated executionIntentTimeKind = iota
+	executionIntentSubmitted
+	executionIntentFilled
+	executionIntentProtected
+)
+
+func executionIntentWithin(intent *store.CopyTradeExecutionIntent, kind executionIntentTimeKind, end time.Time) bool {
+	if intent == nil {
+		return false
+	}
+	var at *time.Time
+	switch kind {
+	case executionIntentCreated:
+		at = &intent.CreatedAt
+	case executionIntentSubmitted:
+		at = intent.SubmittedAt
+	case executionIntentFilled:
+		at = intent.FilledAt
+	case executionIntentProtected:
+		at = intent.ProtectedAt
+	}
+	return at != nil && (end.IsZero() || !at.After(end))
 }
 
 func metadataInt64(metadata map[string]interface{}, key string) (int64, bool) {
@@ -535,7 +600,7 @@ func summarizeCycle(cycle *store.CopyGuardCycle, attempts []*store.CopyGuardAtte
 		summary.DecisionCounts[evaluation.Decision]++
 		summary.DecisionOutcomeCounts[evaluation.DecisionOutcome]++
 		summary.MarketOutcomeCounts[evaluation.MarketOutcome]++
-		if evaluation.DecisionOutcome == "UNSCORABLE" {
+		if evaluation.DataQuality != "VERIFIED" {
 			summary.UnscorableDecisions++
 		} else {
 			summary.ScorableDecisions++

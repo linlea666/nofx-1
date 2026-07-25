@@ -171,7 +171,28 @@ func (s *ReentryAIStore) initTables() error {
 	if err := s.initReentryDiagnosticTable(); err != nil {
 		return err
 	}
-	return s.initReentryDecisionEvaluationTable()
+	if err := s.initReentryDecisionEvaluationTable(); err != nil {
+		return err
+	}
+	// Candidate PnL belongs only to the exact analysis whose durable execution
+	// intent filled. Older code matched on attempt_no alone, so a rejected ENTER
+	// could inherit a later analysis' PnL. Clear only rows whose contamination is
+	// positively proven by another exact filled analysis on the same candidate
+	// attempt; preserve legacy rows that lack enough evidence and exclude them
+	// from v3 verified statistics instead of destructively guessing.
+	_, err = s.db.Exec(`UPDATE reentry_ai_analyses SET outcome_pnl=NULL,updated_at=CURRENT_TIMESTAMP
+		WHERE candidate_id>0 AND outcome_pnl IS NOT NULL AND NOT EXISTS (
+			SELECT 1 FROM copy_trade_execution_intents i
+			WHERE i.analysis_id=reentry_ai_analyses.id AND i.status IN ('FILLED','PROTECTED')
+		) AND EXISTS (
+			SELECT 1 FROM reentry_ai_analyses exact_analysis
+			JOIN copy_trade_execution_intents exact_intent ON exact_intent.analysis_id=exact_analysis.id
+			WHERE exact_analysis.candidate_id=reentry_ai_analyses.candidate_id
+			  AND exact_analysis.attempt_no=reentry_ai_analyses.attempt_no
+			  AND exact_analysis.id<>reentry_ai_analyses.id
+			  AND exact_intent.status IN ('FILLED','PROTECTED')
+		)`)
+	return err
 }
 
 const reentryAnalysisColumns = `id, signal_id, candidate_id, trader_id, cycle_id, symbol, side, attempt_no, decision_generation, call_status, call_error, data_hash,
@@ -436,7 +457,13 @@ func (s *ReentryAIStore) ListCandidateAnalysesPendingOutcome(limit int) ([]*Reen
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
-	rows, err := s.db.Query(`SELECT `+reentryAnalysisColumns+` FROM reentry_ai_analyses WHERE candidate_id>0 AND verdict=? AND call_status='COMPLETED' AND outcome_pnl IS NULL ORDER BY id LIMIT ?`, ReentryVerdictEnter, limit)
+	rows, err := s.db.Query(`SELECT `+reentryAnalysisColumns+` FROM reentry_ai_analyses a
+		WHERE a.candidate_id>0 AND a.verdict=? AND a.call_status='COMPLETED' AND a.outcome_pnl IS NULL
+		AND EXISTS (
+			SELECT 1 FROM copy_trade_execution_intents i
+			WHERE i.analysis_id=a.id AND i.status IN ('FILLED','PROTECTED')
+		)
+		ORDER BY a.id LIMIT ?`, ReentryVerdictEnter, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -519,6 +546,10 @@ type ReentryAIStats struct {
 	CandidateProfitable         int            `json:"candidate_profitable"`
 	CandidateEvaluated          int            `json:"candidate_evaluated"`
 	CandidateUnscorable         int            `json:"candidate_unscorable"`
+	CandidateExecutionRequested int            `json:"candidate_execution_requested"`
+	CandidateExecutionSubmitted int            `json:"candidate_execution_submitted"`
+	CandidateExecutionFilled    int            `json:"candidate_execution_filled"`
+	CandidateExecutionProtected int            `json:"candidate_execution_protected"`
 	CandidateEvaluationOutcomes map[string]int `json:"candidate_evaluation_outcomes"`
 	CandidateMarketOutcomes     map[string]int `json:"candidate_market_outcomes"`
 }
@@ -585,15 +616,15 @@ func (s *ReentryAIStore) GetReentryAIStats(traderIDs []string) (*ReentryAIStats,
 	if err := fill("external_verdict", st.ExternalVerdicts, &st.ExternalScored, &st.ExternalCorrect); err != nil {
 		return nil, err
 	}
-	rows, err := s.db.Query(`SELECT verdict,call_status,COUNT(*),COALESCE(SUM(CASE WHEN outcome_pnl IS NOT NULL THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN outcome_pnl>0 THEN 1 ELSE 0 END),0) FROM reentry_ai_analyses WHERE trader_id IN (`+marks+`) AND candidate_id>0 GROUP BY verdict,call_status`, args...)
+	rows, err := s.db.Query(`SELECT verdict,call_status,COUNT(*) FROM reentry_ai_analyses WHERE trader_id IN (`+marks+`) AND candidate_id>0 GROUP BY verdict,call_status`, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var verdict, status string
-		var count, scored, profitable int
-		if err := rows.Scan(&verdict, &status, &count, &scored, &profitable); err != nil {
+		var count int
+		if err := rows.Scan(&verdict, &status, &count); err != nil {
 			return nil, err
 		}
 		st.CandidateAnalyses += count
@@ -601,32 +632,44 @@ func (s *ReentryAIStore) GetReentryAIStats(traderIDs []string) (*ReentryAIStats,
 		if verdict != "" {
 			st.CandidateDecisions[verdict] += count
 		}
-		st.CandidateScored += scored
-		st.CandidateProfitable += profitable
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 	evalArgs := append(append([]interface{}{}, args...), ReentryDecisionEvaluationVersion)
-	evalRows, err := s.db.Query(`SELECT decision_outcome,market_outcome,COUNT(*) FROM reentry_ai_decision_evaluations WHERE trader_id IN (`+marks+`) AND evaluation_version=? AND horizon='LEADER_FINAL' GROUP BY decision_outcome,market_outcome`, evalArgs...)
+	evalRows, err := s.db.Query(`SELECT decision_outcome,market_outcome,data_quality,COUNT(*) FROM reentry_ai_decision_evaluations WHERE trader_id IN (`+marks+`) AND evaluation_version=? AND horizon='LEADER_FINAL' GROUP BY decision_outcome,market_outcome,data_quality`, evalArgs...)
 	if err != nil {
 		return nil, err
 	}
 	defer evalRows.Close()
 	for evalRows.Next() {
-		var decisionOutcome, marketOutcome string
+		var decisionOutcome, marketOutcome, dataQuality string
 		var count int
-		if err := evalRows.Scan(&decisionOutcome, &marketOutcome, &count); err != nil {
+		if err := evalRows.Scan(&decisionOutcome, &marketOutcome, &dataQuality, &count); err != nil {
 			return nil, err
 		}
 		st.CandidateEvaluated += count
 		st.CandidateEvaluationOutcomes[decisionOutcome] += count
 		st.CandidateMarketOutcomes[marketOutcome] += count
-		if decisionOutcome == "UNSCORABLE" {
+		if dataQuality != "VERIFIED" {
 			st.CandidateUnscorable += count
 		}
 	}
 	if err := evalRows.Err(); err != nil {
+		return nil, err
+	}
+	if err := s.db.QueryRow(`SELECT
+		COALESCE(SUM(CASE WHEN actual_pnl IS NOT NULL THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN actual_pnl>0 THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(execution_requested),0),COALESCE(SUM(execution_submitted),0),
+		COALESCE(SUM(execution_filled),0),COALESCE(SUM(execution_protected),0)
+		FROM reentry_ai_decision_evaluations
+		WHERE trader_id IN (`+marks+`) AND evaluation_version=? AND horizon='LEADER_FINAL'`,
+		evalArgs...).Scan(
+		&st.CandidateScored, &st.CandidateProfitable,
+		&st.CandidateExecutionRequested, &st.CandidateExecutionSubmitted,
+		&st.CandidateExecutionFilled, &st.CandidateExecutionProtected,
+	); err != nil {
 		return nil, err
 	}
 	return st, nil

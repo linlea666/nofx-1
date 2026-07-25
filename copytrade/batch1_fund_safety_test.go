@@ -162,6 +162,40 @@ func TestMappingCircuitBreakFinalizesCopyGuardCycle(t *testing.T) {
 	}
 }
 
+func TestMappingCircuitKeepsLifecycleWhenProtectionCancelIsUnconfirmed(t *testing.T) {
+	st, err := store.New(filepath.Join(t.TempDir(), "circuit-protection-pending.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	mock := &mockStopMgr{cancelErr: errors.New("cancel timeout")}
+	ti := NewTraderIntegration("trader-1", &stopMgrExecutor{mockStopMgr: mock}, st)
+	ti.engine = &Engine{config: &CopyConfig{ProviderType: ProviderOKX, LeaderID: "leader", RiskPolicyVersion: 4}}
+	if err := st.CopyTrade().SavePositionMapping(&store.CopyTradePositionMapping{
+		TraderID: "trader-1", LeaderPosID: "leader-pos", LeaderID: "leader", Symbol: "ETHUSDT",
+		Side: "long", MarginMode: "cross", OpenedAt: time.Now(), LastKnownSize: 0.128,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cycle := newTestCopyGuardCycle(t, st, "trader-1")
+	if err := st.CopyTrade().UpsertCopyGuardProtectiveOrder(&store.CopyGuardProtectiveOrder{
+		CycleID: cycle.ID, TraderID: "trader-1", AlgoID: "stop-1", Symbol: "ETHUSDT",
+		Side: "long", MarginMode: "cross", Quantity: 0.128, TriggerPrice: 1700, Status: "live",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	dec := &decision.Decision{Action: "close_long", Symbol: "ETHUSDT", LeaderPosID: "leader-pos", MarginMode: "cross"}
+	for i := 0; i < mappingFailureCircuitThreshold; i++ {
+		ti.checkAndTripMappingCircuit(dec, errors.New("execution failed"))
+	}
+	if mapping, _ := st.CopyTrade().GetActiveMapping("trader-1", "leader-pos"); mapping == nil {
+		t.Fatal("mapping closed while protective order cancellation was unconfirmed")
+	}
+	if _, err := st.CopyTrade().GetOpenCopyGuardCycle("trader-1", "leader-pos"); err != nil {
+		t.Fatal("Copy Guard cycle closed while protective order may still be live")
+	}
+}
+
 // S1：Binance 实时持仓同步失败时本轮必须 fail-closed——不消费 trade-history
 // 兜底成交（不 markSeen、不产生决策），信号下轮重取。
 func TestBinancePollFailsClosedWhenStateSyncFails(t *testing.T) {

@@ -29,6 +29,25 @@ type mockStopMgr struct {
 	canceled  []string
 }
 
+type settlingStopMgr struct {
+	mockStopMgr
+	calls int
+}
+
+func (m *settlingStopMgr) GetProtectiveStop(_, symbol string) (*trader.ProtectiveStopOrder, error) {
+	m.calls++
+	quantity := 0.5
+	trigger := 98.0
+	if m.calls > 1 {
+		quantity = 1
+		trigger = 97
+	}
+	return &trader.ProtectiveStopOrder{
+		AlgoID: "algo", Symbol: symbol, PositionSide: "long", MarginMode: "cross",
+		Quantity: quantity, TriggerPrice: trigger, State: "live",
+	}, nil
+}
+
 func notFoundErr(what string) error {
 	return fmt.Errorf("%s: %w", what, trader.ErrProtectiveStopNotFound)
 }
@@ -449,5 +468,20 @@ func TestMatchLeaderHistoryRecord(t *testing.T) {
 	}
 	if got := matchLeaderHistoryRecord(records, "missing", "ETHUSDT", "long"); got != nil {
 		t.Fatal("unknown posId must not match")
+	}
+}
+
+func TestProtectiveVerificationWaitsForAcknowledgedTargetToSettle(t *testing.T) {
+	mgr := &settlingStopMgr{}
+	ti := &TraderIntegration{}
+	got, err := ti.verifyProtectiveStopWithGrace(mgr, "algo", "ETHUSDT", "long", "cross", 1, 97, 0.1, 0.1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mgr.calls < 2 {
+		t.Fatal("successful but stale exchange state must be retried")
+	}
+	if got.Quantity != 1 || got.TriggerPrice != 97 {
+		t.Fatalf("verification returned stale target: %+v", got)
 	}
 }

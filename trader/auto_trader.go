@@ -1062,7 +1062,7 @@ func (at *AutoTrader) partialCloseQuantityStep(symbol string) float64 {
 	return inst.BaseQuantityStep
 }
 
-func (at *AutoTrader) quantizeCopyOpenQuantity(dec *decision.Decision, currentPrice, requested float64) (float64, error) {
+func (at *AutoTrader) quantizeCopyOpenQuantity(dec *decision.Decision, currentPrice, requested float64, preferReserved bool) (float64, error) {
 	resolver, ok := at.trader.(ExecutionInstrumentResolver)
 	if !ok {
 		// Compatibility for non-Copy-Guard executors and lightweight adapters.
@@ -1076,6 +1076,18 @@ func (at *AutoTrader) quantizeCopyOpenQuantity(dec *decision.Decision, currentPr
 	inst, err := resolver.ResolveExecutionInstrument(dec.Symbol)
 	if err != nil {
 		return 0, err
+	}
+	if preferReserved && dec.QuantizedQuantity > 0 {
+		locked := dec.QuantizedQuantity
+		check, checkErr := QuantizeOrderIntent(inst, locked, QuantityRiskIncrease)
+		if checkErr != nil || math.Abs(check.Quantized-locked) > math.Max(inst.BaseQuantityStep*1e-9, 1e-12) {
+			return 0, fmt.Errorf("reserved quantity %.12f is not valid for execution step %.12f", locked, inst.BaseQuantityStep)
+		}
+		if inst.MinNotional > 0 && locked*currentPrice+1e-9 < inst.MinNotional {
+			return 0, fmt.Errorf("reserved notional %.4f is below exchange minimum %.4f", locked*currentPrice, inst.MinNotional)
+		}
+		dec.PositionSizeUSD = locked * currentPrice
+		return locked, nil
 	}
 	q, err := QuantizeOrderIntent(inst, requested, QuantityRiskIncrease)
 	if err != nil {
@@ -1363,7 +1375,7 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 	// exact execution contract and quantizes once before the adapter sees it.
 	quantity := actualPositionSize / currentPrice
 	if isCopyTrade {
-		quantity, err = at.quantizeCopyOpenQuantity(decision, currentPrice, quantity)
+		quantity, err = at.quantizeCopyOpenQuantity(decision, currentPrice, quantity, true)
 		if err != nil {
 			return fmt.Errorf("copy open quantity preflight: %w", err)
 		}
@@ -1399,7 +1411,7 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 		//   - 非跟单（AI 决策已有自己的余额预扣逻辑）
 		//   - 非保证金错误（如 size below minSz、风控拒单等，减半通常无济于事）
 		if isCopyTrade && isInsufficientMarginError(err) {
-			retryQty, quantizeErr := at.quantizeCopyOpenQuantity(decision, currentPrice, quantity*0.5)
+			retryQty, quantizeErr := at.quantizeCopyOpenQuantity(decision, currentPrice, quantity*0.5, false)
 			if quantizeErr != nil {
 				return fmt.Errorf("open long retry quantity invalid: initial=%v quantize=%v", err, quantizeErr)
 			}
@@ -1607,7 +1619,7 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 	// exact execution contract and quantizes once before the adapter sees it.
 	quantity := actualPositionSize / currentPrice
 	if isCopyTrade {
-		quantity, err = at.quantizeCopyOpenQuantity(decision, currentPrice, quantity)
+		quantity, err = at.quantizeCopyOpenQuantity(decision, currentPrice, quantity, true)
 		if err != nil {
 			return fmt.Errorf("copy open quantity preflight: %w", err)
 		}
@@ -1633,7 +1645,7 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 		// 🔁 PR-4 / 修复 E'：跟单开空保证金不足，自动减半重试一次。逻辑与 OpenLong 对称。
 		// 详见 executeOpenLongWithRecord 中相同位置的注释。
 		if isCopyTrade && isInsufficientMarginError(err) {
-			retryQty, quantizeErr := at.quantizeCopyOpenQuantity(decision, currentPrice, quantity*0.5)
+			retryQty, quantizeErr := at.quantizeCopyOpenQuantity(decision, currentPrice, quantity*0.5, false)
 			if quantizeErr != nil {
 				return fmt.Errorf("open short retry quantity invalid: initial=%v quantize=%v", err, quantizeErr)
 			}

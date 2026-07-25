@@ -251,6 +251,7 @@ interface FormState {
   risk_reentry_enabled: boolean // 默认 true：AI guarded 持续观察重入
   risk_reentry_ratio: number // 默认 50%（前端用百分比，提交时转 0.5）
   risk_reentry_decision_mode: 'ai_guarded' | 'legacy_rule' | 'disabled'
+  risk_reentry_min_notional: number // 0=使用交易所最小名义
   risk_ai_confidence_threshold: number // 前端百分比
   risk_ai_min_review_seconds: number
   risk_ai_daily_call_limit: number
@@ -336,6 +337,7 @@ export function TraderConfigModal({
     risk_reentry_enabled: true,
     risk_reentry_ratio: 50, // %（提交时 /100 转 0.5）
     risk_reentry_decision_mode: 'ai_guarded',
+    risk_reentry_min_notional: 0,
     risk_ai_confidence_threshold: 80,
     risk_ai_min_review_seconds: 300,
     risk_ai_daily_call_limit: 12,
@@ -493,6 +495,7 @@ export function TraderConfigModal({
                 : 50,
             risk_reentry_decision_mode:
               cfg.risk_reentry_decision_mode ?? 'ai_guarded',
+            risk_reentry_min_notional: cfg.risk_reentry_min_notional ?? 0,
             risk_ai_confidence_threshold:
               (cfg.risk_ai_confidence_threshold ?? 0.8) * 100,
             risk_ai_min_review_seconds: cfg.risk_ai_min_review_seconds ?? 300,
@@ -581,6 +584,7 @@ export function TraderConfigModal({
           risk_reentry_ratio: (cfg.risk_reentry_ratio ?? 0.5) * 100,
           risk_reentry_decision_mode:
             cfg.risk_reentry_decision_mode ?? 'ai_guarded',
+          risk_reentry_min_notional: cfg.risk_reentry_min_notional ?? 0,
           risk_ai_confidence_threshold:
             (cfg.risk_ai_confidence_threshold ?? 0.8) * 100,
           risk_ai_min_review_seconds: cfg.risk_ai_min_review_seconds ?? 300,
@@ -652,6 +656,7 @@ export function TraderConfigModal({
         risk_reentry_enabled: true,
         risk_reentry_ratio: 50,
         risk_reentry_decision_mode: 'ai_guarded',
+        risk_reentry_min_notional: 0,
         risk_ai_confidence_threshold: 80,
         risk_ai_min_review_seconds: 300,
         risk_ai_daily_call_limit: 12,
@@ -888,6 +893,7 @@ export function TraderConfigModal({
             risk_reentry_enabled: formData.risk_reentry_enabled,
             risk_reentry_ratio: formData.risk_reentry_ratio / 100,
             risk_reentry_decision_mode: formData.risk_reentry_decision_mode,
+            risk_reentry_min_notional: formData.risk_reentry_min_notional,
             risk_ai_confidence_threshold:
               formData.risk_ai_confidence_threshold / 100,
             risk_ai_min_review_seconds: formData.risk_ai_min_review_seconds,
@@ -1777,6 +1783,7 @@ export function TraderConfigModal({
                                       risk_reentry_enabled: true,
                                       risk_reentry_ratio: 50,
                                       risk_reentry_decision_mode: 'ai_guarded',
+                                      risk_reentry_min_notional: 0,
                                       risk_ai_confidence_threshold: 80,
                                       risk_ai_min_review_seconds: 300,
                                       risk_ai_daily_call_limit: 12,
@@ -2337,6 +2344,26 @@ export function TraderConfigModal({
                                       className="w-full accent-[#F0B90B]"
                                     />
                                   </div>
+                                  <label className="text-xs text-[#848E9C]">
+                                    AI 重入最小名义（USDT）
+                                    <input
+                                      type="number"
+                                      min="0"
+                                      step="1"
+                                      value={formData.risk_reentry_min_notional}
+                                      onChange={(e) =>
+                                        handleInputChange(
+                                          'risk_reentry_min_notional',
+                                          Math.max(0, Number(e.target.value))
+                                        )
+                                      }
+                                      className="mt-1 w-full px-2 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF]"
+                                    />
+                                    <span className="mt-1 block text-[10px] text-[#5E6673]">
+                                      0
+                                      表示采用交易所合约最小值，不使用跟单预警阈值
+                                    </span>
+                                  </label>
                                 </div>
                                 {formData.risk_reentry_decision_mode ===
                                   'ai_guarded' && (

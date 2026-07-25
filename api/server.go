@@ -465,6 +465,7 @@ type CopyConfigReq struct {
 	RiskReentryEnabled         *bool    `json:"risk_reentry_enabled,omitempty"`
 	RiskReentryRatio           float64  `json:"risk_reentry_ratio,omitempty"`
 	RiskReentryDecisionMode    *string  `json:"risk_reentry_decision_mode,omitempty"`
+	RiskReentryMinNotional     *float64 `json:"risk_reentry_min_notional,omitempty"`
 	RiskCycleLossBudgetPct     *float64 `json:"risk_cycle_loss_budget_pct,omitempty"`
 	RiskPortfolioLossBudgetPct *float64 `json:"risk_portfolio_loss_budget_pct,omitempty"`
 	RiskRoundTripFeeBPS        *float64 `json:"risk_round_trip_fee_bps,omitempty"`
@@ -602,6 +603,9 @@ func applyCopyConfigRiskFields(copyConfig *store.CopyTradeConfig, req *CopyConfi
 	}
 	if req.RiskReentryDecisionMode != nil {
 		copyConfig.RiskReentryDecisionMode = *req.RiskReentryDecisionMode
+	}
+	if req.RiskReentryMinNotional != nil {
+		copyConfig.RiskReentryMinNotional = *req.RiskReentryMinNotional
 	}
 	if req.RiskCycleLossBudgetPct != nil {
 		copyConfig.RiskCycleLossBudgetPct = *req.RiskCycleLossBudgetPct

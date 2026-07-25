@@ -59,6 +59,10 @@ type CopyTradeConfig struct {
 	// RiskReentryDecisionMode 决定止损后的重入决策来源。
 	// legacy_rule 仅为存量兼容；ai_guarded 由 AI 判断方向、代码执行风控；disabled 禁用重入。
 	RiskReentryDecisionMode string `json:"risk_reentry_decision_mode"`
+	// RiskReentryMinNotional is an explicit AI/reentry execution floor.
+	// Zero delegates to the resolved exchange instrument minimum and must not
+	// inherit MinTradeWarn (which is only an operational warning threshold).
+	RiskReentryMinNotional float64 `json:"risk_reentry_min_notional"`
 
 	// vNext 风险预算。RiskAccountPct 保留原 JSON/DB 名称以兼容旧客户端，
 	// 在新策略中语义明确为“单次尝试最大账户风险”。

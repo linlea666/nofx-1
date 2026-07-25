@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"nofx/copyguardmetrics"
-	"nofx/copytrade"
 	"nofx/logger"
 	"nofx/store"
 )
@@ -173,16 +172,13 @@ func (a *Advisor) pollAICandidates(cfg *store.ReentryAIConfig) {
 		if err != nil || traderCfg.RiskReentryDecisionMode != "ai_guarded" || !traderCfg.RiskReentryEnabled {
 			continue
 		}
-		minNotional := traderCfg.MinTradeWarn
-		if minNotional <= 0 {
-			minNotional = copytrade.DefaultMinTradeNotional
-		}
+		minNotional := traderCfg.RiskReentryMinNotional
 		unactionableCode := ""
 		unactionableMessage := ""
 		switch {
 		case !candidate.Protectable:
 			unactionableCode, unactionableMessage = "PROTECTION_UNAVAILABLE", "deterministic protection precheck unavailable"
-		case candidate.MaxNotional < minNotional:
+		case minNotional > 0 && candidate.MaxNotional < minNotional:
 			unactionableCode, unactionableMessage = "MIN_NOTIONAL", fmt.Sprintf("maximum executable notional %.2f is below minimum %.2f", candidate.MaxNotional, minNotional)
 		}
 		if unactionableCode != "" {
@@ -192,7 +188,11 @@ func (a *Advisor) pollAICandidates(cfg *store.ReentryAIConfig) {
 			}
 			_ = a.st.ReentryAI().DeferReentryCandidateUnactionable(candidate.ID, 0, unactionableMessage, retry)
 			a.updateCandidateCycleStatus(candidate, store.CopyGuardAIWaiting)
-			a.recordCandidateEvent(candidate, "AI_CANDIDATE_UNACTIONABLE", candidate.TriggerPrice, candidate.MaxNotional, map[string]interface{}{"reason_code": unactionableCode, "reason": unactionableMessage})
+			if record, recordErr := a.st.ReentryAI().ShouldRecordReentryCandidateUnactionable(candidate.ID, unactionableCode, time.Hour); recordErr != nil {
+				logger.Warnf("[ReentryAdvisor] 候选 %d 无法执行事件去重失败: %v", candidate.ID, recordErr)
+			} else if record {
+				a.recordCandidateEvent(candidate, "AI_CANDIDATE_UNACTIONABLE", candidate.TriggerPrice, candidate.MaxNotional, map[string]interface{}{"reason_code": unactionableCode, "reason": unactionableMessage})
+			}
 			continue
 		}
 		claimed, ok, err := a.st.ReentryAI().ClaimReentryCandidateReview(candidate.ID, time.Duration(traderCfg.RiskAIMinReviewSeconds)*time.Second, traderCfg.RiskAIDailyCallLimit, traderCfg.RiskAILifecycleCallLimit)
@@ -219,8 +219,10 @@ func (a *Advisor) pollAICandidates(cfg *store.ReentryAIConfig) {
 			if failed != nil {
 				analysisID = failed.ID
 			}
+			recordEvent := true
 			if errors.Is(err, errCandidateUnactionable) {
-				_ = a.st.ReentryAI().DeferReentryCandidateUnactionable(claimed.ID, analysisID, err.Error(), 5*time.Minute)
+				_ = a.st.ReentryAI().DeferReentryCandidateUnactionable(claimed.ID, analysisID, err.Error(), time.Hour)
+				recordEvent, _ = a.st.ReentryAI().ShouldRecordReentryCandidateUnactionable(claimed.ID, "DATA_UNAVAILABLE", time.Hour)
 			} else {
 				_ = a.st.ReentryAI().FailReentryCandidateBeforeModel(claimed.ID, analysisID, err.Error(), candidateFailureBackoff(claimed.FailureCount+1))
 			}
@@ -234,8 +236,10 @@ func (a *Advisor) pollAICandidates(cfg *store.ReentryAIConfig) {
 			if failed != nil {
 				detail["analysis_id"] = failed.ID
 			}
-			a.recordCandidateEvent(claimed, eventType, 0, 0, detail)
-			if claimed.FailureCount+1 == 3 {
+			if recordEvent {
+				a.recordCandidateEvent(claimed, eventType, 0, 0, detail)
+			}
+			if !errors.Is(err, errCandidateUnactionable) && claimed.FailureCount+1 == 3 {
 				a.notifyCandidateImportant(claimed, "AI_REVIEW_FAILED", "AI 候选数据连续生成失败", "行情或数据包连续不可用，候选将按退避策略继续等待。")
 			}
 			continue

@@ -1804,18 +1804,17 @@ func (e *Engine) reserveExecutionIntent(dec *decision.Decision) bool {
 	if dec == nil || e.store == nil || dec.LeaderPosID == "" || dec.Action == "hold" {
 		return true
 	}
-	revision := int64(1)
-	if mapping, err := e.store.CopyTrade().GetMapping(e.traderID, dec.LeaderPosID); err != nil {
+	lastRevision, err := e.store.CopyTrade().GetSourceSnapshotRevision(e.traderID, dec.LeaderPosID)
+	if err != nil {
 		logger.Errorf("❌ [%s] 查询执行意图修订号失败 | posId=%s: %v", e.traderID, dec.LeaderPosID, err)
 		if dec.SourceFillID != "" {
 			e.UnmarkSeen(dec.SourceFillID)
 		}
 		return false
-	} else if mapping != nil {
-		revision = mapping.SourceRevision + 1
-		if revision <= 0 {
-			revision = 1
-		}
+	}
+	revision := lastRevision + 1
+	if revision <= 0 {
+		revision = 1
 	}
 	side := "long"
 	if strings.HasSuffix(dec.Action, "short") {

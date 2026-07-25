@@ -182,6 +182,31 @@ func TestCopyGuardAccountingNoStopHasZeroGuardEffect(t *testing.T) {
 	}
 }
 
+func TestCopyGuardSummaryExcludesMissingBaselineFromEffect(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "copyguard-missing-baseline.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&CopyGuardCycle{
+		TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "missing-baseline",
+		Symbol: "BTCUSDT", Side: "short", MarginMode: "cross", Status: CopyGuardFollowing,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = st.DB().Exec(`UPDATE copy_guard_cycles SET accounting_status='RECONCILED',stop_count=1,actual_pnl=-1,baseline_pnl=100,net_guard_effect=-101,baseline_source='missing',closed_at=CURRENT_TIMESTAMP WHERE id=?`, cycle.ID); err != nil {
+		t.Fatal(err)
+	}
+	summary, err := st.CopyTrade().CopyGuardSummary([]string{"trader-1"}, time.Now().Add(-time.Hour), time.Now().Add(time.Hour), CopyGuardFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.ActualPnL != -1 || summary.BaselinePnL != 0 || summary.NetGuardEffect != 0 || summary.UnscorableBaselineCycles != 1 || summary.StoppedCycleCount != 0 {
+		t.Fatalf("missing baseline polluted effect metrics: %+v", summary)
+	}
+}
+
 func TestCopyGuardProtectionRetryIsAtomic(t *testing.T) {
 	st, err := New(filepath.Join(t.TempDir(), "copyguard-retry.db"))
 	if err != nil {

@@ -956,6 +956,7 @@ type CopyTradeConfigRequest struct {
 	RiskReentryEnabled         *bool    `json:"risk_reentry_enabled,omitempty"`
 	RiskReentryRatio           *float64 `json:"risk_reentry_ratio,omitempty"`
 	RiskReentryDecisionMode    *string  `json:"risk_reentry_decision_mode,omitempty"`
+	RiskReentryMinNotional     *float64 `json:"risk_reentry_min_notional,omitempty"`
 	RiskCycleLossBudgetPct     *float64 `json:"risk_cycle_loss_budget_pct,omitempty"`
 	RiskPortfolioLossBudgetPct *float64 `json:"risk_portfolio_loss_budget_pct,omitempty"`
 	RiskRoundTripFeeBPS        *float64 `json:"risk_round_trip_fee_bps,omitempty"`
@@ -1162,6 +1163,11 @@ func (h *CopyTradeHandler) SaveConfig(c *gin.Context) {
 		config.RiskReentryDecisionMode = existing.RiskReentryDecisionMode
 	} else {
 		config.RiskReentryDecisionMode = "ai_guarded"
+	}
+	if req.RiskReentryMinNotional != nil {
+		config.RiskReentryMinNotional = *req.RiskReentryMinNotional
+	} else if existing != nil {
+		config.RiskReentryMinNotional = existing.RiskReentryMinNotional
 	}
 	if req.RiskCycleLossBudgetPct != nil {
 		config.RiskCycleLossBudgetPct = *req.RiskCycleLossBudgetPct

@@ -970,16 +970,16 @@ func (e *Engine) checkReentryConditions() {
 			stoppedNotional = v4Cycle.FollowerNotional
 		}
 		reentrySize := stoppedNotional * e.config.RiskReentryRatio
-		// 最小金额阈值：低于交易所最小订单价值会导致下单失败 → 触发熔断；
-		// 优先级用配置的 MinTradeWarn（与开仓金额最小阈值同一概念），未配置时统一兜底
-		minReentry := minTradeNotionalOrDefault(e.config.MinTradeWarn)
+		// Explicit reentry floor only. Zero delegates to the execution
+		// instrument resolver; MinTradeWarn is an alert and must not block AI.
+		minReentry := e.config.RiskReentryMinNotional
 		if reentrySize <= 0 {
 			logger.Warnf("⚠️ [%s] 重入金额非正(%.4f)，跳过 | posId=%s", e.traderID, reentrySize, mapping.LeaderPosID)
 			e.recordWatchSample(v4Cycle, leaderPos, markPrice, currentATR, reentryBoundary, chaseLimit, watchGateMinNotional)
 			delete(e.reentryCandidateTicks, mapping.LeaderPosID)
 			continue
 		}
-		if reentrySize < minReentry {
+		if minReentry > 0 && reentrySize < minReentry {
 			logger.Infof("⏭️ [%s] 重入金额 %.2f < 阈值 %.2f，跳过本次（条件保持，下轮再判） | posId=%s",
 				e.traderID, reentrySize, minReentry, mapping.LeaderPosID)
 			e.recordWatchSample(v4Cycle, leaderPos, markPrice, currentATR, reentryBoundary, chaseLimit, watchGateMinNotional)

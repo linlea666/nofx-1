@@ -1055,6 +1055,12 @@ function AdvisorSettingsCard() {
                   条可回填真实盈亏，其中盈利 {stats.candidate_profitable}
                   条。不会把未执行决策伪装成反事实盈亏。
                 </div>
+                <div className="text-[#848E9C]">
+                  执行漏斗：REQUESTED {stats.candidate_execution_requested ?? 0}{' '}
+                  → SUBMITTED {stats.candidate_execution_submitted ?? 0} →
+                  FILLED {stats.candidate_execution_filled ?? 0} → PROTECTED{' '}
+                  {stats.candidate_execution_protected ?? 0}
+                </div>
                 <div className="border-t border-[#2B3139] pt-2">
                   后验评价：{stats.candidate_evaluated} 条，其中不可评分{' '}
                   {stats.candidate_unscorable} 条；市场结果{' '}
@@ -2113,6 +2119,13 @@ export function CopyGuardPage() {
           }
         />
       </div>
+      {(summary?.unscorable_baseline_cycles ?? 0) > 0 && (
+        <div className="border border-[#F0B90B] bg-[#F0B90B]/10 rounded-lg p-4 text-sm text-[#F0B90B]">
+          有 {summary?.unscorable_baseline_cycles}{' '}
+          个已止损周期缺少有效领航员离场价，已从“帮你少亏 / 提前离场代价 /
+          综合净改善”中排除，避免零价格制造虚假收益。
+        </div>
+      )}
       {(summary?.unprotectable_count ?? 0) > 0 && (
         <div className="border border-[#F6465D] bg-[#F6465D]/10 rounded-lg p-4 text-sm text-[#F6465D]">
           高危：当前有 {summary?.unprotectable_count}{' '}

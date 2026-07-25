@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"math"
 	"time"
 )
 
@@ -29,34 +30,37 @@ type CopyGuardReentryCandidate struct {
 	MarginMode  string `json:"margin_mode"`
 	Status      string `json:"status"`
 
-	TriggerPrice        float64 `json:"trigger_price"`
-	ATR                 float64 `json:"atr"`
-	MaxNotional         float64 `json:"max_notional"`
-	StopCount           int     `json:"stop_count"`
-	ReentryCount        int     `json:"reentry_count"`
-	LeaderSize          float64 `json:"leader_size"`
-	LeaderEntryPrice    float64 `json:"leader_entry_price"`
-	LastStopPrice       float64 `json:"last_stop_price"`
-	DistanceATRRatio    float64 `json:"distance_atr_ratio"`
-	Protectable         bool    `json:"protectable"`
-	FeatureHash         string  `json:"feature_hash"`
-	PendingTrigger      string  `json:"pending_trigger"`
-	DecisionGeneration  int     `json:"decision_generation"`
-	ReviewCount         int     `json:"review_count"`
-	FailureCount        int     `json:"failure_count"`
-	LastDecision        string  `json:"last_decision"`
-	Regime              string  `json:"regime"`
-	Confidence          float64 `json:"confidence"`
-	SizeFactor          float64 `json:"size_factor"`
-	EntryPriceLow       float64 `json:"entry_price_low"`
-	EntryPriceHigh      float64 `json:"entry_price_high"`
-	AttentionPriceLow   float64 `json:"attention_price_low"`
-	AttentionPriceHigh  float64 `json:"attention_price_high"`
-	ConsecutiveAbandons int     `json:"consecutive_abandons"`
-	LastAbandonCandle   string  `json:"last_abandon_candle"`
-	LastAnalysisID      int64   `json:"last_analysis_id"`
-	DecisionTTLSeconds  int     `json:"decision_ttl_seconds"`
-	LastError           string  `json:"last_error"`
+	TriggerPrice            float64    `json:"trigger_price"`
+	ATR                     float64    `json:"atr"`
+	MaxNotional             float64    `json:"max_notional"`
+	StopCount               int        `json:"stop_count"`
+	ReentryCount            int        `json:"reentry_count"`
+	LeaderSize              float64    `json:"leader_size"`
+	LeaderEntryPrice        float64    `json:"leader_entry_price"`
+	LastStopPrice           float64    `json:"last_stop_price"`
+	DistanceATRRatio        float64    `json:"distance_atr_ratio"`
+	Protectable             bool       `json:"protectable"`
+	FeatureHash             string     `json:"feature_hash"`
+	PendingTrigger          string     `json:"pending_trigger"`
+	DecisionGeneration      int        `json:"decision_generation"`
+	ReviewCount             int        `json:"review_count"`
+	FailureCount            int        `json:"failure_count"`
+	LastDecision            string     `json:"last_decision"`
+	Regime                  string     `json:"regime"`
+	Confidence              float64    `json:"confidence"`
+	SizeFactor              float64    `json:"size_factor"`
+	EntryPriceLow           float64    `json:"entry_price_low"`
+	EntryPriceHigh          float64    `json:"entry_price_high"`
+	AttentionPriceLow       float64    `json:"attention_price_low"`
+	AttentionPriceHigh      float64    `json:"attention_price_high"`
+	ConsecutiveAbandons     int        `json:"consecutive_abandons"`
+	LastAbandonCandle       string     `json:"last_abandon_candle"`
+	LastAnalysisID          int64      `json:"last_analysis_id"`
+	DecisionTTLSeconds      int        `json:"decision_ttl_seconds"`
+	LastError               string     `json:"last_error"`
+	FailureBackoffUntil     *time.Time `json:"failure_backoff_until,omitempty"`
+	LastUnactionableCode    string     `json:"last_unactionable_code,omitempty"`
+	LastUnactionableEventAt *time.Time `json:"last_unactionable_event_at,omitempty"`
 
 	// Effective per-trader policy is populated by the API and is not persisted
 	// on the candidate row. This prevents the dashboard from presenting the
@@ -97,6 +101,7 @@ func (s *ReentryAIStore) initReentryCandidateTables() error {
 			attention_price_low REAL DEFAULT 0, attention_price_high REAL DEFAULT 0,
 			consecutive_abandons INTEGER DEFAULT 0, last_abandon_candle TEXT DEFAULT '',
 			last_analysis_id INTEGER DEFAULT 0, decision_ttl_seconds INTEGER DEFAULT 30, last_error TEXT DEFAULT '',
+			failure_backoff_until DATETIME, last_unactionable_code TEXT DEFAULT '', last_unactionable_event_at DATETIME,
 			snapshot_at DATETIME DEFAULT CURRENT_TIMESTAMP, last_review_at DATETIME,
 			next_review_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP, closed_at DATETIME
@@ -106,6 +111,8 @@ func (s *ReentryAIStore) initReentryCandidateTables() error {
 		CREATE TABLE IF NOT EXISTS copy_guard_risk_reservations (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			trader_id TEXT NOT NULL, account_key TEXT NOT NULL DEFAULT '', cycle_id INTEGER NOT NULL, attempt_no INTEGER NOT NULL,
+			intent_id INTEGER NOT NULL DEFAULT 0, replace_cycle_id INTEGER NOT NULL DEFAULT 0, replace_attempt_no INTEGER NOT NULL DEFAULT 0,
+			target_risk_usd REAL NOT NULL DEFAULT 0, attempt_override BOOLEAN NOT NULL DEFAULT 0,
 			risk_usd REAL NOT NULL, status TEXT NOT NULL DEFAULT 'ACTIVE',
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP, released_at DATETIME,
 			UNIQUE(cycle_id,attempt_no)
@@ -116,7 +123,16 @@ func (s *ReentryAIStore) initReentryCandidateTables() error {
 		return err
 	}
 	_, _ = s.db.Exec(`ALTER TABLE copy_guard_reentry_candidates ADD COLUMN decision_ttl_seconds INTEGER DEFAULT 30`)
+	_, _ = s.db.Exec(`ALTER TABLE copy_guard_reentry_candidates ADD COLUMN failure_backoff_until DATETIME`)
+	_, _ = s.db.Exec(`ALTER TABLE copy_guard_reentry_candidates ADD COLUMN last_unactionable_code TEXT DEFAULT ''`)
+	_, _ = s.db.Exec(`ALTER TABLE copy_guard_reentry_candidates ADD COLUMN last_unactionable_event_at DATETIME`)
 	_, _ = s.db.Exec(`ALTER TABLE copy_guard_risk_reservations ADD COLUMN account_key TEXT NOT NULL DEFAULT ''`)
+	_, _ = s.db.Exec(`ALTER TABLE copy_guard_risk_reservations ADD COLUMN intent_id INTEGER NOT NULL DEFAULT 0`)
+	_, _ = s.db.Exec(`ALTER TABLE copy_guard_risk_reservations ADD COLUMN replace_cycle_id INTEGER NOT NULL DEFAULT 0`)
+	_, _ = s.db.Exec(`ALTER TABLE copy_guard_risk_reservations ADD COLUMN replace_attempt_no INTEGER NOT NULL DEFAULT 0`)
+	_, _ = s.db.Exec(`ALTER TABLE copy_guard_risk_reservations ADD COLUMN target_risk_usd REAL NOT NULL DEFAULT 0`)
+	_, _ = s.db.Exec(`ALTER TABLE copy_guard_risk_reservations ADD COLUMN attempt_override BOOLEAN NOT NULL DEFAULT 0`)
+	_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_cg_risk_reservation_intent ON copy_guard_risk_reservations(intent_id,status)`)
 	_, _ = s.db.Exec(`UPDATE copy_guard_risk_reservations SET account_key=COALESCE((SELECT exchange_id FROM traders WHERE traders.id=copy_guard_risk_reservations.trader_id),trader_id) WHERE account_key=''`)
 	// v7 removes the human approval path. Preserve any old pending signal as a
 	// durable AI candidate so it is neither silently executed nor lost. Legacy
@@ -136,18 +152,22 @@ const reentryCandidateColumns = `id,cycle_id,trader_id,leader_pos_id,symbol,side
 	trigger_price,atr,max_notional,stop_count,reentry_count,leader_size,leader_entry_price,last_stop_price,
 	distance_atr_ratio,protectable,feature_hash,pending_trigger,decision_generation,review_count,failure_count,
 	last_decision,regime,confidence,size_factor,entry_price_low,entry_price_high,attention_price_low,attention_price_high,
-	consecutive_abandons,last_abandon_candle,last_analysis_id,decision_ttl_seconds,last_error,snapshot_at,last_review_at,next_review_at,
+	consecutive_abandons,last_abandon_candle,last_analysis_id,decision_ttl_seconds,last_error,
+	failure_backoff_until,COALESCE(last_unactionable_code,''),last_unactionable_event_at,
+	snapshot_at,last_review_at,next_review_at,
 	created_at,updated_at,closed_at`
 
 func scanReentryCandidate(row rowScanner) (*CopyGuardReentryCandidate, error) {
 	var c CopyGuardReentryCandidate
 	var snapshot, next, created, updated string
-	var last, closed sql.NullString
+	var last, closed, failureBackoff, unactionableEvent sql.NullString
 	if err := row.Scan(&c.ID, &c.CycleID, &c.TraderID, &c.LeaderPosID, &c.Symbol, &c.Side, &c.MarginMode, &c.Status,
 		&c.TriggerPrice, &c.ATR, &c.MaxNotional, &c.StopCount, &c.ReentryCount, &c.LeaderSize, &c.LeaderEntryPrice, &c.LastStopPrice,
 		&c.DistanceATRRatio, &c.Protectable, &c.FeatureHash, &c.PendingTrigger, &c.DecisionGeneration, &c.ReviewCount, &c.FailureCount,
 		&c.LastDecision, &c.Regime, &c.Confidence, &c.SizeFactor, &c.EntryPriceLow, &c.EntryPriceHigh, &c.AttentionPriceLow, &c.AttentionPriceHigh,
-		&c.ConsecutiveAbandons, &c.LastAbandonCandle, &c.LastAnalysisID, &c.DecisionTTLSeconds, &c.LastError, &snapshot, &last, &next, &created, &updated, &closed); err != nil {
+		&c.ConsecutiveAbandons, &c.LastAbandonCandle, &c.LastAnalysisID, &c.DecisionTTLSeconds, &c.LastError,
+		&failureBackoff, &c.LastUnactionableCode, &unactionableEvent,
+		&snapshot, &last, &next, &created, &updated, &closed); err != nil {
 		return nil, err
 	}
 	var err error
@@ -164,6 +184,12 @@ func scanReentryCandidate(row rowScanner) (*CopyGuardReentryCandidate, error) {
 		return nil, err
 	}
 	if c.LastReviewAt, err = parseNullableDBTime(last); err != nil {
+		return nil, err
+	}
+	if c.FailureBackoffUntil, err = parseNullableDBTime(failureBackoff); err != nil {
+		return nil, err
+	}
+	if c.LastUnactionableEventAt, err = parseNullableDBTime(unactionableEvent); err != nil {
 		return nil, err
 	}
 	if c.ClosedAt, err = parseNullableDBTime(closed); err != nil {
@@ -194,7 +220,13 @@ func (s *ReentryAIStore) EnsureReentryCandidate(c *CopyGuardReentryCandidate, fi
 		leader_size=excluded.leader_size,leader_entry_price=excluded.leader_entry_price,last_stop_price=excluded.last_stop_price,
 		distance_atr_ratio=excluded.distance_atr_ratio,protectable=excluded.protectable,
 		pending_trigger=CASE WHEN copy_guard_reentry_candidates.feature_hash<>excluded.feature_hash THEN excluded.pending_trigger ELSE copy_guard_reentry_candidates.pending_trigger END,
-		next_review_at=CASE WHEN copy_guard_reentry_candidates.feature_hash<>excluded.feature_hash THEN CASE WHEN excluded.next_review_at>CURRENT_TIMESTAMP THEN excluded.next_review_at ELSE CURRENT_TIMESTAMP END ELSE copy_guard_reentry_candidates.next_review_at END,
+		next_review_at=CASE WHEN copy_guard_reentry_candidates.feature_hash<>excluded.feature_hash THEN
+			CASE
+				WHEN copy_guard_reentry_candidates.failure_backoff_until IS NOT NULL AND copy_guard_reentry_candidates.failure_backoff_until>excluded.next_review_at THEN copy_guard_reentry_candidates.failure_backoff_until
+				WHEN excluded.next_review_at>CURRENT_TIMESTAMP THEN excluded.next_review_at
+				ELSE CURRENT_TIMESTAMP
+			END
+			ELSE copy_guard_reentry_candidates.next_review_at END,
 		feature_hash=excluded.feature_hash,
 		closed_at=CASE WHEN copy_guard_reentry_candidates.reentry_count<>excluded.reentry_count THEN NULL ELSE copy_guard_reentry_candidates.closed_at END,
 		snapshot_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP
@@ -210,7 +242,10 @@ func (s *ReentryAIStore) ListDueReentryCandidates(limit int) ([]*CopyGuardReentr
 	if limit <= 0 || limit > 100 {
 		limit = 50
 	}
-	rows, err := s.db.Query(`SELECT `+reentryCandidateColumns+` FROM copy_guard_reentry_candidates WHERE status IN ('WATCHING','WAITING') AND next_review_at<=CURRENT_TIMESTAMP ORDER BY next_review_at,id LIMIT ?`, limit)
+	rows, err := s.db.Query(`SELECT `+reentryCandidateColumns+` FROM copy_guard_reentry_candidates
+		WHERE status IN ('WATCHING','WAITING') AND next_review_at<=CURRENT_TIMESTAMP
+		AND (failure_backoff_until IS NULL OR failure_backoff_until<=CURRENT_TIMESTAMP)
+		ORDER BY next_review_at,id LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -314,7 +349,7 @@ func (s *ReentryAIStore) FinishReentryCandidateReview(id int64, d ReentryCandida
 	if d.Decision == ReentryVerdictAbandon {
 		status = ReentryCandidateWaiting
 	}
-	res, err := s.db.Exec(`UPDATE copy_guard_reentry_candidates SET status=?,last_decision=?,regime=?,confidence=?,size_factor=?,entry_price_low=?,entry_price_high=?,attention_price_low=?,attention_price_high=?,next_review_at=?,last_analysis_id=?,decision_ttl_seconds=?,failure_count=0,last_error='',consecutive_abandons=CASE WHEN ? AND last_abandon_candle<>? THEN consecutive_abandons+1 WHEN ? THEN consecutive_abandons ELSE 0 END,last_abandon_candle=CASE WHEN ? THEN ? ELSE '' END,updated_at=CURRENT_TIMESTAMP WHERE id=? AND status=?`, status, d.Decision, d.Regime, d.Confidence, d.SizeFactor, d.EntryPriceLow, d.EntryPriceHigh, d.AttentionPriceLow, d.AttentionPriceHigh, d.NextReview.UTC(), d.AnalysisID, d.TTLSeconds, d.ConfirmAbandon, d.CandleKey, d.ConfirmAbandon, d.ConfirmAbandon, d.CandleKey, id, ReentryCandidateReviewing)
+	res, err := s.db.Exec(`UPDATE copy_guard_reentry_candidates SET status=?,last_decision=?,regime=?,confidence=?,size_factor=?,entry_price_low=?,entry_price_high=?,attention_price_low=?,attention_price_high=?,next_review_at=?,last_analysis_id=?,decision_ttl_seconds=?,failure_count=0,last_error='',failure_backoff_until=NULL,consecutive_abandons=CASE WHEN ? AND last_abandon_candle<>? THEN consecutive_abandons+1 WHEN ? THEN consecutive_abandons ELSE 0 END,last_abandon_candle=CASE WHEN ? THEN ? ELSE '' END,updated_at=CURRENT_TIMESTAMP WHERE id=? AND status=?`, status, d.Decision, d.Regime, d.Confidence, d.SizeFactor, d.EntryPriceLow, d.EntryPriceHigh, d.AttentionPriceLow, d.AttentionPriceHigh, d.NextReview.UTC(), d.AnalysisID, d.TTLSeconds, d.ConfirmAbandon, d.CandleKey, d.ConfirmAbandon, d.ConfirmAbandon, d.CandleKey, id, ReentryCandidateReviewing)
 	if err != nil {
 		return err
 	}
@@ -325,7 +360,8 @@ func (s *ReentryAIStore) FinishReentryCandidateReview(id int64, d ReentryCandida
 }
 
 func (s *ReentryAIStore) FailReentryCandidateReview(id int64, message string, retry time.Duration) error {
-	res, err := s.db.Exec(`UPDATE copy_guard_reentry_candidates SET status=?,failure_count=failure_count+1,last_error=?,next_review_at=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND status IN (?,?)`, ReentryCandidateWaiting, message, time.Now().Add(retry).UTC(), id, ReentryCandidateReviewing, ReentryCandidateEntryPending)
+	retryAt := time.Now().Add(retry).UTC()
+	res, err := s.db.Exec(`UPDATE copy_guard_reentry_candidates SET status=?,failure_count=failure_count+1,last_error=?,next_review_at=?,failure_backoff_until=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND status IN (?,?)`, ReentryCandidateWaiting, message, retryAt, retryAt, id, ReentryCandidateReviewing, ReentryCandidateEntryPending)
 	if err != nil {
 		return err
 	}
@@ -363,8 +399,9 @@ func (s *ReentryAIStore) DeferReentryCandidateUnactionable(candidateID, analysis
 			return err
 		}
 	}
-	res, err := tx.Exec(`UPDATE copy_guard_reentry_candidates SET status=?,review_count=CASE WHEN status=? THEN max(review_count-1,0) ELSE review_count END,last_error=?,next_review_at=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND status IN (?,?,?)`,
-		ReentryCandidateWaiting, ReentryCandidateReviewing, message, time.Now().Add(retry).UTC(), candidateID, ReentryCandidateWatching, ReentryCandidateWaiting, ReentryCandidateReviewing)
+	retryAt := time.Now().Add(retry).UTC()
+	res, err := tx.Exec(`UPDATE copy_guard_reentry_candidates SET status=?,review_count=CASE WHEN status=? THEN max(review_count-1,0) ELSE review_count END,last_error=?,next_review_at=?,failure_backoff_until=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND status IN (?,?,?)`,
+		ReentryCandidateWaiting, ReentryCandidateReviewing, message, retryAt, retryAt, candidateID, ReentryCandidateWatching, ReentryCandidateWaiting, ReentryCandidateReviewing)
 	if err != nil {
 		return err
 	}
@@ -372,6 +409,31 @@ func (s *ReentryAIStore) DeferReentryCandidateUnactionable(candidateID, analysis
 		return fmt.Errorf("candidate is no longer actionable")
 	}
 	return tx.Commit()
+}
+
+// ShouldRecordReentryCandidateUnactionable suppresses identical deterministic
+// noise while retaining a periodic heartbeat. Scheduling remains owned by
+// DeferReentryCandidateUnactionable.
+func (s *ReentryAIStore) ShouldRecordReentryCandidateUnactionable(candidateID int64, reasonCode string, heartbeat time.Duration) (bool, error) {
+	if candidateID <= 0 || reasonCode == "" {
+		return false, fmt.Errorf("invalid unactionable event identity")
+	}
+	if heartbeat <= 0 {
+		heartbeat = time.Hour
+	}
+	cutoff := time.Now().Add(-heartbeat).UTC()
+	res, err := s.db.Exec(`UPDATE copy_guard_reentry_candidates
+		SET last_unactionable_code=?,last_unactionable_event_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP
+		WHERE id=? AND (
+			COALESCE(last_unactionable_code,'')<>? OR
+			last_unactionable_event_at IS NULL OR
+			last_unactionable_event_at<=?
+		)`, reasonCode, candidateID, reasonCode, cutoff)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
 }
 
 // FailReentryCandidateBeforeModel returns a claimed review that failed during
@@ -392,7 +454,8 @@ func (s *ReentryAIStore) FailReentryCandidateBeforeModel(candidateID, analysisID
 			return fmt.Errorf("candidate analysis is no longer pending")
 		}
 	}
-	res, err := tx.Exec(`UPDATE copy_guard_reentry_candidates SET status=?,review_count=max(review_count-1,0),failure_count=failure_count+1,last_error=?,next_review_at=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND status=?`, ReentryCandidateWaiting, message, time.Now().Add(retry).UTC(), candidateID, ReentryCandidateReviewing)
+	retryAt := time.Now().Add(retry).UTC()
+	res, err := tx.Exec(`UPDATE copy_guard_reentry_candidates SET status=?,review_count=max(review_count-1,0),failure_count=failure_count+1,last_error=?,next_review_at=?,failure_backoff_until=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND status=?`, ReentryCandidateWaiting, message, retryAt, retryAt, candidateID, ReentryCandidateReviewing)
 	if err != nil {
 		return err
 	}
@@ -638,17 +701,17 @@ func (s *ReentryAIStore) ListReentryCandidatesByTraders(traderIDs []string, stat
 // ReserveCopyGuardRisk 在同一 SQLite 事务内校验并预留单次、周期和组合风险，
 // 防止多个交易员的 AI 决策同时通过各自的内存检查。
 func (s *ReentryAIStore) ReserveCopyGuardRisk(traderID string, cycleID int64, attemptNo int, riskUSD, equity, attemptPct, cyclePct, portfolioPct float64) error {
-	return s.reserveCopyGuardRisk(traderID, cycleID, attemptNo, riskUSD, equity, attemptPct, cyclePct, portfolioPct, false)
+	return s.reserveCopyGuardRisk(traderID, cycleID, attemptNo, 0, riskUSD, equity, attemptPct, cyclePct, portfolioPct, false)
 }
 
 // ReserveCopyGuardRiskFollowFirst permits only the discrete execution-step
 // exception selected by the operator: the attempt target may be exceeded, but
 // cycle and account-portfolio budgets remain hard transactional limits.
 func (s *ReentryAIStore) ReserveCopyGuardRiskFollowFirst(traderID string, cycleID int64, attemptNo int, riskUSD, equity, attemptPct, cyclePct, portfolioPct float64) error {
-	return s.reserveCopyGuardRisk(traderID, cycleID, attemptNo, riskUSD, equity, attemptPct, cyclePct, portfolioPct, true)
+	return s.reserveCopyGuardRisk(traderID, cycleID, attemptNo, 0, riskUSD, equity, attemptPct, cyclePct, portfolioPct, true)
 }
 
-func (s *ReentryAIStore) reserveCopyGuardRisk(traderID string, cycleID int64, attemptNo int, riskUSD, equity, attemptPct, cyclePct, portfolioPct float64, allowAttemptStepOverride bool) error {
+func (s *ReentryAIStore) reserveCopyGuardRisk(traderID string, cycleID int64, attemptNo int, intentID int64, riskUSD, equity, attemptPct, cyclePct, portfolioPct float64, allowAttemptStepOverride bool) error {
 	if riskUSD <= 0 || equity <= 0 {
 		return fmt.Errorf("invalid risk reservation")
 	}
@@ -681,11 +744,129 @@ func (s *ReentryAIStore) reserveCopyGuardRisk(traderID string, cycleID int64, at
 	if portfolioUsed+riskUSD > equity*portfolioPct+1e-9 {
 		return fmt.Errorf("portfolio risk %.4f exceeds remaining budget %.4f", riskUSD, equity*portfolioPct-portfolioUsed)
 	}
-	_, err = tx.Exec(`INSERT INTO copy_guard_risk_reservations(trader_id,account_key,cycle_id,attempt_no,risk_usd,status) VALUES(?,?,?,?,?, 'ACTIVE') ON CONFLICT(cycle_id,attempt_no) DO UPDATE SET trader_id=excluded.trader_id,account_key=excluded.account_key,risk_usd=excluded.risk_usd,status='ACTIVE',released_at=NULL`, traderID, accountKey, cycleID, attemptNo, riskUSD)
+	_, err = tx.Exec(`INSERT INTO copy_guard_risk_reservations(trader_id,account_key,cycle_id,attempt_no,intent_id,risk_usd,status) VALUES(?,?,?,?,?,?,'ACTIVE') ON CONFLICT(cycle_id,attempt_no) DO UPDATE SET trader_id=excluded.trader_id,account_key=excluded.account_key,intent_id=excluded.intent_id,risk_usd=excluded.risk_usd,status='ACTIVE',released_at=NULL`, traderID, accountKey, cycleID, attemptNo, intentID, riskUSD)
 	if err != nil {
 		return err
 	}
 	return tx.Commit()
+}
+
+// ReserveCopyGuardIntentRisk atomically reserves the target risk before a
+// leader open/add reaches the exchange. For an add, the existing cycle attempt
+// remains active and the temporary row contributes only the positive delta, so
+// concurrent account checks see the exact target rather than double-counting.
+func (s *ReentryAIStore) ReserveCopyGuardIntentRisk(traderID string, intentID, replaceCycleID int64, replaceAttemptNo int, targetRiskUSD, equity, attemptPct, cyclePct, portfolioPct float64, allowAttemptStepOverride bool) error {
+	if intentID <= 0 || targetRiskUSD <= 0 || equity <= 0 {
+		return fmt.Errorf("invalid execution intent risk reservation")
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	accountKey := traderID
+	var exchangeID sql.NullString
+	if queryErr := tx.QueryRow(`SELECT exchange_id FROM traders WHERE id=?`, traderID).Scan(&exchangeID); queryErr == nil && exchangeID.Valid && exchangeID.String != "" {
+		accountKey = exchangeID.String
+	}
+	var oldRisk, cycleUsed, portfolioUsed float64
+	if replaceCycleID > 0 {
+		oldErr := tx.QueryRow(`SELECT COALESCE(risk_usd,0) FROM copy_guard_risk_reservations WHERE cycle_id=? AND attempt_no=? AND status='ACTIVE'`, replaceCycleID, replaceAttemptNo).Scan(&oldRisk)
+		if oldErr != nil && oldErr != sql.ErrNoRows {
+			return oldErr
+		}
+		if err = tx.QueryRow(`SELECT COALESCE(SUM(risk_usd),0) FROM copy_guard_risk_reservations WHERE cycle_id=? AND status IN ('ACTIVE','CONSUMED') AND attempt_no<>?`, replaceCycleID, replaceAttemptNo).Scan(&cycleUsed); err != nil {
+			return err
+		}
+	}
+	if err = tx.QueryRow(`SELECT COALESCE(SUM(risk_usd),0) FROM copy_guard_risk_reservations WHERE account_key=? AND status='ACTIVE' AND cycle_id<>? AND NOT (cycle_id=? AND attempt_no=?)`, accountKey, -intentID, replaceCycleID, replaceAttemptNo).Scan(&portfolioUsed); err != nil {
+		return err
+	}
+	if !allowAttemptStepOverride && targetRiskUSD > equity*attemptPct+1e-9 {
+		return fmt.Errorf("attempt risk %.4f exceeds %.4f", targetRiskUSD, equity*attemptPct)
+	}
+	if cycleUsed+targetRiskUSD > equity*cyclePct+1e-9 {
+		return fmt.Errorf("cycle risk %.4f exceeds remaining budget %.4f", targetRiskUSD, equity*cyclePct-cycleUsed)
+	}
+	if portfolioUsed+targetRiskUSD > equity*portfolioPct+1e-9 {
+		return fmt.Errorf("portfolio risk %.4f exceeds remaining budget %.4f", targetRiskUSD, equity*portfolioPct-portfolioUsed)
+	}
+	additionalRisk := math.Max(0, targetRiskUSD-oldRisk)
+	_, err = tx.Exec(`INSERT INTO copy_guard_risk_reservations
+		(trader_id,account_key,cycle_id,attempt_no,intent_id,replace_cycle_id,replace_attempt_no,target_risk_usd,attempt_override,risk_usd,status)
+		VALUES(?,?,?,0,?,?,?,?,?,?,'ACTIVE')
+		ON CONFLICT(cycle_id,attempt_no) DO UPDATE SET trader_id=excluded.trader_id,account_key=excluded.account_key,intent_id=excluded.intent_id,
+			replace_cycle_id=excluded.replace_cycle_id,replace_attempt_no=excluded.replace_attempt_no,target_risk_usd=excluded.target_risk_usd,
+			attempt_override=excluded.attempt_override,risk_usd=excluded.risk_usd,status='ACTIVE',released_at=NULL`,
+		traderID, accountKey, -intentID, intentID, replaceCycleID, replaceAttemptNo, targetRiskUSD, allowAttemptStepOverride, additionalRisk)
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// PromoteCopyGuardIntentRisk transfers the live pre-submit reservation to the
+// real cycle after the exchange fill and protective stop are confirmed. It
+// revalidates the actual fill risk while excluding the temporary row, so the
+// promotion cannot overbook the account under concurrent traders.
+func (s *ReentryAIStore) PromoteCopyGuardIntentRisk(traderID string, intentID, cycleID int64, attemptNo int, riskUSD, equity, attemptPct, cyclePct, portfolioPct float64, allowAttemptStepOverride bool) (bool, error) {
+	if intentID <= 0 || cycleID <= 0 || riskUSD <= 0 || equity <= 0 {
+		return false, nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	var reservationID int64
+	var accountKey string
+	var reservedTarget float64
+	var replaceCycleID int64
+	var replaceAttemptNo int
+	var storedOverride bool
+	if err = tx.QueryRow(`SELECT id,account_key,target_risk_usd,replace_cycle_id,replace_attempt_no,attempt_override FROM copy_guard_risk_reservations WHERE intent_id=? AND cycle_id=? AND status='ACTIVE'`, intentID, -intentID).Scan(&reservationID, &accountKey, &reservedTarget, &replaceCycleID, &replaceAttemptNo, &storedOverride); err == sql.ErrNoRows {
+		return false, nil
+	} else if err != nil {
+		return false, err
+	}
+	if replaceCycleID != 0 && (replaceCycleID != cycleID || replaceAttemptNo != attemptNo) {
+		return false, fmt.Errorf("intent risk target changed: reserved cycle=%d/%d actual=%d/%d", replaceCycleID, replaceAttemptNo, cycleID, attemptNo)
+	}
+	var cycleUsed, portfolioUsed float64
+	if err = tx.QueryRow(`SELECT COALESCE(SUM(risk_usd),0) FROM copy_guard_risk_reservations WHERE cycle_id=? AND status IN ('ACTIVE','CONSUMED') AND attempt_no<>?`, cycleID, attemptNo).Scan(&cycleUsed); err != nil {
+		return false, err
+	}
+	if err = tx.QueryRow(`SELECT COALESCE(SUM(risk_usd),0) FROM copy_guard_risk_reservations WHERE account_key=? AND status='ACTIVE' AND id<>? AND NOT (cycle_id=? AND attempt_no=?)`, accountKey, reservationID, cycleID, attemptNo).Scan(&portfolioUsed); err != nil {
+		return false, err
+	}
+	// A temporary reservation above the attempt target is durable evidence that
+	// the one-step exception passed the hard caps before submission. Preserve
+	// it across a process restart where the in-memory decision flag is lost.
+	allowAttemptStepOverride = allowAttemptStepOverride || storedOverride || reservedTarget > equity*attemptPct+1e-9
+	if !allowAttemptStepOverride && riskUSD > equity*attemptPct+1e-9 {
+		return false, fmt.Errorf("attempt risk %.4f exceeds %.4f", riskUSD, equity*attemptPct)
+	}
+	if cycleUsed+riskUSD > equity*cyclePct+1e-9 {
+		return false, fmt.Errorf("cycle risk %.4f exceeds remaining budget %.4f", riskUSD, equity*cyclePct-cycleUsed)
+	}
+	if portfolioUsed+riskUSD > equity*portfolioPct+1e-9 {
+		return false, fmt.Errorf("portfolio risk %.4f exceeds remaining budget %.4f", riskUSD, equity*portfolioPct-portfolioUsed)
+	}
+	if _, err = tx.Exec(`INSERT INTO copy_guard_risk_reservations(trader_id,account_key,cycle_id,attempt_no,intent_id,risk_usd,status) VALUES(?,?,?,?,0,?,'ACTIVE') ON CONFLICT(cycle_id,attempt_no) DO UPDATE SET trader_id=excluded.trader_id,account_key=excluded.account_key,intent_id=0,risk_usd=excluded.risk_usd,status='ACTIVE',released_at=NULL`, traderID, accountKey, cycleID, attemptNo, riskUSD); err != nil {
+		return false, err
+	}
+	if _, err = tx.Exec(`UPDATE copy_guard_risk_reservations SET status='RELEASED',released_at=CURRENT_TIMESTAMP WHERE id=? AND status='ACTIVE'`, reservationID); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
+}
+
+func (s *ReentryAIStore) ReleaseCopyGuardIntentRisk(intentID int64) error {
+	if intentID <= 0 {
+		return nil
+	}
+	_, err := s.db.Exec(`UPDATE copy_guard_risk_reservations SET status='RELEASED',released_at=CURRENT_TIMESTAMP WHERE intent_id=? AND status='ACTIVE'`, intentID)
+	return err
 }
 
 func (s *ReentryAIStore) ReleaseCopyGuardRisk(cycleID int64, attemptNo int) error {
