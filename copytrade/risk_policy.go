@@ -41,6 +41,73 @@ type ProtectionPlan struct {
 	ExpectedLossPct       float64 `json:"expected_loss_pct"`
 }
 
+// ComputeAccountProtectionDistance protects the real ordinary-copy position
+// without resizing it. Market structure/ATR choose the preferred distant stop;
+// the account percentage is a hard loss ceiling, so it may only tighten that
+// distance. Liquidation safety is applied later by finalizeStopLossPrice.
+func ComputeAccountProtectionDistance(c *CopyConfig, side SideType, entryPrice, positionNotional, accountEquity, atr, atrDistance, structureInvalidation, maxAccountLossPct float64) (RiskDistanceResult, error) {
+	if c == nil || entryPrice <= 0 || positionNotional <= 0 || accountEquity <= 0 || atrDistance <= 0 {
+		return RiskDistanceResult{}, fmt.Errorf("invalid account protection input")
+	}
+	if side != SideLong && side != SideShort {
+		return RiskDistanceResult{}, fmt.Errorf("invalid account protection side %s", side)
+	}
+	if maxAccountLossPct < 0.001 || maxAccountLossPct > 0.30 {
+		return RiskDistanceResult{}, fmt.Errorf("max account loss pct %.6f must be between 0.001 and 0.30", maxAccountLossPct)
+	}
+
+	distance := atrDistance
+	governedBy := "atr"
+	structureDistance := 0.0
+	if side == SideLong && structureInvalidation > 0 && structureInvalidation < entryPrice {
+		structureDistance = entryPrice - structureInvalidation + 0.25*atr
+	}
+	if side == SideShort && structureInvalidation > entryPrice {
+		structureDistance = structureInvalidation - entryPrice + 0.25*atr
+	}
+	if structureDistance > distance {
+		distance = structureDistance
+		governedBy = "structure"
+	}
+	minimumExecutionDistance := entryPrice * math.Max(c.RiskSlippageBufferBPS, 1) / 10000
+	if distance < minimumExecutionDistance {
+		distance = minimumExecutionDistance
+		governedBy = "execution_minimum"
+	}
+
+	frictionRate := (c.RiskSlippageBufferBPS + c.RiskRoundTripFeeBPS) / 10000
+	if frictionRate < 0 {
+		frictionRate = 0
+	}
+	priceRiskBudget := accountEquity*maxAccountLossPct - positionNotional*frictionRate
+	if priceRiskBudget <= 0 {
+		return RiskDistanceResult{}, fmt.Errorf("trading friction exhausts account position loss cap")
+	}
+	accountCapDistance := priceRiskBudget / positionNotional * entryPrice
+	noiseConflict := false
+	if accountCapDistance < distance {
+		distance = accountCapDistance
+		governedBy = "account_cap"
+		noiseConflict = true
+	}
+	if distance <= 0 || distance >= entryPrice {
+		return RiskDistanceResult{}, fmt.Errorf("account protection distance %.8f is invalid", distance)
+	}
+
+	expected := positionNotional * (distance/entryPrice + frictionRate)
+	result := RiskDistanceResult{
+		Distance:        distance,
+		ExpectedLossUSD: expected,
+		ExpectedLossPct: expected / accountEquity,
+		GovernedBy:      governedBy,
+		NoiseConflict:   noiseConflict,
+	}
+	if atr > 0 {
+		result.DistanceATRRatio = distance / atr
+	}
+	return result, nil
+}
+
 // AvailableCopyGuardRiskUSD applies the same three-layer minimum used by the
 // atomic reservation. Usage must exclude the attempt being resized.
 func AvailableCopyGuardRiskUSD(c *CopyConfig, equity float64, usage store.CopyGuardRiskUsage) (float64, error) {

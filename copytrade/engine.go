@@ -89,10 +89,6 @@ type Engine struct {
 	// SupportsCopyGuard（OKX/Binance）数据源使用；checkStoppedByRisk 内部访问，与 poll 串行执行无需额外锁
 	stopRiskSuspectCount map[string]int
 
-	// v4 加仓预算：ADDON_RISK_WARNING 事件/告警限频（key = leaderPosID）
-	// 与 poll 串行执行，无需额外锁
-	lastAddonBudgetEvent map[string]time.Time
-
 	// v5 确认式重入：REENTRY_CANDIDATE 连续确认计数（key = leaderPosID）。
 	// 条件持续满足时逐 tick 递增，任一 tick 破坏即清零；达到确认阈值才重入。
 	// 内存态：引擎重启后从 0 重新累计（保守方向，不会导致提前重入）。
@@ -153,7 +149,6 @@ func NewEngine(
 		stopCh:                   make(chan struct{}),
 		stats:                    &EngineStats{StartTime: time.Now()},
 		stopRiskSuspectCount:     make(map[string]int),
-		lastAddonBudgetEvent:     make(map[string]time.Time),
 		reentryCandidateTicks:    make(map[string]int),
 		lastAICandleFeatureCheck: make(map[int64]time.Time),
 	}
@@ -829,6 +824,7 @@ func (e *Engine) poll() {
 			for _, fill := range newFills {
 				e.markSeen(fill.ID)
 			}
+			attachRawFillSources(freshSnapshotFills, newFills)
 			newFills = freshSnapshotFills
 		} else if len(snapshotFills) > 0 {
 			logger.Debugf("📡 [%s] Binance 快照检测到 %d 条信号但全部为重复（已 seen），跳过",
@@ -877,6 +873,7 @@ func (e *Engine) poll() {
 			}
 		}
 		if len(freshSnapshotFills) > 0 {
+			attachRawFillSources(freshSnapshotFills, newFills)
 			for _, fill := range newFills {
 				e.markSeen(fill.ID)
 			}
@@ -909,6 +906,30 @@ func (e *Engine) poll() {
 			fill.Price, fill.Size, fill.Value)
 
 		e.processSignal(signal)
+	}
+}
+
+// attachRawFillSources retains the complete source evidence when authoritative
+// position snapshots collapse several fills into one transition. Exact posId
+// is not exposed by every history endpoint, so symbol+position side is the
+// narrowest safe association; the authoritative size/value still comes from
+// the healthy position snapshot.
+func attachRawFillSources(snapshotFills, rawFills []Fill) {
+	for i := range snapshotFills {
+		seen := make(map[string]struct{})
+		for _, raw := range rawFills {
+			if raw.ID == "" || !strings.EqualFold(raw.Symbol, snapshotFills[i].Symbol) || raw.PositionSide != snapshotFills[i].PositionSide {
+				continue
+			}
+			if _, ok := seen[raw.ID]; ok {
+				continue
+			}
+			seen[raw.ID] = struct{}{}
+			snapshotFills[i].SourceFillIDs = append(snapshotFills[i].SourceFillIDs, raw.ID)
+		}
+		if len(snapshotFills[i].SourceFillIDs) == 0 {
+			snapshotFills[i].SourceFillIDs = []string{snapshotFills[i].ID}
+		}
 	}
 }
 
@@ -1723,48 +1744,40 @@ func (e *Engine) processSignal(signal *TradeSignal) {
 		e.logWarning(w)
 	}
 
-	// 🔧 开仓/加仓 + copySize=0 → 不生成决策（0 金额决策下游必然失败）。
-	// 两类原因区别对待：
-	//   - 领航员权益不可用（瞬态数据故障）：释放去重标记，等下轮 poll 重放
-	//   - 加仓金额不足阈值 / 余额为零：保持 seen（同一 fill 重放也不会有不同结果）
-	if (matchResult.Action == ActionOpen || matchResult.Action == ActionAdd) && copySize == 0 {
-		for _, w := range warnings {
-			if w.Type == WarnLeaderEquityUnavailable {
-				e.UnmarkSeen(fill.ID)
-				logger.Warnf("🎯 [%s] ⏭️ 跳过并释放去重标记 | %s | 领航员权益不可用，等待下轮重放", e.traderID, fill.Symbol)
-				e.stats.SignalsSkipped++
-				return
-			}
-		}
-		logger.Infof("🎯 [%s] ⏭️ %s跳过 | %s | 金额为零（低于阈值或余额不足）", e.traderID, matchResult.Action, fill.Symbol)
-		e.stats.SignalsSkipped++
-		return
-	}
-
-	// vNext AI 模式：初始入场与加仓共用 ProtectionPlan，宽止损通过
-	// 缩仓满足风险预算。legacy_rule 只保留兼容的加仓预算逻辑。
-	if matchResult.Action == ActionOpen || matchResult.Action == ActionAdd {
-		if e.config.RiskReentryDecisionMode == "ai_guarded" {
-			copySize = e.limitAIGuardedTradeRisk(signal, matchResult.PosID, matchResult.Action, copySize)
-		} else if matchResult.Action == ActionAdd {
-			copySize = e.limitAddonRiskBudget(signal, matchResult.PosID, copySize)
-		}
-		minAddon := minTradeNotionalOrDefault(e.config.MinTradeWarn)
-		if copySize < minAddon {
-			logger.Warnf("🚫 [%s] 入场风险预算不足或低于最小下单额，拒绝本次%s | %s", e.traderID, matchResult.Action, fill.Symbol)
-			e.stats.SignalsSkipped++
-			return
-		}
-	}
-
-	// ========================================
-	// Step 4: 构造 Decision
-	// ========================================
+	// Reserve the normalized source transition before any deterministic
+	// execution filter. This guarantees that every recognized/followed signal
+	// has an auditable terminal intent, including zero/minimum/risk skips.
 	dec := e.buildDecisionV2(signal, matchResult, copySize)
 	if !e.reserveExecutionIntent(&dec) {
 		return
 	}
 
+	if (matchResult.Action == ActionOpen || matchResult.Action == ActionAdd) && copySize == 0 {
+		reasonCode := "MIN_NOTIONAL"
+		for _, w := range warnings {
+			if w.Type == WarnLeaderEquityUnavailable {
+				reasonCode = "SOURCE_DATA_UNAVAILABLE"
+				break
+			}
+		}
+		e.commitSkippedReservedIntent(&dec, reasonCode)
+		logger.Infof("🎯 [%s] ⏭️ %s跳过 | %s | 金额为零（低于阈值或余额不足）", e.traderID, matchResult.Action, fill.Symbol)
+		e.stats.SignalsSkipped++
+		return
+	}
+
+	// Ordinary leader opens/adds preserve the proportional source transition.
+	// Exchange minimums and action-specific rounding are resolved immediately
+	// before submission by the execution venue. Copy Guard only manages the
+	// post-fill stop; its AI/cycle/portfolio budgets must never resize a normal
+	// leader transition.
+	if matchResult.Action == ActionOpen || matchResult.Action == ActionAdd {
+		dec.PositionSizeUSD = copySize
+	}
+
+	// ========================================
+	// Step 4: 构造 Decision
+	// ========================================
 	// ========================================
 	// Step 5: 推送决策
 	// ========================================
@@ -1793,6 +1806,30 @@ func (e *Engine) processSignal(signal *TradeSignal) {
 		}
 		logger.Errorf("❌ [%s] 决策通道已满，丢弃决策并释放去重标记等待重放 | %s %s fillID=%s",
 			e.traderID, dec.Action, dec.Symbol, fill.ID)
+	}
+}
+
+func (e *Engine) commitSkippedReservedIntent(dec *decision.Decision, reasonCode string) {
+	if dec == nil || dec.ExecutionIntentID <= 0 || e.store == nil {
+		return
+	}
+	side := "long"
+	if strings.HasSuffix(dec.Action, "short") {
+		side = "short"
+	}
+	var err error
+	if strings.HasPrefix(dec.Action, "open_") {
+		err = e.store.CopyTrade().CommitIgnoredLeaderTransition(store.IgnoredLeaderTransition{
+			IntentID: dec.ExecutionIntentID, TraderID: e.traderID, LeaderID: e.config.LeaderID,
+			LeaderPosID: dec.LeaderPosID, SourceRevision: dec.SourceRevision, Symbol: dec.Symbol,
+			Side: side, MarginMode: dec.MarginMode, LeaderTargetSize: dec.LeaderPosSize, ReasonCode: reasonCode,
+		})
+	} else {
+		err = e.store.CopyTrade().CommitSkippedLeaderTransition(dec.ExecutionIntentID, e.traderID, dec.LeaderPosID,
+			dec.SourceRevision, dec.LeaderPosSize, reasonCode)
+	}
+	if err != nil {
+		logger.Errorf("❌ [%s] 提交跳过执行意图失败 | intent=%d reason=%s: %v", e.traderID, dec.ExecutionIntentID, reasonCode, err)
 	}
 }
 
@@ -1828,6 +1865,7 @@ func (e *Engine) reserveExecutionIntent(dec *decision.Decision) bool {
 		Action: dec.Action, Symbol: dec.Symbol, Side: side,
 		MarginMode: dec.MarginMode, LeaderTargetSize: dec.LeaderPosSize,
 		RequestedNotional: dec.PositionSizeUSD, ClientOrderID: dec.ClientOrderID,
+		SourceFillIDs: dec.SourceFillIDs,
 	})
 	if err != nil {
 		logger.Errorf("❌ [%s] 预留执行意图失败 | posId=%s action=%s: %v", e.traderID, dec.LeaderPosID, dec.Action, err)
@@ -1922,17 +1960,19 @@ func (e *Engine) buildDecisionV2(signal *TradeSignal, match *SignalMatchResult, 
 	}
 
 	dec := decision.Decision{
-		Symbol:        fill.Symbol,
-		Action:        e.mapAction(match.Action, fill.PositionSide),
-		IsCopyTrade:   true,
-		Reasoning:     fmt.Sprintf("Copy trading: %s following %s leader %s", match.Action, e.config.ProviderType, e.config.LeaderID),
-		EntryPrice:    fill.Price,
-		LeaderPosID:   match.PosID,
-		LeaderPosSize: leaderPosSize,    // 传递领航员当前持仓数量
-		MarginMode:    match.MarginMode, // 直接使用匹配结果中的 marginMode
-		SourceFillID:  fill.ID,          // 执行瞬态失败时用于释放去重标记重放
-		SourceSymbol:  fill.Symbol,
-		ValueCurrency: fill.ValueCurrency,
+		Symbol:          fill.Symbol,
+		Action:          e.mapAction(match.Action, fill.PositionSide),
+		IsCopyTrade:     true,
+		CopyTradeAction: string(match.Action),
+		Reasoning:       fmt.Sprintf("Copy trading: %s following %s leader %s", match.Action, e.config.ProviderType, e.config.LeaderID),
+		EntryPrice:      fill.Price,
+		LeaderPosID:     match.PosID,
+		LeaderPosSize:   leaderPosSize,    // 传递领航员当前持仓数量
+		MarginMode:      match.MarginMode, // 直接使用匹配结果中的 marginMode
+		SourceFillID:    fill.ID,          // 执行瞬态失败时用于释放去重标记重放
+		SourceFillIDs:   append([]string(nil), fill.SourceFillIDs...),
+		SourceSymbol:    fill.Symbol,
+		ValueCurrency:   fill.ValueCurrency,
 	}
 	if match.SourceSymbol != "" {
 		dec.SourceSymbol = match.SourceSymbol
@@ -2257,44 +2297,20 @@ func (e *Engine) calculateCopySizeByPositionChange(signal *TradeSignal, match *S
 		leaderTradeValue, leaderEquity, anchorSource, leaderTradeRatio*100,
 		followerEquity, e.config.CopyRatio*100, copySize)
 
-	// 最小金额检查：仅开仓时自动提升到阈值；加仓时直接跳过（不提升）。
-	//
-	// 原因：旧逻辑对 open/add 都无条件提升到 minTradeThreshold（默认 12 USDT），
-	// 在领航员高频小额加仓场景（例如每次加 0.5 USDT）会导致跟随者每次都被
-	// 强制加 12 USDT，仓位累积速度远高于领航员，破坏了"按比例镜像"语义。
-	//
-	// 修复策略：
-	//   - ActionOpen：保留 boost（开仓只发生一次，必须达到交易所最小起步金额）
-	//   - ActionAdd ：copySize < threshold → 直接置零（信号被跳过，不更新 last_known_size，
-	//                  等领航员后续加仓累积到 threshold 以上再跟），保持长期比例镜像
+	// MinTradeWarn is operational observability only. The exact venue minimum
+	// depends on symbol price, minQty/minNotional and native step (OKX ctVal);
+	// it is resolved at the execution boundary. In particular this layer must
+	// not promote an add or use the historical fixed 10/12 USDT threshold as an
+	// exchange rule.
 	minTradeThreshold := minTradeNotionalOrDefault(e.config.MinTradeWarn)
 	if copySize > 0 && copySize < minTradeThreshold {
-		if match.Action == ActionAdd {
-			// 跳过：让 processSignal 看到 copySize==0 + add 信号 → 不生成决策
-			logger.Infof("📊 [%s] 加仓金额 %.2f < 阈值 %.2f，跳过本次跟随（等待累积）",
-				e.traderID, copySize, minTradeThreshold)
-			warnings = append(warnings, Warning{
-				Timestamp:   time.Now(),
-				Symbol:      fill.Symbol,
-				Type:        "add_below_threshold_skip",
-				Message:     fmt.Sprintf("加仓金额 %.2f 低于阈值 %.2f，跳过", copySize, minTradeThreshold),
-				SignalValue: leaderTradeValue,
-				CopyValue:   0,
-				Executed:    false,
-			})
-			return 0, warnings
-		}
-
-		// 仅开仓走 boost
-		originalSize := copySize
-		copySize = minTradeThreshold
-		logger.Infof("📊 [%s] 开仓金额 %.2f < 阈值 %.2f，自动提升到 %.2f USDT",
-			e.traderID, originalSize, minTradeThreshold, copySize)
+		logger.Infof("📊 [%s] %s比例金额 %.2f < 运营预警阈值 %.2f；执行层将按交易所真实约束判定",
+			e.traderID, match.Action, copySize, minTradeThreshold)
 		warnings = append(warnings, Warning{
 			Timestamp:   time.Now(),
 			Symbol:      fill.Symbol,
-			Type:        "size_boosted",
-			Message:     fmt.Sprintf("开仓金额 %.2f 低于阈值，已提升到 %.2f USDT", originalSize, minTradeThreshold),
+			Type:        "below_operational_warning_threshold",
+			Message:     fmt.Sprintf("%s比例金额 %.2f 低于运营预警阈值 %.2f，未改变订单金额", match.Action, copySize, minTradeThreshold),
 			SignalValue: leaderTradeValue,
 			CopyValue:   copySize,
 			Executed:    true,

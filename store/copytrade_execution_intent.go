@@ -15,47 +15,84 @@ const (
 	ExecutionIntentSkipped     = "SKIPPED"
 	ExecutionIntentFailed      = "FAILED"
 	ExecutionIntentReconciling = "RECONCILING"
+
+	ExecutionOrderAttemptPrepared  = "PREPARED"
+	ExecutionOrderAttemptSubmitted = "SUBMITTED"
+	ExecutionOrderAttemptFilled    = "FILLED"
+	ExecutionOrderAttemptFailed    = "FAILED"
+	ExecutionOrderAttemptUnknown   = "UNKNOWN"
 )
+
+type CopyTradeExecutionIntentSource struct {
+	ID           int64     `json:"id"`
+	IntentID     int64     `json:"intent_id"`
+	SourceFillID string    `json:"source_fill_id"`
+	CreatedAt    time.Time `json:"created_at"`
+}
+
+type CopyTradeExecutionOrderAttempt struct {
+	ID                int64      `json:"id"`
+	IntentID          int64      `json:"intent_id"`
+	AttemptNo         int        `json:"attempt_no"`
+	ClientOrderID     string     `json:"client_order_id"`
+	RequestedQuantity float64    `json:"requested_quantity"`
+	QuantizedQuantity float64    `json:"quantized_quantity"`
+	FilledQuantity    float64    `json:"filled_quantity"`
+	ExchangeOrderID   string     `json:"exchange_order_id"`
+	ExchangeState     string     `json:"exchange_state"`
+	Status            string     `json:"status"`
+	LastError         string     `json:"last_error"`
+	CreatedAt         time.Time  `json:"created_at"`
+	UpdatedAt         time.Time  `json:"updated_at"`
+	SubmittedAt       *time.Time `json:"submitted_at,omitempty"`
+	FilledAt          *time.Time `json:"filled_at,omitempty"`
+	TerminalAt        *time.Time `json:"terminal_at,omitempty"`
+}
 
 // CopyTradeExecutionIntent is the durable identity and acknowledgement record
 // for one source-position transition. Position mappings describe the current
 // relationship; intents describe the individual exchange mutation that moves
 // that relationship forward.
 type CopyTradeExecutionIntent struct {
-	ID                 int64      `json:"id"`
-	TraderID           string     `json:"trader_id"`
-	LeaderPosID        string     `json:"leader_pos_id"`
-	SourceRevision     int64      `json:"source_revision"`
-	SourceFillID       string     `json:"source_fill_id"`
-	SourceKind         string     `json:"source_kind"`
-	CanonicalKey       string     `json:"canonical_key"`
-	CycleID            int64      `json:"cycle_id,omitempty"`
-	CandidateID        int64      `json:"candidate_id,omitempty"`
-	AnalysisID         int64      `json:"analysis_id,omitempty"`
-	AttemptNo          int        `json:"attempt_no,omitempty"`
-	DecisionGeneration int        `json:"decision_generation,omitempty"`
-	Action             string     `json:"action"`
-	Symbol             string     `json:"symbol"`
-	Side               string     `json:"side"`
-	MarginMode         string     `json:"margin_mode"`
-	LeaderTargetSize   float64    `json:"leader_target_size"`
-	RequestedNotional  float64    `json:"requested_notional"`
-	RequestedQuantity  float64    `json:"requested_quantity"`
-	QuantizedQuantity  float64    `json:"quantized_quantity"`
-	FilledQuantity     float64    `json:"filled_quantity"`
-	ClientOrderID      string     `json:"client_order_id"`
-	ExchangeOrderID    string     `json:"exchange_order_id"`
-	ExchangeState      string     `json:"exchange_state"`
-	Status             string     `json:"status"`
-	ReasonCode         string     `json:"reason_code"`
-	LastError          string     `json:"last_error"`
-	FailureCounted     bool       `json:"failure_counted"`
-	CreatedAt          time.Time  `json:"created_at"`
-	UpdatedAt          time.Time  `json:"updated_at"`
-	SubmittedAt        *time.Time `json:"submitted_at,omitempty"`
-	FilledAt           *time.Time `json:"filled_at,omitempty"`
-	ProtectedAt        *time.Time `json:"protected_at,omitempty"`
-	TerminalAt         *time.Time `json:"terminal_at,omitempty"`
+	ID                        int64      `json:"id"`
+	TraderID                  string     `json:"trader_id"`
+	LeaderPosID               string     `json:"leader_pos_id"`
+	SourceRevision            int64      `json:"source_revision"`
+	SourceFillID              string     `json:"source_fill_id"`
+	SourceKind                string     `json:"source_kind"`
+	CanonicalKey              string     `json:"canonical_key"`
+	CycleID                   int64      `json:"cycle_id,omitempty"`
+	CandidateID               int64      `json:"candidate_id,omitempty"`
+	AnalysisID                int64      `json:"analysis_id,omitempty"`
+	AttemptNo                 int        `json:"attempt_no,omitempty"`
+	DecisionGeneration        int        `json:"decision_generation,omitempty"`
+	Action                    string     `json:"action"`
+	Symbol                    string     `json:"symbol"`
+	Side                      string     `json:"side"`
+	MarginMode                string     `json:"margin_mode"`
+	LeaderTargetSize          float64    `json:"leader_target_size"`
+	RequestedNotional         float64    `json:"requested_notional"`
+	RequestedQuantity         float64    `json:"requested_quantity"`
+	QuantizedQuantity         float64    `json:"quantized_quantity"`
+	QuantityStep              float64    `json:"quantity_step"`
+	ExchangeMinQuantity       float64    `json:"exchange_min_quantity"`
+	ExchangeMinNotional       float64    `json:"exchange_min_notional"`
+	MinimumExecutableQuantity float64    `json:"minimum_executable_quantity"`
+	FilledQuantity            float64    `json:"filled_quantity"`
+	ClientOrderID             string     `json:"client_order_id"`
+	ExchangeOrderID           string     `json:"exchange_order_id"`
+	ExchangeState             string     `json:"exchange_state"`
+	Status                    string     `json:"status"`
+	ReasonCode                string     `json:"reason_code"`
+	LastError                 string     `json:"last_error"`
+	FailureCounted            bool       `json:"failure_counted"`
+	CreatedAt                 time.Time  `json:"created_at"`
+	UpdatedAt                 time.Time  `json:"updated_at"`
+	SubmittedAt               *time.Time `json:"submitted_at,omitempty"`
+	FilledAt                  *time.Time `json:"filled_at,omitempty"`
+	ProtectedAt               *time.Time `json:"protected_at,omitempty"`
+	TerminalAt                *time.Time `json:"terminal_at,omitempty"`
+	SourceFillIDs             []string   `json:"source_fill_ids,omitempty"`
 }
 
 type LeaderExecutionCommit struct {
@@ -272,7 +309,7 @@ func (s *CopyTradeStore) CommitIgnoredLeaderTransition(c IgnoredLeaderTransition
 }
 
 // CommitSkippedLeaderTransition acknowledges a source revision that correctly
-// produced no exchange order (currently a sub-lot reduction). It advances
+// produced no exchange order (for example a sub-lot add/reduction). It advances
 // source state without inventing a fill,
 // add/reduce counter, or accumulated reduction.
 func (s *CopyTradeStore) CommitSkippedLeaderTransition(intentID int64, traderID, leaderPosID string, sourceRevision int64, leaderTargetSize float64, reasonCode string) error {
@@ -333,6 +370,10 @@ func (s *CopyTradeStore) initExecutionIntentTable() error {
 			requested_notional REAL DEFAULT 0,
 			requested_quantity REAL DEFAULT 0,
 			quantized_quantity REAL DEFAULT 0,
+			quantity_step REAL DEFAULT 0,
+			exchange_min_quantity REAL DEFAULT 0,
+			exchange_min_notional REAL DEFAULT 0,
+			minimum_executable_quantity REAL DEFAULT 0,
 			filled_quantity REAL DEFAULT 0,
 			client_order_id TEXT DEFAULT '',
 			exchange_order_id TEXT DEFAULT '',
@@ -363,6 +404,10 @@ func (s *CopyTradeStore) initExecutionIntentTable() error {
 		{"attempt_no", "INTEGER NOT NULL DEFAULT 0"},
 		{"decision_generation", "INTEGER NOT NULL DEFAULT 0"},
 		{"exchange_state", "TEXT DEFAULT ''"},
+		{"quantity_step", "REAL DEFAULT 0"},
+		{"exchange_min_quantity", "REAL DEFAULT 0"},
+		{"exchange_min_notional", "REAL DEFAULT 0"},
+		{"minimum_executable_quantity", "REAL DEFAULT 0"},
 		{"submitted_at", "DATETIME"}, {"filled_at", "DATETIME"},
 		{"protected_at", "DATETIME"}, {"terminal_at", "DATETIME"},
 	}
@@ -374,8 +419,53 @@ func (s *CopyTradeStore) initExecutionIntentTable() error {
 	if _, err = s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_copy_intent_canonical ON copy_trade_execution_intents(canonical_key) WHERE canonical_key<>''`); err != nil {
 		return err
 	}
-	_, err = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_copy_intent_trader_status ON copy_trade_execution_intents(trader_id,status,updated_at)`)
-	return err
+	if _, err = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_copy_intent_trader_status ON copy_trade_execution_intents(trader_id,status,updated_at)`); err != nil {
+		return err
+	}
+	if _, err = s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS copy_trade_execution_intent_sources (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			intent_id INTEGER NOT NULL,
+			source_fill_id TEXT NOT NULL,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(intent_id, source_fill_id),
+			FOREIGN KEY(intent_id) REFERENCES copy_trade_execution_intents(id) ON DELETE CASCADE
+		)
+	`); err != nil {
+		return err
+	}
+	if _, err = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_copy_intent_sources_fill ON copy_trade_execution_intent_sources(source_fill_id)`); err != nil {
+		return err
+	}
+	if _, err = s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS copy_trade_execution_order_attempts (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			intent_id INTEGER NOT NULL,
+			attempt_no INTEGER NOT NULL,
+			client_order_id TEXT NOT NULL,
+			requested_quantity REAL DEFAULT 0,
+			quantized_quantity REAL DEFAULT 0,
+			filled_quantity REAL DEFAULT 0,
+			exchange_order_id TEXT DEFAULT '',
+			exchange_state TEXT DEFAULT '',
+			status TEXT NOT NULL DEFAULT 'PREPARED',
+			last_error TEXT DEFAULT '',
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			submitted_at DATETIME,
+			filled_at DATETIME,
+			terminal_at DATETIME,
+			UNIQUE(intent_id, attempt_no),
+			UNIQUE(intent_id, client_order_id),
+			FOREIGN KEY(intent_id) REFERENCES copy_trade_execution_intents(id) ON DELETE CASCADE
+		)
+	`); err != nil {
+		return err
+	}
+	if _, err = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_copy_order_attempt_intent ON copy_trade_execution_order_attempts(intent_id,attempt_no)`); err != nil {
+		return err
+	}
+	return nil
 }
 
 // ReserveExecutionIntent atomically claims a source transition. Concurrent
@@ -434,10 +524,120 @@ func (s *CopyTradeStore) ReserveExecutionIntent(intent *CopyTradeExecutionIntent
 	if err != nil {
 		return nil, false, err
 	}
+	sourceIDs := append([]string(nil), intent.SourceFillIDs...)
+	if len(sourceIDs) == 0 && intent.SourceFillID != "" {
+		sourceIDs = []string{intent.SourceFillID}
+	}
+	for _, sourceID := range sourceIDs {
+		sourceID = strings.TrimSpace(sourceID)
+		if sourceID == "" {
+			continue
+		}
+		if _, err = tx.Exec(`INSERT OR IGNORE INTO copy_trade_execution_intent_sources(intent_id,source_fill_id) VALUES(?,?)`, stored.ID, sourceID); err != nil {
+			return nil, false, err
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, false, err
 	}
+	stored.SourceFillIDs = sourceIDs
 	return stored, claimed, nil
+}
+
+// PrepareExecutionOrderAttempt durably records a concrete exchange submission
+// before the adapter is called. Reusing the same client id is idempotent.
+func (s *CopyTradeStore) PrepareExecutionOrderAttempt(intentID int64, clientOrderID string, quantity float64) (*CopyTradeExecutionOrderAttempt, error) {
+	if intentID <= 0 || strings.TrimSpace(clientOrderID) == "" || quantity <= 0 {
+		return nil, fmt.Errorf("invalid execution order attempt")
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	var attemptNo int
+	err = tx.QueryRow(`SELECT attempt_no FROM copy_trade_execution_order_attempts WHERE intent_id=? AND client_order_id=?`, intentID, clientOrderID).Scan(&attemptNo)
+	if err == sql.ErrNoRows {
+		if err = tx.QueryRow(`SELECT COALESCE(MAX(attempt_no),0)+1 FROM copy_trade_execution_order_attempts WHERE intent_id=?`, intentID).Scan(&attemptNo); err != nil {
+			return nil, err
+		}
+		if _, err = tx.Exec(`INSERT INTO copy_trade_execution_order_attempts(intent_id,attempt_no,client_order_id,requested_quantity,quantized_quantity,status) VALUES(?,?,?,?,?,'PREPARED')`,
+			intentID, attemptNo, clientOrderID, quantity, quantity); err != nil {
+			return nil, err
+		}
+	} else if err != nil {
+		return nil, err
+	}
+	row := tx.QueryRow(`SELECT id,intent_id,attempt_no,client_order_id,requested_quantity,quantized_quantity,filled_quantity,exchange_order_id,exchange_state,status,last_error,created_at,updated_at,submitted_at,filled_at,terminal_at FROM copy_trade_execution_order_attempts WHERE intent_id=? AND client_order_id=?`, intentID, clientOrderID)
+	attempt, err := scanExecutionOrderAttempt(row)
+	if err != nil {
+		return nil, err
+	}
+	if err = tx.Commit(); err != nil {
+		return nil, err
+	}
+	return attempt, nil
+}
+
+func (s *CopyTradeStore) CompleteExecutionOrderAttempt(intentID int64, clientOrderID, status, exchangeOrderID, exchangeState, lastError string, filledQuantity float64) error {
+	if intentID <= 0 || strings.TrimSpace(clientOrderID) == "" || status == "" {
+		return fmt.Errorf("invalid execution order attempt update")
+	}
+	_, err := s.db.Exec(`UPDATE copy_trade_execution_order_attempts SET status=?,
+		exchange_order_id=CASE WHEN ?<>'' THEN ? ELSE exchange_order_id END,
+		exchange_state=CASE WHEN ?<>'' THEN ? ELSE exchange_state END,
+		filled_quantity=CASE WHEN ?>0 THEN ? ELSE filled_quantity END,last_error=?,
+		submitted_at=CASE WHEN ? IN ('SUBMITTED','FILLED') THEN COALESCE(submitted_at,CURRENT_TIMESTAMP) ELSE submitted_at END,
+		filled_at=CASE WHEN ?='FILLED' THEN COALESCE(filled_at,CURRENT_TIMESTAMP) ELSE filled_at END,
+		terminal_at=CASE WHEN ? IN ('FILLED','FAILED') THEN COALESCE(terminal_at,CURRENT_TIMESTAMP) ELSE terminal_at END,
+		updated_at=CURRENT_TIMESTAMP WHERE intent_id=? AND client_order_id=?`,
+		status, exchangeOrderID, exchangeOrderID, exchangeState, exchangeState, filledQuantity, filledQuantity, lastError,
+		status, status, status, intentID, clientOrderID)
+	return err
+}
+
+func (s *CopyTradeStore) ListExecutionOrderAttempts(intentID int64) ([]*CopyTradeExecutionOrderAttempt, error) {
+	rows, err := s.db.Query(`SELECT id,intent_id,attempt_no,client_order_id,requested_quantity,quantized_quantity,filled_quantity,exchange_order_id,exchange_state,status,last_error,created_at,updated_at,submitted_at,filled_at,terminal_at FROM copy_trade_execution_order_attempts WHERE intent_id=? ORDER BY attempt_no`, intentID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*CopyTradeExecutionOrderAttempt
+	for rows.Next() {
+		attempt, scanErr := scanExecutionOrderAttempt(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		out = append(out, attempt)
+	}
+	return out, rows.Err()
+}
+
+func scanExecutionOrderAttempt(scanner interface{ Scan(...interface{}) error }) (*CopyTradeExecutionOrderAttempt, error) {
+	var x CopyTradeExecutionOrderAttempt
+	var created, updated string
+	var submitted, filled, terminal sql.NullString
+	if err := scanner.Scan(&x.ID, &x.IntentID, &x.AttemptNo, &x.ClientOrderID, &x.RequestedQuantity, &x.QuantizedQuantity,
+		&x.FilledQuantity, &x.ExchangeOrderID, &x.ExchangeState, &x.Status, &x.LastError, &created, &updated, &submitted, &filled, &terminal); err != nil {
+		return nil, err
+	}
+	var err error
+	if x.CreatedAt, err = parseDBTime(created); err != nil {
+		return nil, err
+	}
+	if x.UpdatedAt, err = parseDBTime(updated); err != nil {
+		return nil, err
+	}
+	if x.SubmittedAt, err = parseNullableDBTime(submitted); err != nil {
+		return nil, err
+	}
+	if x.FilledAt, err = parseNullableDBTime(filled); err != nil {
+		return nil, err
+	}
+	if x.TerminalAt, err = parseNullableDBTime(terminal); err != nil {
+		return nil, err
+	}
+	return &x, nil
 }
 
 func getExecutionIntentTx(tx *sql.Tx, traderID, leaderPosID string, sourceRevision int64, action, canonicalKey string) (*CopyTradeExecutionIntent, error) {
@@ -452,6 +652,7 @@ func getExecutionIntentTx(tx *sql.Tx, traderID, leaderPosID string, sourceRevisi
 		COALESCE(cycle_id,0),COALESCE(candidate_id,0),COALESCE(analysis_id,0),COALESCE(attempt_no,0),COALESCE(decision_generation,0),
 		COALESCE(symbol,''),COALESCE(side,''),COALESCE(margin_mode,''),COALESCE(leader_target_size,0),
 		COALESCE(requested_notional,0),COALESCE(requested_quantity,0),COALESCE(quantized_quantity,0),
+		COALESCE(quantity_step,0),COALESCE(exchange_min_quantity,0),COALESCE(exchange_min_notional,0),COALESCE(minimum_executable_quantity,0),
 		COALESCE(filled_quantity,0),COALESCE(client_order_id,''),COALESCE(exchange_order_id,''),status,
 		COALESCE(exchange_state,''),COALESCE(reason_code,''),COALESCE(last_error,''),COALESCE(failure_counted,0),created_at,updated_at,
 		submitted_at,filled_at,protected_at,terminal_at
@@ -467,7 +668,8 @@ func scanExecutionIntent(scanner interface{ Scan(...interface{}) error }) (*Copy
 		&x.SourceKind, &x.CanonicalKey,
 		&x.CycleID, &x.CandidateID, &x.AnalysisID, &x.AttemptNo, &x.DecisionGeneration,
 		&x.Symbol, &x.Side, &x.MarginMode, &x.LeaderTargetSize, &x.RequestedNotional, &x.RequestedQuantity,
-		&x.QuantizedQuantity, &x.FilledQuantity, &x.ClientOrderID, &x.ExchangeOrderID, &x.Status,
+		&x.QuantizedQuantity, &x.QuantityStep, &x.ExchangeMinQuantity, &x.ExchangeMinNotional, &x.MinimumExecutableQuantity,
+		&x.FilledQuantity, &x.ClientOrderID, &x.ExchangeOrderID, &x.Status,
 		&x.ExchangeState, &x.ReasonCode, &x.LastError, &x.FailureCounted, &created, &updated,
 		&submitted, &filled, &protected, &terminal); err != nil {
 		return nil, err
@@ -498,7 +700,8 @@ func (s *CopyTradeStore) UpdateExecutionIntent(id int64, status, reasonCode, las
 	if id <= 0 || status == "" {
 		return fmt.Errorf("invalid execution intent transition")
 	}
-	res, err := s.db.Exec(`UPDATE copy_trade_execution_intents SET status=?,reason_code=?,last_error=?,
+	res, err := s.db.Exec(`UPDATE copy_trade_execution_intents SET status=?,
+		reason_code=CASE WHEN ?<>'' THEN ? ELSE reason_code END,last_error=?,
 		exchange_order_id=CASE WHEN ?<>'' THEN ? ELSE exchange_order_id END,
 		requested_quantity=CASE WHEN ?>0 THEN ? ELSE requested_quantity END,
 		quantized_quantity=CASE WHEN ?>0 THEN ? ELSE quantized_quantity END,
@@ -507,7 +710,7 @@ func (s *CopyTradeStore) UpdateExecutionIntent(id int64, status, reasonCode, las
 		filled_at=CASE WHEN ?='FILLED' THEN COALESCE(filled_at,CURRENT_TIMESTAMP) ELSE filled_at END,
 		protected_at=CASE WHEN ?='PROTECTED' THEN COALESCE(protected_at,CURRENT_TIMESTAMP) ELSE protected_at END,
 		terminal_at=CASE WHEN ? IN ('SKIPPED','FAILED') THEN COALESCE(terminal_at,CURRENT_TIMESTAMP) ELSE terminal_at END,
-		updated_at=CURRENT_TIMESTAMP WHERE id=? AND (`+validExecutionIntentTransitionSQL()+`)`, status, reasonCode, lastError,
+		updated_at=CURRENT_TIMESTAMP WHERE id=? AND (`+validExecutionIntentTransitionSQL()+`)`, status, reasonCode, reasonCode, lastError,
 		exchangeOrderID, exchangeOrderID, requestedQty, requestedQty, quantizedQty, quantizedQty, filledQty, filledQty,
 		status, status, status, status, id, status, status, status, status, status)
 	if err != nil {
@@ -535,6 +738,18 @@ func (s *CopyTradeStore) UpdateExecutionIntentExchangeState(id int64, exchangeSt
 		return nil
 	}
 	_, err := s.db.Exec(`UPDATE copy_trade_execution_intents SET exchange_state=?,updated_at=CURRENT_TIMESTAMP WHERE id=?`, strings.ToUpper(strings.TrimSpace(exchangeState)), id)
+	return err
+}
+
+func (s *CopyTradeStore) UpdateExecutionIntentQuantityConstraints(id int64, requested, quantized, step, exchangeMinQuantity, exchangeMinNotional, minimumExecutable float64) error {
+	if id <= 0 || requested <= 0 || step <= 0 || minimumExecutable <= 0 {
+		return fmt.Errorf("invalid execution quantity constraints")
+	}
+	_, err := s.db.Exec(`UPDATE copy_trade_execution_intents SET
+		requested_quantity=?,quantized_quantity=?,quantity_step=?,
+		exchange_min_quantity=?,exchange_min_notional=?,minimum_executable_quantity=?,
+		updated_at=CURRENT_TIMESTAMP WHERE id=?`,
+		requested, quantized, step, exchangeMinQuantity, exchangeMinNotional, minimumExecutable, id)
 	return err
 }
 
@@ -566,6 +781,7 @@ func (s *CopyTradeStore) ListUnfinishedExecutionIntents(traderID string) ([]*Cop
 		COALESCE(cycle_id,0),COALESCE(candidate_id,0),COALESCE(analysis_id,0),COALESCE(attempt_no,0),COALESCE(decision_generation,0),
 		COALESCE(symbol,''),COALESCE(side,''),COALESCE(margin_mode,''),COALESCE(leader_target_size,0),
 		COALESCE(requested_notional,0),COALESCE(requested_quantity,0),COALESCE(quantized_quantity,0),
+		COALESCE(quantity_step,0),COALESCE(exchange_min_quantity,0),COALESCE(exchange_min_notional,0),COALESCE(minimum_executable_quantity,0),
 		COALESCE(filled_quantity,0),COALESCE(client_order_id,''),COALESCE(exchange_order_id,''),status,
 		COALESCE(exchange_state,''),COALESCE(reason_code,''),COALESCE(last_error,''),COALESCE(failure_counted,0),created_at,updated_at,
 		submitted_at,filled_at,protected_at,terminal_at
@@ -591,6 +807,7 @@ func (s *CopyTradeStore) ListExecutionIntentsByCycle(cycleID int64) ([]*CopyTrad
 		COALESCE(cycle_id,0),COALESCE(candidate_id,0),COALESCE(analysis_id,0),COALESCE(attempt_no,0),COALESCE(decision_generation,0),
 		COALESCE(symbol,''),COALESCE(side,''),COALESCE(margin_mode,''),COALESCE(leader_target_size,0),
 		COALESCE(requested_notional,0),COALESCE(requested_quantity,0),COALESCE(quantized_quantity,0),
+		COALESCE(quantity_step,0),COALESCE(exchange_min_quantity,0),COALESCE(exchange_min_notional,0),COALESCE(minimum_executable_quantity,0),
 		COALESCE(filled_quantity,0),COALESCE(client_order_id,''),COALESCE(exchange_order_id,''),status,
 		COALESCE(exchange_state,''),COALESCE(reason_code,''),COALESCE(last_error,''),COALESCE(failure_counted,0),created_at,updated_at,
 		submitted_at,filled_at,protected_at,terminal_at

@@ -33,6 +33,7 @@ import type {
   BinanceCredentialsSetRequest,
   BinanceCredentialsTestResponse,
   BinanceCredentialsAffectedResponse,
+  CopyGuardAccountRiskPolicyResponse,
 } from '../types'
 import { CryptoService } from './crypto'
 import { httpClient } from './httpClient'
@@ -249,6 +250,33 @@ export const api = {
   ): Promise<void> {
     const result = await httpClient.put(`${API_BASE}/exchanges`, request)
     if (!result.success) throw new Error('更新交易所配置失败')
+  },
+
+  async getCopyGuardAccountRiskPolicy(
+    exchangeId: string
+  ): Promise<CopyGuardAccountRiskPolicyResponse> {
+    const result = await httpClient.get<CopyGuardAccountRiskPolicyResponse>(
+      `${API_BASE}/copytrade/risk/accounts/${exchangeId}/policy`
+    )
+    if (!result.success || !result.data) throw new Error('获取账户保护配置失败')
+    return result.data
+  },
+
+  async updateCopyGuardAccountRiskPolicy(
+    exchangeId: string,
+    maxPositionLossPct: number,
+    highRiskConfirmed = false,
+    extremeConfirmValue?: number
+  ): Promise<void> {
+    const result = await httpClient.put(
+      `${API_BASE}/copytrade/risk/accounts/${exchangeId}/policy`,
+      {
+        copy_guard_max_position_loss_pct: maxPositionLossPct,
+        risk_high_risk_confirmed: highRiskConfirmed,
+        risk_extreme_risk_confirm_value: extremeConfirmValue,
+      }
+    )
+    if (!result.success) throw new Error('保存账户保护配置失败')
   },
 
   // 创建新的交易所账户

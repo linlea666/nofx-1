@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"nofx/copyguardmetrics"
+	"nofx/copytrade"
 	"nofx/logger"
 	"nofx/store"
 )
@@ -144,7 +145,7 @@ func (a *Advisor) pollOnce() {
 }
 
 func (a *Advisor) backfillDecisionEvaluations() {
-	cycleIDs, err := a.st.ReentryAI().ListClosedCyclesPendingAIEvaluation(25)
+	cycleIDs, err := a.st.ReentryAI().ListCyclesWithMatureAIEvaluationWindows(25)
 	if err != nil {
 		logger.Warnf("[ReentryAdvisor] AI 后验评价待处理周期查询失败: %v", err)
 		return
@@ -169,17 +170,35 @@ func (a *Advisor) pollAICandidates(cfg *store.ReentryAIConfig) {
 	}
 	for _, candidate := range candidates {
 		traderCfg, err := a.st.CopyTrade().GetByTraderID(candidate.TraderID)
-		if err != nil || traderCfg.RiskReentryDecisionMode != "ai_guarded" || !traderCfg.RiskReentryEnabled {
+		if err != nil || !traderCfg.RiskStopLossEnabled || traderCfg.RiskReentryDecisionMode != "ai_guarded" || !traderCfg.RiskReentryEnabled {
 			continue
 		}
 		minNotional := traderCfg.RiskReentryMinNotional
+		maxExecutableNotional := candidate.MaxNotional
 		unactionableCode := ""
 		unactionableMessage := ""
+		riskSnapshot, snapshotErr := copytrade.GetExecutionRiskSnapshotForTrader(candidate.TraderID, candidate.CycleID)
+		if snapshotErr == nil && riskSnapshot != nil {
+			if minNotional <= 0 {
+				minNotional = riskSnapshot.MinExecutableNotional
+			}
+			if riskSnapshot.MaxExecutableNotional > 0 && (maxExecutableNotional <= 0 || riskSnapshot.MaxExecutableNotional < maxExecutableNotional) {
+				maxExecutableNotional = riskSnapshot.MaxExecutableNotional
+			}
+		}
 		switch {
 		case !candidate.Protectable:
 			unactionableCode, unactionableMessage = "PROTECTION_UNAVAILABLE", "deterministic protection precheck unavailable"
-		case minNotional > 0 && candidate.MaxNotional < minNotional:
-			unactionableCode, unactionableMessage = "MIN_NOTIONAL", fmt.Sprintf("maximum executable notional %.2f is below minimum %.2f", candidate.MaxNotional, minNotional)
+		case snapshotErr != nil || riskSnapshot == nil || !riskSnapshot.ExecutionConstraintsAvailable:
+			reason := "execution constraints unavailable"
+			if snapshotErr != nil {
+				reason = snapshotErr.Error()
+			} else if riskSnapshot != nil && riskSnapshot.ExecutionConstraintReason != "" {
+				reason = riskSnapshot.ExecutionConstraintReason
+			}
+			unactionableCode, unactionableMessage = "EXECUTION_CONSTRAINTS_UNAVAILABLE", reason
+		case minNotional > 0 && maxExecutableNotional < minNotional:
+			unactionableCode, unactionableMessage = "MIN_NOTIONAL", fmt.Sprintf("maximum executable notional %.2f is below exchange minimum %.2f", maxExecutableNotional, minNotional)
 		}
 		if unactionableCode != "" {
 			retry := time.Duration(traderCfg.RiskAIMinReviewSeconds) * time.Second

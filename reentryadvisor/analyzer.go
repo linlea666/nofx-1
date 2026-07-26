@@ -527,6 +527,9 @@ func classifyAIReentryPreflightError(err error) string {
 	if err == nil {
 		return ""
 	}
+	if code := copytrade.ReasonCodeOf(err); code != "" {
+		return code
+	}
 	message := strings.ToLower(err.Error())
 	checks := []struct {
 		code   string

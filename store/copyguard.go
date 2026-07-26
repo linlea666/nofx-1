@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"math/rand"
 	"sort"
 	"strings"
 	"time"
@@ -72,6 +73,7 @@ const (
 type CopyGuardPolicy struct {
 	Version                int     `json:"version"`
 	StopMode               string  `json:"stop_mode"`
+	StopMaxAccountLossPct  float64 `json:"stop_max_account_loss_pct,omitempty"`
 	ATRPeriod              int     `json:"atr_period"`
 	ATRCacheMaxAgeMinutes  int     `json:"atr_cache_max_age_minutes"`
 	ATRFallbackPct         float64 `json:"atr_fallback_pct"`
@@ -140,6 +142,9 @@ type CopyGuardCycle struct {
 	BaselineNotional    float64 `json:"baseline_notional"`
 	BaselineRealizedPnL float64 `json:"baseline_realized_pnl"`
 	BaselineLeaderSize  float64 `json:"baseline_leader_size"`
+	ShadowLeaderSize    float64 `json:"shadow_leader_size"`
+	BaselineAvailable   bool    `json:"baseline_leader_size_available"`
+	BaselineQuality     string  `json:"baseline_leader_size_quality"`
 	AccountEquity       float64 `json:"account_equity"`
 	ATRAtEntry          float64 `json:"atr_at_entry"`
 	ATRAtStop           float64 `json:"atr_at_stop"`
@@ -247,6 +252,12 @@ type CopyGuardAttempt struct {
 
 func (s *CopyTradeStore) initCopyGuardTables() error {
 	_, err := s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS copy_guard_account_policies (
+			exchange_id TEXT PRIMARY KEY,
+			max_position_loss_pct REAL NOT NULL DEFAULT 0.10,
+			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			FOREIGN KEY (exchange_id) REFERENCES exchanges(id) ON DELETE CASCADE
+		);
 		CREATE TABLE IF NOT EXISTS copy_guard_policies (
 			trader_id TEXT PRIMARY KEY,
 			policy_json TEXT NOT NULL,
@@ -259,7 +270,9 @@ func (s *CopyTradeStore) initCopyGuardTables() error {
 			symbol TEXT NOT NULL, side TEXT NOT NULL, margin_mode TEXT NOT NULL,
 			status TEXT NOT NULL DEFAULT 'FOLLOWING', policy_snapshot TEXT NOT NULL DEFAULT '{}',
 			leader_entry_price REAL DEFAULT 0, follower_entry_price REAL DEFAULT 0,
-			follower_notional REAL DEFAULT 0, baseline_notional REAL DEFAULT 0, baseline_realized_pnl REAL DEFAULT 0, baseline_leader_size REAL DEFAULT 0, account_equity REAL DEFAULT 0,
+			follower_notional REAL DEFAULT 0, baseline_notional REAL DEFAULT 0, baseline_realized_pnl REAL DEFAULT 0, baseline_leader_size REAL DEFAULT 0,
+			shadow_leader_size REAL DEFAULT 0, baseline_leader_size_available BOOLEAN NOT NULL DEFAULT 0,
+			baseline_leader_size_quality TEXT NOT NULL DEFAULT 'UNSCORABLE', account_equity REAL DEFAULT 0,
 			atr_at_entry REAL DEFAULT 0, atr_at_stop REAL DEFAULT 0, last_observed_price REAL DEFAULT 0,
 			reentry_count INTEGER DEFAULT 0, stop_count INTEGER DEFAULT 0,
 			actual_pnl REAL DEFAULT 0, baseline_pnl REAL DEFAULT 0, fees REAL DEFAULT 0,
@@ -309,45 +322,81 @@ func (s *CopyTradeStore) initCopyGuardTables() error {
 		CREATE INDEX IF NOT EXISTS idx_copy_guard_watch_samples_cycle ON copy_guard_watch_samples(cycle_id, created_at);
 	`)
 	if err == nil {
-		migrations := []string{
-			`ALTER TABLE copy_guard_cycles ADD COLUMN baseline_notional REAL DEFAULT 0`,
-			`ALTER TABLE copy_guard_cycles ADD COLUMN baseline_realized_pnl REAL DEFAULT 0`,
-			`ALTER TABLE copy_guard_cycles ADD COLUMN baseline_leader_size REAL DEFAULT 0`,
-			`ALTER TABLE copy_guard_cycles ADD COLUMN protection_status TEXT DEFAULT 'PENDING'`,
-			`ALTER TABLE copy_guard_cycles ADD COLUMN protection_retries INTEGER DEFAULT 0`,
-			`ALTER TABLE copy_guard_cycles ADD COLUMN protection_coverage REAL DEFAULT 0`,
-			`ALTER TABLE copy_guard_cycles ADD COLUMN protection_error TEXT DEFAULT ''`,
-			`ALTER TABLE copy_guard_cycles ADD COLUMN follower_pos_id TEXT DEFAULT ''`,
-			`ALTER TABLE copy_guard_cycles ADD COLUMN entry_order_id TEXT DEFAULT ''`,
-			`ALTER TABLE copy_guard_cycles ADD COLUMN exit_order_id TEXT DEFAULT ''`,
-			`ALTER TABLE copy_guard_cycles ADD COLUMN protection_missing_at DATETIME`,
-			`ALTER TABLE copy_guard_cycles ADD COLUMN pending_since DATETIME`,
-			`ALTER TABLE copy_guard_cycles ADD COLUMN liquidation_penalty REAL DEFAULT 0`,
-			`ALTER TABLE copy_guard_cycles ADD COLUMN protection_missing_seconds REAL DEFAULT 0`,
-			`ALTER TABLE copy_guard_cycles ADD COLUMN protection_last_retry_at DATETIME`,
-			`ALTER TABLE copy_guard_cycles ADD COLUMN tracking_difference REAL DEFAULT 0`,
-			`ALTER TABLE copy_guard_cycles ADD COLUMN accounting_status TEXT DEFAULT 'OPEN'`,
-			`ALTER TABLE copy_guard_cycles ADD COLUMN accounting_error TEXT DEFAULT ''`,
-			`ALTER TABLE copy_guard_cycles ADD COLUMN reconciled_at DATETIME`,
-			`ALTER TABLE copy_guard_attempts ADD COLUMN liquidation_penalty REAL DEFAULT 0`,
-			`ALTER TABLE copy_guard_attempts ADD COLUMN reconciled BOOLEAN DEFAULT 0`,
-			`ALTER TABLE copy_guard_attempts ADD COLUMN follower_pos_id TEXT DEFAULT ''`,
-			`ALTER TABLE copy_guard_attempts ADD COLUMN entry_order_id TEXT DEFAULT ''`,
-			`ALTER TABLE copy_guard_attempts ADD COLUMN exit_order_id TEXT DEFAULT ''`,
-			`ALTER TABLE copy_guard_cycles ADD COLUMN baseline_source TEXT DEFAULT ''`,
+		migrations := []struct {
+			table, name, definition string
+		}{
+			{"copy_guard_cycles", "baseline_notional", "REAL DEFAULT 0"},
+			{"copy_guard_cycles", "baseline_realized_pnl", "REAL DEFAULT 0"},
+			{"copy_guard_cycles", "baseline_leader_size", "REAL DEFAULT 0"},
+			{"copy_guard_cycles", "protection_status", "TEXT DEFAULT 'PENDING'"},
+			{"copy_guard_cycles", "protection_retries", "INTEGER DEFAULT 0"},
+			{"copy_guard_cycles", "protection_coverage", "REAL DEFAULT 0"},
+			{"copy_guard_cycles", "protection_error", "TEXT DEFAULT ''"},
+			{"copy_guard_cycles", "follower_pos_id", "TEXT DEFAULT ''"},
+			{"copy_guard_cycles", "entry_order_id", "TEXT DEFAULT ''"},
+			{"copy_guard_cycles", "exit_order_id", "TEXT DEFAULT ''"},
+			{"copy_guard_cycles", "protection_missing_at", "DATETIME"},
+			{"copy_guard_cycles", "pending_since", "DATETIME"},
+			{"copy_guard_cycles", "liquidation_penalty", "REAL DEFAULT 0"},
+			{"copy_guard_cycles", "protection_missing_seconds", "REAL DEFAULT 0"},
+			{"copy_guard_cycles", "protection_last_retry_at", "DATETIME"},
+			{"copy_guard_cycles", "tracking_difference", "REAL DEFAULT 0"},
+			{"copy_guard_cycles", "accounting_status", "TEXT DEFAULT 'OPEN'"},
+			{"copy_guard_cycles", "accounting_error", "TEXT DEFAULT ''"},
+			{"copy_guard_cycles", "reconciled_at", "DATETIME"},
+			{"copy_guard_attempts", "liquidation_penalty", "REAL DEFAULT 0"},
+			{"copy_guard_attempts", "reconciled", "BOOLEAN DEFAULT 0"},
+			{"copy_guard_attempts", "follower_pos_id", "TEXT DEFAULT ''"},
+			{"copy_guard_attempts", "entry_order_id", "TEXT DEFAULT ''"},
+			{"copy_guard_attempts", "exit_order_id", "TEXT DEFAULT ''"},
+			{"copy_guard_cycles", "baseline_source", "TEXT DEFAULT ''"},
 			// baseline_version: 1 = 旧口径（领航员比例折算的影子名义），
 			// 2 = own-path 口径（每个 attempt 按自身名义持有到领航员平仓价）。
 			// 仅作启动一次性重算的书签，业务逻辑不读取。
-			`ALTER TABLE copy_guard_cycles ADD COLUMN baseline_version INTEGER DEFAULT 1`,
-			`ALTER TABLE copy_guard_cycles ADD COLUMN leader_entry_at_stop REAL DEFAULT 0`,
-			`ALTER TABLE copy_guard_watch_samples ADD COLUMN attempt_no INTEGER NOT NULL DEFAULT 0`,
-			`ALTER TABLE copy_guard_protective_orders ADD COLUMN quantity_step REAL DEFAULT 0`,
-			`ALTER TABLE copy_guard_protective_orders ADD COLUMN previous_algo_id TEXT DEFAULT ''`,
-			`ALTER TABLE copy_guard_protective_orders ADD COLUMN previous_algo_client_id TEXT DEFAULT ''`,
-			`ALTER TABLE copy_guard_protective_orders ADD COLUMN replacement_pending BOOLEAN DEFAULT 0`,
+			{"copy_guard_cycles", "baseline_version", "INTEGER DEFAULT 1"},
+			{"copy_guard_cycles", "leader_entry_at_stop", "REAL DEFAULT 0"},
+			{"copy_guard_watch_samples", "attempt_no", "INTEGER NOT NULL DEFAULT 0"},
+			{"copy_guard_protective_orders", "quantity_step", "REAL DEFAULT 0"},
+			{"copy_guard_protective_orders", "previous_algo_id", "TEXT DEFAULT ''"},
+			{"copy_guard_protective_orders", "previous_algo_client_id", "TEXT DEFAULT ''"},
+			{"copy_guard_protective_orders", "replacement_pending", "BOOLEAN DEFAULT 0"},
+			{"copy_guard_cycles", "shadow_leader_size", "REAL DEFAULT 0"},
+			{"copy_guard_cycles", "baseline_leader_size_available", "BOOLEAN NOT NULL DEFAULT 0"},
+			{"copy_guard_cycles", "baseline_leader_size_quality", "TEXT NOT NULL DEFAULT 'UNSCORABLE'"},
 		}
 		for _, migration := range migrations {
-			_, _ = s.db.Exec(migration)
+			if migrationErr := ensureSQLiteColumn(s.db, migration.table, migration.name, migration.definition); migrationErr != nil {
+				return fmt.Errorf("migrate %s.%s: %w", migration.table, migration.name, migrationErr)
+			}
+		}
+		// Recover an immutable cycle baseline only from the earliest confirmed
+		// leader open. The legacy baseline_leader_size value was a mutable
+		// shadow and is not accepted as evidence. Shadow continuity may retain
+		// that legacy observation, but unavailable baselines stay unavailable.
+		if _, migrationErr := s.db.Exec(`UPDATE copy_guard_cycles
+			SET shadow_leader_size=CASE WHEN shadow_leader_size<=0 THEN baseline_leader_size ELSE shadow_leader_size END
+			WHERE closed_at IS NULL`); migrationErr != nil {
+			return fmt.Errorf("initialize copy guard shadow size: %w", migrationErr)
+		}
+		if _, migrationErr := s.db.Exec(`UPDATE copy_guard_cycles
+			SET baseline_leader_size=(
+				SELECT i.leader_target_size FROM copy_trade_execution_intents i
+				WHERE i.trader_id=copy_guard_cycles.trader_id
+				  AND i.leader_pos_id=copy_guard_cycles.leader_pos_id
+				  AND i.action IN ('open_long','open_short')
+				  AND i.status IN ('FILLED','PROTECTED')
+				  AND i.leader_target_size>0
+				ORDER BY i.source_revision,i.id LIMIT 1
+			),baseline_leader_size_available=1,baseline_leader_size_quality='VERIFIED'
+			WHERE closed_at IS NULL AND EXISTS(
+				SELECT 1 FROM copy_trade_execution_intents i
+				WHERE i.trader_id=copy_guard_cycles.trader_id
+				  AND i.leader_pos_id=copy_guard_cycles.leader_pos_id
+				  AND i.action IN ('open_long','open_short')
+				  AND i.status IN ('FILLED','PROTECTED')
+				  AND i.leader_target_size>0
+			)`); migrationErr != nil {
+			return fmt.Errorf("recover copy guard immutable baseline: %w", migrationErr)
 		}
 		// Existing closed cycles were produced before deterministic settlement was
 		// available. Preserve their raw values but never present them as verified.
@@ -473,7 +522,7 @@ func scanCopyGuardWatchSample(scan func(dest ...interface{}) error) (*CopyGuardW
 }
 
 func policyFromConfig(c *CopyTradeConfig) CopyGuardPolicy {
-	return CopyGuardPolicy{Version: c.RiskPolicyVersion, StopMode: c.RiskStopMode, ATRPeriod: c.RiskATRPeriod, ATRCacheMaxAgeMinutes: c.RiskATRCacheMaxAgeMinutes, ATRFallbackPct: c.RiskATRFallbackPct, TriggerPriceType: c.RiskTriggerPriceType, SlippageBufferBPS: c.RiskSlippageBufferBPS, RoundTripFeeBPS: c.RiskRoundTripFeeBPS, LiquidationBufferATR: c.RiskLiquidationBufferATR, MaxReentries: c.RiskMaxReentries, ReentryBandATR: c.RiskReentryBandATR, ReentryCooldownSec: c.RiskReentryCooldownSeconds, ReentryMaxChaseATR: c.RiskReentryMaxChaseATR, MaxATRExpansion: c.RiskReentryMaxATRExpansion, WatchTimeoutMinutes: c.RiskWatchTimeoutMinutes, MigrationConfirmed: c.RiskMigrationConfirmed, AddonBudgetPct: c.RiskAddonBudgetPct, CycleLossBudgetPct: c.RiskCycleLossBudgetPct, PortfolioLossBudgetPct: c.RiskPortfolioLossBudgetPct, ReentryDecisionMode: c.RiskReentryDecisionMode, ReentryMinNotional: c.RiskReentryMinNotional, AIConfidenceThreshold: c.RiskAIConfidenceThreshold, AIMinReviewSeconds: c.RiskAIMinReviewSeconds, AIDailyCallLimit: c.RiskAIDailyCallLimit, AILifecycleCallLimit: c.RiskAILifecycleCallLimit, NotificationLevel: c.RiskNotificationLevel, ReentryMinRecoveryATR: c.RiskReentryMinRecoveryATR, ReentryCooldownEscalation: c.RiskReentryCooldownEscalation, ReentryRecoveryEscalation: c.RiskReentryRecoveryEscalation, UnprotectableAction: c.RiskUnprotectableAction, ReentryNoiseOverride: c.RiskReentryNoiseOverride, DefaultsVersion: copyGuardPolicyDefaultsVersion}
+	return CopyGuardPolicy{Version: c.RiskPolicyVersion, StopMode: c.RiskStopMode, StopMaxAccountLossPct: c.RiskStopMaxAccountLossPct, ATRPeriod: c.RiskATRPeriod, ATRCacheMaxAgeMinutes: c.RiskATRCacheMaxAgeMinutes, ATRFallbackPct: c.RiskATRFallbackPct, TriggerPriceType: c.RiskTriggerPriceType, SlippageBufferBPS: c.RiskSlippageBufferBPS, RoundTripFeeBPS: c.RiskRoundTripFeeBPS, LiquidationBufferATR: c.RiskLiquidationBufferATR, MaxReentries: c.RiskMaxReentries, ReentryBandATR: c.RiskReentryBandATR, ReentryCooldownSec: c.RiskReentryCooldownSeconds, ReentryMaxChaseATR: c.RiskReentryMaxChaseATR, MaxATRExpansion: c.RiskReentryMaxATRExpansion, WatchTimeoutMinutes: c.RiskWatchTimeoutMinutes, MigrationConfirmed: c.RiskMigrationConfirmed, AddonBudgetPct: c.RiskAddonBudgetPct, CycleLossBudgetPct: c.RiskCycleLossBudgetPct, PortfolioLossBudgetPct: c.RiskPortfolioLossBudgetPct, ReentryDecisionMode: c.RiskReentryDecisionMode, ReentryMinNotional: c.RiskReentryMinNotional, AIConfidenceThreshold: c.RiskAIConfidenceThreshold, AIMinReviewSeconds: c.RiskAIMinReviewSeconds, AIDailyCallLimit: c.RiskAIDailyCallLimit, AILifecycleCallLimit: c.RiskAILifecycleCallLimit, NotificationLevel: c.RiskNotificationLevel, ReentryMinRecoveryATR: c.RiskReentryMinRecoveryATR, ReentryCooldownEscalation: c.RiskReentryCooldownEscalation, ReentryRecoveryEscalation: c.RiskReentryRecoveryEscalation, UnprotectableAction: c.RiskUnprotectableAction, ReentryNoiseOverride: c.RiskReentryNoiseOverride, DefaultsVersion: copyGuardPolicyDefaultsVersion}
 }
 
 func (s *CopyTradeStore) saveCopyGuardPolicy(c *CopyTradeConfig) error {
@@ -499,6 +548,7 @@ func (s *CopyTradeStore) loadCopyGuardPolicy(c *CopyTradeConfig) error {
 		return err
 	}
 	c.RiskPolicyVersion, c.RiskStopMode, c.RiskATRPeriod = p.Version, p.StopMode, p.ATRPeriod
+	c.RiskStopMaxAccountLossPct = p.StopMaxAccountLossPct
 	c.RiskATRCacheMaxAgeMinutes = p.ATRCacheMaxAgeMinutes
 	c.RiskATRFallbackPct, c.RiskTriggerPriceType = p.ATRFallbackPct, p.TriggerPriceType
 	c.RiskSlippageBufferBPS, c.RiskLiquidationBufferATR = p.SlippageBufferBPS, p.LiquidationBufferATR
@@ -579,7 +629,7 @@ func (s *CopyTradeStore) EnsureCopyGuardCycle(c *CopyGuardCycle) (*CopyGuardCycl
 	err := s.db.QueryRow(`SELECT id FROM copy_guard_cycles WHERE trader_id=? AND leader_pos_id=? AND closed_at IS NULL ORDER BY id DESC LIMIT 1`, c.TraderID, c.LeaderPosID).Scan(&existing)
 	if err == nil {
 		if c.BaselineLeaderSize > 0 {
-			_, _ = s.db.Exec(`UPDATE copy_guard_cycles SET baseline_leader_size=? WHERE id=? AND baseline_leader_size<=0`, c.BaselineLeaderSize, existing)
+			_, _ = s.db.Exec(`UPDATE copy_guard_cycles SET baseline_leader_size=?,shadow_leader_size=?,baseline_leader_size_available=1,baseline_leader_size_quality='VERIFIED' WHERE id=? AND baseline_leader_size<=0`, c.BaselineLeaderSize, c.BaselineLeaderSize, existing)
 		}
 		return s.GetCopyGuardCycle(existing)
 	}
@@ -589,8 +639,12 @@ func (s *CopyTradeStore) EnsureCopyGuardCycle(c *CopyGuardCycle) (*CopyGuardCycl
 	if c.ProtectionStatus == "" {
 		c.ProtectionStatus = CopyGuardProtectionPending
 	}
-	res, err := s.db.Exec(`INSERT INTO copy_guard_cycles(trader_id,leader_id,leader_pos_id,symbol,side,margin_mode,status,policy_snapshot,leader_entry_price,follower_entry_price,follower_notional,baseline_notional,baseline_leader_size,account_equity,atr_at_entry,last_observed_price,protection_status,baseline_version,pending_since) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,2,CURRENT_TIMESTAMP)`,
-		c.TraderID, c.LeaderID, c.LeaderPosID, c.Symbol, c.Side, c.MarginMode, c.Status, c.PolicySnapshot, c.LeaderEntryPrice, c.FollowerEntryPrice, c.FollowerNotional, c.FollowerNotional, c.BaselineLeaderSize, c.AccountEquity, c.ATRAtEntry, c.LastObservedPrice, c.ProtectionStatus)
+	available, quality := c.BaselineLeaderSize > 0, "UNSCORABLE"
+	if available {
+		quality = "VERIFIED"
+	}
+	res, err := s.db.Exec(`INSERT INTO copy_guard_cycles(trader_id,leader_id,leader_pos_id,symbol,side,margin_mode,status,policy_snapshot,leader_entry_price,follower_entry_price,follower_notional,baseline_notional,baseline_leader_size,shadow_leader_size,baseline_leader_size_available,baseline_leader_size_quality,account_equity,atr_at_entry,last_observed_price,protection_status,baseline_version,pending_since) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,2,CURRENT_TIMESTAMP)`,
+		c.TraderID, c.LeaderID, c.LeaderPosID, c.Symbol, c.Side, c.MarginMode, c.Status, c.PolicySnapshot, c.LeaderEntryPrice, c.FollowerEntryPrice, c.FollowerNotional, c.FollowerNotional, c.BaselineLeaderSize, c.BaselineLeaderSize, available, quality, c.AccountEquity, c.ATRAtEntry, c.LastObservedPrice, c.ProtectionStatus)
 	if err != nil {
 		return nil, err
 	}
@@ -602,7 +656,7 @@ func (s *CopyTradeStore) InitializeCopyGuardLeaderBaseline(id int64, leaderSize 
 	if id <= 0 || leaderSize <= 0 {
 		return nil
 	}
-	_, err := s.db.Exec(`UPDATE copy_guard_cycles SET baseline_leader_size=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND baseline_leader_size<=0`, leaderSize, id)
+	_, err := s.db.Exec(`UPDATE copy_guard_cycles SET baseline_leader_size=?,shadow_leader_size=CASE WHEN shadow_leader_size<=0 THEN ? ELSE shadow_leader_size END,baseline_leader_size_available=1,baseline_leader_size_quality='VERIFIED',updated_at=CURRENT_TIMESTAMP WHERE id=? AND baseline_leader_size<=0`, leaderSize, leaderSize, id)
 	return err
 }
 
@@ -618,13 +672,13 @@ func (s *CopyTradeStore) GetOpenCopyGuardCycle(traderID, leaderPosID string) (*C
 
 type rowScanner interface{ Scan(...interface{}) error }
 
-const copyGuardCycleSelect = `SELECT id,trader_id,leader_id,leader_pos_id,symbol,side,margin_mode,status,policy_snapshot,leader_entry_price,follower_entry_price,follower_notional,baseline_notional,baseline_realized_pnl,baseline_leader_size,account_equity,atr_at_entry,atr_at_stop,leader_entry_at_stop,last_observed_price,reentry_count,stop_count,actual_pnl,baseline_pnl,fees,funding_fee,liquidation_penalty,slippage,net_guard_effect,tracking_difference,accounting_status,accounting_error,baseline_source,protection_status,protection_retries,protection_coverage,protection_error,protection_missing_seconds,follower_pos_id,entry_order_id,exit_order_id,protection_missing_at,protection_last_retry_at,pending_since,reconciled_at,opened_at,stopped_at,closed_at,updated_at FROM copy_guard_cycles`
+const copyGuardCycleSelect = `SELECT id,trader_id,leader_id,leader_pos_id,symbol,side,margin_mode,status,policy_snapshot,leader_entry_price,follower_entry_price,follower_notional,baseline_notional,baseline_realized_pnl,baseline_leader_size,shadow_leader_size,baseline_leader_size_available,baseline_leader_size_quality,account_equity,atr_at_entry,atr_at_stop,leader_entry_at_stop,last_observed_price,reentry_count,stop_count,actual_pnl,baseline_pnl,fees,funding_fee,liquidation_penalty,slippage,net_guard_effect,tracking_difference,accounting_status,accounting_error,baseline_source,protection_status,protection_retries,protection_coverage,protection_error,protection_missing_seconds,follower_pos_id,entry_order_id,exit_order_id,protection_missing_at,protection_last_retry_at,pending_since,reconciled_at,opened_at,stopped_at,closed_at,updated_at FROM copy_guard_cycles`
 
 func scanCopyGuardCycle(row rowScanner) (*CopyGuardCycle, error) {
 	var c CopyGuardCycle
 	var opened, updated string
 	var stopped, closed, missing, lastRetry, pending, reconciled sql.NullString
-	err := row.Scan(&c.ID, &c.TraderID, &c.LeaderID, &c.LeaderPosID, &c.Symbol, &c.Side, &c.MarginMode, &c.Status, &c.PolicySnapshot, &c.LeaderEntryPrice, &c.FollowerEntryPrice, &c.FollowerNotional, &c.BaselineNotional, &c.BaselineRealizedPnL, &c.BaselineLeaderSize, &c.AccountEquity, &c.ATRAtEntry, &c.ATRAtStop, &c.LeaderEntryAtStop, &c.LastObservedPrice, &c.ReentryCount, &c.StopCount, &c.ActualPnL, &c.BaselinePnL, &c.Fees, &c.FundingFee, &c.LiquidationPenalty, &c.Slippage, &c.NetGuardEffect, &c.TrackingDifference, &c.AccountingStatus, &c.AccountingError, &c.BaselineSource, &c.ProtectionStatus, &c.ProtectionRetries, &c.ProtectionCoverage, &c.ProtectionError, &c.ProtectionMissingSeconds, &c.FollowerPosID, &c.EntryOrderID, &c.ExitOrderID, &missing, &lastRetry, &pending, &reconciled, &opened, &stopped, &closed, &updated)
+	err := row.Scan(&c.ID, &c.TraderID, &c.LeaderID, &c.LeaderPosID, &c.Symbol, &c.Side, &c.MarginMode, &c.Status, &c.PolicySnapshot, &c.LeaderEntryPrice, &c.FollowerEntryPrice, &c.FollowerNotional, &c.BaselineNotional, &c.BaselineRealizedPnL, &c.BaselineLeaderSize, &c.ShadowLeaderSize, &c.BaselineAvailable, &c.BaselineQuality, &c.AccountEquity, &c.ATRAtEntry, &c.ATRAtStop, &c.LeaderEntryAtStop, &c.LastObservedPrice, &c.ReentryCount, &c.StopCount, &c.ActualPnL, &c.BaselinePnL, &c.Fees, &c.FundingFee, &c.LiquidationPenalty, &c.Slippage, &c.NetGuardEffect, &c.TrackingDifference, &c.AccountingStatus, &c.AccountingError, &c.BaselineSource, &c.ProtectionStatus, &c.ProtectionRetries, &c.ProtectionCoverage, &c.ProtectionError, &c.ProtectionMissingSeconds, &c.FollowerPosID, &c.EntryOrderID, &c.ExitOrderID, &missing, &lastRetry, &pending, &reconciled, &opened, &stopped, &closed, &updated)
 	if err != nil {
 		return nil, err
 	}
@@ -821,7 +875,7 @@ func (s *CopyTradeStore) UpdateCopyGuardShadow(id int64, leaderEntry, lastPrice,
 	defer tx.Rollback()
 	var oldEntry, oldNotional, oldLeaderSize, realized float64
 	var side string
-	if err = tx.QueryRow(`SELECT leader_entry_price,baseline_notional,baseline_realized_pnl,baseline_leader_size,side FROM copy_guard_cycles WHERE id=?`, id).Scan(&oldEntry, &oldNotional, &realized, &oldLeaderSize, &side); err != nil {
+	if err = tx.QueryRow(`SELECT leader_entry_price,baseline_notional,baseline_realized_pnl,shadow_leader_size,side FROM copy_guard_cycles WHERE id=?`, id).Scan(&oldEntry, &oldNotional, &realized, &oldLeaderSize, &side); err != nil {
 		return err
 	}
 	// A size reduction realizes the corresponding shadow quantity at the current
@@ -835,7 +889,7 @@ func (s *CopyTradeStore) UpdateCopyGuardShadow(id int64, leaderEntry, lastPrice,
 		}
 		realized += reduced * move
 	}
-	if _, err = tx.Exec(`UPDATE copy_guard_cycles SET leader_entry_price=?,last_observed_price=?,baseline_notional=?,baseline_realized_pnl=?,baseline_leader_size=?,updated_at=CURRENT_TIMESTAMP WHERE id=?`, leaderEntry, lastPrice, baselineNotional, realized, leaderSize, id); err != nil {
+	if _, err = tx.Exec(`UPDATE copy_guard_cycles SET leader_entry_price=?,last_observed_price=?,baseline_notional=?,baseline_realized_pnl=?,shadow_leader_size=?,updated_at=CURRENT_TIMESTAMP WHERE id=?`, leaderEntry, lastPrice, baselineNotional, realized, leaderSize, id); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -1542,6 +1596,8 @@ type CopyGuardSummary struct {
 	AvoidedLoss            float64 `json:"avoided_loss"`
 	OpportunityCost        float64 `json:"opportunity_cost"`
 	NetGuardEffect         float64 `json:"net_guard_effect"`
+	StopOnlyPnL            float64 `json:"stop_only_pnl"`
+	ReentryContribution    float64 `json:"reentry_contribution"`
 	Fees                   float64 `json:"fees"`
 	FundingFee             float64 `json:"funding_fee"`
 	LiquidationPenalty     float64 `json:"liquidation_penalty"`
@@ -1578,15 +1634,77 @@ type CopyGuardSummary struct {
 	// last_observed）的已对账周期数；其净效果单独累加在
 	// EstimatedNetGuardEffect，headline NetGuardEffect 中已实测部分 =
 	// NetGuardEffect − EstimatedNetGuardEffect。
-	EstimatedBaselineCycles  int     `json:"estimated_baseline_cycles"`
-	EstimatedNetGuardEffect  float64 `json:"estimated_net_guard_effect"`
-	UnscorableBaselineCycles int     `json:"unscorable_baseline_cycles"`
+	EstimatedBaselineCycles  int          `json:"estimated_baseline_cycles"`
+	EstimatedNetGuardEffect  float64      `json:"estimated_net_guard_effect"`
+	UnscorableBaselineCycles int          `json:"unscorable_baseline_cycles"`
+	VerifiedBaselineCycles   int          `json:"verified_baseline_cycles"`
+	ReentrySuccessEstimate   RateEstimate `json:"reentry_success_estimate"`
+	FalseKillEstimate        RateEstimate `json:"false_kill_estimate"`
+	MeanNetEffectCI          MeanEstimate `json:"mean_net_guard_effect_estimate"`
 	// Drawdown/tail metrics only use reconciled cycles that actually stopped.
 	// With small samples CVaR95 intentionally collapses to the worst observation.
 	MaxRealizedDrawdownUSD float64               `json:"max_realized_drawdown_usd"`
 	WorstCycleLossUSD      float64               `json:"worst_cycle_loss_usd"`
 	TailLossCVaR95USD      float64               `json:"tail_loss_cvar_95_usd"`
 	Trend                  []CopyGuardTrendPoint `json:"trend"`
+}
+
+type RateEstimate struct {
+	Numerator   int     `json:"numerator"`
+	Denominator int     `json:"denominator"`
+	Rate        float64 `json:"rate"`
+	CI95Low     float64 `json:"ci95_low"`
+	CI95High    float64 `json:"ci95_high"`
+	Method      string  `json:"method"`
+	Status      string  `json:"status"`
+}
+
+type MeanEstimate struct {
+	SampleCount int     `json:"sample_count"`
+	Mean        float64 `json:"mean"`
+	CI95Low     float64 `json:"ci95_low"`
+	CI95High    float64 `json:"ci95_high"`
+	Method      string  `json:"method"`
+	Status      string  `json:"status"`
+}
+
+func wilsonRate(successes, total int) RateEstimate {
+	out := RateEstimate{Numerator: successes, Denominator: total, Method: "WILSON_95", Status: "INSUFFICIENT_DATA"}
+	if total <= 0 {
+		return out
+	}
+	p, z := float64(successes)/float64(total), 1.959963984540054
+	n := float64(total)
+	denom := 1 + z*z/n
+	center := (p + z*z/(2*n)) / denom
+	margin := z * math.Sqrt((p*(1-p)+z*z/(4*n))/n) / denom
+	out.Rate, out.CI95Low, out.CI95High, out.Status = p, math.Max(0, center-margin), math.Min(1, center+margin), "AVAILABLE"
+	return out
+}
+
+func bootstrapMean(values []float64) MeanEstimate {
+	out := MeanEstimate{SampleCount: len(values), Method: "BOOTSTRAP_95_FIXED_SEED", Status: "INSUFFICIENT_SAMPLE"}
+	if len(values) == 0 {
+		return out
+	}
+	for _, v := range values {
+		out.Mean += v
+	}
+	out.Mean /= float64(len(values))
+	if len(values) < 20 {
+		return out
+	}
+	rng := rand.New(rand.NewSource(1))
+	means := make([]float64, 5000)
+	for i := range means {
+		for j := 0; j < len(values); j++ {
+			means[i] += values[rng.Intn(len(values))]
+		}
+		means[i] /= float64(len(values))
+	}
+	sort.Float64s(means)
+	out.CI95Low, out.CI95High, out.Status = means[124], means[4874], "AVAILABLE"
+	return out
 }
 
 func copyGuardTailRisk(pnls []float64) (maxDrawdown, worstLoss, cvar95 float64) {
@@ -1698,11 +1816,38 @@ func (s *CopyTradeStore) CopyGuardSummary(traderIDs []string, from, to time.Time
 	if stoppedCycles > 0 {
 		x.FalseKillRate = float64(falseKills) / float64(stoppedCycles)
 	}
+	x.ReentrySuccessEstimate = wilsonRate(winningReentries, endedReentries)
+	x.FalseKillEstimate = wilsonRate(falseKills, stoppedCycles)
+	_ = s.db.QueryRow(`SELECT
+		COALESCE(SUM(CASE WHEN a.attempt_no=0 THEN a.pnl ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN a.attempt_no>0 THEN a.pnl ELSE 0 END),0)
+		FROM copy_guard_attempts a JOIN copy_guard_cycles c ON c.id=a.cycle_id
+		WHERE c.id IN (`+filteredCycleQuery+`) AND c.accounting_status='RECONCILED'`, rateArgs...).Scan(&x.StopOnlyPnL, &x.ReentryContribution)
 	// v5 统计分层：估算基线（最后观测价，领航员真实离场价未获得）的周期
 	// 单列，避免估算值混入 headline 后误导（实测口径 = 总值 − 估算部分）。
 	// 计数与求和口径一致：都只统计 stop_count>0（headline 净效果的组成部分）
 	_ = s.db.QueryRow(`SELECT COUNT(*),COALESCE(SUM(net_guard_effect),0) FROM copy_guard_cycles WHERE id IN (`+filteredCycleQuery+`) AND accounting_status='RECONCILED' AND baseline_source='last_observed' AND stop_count>0`, rateArgs...).Scan(&x.EstimatedBaselineCycles, &x.EstimatedNetGuardEffect)
 	_ = s.db.QueryRow(`SELECT COUNT(*) FROM copy_guard_cycles WHERE id IN (`+filteredCycleQuery+`) AND accounting_status='RECONCILED' AND baseline_source='missing' AND stop_count>0`, rateArgs...).Scan(&x.UnscorableBaselineCycles)
+	_ = s.db.QueryRow(`SELECT COUNT(*) FROM copy_guard_cycles WHERE id IN (`+filteredCycleQuery+`) AND accounting_status='RECONCILED' AND COALESCE(baseline_source,'') NOT IN ('missing','last_observed') AND stop_count>0`, rateArgs...).Scan(&x.VerifiedBaselineCycles)
+	verifiedRows, verifiedErr := s.db.Query(`SELECT net_guard_effect FROM copy_guard_cycles WHERE id IN (`+filteredCycleQuery+`) AND accounting_status='RECONCILED' AND COALESCE(baseline_source,'') NOT IN ('missing','last_observed') AND stop_count>0 ORDER BY id`, rateArgs...)
+	if verifiedErr != nil {
+		return &x, verifiedErr
+	}
+	var verifiedEffects []float64
+	for verifiedRows.Next() {
+		var effect float64
+		if scanErr := verifiedRows.Scan(&effect); scanErr != nil {
+			_ = verifiedRows.Close()
+			return &x, scanErr
+		}
+		verifiedEffects = append(verifiedEffects, effect)
+	}
+	if rowsErr := verifiedRows.Err(); rowsErr != nil {
+		_ = verifiedRows.Close()
+		return &x, rowsErr
+	}
+	_ = verifiedRows.Close()
+	x.MeanNetEffectCI = bootstrapMean(verifiedEffects)
 	rows, queryErr := s.db.Query(`SELECT actual_pnl FROM copy_guard_cycles WHERE id IN (`+filteredCycleQuery+`) AND accounting_status='RECONCILED' AND stop_count>0 ORDER BY COALESCE(closed_at,opened_at),id`, rateArgs...)
 	if queryErr != nil {
 		return &x, queryErr

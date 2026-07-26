@@ -660,16 +660,24 @@ func (s *ReentryAIStore) GetReentryAIStats(traderIDs []string) (*ReentryAIStats,
 	}
 	if err := s.db.QueryRow(`SELECT
 		COALESCE(SUM(CASE WHEN actual_pnl IS NOT NULL THEN 1 ELSE 0 END),0),
-		COALESCE(SUM(CASE WHEN actual_pnl>0 THEN 1 ELSE 0 END),0),
-		COALESCE(SUM(execution_requested),0),COALESCE(SUM(execution_submitted),0),
-		COALESCE(SUM(execution_filled),0),COALESCE(SUM(execution_protected),0)
+		COALESCE(SUM(CASE WHEN actual_pnl>0 THEN 1 ELSE 0 END),0)
 		FROM reentry_ai_decision_evaluations
 		WHERE trader_id IN (`+marks+`) AND evaluation_version=? AND horizon='LEADER_FINAL'`,
 		evalArgs...).Scan(
 		&st.CandidateScored, &st.CandidateProfitable,
-		&st.CandidateExecutionRequested, &st.CandidateExecutionSubmitted,
-		&st.CandidateExecutionFilled, &st.CandidateExecutionProtected,
 	); err != nil {
+		return nil, err
+	}
+	// Operational conversion is live lifecycle state, not a terminal evaluation
+	// artifact. Active positions therefore appear immediately.
+	if err := s.db.QueryRow(`SELECT
+		COALESCE(SUM(CASE WHEN EXISTS(SELECT 1 FROM copy_trade_execution_intents i WHERE i.analysis_id=a.id) THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN EXISTS(SELECT 1 FROM copy_trade_execution_intents i JOIN copy_trade_execution_order_attempts oa ON oa.intent_id=i.id WHERE i.analysis_id=a.id AND oa.status IN ('SUBMITTED','FILLED')) THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN EXISTS(SELECT 1 FROM copy_trade_execution_intents i WHERE i.analysis_id=a.id AND i.status IN ('FILLED','PROTECTED')) THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN EXISTS(SELECT 1 FROM copy_trade_execution_intents i WHERE i.analysis_id=a.id AND i.status='PROTECTED') THEN 1 ELSE 0 END),0)
+		FROM reentry_ai_analyses a
+		WHERE a.trader_id IN (`+marks+`) AND a.candidate_id>0 AND a.call_status='COMPLETED' AND a.verdict='ENTER'`,
+		args...).Scan(&st.CandidateExecutionRequested, &st.CandidateExecutionSubmitted, &st.CandidateExecutionFilled, &st.CandidateExecutionProtected); err != nil {
 		return nil, err
 	}
 	return st, nil

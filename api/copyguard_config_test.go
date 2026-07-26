@@ -33,6 +33,31 @@ func TestValidateRiskConfirmation(t *testing.T) {
 	}
 }
 
+func TestValidateStopLossPctConfirmation(t *testing.T) {
+	if err := validateStopLossPctConfirmation(0, false, nil); err != nil {
+		t.Fatalf("zero trader override must inherit the account policy: %v", err)
+	}
+	if err := validateStopLossPctConfirmation(0.001, false, nil); err != nil {
+		t.Fatalf("0.1%% lower boundary must pass: %v", err)
+	}
+	if err := validateStopLossPctConfirmation(0.10, false, nil); err != nil {
+		t.Fatalf("10%% account default boundary must not require confirmation: %v", err)
+	}
+	if err := validateStopLossPctConfirmation(0.20, false, nil); err == nil {
+		t.Fatal("stop cap above 10% must require explicit confirmation")
+	}
+	exact, wrong := 20.0, 19.9
+	if err := validateStopLossPctConfirmation(0.20, true, &wrong); err == nil {
+		t.Fatal("mismatched typed stop cap must be rejected")
+	}
+	if err := validateStopLossPctConfirmation(0.20, true, &exact); err != nil {
+		t.Fatalf("matching typed stop cap must pass: %v", err)
+	}
+	if err := validateStopLossPctConfirmation(0.301, true, &exact); err == nil {
+		t.Fatal("stop cap above 30% must always be rejected")
+	}
+}
+
 func TestApplyCopyConfigRiskFieldsV4DefaultsAndExplicitZero(t *testing.T) {
 	// Copy Guard 风控字段对 SupportsCopyGuard 数据源（OKX/Binance）生效；
 	// 本用例只覆盖 OKX。不支持的 provider 会被整体剥离（见下一个用例）

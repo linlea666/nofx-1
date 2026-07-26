@@ -152,7 +152,11 @@ type Decision struct {
 	// IsCopyTrade 显式标记跟单决策。执行层（auto_trader）此前只靠
 	// Reasoning 文案包含 "Copy trading" 判定，文案调整会静默破坏跟单
 	// 执行路径；判定改为 IsCopyTrade || 旧文案匹配（向后兼容）。
-	IsCopyTrade           bool    `json:"is_copy_trade,omitempty"`
+	IsCopyTrade bool `json:"is_copy_trade,omitempty"`
+	// CopyTradeAction is the normalized source transition ("open", "add",
+	// "reduce", "close", "ai_reentry"). It replaces fragile Reasoning text
+	// parsing at execution and quantity-policy boundaries.
+	CopyTradeAction       string  `json:"copy_trade_action,omitempty"`
 	LeaderPosID           string  `json:"leader_pos_id,omitempty"`   // 领航员仓位 ID（用于映射追踪）
 	LeaderPosSize         float64 `json:"leader_pos_size,omitempty"` // 领航员当前持仓数量（用于 lastKnownSize 追踪）
 	ClientOrderID         string  `json:"client_order_id,omitempty"` // Copy Guard 幂等执行与重启恢复
@@ -172,6 +176,17 @@ type Decision struct {
 	ExecutionSymbol       string  `json:"execution_symbol,omitempty"`
 	ValueCurrency         string  `json:"value_currency,omitempty"`
 	ExecutionSettleAsset  string  `json:"execution_settle_asset,omitempty"`
+
+	// SourceFillIDs contains every source fill collapsed into this normalized
+	// leader transition. SourceFillID remains the compatibility/primary id.
+	SourceFillIDs []string `json:"source_fill_ids,omitempty"`
+
+	// Order-attempt callbacks are installed by the copy-trade integration.
+	// They deliberately stay out of JSON and keep the trader package unaware
+	// of persistence while ensuring every actual exchange submission is
+	// durable before it leaves the process.
+	BeforeOrderSubmit func(clientOrderID string, quantity float64) error                        `json:"-"`
+	AfterOrderSubmit  func(clientOrderID string, order map[string]interface{}, submitErr error) `json:"-"`
 }
 
 // FullDecision AI's complete decision (including chain of thought)

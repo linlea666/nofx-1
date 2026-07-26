@@ -405,7 +405,7 @@ func buildDataPack(st *store.Store, bn *binanceClient, sig *store.CopyGuardManua
 		}
 		guard.Leader.UnrealizedPnLPct = round(pnl, 3)
 	}
-	if cycle.BaselineLeaderSize > 0 {
+	if cycle.BaselineAvailable && cycle.BaselineLeaderSize > 0 {
 		guard.Leader.SizeVsCycleBaseline = round(sig.LeaderSize/cycle.BaselineLeaderSize, 3)
 		guard.Leader.SizeVsCycleBaselineAvailable = true
 	}

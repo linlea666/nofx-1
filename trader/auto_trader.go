@@ -1062,6 +1062,29 @@ func (at *AutoTrader) partialCloseQuantityStep(symbol string) float64 {
 	return inst.BaseQuantityStep
 }
 
+func copyOpenQuantityKind(dec *decision.Decision) QuantityIntentKind {
+	if dec == nil {
+		return QuantityInitialOpen
+	}
+	switch strings.ToLower(strings.TrimSpace(dec.CopyTradeAction)) {
+	case "add":
+		return QuantityAdd
+	case "ai_reentry":
+		return QuantityAIReentry
+	case "open":
+		return QuantityInitialOpen
+	}
+	// Compatibility for decisions persisted before CopyTradeAction existed.
+	reasoning := strings.ToLower(dec.Reasoning)
+	if strings.Contains(reasoning, "reentry") {
+		return QuantityAIReentry
+	}
+	if strings.Contains(reasoning, "add") {
+		return QuantityAdd
+	}
+	return QuantityInitialOpen
+}
+
 func (at *AutoTrader) quantizeCopyOpenQuantity(dec *decision.Decision, currentPrice, requested float64, preferReserved bool) (float64, error) {
 	resolver, ok := at.trader.(ExecutionInstrumentResolver)
 	if !ok {
@@ -1077,28 +1100,26 @@ func (at *AutoTrader) quantizeCopyOpenQuantity(dec *decision.Decision, currentPr
 	if err != nil {
 		return 0, err
 	}
+	kind := copyOpenQuantityKind(dec)
 	if preferReserved && dec.QuantizedQuantity > 0 {
 		locked := dec.QuantizedQuantity
-		check, checkErr := QuantizeOrderIntent(inst, locked, QuantityRiskIncrease)
+		check, checkErr := QuantizeOrderIntentAtPrice(inst, locked, currentPrice, kind)
 		if checkErr != nil || math.Abs(check.Quantized-locked) > math.Max(inst.BaseQuantityStep*1e-9, 1e-12) {
 			return 0, fmt.Errorf("reserved quantity %.12f is not valid for execution step %.12f", locked, inst.BaseQuantityStep)
-		}
-		if inst.MinNotional > 0 && locked*currentPrice+1e-9 < inst.MinNotional {
-			return 0, fmt.Errorf("reserved notional %.4f is below exchange minimum %.4f", locked*currentPrice, inst.MinNotional)
 		}
 		dec.PositionSizeUSD = locked * currentPrice
 		return locked, nil
 	}
-	q, err := QuantizeOrderIntent(inst, requested, QuantityRiskIncrease)
+	q, err := QuantizeOrderIntentAtPrice(inst, requested, currentPrice, kind)
 	if err != nil {
 		return 0, err
-	}
-	if inst.MinNotional > 0 && q.Quantized*currentPrice+1e-9 < inst.MinNotional {
-		return 0, fmt.Errorf("quantized notional %.4f is below exchange minimum %.4f", q.Quantized*currentPrice, inst.MinNotional)
 	}
 	dec.RequestedQuantity = requested
 	dec.QuantizedQuantity = q.Quantized
 	dec.QuantityStepOverride = q.StepOverride
+	if kind == QuantityInitialOpen && q.UsedMinimum {
+		dec.ExecutionReasonCode = "OPEN_PROMOTED_TO_EXCHANGE_MINIMUM"
+	}
 	dec.PositionSizeUSD = q.Quantized * currentPrice
 	return q.Quantized, nil
 }
@@ -1114,7 +1135,7 @@ func (at *AutoTrader) guardPartialCloseQuantity(symbol string, totalQuantity, cl
 	if hasResolver {
 		inst, err := resolver.ResolveExecutionInstrument(symbol)
 		if err == nil && inst != nil && inst.BaseQuantityStep > 0 {
-			quantized, qErr := QuantizeOrderIntent(inst, closeQuantity, QuantityRiskReduce)
+			quantized, qErr := QuantizeOrderIntent(inst, closeQuantity, QuantityPartialReduce)
 			if errors.Is(qErr, ErrQuantitySubLot) {
 				logger.Infof("  ⏭️ 减仓量 %.8f 不足最小可执行数量 %.8f，记录并忽略到领航员最终平仓", closeQuantity, inst.MinBaseQuantity)
 				return 0, fmt.Errorf("%w: 减仓量 %.8f 不足一个交易步长 %.8f", ErrPartialCloseSubLot, closeQuantity, inst.BaseQuantityStep)
@@ -1213,6 +1234,20 @@ func (at *AutoTrader) closeShortOrder(copyTrade bool, symbol string, quantity fl
 		}
 	}
 	return at.trader.CloseShort(symbol, quantity)
+}
+
+func prepareCopyOrderAttempt(d *decision.Decision, copyTrade bool, clientOrderID string, quantity float64) error {
+	if !copyTrade || d == nil || d.BeforeOrderSubmit == nil {
+		return nil
+	}
+	return d.BeforeOrderSubmit(clientOrderID, quantity)
+}
+
+func finishCopyOrderAttempt(d *decision.Decision, copyTrade bool, clientOrderID string, order map[string]interface{}, err error) {
+	if !copyTrade || d == nil || d.AfterOrderSubmit == nil {
+		return
+	}
+	d.AfterOrderSubmit(clientOrderID, order, err)
 }
 
 func captureDecisionOrderIDs(d *decision.Decision, order map[string]interface{}) {
@@ -1396,7 +1431,11 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 	}
 
 	// Open position
+	if err := prepareCopyOrderAttempt(decision, isCopyTrade, decision.ClientOrderID, quantity); err != nil {
+		return fmt.Errorf("persist open long attempt: %w", err)
+	}
 	order, err := at.openLongOrder(isCopyTrade, decision.Symbol, quantity, decision.Leverage, decision.ClientOrderID)
+	finishCopyOrderAttempt(decision, isCopyTrade, decision.ClientOrderID, order, err)
 	if err != nil {
 		// 🔁 PR-4 / 修复 E'：跟单开仓遇到保证金不足，自动减半重试一次。
 		//
@@ -1424,7 +1463,11 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 			retryClientID := deriveHalvedRetryClientOrderID(decision.ClientOrderID)
 			logger.Warnf("  🔁 [%s] 跟单开多保证金不足，减半重试一次 | qty=%.4f→%.4f USD=%.2f→%.2f | 原err=%v",
 				decision.Symbol, quantity, retryQty, actualPositionSize, retrySize, err)
+			if prepareErr := prepareCopyOrderAttempt(decision, isCopyTrade, retryClientID, retryQty); prepareErr != nil {
+				return fmt.Errorf("persist open long retry attempt: %w", prepareErr)
+			}
 			order2, err2 := at.openLongOrder(isCopyTrade, decision.Symbol, retryQty, decision.Leverage, retryClientID)
+			finishCopyOrderAttempt(decision, isCopyTrade, retryClientID, order2, err2)
 			if err2 != nil {
 				return fmt.Errorf("open long retry-halved failed: initial=%v retry=%v", err, err2)
 			}
@@ -1640,7 +1683,11 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 	}
 
 	// Open position
+	if err := prepareCopyOrderAttempt(decision, isCopyTrade, decision.ClientOrderID, quantity); err != nil {
+		return fmt.Errorf("persist open short attempt: %w", err)
+	}
 	order, err := at.openShortOrder(isCopyTrade, decision.Symbol, quantity, decision.Leverage, decision.ClientOrderID)
+	finishCopyOrderAttempt(decision, isCopyTrade, decision.ClientOrderID, order, err)
 	if err != nil {
 		// 🔁 PR-4 / 修复 E'：跟单开空保证金不足，自动减半重试一次。逻辑与 OpenLong 对称。
 		// 详见 executeOpenLongWithRecord 中相同位置的注释。
@@ -1658,7 +1705,11 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 			retryClientID := deriveHalvedRetryClientOrderID(decision.ClientOrderID)
 			logger.Warnf("  🔁 [%s] 跟单开空保证金不足，减半重试一次 | qty=%.4f→%.4f USD=%.2f→%.2f | 原err=%v",
 				decision.Symbol, quantity, retryQty, actualPositionSize, retrySize, err)
+			if prepareErr := prepareCopyOrderAttempt(decision, isCopyTrade, retryClientID, retryQty); prepareErr != nil {
+				return fmt.Errorf("persist open short retry attempt: %w", prepareErr)
+			}
 			order2, err2 := at.openShortOrder(isCopyTrade, decision.Symbol, retryQty, decision.Leverage, retryClientID)
+			finishCopyOrderAttempt(decision, isCopyTrade, retryClientID, order2, err2)
 			if err2 != nil {
 				return fmt.Errorf("open short retry-halved failed: initial=%v retry=%v", err, err2)
 			}
@@ -1822,7 +1873,11 @@ func (at *AutoTrader) executeCloseLongWithRecord(decision *decision.Decision, ac
 	}
 
 	// Close position
+	if err := prepareCopyOrderAttempt(decision, isCopyTrade, decision.ClientOrderID, closeQuantity); err != nil {
+		return fmt.Errorf("persist close long attempt: %w", err)
+	}
 	order, err := at.closeLongOrder(isCopyTrade, decision.Symbol, closeQuantity, decision.ClientOrderID)
+	finishCopyOrderAttempt(decision, isCopyTrade, decision.ClientOrderID, order, err)
 	if err != nil {
 		return err
 	}
@@ -1969,7 +2024,11 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *decision.Decision, a
 	}
 
 	// Close position
+	if err := prepareCopyOrderAttempt(decision, isCopyTrade, decision.ClientOrderID, closeQuantity); err != nil {
+		return fmt.Errorf("persist close short attempt: %w", err)
+	}
 	order, err := at.closeShortOrder(isCopyTrade, decision.Symbol, closeQuantity, decision.ClientOrderID)
+	finishCopyOrderAttempt(decision, isCopyTrade, decision.ClientOrderID, order, err)
 	if err != nil {
 		return err
 	}

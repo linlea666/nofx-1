@@ -107,12 +107,18 @@ func (s *ReentryAIStore) initReentryDecisionEvaluationTable() error {
 	if err != nil {
 		return err
 	}
-	_, _ = s.db.Exec(`ALTER TABLE reentry_ai_decision_evaluations ADD COLUMN data_quality TEXT NOT NULL DEFAULT 'UNSCORABLE'`)
-	_, _ = s.db.Exec(`ALTER TABLE reentry_ai_decision_evaluations ADD COLUMN execution_data_quality TEXT NOT NULL DEFAULT 'UNSCORABLE'`)
-	_, _ = s.db.Exec(`ALTER TABLE reentry_ai_decision_evaluations ADD COLUMN execution_requested BOOLEAN NOT NULL DEFAULT 0`)
-	_, _ = s.db.Exec(`ALTER TABLE reentry_ai_decision_evaluations ADD COLUMN execution_submitted BOOLEAN NOT NULL DEFAULT 0`)
-	_, _ = s.db.Exec(`ALTER TABLE reentry_ai_decision_evaluations ADD COLUMN execution_filled BOOLEAN NOT NULL DEFAULT 0`)
-	_, _ = s.db.Exec(`ALTER TABLE reentry_ai_decision_evaluations ADD COLUMN execution_protected BOOLEAN NOT NULL DEFAULT 0`)
+	for _, column := range []struct{ name, definition string }{
+		{"data_quality", "TEXT NOT NULL DEFAULT 'UNSCORABLE'"},
+		{"execution_data_quality", "TEXT NOT NULL DEFAULT 'UNSCORABLE'"},
+		{"execution_requested", "BOOLEAN NOT NULL DEFAULT 0"},
+		{"execution_submitted", "BOOLEAN NOT NULL DEFAULT 0"},
+		{"execution_filled", "BOOLEAN NOT NULL DEFAULT 0"},
+		{"execution_protected", "BOOLEAN NOT NULL DEFAULT 0"},
+	} {
+		if err = ensureSQLiteColumn(s.db, "reentry_ai_decision_evaluations", column.name, column.definition); err != nil {
+			return fmt.Errorf("migrate reentry_ai_decision_evaluations.%s: %w", column.name, err)
+		}
+	}
 	return nil
 }
 
@@ -228,6 +234,39 @@ func (s *ReentryAIStore) ListClosedCyclesPendingAIEvaluation(limit int) ([]int64
 		WHERE a.candidate_id>0 AND a.call_status='COMPLETED' AND a.verdict<>'' AND c.closed_at IS NOT NULL
 		AND NOT EXISTS (SELECT 1 FROM reentry_ai_decision_evaluations e WHERE e.analysis_id=a.id AND e.evaluation_version=? AND e.horizon='LEADER_FINAL')
 		ORDER BY a.cycle_id LIMIT ?`, ReentryDecisionEvaluationVersion, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// ListCyclesWithMatureAIEvaluationWindows includes active cycles whose fixed
+// 30m/2h window is mature as well as closed cycles awaiting LEADER_FINAL.
+func (s *ReentryAIStore) ListCyclesWithMatureAIEvaluationWindows(limit int) ([]int64, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 25
+	}
+	rows, err := s.db.Query(`SELECT DISTINCT a.cycle_id FROM reentry_ai_analyses a
+		JOIN copy_guard_cycles c ON c.id=a.cycle_id
+		WHERE a.candidate_id>0 AND a.call_status='COMPLETED' AND a.verdict<>''
+		AND (
+			(COALESCE(a.model_completed_at,a.snapshot_at)<=datetime('now','-30 minutes')
+			 AND NOT EXISTS (SELECT 1 FROM reentry_ai_decision_evaluations e WHERE e.analysis_id=a.id AND e.evaluation_version=? AND e.horizon='30_MINUTES'))
+			OR (COALESCE(a.model_completed_at,a.snapshot_at)<=datetime('now','-2 hours')
+			 AND NOT EXISTS (SELECT 1 FROM reentry_ai_decision_evaluations e WHERE e.analysis_id=a.id AND e.evaluation_version=? AND e.horizon='2_HOURS'))
+			OR (c.closed_at IS NOT NULL
+			 AND NOT EXISTS (SELECT 1 FROM reentry_ai_decision_evaluations e WHERE e.analysis_id=a.id AND e.evaluation_version=? AND e.horizon='LEADER_FINAL'))
+		)
+		ORDER BY a.cycle_id LIMIT ?`, ReentryDecisionEvaluationVersion, ReentryDecisionEvaluationVersion, ReentryDecisionEvaluationVersion, limit)
 	if err != nil {
 		return nil, err
 	}

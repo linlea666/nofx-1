@@ -551,9 +551,10 @@ func TestBinanceCalculateFallbackOnDetailListFailure(t *testing.T) {
 
 	copySize, _ := e.calculateCopySizeByPositionChange(signal, match)
 
-	// 降级路径：使用 leaderEquity=3493 → ratio≈9.76% → copy=11.7 → 自动提升到 12 USDT
-	if copySize != 12.0 {
-		t.Fatalf("expected fallback boosted to 12.00 USDT, got %.2f", copySize)
+	// 降级路径只决定比例金额；交易所最小量由执行边界处理。
+	expected := 341.16 / 3493.16 * 100 * 1.2
+	if math.Abs(copySize-expected) > 1e-9 {
+		t.Fatalf("expected proportional fallback %.8f USDT, got %.8f", expected, copySize)
 	}
 }
 
@@ -898,13 +899,9 @@ func TestBinanceSnapshotFillsDeduplicateAcrossPolls(t *testing.T) {
 	}
 }
 
-// TestAddBelowMinThresholdIsSkippedNotBoosted 验证修复 D：
-// 加仓时（match.Action == ActionAdd）若 copySize < minTradeThreshold，
-// 应返回 0 且发出 "add_below_threshold_skip" 警告，而不是被强制提升到阈值。
-//
-// 复现场景：领航员持续小额加仓 0.5 USDT，旧逻辑每次都被 boost 到 12 USDT，
-// 跟随者仓位累积速度远高于领航员，破坏"按比例镜像"语义。
-func TestAddBelowMinThresholdIsSkippedNotBoosted(t *testing.T) {
+// MinTradeWarn is observability only. The execution venue, not this source
+// calculation, decides whether an add is independently executable.
+func TestAddBelowOperationalWarningPreservesProportionalAmount(t *testing.T) {
 	e, _ := newTestCopyTradeEngine(t, ProviderOKX)
 	e.config.MinTradeWarn = 12.0
 	e.config.CopyRatio = 1.0
@@ -937,28 +934,25 @@ func TestAddBelowMinThresholdIsSkippedNotBoosted(t *testing.T) {
 
 	copySize, warnings := e.calculateCopySizeByPositionChange(signal, match)
 
-	if copySize != 0 {
-		t.Fatalf("ActionAdd 不足阈值应跳过 (copySize=0)，实际 copySize=%.4f", copySize)
+	if math.Abs(copySize-0.05) > 1e-9 {
+		t.Fatalf("ActionAdd must preserve proportional 0.05 USDT, got %.4f", copySize)
 	}
 
 	found := false
 	for _, w := range warnings {
-		if w.Type == "add_below_threshold_skip" {
+		if w.Type == "below_operational_warning_threshold" {
 			found = true
-			if w.Executed {
-				t.Fatalf("add_below_threshold_skip 警告应 Executed=false")
+			if !w.Executed {
+				t.Fatalf("operational warning must not mark the transition skipped")
 			}
 		}
 	}
 	if !found {
-		t.Fatalf("期望 add_below_threshold_skip 警告，实际: %+v", warnings)
+		t.Fatalf("expected operational warning, got %+v", warnings)
 	}
 }
 
-// TestOpenBelowMinThresholdStillBoosted 验证修复 D 的"反向"：
-// 开仓时（match.Action == ActionOpen）若 copySize < minTradeThreshold，
-// 仍然要 boost 到阈值（开仓只发生一次，必须达到交易所最小起步金额）。
-func TestOpenBelowMinThresholdStillBoosted(t *testing.T) {
+func TestOpenBelowOperationalWarningDefersPromotionToExecutionVenue(t *testing.T) {
 	e, _ := newTestCopyTradeEngine(t, ProviderOKX)
 	e.config.MinTradeWarn = 12.0
 	e.config.CopyRatio = 1.0
@@ -980,34 +974,24 @@ func TestOpenBelowMinThresholdStillBoosted(t *testing.T) {
 
 	copySize, warnings := e.calculateCopySizeByPositionChange(signal, match)
 
-	if copySize < 11.99 || copySize > 12.01 {
-		t.Fatalf("ActionOpen 不足阈值应 boost 到 12，实际 copySize=%.4f", copySize)
+	if math.Abs(copySize-0.05) > 1e-9 {
+		t.Fatalf("ActionOpen must preserve proportional 0.05 USDT before venue quantization, got %.4f", copySize)
 	}
 
-	foundBoost := false
-	foundSkip := false
+	foundWarning := false
 	for _, w := range warnings {
-		if w.Type == "size_boosted" {
-			foundBoost = true
-			if !w.Executed {
-				t.Fatalf("size_boosted 警告应 Executed=true")
-			}
-		}
-		if w.Type == "add_below_threshold_skip" {
-			foundSkip = true
+		if w.Type == "below_operational_warning_threshold" {
+			foundWarning = true
 		}
 	}
-	if !foundBoost {
-		t.Fatalf("ActionOpen 期望 size_boosted 警告，实际: %+v", warnings)
-	}
-	if foundSkip {
-		t.Fatalf("ActionOpen 不应产生 add_below_threshold_skip 警告")
+	if !foundWarning {
+		t.Fatalf("expected operational warning, got %+v", warnings)
 	}
 }
 
-// TestProcessSignalSkipsAddWhenBelowThreshold 端到端验证修复 D：
-// 领航员小额加仓 → poll 路径不应推送决策、不应更新 last_known_size。
-func TestProcessSignalSkipsAddWhenBelowThreshold(t *testing.T) {
+// Every recognized transition must reserve an intent before the venue boundary
+// can decide SKIPPED_ADD_BELOW_EXCHANGE_MINIMUM.
+func TestProcessSignalReservesSmallAddBeforeVenuePreflight(t *testing.T) {
 	const posID = "1239518824_ETHUSDT_LONG"
 
 	e, st := newTestCopyTradeEngine(t, ProviderBinance)
@@ -1030,14 +1014,19 @@ func TestProcessSignalSkipsAddWhenBelowThreshold(t *testing.T) {
 
 	e.poll()
 
-	// 预期：无决策推送
+	// Source stage emits one reserved decision; integration preflight owns the
+	// exchange-minimum skip and atomic source revision advancement.
 	select {
 	case dec := <-e.decisionCh:
-		t.Fatalf("加仓金额不足应跳过决策，但收到: %+v", dec.Decisions)
+		if len(dec.Decisions) != 1 || dec.Decisions[0].CopyTradeAction != "add" ||
+			dec.Decisions[0].ExecutionIntentID == 0 {
+			t.Fatalf("small add must have one reserved add intent: %+v", dec.Decisions)
+		}
 	default:
+		t.Fatal("small add must not disappear before execution preflight")
 	}
 
-	// 验证 last_known_size 未被更新（仍为 0.01，不是 0.0101）
+	// The source stage must not pretend a fill/skip was committed.
 	mapping, err := st.CopyTrade().GetActiveMapping("test-trader", posID)
 	if err != nil || mapping == nil {
 		t.Fatalf("mapping 应仍 active: err=%v mapping=%+v", err, mapping)

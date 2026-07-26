@@ -39,6 +39,10 @@ type StopLossCalcInput struct {
 	LiquidationPrice float64  // 跟随者强平价；0 表示交易所未返回
 	PriceTickSize    float64  // 执行交易所精确价格步长；0 时仅兼容旧 OKX 路径
 	BaseQuantityStep float64  // 执行交易所精确基础币数量步长
+	// MaxAccountLossPct is the effective account-level hard cap for this real
+	// follower position. Zero preserves the legacy/AI sizing calculation.
+	MaxAccountLossPct     float64
+	StructureInvalidation float64
 }
 
 // StopLossCalcResult 止损价计算结果（含完整决策追踪，便于日志和调试）
@@ -120,6 +124,26 @@ func calcStopLossPrice(cfg *CopyConfig, input *StopLossCalcInput) (*StopLossCalc
 	if result.ATRDistance <= 0 {
 		return nil, fmt.Errorf("no valid ATR or fallback distance")
 	}
+	if input.MaxAccountLossPct > 0 {
+		computed, err := ComputeAccountProtectionDistance(
+			cfg, input.Side, input.EntryPrice, input.PositionValue,
+			input.FollowerEquity, result.ATRValue, result.ATRDistance,
+			input.StructureInvalidation, input.MaxAccountLossPct,
+		)
+		if err != nil {
+			return nil, err
+		}
+		result.SLDistance = computed.Distance
+		result.GovernedBy = computed.GovernedBy
+		result.NoiseConflict = computed.NoiseConflict
+		result.ExpectedLossUSD = computed.ExpectedLossUSD
+		result.ExpectedLossPct = computed.ExpectedLossPct
+		if margin := input.PositionValue / float64(input.Leverage); margin > 0 {
+			result.ExpectedMarginLossPct = computed.ExpectedLossUSD / margin
+		}
+		result.DistanceATRRatio = computed.DistanceATRRatio
+		return finalizeStopLossPrice(input, result, cfg.RiskLiquidationBufferATR)
+	}
 	computed, err := ComputeRiskDistanceV4(cfg, input.EntryPrice, input.PositionValue, input.FollowerEquity, result.ATRDistance, input.Leverage)
 	if err != nil {
 		return nil, err
@@ -133,22 +157,6 @@ func calcStopLossPrice(cfg *CopyConfig, input *StopLossCalcInput) (*StopLossCalc
 	result.DistanceATRRatio = computed.DistanceATRRatio
 	return finalizeStopLossPrice(input, result, cfg.RiskLiquidationBufferATR)
 }
-
-// ============================================================================
-// 加仓账户风险预算（Copy Guard v7：超限自动缩量）
-//
-// 背景：volatility_priority 模式下 RiskAccountPct 只是软性提示，领航员连续
-// 加仓时单笔预期止损损失可以增长（WLD 实盘：5.2% → 28.4%）。这里在跟随加仓
-// 时预估「加仓后总敞口按当前止损距离全损」占账户权益的比例，超过
-// RiskAddonBudgetPct 时记录 ADDON_RISK_WARNING 告警。
-//
-// v7 把费用与滑点纳入预算，超限时缩小本次加仓；不能安全达到交易所最小量
-// 时拒绝，避免仅告警却继续穿透风险预算。
-// ============================================================================
-
-// addonBudgetEventInterval：同一仓位 ADDON_RISK_WARNING 事件/告警的最小间隔，
-// 限频避免事件与日志刷屏。
-const addonBudgetEventInterval = 60 * time.Second
 
 // structuralInvalidationPrice uses only completed 5m/15m OKX mark candles.
 // The most recent confirmed two-sided swing is preferred; unavailable market
@@ -179,158 +187,6 @@ func structuralInvalidationPrice(symbol string, side SideType, entryPrice float6
 		}
 	}
 	return best
-}
-
-// limitAddonRiskBudget 检查本次加仓后的风险，超预算时缩量。Copy Guard
-// 数据缺失时保守拒绝，避免旧逻辑“只告警仍然穿透预算”。
-func (e *Engine) limitAddonRiskBudget(signal *TradeSignal, posID string, copySize float64) float64 {
-	cfg := e.config
-	// 显式 v4+ 门槛：加仓预算是 Copy Guard v4 特性。version<4 的存量配置
-	// 目前也进不来（budget 默认 0 + 无 open cycle 双重隐式短路），此检查
-	// 把门控从"依赖下游数据缺失"改为与 shouldManageStopLoss 等一致的
-	// 显式判定，防止未来重构 cycle 创建时机时悄悄漏风。
-	if cfg == nil || !SupportsCopyGuard(cfg.ProviderType) || cfg.RiskPolicyVersion < 4 || !cfg.RiskStopLossEnabled {
-		return copySize
-	}
-	budget := cfg.RiskAddonBudgetPct
-	if budget <= 0 || budget >= 1 {
-		return copySize
-	}
-	if e.store == nil || e.getFollowerEquity == nil || signal == nil || signal.Fill == nil || copySize <= 0 {
-		return 0
-	}
-	cycle, err := e.store.CopyTrade().GetOpenCopyGuardCycle(e.traderID, posID)
-	if err != nil || cycle == nil {
-		return 0
-	}
-	equity := e.getFollowerEquity()
-	entryPrice := signal.Fill.Price
-	if equity <= 0 || entryPrice <= 0 {
-		return 0
-	}
-	period := cfg.RiskATRPeriod
-	if period <= 0 {
-		period = 14
-	}
-	var atrDistance float64
-	if atr, atrErr := market.GetOKXATRWithMaxAge(signal.Fill.Symbol, cfg.RiskATRTimeframe, period, riskATRCacheMaxAge(cfg)); atrErr == nil && atr > 0 {
-		atrDistance = atr * cfg.RiskATRMultiplier
-	} else {
-		atrDistance = entryPrice * cfg.RiskATRFallbackPct
-	}
-	if atrDistance <= 0 {
-		return 0
-	}
-	totalNotional := cycle.FollowerNotional + copySize
-	computed, err := ComputeRiskDistanceV4(cfg, entryPrice, totalNotional, equity, atrDistance, e.getLeaderLeverage(signal))
-	if err != nil {
-		return 0
-	}
-	if computed.ExpectedLossPct <= budget {
-		return copySize
-	}
-	lossRate := computed.ExpectedLossUSD / totalNotional
-	allowed := equity*budget/lossRate - cycle.FollowerNotional
-	if allowed < 0 {
-		allowed = 0
-	}
-	if allowed > copySize {
-		allowed = copySize
-	}
-
-	now := time.Now()
-	if last, ok := e.lastAddonBudgetEvent[posID]; !ok || now.Sub(last) >= addonBudgetEventInterval {
-		e.lastAddonBudgetEvent[posID] = now
-		msg := fmt.Sprintf("加仓风险缩量：预期止损损失 %.1f%% 超预算 %.1f%%（请求 %.2f，允许 %.2f）",
-			computed.ExpectedLossPct*100, budget*100, copySize, allowed)
-		logger.Warnf("🚧 [%s] %s | %s posId=%s", e.traderID, msg, signal.Fill.Symbol, posID)
-		e.logWarning(Warning{
-			Timestamp:    now,
-			Symbol:       signal.Fill.Symbol,
-			Type:         "addon_risk_shrunk",
-			Message:      msg,
-			SignalAction: string(ActionAdd),
-			SignalValue:  copySize,
-			CopyValue:    allowed,
-			Executed:     allowed > 0,
-		})
-		if err := e.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{
-			CycleID:  cycle.ID,
-			TraderID: e.traderID,
-			Type:     "ADDON_RISK_SHRUNK",
-			Price:    entryPrice,
-			Notional: copySize,
-			Metadata: map[string]interface{}{
-				"expected_loss_pct": computed.ExpectedLossPct,
-				"budget_pct":        budget,
-				"current_notional":  cycle.FollowerNotional,
-				"addon_notional":    copySize,
-				"allowed_notional":  allowed,
-				"governed_by":       computed.GovernedBy,
-				"blocked":           allowed <= 0,
-			},
-		}); err != nil {
-			logger.Warnf("⚠️ [%s] ADDON_RISK_SHRUNK 事件写入失败: %v", e.traderID, err)
-		}
-	}
-	return allowed
-}
-
-func (e *Engine) limitAIGuardedTradeRisk(signal *TradeSignal, posID string, action ActionType, requested float64) float64 {
-	if e.config == nil || e.config.RiskReentryDecisionMode != "ai_guarded" || !e.config.RiskStopLossEnabled || signal == nil || signal.Fill == nil || requested <= 0 || e.getFollowerEquity == nil {
-		return requested
-	}
-	entryPrice, equity := signal.Fill.Price, e.getFollowerEquity()
-	if entryPrice <= 0 || equity <= 0 {
-		return 0
-	}
-	atr, err := market.GetOKXATRWithMaxAge(signal.Fill.Symbol, e.config.RiskATRTimeframe, e.config.RiskATRPeriod, riskATRCacheMaxAge(e.config))
-	if err != nil || atr <= 0 {
-		atr = entryPrice * e.config.RiskATRFallbackPct
-	}
-	if atr <= 0 {
-		return 0
-	}
-	currentNotional := float64(0)
-	var cycle *store.CopyGuardCycle
-	cycleID := int64(0)
-	if action == ActionAdd {
-		cycle, _ = e.store.CopyTrade().GetOpenCopyGuardCycle(e.traderID, posID)
-		if cycle == nil {
-			return 0
-		}
-		cycleID = cycle.ID
-		currentNotional = cycle.FollowerNotional
-	}
-	usage, err := e.store.ReentryAI().GetCopyGuardRiskUsageExcludingAttempt(e.traderID, cycleID, 0)
-	if err != nil {
-		return 0
-	}
-	availableRisk, err := AvailableCopyGuardRiskUSD(e.config, equity, usage)
-	if err != nil {
-		return 0
-	}
-	side := signal.Fill.PositionSide
-	structure := structuralInvalidationPrice(signal.Fill.Symbol, side, entryPrice)
-	plan, err := BuildProtectionPlan(e.config, side, entryPrice, atr, structure, equity, availableRisk/equity, currentNotional+requested)
-	if err != nil {
-		logger.Warnf("[CopyGuard] trader=%s event=ENTRY_RISK_REJECTED symbol=%s reason=%v", e.traderID, signal.Fill.Symbol, err)
-		return 0
-	}
-	allowed := plan.MaxNotional - currentNotional
-	if allowed < 0 {
-		allowed = 0
-	}
-	if allowed > requested {
-		allowed = requested
-	}
-	if allowed+1e-9 < requested {
-		logger.Warnf("[CopyGuard] trader=%s event=ENTRY_RISK_SHRUNK symbol=%s requested=%.2f allowed=%.2f stop=%.8f", e.traderID, signal.Fill.Symbol, requested, allowed, plan.StopPrice)
-		if cycle != nil {
-			_ = e.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: e.traderID, Type: "ADDON_RISK_SHRUNK", Price: entryPrice, Notional: requested, Metadata: map[string]interface{}{"allowed_notional": allowed, "stop_price": plan.StopPrice, "stop_distance": plan.StopDistance, "structure_invalidation": plan.StructureInvalidation, "expected_loss_usd": plan.ExpectedLossUSD, "risk_budget": plan.MaxRiskUSD}})
-		}
-	}
-	return allowed
 }
 
 // isLiquidationPriceDirectionValid checks the liquidation price is on the
@@ -676,6 +532,15 @@ const (
 // 满足时通过 e.decisionCh 推一个 Open 决策出去
 func (e *Engine) checkReentryConditions() {
 	if e.store == nil || e.config == nil {
+		return
+	}
+	// Configuration can be changed while the copy engine keeps running. Always
+	// gate reentry from the persisted policy so disabling account protection is
+	// effective without waiting for a process restart.
+	persisted, persistedErr := e.store.CopyTrade().GetByTraderID(e.traderID)
+	if persistedErr == nil && persisted.RiskPolicyVersion >= 4 &&
+		(!persisted.RiskStopLossEnabled || !persisted.RiskReentryEnabled ||
+			persisted.RiskReentryDecisionMode == "disabled") {
 		return
 	}
 	if !SupportsCopyGuard(e.config.ProviderType) {
@@ -1098,10 +963,10 @@ func (e *Engine) handleAIGuardedReentry(mapping *store.CopyTradePositionMapping,
 	if atr <= 0 {
 		return
 	}
-	if cycle.BaselineLeaderSize <= 0 && leaderPos.Size > 0 {
-		if err := e.store.CopyTrade().InitializeCopyGuardLeaderBaseline(cycle.ID, leaderPos.Size); err == nil {
-			cycle.BaselineLeaderSize = leaderPos.Size
-		}
+	if !cycle.BaselineAvailable || cycle.BaselineLeaderSize <= 0 {
+		_ = e.store.CopyTrade().UpdateCopyGuardObservation(cycle.ID, "AI_BASELINE_UNAVAILABLE", leaderPos.EntryPrice, mark, 0)
+		logger.Warnf("⚠️ [%s] AI 重入暂停：周期初始领航员仓位基准缺少可验证证据 | cycle=%d %s", e.traderID, cycle.ID, cycle.Symbol)
+		return
 	}
 	stoppedNotional, lastStop, noiseRatio := cycle.FollowerNotional, float64(0), float64(0)
 	if stoppedAttempt != nil {
@@ -1702,6 +1567,7 @@ func (e *Engine) emitReentryDecision(mapping *store.CopyTradePositionMapping, le
 
 	// 走标准 buildDecisionV2 流程（不重新计算金额，直接传 copySize）
 	dec := e.buildDecisionV2(signal, match, copySize)
+	dec.CopyTradeAction = "ai_reentry"
 	dec.Reasoning = fmt.Sprintf("Copy trading: reentry (judge E) following %s leader %s | posId=%s ratio=%.2f×%.2f",
 		e.config.ProviderType, e.config.LeaderID, mapping.LeaderPosID, e.config.CopyRatio, e.config.RiskReentryRatio)
 	// 清空引擎默认的 fill 级稳定 clOrdId：重入的幂等 ID 必须是 integration

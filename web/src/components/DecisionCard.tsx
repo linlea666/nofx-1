@@ -312,6 +312,34 @@ function ActionCard({
         </div>
       )}
 
+      {action.execution_intent_id &&
+        ((action.requested_quantity || 0) > 0 ||
+          (action.quantized_quantity || 0) > 0) && (
+          <div className="mt-2 grid gap-x-4 gap-y-1 rounded bg-[#0B0E11] p-2 text-xs text-[#848E9C] sm:grid-cols-2">
+            <span>
+              原始数量：{action.requested_quantity?.toPrecision(8) || '-'}
+            </span>
+            <span>
+              量化数量：{action.quantized_quantity?.toPrecision(8) || '-'}
+            </span>
+            <span>
+              最小可执行：
+              {action.minimum_executable_quantity?.toPrecision(8) || '-'}
+            </span>
+            <span>步长：{action.quantity_step?.toPrecision(8) || '-'}</span>
+            <span>
+              交易所最小数量：
+              {action.exchange_min_quantity?.toPrecision(8) || '-'}
+            </span>
+            <span>
+              交易所最小名义：
+              {action.exchange_min_notional
+                ? `${action.exchange_min_notional.toFixed(4)} USDT`
+                : '-'}
+            </span>
+          </div>
+        )}
+
       {action.reasoning && (
         <div className="mt-3 pt-3" style={{ borderTop: '1px solid #2B3139' }}>
           <div className="text-xs line-clamp-2" style={{ color: '#848E9C' }}>

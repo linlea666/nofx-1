@@ -19,7 +19,7 @@ type CopyTradeConfig struct {
 	CopyRatio      float64 `json:"copy_ratio"`       // 跟单系数 (1.0 = 100%)
 	SyncLeverage   bool    `json:"sync_leverage"`    // 同步杠杆
 	SyncMarginMode bool    `json:"sync_margin_mode"` // 同步保证金模式
-	MinTradeWarn   float64 `json:"min_trade_warn"`   // 小额预警阈值
+	MinTradeWarn   float64 `json:"min_trade_warn"`   // 纯运营小额预警，不参与交易所可执行性判断
 	MaxTradeWarn   float64 `json:"max_trade_warn"`   // 大额预警阈值 (0=不预警)
 	Enabled        bool    `json:"enabled"`          // 是否启用
 
@@ -41,8 +41,13 @@ type CopyTradeConfig struct {
 
 	// 主开关
 	RiskStopLossEnabled bool `json:"risk_stop_loss_enabled"` // 默认 true
+	// RiskStopMaxAccountLossPct is a per-trader override for the account-level
+	// position stop. Zero means inherit the follower exchange-account policy
+	// (default 10%). It is deliberately separate from RiskAccountPct, which is
+	// retained as the AI reentry attempt budget.
+	RiskStopMaxAccountLossPct float64 `json:"risk_stop_max_account_loss_pct,omitempty"`
 
-	// 账户硬兜底（v5：单笔最多亏账户的百分比，任何模式下的最终封顶）
+	// AI 重入单次尝试预算；普通领航员开仓/加仓不读取该字段。
 	RiskAccountPct float64 `json:"risk_account_pct"` // v7 单次尝试风险预算，默认 0.02 (=2%)
 
 	// ATR 基线（v5.2 抗噪主力线：止损距离 = k×ATR，与账户线取严）
@@ -101,9 +106,9 @@ type CopyTradeConfig struct {
 	// RiskMigrationConfirmed 升级书签：v3→v4 升级完成时置 true，业务运行时
 	// 不读取（无任何门控），仅供审计/回滚排查确认该配置已完成迁移。
 	RiskMigrationConfirmed bool `json:"risk_migration_confirmed"`
-	// RiskAddonBudgetPct: 加仓账户风险预算（v4）。跟随领航员加仓时预估
-	// "加仓后总敞口按当前止损距离全损"占账户权益的比例；v7 超限自动缩量，
-	// 低于最小下单量则拒绝。默认 0.15 (=15%)。
+	// RiskAddonBudgetPct is retained for protocol and rollback compatibility.
+	// Ordinary leader adds no longer read it; AI reentry sizing remains governed
+	// by its own attempt/cycle/portfolio budgets.
 	RiskAddonBudgetPct float64 `json:"risk_addon_budget_pct"`
 	// RiskReentryMinRecoveryATR: 重入最小恢复幅度（v4，单位 ATR 倍数）。
 	// 止损后价格必须从止损成交价向有利方向恢复至少该幅度才允许重入，

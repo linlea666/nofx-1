@@ -24,6 +24,36 @@ import (
 // 两个保存入口（SaveConfig / server.go 创建与更新交易员）共用。
 const maxCopyRatio = 10.0
 
+const manualReentryDeprecatedMessage = "risk_manual_reentry_enabled is deprecated and is always false; use ai_guarded candidates"
+
+func applyRetiredCopyGuardCompatibility(config *store.CopyTradeConfig, requested *bool) bool {
+	if config == nil {
+		return false
+	}
+	deprecatedRequested := requested != nil && *requested
+	config.RiskManualReentryEnabled = false
+	return deprecatedRequested
+}
+
+func copyGuardAIActive(config *store.CopyTradeConfig) bool {
+	return config != nil &&
+		config.RiskStopLossEnabled &&
+		config.RiskReentryEnabled &&
+		config.RiskReentryDecisionMode == "ai_guarded"
+}
+
+// disableReentryCandidatesAfterConfigSave closes only candidates that have not
+// reached an exchange submission. Submitted work remains owned by the durable
+// intent reconciler so disabling protection cannot hide an in-flight order.
+func disableReentryCandidatesAfterConfigSave(st *store.Store, old, current *store.CopyTradeConfig) {
+	if st == nil || current == nil || !copyGuardAIActive(old) || copyGuardAIActive(current) {
+		return
+	}
+	if err := st.ReentryAI().DisableReentryCandidatesForTrader(current.TraderID, "account protection or AI reentry disabled"); err != nil {
+		logger.Errorf("Failed to disable AI reentry candidates for trader %s: %v", current.TraderID, err)
+	}
+}
+
 // CopyTradeHandler 跟单 API Handler
 type CopyTradeHandler struct {
 	store         *store.Store
@@ -39,7 +69,7 @@ func NewCopyTradeHandler(st *store.Store, tm *manager.TraderManager) *CopyTradeH
 }
 
 func validateAIGuardedPrerequisites(st *store.Store, cfg *store.CopyTradeConfig) error {
-	if cfg == nil || cfg.RiskReentryDecisionMode != "ai_guarded" {
+	if cfg == nil || !cfg.RiskStopLossEnabled || !cfg.RiskReentryEnabled || cfg.RiskReentryDecisionMode != "ai_guarded" {
 		return nil
 	}
 	aiCfg, err := st.ReentryAI().GetReentryAIConfig()
@@ -97,6 +127,26 @@ func validateRiskConfirmation(accountRisk float64, confirmed bool, typedPercent 
 	return nil
 }
 
+func validateStopLossPctConfirmation(stopPct float64, confirmed bool, typedPercent *float64) error {
+	if stopPct == 0 {
+		return nil // inherit account policy
+	}
+	if stopPct < 0.001 || stopPct > 0.30 {
+		return fmt.Errorf("risk_stop_max_account_loss_pct must be 0 (inherit) or between 0.1%% and 30%%")
+	}
+	if stopPct <= 0.10 {
+		return nil
+	}
+	if !confirmed {
+		return fmt.Errorf("risk_stop_max_account_loss_pct > 10%% requires risk_high_risk_confirmed")
+	}
+	expected := stopPct * 100
+	if typedPercent == nil || math.IsNaN(*typedPercent) || math.IsInf(*typedPercent, 0) || math.Abs(*typedPercent-expected) > 1e-9 {
+		return fmt.Errorf("risk_stop_max_account_loss_pct > 10%% requires matching risk_extreme_risk_confirm_value")
+	}
+	return nil
+}
+
 // RegisterRoutes 注册路由
 func (h *CopyTradeHandler) RegisterRoutes(group *gin.RouterGroup) {
 	copyTrade := group.Group("/copytrade")
@@ -110,6 +160,8 @@ func (h *CopyTradeHandler) RegisterRoutes(group *gin.RouterGroup) {
 		copyTrade.GET("/logs/:trader_id", h.GetLogs)
 		copyTrade.GET("/risk/summary", h.GetRiskSummary)
 		copyTrade.GET("/risk/defaults", h.GetRiskDefaults)
+		copyTrade.GET("/risk/accounts/:exchange_id/policy", h.GetAccountRiskPolicy)
+		copyTrade.PUT("/risk/accounts/:exchange_id/policy", h.SaveAccountRiskPolicy)
 		copyTrade.GET("/risk/ai-candidates", h.ListAICandidates)
 		copyTrade.POST("/risk/ai-candidates/:id/pause", h.PauseAICandidate)
 		copyTrade.POST("/risk/ai-candidates/:id/resume", h.ResumeAICandidate)
@@ -948,6 +1000,7 @@ type CopyTradeConfigRequest struct {
 	// 前端传入将被忽略。
 	// ============================================================
 	RiskStopLossEnabled        *bool    `json:"risk_stop_loss_enabled,omitempty"`
+	RiskStopMaxAccountLossPct  *float64 `json:"risk_stop_max_account_loss_pct,omitempty"`
 	RiskAccountPct             *float64 `json:"risk_account_pct,omitempty"`
 	RiskATRMultiplier          *float64 `json:"risk_atr_multiplier,omitempty"`
 	RiskATRTimeframe           *string  `json:"risk_atr_timeframe,omitempty"`
@@ -968,24 +1021,25 @@ type CopyTradeConfigRequest struct {
 	// 历史人工重入兼容字段；v7 固定 false
 	RiskManualReentryEnabled *bool `json:"risk_manual_reentry_enabled,omitempty"`
 
-	RiskPolicyVersion          *int     `json:"risk_policy_version,omitempty"`
-	RiskStopMode               *string  `json:"risk_stop_mode,omitempty"`
-	RiskATRPeriod              *int     `json:"risk_atr_period,omitempty"`
-	RiskATRCacheMaxAgeMinutes  *int     `json:"risk_atr_cache_max_age_minutes,omitempty"`
-	RiskATRFallbackPct         *float64 `json:"risk_atr_fallback_pct,omitempty"`
-	RiskTriggerPriceType       *string  `json:"risk_trigger_price_type,omitempty"`
-	RiskSlippageBufferBPS      *float64 `json:"risk_slippage_buffer_bps,omitempty"`
-	RiskLiquidationBufferATR   *float64 `json:"risk_liquidation_buffer_atr,omitempty"`
-	RiskMaxReentries           *int     `json:"risk_max_reentries,omitempty"`
-	RiskReentryBandATR         *float64 `json:"risk_reentry_band_atr,omitempty"`
-	RiskReentryCooldownSeconds *int     `json:"risk_reentry_cooldown_seconds,omitempty"`
-	RiskReentryMaxChaseATR     *float64 `json:"risk_reentry_max_chase_atr,omitempty"`
-	RiskReentryMaxATRExpansion *float64 `json:"risk_reentry_max_atr_expansion,omitempty"`
-	RiskWatchTimeoutMinutes    *int     `json:"risk_watch_timeout_minutes,omitempty"`
-	RiskMigrationConfirmed     *bool    `json:"risk_migration_confirmed,omitempty"`
-	RiskAddonBudgetPct         *float64 `json:"risk_addon_budget_pct,omitempty"`
-	RiskHighRiskConfirmed      bool     `json:"risk_high_risk_confirmed,omitempty"`
-	RiskExtremeConfirmValue    *float64 `json:"risk_extreme_risk_confirm_value,omitempty"`
+	RiskPolicyVersion           *int     `json:"risk_policy_version,omitempty"`
+	RiskStopMode                *string  `json:"risk_stop_mode,omitempty"`
+	RiskATRPeriod               *int     `json:"risk_atr_period,omitempty"`
+	RiskATRCacheMaxAgeMinutes   *int     `json:"risk_atr_cache_max_age_minutes,omitempty"`
+	RiskATRFallbackPct          *float64 `json:"risk_atr_fallback_pct,omitempty"`
+	RiskTriggerPriceType        *string  `json:"risk_trigger_price_type,omitempty"`
+	RiskSlippageBufferBPS       *float64 `json:"risk_slippage_buffer_bps,omitempty"`
+	RiskLiquidationBufferATR    *float64 `json:"risk_liquidation_buffer_atr,omitempty"`
+	RiskMaxReentries            *int     `json:"risk_max_reentries,omitempty"`
+	RiskReentryBandATR          *float64 `json:"risk_reentry_band_atr,omitempty"`
+	RiskReentryCooldownSeconds  *int     `json:"risk_reentry_cooldown_seconds,omitempty"`
+	RiskReentryMaxChaseATR      *float64 `json:"risk_reentry_max_chase_atr,omitempty"`
+	RiskReentryMaxATRExpansion  *float64 `json:"risk_reentry_max_atr_expansion,omitempty"`
+	RiskWatchTimeoutMinutes     *int     `json:"risk_watch_timeout_minutes,omitempty"`
+	RiskMigrationConfirmed      *bool    `json:"risk_migration_confirmed,omitempty"`
+	RiskAddonBudgetPct          *float64 `json:"risk_addon_budget_pct,omitempty"`
+	RiskHighRiskConfirmed       bool     `json:"risk_high_risk_confirmed,omitempty"`
+	RiskExtremeConfirmValue     *float64 `json:"risk_extreme_risk_confirm_value,omitempty"`
+	RiskStopExtremeConfirmValue *float64 `json:"risk_stop_extreme_confirm_value,omitempty"`
 
 	// v4.1 重入加严（字段含义见 store.CopyTradeConfig 注释）
 	RiskReentryMinRecoveryATR     *float64 `json:"risk_reentry_min_recovery_atr,omitempty"`
@@ -1025,10 +1079,15 @@ func (h *CopyTradeHandler) GetConfig(c *gin.Context) {
 		}
 		sourceHealth = &copy
 	}
+	var effectiveStopPolicy interface{}
+	if policy, policyErr := h.store.CopyTrade().EffectiveCopyGuardStopPolicy(traderID, config.RiskStopMaxAccountLossPct); policyErr == nil {
+		effectiveStopPolicy = policy
+	}
 	c.JSON(http.StatusOK, gin.H{
-		"config":        maskedCopyTradeConfig(config),
-		"status":        copytrade.IsCopyTradingRunning(traderID),
-		"source_health": sourceHealth,
+		"config":                maskedCopyTradeConfig(config),
+		"status":                copytrade.IsCopyTradingRunning(traderID),
+		"source_health":         sourceHealth,
+		"effective_stop_policy": effectiveStopPolicy,
 	})
 }
 
@@ -1044,9 +1103,94 @@ func sanitizeSourceHealthError(value string) string {
 func (h *CopyTradeHandler) GetRiskDefaults(c *gin.Context) {
 	d := store.NewCopyGuardDefaults()
 	c.JSON(http.StatusOK, gin.H{
-		"defaults_version": store.CopyGuardDefaultsVersion(),
-		"defaults":         d,
+		"defaults_version":                 store.CopyGuardDefaultsVersion(),
+		"defaults":                         d,
+		"copy_guard_max_position_loss_pct": store.DefaultCopyGuardMaxPositionLossPct,
 	})
+}
+
+type accountRiskPolicyRequest struct {
+	MaxPositionLossPct  float64  `json:"copy_guard_max_position_loss_pct" binding:"required"`
+	HighRiskConfirmed   bool     `json:"risk_high_risk_confirmed,omitempty"`
+	ExtremeConfirmValue *float64 `json:"risk_extreme_risk_confirm_value,omitempty"`
+}
+
+func (h *CopyTradeHandler) accountWorstCaseRisk(userID, exchangeID string, accountPct float64) (int, float64, error) {
+	traders, err := h.store.Trader().List(userID)
+	if err != nil {
+		return 0, 0, err
+	}
+	count, worst := 0, 0.0
+	for _, t := range traders {
+		if t.ExchangeID != exchangeID {
+			continue
+		}
+		cfg, cfgErr := h.store.CopyTrade().GetByTraderID(t.ID)
+		if cfgErr != nil || !cfg.RiskStopLossEnabled {
+			continue
+		}
+		pct := accountPct
+		if cfg.RiskStopMaxAccountLossPct > 0 {
+			pct = cfg.RiskStopMaxAccountLossPct
+		}
+		cycles, cycleErr := h.store.CopyTrade().ListOpenCopyGuardCycles(t.ID)
+		if cycleErr != nil {
+			return 0, 0, cycleErr
+		}
+		for _, cycle := range cycles {
+			if cycle.FollowerNotional <= 0 || cycle.AccountEquity <= 0 {
+				continue
+			}
+			count++
+			worst += cycle.AccountEquity * pct
+		}
+	}
+	return count, worst, nil
+}
+
+func (h *CopyTradeHandler) GetAccountRiskPolicy(c *gin.Context) {
+	exchangeID := c.Param("exchange_id")
+	if _, err := h.store.Exchange().GetByID(c.GetString("user_id"), exchangeID); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "exchange account not found"})
+		return
+	}
+	policy, err := h.store.CopyTrade().GetCopyGuardAccountPolicy(exchangeID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	count, worst, err := h.accountWorstCaseRisk(c.GetString("user_id"), exchangeID, policy.MaxPositionLossPct)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"policy": policy, "open_protected_positions": count,
+		"aggregate_worst_case_risk_usd": worst, "aggregate_is_warning_only": true,
+	})
+}
+
+func (h *CopyTradeHandler) SaveAccountRiskPolicy(c *gin.Context) {
+	exchangeID := c.Param("exchange_id")
+	if _, err := h.store.Exchange().GetByID(c.GetString("user_id"), exchangeID); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "exchange account not found"})
+		return
+	}
+	var req accountRiskPolicyRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := validateStopLossPctConfirmation(req.MaxPositionLossPct, req.HighRiskConfirmed, req.ExtremeConfirmValue); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := h.store.CopyTrade().UpsertCopyGuardAccountPolicy(exchangeID, req.MaxPositionLossPct); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	policy, _ := h.store.CopyTrade().GetCopyGuardAccountPolicy(exchangeID)
+	c.JSON(http.StatusOK, gin.H{"message": "account risk policy saved", "policy": policy})
 }
 
 // maskedCopyTradeConfig 返回凭证已脱敏的配置副本（API 响应专用，不落库）。
@@ -1117,6 +1261,11 @@ func (h *CopyTradeHandler) SaveConfig(c *gin.Context) {
 		config.RiskStopLossEnabled = existing.RiskStopLossEnabled
 	} else {
 		config.RiskStopLossEnabled = true // 默认 on
+	}
+	if req.RiskStopMaxAccountLossPct != nil {
+		config.RiskStopMaxAccountLossPct = *req.RiskStopMaxAccountLossPct
+	} else if existing != nil {
+		config.RiskStopMaxAccountLossPct = existing.RiskStopMaxAccountLossPct
 	}
 	if req.RiskAccountPct != nil {
 		config.RiskAccountPct = *req.RiskAccountPct
@@ -1209,13 +1358,7 @@ func (h *CopyTradeHandler) SaveConfig(c *gin.Context) {
 	} else if existing != nil {
 		config.RiskNotificationLevel = existing.RiskNotificationLevel
 	}
-	if req.RiskManualReentryEnabled != nil {
-		config.RiskManualReentryEnabled = *req.RiskManualReentryEnabled
-	} else if existing != nil {
-		config.RiskManualReentryEnabled = existing.RiskManualReentryEnabled
-	} else {
-		config.RiskManualReentryEnabled = false // v7 已废弃逐笔人工确认
-	}
+	manualDeprecated := applyRetiredCopyGuardCompatibility(config, req.RiskManualReentryEnabled)
 	applyCopyGuardV4Request(config, existing, &req)
 	if config.RiskPolicyVersion >= 4 && !copytrade.SupportsCopyGuard(copytrade.ProviderType(config.ProviderType)) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "copy guard is only supported for OKX or Binance leader sources"})
@@ -1223,6 +1366,10 @@ func (h *CopyTradeHandler) SaveConfig(c *gin.Context) {
 	}
 	if config.RiskPolicyVersion >= 4 {
 		if err := validateRiskConfirmation(config.RiskAccountPct, req.RiskHighRiskConfirmed, req.RiskExtremeConfirmValue); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		if err := validateStopLossPctConfirmation(config.RiskStopMaxAccountLossPct, req.RiskHighRiskConfirmed, req.RiskStopExtremeConfirmValue); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
@@ -1254,6 +1401,7 @@ func (h *CopyTradeHandler) SaveConfig(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save config"})
 		return
 	}
+	disableReentryCandidatesAfterConfigSave(h.store, existing, config)
 
 	// 更新 trader 的决策模式
 	if req.Enabled {
@@ -1265,10 +1413,14 @@ func (h *CopyTradeHandler) SaveConfig(c *gin.Context) {
 	logger.Infof("✓ Saved copy trade config for trader %s: provider=%s leader=%s ratio=%.0f%%",
 		traderID, req.ProviderType, req.LeaderID, req.CopyRatio*100)
 
-	c.JSON(http.StatusOK, gin.H{
+	response := gin.H{
 		"message": "config saved",
 		"config":  maskedCopyTradeConfig(config),
-	})
+	}
+	if manualDeprecated {
+		response["deprecated"] = manualReentryDeprecatedMessage
+	}
+	c.JSON(http.StatusOK, response)
 }
 
 func applyCopyGuardV4Request(c, old *store.CopyTradeConfig, r *CopyTradeConfigRequest) {

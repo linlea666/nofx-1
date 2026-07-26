@@ -65,6 +65,10 @@ export interface DecisionAction {
   requested_quantity?: number
   quantized_quantity?: number
   filled_quantity?: number
+  quantity_step?: number
+  exchange_min_quantity?: number
+  exchange_min_notional?: number
+  minimum_executable_quantity?: number
   exchange_order_id?: string
   exchange_order_state?: string
   execution_status?:
@@ -160,6 +164,20 @@ export interface Exchange {
   lighterApiKeyIndex?: number
 }
 
+export interface CopyGuardAccountRiskPolicy {
+  exchange_id: string
+  max_position_loss_pct: number
+  source?: string
+  updated_at?: string
+}
+
+export interface CopyGuardAccountRiskPolicyResponse {
+  policy: CopyGuardAccountRiskPolicy
+  open_protected_positions: number
+  aggregate_worst_case_risk_usd: number
+  aggregate_is_warning_only: boolean
+}
+
 export interface CreateExchangeRequest {
   exchange_type: string // "binance", "bybit", "okx", "hyperliquid", "aster", "lighter"
   account_name: string // User-defined account name
@@ -240,7 +258,7 @@ export interface CopyConfigRequest {
   copy_ratio: number
   sync_leverage: boolean
   sync_margin_mode?: boolean // 同步保证金模式（OKX 区分全仓/逐仓）
-  min_trade_warn?: number // 最小跟单金额阈值（USDT），低于此金额跳过/预警；未传保留存量值
+  min_trade_warn?: number // 纯运营预警阈值；不参与交易所最小量或订单量化
   max_trade_warn?: number // 最大跟单金额预警阈值（USDT），0=不预警；未传保留存量值
   // Binance Web 凭证（仅 provider_type=binance 时使用）
   binance_p20t?: string // 登录 cookie p20t
@@ -255,6 +273,7 @@ export interface CopyConfigRequest {
   // risk_stop_noise_floor_atr / risk_cycle_max_loss_pct）已随 v5 下线。
   // ============================================================
   risk_stop_loss_enabled?: boolean // 默认 true：启用账户保护硬止损
+  risk_stop_max_account_loss_pct?: number // 0=继承执行账户默认值（默认10%）
   risk_account_pct?: number // 默认 0.02：单次尝试风险预算
   risk_cycle_loss_budget_pct?: number
   risk_portfolio_loss_budget_pct?: number
@@ -290,9 +309,10 @@ export interface CopyConfigRequest {
   risk_reentry_max_atr_expansion?: number
   risk_watch_timeout_minutes?: number
   risk_migration_confirmed?: boolean
-  risk_addon_budget_pct?: number // 默认 0.15：加仓超限自动缩量，低于最小量拒绝
+  risk_addon_budget_pct?: number // deprecated：仅协议兼容，普通跟单加仓不读取
   risk_high_risk_confirmed?: boolean
   risk_extreme_risk_confirm_value?: number
+  risk_stop_extreme_confirm_value?: number
 
   // v4.1 重入加严
   risk_reentry_min_recovery_atr?: number // 默认 0.5：重入前价格须从止损价恢复的最小幅度（ATR 倍数）
@@ -767,6 +787,7 @@ export interface CopyTradeConfig {
   source_generation?: number
   // Copy Guard v7，详见 CopyConfigRequest
   risk_stop_loss_enabled?: boolean
+  risk_stop_max_account_loss_pct?: number
   risk_account_pct?: number
   risk_cycle_loss_budget_pct?: number
   risk_portfolio_loss_budget_pct?: number
@@ -818,6 +839,11 @@ export interface CopyTradeConfigResponse {
   config: CopyTradeConfig
   status: boolean
   source_health?: CopyTradeSourceHealth | null
+  effective_stop_policy?: {
+    exchange_id: string
+    effective_risk_stop_max_account_loss_pct: number
+    risk_stop_pct_source: 'account_default' | 'trader_override'
+  } | null
 }
 
 export interface CopyGuardSummary {
@@ -830,6 +856,8 @@ export interface CopyGuardSummary {
   avoided_loss: number
   opportunity_cost: number
   net_guard_effect: number
+  stop_only_pnl: number
+  reentry_contribution: number
   fees: number
   funding_fee: number
   liquidation_penalty: number
@@ -861,6 +889,10 @@ export interface CopyGuardSummary {
   estimated_baseline_cycles: number // 基线仍为"最后观测价估算"的已对账周期数
   estimated_net_guard_effect: number // 上述周期贡献的净效果（含在 net_guard_effect 内）
   unscorable_baseline_cycles: number // 缺少有效领航员离场价，不进入保护效果统计
+  verified_baseline_cycles: number
+  reentry_success_estimate: RateEstimate
+  false_kill_estimate: RateEstimate
+  mean_net_guard_effect_estimate: MeanEstimate
   max_realized_drawdown_usd: number // 已对账止损周期按结束顺序形成的真实盈亏路径最大回撤
   worst_cycle_loss_usd: number // 已对账止损周期的最大单周期亏损绝对值
   tail_loss_cvar_95_usd: number // 样本 95% 尾部平均损失；小样本时等于最差观测
@@ -870,6 +902,23 @@ export interface CopyGuardSummary {
     baseline: number
     net_effect: number
   }>
+}
+export interface RateEstimate {
+  numerator: number
+  denominator: number
+  rate: number
+  ci95_low: number
+  ci95_high: number
+  method: string
+  status: string
+}
+export interface MeanEstimate {
+  sample_count: number
+  mean: number
+  ci95_low: number
+  ci95_high: number
+  method: string
+  status: string
 }
 export interface CopyGuardCycle {
   id: number
@@ -1110,6 +1159,11 @@ export interface ReentryAIDecisionEvaluation {
   evaluation_version: number
   evaluation_status: string
   data_quality: 'VERIFIED' | 'ESTIMATED' | 'UNSCORABLE'
+  execution_data_quality:
+    | 'VERIFIED'
+    | 'ESTIMATED'
+    | 'UNSCORABLE'
+    | 'NOT_APPLICABLE'
   market_outcome:
     | 'REVERSAL_CONFIRMED'
     | 'CONTINUED_AGAINST'

@@ -624,7 +624,8 @@ function CandidateAnalysisModal({
               </div>
               {evaluations.length === 0 ? (
                 <div className="text-[#848E9C]">
-                  周期闭合并完成行情归档后生成；不会让 AI
+                  30 分钟与 2
+                  小时窗口成熟后生成；领航员最终窗口在周期闭合后生成。 不会让 AI
                   给自己打分，也不会影响交易。
                 </div>
               ) : (
@@ -639,7 +640,8 @@ function CandidateAnalysisModal({
                     </span>
                     <span>
                       窗口：{evaluation.horizon} · 数据：
-                      {evaluation.data_quality} · 评价 v
+                      {evaluation.data_quality} · 执行证据：
+                      {evaluation.execution_data_quality} · 评价 v
                       {evaluation.evaluation_version}
                     </span>
                     <span>
@@ -1033,7 +1035,7 @@ function AdvisorSettingsCard() {
             {stats.candidate_analyses > 0 && (
               <div className="space-y-1 border-t border-[#2B3139] pt-2 text-xs text-[#B7BDC6]">
                 <div className="font-medium text-[#EAECEF]">
-                  AI 持续候选：{stats.candidate_analyses} 次完整调度
+                  AI 持续候选：{stats.candidate_analyses} 条分析记录
                 </div>
                 <div>
                   决策：
@@ -1043,7 +1045,16 @@ function AdvisorSettingsCard() {
                 </div>
                 <div>
                   调用状态：
-                  {['COMPLETED', 'INVALID', 'FAILED', 'PENDING']
+                  {[
+                    'PENDING',
+                    'RUNNING',
+                    'COMPLETED',
+                    'INVALID',
+                    'FAILED',
+                    'PREPARE_FAILED',
+                    'UNACTIONABLE',
+                    'SKIPPED',
+                  ]
                     .map(
                       (v) => `${v} ${stats.candidate_call_statuses?.[v] || 0}`
                     )

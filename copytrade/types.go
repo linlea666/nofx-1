@@ -69,19 +69,21 @@ const (
 	// 减仓价值低于此值时跳过，等待后续全平
 	MinOrderValue = 10.0
 
-	// DefaultMinTradeNotional 最小跟单/重入金额兜底（USDT）。
-	// 用户未配置 MinTradeWarn（<=0）时的统一 fallback：交易所最小名义
-	// 普遍为 10 USDT，取 12 预留精度损失余量。此前散落 10/12 两种硬编码，
-	// 与 store.NewCopyGuardDefaults 的默认值（12）统一（M18）。
+	// DefaultMinTradeNotional is the default operational warning threshold.
+	// It never substitutes exchange minQty/minNotional/step.
 	DefaultMinTradeNotional = 12.0
 )
 
-// minTradeNotionalOrDefault 返回配置的最小跟单金额阈值，未配置时用统一兜底。
+// minTradeNotionalOrDefault returns the operational warning threshold.
 func minTradeNotionalOrDefault(configured float64) float64 {
 	if configured > 0 {
 		return configured
 	}
 	return DefaultMinTradeNotional
+}
+
+func usesV4CopyGuardRisk(config *CopyConfig) bool {
+	return config != nil && config.RiskPolicyVersion >= 4 && config.RiskStopLossEnabled
 }
 
 // SideType 持仓方向
@@ -109,6 +111,9 @@ type Fill struct {
 	ValueError    string     // 归一失败原因（开仓/加仓必须 fail closed）
 	Timestamp     time.Time  // 成交时间
 	ClosedPnL     float64    // 平仓盈亏 (如有)
+	// SourceFillIDs records raw fills collapsed into a snapshot transition.
+	// For non-snapshot providers it is empty and ID remains the sole source id.
+	SourceFillIDs []string
 
 	// 原始数据（调试用）
 	Raw interface{} `json:"-"`
@@ -197,6 +202,7 @@ type CopyConfig struct {
 	// v3 旧策略与噪音下限/周期熔断/反加仓铁律等参数已于 v5 下线
 	// ============================================================
 	RiskStopLossEnabled        bool    `json:"risk_stop_loss_enabled"`
+	RiskStopMaxAccountLossPct  float64 `json:"risk_stop_max_account_loss_pct,omitempty"`
 	RiskAccountPct             float64 `json:"risk_account_pct"`    // v7：单次尝试风险预算，默认 0.02
 	RiskATRMultiplier          float64 `json:"risk_atr_multiplier"` // v5.2：止损距离基线 k×ATR，默认 2.0
 	RiskATRTimeframe           string  `json:"risk_atr_timeframe"`
@@ -233,8 +239,8 @@ type CopyConfig struct {
 	RiskReentryMaxATRExpansion float64 `json:"risk_reentry_max_atr_expansion"`
 	RiskWatchTimeoutMinutes    int     `json:"risk_watch_timeout_minutes"`
 	RiskMigrationConfirmed     bool    `json:"risk_migration_confirmed"`
-	// RiskAddonBudgetPct: 加仓账户风险预算（v4）。加仓后总敞口按当前止损距离
-	// 的预期损失超过账户权益的该比例时自动缩量；低于最小量则拒绝。
+	// RiskAddonBudgetPct is deprecated protocol compatibility. Ordinary leader
+	// adds are proportional and never read this field.
 	RiskAddonBudgetPct float64 `json:"risk_addon_budget_pct"`
 	// v4.1 重入加严（字段含义见 store.CopyTradeConfig 同名注释）
 	RiskReentryMinRecoveryATR     float64 `json:"risk_reentry_min_recovery_atr"`

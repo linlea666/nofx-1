@@ -61,8 +61,9 @@ type pathResult struct {
 	reason          string
 }
 
-// EvaluateCycleAIDecisions materializes deterministic post-decision outcomes
-// for one closed Copy Guard cycle. It is safe to call from both the background
+// EvaluateCycleAIDecisions materializes deterministic post-decision outcomes.
+// Fixed windows are generated as soon as they mature; LEADER_FINAL still
+// requires a closed cycle. It is safe to call from both the background
 // backfiller and the final email path: the unique evaluation key and INSERT
 // OR IGNORE make it idempotent across restarts and concurrent callers.
 func EvaluateCycleAIDecisions(st *store.Store, cycleID int64) (*AIEffectSummary, error) {
@@ -73,9 +74,7 @@ func EvaluateCycleAIDecisions(st *store.Store, cycleID int64) (*AIEffectSummary,
 	if err != nil {
 		return nil, err
 	}
-	if cycle.ClosedAt == nil {
-		return nil, fmt.Errorf("cycle %d is not closed", cycleID)
-	}
+	now := time.Now()
 	analyses, err := st.ReentryAI().ListReentryAnalysesByCycle(cycleID, 500)
 	if err != nil {
 		return nil, err
@@ -143,15 +142,23 @@ func EvaluateCycleAIDecisions(st *store.Store, cycleID int64) (*AIEffectSummary,
 			{name: evaluationHorizonTerminal},
 		}
 		for _, horizon := range horizons {
-			end := *cycle.ClosedAt
+			if horizon.duration == 0 && cycle.ClosedAt == nil {
+				continue
+			}
+			end := now
 			status := "FINAL"
 			if horizon.duration > 0 {
 				fixedEnd := decisionAt.Add(horizon.duration)
-				if fixedEnd.Before(end) {
-					end = fixedEnd
-				} else {
+				if cycle.ClosedAt == nil && now.Before(fixedEnd) {
+					continue
+				}
+				end = fixedEnd
+				if cycle.ClosedAt != nil && cycle.ClosedAt.Before(fixedEnd) {
+					end = *cycle.ClosedAt
 					status = "TRUNCATED_AT_LEADER_CLOSE"
 				}
+			} else {
+				end = *cycle.ClosedAt
 			}
 			if end.Before(decisionAt) {
 				end = decisionAt
@@ -164,7 +171,7 @@ func EvaluateCycleAIDecisions(st *store.Store, cycleID int64) (*AIEffectSummary,
 			requested := requestedByEvent || executionIntentWithin(executionIntent, executionIntentCreated, end)
 			submitted := hasEventForAnalysisWithin(events, "REENTRY_SUBMITTED", analysis.ID, end) || executionIntentWithin(executionIntent, executionIntentSubmitted, end)
 			filledByIntent := executionIntent != nil && executionIntent.FilledQuantity > 0 && executionIntentWithin(executionIntent, executionIntentFilled, end)
-			actualExecuted := (filledByIntent || (executionIntent == nil && requestedByEvent)) && attempt != nil
+			actualExecuted := filledByIntent || (executionIntent == nil && requestedByEvent && attempt != nil)
 			protected := actualExecuted && (executionIntentWithin(executionIntent, executionIntentProtected, end) || (executionIntent == nil && hasEventForAttemptWithin(events, "PROTECTION_ACTIVE", analysis.AttemptNo, end)))
 			path := evaluatePath(samples, analysis.AttemptNo-1, cycle.Side, analysis.SnapshotPrice, atr, decisionAt, end, expectedInterval)
 			dataQuality := "VERIFIED"
@@ -180,7 +187,7 @@ func EvaluateCycleAIDecisions(st *store.Store, cycleID int64) (*AIEffectSummary,
 			}
 			var classifiedAttempt *store.CopyGuardAttempt
 			var actualPnL *float64
-			if horizon.name == evaluationHorizonTerminal && actualExecuted && attempt.ClosedAt != nil && attempt.Reconciled {
+			if horizon.name == evaluationHorizonTerminal && actualExecuted && attempt != nil && attempt.ClosedAt != nil && attempt.Reconciled {
 				classifiedAttempt = attempt
 				value := attempt.PnL
 				actualPnL = &value
@@ -201,7 +208,7 @@ func EvaluateCycleAIDecisions(st *store.Store, cycleID int64) (*AIEffectSummary,
 				WindowStartAt: decisionAt, WindowEndAt: end, SampleCount: path.sampleCount,
 				CoverageRatio: path.coverage, MaxGapSeconds: path.maxGapSeconds,
 				ActualExecuted: actualExecuted, ActualPnL: actualPnL, EvaluationLatency: end.Sub(decisionAt).Seconds(),
-				ExecutionRequested: requested, ExecutionSubmitted: submitted, ExecutionFilled: actualExecuted, ExecutionProtected: protected,
+				ExecutionRequested: requested, ExecutionSubmitted: submitted, ExecutionFilled: filledByIntent || actualExecuted, ExecutionProtected: protected,
 			}
 			saved, inserted, saveErr := st.ReentryAI().SaveReentryDecisionEvaluation(evaluation)
 			if saveErr != nil {
@@ -469,10 +476,6 @@ func analysisDecisionAt(analysis *store.ReentryAIAnalysis) time.Time {
 	return time.Time{}
 }
 
-func hasEventForAnalysis(events []*store.CopyGuardEvent, eventType string, analysisID int64) bool {
-	return hasEventForAnalysisWithin(events, eventType, analysisID, time.Time{})
-}
-
 func hasEventForAnalysisWithin(events []*store.CopyGuardEvent, eventType string, analysisID int64, end time.Time) bool {
 	for _, event := range events {
 		if event == nil || event.Type != eventType {
@@ -486,10 +489,6 @@ func hasEventForAnalysisWithin(events []*store.CopyGuardEvent, eventType string,
 		}
 	}
 	return false
-}
-
-func hasEventForAttempt(events []*store.CopyGuardEvent, eventType string, attemptNo int) bool {
-	return hasEventForAttemptWithin(events, eventType, attemptNo, time.Time{})
 }
 
 func hasEventForAttemptWithin(events []*store.CopyGuardEvent, eventType string, attemptNo int, end time.Time) bool {

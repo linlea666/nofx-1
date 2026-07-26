@@ -122,18 +122,28 @@ func (s *ReentryAIStore) initReentryCandidateTables() error {
 	if err != nil {
 		return err
 	}
-	_, _ = s.db.Exec(`ALTER TABLE copy_guard_reentry_candidates ADD COLUMN decision_ttl_seconds INTEGER DEFAULT 30`)
-	_, _ = s.db.Exec(`ALTER TABLE copy_guard_reentry_candidates ADD COLUMN failure_backoff_until DATETIME`)
-	_, _ = s.db.Exec(`ALTER TABLE copy_guard_reentry_candidates ADD COLUMN last_unactionable_code TEXT DEFAULT ''`)
-	_, _ = s.db.Exec(`ALTER TABLE copy_guard_reentry_candidates ADD COLUMN last_unactionable_event_at DATETIME`)
-	_, _ = s.db.Exec(`ALTER TABLE copy_guard_risk_reservations ADD COLUMN account_key TEXT NOT NULL DEFAULT ''`)
-	_, _ = s.db.Exec(`ALTER TABLE copy_guard_risk_reservations ADD COLUMN intent_id INTEGER NOT NULL DEFAULT 0`)
-	_, _ = s.db.Exec(`ALTER TABLE copy_guard_risk_reservations ADD COLUMN replace_cycle_id INTEGER NOT NULL DEFAULT 0`)
-	_, _ = s.db.Exec(`ALTER TABLE copy_guard_risk_reservations ADD COLUMN replace_attempt_no INTEGER NOT NULL DEFAULT 0`)
-	_, _ = s.db.Exec(`ALTER TABLE copy_guard_risk_reservations ADD COLUMN target_risk_usd REAL NOT NULL DEFAULT 0`)
-	_, _ = s.db.Exec(`ALTER TABLE copy_guard_risk_reservations ADD COLUMN attempt_override BOOLEAN NOT NULL DEFAULT 0`)
-	_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_cg_risk_reservation_intent ON copy_guard_risk_reservations(intent_id,status)`)
-	_, _ = s.db.Exec(`UPDATE copy_guard_risk_reservations SET account_key=COALESCE((SELECT exchange_id FROM traders WHERE traders.id=copy_guard_risk_reservations.trader_id),trader_id) WHERE account_key=''`)
+	for _, migration := range []struct{ table, name, definition string }{
+		{"copy_guard_reentry_candidates", "decision_ttl_seconds", "INTEGER DEFAULT 30"},
+		{"copy_guard_reentry_candidates", "failure_backoff_until", "DATETIME"},
+		{"copy_guard_reentry_candidates", "last_unactionable_code", "TEXT DEFAULT ''"},
+		{"copy_guard_reentry_candidates", "last_unactionable_event_at", "DATETIME"},
+		{"copy_guard_risk_reservations", "account_key", "TEXT NOT NULL DEFAULT ''"},
+		{"copy_guard_risk_reservations", "intent_id", "INTEGER NOT NULL DEFAULT 0"},
+		{"copy_guard_risk_reservations", "replace_cycle_id", "INTEGER NOT NULL DEFAULT 0"},
+		{"copy_guard_risk_reservations", "replace_attempt_no", "INTEGER NOT NULL DEFAULT 0"},
+		{"copy_guard_risk_reservations", "target_risk_usd", "REAL NOT NULL DEFAULT 0"},
+		{"copy_guard_risk_reservations", "attempt_override", "BOOLEAN NOT NULL DEFAULT 0"},
+	} {
+		if err = ensureSQLiteColumn(s.db, migration.table, migration.name, migration.definition); err != nil {
+			return fmt.Errorf("migrate %s.%s: %w", migration.table, migration.name, err)
+		}
+	}
+	if _, err = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_cg_risk_reservation_intent ON copy_guard_risk_reservations(intent_id,status)`); err != nil {
+		return err
+	}
+	if _, err = s.db.Exec(`UPDATE copy_guard_risk_reservations SET account_key=COALESCE((SELECT exchange_id FROM traders WHERE traders.id=copy_guard_risk_reservations.trader_id),trader_id) WHERE account_key=''`); err != nil {
+		return err
+	}
 	// v7 removes the human approval path. Preserve any old pending signal as a
 	// durable AI candidate so it is neither silently executed nor lost. Legacy
 	// traders remain inert until explicitly switched to ai_guarded.
@@ -263,7 +273,7 @@ func (s *ReentryAIStore) ListDueReentryCandidates(limit int) ([]*CopyGuardReentr
 
 func (s *ReentryAIStore) CountReentryCandidateCalls24h(candidateID int64) (int, error) {
 	var count int
-	err := s.db.QueryRow(`SELECT COUNT(*) FROM reentry_ai_analyses WHERE candidate_id=? AND call_status NOT IN ('SKIPPED','PREPARE_FAILED') AND created_at>=datetime('now','-24 hours')`, candidateID).Scan(&count)
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM reentry_ai_analyses WHERE candidate_id=? AND call_status IN ('RUNNING','COMPLETED','INVALID','FAILED') AND created_at>=datetime('now','-24 hours')`, candidateID).Scan(&count)
 	return count, err
 }
 
@@ -295,7 +305,7 @@ func (s *ReentryAIStore) ClaimReentryCandidateReview(id int64, minInterval time.
 		return c, false, nil
 	}
 	var daily int
-	if err = tx.QueryRow(`SELECT COUNT(*) FROM reentry_ai_analyses WHERE candidate_id=? AND call_status NOT IN ('SKIPPED','PREPARE_FAILED') AND created_at>=datetime('now','-24 hours')`, id).Scan(&daily); err != nil {
+	if err = tx.QueryRow(`SELECT COUNT(*) FROM reentry_ai_analyses WHERE candidate_id=? AND call_status IN ('RUNNING','COMPLETED','INVALID','FAILED') AND created_at>=datetime('now','-24 hours')`, id).Scan(&daily); err != nil {
 		return nil, false, err
 	}
 	if daily >= dailyLimit {
@@ -592,6 +602,34 @@ func (s *ReentryAIStore) TerminateReentryCandidate(id int64) error {
 		return fmt.Errorf("candidate cannot be terminated while an entry may be in flight or after it is terminal")
 	}
 	return nil
+}
+
+// DisableReentryCandidatesForTrader closes every candidate that cannot have
+// reached the exchange. ENTRY_PENDING is also closed only when no submitted or
+// filled execution intent exists; in-flight exchange work remains owned by the
+// durable reconciliation path.
+func (s *ReentryAIStore) DisableReentryCandidatesForTrader(traderID, reason string) error {
+	if traderID == "" {
+		return fmt.Errorf("trader id is required")
+	}
+	if reason == "" {
+		reason = "account protection disabled"
+	}
+	_, err := s.db.Exec(`UPDATE copy_guard_reentry_candidates
+		SET status=?,last_error=?,closed_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP
+		WHERE trader_id=? AND (
+			status IN (?,?,?,?) OR
+			(status=? AND NOT EXISTS (
+				SELECT 1 FROM copy_trade_execution_intents i
+				WHERE i.candidate_id=copy_guard_reentry_candidates.id
+				  AND i.status IN ('SUBMITTED','FILLED','PROTECTED','RECONCILING')
+			))
+		)`,
+		ReentryCandidateInvalidated, reason, traderID,
+		ReentryCandidateWatching, ReentryCandidateWaiting, ReentryCandidateReviewing, ReentryCandidatePaused,
+		ReentryCandidateEntryPending,
+	)
+	return err
 }
 
 func (s *ReentryAIStore) ResumeReentryCandidate(id int64) error {

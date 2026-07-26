@@ -226,7 +226,7 @@ interface FormState {
   copy_ratio: number
   copy_sync_leverage: boolean
   copy_sync_margin_mode: boolean // 同步保证金模式（OKX 区分全仓/逐仓）
-  copy_min_trade_warn: number // 最小跟单金额（USDT），低于此金额跳过加仓/预警
+  copy_min_trade_warn: number // 纯运营预警阈值，不参与订单最小量判断
   copy_max_trade_warn: number // 最大跟单金额预警（USDT），0=不预警
   copy_binance_source_mode: BinanceSourceMode
   copy_binance_top_trader_id: string
@@ -240,6 +240,7 @@ interface FormState {
   // stop_noise_floor / cycle_max_loss）已随 v5 下线。
   // ============================================================
   risk_stop_loss_enabled: boolean // 默认 true：启用账户保护硬止损
+  risk_stop_max_account_loss_pct: number // 0=继承账户默认值；否则为交易员覆盖百分比
   risk_account_pct: number // 单次尝试风险（前端百分比）
   risk_cycle_loss_budget_pct: number
   risk_portfolio_loss_budget_pct: number
@@ -274,7 +275,7 @@ interface FormState {
   risk_reentry_max_atr_expansion: number
   risk_watch_timeout_minutes: number
   risk_migration_confirmed: boolean
-  risk_addon_budget_pct: number // 默认 15%：超限自动缩量，低于最小量拒绝
+  risk_addon_budget_pct: number // deprecated：仅协议兼容，普通跟单加仓不读取
   // v4.1 重入加严
   risk_reentry_min_recovery_atr: number // 默认 0.5：重入最小恢复幅度（ATR 倍数）
   risk_reentry_cooldown_escalation: number // 默认 3：第 N 次重入冷却倍率
@@ -318,7 +319,7 @@ export function TraderConfigModal({
     copy_ratio: 1.0,
     copy_sync_leverage: true,
     copy_sync_margin_mode: true, // 默认同步保证金模式
-    copy_min_trade_warn: 12, // 与后端 NewCopyGuardDefaults / DefaultMinTradeNotional 一致
+    copy_min_trade_warn: 12, // 纯运营预警，不参与交易所最小量判断
     copy_max_trade_warn: 0,
     copy_binance_source_mode: 'copy_management',
     copy_binance_top_trader_id: '',
@@ -326,6 +327,7 @@ export function TraderConfigModal({
     copy_binance_csrf_token: '',
     // 账户保护 v5 风控默认值（与后端 store.FillRiskDefaults 保持一致）
     risk_stop_loss_enabled: true,
+    risk_stop_max_account_loss_pct: 0,
     risk_account_pct: 2,
     risk_cycle_loss_budget_pct: 5,
     risk_portfolio_loss_budget_pct: 8,
@@ -474,6 +476,8 @@ export function TraderConfigModal({
             copy_binance_csrf_token: cfg.binance_csrf_token ?? '',
             // 风控字段回填（× 100 转百分比展示，与 store.FillRiskDefaults 保持一致）
             risk_stop_loss_enabled: cfg.risk_stop_loss_enabled ?? true,
+            risk_stop_max_account_loss_pct:
+              (cfg.risk_stop_max_account_loss_pct ?? 0) * 100,
             risk_account_pct:
               cfg.risk_account_pct != null ? cfg.risk_account_pct * 100 : 2,
             risk_cycle_loss_budget_pct:
@@ -572,6 +576,8 @@ export function TraderConfigModal({
         setFormData((prev) => ({
           ...prev,
           risk_stop_loss_enabled: cfg.risk_stop_loss_enabled ?? true,
+          risk_stop_max_account_loss_pct:
+            (cfg.risk_stop_max_account_loss_pct ?? 0) * 100,
           risk_account_pct: (cfg.risk_account_pct ?? 0.02) * 100,
           risk_cycle_loss_budget_pct:
             (cfg.risk_cycle_loss_budget_pct ?? 0.05) * 100,
@@ -645,6 +651,7 @@ export function TraderConfigModal({
         copy_binance_csrf_token: '',
         // 风控默认值（与 useState 初始值保持一致）
         risk_stop_loss_enabled: true,
+        risk_stop_max_account_loss_pct: 0,
         risk_account_pct: 2,
         risk_cycle_loss_budget_pct: 5,
         risk_portfolio_loss_budget_pct: 8,
@@ -744,6 +751,7 @@ export function TraderConfigModal({
       formData.risk_policy_version >= 4
     let highRiskConfirmed = false
     let extremeRiskConfirmValue: number | undefined
+    let stopExtremeRiskConfirmValue: number | undefined
     if (
       isCopyGuardEnabled &&
       !(
@@ -780,6 +788,29 @@ export function TraderConfigModal({
     }
     if (isCopyGuardEnabled && formData.risk_account_pct > 4) {
       highRiskConfirmed = true
+    }
+    if (
+      isCopyGuardEnabled &&
+      (formData.risk_stop_max_account_loss_pct < 0 ||
+        (formData.risk_stop_max_account_loss_pct > 0 &&
+          formData.risk_stop_max_account_loss_pct < 0.1) ||
+        formData.risk_stop_max_account_loss_pct > 30)
+    ) {
+      window.alert('单仓最大账户亏损必须为 0（继承）或 0.1%～30%')
+      return
+    }
+    if (isCopyGuardEnabled && formData.risk_stop_max_account_loss_pct > 10) {
+      const typed = window.prompt(
+        `单仓最大账户亏损 ${formData.risk_stop_max_account_loss_pct.toFixed(2)}% 超过默认 10%。请输入该百分比数值确认：`
+      )
+      if (
+        typed === null ||
+        Number(typed) !== formData.risk_stop_max_account_loss_pct
+      ) {
+        return
+      }
+      highRiskConfirmed = true
+      stopExtremeRiskConfirmValue = Number(typed)
     }
 
     let normalizedTopTraderID: string | null = null
@@ -880,6 +911,8 @@ export function TraderConfigModal({
           Object.assign(saveData.copy_config, {
             // 前端展示百分比 → 后端存比例，× 0.01 转换
             risk_stop_loss_enabled: formData.risk_stop_loss_enabled,
+            risk_stop_max_account_loss_pct:
+              formData.risk_stop_max_account_loss_pct / 100,
             risk_account_pct: formData.risk_account_pct / 100,
             risk_cycle_loss_budget_pct:
               formData.risk_cycle_loss_budget_pct / 100,
@@ -922,6 +955,7 @@ export function TraderConfigModal({
             risk_addon_budget_pct: formData.risk_addon_budget_pct / 100,
             risk_high_risk_confirmed: highRiskConfirmed,
             risk_extreme_risk_confirm_value: extremeRiskConfirmValue,
+            risk_stop_extreme_confirm_value: stopExtremeRiskConfirmValue,
             // v4.1 重入加严
             risk_reentry_min_recovery_atr:
               formData.risk_reentry_min_recovery_atr,
@@ -1555,11 +1589,11 @@ export function TraderConfigModal({
                     </p>
                   </div>
 
-                  {/* 跟单金额阈值（M18：min/max_trade_warn 透传） */}
+                  {/* 跟单运营预警阈值（不参与交易所可执行性判断） */}
                   <div className="grid grid-cols-2 gap-4">
                     <div>
                       <label className="text-sm text-[#EAECEF] block mb-2">
-                        最小跟单金额 (USDT)
+                        小额跟单预警 (USDT)
                       </label>
                       <input
                         type="number"
@@ -1577,8 +1611,8 @@ export function TraderConfigModal({
                         className="w-full px-3 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF] focus:border-[#F0B90B] focus:outline-none"
                       />
                       <p className="text-xs text-[#848E9C] mt-1">
-                        低于此金额的加仓跳过（等待累积），开仓自动补足到该金额；留
-                        0 使用默认 12
+                        仅记录运营预警。开仓、加仓是否可执行严格使用交易所实时
+                        minQty / minNotional / step
                       </p>
                     </div>
                     <div>
@@ -1753,11 +1787,35 @@ export function TraderConfigModal({
                         <>
                           {formData.risk_policy_version >= 4 && (
                             <div className="grid grid-cols-2 gap-3">
+                              <label className="col-span-2 text-xs text-[#848E9C]">
+                                单仓最大账户亏损 %（0 = 继承执行账户默认 10%）
+                                <input
+                                  type="number"
+                                  min="0"
+                                  max="30"
+                                  step="0.1"
+                                  value={
+                                    formData.risk_stop_max_account_loss_pct
+                                  }
+                                  onChange={(e) =>
+                                    handleInputChange(
+                                      'risk_stop_max_account_loss_pct',
+                                      Number(e.target.value)
+                                    )
+                                  }
+                                  className="mt-1 w-full px-2 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF]"
+                                />
+                                <span className="mt-1 block">
+                                  技术关键位 / ATR
+                                  优先，账户百分比为硬封顶；加减仓后止损只会保持或收紧
+                                </span>
+                              </label>
                               <div className="col-span-2 flex items-center justify-between rounded border border-[#F0B90B44] bg-[#F0B90B0D] p-3 text-xs">
                                 <span className="text-[#848E9C]">
-                                  推荐（v7）：单次/周期/组合风险 2% / 5% /
-                                  8%，ATR14 / 1小时 / 2.0倍，AI
-                                  持续观察，最多重入 2 次，不可保护时立即离场
+                                  推荐：普通跟单不缩量；AI
+                                  重入单次/周期/组合风险 2% / 5% / 8%，ATR14 /
+                                  1小时 / 2.0倍，AI 持续观察，最多重入 2
+                                  次，不可保护时立即离场
                                 </span>
                                 <button
                                   type="button"
@@ -1772,6 +1830,7 @@ export function TraderConfigModal({
                                       risk_atr_multiplier: 2.0,
                                       risk_atr_timeframe: '1h',
                                       risk_atr_fallback_pct: 2,
+                                      risk_stop_max_account_loss_pct: 0,
                                       risk_account_pct: 2,
                                       risk_cycle_loss_budget_pct: 5,
                                       risk_portfolio_loss_budget_pct: 8,
@@ -1911,33 +1970,10 @@ export function TraderConfigModal({
                                   className="mt-1 w-full px-2 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF]"
                                 />
                               </label>
-                              <div className="col-span-2">
-                                <label className="text-xs text-[#848E9C] block">
-                                  加仓风险预算（% 账户权益）{' '}
-                                  <span className="text-[#F0B90B]">
-                                    {formData.risk_addon_budget_pct.toFixed(0)}%
-                                  </span>
-                                </label>
-                                <input
-                                  type="number"
-                                  min="1"
-                                  max="100"
-                                  step="1"
-                                  value={formData.risk_addon_budget_pct}
-                                  onChange={(e) => {
-                                    const v = Number(e.target.value)
-                                    handleInputChange(
-                                      'risk_addon_budget_pct',
-                                      isFinite(v) && v > 0
-                                        ? Math.min(v, 100)
-                                        : 15
-                                    )
-                                  }}
-                                  className="mt-1 w-full px-2 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF]"
-                                />
-                                <p className="text-xs text-[#848E9C] mt-1">
-                                  超限时自动缩量；缩量后低于交易所最小下单量则拒绝加仓。
-                                </p>
+                              <div className="col-span-2 rounded border border-[#2B3139] bg-[#0B0E11] p-3 text-xs text-[#848E9C]">
+                                旧“加仓风险预算”字段已停用，仅为旧客户端和回滚保留。
+                                普通跟单加仓按领航员比例执行；不足交易所真实最小量时直接忽略，
+                                不会向上提升或被该字段缩量。
                               </div>
                             </div>
                           )}

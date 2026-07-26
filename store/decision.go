@@ -58,30 +58,37 @@ type PositionSnapshot struct {
 
 // DecisionAction decision action
 type DecisionAction struct {
-	Action              string    `json:"action"`
-	Symbol              string    `json:"symbol"`
-	Quantity            float64   `json:"quantity"`
-	Leverage            int       `json:"leverage"`
-	Price               float64   `json:"price"`
-	StopLoss            float64   `json:"stop_loss,omitempty"`   // Stop loss price
-	TakeProfit          float64   `json:"take_profit,omitempty"` // Take profit price
-	Confidence          int       `json:"confidence,omitempty"`  // AI confidence (0-100)
-	Reasoning           string    `json:"reasoning,omitempty"`   // Brief reasoning
-	OrderID             int64     `json:"order_id"`
-	Timestamp           time.Time `json:"timestamp"`
-	Success             bool      `json:"success"`
-	Error               string    `json:"error"`
-	ExecutionIntentID   int64     `json:"execution_intent_id,omitempty"`
-	SourceFillID        string    `json:"source_fill_id,omitempty"`
-	LeaderPosID         string    `json:"leader_pos_id,omitempty"`
-	SourceRevision      int64     `json:"source_revision,omitempty"`
-	RequestedQuantity   float64   `json:"requested_quantity,omitempty"`
-	QuantizedQuantity   float64   `json:"quantized_quantity,omitempty"`
-	FilledQuantity      float64   `json:"filled_quantity,omitempty"`
-	ExchangeOrderID     string    `json:"exchange_order_id,omitempty"`
-	ExchangeOrderState  string    `json:"exchange_order_state,omitempty"`
-	ExecutionStatus     string    `json:"execution_status,omitempty"`
-	ExecutionReasonCode string    `json:"execution_reason_code,omitempty"`
+	Action                    string    `json:"action"`
+	Symbol                    string    `json:"symbol"`
+	Quantity                  float64   `json:"quantity"`
+	Leverage                  int       `json:"leverage"`
+	Price                     float64   `json:"price"`
+	StopLoss                  float64   `json:"stop_loss,omitempty"`   // Stop loss price
+	TakeProfit                float64   `json:"take_profit,omitempty"` // Take profit price
+	Confidence                int       `json:"confidence,omitempty"`  // AI confidence (0-100)
+	Reasoning                 string    `json:"reasoning,omitempty"`   // Brief reasoning
+	OrderID                   int64     `json:"order_id"`
+	Timestamp                 time.Time `json:"timestamp"`
+	Success                   bool      `json:"success"`
+	Error                     string    `json:"error"`
+	ExecutionIntentID         int64     `json:"execution_intent_id,omitempty"`
+	SourceFillID              string    `json:"source_fill_id,omitempty"`
+	LeaderPosID               string    `json:"leader_pos_id,omitempty"`
+	SourceRevision            int64     `json:"source_revision,omitempty"`
+	RequestedQuantity         float64   `json:"requested_quantity,omitempty"`
+	QuantizedQuantity         float64   `json:"quantized_quantity,omitempty"`
+	FilledQuantity            float64   `json:"filled_quantity,omitempty"`
+	QuantityStep              float64   `json:"quantity_step,omitempty"`
+	ExchangeMinQuantity       float64   `json:"exchange_min_quantity,omitempty"`
+	ExchangeMinNotional       float64   `json:"exchange_min_notional,omitempty"`
+	MinimumExecutableQuantity float64   `json:"minimum_executable_quantity,omitempty"`
+	ExchangeOrderID           string    `json:"exchange_order_id,omitempty"`
+	ClientOrderID             string    `json:"client_order_id,omitempty"`
+	ExchangeOrderState        string    `json:"exchange_order_state,omitempty"`
+	ExecutionStatus           string    `json:"execution_status,omitempty"`
+	ExecutionReasonCode       string    `json:"execution_reason_code,omitempty"`
+	ProtectionStatus          string    `json:"protection_status,omitempty"`
+	ProtectionCoverage        float64   `json:"protection_coverage,omitempty"`
 }
 
 // Statistics statistics information
@@ -397,9 +404,9 @@ func (s *DecisionStore) fillRecordDetails(record *DecisionRecord) {
 			continue
 		}
 		var status, reason, lastError, exchangeOrderID, exchangeOrderState string
-		var requested, quantized, filled float64
-		err := s.db.QueryRow(`SELECT status,COALESCE(reason_code,''),COALESCE(last_error,''),COALESCE(exchange_order_id,''),COALESCE(exchange_state,''),COALESCE(requested_quantity,0),COALESCE(quantized_quantity,0),COALESCE(filled_quantity,0) FROM copy_trade_execution_intents WHERE id=?`, action.ExecutionIntentID).
-			Scan(&status, &reason, &lastError, &exchangeOrderID, &exchangeOrderState, &requested, &quantized, &filled)
+		var requested, quantized, filled, quantityStep, exchangeMinQuantity, exchangeMinNotional, minimumExecutableQuantity float64
+		err := s.db.QueryRow(`SELECT status,COALESCE(reason_code,''),COALESCE(last_error,''),COALESCE(exchange_order_id,''),COALESCE(exchange_state,''),COALESCE(requested_quantity,0),COALESCE(quantized_quantity,0),COALESCE(filled_quantity,0),COALESCE(quantity_step,0),COALESCE(exchange_min_quantity,0),COALESCE(exchange_min_notional,0),COALESCE(minimum_executable_quantity,0) FROM copy_trade_execution_intents WHERE id=?`, action.ExecutionIntentID).
+			Scan(&status, &reason, &lastError, &exchangeOrderID, &exchangeOrderState, &requested, &quantized, &filled, &quantityStep, &exchangeMinQuantity, &exchangeMinNotional, &minimumExecutableQuantity)
 		if err != nil {
 			overall = false
 			continue
@@ -411,6 +418,10 @@ func (s *DecisionStore) fillRecordDetails(record *DecisionRecord) {
 		action.RequestedQuantity = requested
 		action.QuantizedQuantity = quantized
 		action.FilledQuantity = filled
+		action.QuantityStep = quantityStep
+		action.ExchangeMinQuantity = exchangeMinQuantity
+		action.ExchangeMinNotional = exchangeMinNotional
+		action.MinimumExecutableQuantity = minimumExecutableQuantity
 		action.Success = status == ExecutionIntentFilled || status == ExecutionIntentProtected || status == ExecutionIntentSkipped
 		if !action.Success {
 			overall = false

@@ -2,6 +2,7 @@ package trader
 
 import (
 	"errors"
+	"math"
 	"testing"
 
 	"nofx/decision"
@@ -46,6 +47,40 @@ func TestQuantizeOrderIntentSubLotAndMinimumLot(t *testing.T) {
 	}
 	if _, err := QuantizeOrderIntent(inst, 0.019, QuantityRiskReduce); !errors.Is(err, ErrQuantitySubLot) {
 		t.Fatalf("expected ErrQuantitySubLot, got %v", err)
+	}
+}
+
+func TestQuantizeOrderIntentAtPriceUsesVenueMinimumByAction(t *testing.T) {
+	inst := &ExecutionInstrument{
+		BaseQuantityStep: 0.01,
+		MinBaseQuantity:  0.01,
+		MinNotional:      10,
+	}
+	open, err := QuantizeOrderIntentAtPrice(inst, 0.06, 100, QuantityInitialOpen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if open.Quantized != 0.10 || !open.UsedMinimum {
+		t.Fatalf("initial open must promote exactly to exchange minimum: %+v", open)
+	}
+	if _, err := QuantizeOrderIntentAtPrice(inst, 0.06, 100, QuantityAdd); !errors.Is(err, ErrQuantityBelowMinimum) {
+		t.Fatalf("small add must be skipped, got %v", err)
+	}
+	closeQty, err := QuantizeOrderIntentAtPrice(inst, 0.06, 100, QuantityFinalClose)
+	if err != nil || closeQty.Quantized != 0.06 {
+		t.Fatalf("final close must ignore opening min notional: %+v err=%v", closeQty, err)
+	}
+}
+
+func TestMinimumExecutableQuantityCeilsNotionalToStep(t *testing.T) {
+	inst := &ExecutionInstrument{
+		BaseQuantityStep: 0.03,
+		MinBaseQuantity:  0.03,
+		MinNotional:      11,
+	}
+	got, err := MinimumExecutableQuantity(inst, 100)
+	if err != nil || math.Abs(got-0.12) > 1e-12 {
+		t.Fatalf("minimum=%v err=%v, want 0.12", got, err)
 	}
 }
 

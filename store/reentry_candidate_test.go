@@ -119,6 +119,56 @@ func TestLowConfidenceEnterRemainsWaitingWithoutFailure(t *testing.T) {
 	}
 }
 
+func TestDisableReentryCandidatesKeepsSubmittedIntentOwnedByReconciler(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "candidate-disable.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	rs := st.ReentryAI()
+
+	watching, err := rs.EnsureReentryCandidate(&CopyGuardReentryCandidate{
+		CycleID: 101, TraderID: "trader-a", LeaderPosID: "watching", Symbol: "ETHUSDT", Side: "long",
+		FeatureHash: "watching", Protectable: true,
+	}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	inflight, err := rs.EnsureReentryCandidate(&CopyGuardReentryCandidate{
+		CycleID: 102, TraderID: "trader-a", LeaderPosID: "inflight", Symbol: "BTCUSDT", Side: "short",
+		FeatureHash: "inflight", Protectable: true,
+	}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = rs.MarkReentryCandidateStatus(inflight.ID, ReentryCandidateEntryPending, ""); err != nil {
+		t.Fatal(err)
+	}
+	intent, claimed, err := st.CopyTrade().ReserveExecutionIntent(&CopyTradeExecutionIntent{
+		TraderID: "trader-a", LeaderPosID: "inflight", SourceRevision: 1,
+		SourceKind: "AI_REENTRY", CanonicalKey: "ai|trader-a|102|1",
+		CycleID: 102, CandidateID: inflight.ID, Action: "open_short",
+	})
+	if err != nil || !claimed {
+		t.Fatalf("reserve inflight intent claimed=%v err=%v", claimed, err)
+	}
+	if err = st.CopyTrade().UpdateExecutionIntent(intent.ID, ExecutionIntentSubmitted, "", "", "order-1", 1, 1, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	if err = rs.DisableReentryCandidatesForTrader("trader-a", "protection disabled"); err != nil {
+		t.Fatal(err)
+	}
+	watching, err = rs.GetReentryCandidate(watching.ID)
+	if err != nil || watching.Status != ReentryCandidateInvalidated || watching.ClosedAt == nil {
+		t.Fatalf("unsubmitted candidate was not invalidated: candidate=%+v err=%v", watching, err)
+	}
+	inflight, err = rs.GetReentryCandidate(inflight.ID)
+	if err != nil || inflight.Status != ReentryCandidateEntryPending || inflight.ClosedAt != nil {
+		t.Fatalf("submitted candidate must remain reconciliation-owned: candidate=%+v err=%v", inflight, err)
+	}
+}
+
 func TestCandidateOperatorTransitionsRejectInFlightEntry(t *testing.T) {
 	st, err := New(filepath.Join(t.TempDir(), "candidate-operator-transition.db"))
 	if err != nil {

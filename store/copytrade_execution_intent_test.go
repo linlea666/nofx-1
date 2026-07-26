@@ -103,6 +103,20 @@ func TestExecutionIntentAdditiveMigrationIsIdempotent(t *testing.T) {
 			if reserveErr != nil || !claimed || intent.SourceKind != "AI_REENTRY" || intent.CandidateID != 2 {
 				t.Fatalf("migrated columns unusable: intent=%+v claimed=%v err=%v", intent, claimed, reserveErr)
 			}
+			if updateErr := st.CopyTrade().UpdateExecutionIntentQuantityConstraints(intent.ID, 0.006, 0.01, 0.001, 0.001, 10, 0.01); updateErr != nil {
+				t.Fatalf("migrated quantity constraint columns unusable: %v", updateErr)
+			}
+		} else {
+			intents, getErr := st.CopyTrade().ListExecutionIntentsByCycle(1)
+			if getErr != nil || len(intents) != 1 {
+				t.Fatalf("load migrated intent: count=%d err=%v", len(intents), getErr)
+			}
+			intent := intents[0]
+			if intent.RequestedQuantity != 0.006 || intent.QuantizedQuantity != 0.01 ||
+				intent.QuantityStep != 0.001 || intent.ExchangeMinQuantity != 0.001 ||
+				intent.ExchangeMinNotional != 10 || intent.MinimumExecutableQuantity != 0.01 {
+				t.Fatalf("quantity constraints were not preserved across restart: %+v", intent)
+			}
 		}
 		if closeErr := st.Close(); closeErr != nil {
 			t.Fatal(closeErr)

@@ -105,6 +105,12 @@ export function ExchangeConfigModal({
 
   // 保存中状态
   const [isSaving, setIsSaving] = useState(false)
+  const [accountStopLossPct, setAccountStopLossPct] = useState(10)
+  const [accountStopPolicyLoaded, setAccountStopPolicyLoaded] = useState(false)
+  const [aggregateRisk, setAggregateRisk] = useState<{
+    positions: number
+    worstCaseUSD: number
+  } | null>(null)
 
   // 账户名称
   const [accountName, setAccountName] = useState('')
@@ -182,6 +188,43 @@ export function ExchangeConfigModal({
       setLighterApiKeyIndex(selectedExchange.lighterApiKeyIndex || 0)
     }
   }, [editingExchangeId, selectedExchange])
+
+  useEffect(() => {
+    setAccountStopPolicyLoaded(false)
+    setAggregateRisk(null)
+    if (
+      !editingExchangeId ||
+      (currentExchangeType !== 'okx' && currentExchangeType !== 'binance')
+    ) {
+      return
+    }
+    let cancelled = false
+    void api
+      .getCopyGuardAccountRiskPolicy(editingExchangeId)
+      .then((data) => {
+        if (cancelled) return
+        setAccountStopLossPct(data.policy.max_position_loss_pct * 100)
+        setAggregateRisk({
+          positions: data.open_protected_positions,
+          worstCaseUSD: data.aggregate_worst_case_risk_usd,
+        })
+        setAccountStopPolicyLoaded(true)
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          toast.error(
+            error instanceof Error
+              ? error.message
+              : language === 'zh'
+                ? '读取账户保护配置失败'
+                : 'Failed to load account protection policy'
+          )
+        }
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [editingExchangeId, currentExchangeType, language])
 
   // 加载服务器IP（当选择binance时）
   useEffect(() => {
@@ -305,6 +348,32 @@ export function ExchangeConfigModal({
 
     const exchangeId = editingExchangeId || null
     const exchangeType = currentExchangeType || ''
+    let accountHighRiskConfirmed = false
+    let accountExtremeConfirmValue: number | undefined
+    if (
+      editingExchangeId &&
+      accountStopPolicyLoaded &&
+      (currentExchangeType === 'okx' || currentExchangeType === 'binance')
+    ) {
+      if (accountStopLossPct < 0.1 || accountStopLossPct > 30) {
+        toast.error(
+          language === 'zh'
+            ? '账户默认单仓最大亏损必须为 0.1%～30%'
+            : 'Account max position loss must be between 0.1% and 30%'
+        )
+        return
+      }
+      if (accountStopLossPct > 10) {
+        const typed = window.prompt(
+          language === 'zh'
+            ? `账户默认单仓最大亏损 ${accountStopLossPct.toFixed(2)}% 超过 10%。请输入该百分比数值确认：`
+            : `Account max position loss ${accountStopLossPct.toFixed(2)}% exceeds 10%. Type the percentage to confirm:`
+        )
+        if (typed === null || Number(typed) !== accountStopLossPct) return
+        accountHighRiskConfirmed = true
+        accountExtremeConfirmValue = Number(typed)
+      }
+    }
 
     setIsSaving(true)
     try {
@@ -402,6 +471,26 @@ export function ExchangeConfigModal({
           testnet
         )
       }
+      if (
+        editingExchangeId &&
+        accountStopPolicyLoaded &&
+        (currentExchangeType === 'okx' || currentExchangeType === 'binance')
+      ) {
+        await api.updateCopyGuardAccountRiskPolicy(
+          editingExchangeId,
+          accountStopLossPct / 100,
+          accountHighRiskConfirmed,
+          accountExtremeConfirmValue
+        )
+      }
+    } catch (error) {
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : language === 'zh'
+            ? '保存账户配置失败'
+            : 'Failed to save account configuration'
+      )
     } finally {
       setIsSaving(false)
     }
@@ -579,6 +668,53 @@ export function ExchangeConfigModal({
                       : 'Set an easily recognizable name for this account to distinguish multiple accounts on the same exchange'}
                   </div>
                 </div>
+
+                {editingExchangeId &&
+                  (currentExchangeType === 'okx' ||
+                    currentExchangeType === 'binance') && (
+                    <div className="mt-3 rounded border border-[#F0B90B44] bg-[#F0B90B0D] p-3">
+                      <label
+                        className="block text-sm font-semibold"
+                        style={{ color: '#EAECEF' }}
+                      >
+                        {language === 'zh'
+                          ? '账户保护：默认单仓最大亏损'
+                          : 'Account protection: max loss per position'}
+                      </label>
+                      <div className="mt-2 flex items-center gap-2">
+                        <input
+                          type="number"
+                          min="0.1"
+                          max="30"
+                          step="0.1"
+                          value={accountStopLossPct}
+                          disabled={!accountStopPolicyLoaded}
+                          onChange={(e) =>
+                            setAccountStopLossPct(Number(e.target.value))
+                          }
+                          className="w-full rounded px-3 py-2 disabled:opacity-50"
+                          style={{
+                            background: '#1E2329',
+                            border: '1px solid #2B3139',
+                            color: '#EAECEF',
+                          }}
+                        />
+                        <span className="text-sm text-[#F0B90B]">%</span>
+                      </div>
+                      <div className="mt-1 text-xs text-[#848E9C]">
+                        {language === 'zh'
+                          ? '默认 10%；该账户下未单独覆盖的交易员继承此值。超过 10% 保存时需输入数值确认。多仓合计只预警，不缩减普通跟单。'
+                          : 'Default 10%. Traders without an override inherit it. Values above 10% require typed confirmation. Aggregate exposure is warning-only.'}
+                      </div>
+                      {aggregateRisk && (
+                        <div className="mt-1 text-xs text-[#848E9C]">
+                          {language === 'zh'
+                            ? `当前受保护仓位 ${aggregateRisk.positions} 个；静态最坏风险上界约 ${aggregateRisk.worstCaseUSD.toFixed(2)} USDT（仅预警）`
+                            : `${aggregateRisk.positions} protected positions; static worst-case upper bound ${aggregateRisk.worstCaseUSD.toFixed(2)} USDT (warning only)`}
+                        </div>
+                      )}
+                    </div>
+                  )}
 
                 {/* 注册链接 */}
                 <a

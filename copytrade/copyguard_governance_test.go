@@ -4,7 +4,6 @@ import (
 	"math"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"nofx/store"
 )
@@ -51,7 +50,8 @@ func TestComputeOwnPathBaselineReproducesWLD(t *testing.T) {
 }
 
 // ============================================================================
-// 加仓账户风险预算：超预算必须缩量并记录 ADDON_RISK_SHRUNK；预算内不改量。
+// risk_addon_budget_pct is protocol-only compatibility. Ordinary leader adds
+// must not be resized by it.
 // ============================================================================
 
 func newAddonBudgetEngine(t *testing.T) (*Engine, *store.Store) {
@@ -76,77 +76,34 @@ func newAddonBudgetEngine(t *testing.T) (*Engine, *store.Store) {
 			RiskATRPeriod:      14,
 			RiskATRFallbackPct: 0.02,
 		},
-		store:                st,
-		stats:                &EngineStats{},
-		getFollowerEquity:    func() float64 { return 100 },
-		lastAddonBudgetEvent: make(map[string]time.Time),
+		store:              st,
+		stats:              &EngineStats{},
+		getFollowerBalance: func() float64 { return 100 },
+		getFollowerEquity:  func() float64 { return 100 },
 	}
 	return e, st
 }
 
-func TestAddonBudgetShrinksInsteadOfOnlyWarning(t *testing.T) {
-	e, st := newAddonBudgetEngine(t)
-	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "pos-add", Symbol: "WLDUSDT", Side: "long", MarginMode: "cross", Status: store.CopyGuardFollowing, PolicySnapshot: "{}", LeaderEntryPrice: 1, FollowerEntryPrice: 1, FollowerNotional: 100, AccountEquity: 100})
-	if err != nil {
-		t.Fatal(err)
+func TestAddonBudgetDoesNotResizeOrdinaryLeaderAdd(t *testing.T) {
+	e, _ := newAddonBudgetEngine(t)
+	signal := &TradeSignal{
+		ProviderType: ProviderOKX,
+		LeaderID:     "leader",
+		LeaderPosID:  "pos-add",
+		LeaderEquity: 100,
+		Fill: &Fill{
+			Symbol: "WLDUSDT", Price: 1, PositionSide: "long",
+			Action: ActionAdd, Value: 700,
+		},
 	}
-	signal := &TradeSignal{ProviderType: ProviderOKX, LeaderID: "leader", LeaderPosID: "pos-add", Fill: &Fill{Symbol: "WLDUSDT", Price: 1, PositionSide: "long", Action: ActionAdd}}
-
-	countBudgetEvents := func() int {
-		events, err := st.CopyTrade().ListCopyGuardEvents(cycle.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		n := 0
-		for _, ev := range events {
-			if ev.Type == "ADDON_RISK_SHRUNK" {
-				n++
-			}
-		}
-		return n
+	match := &SignalMatchResult{Action: ActionAdd}
+	got, warnings := e.calculateCopySizeByPositionChange(signal, match)
+	if got != 700 {
+		t.Fatalf("deprecated addon budget must not resize ordinary add: got %.8f", got)
 	}
-
-	// 现有名义 100 + 请求加仓 700 = 800，预期损失 16% > 预算 15%；
-	// 最大总名义应压到 750，因此本次只允许 650。
-	if got := e.limitAddonRiskBudget(signal, "pos-add", 700); got != 650 {
-		t.Fatalf("expected addon to shrink to 650, got %.8f", got)
-	}
-	if countBudgetEvents() != 1 {
-		t.Fatalf("expected exactly 1 ADDON_RISK_SHRUNK event, got %d", countBudgetEvents())
-	}
-
-	// 60 秒限频窗口内重复超预算：仍须缩量，但不重复写事件。
-	if got := e.limitAddonRiskBudget(signal, "pos-add", 700); got != 650 {
-		t.Fatalf("rate limiting must not bypass shrink, got %.8f", got)
-	}
-	if countBudgetEvents() != 1 {
-		t.Fatalf("rate-limited warning must not write a duplicate event, got %d", countBudgetEvents())
-	}
-
-	// 100 + 500 = 600，预期损失 12% ≤ 15% → 不告警
-	e2, st2 := newAddonBudgetEngine(t)
-	cycle2, err := st2.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "pos-add", Symbol: "WLDUSDT", Side: "long", MarginMode: "cross", Status: store.CopyGuardFollowing, PolicySnapshot: "{}", LeaderEntryPrice: 1, FollowerEntryPrice: 1, FollowerNotional: 100, AccountEquity: 100})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := e2.limitAddonRiskBudget(signal, "pos-add", 500); got != 500 {
-		t.Fatalf("an add within budget must remain unchanged, got %.8f", got)
-	}
-	events2, _ := st2.CopyTrade().ListCopyGuardEvents(cycle2.ID)
-	for _, ev := range events2 {
-		if ev.Type == "ADDON_RISK_SHRUNK" {
-			t.Fatal("an add within the budget must not produce a warning event")
-		}
-	}
-	// 预算设 0（禁用）→ 完全不检查
-	e2.config.RiskAddonBudgetPct = 0
-	if got := e2.limitAddonRiskBudget(signal, "pos-add", 10000); got != 10000 {
-		t.Fatalf("budget=0 must leave addon unchanged, got %.8f", got)
-	}
-	events2, _ = st2.CopyTrade().ListCopyGuardEvents(cycle2.ID)
-	for _, ev := range events2 {
-		if ev.Type == "ADDON_RISK_SHRUNK" {
-			t.Fatal("budget=0 disables the check entirely")
+	for _, warning := range warnings {
+		if warning.Type == "addon_risk_shrunk" {
+			t.Fatal("ordinary add must not produce addon risk shrink warning")
 		}
 	}
 }
