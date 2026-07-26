@@ -129,35 +129,6 @@ func AvailableCopyGuardRiskUSD(c *CopyConfig, equity float64, usage store.CopyGu
 	return available, nil
 }
 
-// AvailableCopyGuardFollowFirstRiskUSD is used only after a resolved exchange
-// quantity step increased a non-zero copy intent. It intentionally omits the
-// per-attempt target while preserving cycle and portfolio hard limits.
-func AvailableCopyGuardFollowFirstRiskUSD(c *CopyConfig, equity float64, usage store.CopyGuardRiskUsage) (float64, error) {
-	if c == nil || equity <= 0 {
-		return 0, fmt.Errorf("invalid follow-first risk capacity input")
-	}
-	available := equity*c.RiskCycleLossBudgetPct - usage.CycleUsedUSD
-	if portfolio := equity*c.RiskPortfolioLossBudgetPct - usage.PortfolioUsedUSD; portfolio < available {
-		available = portfolio
-	}
-	if available <= 1e-9 {
-		return 0, fmt.Errorf("copy guard cycle/portfolio hard risk budget exhausted")
-	}
-	return available, nil
-}
-
-// IsSingleStepFollowFirstOverflow recognizes only the discrete exchange-step
-// excess approved by the follow-first policy. Anything wider than one base
-// quantity step remains a normal risk-cap failure.
-func IsSingleStepFollowFirstOverflow(actualNotional, normalMaxNotional, baseQuantityStep, entryPrice float64) bool {
-	if actualNotional <= 0 || normalMaxNotional <= 0 || baseQuantityStep <= 0 || entryPrice <= 0 {
-		return false
-	}
-	tolerance := math.Max(0.01, actualNotional*0.001)
-	excess := actualNotional - normalMaxNotional
-	return excess > tolerance && excess <= baseQuantityStep*entryPrice+tolerance
-}
-
 // BuildProtectionPlan keeps market structure and risk sizing in one contract
 // shared by initial entries, add-ons and AI reentries. A wide valid stop always
 // shrinks notional; it is never squeezed merely to fit the account budget.
@@ -450,9 +421,6 @@ func ValidateRiskPolicyV4(c *CopyConfig) error {
 	maxRatio := 1.0
 	if c.RiskReentryDecisionMode == "ai_guarded" {
 		maxRatio = 0.5
-		if c.RiskUnprotectableAction != "close" {
-			return fmt.Errorf("ai_guarded requires risk_unprotectable_action=close")
-		}
 	}
 	if invalidRange(c.RiskReentryRatio, 0.1, maxRatio) {
 		return fmt.Errorf("risk_reentry_ratio must be 0.1..%.1f", maxRatio)
@@ -505,6 +473,9 @@ func ValidateRiskPolicyV4(c *CopyConfig) error {
 	if c.RiskUnprotectableAction != "" && c.RiskUnprotectableAction != "close" && c.RiskUnprotectableAction != "follow" {
 		return fmt.Errorf("risk_unprotectable_action must be close or follow")
 	}
+	if c.RiskUnprotectableDisposition != "" && c.RiskUnprotectableDisposition != "warn" && c.RiskUnprotectableDisposition != "close" {
+		return fmt.Errorf("risk_unprotectable_disposition must be warn or close")
+	}
 	return nil
 }
 
@@ -517,5 +488,5 @@ func ValidateStoredRiskPolicy(c *store.CopyTradeConfig) error {
 		return nil
 	}
 	c.FillRiskDefaults()
-	return ValidateRiskPolicyV4(&CopyConfig{ProviderType: ProviderType(c.ProviderType), RiskPolicyVersion: c.RiskPolicyVersion, RiskStopMode: c.RiskStopMode, RiskATRPeriod: c.RiskATRPeriod, RiskATRCacheMaxAgeMinutes: c.RiskATRCacheMaxAgeMinutes, RiskATRMultiplier: c.RiskATRMultiplier, RiskATRFallbackPct: c.RiskATRFallbackPct, RiskTriggerPriceType: c.RiskTriggerPriceType, RiskAccountPct: c.RiskAccountPct, RiskCycleLossBudgetPct: c.RiskCycleLossBudgetPct, RiskPortfolioLossBudgetPct: c.RiskPortfolioLossBudgetPct, RiskRoundTripFeeBPS: c.RiskRoundTripFeeBPS, RiskSlippageBufferBPS: c.RiskSlippageBufferBPS, RiskLiquidationBufferATR: c.RiskLiquidationBufferATR, RiskMaxReentries: c.RiskMaxReentries, RiskReentryRatio: c.RiskReentryRatio, RiskReentryDecisionMode: c.RiskReentryDecisionMode, RiskReentryMinNotional: c.RiskReentryMinNotional, RiskAIConfidenceThreshold: c.RiskAIConfidenceThreshold, RiskAIMinReviewSeconds: c.RiskAIMinReviewSeconds, RiskAIDailyCallLimit: c.RiskAIDailyCallLimit, RiskAILifecycleCallLimit: c.RiskAILifecycleCallLimit, RiskNotificationLevel: c.RiskNotificationLevel, RiskReentryBandATR: c.RiskReentryBandATR, RiskReentryCooldownSeconds: c.RiskReentryCooldownSeconds, RiskReentryMaxChaseATR: c.RiskReentryMaxChaseATR, RiskReentryMaxATRExpansion: c.RiskReentryMaxATRExpansion, RiskWatchTimeoutMinutes: c.RiskWatchTimeoutMinutes, RiskAddonBudgetPct: c.RiskAddonBudgetPct, RiskReentryMinRecoveryATR: c.RiskReentryMinRecoveryATR, RiskReentryCooldownEscalation: c.RiskReentryCooldownEscalation, RiskReentryRecoveryEscalation: c.RiskReentryRecoveryEscalation, RiskUnprotectableAction: c.RiskUnprotectableAction})
+	return ValidateRiskPolicyV4(&CopyConfig{ProviderType: ProviderType(c.ProviderType), RiskPolicyVersion: c.RiskPolicyVersion, RiskStopMode: c.RiskStopMode, RiskATRPeriod: c.RiskATRPeriod, RiskATRCacheMaxAgeMinutes: c.RiskATRCacheMaxAgeMinutes, RiskATRMultiplier: c.RiskATRMultiplier, RiskATRFallbackPct: c.RiskATRFallbackPct, RiskTriggerPriceType: c.RiskTriggerPriceType, RiskAccountPct: c.RiskAccountPct, RiskCycleLossBudgetPct: c.RiskCycleLossBudgetPct, RiskPortfolioLossBudgetPct: c.RiskPortfolioLossBudgetPct, RiskRoundTripFeeBPS: c.RiskRoundTripFeeBPS, RiskSlippageBufferBPS: c.RiskSlippageBufferBPS, RiskLiquidationBufferATR: c.RiskLiquidationBufferATR, RiskMaxReentries: c.RiskMaxReentries, RiskReentryRatio: c.RiskReentryRatio, RiskReentryDecisionMode: c.RiskReentryDecisionMode, RiskReentryMinNotional: c.RiskReentryMinNotional, RiskAIConfidenceThreshold: c.RiskAIConfidenceThreshold, RiskAIMinReviewSeconds: c.RiskAIMinReviewSeconds, RiskAIDailyCallLimit: c.RiskAIDailyCallLimit, RiskAILifecycleCallLimit: c.RiskAILifecycleCallLimit, RiskNotificationLevel: c.RiskNotificationLevel, RiskReentryBandATR: c.RiskReentryBandATR, RiskReentryCooldownSeconds: c.RiskReentryCooldownSeconds, RiskReentryMaxChaseATR: c.RiskReentryMaxChaseATR, RiskReentryMaxATRExpansion: c.RiskReentryMaxATRExpansion, RiskWatchTimeoutMinutes: c.RiskWatchTimeoutMinutes, RiskAddonBudgetPct: c.RiskAddonBudgetPct, RiskReentryMinRecoveryATR: c.RiskReentryMinRecoveryATR, RiskReentryCooldownEscalation: c.RiskReentryCooldownEscalation, RiskReentryRecoveryEscalation: c.RiskReentryRecoveryEscalation, RiskUnprotectableDisposition: c.RiskUnprotectableDisposition, RiskUnprotectableAction: c.RiskUnprotectableAction})
 }

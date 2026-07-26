@@ -168,11 +168,18 @@ func EvaluateCycleAIDecisions(st *store.Store, cycleID int64) (*AIEffectSummary,
 				horizonActionability = "PREFLIGHT_REJECTED"
 			}
 			attempt, requestedByEvent := requestedAttemptWithin(events, attempts, analysis, end)
-			requested := requestedByEvent || executionIntentWithin(executionIntent, executionIntentCreated, end)
-			submitted := hasEventForAnalysisWithin(events, "REENTRY_SUBMITTED", analysis.ID, end) || executionIntentWithin(executionIntent, executionIntentSubmitted, end)
+			requestedEvidence := requestedByEvent || executionIntentWithin(executionIntent, executionIntentCreated, end)
+			submittedEvidence := hasEventForAnalysisWithin(events, "REENTRY_SUBMITTED", analysis.ID, end) || executionIntentWithin(executionIntent, executionIntentSubmitted, end)
 			filledByIntent := executionIntent != nil && executionIntent.FilledQuantity > 0 && executionIntentWithin(executionIntent, executionIntentFilled, end)
 			actualExecuted := filledByIntent || (executionIntent == nil && requestedByEvent && attempt != nil)
-			protected := actualExecuted && (executionIntentWithin(executionIntent, executionIntentProtected, end) || (executionIntent == nil && hasEventForAttemptWithin(events, "PROTECTION_ACTIVE", analysis.AttemptNo, end)))
+			protectedEvidence := actualExecuted && (executionIntentWithin(executionIntent, executionIntentProtected, end) || (executionIntent == nil && hasEventForAttemptWithin(events, "PROTECTION_ACTIVE", analysis.AttemptNo, end)))
+			// A later lifecycle fact necessarily proves every earlier stage even
+			// when a legacy deployment omitted the intermediate event. This
+			// keeps ENTER -> REQUESTED -> SUBMITTED -> FILLED -> PROTECTED
+			// monotonic without pretending the missing linkage was verified.
+			requested, submitted, filled, protected := monotonicExecutionFunnel(
+				requestedEvidence, submittedEvidence, actualExecuted, protectedEvidence,
+			)
 			path := evaluatePath(samples, analysis.AttemptNo-1, cycle.Side, analysis.SnapshotPrice, atr, decisionAt, end, expectedInterval)
 			dataQuality := "VERIFIED"
 			if path.marketOutcome == store.ReentryMarketInsufficient {
@@ -183,6 +190,9 @@ func EvaluateCycleAIDecisions(st *store.Store, cycleID int64) (*AIEffectSummary,
 				executionDataQuality = "UNSCORABLE"
 				if executionIntent != nil || requested || submitted || hasEventForAnalysisWithin(events, "REENTRY_PREFLIGHT_REJECTED", analysis.ID, end) {
 					executionDataQuality = "VERIFIED"
+				}
+				if executionIntent == nil && (filled || submitted) {
+					executionDataQuality = "ESTIMATED_LEGACY"
 				}
 			}
 			var classifiedAttempt *store.CopyGuardAttempt
@@ -208,7 +218,7 @@ func EvaluateCycleAIDecisions(st *store.Store, cycleID int64) (*AIEffectSummary,
 				WindowStartAt: decisionAt, WindowEndAt: end, SampleCount: path.sampleCount,
 				CoverageRatio: path.coverage, MaxGapSeconds: path.maxGapSeconds,
 				ActualExecuted: actualExecuted, ActualPnL: actualPnL, EvaluationLatency: end.Sub(decisionAt).Seconds(),
-				ExecutionRequested: requested, ExecutionSubmitted: submitted, ExecutionFilled: filledByIntent || actualExecuted, ExecutionProtected: protected,
+				ExecutionRequested: requested, ExecutionSubmitted: submitted, ExecutionFilled: filled, ExecutionProtected: protected,
 			}
 			saved, inserted, saveErr := st.ReentryAI().SaveReentryDecisionEvaluation(evaluation)
 			if saveErr != nil {
@@ -258,6 +268,13 @@ func EvaluateCycleAIDecisions(st *store.Store, cycleID int64) (*AIEffectSummary,
 		})
 	}
 	return summary, nil
+}
+
+func monotonicExecutionFunnel(requested, submitted, filled, protected bool) (bool, bool, bool, bool) {
+	filled = filled || protected
+	submitted = submitted || filled
+	requested = requested || submitted
+	return requested, submitted, filled, protected
 }
 
 func evaluatePath(samples []*store.CopyGuardWatchSample, watchAttempt int, side string, referencePrice, atr float64, start, end time.Time, expectedInterval time.Duration) pathResult {

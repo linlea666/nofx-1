@@ -2,6 +2,7 @@ package copytrade
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -246,11 +247,13 @@ func (ti *TraderIntegration) StartCopyTrading() error {
 		RiskAddonBudgetPct:         copyConfig.RiskAddonBudgetPct,
 
 		// v4.1 重入加严 + v5 可保护性/噪音档
-		RiskReentryMinRecoveryATR:     copyConfig.RiskReentryMinRecoveryATR,
-		RiskReentryCooldownEscalation: copyConfig.RiskReentryCooldownEscalation,
-		RiskReentryRecoveryEscalation: copyConfig.RiskReentryRecoveryEscalation,
-		RiskUnprotectableAction:       copyConfig.RiskUnprotectableAction,
-		RiskReentryNoiseOverride:      copyConfig.RiskReentryNoiseOverride,
+		RiskReentryMinRecoveryATR:         copyConfig.RiskReentryMinRecoveryATR,
+		RiskReentryMinRecoveryATRExplicit: copyConfig.RiskReentryMinRecoveryATRExplicit,
+		RiskReentryCooldownEscalation:     copyConfig.RiskReentryCooldownEscalation,
+		RiskReentryRecoveryEscalation:     copyConfig.RiskReentryRecoveryEscalation,
+		RiskUnprotectableDisposition:      copyConfig.RiskUnprotectableDisposition,
+		RiskUnprotectableAction:           copyConfig.RiskUnprotectableAction,
+		RiskReentryNoiseOverride:          copyConfig.RiskReentryNoiseOverride,
 	}
 	engineConfig.FillRiskDefaults() // 兜底默认值（旧库迁移 / 前端未传时）
 	if err := ValidateRiskPolicyV4(engineConfig); err != nil {
@@ -401,6 +404,31 @@ func (ti *TraderIntegration) recoverExecutionIntents() {
 	ti.reconcileExecutionIntents(true)
 }
 
+const (
+	// The monitor reconciles roughly every three seconds. Align the attempt
+	// ceiling with the age ceiling so a short venue outage cannot escalate to
+	// manual review after only about one minute.
+	executionReconciliationMaxAttempts = 600
+	executionReconciliationMaxAge      = 30 * time.Minute
+)
+
+func (ti *TraderIntegration) recordExecutionReconciliationFailure(intent *store.CopyTradeExecutionIntent, reasonCode, message string) {
+	if intent == nil {
+		return
+	}
+	terminal, err := ti.store.CopyTrade().RecordExecutionReconciliationFailure(
+		intent.ID, reasonCode, message, executionReconciliationMaxAttempts, executionReconciliationMaxAge,
+	)
+	if err != nil {
+		logger.Errorf("❌ [%s] 执行意图对账失败状态落库失败 | intent=%d: %v", ti.traderID, intent.ID, err)
+		return
+	}
+	if terminal {
+		logger.Errorf("🚨 [%s] 执行意图超过自动对账边界，已转人工复核 | intent=%d posId=%s reason=%s",
+			ti.traderID, intent.ID, intent.LeaderPosID, reasonCode)
+	}
+}
+
 func (ti *TraderIntegration) logExecutionReconciliationReport() {
 	if ti.store == nil {
 		return
@@ -428,6 +456,15 @@ func (ti *TraderIntegration) reconcileExecutionIntents(startup bool) {
 		logger.Warnf("⚠️ [%s] 读取未完成执行意图失败: %v", ti.traderID, err)
 		return
 	}
+	if startup && ti.engine != nil && ti.engine.config != nil &&
+		SupportsCopyGuard(ti.engine.config.ProviderType) && usesV4CopyGuardRisk(ti.engine.config) {
+		lifecycleGaps, gapErr := ti.store.CopyTrade().ListFilledExecutionIntentsWithLifecycleGap(ti.traderID)
+		if gapErr != nil {
+			logger.Warnf("⚠️ [%s] 读取成交后保护生命周期缺口失败: %v", ti.traderID, gapErr)
+		} else {
+			intents = append(intents, lifecycleGaps...)
+		}
+	}
 	provider, supportsLookup := ti.executor.(ClientOrderStatusProvider)
 	for _, intent := range intents {
 		if !startup && intent.Status != store.ExecutionIntentReconciling {
@@ -440,24 +477,64 @@ func (ti *TraderIntegration) reconcileExecutionIntents(startup bool) {
 			ti.reconcileAIReentryIntent(intent, provider, supportsLookup, startup)
 			continue
 		}
-		if mapping, mappingErr := ti.store.CopyTrade().GetMapping(ti.traderID, intent.LeaderPosID); mappingErr == nil && mapping != nil && mapping.SourceRevision == intent.SourceRevision && mappingStateAcknowledgesIntent(mapping, intent) {
-			dec := &decision.Decision{Symbol: intent.Symbol, Action: intent.Action, IsCopyTrade: true,
-				LeaderPosID: intent.LeaderPosID, LeaderPosSize: intent.LeaderTargetSize, MarginMode: intent.MarginMode,
+		if intent.Status == store.ExecutionIntentReconciling && intent.ReasonCode == "SKIPPED_ADD_COMMIT_FAILED" {
+			if skipErr := ti.store.CopyTrade().CommitSkippedLeaderTransition(
+				intent.ID, ti.traderID, intent.LeaderPosID, intent.SourceRevision,
+				intent.LeaderTargetSize, "SKIPPED_ADD_INSUFFICIENT_MARGIN",
+			); skipErr != nil {
+				ti.recordExecutionReconciliationFailure(intent, "SKIPPED_ADD_COMMIT_FAILED", skipErr.Error())
+			} else {
+				logger.Warnf("🟡 [%s] 已恢复余额不足加仓的本地跳过提交 | intent=%d posId=%s revision=%d",
+					ti.traderID, intent.ID, intent.LeaderPosID, intent.SourceRevision)
+			}
+			continue
+		}
+		if mapping, mappingErr := ti.store.CopyTrade().GetMappingForReconciliation(ti.traderID, intent.LeaderPosID); mappingErr == nil && mapping != nil && mapping.SourceRevision == intent.SourceRevision && mappingStateAcknowledgesIntent(mapping, intent) {
+			symbol := intent.Symbol
+			if symbol == "" {
+				symbol = mapping.Symbol
+			}
+			marginMode := intent.MarginMode
+			if marginMode == "" {
+				marginMode = mapping.MarginMode
+			}
+			entryPrice := mapping.OpenPrice
+			if intent.Action == "close_long" || intent.Action == "close_short" {
+				entryPrice = mapping.ClosePrice
+			}
+			dec := &decision.Decision{Symbol: symbol, Action: intent.Action, IsCopyTrade: true,
+				LeaderPosID: intent.LeaderPosID, LeaderPosSize: intent.LeaderTargetSize, MarginMode: marginMode,
 				SourceFillID: intent.SourceFillID, SourceRevision: intent.SourceRevision, ExecutionIntentID: intent.ID,
 				ClientOrderID: intent.ClientOrderID, ExchangeOrderID: intent.ExchangeOrderID,
 				RequestedQuantity: intent.RequestedQuantity, QuantizedQuantity: intent.QuantizedQuantity, FilledQuantity: intent.FilledQuantity,
-				PositionSizeUSD: intent.RequestedNotional, Reasoning: "Copy trading: recovered acknowledged execution intent"}
-			if intent.Action == "open_long" || intent.Action == "open_short" || intent.Action == "reduce_long" || intent.Action == "reduce_short" {
-				ti.refreshStopLossAfterExecute(dec)
+				PositionSizeUSD: intent.RequestedNotional, EntryPrice: entryPrice,
+				SourceSymbol: mapping.SourceSymbol, ExecutionSymbol: mapping.ExecutionSymbol,
+				ValueCurrency: mapping.SourceQuoteAsset, ExecutionSettleAsset: mapping.ExecutionSettleAsset,
+				Reasoning: "Copy trading: recovered acknowledged execution intent"}
+			if mapping.Status == store.MappingStatusActive && ti.engine != nil && usesV4CopyGuardRisk(ti.engine.config) {
+				if _, cycleErr := ti.store.CopyTrade().GetOpenCopyGuardCycle(ti.traderID, mapping.LeaderPosID); errors.Is(cycleErr, sql.ErrNoRows) {
+					if _, _, ensureErr := ti.ensureV4CycleForMapping(mapping, nil, "filled intent lifecycle recovery"); ensureErr != nil {
+						ti.transitionExecutionIntent(dec, store.ExecutionIntentReconciling, "COPY_GUARD_CYCLE_RECOVERY_PENDING", ensureErr.Error())
+						continue
+					}
+				} else if cycleErr != nil {
+					ti.transitionExecutionIntent(dec, store.ExecutionIntentReconciling, "COPY_GUARD_CYCLE_QUERY_FAILED", cycleErr.Error())
+					continue
+				}
 			}
+			// CommitLeaderExecutionFill deliberately precedes lifecycle hooks.
+			// Re-run only those idempotent hooks when the exact mapping revision
+			// proves the exchange mutation; never resubmit the business order.
+			ti.updatePositionMapping(dec, true)
+			ti.refreshStopLossAfterExecute(dec)
 			if dec.ExecutionStatus != store.ExecutionIntentProtected && dec.ExecutionStatus != store.ExecutionIntentReconciling && dec.ExecutionStatus != store.ExecutionIntentFailed {
 				ti.transitionExecutionIntent(dec, store.ExecutionIntentFilled, "MAPPING_ALREADY_ACKNOWLEDGED", "")
 			}
 			logger.Warnf("🟡 [%s] 执行意图已由 mapping 修订确认，跳过重复业务提交 | intent=%d revision=%d", ti.traderID, intent.ID, intent.SourceRevision)
 			continue
 		} else if mappingErr == nil && mapping != nil && mapping.SourceRevision > intent.SourceRevision {
-			_ = ti.store.CopyTrade().UpdateExecutionIntent(intent.ID, store.ExecutionIntentReconciling, "REVISION_CONFLICT",
-				fmt.Sprintf("mapping revision %d is newer than intent revision %d", mapping.SourceRevision, intent.SourceRevision), "", 0, 0, 0)
+			ti.recordExecutionReconciliationFailure(intent, "REVISION_CONFLICT",
+				fmt.Sprintf("mapping revision %d is newer than intent revision %d", mapping.SourceRevision, intent.SourceRevision))
 			continue
 		}
 		if intent.Status == store.ExecutionIntentReserved {
@@ -474,12 +551,12 @@ func (ti *TraderIntegration) reconcileExecutionIntents(startup bool) {
 			}
 		}
 		if !supportsLookup {
-			_ = ti.store.CopyTrade().UpdateExecutionIntent(intent.ID, store.ExecutionIntentReconciling, "ORDER_LOOKUP_UNAVAILABLE", "startup requires manual reconciliation", "", 0, 0, 0)
+			ti.recordExecutionReconciliationFailure(intent, "ORDER_LOOKUP_UNAVAILABLE", "execution venue does not support client-order lookup")
 			continue
 		}
 		order, actualClientID, lookupErr := ti.lookupExecutionIntentOrder(provider, intent)
 		if lookupErr != nil {
-			_ = ti.store.CopyTrade().UpdateExecutionIntent(intent.ID, store.ExecutionIntentReconciling, "ORDER_LOOKUP_FAILED", lookupErr.Error(), "", 0, 0, 0)
+			ti.recordExecutionReconciliationFailure(intent, "ORDER_LOOKUP_FAILED", lookupErr.Error())
 			continue
 		}
 		filled := getFloatField(order, "executedQty", "filled_quantity", "quantity")
@@ -611,12 +688,12 @@ func (ti *TraderIntegration) reconcileAIReentryIntent(intent *store.CopyTradeExe
 		return
 	}
 	if !supportsLookup {
-		_ = ti.store.CopyTrade().UpdateExecutionIntent(intent.ID, store.ExecutionIntentReconciling, "ORDER_LOOKUP_UNAVAILABLE", "AI reentry requires manual exchange reconciliation", "", 0, 0, 0)
+		ti.recordExecutionReconciliationFailure(intent, "ORDER_LOOKUP_UNAVAILABLE", "AI reentry requires client-order lookup")
 		return
 	}
 	order, actualClientID, err := ti.lookupExecutionIntentOrder(provider, intent)
 	if err != nil {
-		_ = ti.store.CopyTrade().UpdateExecutionIntent(intent.ID, store.ExecutionIntentReconciling, "ORDER_LOOKUP_FAILED", err.Error(), "", 0, 0, 0)
+		ti.recordExecutionReconciliationFailure(intent, "ORDER_LOOKUP_FAILED", err.Error())
 		return
 	}
 	state := strings.ToUpper(getStringField(order, "status", "state"))
@@ -748,6 +825,91 @@ func (ti *TraderIntegration) monitorV4ProtectiveStops() {
 // cheap when nothing is missing (one mapping list + one cycle lookup each).
 const backfillV4CyclesEvery = time.Minute
 
+func (ti *TraderIntegration) ensureV4CycleForMapping(mapping *store.CopyTradePositionMapping, positions []map[string]interface{}, reason string) (*store.CopyGuardCycle, bool, error) {
+	if mapping == nil || ti.engine == nil || ti.engine.config == nil {
+		return nil, false, fmt.Errorf("copy guard lifecycle recovery has no active mapping/config")
+	}
+	cfg := ti.engine.config
+	if !SupportsCopyGuard(cfg.ProviderType) || cfg.RiskPolicyVersion < 4 || !cfg.RiskStopLossEnabled {
+		return nil, false, nil
+	}
+	if cycle, err := ti.store.CopyTrade().GetOpenCopyGuardCycle(ti.traderID, mapping.LeaderPosID); err == nil {
+		return cycle, false, nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return nil, false, err
+	}
+	if positions == nil {
+		var err error
+		positions, err = ti.getFreshPositions()
+		if err != nil {
+			return nil, false, fmt.Errorf("load fresh follower positions: %w", err)
+		}
+	}
+	entryPrice, qty := 0.0, 0.0
+	for _, pos := range positions {
+		if getStringField(pos, "symbol") != mapping.Symbol {
+			continue
+		}
+		if !strings.EqualFold(getStringField(pos, "side"), mapping.Side) {
+			continue
+		}
+		mode := getStringField(pos, "mgnMode", "marginMode")
+		if mapping.MarginMode != "" && mode != "" && mode != mapping.MarginMode {
+			continue
+		}
+		entryPrice = getFloatField(pos, "entryPrice", "entry_price")
+		qty = absFloat(getFloatField(pos, "positionAmt", "quantity"))
+		break
+	}
+	if qty <= 0 || entryPrice <= 0 {
+		return nil, false, fmt.Errorf("fresh follower position is unavailable for %s %s", mapping.Symbol, mapping.Side)
+	}
+	leaderEntry := mapping.OpenPrice
+	if leaderEntry <= 0 {
+		leaderEntry = entryPrice
+	}
+	baselineSize, baselineAvailable, err := ti.store.CopyTrade().GetConfirmedInitialLeaderSize(ti.traderID, mapping.LeaderPosID)
+	if err != nil {
+		return nil, false, fmt.Errorf("load confirmed initial leader baseline: %w", err)
+	}
+	if !baselineAvailable {
+		baselineSize = 0
+	}
+	policyJSON, err := json.Marshal(cfg)
+	if err != nil {
+		return nil, false, fmt.Errorf("encode copy guard policy snapshot: %w", err)
+	}
+	cycle, err := ti.store.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{
+		TraderID: ti.traderID, LeaderID: cfg.LeaderID, LeaderPosID: mapping.LeaderPosID,
+		Symbol: mapping.Symbol, Side: mapping.Side, MarginMode: mapping.MarginMode,
+		Status: store.CopyGuardFollowing, PolicySnapshot: string(policyJSON),
+		LeaderEntryPrice: leaderEntry, FollowerEntryPrice: entryPrice, FollowerNotional: entryPrice * qty,
+		BaselineLeaderSize: baselineSize, ShadowLeaderSize: mapping.LastKnownSize,
+		AccountEquity: ti.getEquityFunc()(), ATRAtEntry: ti.copyGuardEntryATR(mapping.Symbol, entryPrice),
+		LastObservedPrice: leaderEntry,
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	if strings.TrimSpace(reason) == "" {
+		reason = "active mapping lifecycle recovery"
+	}
+	if err = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{
+		CycleID: cycle.ID, TraderID: ti.traderID, Type: "CYCLE_BACKFILLED",
+		Price: entryPrice, Quantity: qty, Notional: entryPrice * qty,
+		Metadata: map[string]interface{}{
+			"reason": reason, "leader_entry_price": leaderEntry,
+			"baseline_available": baselineAvailable,
+		},
+	}); err != nil {
+		return nil, false, fmt.Errorf("persist copy guard recovery event: %w", err)
+	}
+	if err = ti.store.CopyTrade().OpenCopyGuardAttempt(cycle.ID, 0, entryPrice, entryPrice*qty, qty, 0); err != nil {
+		return nil, false, fmt.Errorf("persist copy guard recovery attempt: %w", err)
+	}
+	return cycle, true, nil
+}
+
 // backfillV4Cycles creates Copy Guard lifecycles for positions that were
 // already being followed before v4 was enabled: their mappings are 'active'
 // but no cycle exists, so they had no protection and never appeared in the
@@ -784,48 +946,14 @@ func (ti *TraderIntegration) backfillV4Cycles() {
 			}
 			positionsLoaded = true
 		}
-		entryPrice, qty := 0.0, 0.0
-		for _, pos := range positions {
-			if getStringField(pos, "symbol") != mapping.Symbol {
-				continue
-			}
-			if !strings.EqualFold(getStringField(pos, "side"), mapping.Side) {
-				continue
-			}
-			mode := getStringField(pos, "mgnMode", "marginMode")
-			if mapping.MarginMode != "" && mode != "" && mode != mapping.MarginMode {
-				continue
-			}
-			entryPrice = getFloatField(pos, "entryPrice", "entry_price")
-			qty = absFloat(getFloatField(pos, "positionAmt", "quantity"))
-			break
-		}
-		if qty <= 0 || entryPrice <= 0 {
-			// Follower does not actually hold this position (e.g. manually
-			// closed): nothing to protect, leave the mapping to the engine.
-			continue
-		}
-		leaderEntry := mapping.OpenPrice
-		if leaderEntry <= 0 {
-			leaderEntry = entryPrice
-		}
-		baselineSize, baselineAvailable, baselineErr := ti.store.CopyTrade().GetConfirmedInitialLeaderSize(ti.traderID, mapping.LeaderPosID)
-		if baselineErr != nil {
-			logger.Warnf("⚠️ [%s] Copy Guard 初始基准证据读取失败 | posId=%s: %v", ti.traderID, mapping.LeaderPosID, baselineErr)
-			continue
-		}
-		if !baselineAvailable {
-			baselineSize = 0
-		}
-		policyJSON, _ := json.Marshal(cfg)
-		cycle, cerr := ti.store.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{TraderID: ti.traderID, LeaderID: cfg.LeaderID, LeaderPosID: mapping.LeaderPosID, Symbol: mapping.Symbol, Side: mapping.Side, MarginMode: mapping.MarginMode, Status: store.CopyGuardFollowing, PolicySnapshot: string(policyJSON), LeaderEntryPrice: leaderEntry, FollowerEntryPrice: entryPrice, FollowerNotional: entryPrice * qty, BaselineLeaderSize: baselineSize, ShadowLeaderSize: mapping.LastKnownSize, AccountEquity: ti.getEquityFunc()(), ATRAtEntry: ti.copyGuardEntryATR(mapping.Symbol, entryPrice), LastObservedPrice: leaderEntry})
+		cycle, created, cerr := ti.ensureV4CycleForMapping(mapping, positions, "position followed before Copy Guard v4 was enabled")
 		if cerr != nil {
 			logger.Warnf("⚠️ [%s] Copy Guard 存量仓位回填失败 | posId=%s %s: %v", ti.traderID, mapping.LeaderPosID, mapping.Symbol, cerr)
 			continue
 		}
-		_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "CYCLE_BACKFILLED", Price: entryPrice, Quantity: qty, Notional: entryPrice * qty, Metadata: map[string]interface{}{"reason": "position followed before Copy Guard v4 was enabled", "leader_entry_price": leaderEntry, "baseline_available": baselineAvailable}})
-		_ = ti.store.CopyTrade().OpenCopyGuardAttempt(cycle.ID, 0, entryPrice, entryPrice*qty, qty, 0)
-		logger.Infof("📝 [%s] Copy Guard 存量仓位已回填生命周期 | cycle=%d posId=%s %s %s qty=%.4f entry=%.4f", ti.traderID, cycle.ID, mapping.LeaderPosID, mapping.Symbol, mapping.Side, qty, entryPrice)
+		if created {
+			logger.Infof("📝 [%s] Copy Guard 存量仓位已回填生命周期 | cycle=%d posId=%s %s %s", ti.traderID, cycle.ID, mapping.LeaderPosID, mapping.Symbol, mapping.Side)
+		}
 	}
 }
 
@@ -1134,7 +1262,7 @@ func (ti *TraderIntegration) reconcileStoppedV4Attempts() {
 			continue
 		}
 		for _, attempt := range attempts {
-			if attempt.Status != "STOPPED" || attempt.Reconciled || attempt.ClosedAt == nil {
+			if (attempt.Status != "STOPPED" && attempt.Status != "FORCED_EXIT") || attempt.Reconciled || attempt.ClosedAt == nil {
 				continue
 			}
 			if last := ti.lastAttemptReconcile[attempt.ID]; !last.IsZero() && time.Since(last) < time.Minute {
@@ -1311,11 +1439,22 @@ func (ti *TraderIntegration) pollV4ProtectiveStops() {
 					_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "FORCED_EXIT", Price: stored.TriggerPrice, Quantity: remain, Metadata: map[string]interface{}{"order_id": orderID, "reason": "partial_stop_residual"}})
 				}
 			} else if ti.residualCloseTries[cycle.ID] >= 3 && time.Since(ti.residualCloseLast[cycle.ID]) >= unprotectableRecheckDelay {
-				// 3 次 reduce-only 强平耗尽仍有残仓：STOP_PARTIAL 不能成为无逃生
-				// 终态（残仓裸奔且禁止重入）。升级到 GUARD_UNPROTECTABLE 处置
-				// （复用 close/follow 处置模式与升级告警），按不可保护复检节奏重试。
+				// The protective stop is already proven triggered; this is only
+				// residual cleanup. Keep STOP_PARTIAL open and retry a bounded
+				// cadence until fresh positions prove flat, then the normal stop
+				// settlement below records the real protective-stop evidence.
+				// Do not route through "unprotectable" handling: that would
+				// relabel an actual stop as a protection-establishment failure.
 				ti.residualCloseLast[cycle.ID] = time.Now()
-				ti.handleUnprotectableCycle(cycle, fmt.Errorf("stop residual close retries exhausted; remaining %.8f %s still open", remain, cycle.Symbol))
+				if closer, ok := ti.executor.(EmergencyPositionCloser); ok {
+					orderID, closeErr := closer.ClosePositionMarket(cycle.Symbol, cycle.Side)
+					if closeErr != nil {
+						ti.notifyProtection(cycle, "Copy Guard 止损残仓持续未平", fmt.Sprintf("保护止损已触发，但残仓 %.8f 在常规重试后仍未退出；系统将按慢速节奏继续 reduce-only 市价平仓。\n错误: %v", remain, closeErr), "stop_residual_exhausted")
+						_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "GUARD_FORCED_EXIT_FAILED", Price: stored.TriggerPrice, Quantity: remain, Metadata: map[string]interface{}{"error": closeErr.Error(), "reason": "partial_stop_residual_slow_retry"}})
+					} else {
+						_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "FORCED_EXIT", Price: stored.TriggerPrice, Quantity: remain, Metadata: map[string]interface{}{"order_id": orderID, "reason": "partial_stop_residual_slow_retry"}})
+					}
+				}
 			}
 			continue
 		}
@@ -1420,8 +1559,8 @@ const protectiveQueryFailureThreshold = 3
 const protectionMissingEscalationAfter = 10 * time.Minute
 
 // protectionRetryMaxAttempts (v5): 重试退避封顶。PENDING/DEGRADED（确认无有效
-// 保护）连续重试到此次数后不再无限重挂，转入 GUARD_UNPROTECTABLE 处置
-// （统一强制离场）。周期 65/66 曾在保护单
+// 保护）连续重试到此次数后不再无限重挂，转入 GUARD_UNPROTECTABLE 处置：
+// 普通跟单按 warn/close 配置，AI 重入始终强制离场。周期 65/66 曾在保护单
 // 反复被拒时空转 110 次重试、仓位全程裸跑，这里是对应的结构性修复。
 // UNKNOWN（状态未知，可能已有保护）不受封顶影响——状态未知时强制平仓
 // 比裸跑更危险。
@@ -1444,7 +1583,7 @@ func (ti *TraderIntegration) retryDegradedV4Protections() {
 			continue
 		}
 		switch cycle.ProtectionStatus {
-		case store.CopyGuardProtectionPending, store.CopyGuardProtectionUnknown, store.CopyGuardProtectionDegraded, store.CopyGuardProtectionUnprotectable:
+		case store.CopyGuardProtectionPending, store.CopyGuardProtectionUnknown, store.CopyGuardProtectionDegraded, store.CopyGuardProtectionUnprotectable, store.CopyGuardProtectionUnprotectedWarning, store.CopyGuardProtectionForcedExitPending:
 		default:
 			continue
 		}
@@ -1452,7 +1591,9 @@ func (ti *TraderIntegration) retryDegradedV4Protections() {
 			ti.notifyProtection(cycle, "Copy Guard 保护缺失超时", fmt.Sprintf("该仓位已连续 %.0f 分钟没有完整有效的止损保护，系统仍在自动重试。\n建议人工检查执行交易所，必要时手动挂止损或平仓。\n当前状态: %s\n最近错误: %s", time.Since(*cycle.ProtectionMissingAt).Minutes(), cycle.ProtectionStatus, cycle.ProtectionError), "missing_escalation")
 		}
 		retryDelay := protectionRetryDelay(cycle.ProtectionRetries)
-		if cycle.ProtectionStatus == store.CopyGuardProtectionUnprotectable {
+		if cycle.ProtectionStatus == store.CopyGuardProtectionUnprotectable ||
+			cycle.ProtectionStatus == store.CopyGuardProtectionUnprotectedWarning ||
+			cycle.ProtectionStatus == store.CopyGuardProtectionForcedExitPending {
 			retryDelay = unprotectableRecheckDelay
 		}
 		if cycle.ProtectionLastRetryAt != nil && time.Since(*cycle.ProtectionLastRetryAt) < retryDelay {
@@ -1466,10 +1607,25 @@ func (ti *TraderIntegration) retryDegradedV4Protections() {
 		if !claimed {
 			continue
 		}
+		if cycle.ProtectionStatus == store.CopyGuardProtectionForcedExitPending {
+			remaining, known := ti.followerPositionQuantity(cycle.Symbol, cycle.Side, cycle.MarginMode, true)
+			if known && remaining <= 1e-12 {
+				ti.finalizeUnprotectedMarketExit(cycle, cycle.ProtectionError)
+				continue
+			}
+			detail := "fresh follower position is unavailable"
+			if known {
+				detail = fmt.Sprintf("follower position still has %.8f remaining", remaining)
+			}
+			ti.handleUnprotectableCycle(cycle, fmt.Errorf("forced exit pending: %s", detail), true)
+			continue
+		}
 		// v5 重试退避封顶：确认无有效保护且重试用尽 → GUARD_UNPROTECTABLE 处置
 		if cycle.ProtectionRetries >= protectionRetryMaxAttempts &&
 			(cycle.ProtectionStatus == store.CopyGuardProtectionPending || cycle.ProtectionStatus == store.CopyGuardProtectionDegraded) {
-			ti.handleUnprotectableCycle(cycle, fmt.Errorf("protection retries exhausted (%d attempts): %s", cycle.ProtectionRetries, cycle.ProtectionError))
+			ti.handleUnprotectableCycle(cycle,
+				fmt.Errorf("protection retries exhausted (%d attempts): %s", cycle.ProtectionRetries, cycle.ProtectionError),
+				requiresUnprotectedForcedExit(cycle))
 			continue
 		}
 		action := "open_long"
@@ -1481,6 +1637,11 @@ func (ti *TraderIntegration) retryDegradedV4Protections() {
 	}
 }
 
+func requiresUnprotectedForcedExit(cycle *store.CopyGuardCycle) bool {
+	return cycle != nil &&
+		(cycle.Status == store.CopyGuardFollowingReentry || cycle.ReentryCount > 0)
+}
+
 // handleUnprotectableForDecision 决策路径进入 GUARD_UNPROTECTABLE 处置
 // （calcStopLossPrice 判定 clamp 后仍不可保护 / 开仓即触发）。
 func (ti *TraderIntegration) handleUnprotectableForDecision(dec *decision.Decision, side string, quantity, entryPrice float64, cause error) {
@@ -1489,63 +1650,75 @@ func (ti *TraderIntegration) handleUnprotectableForDecision(dec *decision.Decisi
 		logger.Errorf("❌ [%s] Copy Guard 不可保护但生命周期缺失 | %s %s: %v (cause=%v)", ti.traderID, dec.Symbol, side, err, cause)
 		return
 	}
-	ti.handleUnprotectableCycle(cycle, cause)
+	outcome := ti.handleUnprotectableCycle(cycle, cause, isAIReentryDecision(dec))
 	message := "protection cannot be established"
 	if cause != nil {
 		message = cause.Error()
 	}
-	quantity, known := ti.followerPositionQuantity(dec.Symbol, side, dec.MarginMode, true)
-	if known && quantity <= 0 {
+	if outcome == "warn" {
+		ti.transitionExecutionIntent(dec, store.ExecutionIntentFilled, "GUARD_UNPROTECTED_WARNING", message)
+		return
+	}
+	if outcome == "close_confirmed" {
 		ti.transitionExecutionIntent(dec, store.ExecutionIntentFailed, "GUARD_UNPROTECTABLE_EXITED", message)
 		return
 	}
 	ti.transitionExecutionIntent(dec, store.ExecutionIntentReconciling, "GUARD_FORCED_EXIT_PENDING", message)
 }
 
-// handleUnprotectableCycle GUARD_UNPROTECTABLE 处置（v5 可保护性状态机终点）：
-//   - close：立即市价平掉跟单仓位，周期进入 STOPPED_WATCHING 观察，
-//     记 GUARD_FORCED_EXIT；重入判据后续照常评估（含可保护性预检）。
-//
-// Historical "follow" is still readable for wire/storage compatibility, but
-// executing it would violate the account-protection contract by leaving a
-// known naked position. Runtime handling therefore always fails closed.
-func (ti *TraderIntegration) handleUnprotectableCycle(cycle *store.CopyGuardCycle, cause error) {
-	message := "protection cannot be established"
-	if cause != nil {
-		message = cause.Error()
-	}
-	action := "close"
-	logger.Errorf("🚨 [%s] Copy Guard 仓位不可保护 | cycle=%d %s %s | 处置=%s | %s", ti.traderID, cycle.ID, cycle.Symbol, cycle.Side, action, message)
-	_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "GUARD_UNPROTECTABLE", Metadata: map[string]interface{}{
-		"action": action, "error": message, "leader_pos_id": cycle.LeaderPosID, "symbol": cycle.Symbol, "side": cycle.Side, "retries": cycle.ProtectionRetries,
-	}})
-
-	// close 模式：强制离场。保护单在市价平仓确认前保持 live，避免撤单
-	// 与平仓之间出现无保护窗口；平仓成功后再精确清理本周期的保护单。
-	closeAction := "close_long"
-	if cycle.Side == "short" {
-		closeAction = "close_short"
-	}
-	dec := &decision.Decision{Symbol: cycle.Symbol, Action: closeAction, MarginMode: cycle.MarginMode, LeaderPosID: cycle.LeaderPosID, Reasoning: "Copy Guard forced exit: position unprotectable"}
-	ti.captureV4FollowerBeforeClose(dec)
-	closer, ok := ti.executor.(EmergencyPositionCloser)
-	if !ok {
-		ti.markProtectionIssue(cycle, store.CopyGuardProtectionDegraded, "GUARD_FORCED_EXIT_FAILED", fmt.Errorf("executor does not support preserving emergency close"), 0, false)
-		return
-	}
-	if _, execErr := closer.ClosePositionMarket(cycle.Symbol, cycle.Side); execErr != nil {
-		// 平仓失败：标 DEGRADED 留在重试链里（下一轮到封顶仍会再次进入本处置）
-		logger.Errorf("❌ [%s] Copy Guard 强制离场失败 | cycle=%d %s: %v", ti.traderID, cycle.ID, cycle.Symbol, execErr)
-		ti.markProtectionIssue(cycle, store.CopyGuardProtectionDegraded, "GUARD_FORCED_EXIT_FAILED", execErr, 0, false)
-		return
-	}
-	if mgr, ok := ti.executor.(ProtectiveStopManagerV4); ok {
-		if order, oerr := ti.store.CopyTrade().GetCopyGuardProtectiveOrder(cycle.ID); oerr == nil {
-			if cancelErr := ti.cancelProtectiveOrderForCycle(mgr, cycle, order); cancelErr != nil {
-				logger.Warnf("⚠️ [%s] Copy Guard 强平后撤保护单失败（巡检将继续重试）: %v", ti.traderID, cancelErr)
-				ti.markProtectionIssue(cycle, store.CopyGuardProtectionUnknown, "PROTECTION_VERIFY_UNKNOWN", cancelErr, cycle.ProtectionCoverage, false)
+func (ti *TraderIntegration) unprotectableDisposition(cycle *store.CopyGuardCycle) string {
+	if cycle != nil && strings.TrimSpace(cycle.PolicySnapshot) != "" {
+		var policy store.CopyGuardPolicy
+		if json.Unmarshal([]byte(cycle.PolicySnapshot), &policy) == nil {
+			if policy.UnprotectableDisposition == "close" || policy.UnprotectableDisposition == "warn" {
+				return policy.UnprotectableDisposition
+			}
+			// From defaults v8 onward a legacy field can only be present because
+			// a legacy client explicitly wrote it; older snapshots contained a
+			// server-forced "close" and therefore migrate to warn.
+			if policy.DefaultsVersion >= 8 && policy.UnprotectableAction == "close" {
+				return "close"
 			}
 		}
+	}
+	if ti.engine != nil && ti.engine.config != nil {
+		if disposition := ti.engine.config.RiskUnprotectableDisposition; disposition == "close" || disposition == "warn" {
+			return disposition
+		}
+	}
+	return "warn"
+}
+
+// finalizeUnprotectedMarketExit commits the forced-exit lifecycle only after a
+// fresh exchange position read has confirmed flat. A submission ACK alone is
+// not evidence of execution and must leave mapping/cycle state untouched.
+func (ti *TraderIntegration) finalizeUnprotectedMarketExit(cycle *store.CopyGuardCycle, message string) string {
+	if cycle == nil {
+		return "close_pending"
+	}
+	if strings.TrimSpace(message) == "" {
+		message = "protection cannot be established"
+	}
+	order, orderErr := ti.store.CopyTrade().GetCopyGuardProtectiveOrder(cycle.ID)
+	switch {
+	case orderErr == nil:
+		mgr, ok := ti.executor.(ProtectiveStopManagerV4)
+		if !ok {
+			cancelErr := fmt.Errorf("executor cannot cancel and confirm protective order %s", order.AlgoID)
+			ti.markProtectionIssue(cycle, store.CopyGuardProtectionForcedExitPending, "PROTECTION_CANCEL_UNCONFIRMED", cancelErr, cycle.ProtectionCoverage, false)
+			return "close_pending"
+		}
+		if cancelErr := ti.cancelProtectiveOrderForCycle(mgr, cycle, order); cancelErr != nil {
+			logger.Warnf("⚠️ [%s] Copy Guard 强平后撤保护单失败（巡检将继续重试）: %v", ti.traderID, cancelErr)
+			ti.markProtectionIssue(cycle, store.CopyGuardProtectionForcedExitPending, "PROTECTION_CANCEL_UNCONFIRMED", cancelErr, cycle.ProtectionCoverage, false)
+			return "close_pending"
+		}
+	case errors.Is(orderErr, sql.ErrNoRows):
+		// No persisted protective order exists for this cycle.
+	default:
+		queryErr := fmt.Errorf("query protective order before forced-exit finalization: %w", orderErr)
+		ti.markProtectionIssue(cycle, store.CopyGuardProtectionForcedExitPending, "PROTECTION_QUERY_UNCONFIRMED", queryErr, cycle.ProtectionCoverage, false)
+		return "close_pending"
 	}
 	price := float64(0)
 	if slMgr, ok := ti.executor.(StopLossManager); ok {
@@ -1560,33 +1733,114 @@ func (ti *TraderIntegration) handleUnprotectableCycle(cycle *store.CopyGuardCycl
 	if cycle.FollowerEntryPrice > 0 {
 		quantity = cycle.FollowerNotional / cycle.FollowerEntryPrice
 	}
-	// 领航员快照 → mapping 进观察态（重入判据照常运行）
-	pnl, size, addCount := float64(0), float64(0), 0
-	if leader := ti.engine.buildLeaderPosMap()[cycle.LeaderPosID]; leader != nil {
-		pnl, size = leader.UnrealizedPnL, leader.Size
-		if leader.EntryPrice > 0 {
-			_ = ti.store.CopyTrade().SnapshotCopyGuardLeaderEntryAtStop(cycle.ID, leader.EntryPrice)
+	if recordErr := ti.store.CopyTrade().RecordCopyGuardUnprotectedExit(
+		cycle.ID, ti.traderID, cycle.LeaderPosID, cycle.ReentryCount, price, quantity, message,
+	); recordErr != nil {
+		logger.Errorf("[CopyGuard] trader=%s cycle=%d attempt=%d event=FORCED_EXIT_PERSIST_FAILED reason=%v", ti.traderID, cycle.ID, cycle.ReentryCount, recordErr)
+		ti.notifyProtection(cycle, "Copy Guard 已退出但账本落库失败", "仓位已确认退出，但本地止损账本提交失败；系统保持禁止重入并将在仓位缺失检测中重试。错误: "+recordErr.Error(), fmt.Sprintf("forced_exit_persist_%d", cycle.ReentryCount))
+		return "close_pending"
+	}
+	_ = ti.store.ReentryAI().ConsumeCopyGuardRisk(cycle.ID, cycle.ReentryCount)
+	logger.Warnf("🛑 [%s] Copy Guard 强制离场已确认（不可保护） | cycle=%d %s %s price≈%.4f", ti.traderID, cycle.ID, cycle.Symbol, cycle.Side, price)
+	ti.notifyProtection(cycle, "Copy Guard 强制离场（仓位不可保护）", fmt.Sprintf("该仓位无法建立任何有效止损保护（含极紧 clamp 止损），已按处置模式 close 市价平仓并确认空仓。\n原因: %s\n本次不是保护止损成交，周期不会触发 AI 二次入场；仅继续跟踪领航员最终平仓。", message), "forced_exit")
+	return "close_confirmed"
+}
+
+// handleUnprotectableCycle applies the configured terminal protection policy:
+//   - warn (default for ordinary copy): keep the position, record a high-risk
+//     unprotected state and continue bounded protection retries;
+//   - close: market-exit into PROTECTION_EXITED without fabricating a stop
+//     event or AI-reentry eligibility.
+//
+// AI reentry passes forceClose=true because leaving a newly-created reentry
+// position naked would violate its execution contract even when ordinary-copy
+// policy is warn.
+func (ti *TraderIntegration) handleUnprotectableCycle(cycle *store.CopyGuardCycle, cause error, forceClose bool) string {
+	message := "protection cannot be established"
+	if cause != nil {
+		message = cause.Error()
+	}
+	action := ti.unprotectableDisposition(cycle)
+	if forceClose {
+		action = "close"
+	}
+	logger.Errorf("🚨 [%s] Copy Guard 仓位不可保护 | cycle=%d %s %s | 处置=%s | %s", ti.traderID, cycle.ID, cycle.Symbol, cycle.Side, action, message)
+	_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "GUARD_UNPROTECTABLE", Metadata: map[string]interface{}{
+		"action": action, "forced": forceClose, "error": message, "leader_pos_id": cycle.LeaderPosID, "symbol": cycle.Symbol, "side": cycle.Side, "retries": cycle.ProtectionRetries,
+	}})
+	if action == "warn" {
+		if err := ti.store.CopyTrade().UpdateCopyGuardProtectionHealth(cycle.ID, store.CopyGuardProtectionUnprotectedWarning, 0, message, cycle.FollowerPosID, cycle.EntryOrderID, false); err != nil {
+			logger.Errorf("❌ [%s] Copy Guard 无保护警告状态落库失败 | cycle=%d: %v", ti.traderID, cycle.ID, err)
+			return "state_error"
+		}
+		if err := ti.store.CopyTrade().UpdateCopyGuardAttemptProtection(cycle.ID, cycle.ReentryCount, 0, "", store.CopyGuardProtectionUnprotectedWarning, 0); err != nil {
+			logger.Errorf("❌ [%s] Copy Guard 无保护 attempt 状态落库失败 | cycle=%d attempt=%d: %v", ti.traderID, cycle.ID, cycle.ReentryCount, err)
+			return "state_error"
+		}
+		_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "GUARD_UNPROTECTED_WARNING", Metadata: map[string]interface{}{
+			"error": message, "leader_pos_id": cycle.LeaderPosID, "retries": cycle.ProtectionRetries,
+		}})
+		logger.Warnf("⚠️ [%s] Copy Guard 无保护继续跟随 | cycle=%d %s %s（系统继续重试保护单）", ti.traderID, cycle.ID, cycle.Symbol, cycle.Side)
+		ti.notifyProtection(cycle, "Copy Guard 无法建立保护单", fmt.Sprintf("当前普通跟单仓位按配置继续持有，系统将持续重试建立保护并保留高危告警。\n原因: %s\n如不接受裸仓风险，请在交易所手动挂止损或将处置改为立即市价离场。", message), "unprotected_warning")
+		return "warn"
+	}
+	if err := ti.store.CopyTrade().UpdateCopyGuardProtectionHealth(cycle.ID, store.CopyGuardProtectionForcedExitPending, 0, message, cycle.FollowerPosID, cycle.EntryOrderID, false); err != nil {
+		logger.Errorf("❌ [%s] Copy Guard 强制离场前状态落库失败，未提交市价平仓 | cycle=%d: %v", ti.traderID, cycle.ID, err)
+		return "state_error"
+	}
+	if err := ti.store.CopyTrade().UpdateCopyGuardAttemptProtection(cycle.ID, cycle.ReentryCount, 0, "", store.CopyGuardProtectionForcedExitPending, 0); err != nil {
+		logger.Errorf("❌ [%s] Copy Guard 强制离场前 attempt 状态落库失败，未提交市价平仓 | cycle=%d attempt=%d: %v", ti.traderID, cycle.ID, cycle.ReentryCount, err)
+		return "state_error"
+	}
+
+	// close 模式：强制离场。保护单在市价平仓确认前保持 live，避免撤单
+	// 与平仓之间出现无保护窗口；平仓成功后再精确清理本周期的保护单。
+	closeAction := "close_long"
+	if cycle.Side == "short" {
+		closeAction = "close_short"
+	}
+	dec := &decision.Decision{Symbol: cycle.Symbol, Action: closeAction, MarginMode: cycle.MarginMode, LeaderPosID: cycle.LeaderPosID, Reasoning: "Copy Guard forced exit: position unprotectable"}
+	ti.captureV4FollowerBeforeClose(dec)
+	closer, ok := ti.executor.(EmergencyPositionCloser)
+	if !ok {
+		ti.markProtectionIssue(cycle, store.CopyGuardProtectionDegraded, "GUARD_FORCED_EXIT_FAILED", fmt.Errorf("executor does not support preserving emergency close"), 0, false)
+		return "close_failed"
+	}
+	exitOrderID, execErr := closer.ClosePositionMarket(cycle.Symbol, cycle.Side)
+	if execErr != nil {
+		// 平仓失败：标 DEGRADED 留在重试链里（下一轮到封顶仍会再次进入本处置）
+		logger.Errorf("❌ [%s] Copy Guard 强制离场失败 | cycle=%d %s: %v", ti.traderID, cycle.ID, cycle.Symbol, execErr)
+		ti.markProtectionIssue(cycle, store.CopyGuardProtectionDegraded, "GUARD_FORCED_EXIT_FAILED", execErr, 0, false)
+		return "close_failed"
+	}
+	if exitOrderID != "" {
+		if err := ti.store.CopyTrade().UpdateCopyGuardAttemptIdentity(cycle.ID, cycle.ReentryCount, "", "", exitOrderID); err != nil {
+			// The reduce-only close has already been accepted, so it cannot be
+			// rolled back. Keep the durable cycle in FORCED_EXIT_PENDING and
+			// recover from fresh position state rather than pretending the
+			// exit identity was persisted.
+			logger.Errorf("❌ [%s] Copy Guard 强制离场订单身份落库失败 | cycle=%d attempt=%d order=%s: %v",
+				ti.traderID, cycle.ID, cycle.ReentryCount, exitOrderID, err)
 		}
 	}
-	if mapping, _ := ti.store.CopyTrade().GetMapping(ti.traderID, cycle.LeaderPosID); mapping != nil {
-		addCount = mapping.AddCount
+	remaining, known := ti.followerPositionQuantity(cycle.Symbol, cycle.Side, cycle.MarginMode, true)
+	if !known || remaining > 1e-12 {
+		_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{
+			CycleID: cycle.ID, TraderID: ti.traderID, Type: "GUARD_FORCED_EXIT_SUBMITTED",
+			Quantity: remaining,
+			Metadata: map[string]interface{}{
+				"leader_pos_id":  cycle.LeaderPosID,
+				"position_known": known,
+				"remaining_qty":  remaining,
+				"exit_order_id":  exitOrderID,
+				"reason":         message,
+			},
+		})
+		logger.Warnf("⏳ [%s] Copy Guard 强制离场已提交、等待空仓确认 | cycle=%d %s %s known=%v remaining=%.8f",
+			ti.traderID, cycle.ID, cycle.Symbol, cycle.Side, known, remaining)
+		return "close_pending"
 	}
-	atr, _ := market.GetOKXATRWithMaxAge(cycle.Symbol, ti.engine.config.RiskATRTimeframe, ti.engine.config.RiskATRPeriod, riskATRCacheMaxAge(ti.engine.config))
-	if recordErr := ti.store.CopyTrade().RecordCopyGuardStopObserved(cycle.ID, ti.traderID, cycle.ReentryCount, atr, price, quantity, map[string]interface{}{
-		"confirmation": "guard_forced_exit", "error": message, "leader_pnl": pnl,
-	}); recordErr != nil {
-		logger.Errorf("[CopyGuard] trader=%s cycle=%d attempt=%d event=FORCED_EXIT_PERSIST_FAILED reason=%v", ti.traderID, cycle.ID, cycle.ReentryCount, recordErr)
-		ti.notifyProtection(cycle, "Copy Guard 已退出但账本落库失败", "仓位已强制退出，但本地止损账本提交失败；系统保持禁止重入并将在仓位缺失检测中重试。错误: "+recordErr.Error(), fmt.Sprintf("forced_exit_persist_%d", cycle.ReentryCount))
-		return
-	}
-	_ = ti.store.CopyTrade().MarkStoppedByRisk(ti.traderID, cycle.LeaderPosID, pnl, size, addCount)
-	_ = ti.store.ReentryAI().ConsumeCopyGuardRisk(cycle.ID, cycle.ReentryCount)
-	_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "GUARD_FORCED_EXIT", Price: price, Quantity: quantity, Metadata: map[string]interface{}{
-		"error": message, "leader_pos_id": cycle.LeaderPosID,
-	}})
-	_ = ti.store.CopyTrade().UpdateCopyGuardProtectionHealth(cycle.ID, store.CopyGuardProtectionCanceled, 0, message, cycle.FollowerPosID, cycle.EntryOrderID, false)
-	logger.Warnf("🛑 [%s] Copy Guard 强制离场完成（不可保护） | cycle=%d %s %s price≈%.4f", ti.traderID, cycle.ID, cycle.Symbol, cycle.Side, price)
-	ti.notifyProtection(cycle, "Copy Guard 强制离场（仓位不可保护）", fmt.Sprintf("该仓位无法建立任何有效止损保护（含极紧 clamp 止损），已按处置模式 close 市价平仓。\n原因: %s\n周期进入观察期，满足重入条件且可保护时会再次进场。", message), "forced_exit")
+	return ti.finalizeUnprotectedMarketExit(cycle, message)
 }
 
 func (ti *TraderIntegration) recoverV4PendingStates() {
@@ -1853,10 +2107,19 @@ func (ti *TraderIntegration) executeFullDecision(fullDec *decision.FullDecision)
 				executionLogs = append(executionLogs, fmt.Sprintf("❌ %s %s AI 重入未成交: %v", dec.Action, dec.Symbol, err))
 				ti.saveSignalLog(dec, "failed", err.Error())
 			} else if errors.Is(err, trader.ErrExecutionInstrumentUnsupported) && (dec.Action == "open_long" || dec.Action == "open_short") {
-				ti.transitionExecutionIntent(dec, store.ExecutionIntentSkipped, "EXECUTION_INSTRUMENT_UNSUPPORTED", err.Error())
-				ti.handleUnsupportedExecutionInstrument(dec, err)
-				executionLogs = append(executionLogs, fmt.Sprintf("⏭️ %s %s 跳过（执行交易所无精确合约）: %v", dec.Action, dec.Symbol, err))
-				ti.saveSignalLog(dec, "skipped", err.Error())
+				reasonCode := "EXECUTION_INSTRUMENT_UNSUPPORTED"
+				commitErr := ti.commitUnsupportedExecutionTransition(dec, reasonCode)
+				if commitErr != nil {
+					ti.deferSourceTransitionRevalidation(dec, reasonCode, commitErr)
+					ti.handleUnsupportedExecutionInstrument(dec, err, "reconciling")
+					executionLogs = append(executionLogs, fmt.Sprintf("⏳ %s %s 不支持合约跳过提交失败，等待重放/对账: %v", dec.Action, dec.Symbol, commitErr))
+					ti.saveSignalLog(dec, "reconciling", commitErr.Error())
+				} else {
+					dec.ExecutionStatus, dec.ExecutionReasonCode = store.ExecutionIntentSkipped, reasonCode
+					ti.handleUnsupportedExecutionInstrument(dec, err, "skipped")
+					executionLogs = append(executionLogs, fmt.Sprintf("⏭️ %s %s 跳过（执行交易所无精确合约）: %v", dec.Action, dec.Symbol, err))
+					ti.saveSignalLog(dec, "skipped", err.Error())
+				}
 			} else if errors.Is(err, trader.ErrExecutionInstrumentUnsupported) {
 				ti.transitionExecutionIntent(dec, store.ExecutionIntentFailed, "EXECUTION_INSTRUMENT_UNSUPPORTED", err.Error())
 				// A stored active mapping already identifies the exact execution
@@ -1873,8 +2136,8 @@ func (ti *TraderIntegration) executeFullDecision(fullDec *decision.FullDecision)
 						dec.ExecutionIntentID, ti.traderID, dec.LeaderPosID, dec.SourceRevision,
 						dec.LeaderPosSize, reasonCode,
 					); commitErr != nil {
-						reasonCode = "SKIPPED_ADD_COMMIT_FAILED"
-						ti.transitionExecutionIntent(dec, store.ExecutionIntentReconciling, reasonCode, commitErr.Error())
+						ti.deferSourceTransitionRevalidation(dec, reasonCode, commitErr)
+						reasonCode = "SOURCE_REVALIDATION_REQUIRED"
 						logger.Errorf("❌ [%s] 微量加仓跳过后原子推进失败 | intent=%d: %v", ti.traderID, dec.ExecutionIntentID, commitErr)
 					} else {
 						dec.ExecutionStatus = store.ExecutionIntentSkipped
@@ -1893,23 +2156,61 @@ func (ti *TraderIntegration) executeFullDecision(fullDec *decision.FullDecision)
 					ti.traderID, dec.Action, dec.Symbol, err)
 				executionLogs = append(executionLogs,
 					fmt.Sprintf("⏭️ %s %s 跳过（未下单）: %v", dec.Action, dec.Symbol, err))
-				reasonCode := "PARTIAL_CLOSE_SKIPPED"
-				if errors.Is(err, trader.ErrPartialCloseSubLot) {
-					reasonCode = "SKIPPED_SUBLOT"
+				reasonCode := ""
+				switch {
+				case errors.Is(err, trader.ErrFollowerPositionMissing):
+					reasonCode = "FOLLOWER_POSITION_MISSING"
 					if dec.ExecutionIntentID > 0 {
-						if updateErr := ti.store.CopyTrade().CommitSkippedSubLot(dec.ExecutionIntentID, ti.traderID, dec.LeaderPosID, dec.SourceRevision, dec.LeaderPosSize); updateErr != nil {
-							reasonCode = "SKIPPED_SUBLOT_COMMIT_FAILED"
-							logger.Errorf("❌ [%s] 微量减仓跳过后原子推进失败: %v", ti.traderID, updateErr)
+						if updateErr := ti.store.CopyTrade().CommitDetachedLeaderTransition(
+							dec.ExecutionIntentID, ti.traderID, dec.LeaderPosID, dec.SourceRevision,
+							dec.LeaderPosSize, reasonCode,
+						); updateErr != nil {
+							ti.deferSourceTransitionRevalidation(dec, reasonCode, updateErr)
+							reasonCode = "SOURCE_REVALIDATION_REQUIRED"
+							logger.Errorf("❌ [%s] 跟随仓位缺失后的脱离提交失败: %v", ti.traderID, updateErr)
 						} else {
 							dec.ExecutionStatus = store.ExecutionIntentSkipped
-							dec.ExecutionReasonCode = "SKIPPED_SUBLOT"
+							dec.ExecutionReasonCode = "FOLLOWER_POSITION_MISSING"
+						}
+					}
+				case errors.Is(err, trader.ErrPartialCloseSubLot):
+					reasonCode = "SKIPPED_SUBLOT"
+				case errors.Is(err, trader.ErrPartialCloseWouldFlatten):
+					reasonCode = "SKIPPED_PARTIAL_WOULD_FLATTEN"
+				case errors.Is(err, trader.ErrPartialCloseBelowMinimum):
+					reasonCode = "SKIPPED_REDUCE_BELOW_EXCHANGE_MINIMUM"
+				default:
+					// Unknown skip categories are not source acknowledgements.
+					// Preserve the transition for a healthy replay instead of
+					// silently advancing the mapping on an untyped error.
+					reasonCode = "PARTIAL_CLOSE_REVALIDATION_REQUIRED"
+					ti.transitionExecutionIntent(dec, store.ExecutionIntentReconciling, reasonCode, err.Error())
+					if ti.engine != nil {
+						ti.engine.UnmarkDecisionSources(dec)
+					}
+				}
+				if reasonCode != "" && dec.ExecutionStatus != store.ExecutionIntentSkipped &&
+					reasonCode != "PARTIAL_CLOSE_REVALIDATION_REQUIRED" && reasonCode != "SOURCE_REVALIDATION_REQUIRED" {
+					if dec.ExecutionIntentID > 0 {
+						if updateErr := ti.store.CopyTrade().CommitSkippedLeaderTransition(
+							dec.ExecutionIntentID, ti.traderID, dec.LeaderPosID, dec.SourceRevision,
+							dec.LeaderPosSize, reasonCode,
+						); updateErr != nil {
+							skipReasonCode := reasonCode
+							ti.deferSourceTransitionRevalidation(dec, skipReasonCode, updateErr)
+							reasonCode = "SOURCE_REVALIDATION_REQUIRED"
+							logger.Errorf("❌ [%s] 无成交减仓原子推进失败: %v", ti.traderID, updateErr)
+						} else {
+							dec.ExecutionStatus = store.ExecutionIntentSkipped
+							dec.ExecutionReasonCode = reasonCode
 						}
 					}
 				}
-				if dec.ExecutionStatus != store.ExecutionIntentSkipped {
-					ti.transitionExecutionIntent(dec, store.ExecutionIntentSkipped, reasonCode, err.Error())
+				signalStatus := "skipped"
+				if dec.ExecutionStatus == store.ExecutionIntentReconciling {
+					signalStatus = "reconciling"
 				}
-				ti.saveSignalLog(dec, "skipped", err.Error())
+				ti.saveSignalLog(dec, signalStatus, err.Error())
 			} else if errors.Is(err, errCopyGuardRiskPreflight) {
 				// Price/catalog/database failures are not a source
 				// acknowledgement. Keep the canonical pre-submit intent
@@ -1920,8 +2221,8 @@ func (ti *TraderIntegration) executeFullDecision(fullDec *decision.FullDecision)
 					reasonCode = "PRECHECK_INFRASTRUCTURE"
 				}
 				ti.transitionExecutionIntent(dec, store.ExecutionIntentFailed, reasonCode, err.Error())
-				if ti.engine != nil && dec.SourceFillID != "" {
-					ti.engine.UnmarkSeen(dec.SourceFillID)
+				if ti.engine != nil {
+					ti.engine.UnmarkDecisionSources(dec)
 				}
 				executionLogs = append(executionLogs, fmt.Sprintf("⏳ %s %s 下单前置条件暂不可用，保留源变化等待重放: %v", dec.Action, dec.Symbol, err))
 				ti.saveSignalLog(dec, "reconciling", err.Error())
@@ -1953,35 +2254,30 @@ func (ti *TraderIntegration) executeFullDecision(fullDec *decision.FullDecision)
 				}
 			} else if classifyExecutionFailure(err) == "INSUFFICIENT_MARGIN" &&
 				!isRetryableExecutionError(err) &&
-				dec.ExecutionIntentID > 0 &&
-				(strings.EqualFold(dec.CopyTradeAction, "add") ||
-					(dec.CopyTradeAction == "" && strings.Contains(strings.ToLower(dec.Reasoning), "add"))) {
+				ordinaryLeaderRiskIncreaseKind(dec) != "" {
 				// A venue business rejection for insufficient margin is a
-				// definitive zero-fill add. Consume this source revision as an
-				// explicit skip; otherwise the failed (revision, action)
-				// identity permanently blocks every later add for the same
-				// leader position. Ordinary copy adds are never silently
-				// downsized or retried.
-				reasonCode := "SKIPPED_ADD_INSUFFICIENT_MARGIN"
-				if commitErr := ti.store.CopyTrade().CommitSkippedLeaderTransition(
-					dec.ExecutionIntentID, ti.traderID, dec.LeaderPosID,
-					dec.SourceRevision, dec.LeaderPosSize, reasonCode,
-				); commitErr != nil {
-					ti.transitionExecutionIntent(dec, store.ExecutionIntentReconciling, "SKIPPED_ADD_COMMIT_FAILED", commitErr.Error())
-					executionLogs = append(executionLogs, fmt.Sprintf("⏳ %s %s 加仓余额不足且本地跳过提交失败，等待对账: %v", dec.Action, dec.Symbol, commitErr))
+				// definitive zero-fill source transition. Atomically consume it:
+				// an add advances the active mapping, while an initial open
+				// creates an ignored lifecycle. Leaving the open as FAILED makes
+				// every later poll rediscover the same unclaimable revision and
+				// permanently blocks a clean reopen of the same leader_pos_id.
+				reasonCode, commitErr := ti.commitInsufficientMarginLeaderTransition(dec)
+				if commitErr != nil {
+					ti.deferSourceTransitionRevalidation(dec, reasonCode, commitErr)
+					executionLogs = append(executionLogs, fmt.Sprintf("⏳ %s %s 余额不足且本地跳过提交失败，等待源快照重放: %v", dec.Action, dec.Symbol, commitErr))
 					ti.saveSignalLog(dec, "reconciling", commitErr.Error())
 				} else {
 					dec.ExecutionStatus, dec.ExecutionReasonCode = store.ExecutionIntentSkipped, reasonCode
 					action.Error = ""
-					executionLogs = append(executionLogs, fmt.Sprintf("⏭️ %s %s 加仓余额不足，未缩量、未重试并已推进源状态", dec.Action, dec.Symbol))
+					executionLogs = append(executionLogs, fmt.Sprintf("⏭️ %s %s 余额不足，未缩量、未重试并已终结本次源变化", dec.Action, dec.Symbol))
 					ti.saveSignalLog(dec, "skipped", err.Error())
 				}
 			} else {
 				// 瞬态错误（限流/读阶段失败，保证订单未进交易所）重试耗尽：
 				// 释放引擎侧 fill 去重标记，让下轮 poll 重放该信号
 				// （fill 仍在回看窗口内时可恢复；非瞬态错误不重放，避免死循环）。
-				if isRetryableExecutionError(err) && dec.SourceFillID != "" {
-					ti.engine.UnmarkSeen(dec.SourceFillID)
+				if isRetryableExecutionError(err) && ti.engine != nil {
+					ti.engine.UnmarkDecisionSources(dec)
 					logger.Warnf("🔁 [%s] 瞬态失败重试耗尽，已释放去重标记等待重放 | %s %s fillID=%s",
 						ti.traderID, dec.Action, dec.Symbol, dec.SourceFillID)
 				}
@@ -2290,7 +2586,87 @@ func (ti *TraderIntegration) commitAcknowledgedLeaderExecution(dec *decision.Dec
 	return ti.store.CopyTrade().CommitLeaderExecutionFill(commit)
 }
 
-func (ti *TraderIntegration) handleUnsupportedExecutionInstrument(dec *decision.Decision, cause error) {
+func (ti *TraderIntegration) commitUnsupportedExecutionTransition(dec *decision.Decision, reasonCode string) error {
+	if dec == nil || ti.store == nil || ti.engine == nil || ti.engine.config == nil || dec.ExecutionIntentID <= 0 {
+		return fmt.Errorf("missing unsupported execution transition context")
+	}
+	if strings.EqualFold(dec.CopyTradeAction, "add") ||
+		(dec.CopyTradeAction == "" && strings.Contains(strings.ToLower(dec.Reasoning), "add")) {
+		return ti.store.CopyTrade().CommitSkippedLeaderTransition(
+			dec.ExecutionIntentID, ti.traderID, dec.LeaderPosID, dec.SourceRevision,
+			dec.LeaderPosSize, reasonCode,
+		)
+	}
+	return ti.commitIgnoredOpenLeaderTransition(dec, reasonCode)
+}
+
+func (ti *TraderIntegration) commitIgnoredOpenLeaderTransition(dec *decision.Decision, reasonCode string) error {
+	if dec == nil || ti.store == nil || ti.engine == nil || ti.engine.config == nil || dec.ExecutionIntentID <= 0 {
+		return fmt.Errorf("missing ignored open transition context")
+	}
+	side := "long"
+	if dec.Action == "open_short" {
+		side = "short"
+	}
+	return ti.store.CopyTrade().CommitIgnoredLeaderTransition(store.IgnoredLeaderTransition{
+		IntentID: dec.ExecutionIntentID, TraderID: ti.traderID, LeaderID: ti.engine.config.LeaderID,
+		LeaderPosID: dec.LeaderPosID, SourceRevision: dec.SourceRevision, Symbol: dec.Symbol,
+		Side: side, MarginMode: dec.MarginMode, LeaderTargetSize: dec.LeaderPosSize, ReasonCode: reasonCode,
+	})
+}
+
+// ordinaryLeaderRiskIncreaseKind returns the no-fill source action whose
+// lifecycle must be acknowledged after a definitive venue business rejection.
+// AI reentry has its own retry/candidate state machine and is intentionally
+// excluded.
+func ordinaryLeaderRiskIncreaseKind(dec *decision.Decision) string {
+	if dec == nil || dec.ExecutionIntentID <= 0 ||
+		(dec.Action != "open_long" && dec.Action != "open_short") ||
+		strings.EqualFold(dec.CopyTradeAction, "ai_reentry") ||
+		(dec.CopyTradeAction == "" && strings.Contains(strings.ToLower(dec.Reasoning), "reentry")) {
+		return ""
+	}
+	if strings.EqualFold(dec.CopyTradeAction, "add") ||
+		(dec.CopyTradeAction == "" && strings.Contains(strings.ToLower(dec.Reasoning), "add")) {
+		return "add"
+	}
+	return "open"
+}
+
+func (ti *TraderIntegration) commitInsufficientMarginLeaderTransition(dec *decision.Decision) (string, error) {
+	switch ordinaryLeaderRiskIncreaseKind(dec) {
+	case "add":
+		const reasonCode = "SKIPPED_ADD_INSUFFICIENT_MARGIN"
+		return reasonCode, ti.store.CopyTrade().CommitSkippedLeaderTransition(
+			dec.ExecutionIntentID, ti.traderID, dec.LeaderPosID,
+			dec.SourceRevision, dec.LeaderPosSize, reasonCode,
+		)
+	case "open":
+		const reasonCode = "SKIPPED_OPEN_INSUFFICIENT_MARGIN"
+		return reasonCode, ti.commitIgnoredOpenLeaderTransition(dec, reasonCode)
+	default:
+		return "", fmt.Errorf("not an ordinary leader risk-increase transition")
+	}
+}
+
+func (ti *TraderIntegration) deferSourceTransitionRevalidation(dec *decision.Decision, originalReason string, cause error) {
+	if dec == nil {
+		return
+	}
+	message := strings.TrimSpace(originalReason)
+	if cause != nil {
+		if message != "" {
+			message += ": "
+		}
+		message += cause.Error()
+	}
+	ti.transitionExecutionIntent(dec, store.ExecutionIntentReconciling, "SOURCE_REVALIDATION_REQUIRED", message)
+	if ti.engine != nil {
+		ti.engine.UnmarkDecisionSources(dec)
+	}
+}
+
+func (ti *TraderIntegration) handleUnsupportedExecutionInstrument(dec *decision.Decision, cause error, status string) {
 	if dec == nil || ti.store == nil || ti.engine == nil || ti.engine.config == nil {
 		return
 	}
@@ -2302,34 +2678,22 @@ func (ti *TraderIntegration) handleUnsupportedExecutionInstrument(dec *decision.
 	if err := copyStore.MarkUnsupportedExecutionInstrument(ti.traderID, dec.LeaderPosID, dec.Symbol, venue, cause.Error()); err != nil {
 		logger.Warnf("⚠️ [%s] 保存不支持合约状态失败: %v", ti.traderID, err)
 	}
-	mapping, err := copyStore.GetMapping(ti.traderID, dec.LeaderPosID)
-	if err != nil {
-		logger.Warnf("⚠️ [%s] 查询不支持合约基线失败: %v", ti.traderID, err)
-	} else if mapping == nil || mapping.Status == store.MappingStatusClosed {
-		side := "long"
-		if dec.Action == "open_short" {
-			side = "short"
-		}
-		if err := copyStore.RebaselineIgnoredPosition(ti.traderID, ti.engine.config.LeaderID, dec.LeaderPosID, dec.Symbol, side, dec.MarginMode, dec.LeaderPosSize); err != nil {
-			logger.Warnf("⚠️ [%s] 保存不支持合约基线失败: %v", ti.traderID, err)
-		}
-	} else if mapping.Status == store.MappingStatusActive && dec.LeaderPosSize > mapping.LastKnownSize {
-		if err := copyStore.UpdateLastKnownSize(ti.traderID, dec.LeaderPosID, dec.LeaderPosSize); err != nil {
-			logger.Warnf("⚠️ [%s] 更新不支持合约加仓基线失败: %v", ti.traderID, err)
-		}
+	handling := "执行意图与源 revision 已原子记录为跳过；不会回退到其他结算币种"
+	if status == "reconciling" {
+		handling = "跳过状态未能原子提交；已保留源变化并进入对账，后续不会盲目下单"
 	}
 	traderName := ti.traderDisplayName()
 	dedup := fmt.Sprintf("unsupported_instrument|%s|%s|%d", ti.traderID, dec.Symbol, time.Now().Unix()/3600)
 	notifier.Notify(notifier.Alert{
 		Category: "copy_trade", TraderID: ti.traderID, TraderName: traderName,
 		Title:   fmt.Sprintf("%s | 执行交易所不支持 %s", traderName, dec.Symbol),
-		Body:    fmt.Sprintf("领航员: %s\n源合约: %s\n原因: %v\n处理: 本次开仓/加仓已跳过并重建基线，不会回退到 USDT 合约；已有映射的减仓/平仓仍保留。", ti.engine.config.LeaderID, dec.Symbol, cause),
+		Body:    fmt.Sprintf("领航员: %s\n源合约: %s\n原因: %v\n处理: %s；已有映射的减仓/平仓仍保留。", ti.engine.config.LeaderID, dec.Symbol, cause, handling),
 		RateKey: dedup, DedupKey: dedup,
 	})
 	ti.recordCopyEvent(&store.CopyTradeEvent{
 		Category: store.CopyEventCategoryError, EventType: "EXECUTION_INSTRUMENT_UNSUPPORTED",
 		Severity: store.CopyEventSeverityWarn, Symbol: dec.Symbol, LeaderPosID: dec.LeaderPosID,
-		Status: "skipped", Summary: "执行交易所无精确 base+quote/settle 合约，风险增加已跳过",
+		Status: status, Summary: "执行交易所无精确 base+quote/settle 合约，风险增加未提交",
 		Detail: map[string]interface{}{"reason": cause.Error(), "action": dec.Action}, DedupKey: dedup,
 	})
 }
@@ -2680,8 +3044,8 @@ func (ti *TraderIntegration) handleRiskReductionRetry(dec *decision.Decision, er
 	if dec == nil || err == nil {
 		return
 	}
-	if dec.SourceFillID != "" && ti.engine != nil {
-		ti.engine.UnmarkSeen(dec.SourceFillID)
+	if ti.engine != nil {
+		ti.engine.UnmarkDecisionSources(dec)
 	}
 	traderName := ti.traderDisplayName()
 	logger.Errorf("❌ [%s/%s] 风险降低未确认完成，保留映射等待重试 | %s %s | error=%v",
@@ -2718,8 +3082,8 @@ func (ti *TraderIntegration) handleBenignCloseFailure(dec *decision.Decision, er
 		if cerr := ti.store.CopyTrade().CloseMapping(ti.traderID, dec.LeaderPosID, dec.EntryPrice); cerr != nil {
 			// 此时 mapping 仍保持 active；释放 seen key 后，下一轮
 			// detectBinancePositionSnapshotFills/matchCloseReduceSignal 会重试本路径。
-			if dec.SourceFillID != "" && ti.engine != nil {
-				ti.engine.UnmarkSeen(dec.SourceFillID)
+			if ti.engine != nil {
+				ti.engine.UnmarkDecisionSources(dec)
 			}
 			logger.Warnf("⚠️ [%s] 关闭映射失败（已记 silent_close）: %v", ti.traderID, cerr)
 		} else {
@@ -3706,21 +4070,50 @@ func (ti *TraderIntegration) updatePositionMapping(dec *decision.Decision, commi
 			logger.Warnf("⚠️ [%s] posId 方向变更检测 | posId=%s 旧 side=%s 新 side=%s → 关闭旧映射并重建",
 				ti.traderID, dec.LeaderPosID, existingMapping.Side, expectedSide)
 			if SupportsCopyGuard(ti.engine.config.ProviderType) && ti.engine.config.RiskPolicyVersion >= 4 {
-				if oldCycle, cycleErr := copyTradeStore.GetOpenCopyGuardCycle(ti.traderID, dec.LeaderPosID); cycleErr == nil {
+				oldCycle, cycleErr := copyTradeStore.GetOpenCopyGuardCycle(ti.traderID, dec.LeaderPosID)
+				if cycleErr == nil {
 					if mgr, ok := ti.executor.(ProtectiveStopManagerV4); ok {
 						if order, orderErr := copyTradeStore.GetCopyGuardProtectiveOrder(oldCycle.ID); orderErr == nil {
 							if cancelErr := ti.cancelProtectiveOrderForCycle(mgr, oldCycle, order); cancelErr != nil {
 								ti.markProtectionIssue(oldCycle, store.CopyGuardProtectionUnknown, "PROTECTION_VERIFY_UNKNOWN", cancelErr, oldCycle.ProtectionCoverage, false)
+								ti.transitionExecutionIntent(dec, store.ExecutionIntentReconciling, "PROTECTION_CANCEL_UNCONFIRMED", cancelErr.Error())
+								return
 							}
+						} else if !errors.Is(orderErr, sql.ErrNoRows) {
+							ti.transitionExecutionIntent(dec, store.ExecutionIntentReconciling, "PROTECTION_QUERY_UNCONFIRMED", orderErr.Error())
+							return
+						}
+					} else {
+						_, orderErr := copyTradeStore.GetCopyGuardProtectiveOrder(oldCycle.ID)
+						if orderErr == nil {
+							err := fmt.Errorf("executor cannot cancel protective order before leader reversal")
+							ti.transitionExecutionIntent(dec, store.ExecutionIntentReconciling, "PROTECTION_CANCEL_UNCONFIRMED", err.Error())
+							return
+						}
+						if !errors.Is(orderErr, sql.ErrNoRows) {
+							ti.transitionExecutionIntent(dec, store.ExecutionIntentReconciling, "PROTECTION_QUERY_UNCONFIRMED", orderErr.Error())
+							return
 						}
 					}
 					emitWatchSummary(copyTradeStore, ti.traderID, oldCycle, dec.EntryPrice)
-					_ = copyTradeStore.CloseCopyGuardCycle(oldCycle.ID, store.CopyGuardLeaderReversed, oldCycle.ActualPnL, oldCycle.BaselinePnL, oldCycle.Fees, oldCycle.FundingFee, oldCycle.LiquidationPenalty, oldCycle.Slippage)
+					if sourceErr := copyTradeStore.SetCopyGuardBaselineSource(oldCycle.ID, "leader_fill"); sourceErr != nil {
+						ti.transitionExecutionIntent(dec, store.ExecutionIntentReconciling, "BASELINE_SOURCE_PERSIST_FAILED", sourceErr.Error())
+						return
+					}
+					if closeErr := copyTradeStore.CloseCopyGuardCycle(oldCycle.ID, store.CopyGuardLeaderReversed, oldCycle.ActualPnL, oldCycle.BaselinePnL, oldCycle.Fees, oldCycle.FundingFee, oldCycle.LiquidationPenalty, oldCycle.Slippage); closeErr != nil {
+						ti.transitionExecutionIntent(dec, store.ExecutionIntentReconciling, "COPY_GUARD_CYCLE_CLOSE_FAILED", closeErr.Error())
+						return
+					}
 					_ = copyTradeStore.SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: oldCycle.ID, TraderID: ti.traderID, Type: "LEADER_REVERSED", Price: dec.EntryPrice, Metadata: map[string]interface{}{"old_side": oldCycle.Side, "new_side": expectedSide}})
+				} else if !errors.Is(cycleErr, sql.ErrNoRows) {
+					ti.transitionExecutionIntent(dec, store.ExecutionIntentReconciling, "COPY_GUARD_CYCLE_QUERY_FAILED", cycleErr.Error())
+					return
 				}
 			}
 			if err := copyTradeStore.CloseMapping(ti.traderID, dec.LeaderPosID, dec.EntryPrice); err != nil {
-				logger.Warnf("⚠️ [%s] 关闭旧方向映射失败: %v（继续写入新映射）", ti.traderID, err)
+				logger.Warnf("⚠️ [%s] 关闭旧方向映射失败: %v", ti.traderID, err)
+				ti.transitionExecutionIntent(dec, store.ExecutionIntentReconciling, "MAPPING_REVERSAL_CLOSE_FAILED", err.Error())
+				return
 			}
 			existingMapping = nil // 走下方"新开仓"分支重建
 		}
@@ -3733,6 +4126,7 @@ func (ti *TraderIntegration) updatePositionMapping(dec *decision.Decision, commi
 					cycle, ensureErr := copyTradeStore.EnsureCopyGuardCycle(&store.CopyGuardCycle{TraderID: ti.traderID, LeaderID: ti.engine.config.LeaderID, LeaderPosID: dec.LeaderPosID, Symbol: dec.Symbol, Side: expectedSide, MarginMode: dec.MarginMode, Status: store.CopyGuardFollowing, PolicySnapshot: string(policyJSON), LeaderEntryPrice: dec.EntryPrice, FollowerEntryPrice: dec.EntryPrice, FollowerNotional: dec.PositionSizeUSD, BaselineLeaderSize: dec.LeaderPosSize, AccountEquity: ti.getEquityFunc()(), ATRAtEntry: ti.copyGuardEntryATR(dec.Symbol, dec.EntryPrice), LastObservedPrice: dec.EntryPrice})
 					if ensureErr != nil {
 						logger.Warnf("⚠️ [%s] 创建 Copy Guard 生命周期失败: %v", ti.traderID, ensureErr)
+						ti.transitionExecutionIntent(dec, store.ExecutionIntentReconciling, "COPY_GUARD_CYCLE_PERSIST_FAILED", ensureErr.Error())
 					} else {
 						_ = copyTradeStore.SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "INITIAL_ENTRY_FILLED", Price: dec.EntryPrice, Notional: dec.PositionSizeUSD})
 						_ = copyTradeStore.OpenCopyGuardAttempt(cycle.ID, 0, dec.EntryPrice, dec.PositionSizeUSD, dec.FilledQuantity, 0)
@@ -3834,14 +4228,32 @@ func (ti *TraderIntegration) finalizeCopyGuardCycle(dec *decision.Decision) {
 	if err != nil {
 		return
 	}
-	if mgr, ok := ti.executor.(ProtectiveStopManagerV4); ok {
-		if order, e := ti.store.CopyTrade().GetCopyGuardProtectiveOrder(cycle.ID); e == nil {
-			if cancelErr := ti.cancelProtectiveOrderForCycle(mgr, cycle, order); cancelErr == nil {
-				_ = ti.store.CopyTrade().UpdateCopyGuardProtectionHealth(cycle.ID, store.CopyGuardProtectionCanceled, 0, "", cycle.FollowerPosID, cycle.EntryOrderID, false)
-			} else {
-				ti.markProtectionIssue(cycle, store.CopyGuardProtectionUnknown, "PROTECTION_VERIFY_UNKNOWN", cancelErr, cycle.ProtectionCoverage, false)
-			}
+	order, orderErr := ti.store.CopyTrade().GetCopyGuardProtectiveOrder(cycle.ID)
+	switch {
+	case orderErr == nil:
+		mgr, ok := ti.executor.(ProtectiveStopManagerV4)
+		if !ok {
+			cancelErr := fmt.Errorf("executor cannot cancel and confirm protective order %s", order.AlgoID)
+			ti.markProtectionIssue(cycle, store.CopyGuardProtectionUnknown, "PROTECTION_CANCEL_UNCONFIRMED", cancelErr, cycle.ProtectionCoverage, false)
+			ti.transitionExecutionIntent(dec, store.ExecutionIntentReconciling, "PROTECTION_CANCEL_UNCONFIRMED", cancelErr.Error())
+			return
 		}
+		if cancelErr := ti.cancelProtectiveOrderForCycle(mgr, cycle, order); cancelErr != nil {
+			ti.markProtectionIssue(cycle, store.CopyGuardProtectionUnknown, "PROTECTION_CANCEL_UNCONFIRMED", cancelErr, cycle.ProtectionCoverage, false)
+			ti.transitionExecutionIntent(dec, store.ExecutionIntentReconciling, "PROTECTION_CANCEL_UNCONFIRMED", cancelErr.Error())
+			return
+		}
+		if healthErr := ti.store.CopyTrade().UpdateCopyGuardProtectionHealth(cycle.ID, store.CopyGuardProtectionCanceled, 0, "", cycle.FollowerPosID, cycle.EntryOrderID, false); healthErr != nil {
+			ti.transitionExecutionIntent(dec, store.ExecutionIntentReconciling, "PROTECTION_CANCEL_PERSIST_FAILED", healthErr.Error())
+			return
+		}
+	case errors.Is(orderErr, sql.ErrNoRows):
+		// No exchange protection was ever persisted for this lifecycle.
+	default:
+		queryErr := fmt.Errorf("query protective order before cycle finalization: %w", orderErr)
+		ti.markProtectionIssue(cycle, store.CopyGuardProtectionUnknown, "PROTECTION_QUERY_UNCONFIRMED", queryErr, cycle.ProtectionCoverage, false)
+		ti.transitionExecutionIntent(dec, store.ExecutionIntentReconciling, "PROTECTION_QUERY_UNCONFIRMED", queryErr.Error())
+		return
 	}
 	// A source snapshot may report a close transition before its close price is
 	// populated. Never feed zero into the short-return formula: that creates a
@@ -3879,6 +4291,7 @@ func (ti *TraderIntegration) finalizeCopyGuardCycle(dec *decision.Decision) {
 	emitWatchSummary(ti.store.CopyTrade(), ti.traderID, cycle, closePrice)
 	if err := ti.store.CopyTrade().BeginCopyGuardAccounting(cycle.ID, store.CopyGuardLeaderClosed, dec.ExchangeOrderID, baseline); err != nil {
 		logger.Errorf("❌ [%s] failed to begin Copy Guard accounting cycle=%d: %v", ti.traderID, cycle.ID, err)
+		ti.transitionExecutionIntent(dec, store.ExecutionIntentReconciling, "ACCOUNTING_COMMIT_PENDING", err.Error())
 		return
 	}
 	_ = ti.store.CopyTrade().SetCopyGuardBaselineSource(cycle.ID, baselineSource)
@@ -4148,7 +4561,7 @@ func getIntOrFloatField(m map[string]interface{}, key string) int {
 // 设计原则：
 //  1. SupportsCopyGuard 数据源生效（OKX/Binance；HL 不支持账户保护 SL）
 //  2. 任何 SL 操作失败都不阻断主交易流程，但必须进入可保护性状态机
-//     （clamp → GUARD_UNPROTECTABLE → close/follow），禁止静默裸跑
+//     （clamp → GUARD_UNPROTECTABLE → warn/close），禁止静默裸跑
 // ============================================================================
 
 // shouldManageStopLoss 判断当前决策是否走 Copy Guard 保护单管理路径
@@ -4359,8 +4772,8 @@ func (ti *TraderIntegration) refreshStopLossAfterExecute(dec *decision.Decision)
 			},
 		})
 	}
-	// v5 可保护性状态机：算不出可挂的止损价（clamp 后仍不可行 / 开仓即触发）
-	// → 不再无限重试，直接进入 GUARD_UNPROTECTABLE 强制离场处置。
+	// 可保护性状态机：算不出可挂的止损价（clamp 后仍不可行 / 开仓即触发）
+	// → 不再无限重试，按普通跟单 warn/close 配置处置；AI 重入强制离场。
 	if slResult.SLPrice <= 0 {
 		cause := fmt.Errorf("no valid protective trigger price")
 		if slResult.Unprotectable {
@@ -4486,7 +4899,7 @@ func (ti *TraderIntegration) enforceAIGuardedPositionProtection(dec *decision.De
 	if (cycle.ProtectionStatus == store.CopyGuardProtectionVerified || cycle.ProtectionStatus == store.CopyGuardProtectionClamped) && cycle.ProtectionCoverage >= 0.999 {
 		return
 	}
-	ti.handleUnprotectableCycle(cycle, fmt.Errorf("new AI-guarded position is not fully protected (status=%s coverage=%.4f)", cycle.ProtectionStatus, cycle.ProtectionCoverage))
+	ti.handleUnprotectableCycle(cycle, fmt.Errorf("new AI-guarded position is not fully protected (status=%s coverage=%.4f)", cycle.ProtectionStatus, cycle.ProtectionCoverage), true)
 }
 
 func isAIReentryDecision(dec *decision.Decision) bool {
@@ -4729,6 +5142,7 @@ func (ti *TraderIntegration) upsertV4Protection(dec *decision.Decision, side str
 		logger.Warnf("⚠️ [%s] Copy Guard 保护单已 clamp 到强平安全线 | cycle=%d %s %s SL=%.4f 距离=%.4f", ti.traderID, cycle.ID, dec.Symbol, side, result.SLPrice, result.SLDistance)
 	}
 	_ = ti.store.CopyTrade().UpdateCopyGuardProtectionHealth(cycle.ID, healthStatus, coverage, healthMsg, followerPosID, "", false)
+	_ = ti.store.CopyTrade().UpdateCopyGuardAttemptProtection(cycle.ID, cycle.ReentryCount, result.SLPrice, verified.AlgoID, healthStatus, coverage)
 	slDistancePct := float64(0)
 	if entryPrice > 0 {
 		slDistancePct = result.SLDistance / entryPrice
@@ -5139,6 +5553,11 @@ func (ti *TraderIntegration) markProtectionIssueForDecision(dec *decision.Decisi
 	cycle, err := ti.store.CopyTrade().GetOpenCopyGuardCycle(ti.traderID, dec.LeaderPosID)
 	if err != nil {
 		logger.Errorf("❌ [%s] Copy Guard protection issue without lifecycle | %s: %v", ti.traderID, dec.Symbol, cause)
+		message := "protection lifecycle is unavailable"
+		if cause != nil {
+			message = cause.Error()
+		}
+		ti.transitionExecutionIntent(dec, store.ExecutionIntentReconciling, "COPY_GUARD_CYCLE_MISSING", message)
 		return
 	}
 	ti.markProtectionIssue(cycle, status, eventType, cause, coverage, dec.Reasoning != "Copy Guard protection retry")
@@ -5152,6 +5571,8 @@ func (ti *TraderIntegration) markProtectionIssue(cycle *store.CopyGuardCycle, st
 	}
 	_ = ti.store.CopyTrade().UpdateCopyGuardProtectionHealth(cycle.ID, status, coverage, message, cycle.FollowerPosID, cycle.EntryOrderID, incrementRetry)
 	metadata := map[string]interface{}{"error": message, "coverage": coverage, "retry": cycle.ProtectionRetries + 1, "leader_pos_id": cycle.LeaderPosID, "follower_pos_id": cycle.FollowerPosID, "symbol": cycle.Symbol, "side": cycle.Side, "margin_mode": cycle.MarginMode}
+	protectionAlgoID := ""
+	protectionTrigger := float64(0)
 	if cycle.ProtectionMissingAt != nil {
 		metadata["first_failure_at"] = cycle.ProtectionMissingAt.UTC().Format(time.RFC3339)
 		metadata["failure_duration_seconds"] = time.Since(*cycle.ProtectionMissingAt).Seconds()
@@ -5160,11 +5581,14 @@ func (ti *TraderIntegration) markProtectionIssue(cycle *store.CopyGuardCycle, st
 		metadata["failure_duration_seconds"] = 0
 	}
 	if order, err := ti.store.CopyTrade().GetCopyGuardProtectiveOrder(cycle.ID); err == nil {
+		protectionAlgoID = order.AlgoID
+		protectionTrigger = order.TriggerPrice
 		metadata["algo_id"] = order.AlgoID
 		metadata["algo_client_id"] = order.AlgoClientID
 		metadata["protected_quantity"] = order.Quantity
 		metadata["trigger_price"] = order.TriggerPrice
 	}
+	_ = ti.store.CopyTrade().UpdateCopyGuardAttemptProtection(cycle.ID, cycle.ReentryCount, protectionTrigger, protectionAlgoID, status, coverage)
 	// 事件限频：poll 每 3 秒跑一轮，同一错误持续期间会把事件表刷爆
 	// （实盘 cycle 27 积累了 3000+ 条重复 PROTECTION_COVERAGE_LOW）。
 	// 健康状态照常每轮更新，只有"同 cycle + 同事件类型 + 同错误"的重复

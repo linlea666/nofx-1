@@ -64,6 +64,100 @@ func TestExecFailureDedupKeyChangesWhenLeaderOperationChanges(t *testing.T) {
 	}
 }
 
+func TestInsufficientMarginInitialOpenTerminatesAsIgnoredLifecycle(t *testing.T) {
+	st, err := store.New(filepath.Join(t.TempDir(), "nofx-open-margin-skip.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	engine := &Engine{config: &CopyConfig{ProviderType: ProviderBinance, LeaderID: "leader"}}
+	ti := &TraderIntegration{traderID: "trader-1", engine: engine, store: st}
+	intent, claimed, err := st.CopyTrade().ReserveExecutionIntent(&store.CopyTradeExecutionIntent{
+		TraderID: "trader-1", LeaderPosID: "leader-pos", SourceRevision: 1,
+		CanonicalKey: "leader|trader-1|leader-pos|1", SourceFillID: "fill-1",
+		Action: "open_long", Symbol: "ETHUSDT", Side: "long",
+		MarginMode: "cross", LeaderTargetSize: 4,
+	})
+	if err != nil || !claimed {
+		t.Fatalf("reserve intent claimed=%v err=%v", claimed, err)
+	}
+	if err = st.CopyTrade().UpdateExecutionIntent(intent.ID, store.ExecutionIntentSubmitted, "", "", "", 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	dec := &decision.Decision{
+		Action: "open_long", Symbol: "ETHUSDT", IsCopyTrade: true, CopyTradeAction: "open",
+		LeaderPosID: "leader-pos", LeaderPosSize: 4, MarginMode: "cross",
+		ExecutionIntentID: intent.ID, SourceRevision: 1,
+	}
+	reasonCode, err := ti.commitInsufficientMarginLeaderTransition(dec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reasonCode != "SKIPPED_OPEN_INSUFFICIENT_MARGIN" {
+		t.Fatalf("reason=%q", reasonCode)
+	}
+	mapping, err := st.CopyTrade().GetMapping("trader-1", "leader-pos")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mapping.Status != store.MappingStatusIgnored || mapping.SourceRevision != 1 || mapping.LastKnownSize != 4 {
+		t.Fatalf("unexpected ignored mapping: %+v", mapping)
+	}
+	var status, storedReason string
+	if err = st.DB().QueryRow(`SELECT status,reason_code FROM copy_trade_execution_intents WHERE id=?`, intent.ID).Scan(&status, &storedReason); err != nil {
+		t.Fatal(err)
+	}
+	if status != store.ExecutionIntentSkipped || storedReason != reasonCode {
+		t.Fatalf("unexpected intent terminal state: status=%s reason=%s", status, storedReason)
+	}
+}
+
+func TestInsufficientMarginAddAdvancesSourceWithoutCreatingFill(t *testing.T) {
+	st, err := store.New(filepath.Join(t.TempDir(), "nofx-add-margin-skip.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err = st.CopyTrade().SavePositionMapping(&store.CopyTradePositionMapping{
+		TraderID: "trader-1", LeaderPosID: "leader-pos", LeaderID: "leader",
+		Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", OpenedAt: time.Now(),
+		LastKnownSize: 4,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	engine := &Engine{config: &CopyConfig{ProviderType: ProviderBinance, LeaderID: "leader"}}
+	ti := &TraderIntegration{traderID: "trader-1", engine: engine, store: st}
+	intent, claimed, err := st.CopyTrade().ReserveExecutionIntent(&store.CopyTradeExecutionIntent{
+		TraderID: "trader-1", LeaderPosID: "leader-pos", SourceRevision: 2,
+		CanonicalKey: "leader|trader-1|leader-pos|2", SourceFillID: "fill-2",
+		Action: "open_long", Symbol: "ETHUSDT", Side: "long",
+		MarginMode: "cross", LeaderTargetSize: 5,
+	})
+	if err != nil || !claimed {
+		t.Fatalf("reserve intent claimed=%v err=%v", claimed, err)
+	}
+	dec := &decision.Decision{
+		Action: "open_long", Symbol: "ETHUSDT", IsCopyTrade: true, CopyTradeAction: "add",
+		LeaderPosID: "leader-pos", LeaderPosSize: 5, MarginMode: "cross",
+		ExecutionIntentID: intent.ID, SourceRevision: 2,
+	}
+	reasonCode, err := ti.commitInsufficientMarginLeaderTransition(dec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reasonCode != "SKIPPED_ADD_INSUFFICIENT_MARGIN" {
+		t.Fatalf("reason=%q", reasonCode)
+	}
+	mapping, err := st.CopyTrade().GetMapping("trader-1", "leader-pos")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mapping.Status != store.MappingStatusActive || mapping.SourceRevision != 2 || mapping.LastKnownSize != 5 || mapping.AddCount != 0 {
+		t.Fatalf("unexpected active mapping after skipped add: %+v", mapping)
+	}
+}
+
 // TestIsBenignCloseErrorRecognizesAllTraderFormats 覆盖各家 trader 的
 // "本地无对应仓位"错误格式（关键字必须能识别）。
 // 来源参考：

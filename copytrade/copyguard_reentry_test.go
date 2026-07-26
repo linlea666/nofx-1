@@ -71,6 +71,22 @@ func newReentryTestEngine(t *testing.T) (*Engine, *store.Store) {
 		},
 		stopRiskSuspectCount: make(map[string]int),
 	}
+	if _, err := st.DB().Exec(`INSERT INTO traders(id,name,ai_model_id,exchange_id,initial_balance)
+		VALUES(?,?,?,?,?)`, e.traderID, "reentry-test", "", "exchange-1", 100); err != nil {
+		t.Fatal(err)
+	}
+	persisted := store.NewCopyGuardDefaults()
+	persisted.TraderID = e.traderID
+	persisted.ProviderType = string(e.config.ProviderType)
+	persisted.LeaderID = e.config.LeaderID
+	persisted.Enabled = true
+	persisted.RiskPolicyVersion = e.config.RiskPolicyVersion
+	persisted.RiskStopLossEnabled = true
+	persisted.RiskReentryEnabled = true
+	persisted.RiskReentryDecisionMode = "legacy_rule"
+	if err := st.CopyTrade().Upsert(persisted); err != nil {
+		t.Fatal(err)
+	}
 	return e, st
 }
 

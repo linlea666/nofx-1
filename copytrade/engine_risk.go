@@ -1,6 +1,8 @@
 package copytrade
 
 import (
+	"database/sql"
+	"errors"
 	"fmt"
 	"math"
 	"time"
@@ -70,7 +72,7 @@ type StopLossCalcResult struct {
 	// 到强平安全线上的极紧止损（触发概率高，但保护真实存在）
 	Clamped bool
 	// Unprotectable: clamp 后距离仍 < 0.1%（连极紧止损都挂不出），调用方
-	// 必须走 GUARD_UNPROTECTABLE 处置（close/follow），禁止静默裸跑
+	// 必须走 GUARD_UNPROTECTABLE 处置（warn/close），禁止静默裸跑
 	Unprotectable bool
 }
 
@@ -555,9 +557,13 @@ func (e *Engine) checkReentryConditions() {
 	// gate reentry from the persisted policy so disabling account protection is
 	// effective without waiting for a process restart.
 	persisted, persistedErr := e.store.CopyTrade().GetByTraderID(e.traderID)
-	if persistedErr == nil && persisted.RiskPolicyVersion >= 4 &&
-		(!persisted.RiskStopLossEnabled || !persisted.RiskReentryEnabled ||
-			persisted.RiskReentryDecisionMode == "disabled") {
+	if persistedErr != nil {
+		logger.Errorf("❌ [%s] AI 二次入场配置读取失败，本轮安全暂停: %v", e.traderID, persistedErr)
+		return
+	}
+	if persisted.RiskPolicyVersion < 4 ||
+		!persisted.RiskStopLossEnabled || !persisted.RiskReentryEnabled ||
+		persisted.RiskReentryDecisionMode == "disabled" {
 		return
 	}
 	if !SupportsCopyGuard(e.config.ProviderType) {
@@ -593,6 +599,19 @@ func (e *Engine) checkReentryConditions() {
 		terminalWatchStatus := ""
 		v4Cycle, err := e.store.CopyTrade().GetOpenCopyGuardCycle(e.traderID, mapping.LeaderPosID)
 		if err != nil {
+			// A previous reversal pass may have closed the cycle but crashed or
+			// failed before the stopped mapping was advanced. The opposite-side
+			// live source position is durable evidence that the old lifecycle
+			// ended; finish only the local mapping transition, never re-close or
+			// resubmit a follower order.
+			if errors.Is(err, sql.ErrNoRows) {
+				if leaderPos := leaderPosMap[mapping.LeaderPosID]; leaderPos != nil &&
+					leaderPos.Side != "" && string(leaderPos.Side) != mapping.Side {
+					if closeErr := e.store.CopyTrade().MarkStoppedByRiskAsClosed(e.traderID, mapping.LeaderPosID); closeErr != nil {
+						logger.Warnf("⚠️ [%s] 观察期反手周期已闭合但 mapping 收尾失败: %v | posId=%s", e.traderID, closeErr, mapping.LeaderPosID)
+					}
+				}
+			}
 			logger.Debugf("[%s] Copy Guard 生命周期不存在: %v", e.traderID, err)
 			continue
 		}
@@ -650,7 +669,14 @@ func (e *Engine) checkReentryConditions() {
 		if leaderPos.Side != "" && string(leaderPos.Side) != mapping.Side {
 			// 观察期以反手价（当前标记价）作为"领航员离场价"汇总观察期数据
 			emitWatchSummary(e.store.CopyTrade(), e.traderID, v4Cycle, leaderPos.MarkPrice)
-			_ = e.store.CopyTrade().CloseCopyGuardCycle(v4Cycle.ID, store.CopyGuardLeaderReversed, v4Cycle.ActualPnL, v4Cycle.BaselinePnL, v4Cycle.Fees, v4Cycle.FundingFee, v4Cycle.LiquidationPenalty, v4Cycle.Slippage)
+			if err := e.store.CopyTrade().SetCopyGuardBaselineSource(v4Cycle.ID, "last_observed"); err != nil {
+				logger.Warnf("⚠️ [%s] 观察期反手基线来源保存失败: %v | cycle=%d posId=%s", e.traderID, err, v4Cycle.ID, mapping.LeaderPosID)
+				continue
+			}
+			if err := e.store.CopyTrade().CloseCopyGuardCycle(v4Cycle.ID, store.CopyGuardLeaderReversed, v4Cycle.ActualPnL, v4Cycle.BaselinePnL, v4Cycle.Fees, v4Cycle.FundingFee, v4Cycle.LiquidationPenalty, v4Cycle.Slippage); err != nil {
+				logger.Warnf("⚠️ [%s] 观察期反手周期关闭失败: %v | cycle=%d posId=%s", e.traderID, err, v4Cycle.ID, mapping.LeaderPosID)
+				continue
+			}
 			_ = e.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: v4Cycle.ID, TraderID: e.traderID, Type: "LEADER_REVERSED", Price: leaderPos.MarkPrice, Metadata: map[string]interface{}{"old_side": mapping.Side, "new_side": string(leaderPos.Side), "phase": "watch"}})
 			if err := e.store.CopyTrade().MarkStoppedByRiskAsClosed(e.traderID, mapping.LeaderPosID); err != nil {
 				logger.Warnf("⚠️ [%s] 观察期反手后关闭 mapping 失败: %v | posId=%s", e.traderID, err, mapping.LeaderPosID)

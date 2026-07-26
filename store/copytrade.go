@@ -114,18 +114,23 @@ type CopyTradeConfig struct {
 	// RiskReentryMinRecoveryATR: 重入最小恢复幅度（v4，单位 ATR 倍数）。
 	// 止损后价格必须从止损成交价向有利方向恢复至少该幅度才允许重入，
 	// 防止"刚止损又原地接回"。默认 0.5。
-	RiskReentryMinRecoveryATR float64 `json:"risk_reentry_min_recovery_atr"`
+	RiskReentryMinRecoveryATR         float64 `json:"risk_reentry_min_recovery_atr"`
+	RiskReentryMinRecoveryATRExplicit bool    `json:"-"`
 	// RiskReentryCooldownEscalation: 第 N 次重入冷却时间倍率（v4）。
 	// 实际冷却 = cooldown_seconds × escalation^已重入次数。默认 3。
 	RiskReentryCooldownEscalation float64 `json:"risk_reentry_cooldown_escalation"`
 	// RiskReentryRecoveryEscalation: 第 N 次重入最小恢复幅度倍率（v4）。
 	// 实际要求 = min_recovery_atr × escalation^已重入次数。默认 1.5。
 	RiskReentryRecoveryEscalation float64 `json:"risk_reentry_recovery_escalation"`
-	// RiskUnprotectableAction: 保护单不可建立（clamp 到强平缓冲价也不可行）
-	// 时的处置模式（v5）。
-	//   "close"（默认）：保护优先——立即平掉跟单仓位，周期进入观察期
-	//   "follow"：跟单优先——继续裸跑，UI 标红 + 升级告警（用户显式选择）
-	RiskUnprotectableAction string `json:"risk_unprotectable_action"`
+	// RiskUnprotectableDisposition is the canonical v8 policy:
+	//   "warn" (default): keep the ordinary copy position, alert and retry
+	//   "close": immediately market-exit the ordinary copy position.
+	// RiskUnprotectableAction is retained for old clients. "follow" maps to
+	// "warn" and "close" maps to "close" only when an old client explicitly
+	// writes the field; old stored forced-close defaults do not override the
+	// new safe migration default.
+	RiskUnprotectableDisposition string `json:"risk_unprotectable_disposition,omitempty"`
+	RiskUnprotectableAction      string `json:"risk_unprotectable_action"`
 	// RiskReentryNoiseOverride: 止损距离/ATR < 0.3（极易扫损档）时默认禁用
 	// 自动重入；置 true 可强制放行（按谨慎档执行）。
 	RiskReentryNoiseOverride bool `json:"risk_reentry_noise_override"`
@@ -224,7 +229,7 @@ func (c *CopyTradeConfig) FillRiskDefaults() {
 		if c.RiskAddonBudgetPct == 0 {
 			c.RiskAddonBudgetPct = 0.15
 		}
-		if c.RiskReentryMinRecoveryATR == 0 {
+		if c.RiskReentryMinRecoveryATR == 0 && !c.RiskReentryMinRecoveryATRExplicit {
 			c.RiskReentryMinRecoveryATR = 0.5
 		}
 		if c.RiskReentryCooldownEscalation == 0 {
@@ -233,8 +238,11 @@ func (c *CopyTradeConfig) FillRiskDefaults() {
 		if c.RiskReentryRecoveryEscalation == 0 {
 			c.RiskReentryRecoveryEscalation = 1.5
 		}
+		if c.RiskUnprotectableDisposition == "" {
+			c.RiskUnprotectableDisposition = "warn"
+		}
 		if c.RiskUnprotectableAction == "" {
-			c.RiskUnprotectableAction = "close"
+			c.RiskUnprotectableAction = "follow"
 		}
 	}
 }
@@ -245,41 +253,42 @@ func NewCopyGuardDefaults() *CopyTradeConfig {
 	c := &CopyTradeConfig{
 		// 纯运营小额预警默认 12 USDT；交易可执行性始终来自实时交易所
 		// minQty/minNotional/step，不读取本字段。
-		MinTradeWarn:               12,
-		RiskStopLossEnabled:        true,
-		RiskAccountPct:             0.02,
-		RiskATRMultiplier:          2.0,
-		RiskATRTimeframe:           "1h",
-		RiskReentryEnabled:         true,
-		RiskReentryRatio:           0.50,
-		RiskReentryDecisionMode:    "ai_guarded",
-		RiskPolicyVersion:          4,
-		RiskStopMode:               "volatility_priority",
-		RiskATRPeriod:              14,
-		RiskATRCacheMaxAgeMinutes:  120,
-		RiskATRFallbackPct:         0.02,
-		RiskTriggerPriceType:       "mark",
-		RiskSlippageBufferBPS:      10,
-		RiskLiquidationBufferATR:   0.5,
-		RiskMaxReentries:           2,
-		RiskReentryBandATR:         0.5,
-		RiskReentryCooldownSeconds: 300,
-		RiskReentryMaxChaseATR:     0.5,
-		RiskReentryMaxATRExpansion: 2,
-		RiskWatchTimeoutMinutes:    4320,
-		RiskMigrationConfirmed:     true,
-		RiskAddonBudgetPct:         0.15,
-		RiskReentryMinRecoveryATR:  0.5,
-		RiskUnprotectableAction:    "close",
-		RiskCycleLossBudgetPct:     0.05,
-		RiskPortfolioLossBudgetPct: 0.08,
-		RiskRoundTripFeeBPS:        12,
-		RiskAIConfidenceThreshold:  0.80,
-		RiskAIMinReviewSeconds:     300,
-		RiskAIDailyCallLimit:       12,
-		RiskAILifecycleCallLimit:   30,
-		RiskNotificationLevel:      "important",
-		RiskManualReentryEnabled:   false,
+		MinTradeWarn:                 12,
+		RiskStopLossEnabled:          true,
+		RiskAccountPct:               0.02,
+		RiskATRMultiplier:            2.0,
+		RiskATRTimeframe:             "1h",
+		RiskReentryEnabled:           true,
+		RiskReentryRatio:             0.50,
+		RiskReentryDecisionMode:      "ai_guarded",
+		RiskPolicyVersion:            4,
+		RiskStopMode:                 "volatility_priority",
+		RiskATRPeriod:                14,
+		RiskATRCacheMaxAgeMinutes:    120,
+		RiskATRFallbackPct:           0.02,
+		RiskTriggerPriceType:         "mark",
+		RiskSlippageBufferBPS:        10,
+		RiskLiquidationBufferATR:     0.5,
+		RiskMaxReentries:             2,
+		RiskReentryBandATR:           0.5,
+		RiskReentryCooldownSeconds:   300,
+		RiskReentryMaxChaseATR:       0.5,
+		RiskReentryMaxATRExpansion:   2,
+		RiskWatchTimeoutMinutes:      4320,
+		RiskMigrationConfirmed:       true,
+		RiskAddonBudgetPct:           0.15,
+		RiskReentryMinRecoveryATR:    0.5,
+		RiskUnprotectableDisposition: "warn",
+		RiskUnprotectableAction:      "follow",
+		RiskCycleLossBudgetPct:       0.05,
+		RiskPortfolioLossBudgetPct:   0.08,
+		RiskRoundTripFeeBPS:          12,
+		RiskAIConfidenceThreshold:    0.80,
+		RiskAIMinReviewSeconds:       300,
+		RiskAIDailyCallLimit:         12,
+		RiskAILifecycleCallLimit:     30,
+		RiskNotificationLevel:        "important",
+		RiskManualReentryEnabled:     false,
 	}
 	c.FillRiskDefaults()
 	return c
@@ -787,6 +796,10 @@ const (
 	MappingStatusClosed        = "closed"
 	MappingStatusIgnored       = "ignored"
 	MappingStatusStoppedByRisk = "stopped_by_risk" // v3 风控：账户保护止损被交易所触发
+	// MappingStatusDetached means the source position still exists but a fresh
+	// exchange read proved the mapped follower position does not. It is not a
+	// stop-loss fact and therefore must never create an AI reentry candidate.
+	MappingStatusDetached = "detached"
 )
 
 // CopyTradePositionMapping 仓位映射记录
@@ -809,7 +822,7 @@ type CopyTradePositionMapping struct {
 	SourceRevision int64  `json:"source_revision,omitempty"`
 	Side           string `json:"side"`        // long | short
 	MarginMode     string `json:"margin_mode"` // cross | isolated
-	Status         string `json:"status"`      // active | closed | ignored | stopped_by_risk
+	Status         string `json:"status"`      // active | closed | ignored | stopped_by_risk | detached
 
 	// 开仓信息
 	OpenedAt      time.Time `json:"opened_at"`       // 跟单开仓时间
@@ -822,10 +835,13 @@ type CopyTradePositionMapping struct {
 	ClosePrice float64    `json:"close_price"` // 平仓价格
 
 	// 累计统计（加仓/减仓时更新）
-	AddCount               int       `json:"add_count"`                // 累计加仓次数
-	ReduceCount            int       `json:"reduce_count"`             // 累计减仓次数
-	AccumulatedReduceRatio float64   `json:"accumulated_reduce_ratio"` // 累计减仓比例（用于触发全平）
-	UpdatedAt              time.Time `json:"updated_at"`               // 最后更新时间
+	AddCount    int `json:"add_count"`    // 累计加仓次数
+	ReduceCount int `json:"reduce_count"` // 累计减仓次数
+	// AccumulatedReduceRatio is retained only for schema/rollback
+	// compatibility. Current execution never uses it to decide or trigger a
+	// close; final close always follows the venue's real live position.
+	AccumulatedReduceRatio float64   `json:"accumulated_reduce_ratio"`
+	UpdatedAt              time.Time `json:"updated_at"` // 最后更新时间
 
 	// 连续失败熔断（执行失败时累加，成功时清零；超过阈值自动 CloseMapping）
 	ConsecutiveFailCount int        `json:"consecutive_fail_count"` // 连续失败次数
@@ -1012,6 +1028,21 @@ func (s *CopyTradeStore) GetMapping(traderID, leaderPosID string) (*CopyTradePos
 	return s.getMappingByStatus(traderID, leaderPosID, "")
 }
 
+// GetMappingForReconciliation returns the persisted mapping regardless of
+// lifecycle status. Runtime signal matching intentionally hides closed rows,
+// but restart recovery must be able to prove that an exact close revision was
+// already committed without treating a later revision as evidence.
+func (s *CopyTradeStore) GetMappingForReconciliation(traderID, leaderPosID string) (*CopyTradePositionMapping, error) {
+	row := s.db.QueryRow(`SELECT `+mappingSelectColumns+`
+		FROM copy_trade_position_mappings
+		WHERE trader_id=? AND leader_pos_id=?`, traderID, leaderPosID)
+	mapping, err := scanMapping(row)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return mapping, err
+}
+
 // GetSourceSnapshotRevision returns the last persisted acknowledgement
 // sequence even when the mapping is closed. GetMapping intentionally hides
 // closed mappings, but Smart Money must retain their sequence so a reopened
@@ -1038,9 +1069,9 @@ func (s *CopyTradeStore) getMappingByStatus(traderID, leaderPosID, status string
 		query += " AND status = ?"
 		args = append(args, status)
 	} else {
-		// 无状态筛选时，优先级 active > stopped_by_risk > ignored，忽略 closed
+		// 无状态筛选时，优先级 active > stopped_by_risk > detached > ignored，忽略 closed
 		// stopped_by_risk 排在 ignored 前面：让上层 matchSignal 能及时看到熔断状态
-		query += " AND status IN ('active', 'stopped_by_risk', 'ignored') ORDER BY CASE status WHEN 'active' THEN 1 WHEN 'stopped_by_risk' THEN 2 WHEN 'ignored' THEN 3 END LIMIT 1"
+		query += " AND status IN ('active', 'stopped_by_risk', 'detached', 'ignored') ORDER BY CASE status WHEN 'active' THEN 1 WHEN 'stopped_by_risk' THEN 2 WHEN 'detached' THEN 3 WHEN 'ignored' THEN 4 END LIMIT 1"
 	}
 
 	row := s.db.QueryRow(query, args...)
@@ -1074,7 +1105,7 @@ func (s *CopyTradeStore) HasLiveSourceState(traderID string) (bool, error) {
 	var count int
 	err := s.db.QueryRow(`
 		SELECT
-			(SELECT COUNT(1) FROM copy_trade_position_mappings WHERE trader_id=? AND status IN ('active','stopped_by_risk')) +
+			(SELECT COUNT(1) FROM copy_trade_position_mappings WHERE trader_id=? AND status IN ('active','stopped_by_risk','detached')) +
 			(SELECT COUNT(1) FROM copy_guard_cycles WHERE trader_id=? AND closed_at IS NULL)
 	`, traderID, traderID).Scan(&count)
 	return count > 0, err
@@ -1130,8 +1161,8 @@ func (s *CopyTradeStore) IncrementReduceCount(traderID, leaderPosID string) erro
 	return err
 }
 
-// UpdateAccumulatedReduceRatio 更新累积减仓比例（减仓时调用）
-// 用于跟踪累积减仓进度，当超过阈值（如 90%）时触发全平
+// UpdateAccumulatedReduceRatio is a deprecated rollback/maintenance boundary.
+// Current copy execution must not call it.
 func (s *CopyTradeStore) UpdateAccumulatedReduceRatio(traderID, leaderPosID string, ratio float64) error {
 	_, err := s.db.Exec(`
 		UPDATE copy_trade_position_mappings 
@@ -1141,7 +1172,7 @@ func (s *CopyTradeStore) UpdateAccumulatedReduceRatio(traderID, leaderPosID stri
 	return err
 }
 
-// GetAccumulatedReduceRatio 获取累积减仓比例
+// GetAccumulatedReduceRatio reads the deprecated compatibility field.
 func (s *CopyTradeStore) GetAccumulatedReduceRatio(traderID, leaderPosID string) (float64, error) {
 	var ratio float64
 	err := s.db.QueryRow(`
@@ -1155,7 +1186,8 @@ func (s *CopyTradeStore) GetAccumulatedReduceRatio(traderID, leaderPosID string)
 	return ratio, nil
 }
 
-// ClearAccumulatedReduceRatio 清除累积减仓比例（全平后调用）
+// ClearAccumulatedReduceRatio clears the deprecated compatibility field during
+// maintenance/reconciliation; normal close execution does not depend on it.
 func (s *CopyTradeStore) ClearAccumulatedReduceRatio(traderID, leaderPosID string) error {
 	_, err := s.db.Exec(`
 		UPDATE copy_trade_position_mappings 
@@ -1354,6 +1386,10 @@ func (s *CopyTradeStore) ListStoppedByRiskMappings(traderID string) ([]*CopyTrad
 	return s.listMappings(traderID, MappingStatusStoppedByRisk, 0)
 }
 
+func (s *CopyTradeStore) ListDetachedMappings(traderID string) ([]*CopyTradePositionMapping, error) {
+	return s.listMappings(traderID, MappingStatusDetached, 0)
+}
+
 // MarkStoppedByRisk 标记 active 映射为风控止损触发，并保存快照
 // 用于 SL 被交易所触发后的对账识别
 //
@@ -1395,6 +1431,18 @@ func (s *CopyTradeStore) MarkStoppedByRiskAsClosed(traderID, leaderPosID string)
 		SET status = 'closed', closed_at = CURRENT_TIMESTAMP,
 		    source_revision = COALESCE(source_revision, 0) + 1, updated_at = CURRENT_TIMESTAMP
 		WHERE trader_id = ? AND leader_pos_id = ? AND status = 'stopped_by_risk'
+	`, traderID, leaderPosID)
+	return err
+}
+
+// MarkDetachedAsClosed completes a source-only lifecycle after the leader
+// finally closes. No follower order is submitted.
+func (s *CopyTradeStore) MarkDetachedAsClosed(traderID, leaderPosID string) error {
+	_, err := s.db.Exec(`
+		UPDATE copy_trade_position_mappings
+		SET status='closed', closed_at=CURRENT_TIMESTAMP, last_known_size=0,
+		    updated_at=CURRENT_TIMESTAMP
+		WHERE trader_id=? AND leader_pos_id=? AND status='detached'
 	`, traderID, leaderPosID)
 	return err
 }

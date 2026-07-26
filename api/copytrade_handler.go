@@ -35,6 +35,46 @@ func applyRetiredCopyGuardCompatibility(config *store.CopyTradeConfig, requested
 	return deprecatedRequested
 }
 
+// applyUnprotectableCompatibility keeps the legacy close/follow field
+// readable while giving the runtime one unambiguous warn/close policy.
+// A missing canonical field defaults to warn; an explicitly supplied legacy
+// value still maps deterministically for old clients.
+func applyUnprotectableCompatibility(config *store.CopyTradeConfig, disposition, legacyAction string, legacyExplicit bool) {
+	if config == nil {
+		return
+	}
+	if disposition != "" {
+		// Preserve invalid explicit input for the shared policy validator. It
+		// must return 400 rather than silently converting a typo into another
+		// risk policy.
+		config.RiskUnprotectableDisposition = disposition
+	} else if legacyExplicit {
+		config.RiskUnprotectableAction = legacyAction
+		switch legacyAction {
+		case "close":
+			config.RiskUnprotectableDisposition = "close"
+		case "follow":
+			config.RiskUnprotectableDisposition = "warn"
+		default:
+			// Preserve invalid legacy input for validation as well.
+			return
+		}
+	}
+	if config.RiskUnprotectableDisposition != "" &&
+		config.RiskUnprotectableDisposition != "warn" &&
+		config.RiskUnprotectableDisposition != "close" {
+		return
+	}
+	if config.RiskUnprotectableDisposition == "" {
+		config.RiskUnprotectableDisposition = "warn"
+	}
+	if config.RiskUnprotectableDisposition == "close" {
+		config.RiskUnprotectableAction = "close"
+	} else {
+		config.RiskUnprotectableAction = "follow"
+	}
+}
+
 func copyGuardAIActive(config *store.CopyTradeConfig) bool {
 	return config != nil &&
 		config.RiskStopLossEnabled &&
@@ -1047,8 +1087,9 @@ type CopyTradeConfigRequest struct {
 	RiskReentryRecoveryEscalation *float64 `json:"risk_reentry_recovery_escalation,omitempty"`
 
 	// v5 可保护性状态机 / 噪音档重入
-	RiskUnprotectableAction  *string `json:"risk_unprotectable_action,omitempty"`
-	RiskReentryNoiseOverride *bool   `json:"risk_reentry_noise_override,omitempty"`
+	RiskUnprotectableDisposition *string `json:"risk_unprotectable_disposition,omitempty"`
+	RiskUnprotectableAction      *string `json:"risk_unprotectable_action,omitempty"`
+	RiskReentryNoiseOverride     *bool   `json:"risk_reentry_noise_override,omitempty"`
 }
 
 // GetConfig 获取跟单配置
@@ -1517,8 +1558,10 @@ func applyCopyGuardV4Request(c, old *store.CopyTradeConfig, r *CopyTradeConfigRe
 	}
 	if r.RiskReentryMinRecoveryATR != nil {
 		c.RiskReentryMinRecoveryATR = *r.RiskReentryMinRecoveryATR
+		c.RiskReentryMinRecoveryATRExplicit = true
 	} else if old != nil {
 		c.RiskReentryMinRecoveryATR = old.RiskReentryMinRecoveryATR
+		c.RiskReentryMinRecoveryATRExplicit = old.RiskReentryMinRecoveryATRExplicit
 	}
 	if r.RiskReentryCooldownEscalation != nil {
 		c.RiskReentryCooldownEscalation = *r.RiskReentryCooldownEscalation
@@ -1530,11 +1573,19 @@ func applyCopyGuardV4Request(c, old *store.CopyTradeConfig, r *CopyTradeConfigRe
 	} else if old != nil {
 		c.RiskReentryRecoveryEscalation = old.RiskReentryRecoveryEscalation
 	}
+	disposition := ""
+	if r.RiskUnprotectableDisposition != nil {
+		disposition = *r.RiskUnprotectableDisposition
+	}
+	legacyAction := ""
 	if r.RiskUnprotectableAction != nil {
-		// Protocol-compatible read, fail-closed write.
-		c.RiskUnprotectableAction = "close"
-	} else if old != nil {
-		c.RiskUnprotectableAction = "close"
+		legacyAction = *r.RiskUnprotectableAction
+	}
+	if r.RiskUnprotectableDisposition == nil && r.RiskUnprotectableAction == nil && old != nil {
+		c.RiskUnprotectableDisposition = old.RiskUnprotectableDisposition
+		c.RiskUnprotectableAction = old.RiskUnprotectableAction
+	} else {
+		applyUnprotectableCompatibility(c, disposition, legacyAction, r.RiskUnprotectableAction != nil)
 	}
 	if r.RiskReentryNoiseOverride != nil {
 		c.RiskReentryNoiseOverride = *r.RiskReentryNoiseOverride
@@ -1545,31 +1596,30 @@ func applyCopyGuardV4Request(c, old *store.CopyTradeConfig, r *CopyTradeConfigRe
 		// Only missing fields on a brand-new v4 config receive balanced defaults.
 		// Existing values, including valid explicit zero values, are preserved.
 		if old == nil {
+			defaults := store.NewCopyGuardDefaults()
 			if r.RiskSlippageBufferBPS == nil {
-				c.RiskSlippageBufferBPS = 10
+				c.RiskSlippageBufferBPS = defaults.RiskSlippageBufferBPS
 			}
 			if r.RiskLiquidationBufferATR == nil {
-				c.RiskLiquidationBufferATR = 0.5
+				c.RiskLiquidationBufferATR = defaults.RiskLiquidationBufferATR
 			}
 			if r.RiskMaxReentries == nil {
-				// v5：默认单周期最多重入 1 次（whipsaw 磨损收敛）
-				c.RiskMaxReentries = 1
+				c.RiskMaxReentries = defaults.RiskMaxReentries
 			}
 			if r.RiskReentryBandATR == nil {
-				c.RiskReentryBandATR = 0.5
+				c.RiskReentryBandATR = defaults.RiskReentryBandATR
 			}
 			if r.RiskReentryCooldownSeconds == nil {
-				// v4.1：默认冷却 300s（旧默认 60s 在高杠杆震荡下重入过快）
-				c.RiskReentryCooldownSeconds = 300
+				c.RiskReentryCooldownSeconds = defaults.RiskReentryCooldownSeconds
 			}
 			if r.RiskReentryMaxChaseATR == nil {
-				c.RiskReentryMaxChaseATR = 0.5
+				c.RiskReentryMaxChaseATR = defaults.RiskReentryMaxChaseATR
 			}
 			if r.RiskReentryMaxATRExpansion == nil {
-				c.RiskReentryMaxATRExpansion = 2
+				c.RiskReentryMaxATRExpansion = defaults.RiskReentryMaxATRExpansion
 			}
 			if r.RiskReentryEnabled == nil {
-				c.RiskReentryEnabled = true
+				c.RiskReentryEnabled = defaults.RiskReentryEnabled
 			}
 		}
 		c.FillRiskDefaults()

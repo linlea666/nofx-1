@@ -355,6 +355,116 @@ func TestCopyGuardProtectionHealthAndShadowLedger(t *testing.T) {
 	}
 }
 
+func TestCopyGuardAttemptPersistsProtectionLifecycle(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "attempt-protection.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cs := st.CopyTrade()
+	cycle, err := cs.EnsureCopyGuardCycle(&CopyGuardCycle{
+		TraderID: "t1", LeaderID: "leader", LeaderPosID: "p1", Symbol: "ETHUSDT",
+		Side: "long", MarginMode: "cross", Status: CopyGuardFollowing, PolicySnapshot: "{}",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = cs.OpenCopyGuardAttempt(cycle.ID, 0, 100, 20, 0.2, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err = cs.UpdateCopyGuardAttemptProtection(cycle.ID, 0, 92, "algo-1", CopyGuardProtectionVerified, 1); err != nil {
+		t.Fatal(err)
+	}
+	attempts, err := cs.ListCopyGuardAttempts(cycle.ID)
+	if err != nil || len(attempts) != 1 {
+		t.Fatalf("attempts=%d err=%v", len(attempts), err)
+	}
+	got := attempts[0]
+	if got.StopTriggerPrice != 92 || got.ProtectionAlgoID != "algo-1" || got.ProtectionStatus != CopyGuardProtectionVerified || got.ProtectionCoverage != 1 || got.ProtectionUpdatedAt == nil {
+		t.Fatalf("protection lifecycle did not round-trip: %+v", got)
+	}
+}
+
+func TestUnprotectedMarketExitDoesNotCreateStopOrReentryEvidence(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "unprotected-exit.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cs := st.CopyTrade()
+	if err = cs.SavePositionMapping(&CopyTradePositionMapping{
+		TraderID: "t1", LeaderID: "leader", LeaderPosID: "p1", Symbol: "ETHUSDT",
+		Side: "long", MarginMode: "cross", Status: MappingStatusActive,
+		OpenedAt: time.Now(), LastKnownSize: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cycle, err := cs.EnsureCopyGuardCycle(&CopyGuardCycle{
+		TraderID: "t1", LeaderID: "leader", LeaderPosID: "p1", Symbol: "ETHUSDT",
+		Side: "long", MarginMode: "cross", Status: CopyGuardFollowing,
+		PolicySnapshot: "{}", FollowerEntryPrice: 100, FollowerNotional: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = cs.OpenCopyGuardAttempt(cycle.ID, 0, 100, 10, .1, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err = cs.RecordCopyGuardUnprotectedExit(cycle.ID, "t1", "p1", 0, 99, .1, "stop rejected"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := cs.GetCopyGuardCycle(cycle.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != CopyGuardProtectionExited || got.StopCount != 0 || got.ClosedAt != nil || got.AccountingStatus != CopyGuardAccountingPending {
+		t.Fatalf("unprotected exit invented stop evidence or lost accounting state: %+v", got)
+	}
+	mapping, err := cs.GetMapping("t1", "p1")
+	if err != nil || mapping.Status != MappingStatusDetached {
+		t.Fatalf("unprotected exit mapping must be detached from AI reentry: mapping=%+v err=%v", mapping, err)
+	}
+	attempts, err := cs.ListCopyGuardAttempts(cycle.ID)
+	if err != nil || len(attempts) != 1 || attempts[0].Status != "FORCED_EXIT" || attempts[0].StopFillPrice != 0 || attempts[0].StopAlgoID != "" {
+		t.Fatalf("unprotected exit attempt must stay distinct from a stop fill: attempts=%+v err=%v", attempts, err)
+	}
+	stopped, err := cs.ListStoppedByRiskMappings("t1")
+	if err != nil || len(stopped) != 0 {
+		t.Fatalf("unprotected exit must not become reentry-eligible: stopped=%+v err=%v", stopped, err)
+	}
+	if err = cs.ReconcileCopyGuardAttempt(cycle.ID, 0, -1, 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	got, err = cs.GetCopyGuardCycle(cycle.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = cs.CloseCopyGuardCycle(cycle.ID, CopyGuardLeaderClosed, got.ActualPnL, -2, got.Fees, got.FundingFee, got.LiquidationPenalty, got.Slippage); err != nil {
+		t.Fatal(err)
+	}
+	got, err = cs.GetCopyGuardCycle(cycle.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ClosedAt == nil || got.AccountingStatus != CopyGuardAccountingReconciled ||
+		got.TrackingDifference != 1 || got.NetGuardEffect != 1 {
+		t.Fatalf("leader-final close must score forced protection exit against no-Guard baseline: %+v", got)
+	}
+	if err = cs.SetCopyGuardBaselineSource(cycle.ID, "leader_history"); err != nil {
+		t.Fatal(err)
+	}
+	summary, err := cs.CopyGuardSummary(
+		[]string{"t1"}, time.Now().Add(-time.Hour), time.Now().Add(time.Hour), CopyGuardFilter{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.NetGuardEffect != 1 || summary.AvoidedLoss != 1 ||
+		summary.VerifiedBaselineCycles != 1 || summary.StoppedCycleCount != 0 {
+		t.Fatalf("forced protection exit must be attributed as Guard intervention, not a stop: %+v", summary)
+	}
+}
+
 // 观察更新与周期关闭存在竞态（止损与领航员平仓同一轮发生）：
 // 已关闭的周期绝不能被 UpdateCopyGuardObservation 改回 STOPPED_WATCHING，
 // 也不能被 UpdateCopyGuardObservedPrice 改写观测价。
@@ -436,30 +546,31 @@ func TestMigratePolicyDefaults(t *testing.T) {
 		return p
 	}
 
-	// v7 cannot distinguish an old inherited value from an explicit choice, so
-	// every stored number must survive unchanged.
-	seed("t-old-defaults", CopyGuardPolicy{Version: 4, ReentryMaxChaseATR: 0, ReentryCooldownSec: 60, MaxReentries: 2, DefaultsVersion: 2})
+	// Numeric values remain untouched. The pre-v8 forced close/follow policy is
+	// the exception: old clients always echoed it, so it cannot prove an
+	// explicit choice and must migrate to the new warn/follow default.
+	seed("t-old-defaults", CopyGuardPolicy{Version: 4, ReentryMaxChaseATR: 0, ReentryCooldownSec: 60, MaxReentries: 2, UnprotectableAction: "close", DefaultsVersion: 2})
 	// 低代次存量策略：用户显式改过 → 应保留
-	seed("t-custom", CopyGuardPolicy{Version: 4, ReentryMaxChaseATR: 1.2, ReentryCooldownSec: 900, MaxReentries: 3, DefaultsVersion: 2})
+	seed("t-custom", CopyGuardPolicy{Version: 4, ReentryMaxChaseATR: 1.2, ReentryCooldownSec: 900, MaxReentries: 3, UnprotectableDisposition: "close", UnprotectableAction: "close", DefaultsVersion: 2})
 	// Even a value previously produced by a migration is preserved.
 	seed("t-gen4-reduced", CopyGuardPolicy{Version: 4, ReentryMaxChaseATR: 0, ReentryCooldownSec: 60, MaxReentries: 1, DefaultsVersion: 4})
 	// 已是当前代次：即使值等于旧默认也不得再动（用户设回旧值的选择）
-	seed("t-current", CopyGuardPolicy{Version: 4, ReentryMaxChaseATR: 0, ReentryCooldownSec: 60, MaxReentries: 1, DefaultsVersion: copyGuardPolicyDefaultsVersion})
+	seed("t-current", CopyGuardPolicy{Version: 4, ReentryMaxChaseATR: 0, ReentryCooldownSec: 60, MaxReentries: 1, UnprotectableDisposition: "close", UnprotectableAction: "close", DefaultsVersion: copyGuardPolicyDefaultsVersion})
 
 	if err := cs.migrateCopyGuardPolicyDefaults(); err != nil {
 		t.Fatal(err)
 	}
 
-	if p := load("t-old-defaults"); p.ReentryMaxChaseATR != 0 || p.ReentryCooldownSec != 60 || p.MaxReentries != 2 || p.ReentryDecisionMode != "legacy_rule" || p.DefaultsVersion != copyGuardPolicyDefaultsVersion {
-		t.Fatalf("v7 migration must preserve stored values and pin legacy mode: %+v", p)
+	if p := load("t-old-defaults"); p.ReentryMaxChaseATR != 0 || p.ReentryCooldownSec != 60 || p.MaxReentries != 2 || p.ReentryDecisionMode != "legacy_rule" || p.UnprotectableDisposition != "warn" || p.UnprotectableAction != "follow" || p.DefaultsVersion != copyGuardPolicyDefaultsVersion {
+		t.Fatalf("v8 migration must preserve numeric values, pin legacy mode and migrate disposition: %+v", p)
 	}
-	if p := load("t-custom"); p.ReentryMaxChaseATR != 1.2 || p.ReentryCooldownSec != 900 || p.MaxReentries != 3 || p.DefaultsVersion != copyGuardPolicyDefaultsVersion {
-		t.Fatalf("explicit values must be preserved: %+v", p)
+	if p := load("t-custom"); p.ReentryMaxChaseATR != 1.2 || p.ReentryCooldownSec != 900 || p.MaxReentries != 3 || p.UnprotectableDisposition != "warn" || p.UnprotectableAction != "follow" || p.DefaultsVersion != copyGuardPolicyDefaultsVersion {
+		t.Fatalf("numeric values must be preserved while ambiguous pre-v8 disposition migrates: %+v", p)
 	}
 	if p := load("t-gen4-reduced"); p.MaxReentries != 1 || p.ReentryMaxChaseATR != 0 || p.ReentryCooldownSec != 60 || p.ReentryDecisionMode != "legacy_rule" || p.DefaultsVersion != copyGuardPolicyDefaultsVersion {
 		t.Fatalf("v7 migration must not reinterpret prior values: %+v", p)
 	}
-	if p := load("t-current"); p.ReentryMaxChaseATR != 0 || p.ReentryCooldownSec != 60 || p.MaxReentries != 1 {
+	if p := load("t-current"); p.ReentryMaxChaseATR != 0 || p.ReentryCooldownSec != 60 || p.MaxReentries != 1 || p.UnprotectableDisposition != "close" || p.UnprotectableAction != "close" {
 		t.Fatalf("policies at the current version must not be rescanned: %+v", p)
 	}
 }
@@ -520,6 +631,34 @@ func TestMigratePolicyDefaultsGen6(t *testing.T) {
 	}
 	if atr, lev := loadCfg("t-current"); atr != 1.5 || lev != 1 {
 		t.Fatalf("已达当前代次的行不得被重扫，got atr=%.2f lev=%d", atr, lev)
+	}
+}
+
+func TestExplicitZeroReentryRecoverySurvivesPolicyRoundTrip(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "explicit-zero-recovery.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if _, err = st.DB().Exec(`INSERT INTO traders(id, name, ai_model_id, exchange_id, initial_balance) VALUES(?,?,?,?,0)`,
+		"trader-zero", "trader-zero", "m", "e"); err != nil {
+		t.Fatal(err)
+	}
+	cfg := NewCopyGuardDefaults()
+	cfg.TraderID = "trader-zero"
+	cfg.ProviderType = "okx"
+	cfg.LeaderID = "leader"
+	cfg.RiskReentryMinRecoveryATR = 0
+	cfg.RiskReentryMinRecoveryATRExplicit = true
+	if err = st.CopyTrade().Upsert(cfg); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.CopyTrade().GetByTraderID(cfg.TraderID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.RiskReentryMinRecoveryATR != 0 || !got.RiskReentryMinRecoveryATRExplicit {
+		t.Fatalf("explicit zero recovery threshold did not survive save/load: %+v", got)
 	}
 }
 

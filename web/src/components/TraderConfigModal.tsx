@@ -281,7 +281,7 @@ interface FormState {
   risk_reentry_cooldown_escalation: number // 默认 3：第 N 次重入冷却倍率
   risk_reentry_recovery_escalation: number // 默认 1.5：第 N 次重入恢复幅度倍率
   // v5 可保护性状态机 / 噪音档重入
-  risk_unprotectable_action: 'close' | 'follow' // 默认 close：确认不可保护时立即离场
+  risk_unprotectable_action: 'close' | 'follow' // follow=仅警告并持续重试（默认）
   risk_reentry_noise_override: boolean // 默认 false：噪音档（止损距离/ATR<0.3）仍允许重入
 }
 
@@ -367,7 +367,7 @@ export function TraderConfigModal({
     risk_reentry_cooldown_escalation: 3,
     risk_reentry_recovery_escalation: 1.5,
     // v5 可保护性状态机 / 噪音档重入
-    risk_unprotectable_action: 'close',
+    risk_unprotectable_action: 'follow',
     risk_reentry_noise_override: false,
   })
   const [isSaving, setIsSaving] = useState(false)
@@ -543,7 +543,12 @@ export function TraderConfigModal({
             risk_reentry_recovery_escalation:
               cfg.risk_reentry_recovery_escalation ?? 1.5,
             // v5 可保护性状态机 / 噪音档重入
-            risk_unprotectable_action: 'close',
+            risk_unprotectable_action:
+              cfg.risk_unprotectable_disposition === 'close'
+                ? 'close'
+                : cfg.risk_unprotectable_disposition === 'warn'
+                  ? 'follow'
+                  : (cfg.risk_unprotectable_action ?? 'follow'),
             risk_reentry_noise_override:
               cfg.risk_reentry_noise_override ?? false,
           }))
@@ -606,7 +611,12 @@ export function TraderConfigModal({
             cfg.risk_reentry_cooldown_seconds ?? 300,
           risk_watch_timeout_minutes: cfg.risk_watch_timeout_minutes ?? 4320,
           risk_addon_budget_pct: (cfg.risk_addon_budget_pct ?? 0.15) * 100,
-          risk_unprotectable_action: 'close',
+          risk_unprotectable_action:
+            cfg.risk_unprotectable_disposition === 'close'
+              ? 'close'
+              : cfg.risk_unprotectable_disposition === 'warn'
+                ? 'follow'
+                : (cfg.risk_unprotectable_action ?? 'follow'),
         }))
       })
     return () => {
@@ -687,7 +697,7 @@ export function TraderConfigModal({
         risk_reentry_min_recovery_atr: 0.5,
         risk_reentry_cooldown_escalation: 3,
         risk_reentry_recovery_escalation: 1.5,
-        risk_unprotectable_action: 'close',
+        risk_unprotectable_action: 'follow',
         risk_reentry_noise_override: false,
       })
     }
@@ -961,7 +971,9 @@ export function TraderConfigModal({
             risk_reentry_recovery_escalation:
               formData.risk_reentry_recovery_escalation,
             // v5 可保护性状态机 / 噪音档重入
-            risk_unprotectable_action: 'close',
+            risk_unprotectable_disposition:
+              formData.risk_unprotectable_action === 'close' ? 'close' : 'warn',
+            risk_unprotectable_action: formData.risk_unprotectable_action,
             risk_reentry_noise_override: formData.risk_reentry_noise_override,
           })
         }
@@ -1812,7 +1824,8 @@ export function TraderConfigModal({
                                   推荐：普通跟单不缩量；AI
                                   重入单次/周期/组合风险 2% / 5% / 8%，ATR14 /
                                   1小时 / 2.0倍，AI 持续观察，最多重入 2
-                                  次，不可保护时立即离场
+                                  次；普通仓位无法保护默认告警持有，AI
+                                  重入无法保护始终立即离场
                                 </span>
                                 <button
                                   type="button"
@@ -1855,7 +1868,7 @@ export function TraderConfigModal({
                                       risk_reentry_min_recovery_atr: 0.5,
                                       risk_reentry_cooldown_escalation: 3,
                                       risk_reentry_recovery_escalation: 1.5,
-                                      risk_unprotectable_action: 'close',
+                                      risk_unprotectable_action: 'follow',
                                       risk_reentry_noise_override: false,
                                     }))
                                   }
@@ -1987,7 +2000,8 @@ export function TraderConfigModal({
                                     risk_reentry_decision_mode: mode,
                                     ...(mode === 'ai_guarded'
                                       ? {
-                                          risk_unprotectable_action: 'close',
+                                          risk_unprotectable_action:
+                                            prev.risk_unprotectable_action,
                                           risk_reentry_ratio: Math.min(
                                             prev.risk_reentry_ratio,
                                             50
@@ -2034,7 +2048,8 @@ export function TraderConfigModal({
                                             prev.risk_max_reentries,
                                             2
                                           ),
-                                          risk_unprotectable_action: 'close',
+                                          risk_unprotectable_action:
+                                            prev.risk_unprotectable_action,
                                         }))
                                       }
                                       className="ml-2 underline"
@@ -2300,13 +2315,15 @@ export function TraderConfigModal({
                                 }
                                 className="w-full px-3 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF] focus:border-[#F0B90B] focus:outline-none text-sm"
                               >
-                                <option value="close">
-                                  立即市价离场（推荐）
+                                <option value="follow">
+                                  仅警告并继续持有（默认）
                                 </option>
+                                <option value="close">立即市价离场</option>
                               </select>
                               <p className="text-xs text-[#848E9C] mt-1">
-                                所有模式统一失败关闭；旧客户端的 follow
-                                值仅兼容读取，保存时自动迁移为 close。
+                                默认保留普通跟单仓位、记录高危状态并持续重试保护单；
+                                选择立即离场时才会提交市价平仓。AI
+                                二次入场成交后仍执行独立的强制保护失败退出。
                               </p>
                             </div>
                           )}

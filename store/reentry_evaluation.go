@@ -6,7 +6,9 @@ import (
 	"time"
 )
 
-const ReentryDecisionEvaluationVersion = 3
+// v4 makes the operational funnel monotonic and labels legacy inferred stages
+// separately from fully linked intent/order/protection evidence.
+const ReentryDecisionEvaluationVersion = 4
 
 const (
 	ReentryMarketReversal     = "REVERSAL_CONFIRMED"

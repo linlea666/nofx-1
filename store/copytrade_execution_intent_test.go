@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -204,6 +205,71 @@ func TestCommitLeaderExecutionFillAtomicallyAdvancesMappingAndIntent(t *testing.
 	}
 }
 
+func TestFilledExecutionLifecycleGapIsRecoverableWithoutReplayingOrder(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "filled-lifecycle-gap.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cs := st.CopyTrade()
+	openIntent, claimed, err := cs.ReserveExecutionIntent(&CopyTradeExecutionIntent{
+		TraderID: "t1", LeaderPosID: "p1", SourceRevision: 1,
+		CanonicalKey: "leader|t1|p1|1", SourceKind: "LEADER_TRANSITION",
+		Action: "open_long", Symbol: "ETHUSDT", Side: "long", MarginMode: "cross",
+		LeaderTargetSize: 8, ClientOrderID: "open-stable",
+	})
+	if err != nil || !claimed {
+		t.Fatalf("reserve open claimed=%v err=%v", claimed, err)
+	}
+	if err = cs.CommitLeaderExecutionFill(LeaderExecutionCommit{
+		IntentID: openIntent.ID, TraderID: "t1", LeaderID: "leader", LeaderPosID: "p1",
+		SourceRevision: 1, Action: "open_long", Symbol: "ETHUSDT", Side: "long",
+		MarginMode: "cross", LeaderTargetSize: 8, FillPrice: 100, FilledQuantity: 1,
+		FilledNotional: 100, ExchangeOrderID: "open-order", ExchangeState: "FILLED",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	gaps, err := cs.ListFilledExecutionIntentsWithLifecycleGap("t1")
+	if err != nil || len(gaps) != 1 || gaps[0].ID != openIntent.ID {
+		t.Fatalf("confirmed open without cycle must be recoverable: gaps=%+v err=%v", gaps, err)
+	}
+	if _, err = cs.EnsureCopyGuardCycle(&CopyGuardCycle{
+		TraderID: "t1", LeaderID: "leader", LeaderPosID: "p1", Symbol: "ETHUSDT",
+		Side: "long", MarginMode: "cross", Status: CopyGuardFollowing,
+		PolicySnapshot: "{}", LeaderEntryPrice: 100, FollowerEntryPrice: 100,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if gaps, err = cs.ListFilledExecutionIntentsWithLifecycleGap("t1"); err != nil || len(gaps) != 0 {
+		t.Fatalf("open with lifecycle must not be replayed: gaps=%+v err=%v", gaps, err)
+	}
+	closeIntent, claimed, err := cs.ReserveExecutionIntent(&CopyTradeExecutionIntent{
+		TraderID: "t1", LeaderPosID: "p1", SourceRevision: 2,
+		CanonicalKey: "leader|t1|p1|2", SourceKind: "LEADER_TRANSITION",
+		Action: "close_long", Symbol: "ETHUSDT", Side: "long", MarginMode: "cross",
+		LeaderTargetSize: 0, ClientOrderID: "close-stable",
+	})
+	if err != nil || !claimed {
+		t.Fatalf("reserve close claimed=%v err=%v", claimed, err)
+	}
+	if err = cs.CommitLeaderExecutionFill(LeaderExecutionCommit{
+		IntentID: closeIntent.ID, TraderID: "t1", LeaderID: "leader", LeaderPosID: "p1",
+		SourceRevision: 2, Action: "close_long", Symbol: "ETHUSDT", Side: "long",
+		MarginMode: "cross", LeaderTargetSize: 0, FillPrice: 105, FilledQuantity: 1,
+		FilledNotional: 105, ExchangeOrderID: "close-order", ExchangeState: "FILLED",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	closed, err := cs.GetMappingForReconciliation("t1", "p1")
+	if err != nil || closed == nil || closed.Status != MappingStatusClosed || closed.SourceRevision != 2 {
+		t.Fatalf("closed mapping must remain visible to reconciliation: mapping=%+v err=%v", closed, err)
+	}
+	gaps, err = cs.ListFilledExecutionIntentsWithLifecycleGap("t1")
+	if err != nil || len(gaps) != 1 || gaps[0].ID != closeIntent.ID {
+		t.Fatalf("confirmed close with open cycle must be recoverable: gaps=%+v err=%v", gaps, err)
+	}
+}
+
 func TestCommitSkippedSubLotAdvancesRevisionWithoutFakeReduction(t *testing.T) {
 	st, err := New(filepath.Join(t.TempDir(), "sub-lot.db"))
 	if err != nil {
@@ -228,6 +294,43 @@ func TestCommitSkippedSubLotAdvancesRevisionWithoutFakeReduction(t *testing.T) {
 	stored, _, err := cs.ReserveExecutionIntent(&CopyTradeExecutionIntent{TraderID: "t1", LeaderPosID: "p1", SourceRevision: 2, CanonicalKey: "leader|t1|p1|2", Action: "reduce_short"})
 	if err != nil || stored.Status != ExecutionIntentSkipped || stored.ReasonCode != "SKIPPED_SUBLOT" {
 		t.Fatalf("sub-lot intent mismatch: intent=%+v err=%v", stored, err)
+	}
+}
+
+func TestSkippedTransitionRejectsNewerMappingRevisionAsEvidence(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "stale-skip.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cs := st.CopyTrade()
+	if err = cs.SavePositionMapping(&CopyTradePositionMapping{
+		TraderID: "t1", LeaderPosID: "p1", LeaderID: "leader", Symbol: "BTCUSDT",
+		Side: "short", MarginMode: "cross", OpenedAt: time.Now(), LastKnownSize: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var oldIntent *CopyTradeExecutionIntent
+	for revision, target := range []float64{0.999, 0.998} {
+		intent, claimed, reserveErr := cs.ReserveExecutionIntent(&CopyTradeExecutionIntent{
+			TraderID: "t1", LeaderPosID: "p1", SourceRevision: int64(revision + 2),
+			CanonicalKey: fmt.Sprintf("skip-revision-%d", revision+2),
+			SourceFillID: fmt.Sprintf("fill-%d", revision+2),
+			Action:       "reduce_short", Symbol: "BTCUSDT", Side: "short",
+			LeaderTargetSize: target,
+		})
+		if reserveErr != nil || !claimed {
+			t.Fatalf("revision %d reserve claimed=%v err=%v", revision+2, claimed, reserveErr)
+		}
+		if oldIntent == nil {
+			oldIntent = intent
+		}
+		if commitErr := cs.CommitSkippedLeaderTransition(intent.ID, "t1", "p1", int64(revision+2), target, "SKIPPED_SUBLOT"); commitErr != nil {
+			t.Fatalf("revision %d commit: %v", revision+2, commitErr)
+		}
+	}
+	if err = cs.CommitSkippedLeaderTransition(oldIntent.ID, "t1", "p1", 2, 0.999, "SKIPPED_SUBLOT"); err == nil {
+		t.Fatal("newer mapping revision incorrectly proved an older skipped intent")
 	}
 }
 
@@ -382,6 +485,173 @@ func TestSubmittedAndReconcilingIntentMaySettleAsSkipped(t *testing.T) {
 	}
 }
 
+func TestTerminalIntentDoesNotAbsorbLaterSourceTransition(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "terminal-source.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cs := st.CopyTrade()
+	first, claimed, err := cs.ReserveExecutionIntent(&CopyTradeExecutionIntent{
+		TraderID: "t1", LeaderPosID: "p1", SourceRevision: 4,
+		CanonicalKey: "leader|t1|p1|4", SourceFillID: "fill-5600",
+		SourceFillIDs: []string{"fill-5600"}, Action: "reduce_short",
+		LeaderTargetSize: 5600,
+	})
+	if err != nil || !claimed {
+		t.Fatalf("first reserve claimed=%v err=%v", claimed, err)
+	}
+	if err = cs.UpdateExecutionIntent(first.ID, ExecutionIntentSkipped, "SKIPPED_SUBLOT", "", "", 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	got, claimed, err := cs.ReserveExecutionIntent(&CopyTradeExecutionIntent{
+		TraderID: "t1", LeaderPosID: "p1", SourceRevision: 4,
+		CanonicalKey: "leader|t1|p1|4", SourceFillID: "fill-4000",
+		SourceFillIDs: []string{"fill-4000"}, Action: "reduce_short",
+		LeaderTargetSize: 4000,
+	})
+	if err != nil || claimed || got.ID != first.ID {
+		t.Fatalf("later transition should wait for next revision: got=%+v claimed=%v err=%v", got, claimed, err)
+	}
+	var attached, transitions int
+	if err = st.DB().QueryRow(`SELECT COUNT(*) FROM copy_trade_execution_intent_sources WHERE intent_id=? AND source_fill_id='fill-4000'`, first.ID).Scan(&attached); err != nil {
+		t.Fatal(err)
+	}
+	if err = st.DB().QueryRow(`SELECT COUNT(*) FROM copy_trade_source_transitions WHERE intent_id=? AND source_fill_id='fill-4000' AND status='SOURCE_REPLAY_PENDING'`, first.ID).Scan(&transitions); err != nil {
+		t.Fatal(err)
+	}
+	if attached != 0 || transitions != 1 {
+		t.Fatalf("terminal intent must not absorb later source but must audit it for replay: sources=%d replay_transitions=%d", attached, transitions)
+	}
+	replayed, claimed, err := cs.ReserveExecutionIntent(&CopyTradeExecutionIntent{
+		TraderID: "t1", LeaderPosID: "p1", SourceRevision: 5,
+		CanonicalKey: "leader|t1|p1|5", SourceFillID: "fill-4000",
+		SourceFillIDs: []string{"fill-4000"}, Action: "reduce_short",
+		LeaderTargetSize: 4000,
+	})
+	if err != nil || !claimed || replayed.ID == first.ID {
+		t.Fatalf("replayed source must bind to the next canonical intent: got=%+v claimed=%v err=%v", replayed, claimed, err)
+	}
+	var rebound int
+	if err = st.DB().QueryRow(`SELECT COUNT(*) FROM copy_trade_source_transitions WHERE intent_id=? AND source_fill_id='fill-4000' AND source_revision=5 AND status='RESERVED'`, replayed.ID).Scan(&rebound); err != nil {
+		t.Fatal(err)
+	}
+	if rebound != 1 {
+		t.Fatalf("replayed source audit was not rebound to the next intent: %d", rebound)
+	}
+}
+
+func TestMissingFollowerDetachesWithoutCreatingStopEvidence(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "detached.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cs := st.CopyTrade()
+	if err = cs.SavePositionMapping(&CopyTradePositionMapping{
+		TraderID: "t1", LeaderPosID: "p1", LeaderID: "leader", Symbol: "BTCUSDT",
+		Side: "short", MarginMode: "cross", OpenedAt: time.Now(), LastKnownSize: 11000,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cycle, err := cs.EnsureCopyGuardCycle(&CopyGuardCycle{
+		TraderID: "t1", LeaderID: "leader", LeaderPosID: "p1", Symbol: "BTCUSDT",
+		Side: "short", MarginMode: "cross", Status: CopyGuardFollowing, PolicySnapshot: "{}",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent, claimed, err := cs.ReserveExecutionIntent(&CopyTradeExecutionIntent{
+		TraderID: "t1", LeaderPosID: "p1", SourceRevision: 2,
+		CanonicalKey: "leader|t1|p1|2", SourceFillID: "reduce-5600",
+		Action: "reduce_short", LeaderTargetSize: 5600,
+	})
+	if err != nil || !claimed {
+		t.Fatalf("reserve claimed=%v err=%v", claimed, err)
+	}
+	if err = cs.CommitDetachedLeaderTransition(intent.ID, "t1", "p1", 2, 5600, "FOLLOWER_POSITION_MISSING"); err != nil {
+		t.Fatal(err)
+	}
+	mapping, err := cs.GetMapping("t1", "p1")
+	if err != nil || mapping == nil || mapping.Status != MappingStatusDetached || mapping.SourceRevision != 2 || mapping.LastKnownSize != 5600 {
+		t.Fatalf("detached mapping mismatch: mapping=%+v err=%v", mapping, err)
+	}
+	closedCycle, err := cs.GetCopyGuardCycle(cycle.ID)
+	if err != nil || closedCycle.Status != CopyGuardDetached || closedCycle.ClosedAt == nil || closedCycle.StopCount != 0 || closedCycle.AccountingStatus != "UNSCORABLE" {
+		t.Fatalf("detached cycle invented stop evidence: cycle=%+v err=%v", closedCycle, err)
+	}
+}
+
+func TestExecutionReconciliationBecomesManualReviewAfterBound(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "reconcile-bound.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cs := st.CopyTrade()
+	intent, claimed, err := cs.ReserveExecutionIntent(&CopyTradeExecutionIntent{
+		TraderID: "t1", LeaderPosID: "p1", SourceRevision: 1,
+		CanonicalKey: "leader|t1|p1|1", Action: "open_long",
+	})
+	if err != nil || !claimed {
+		t.Fatalf("reserve claimed=%v err=%v", claimed, err)
+	}
+	if terminal, err := cs.RecordExecutionReconciliationFailure(intent.ID, "ORDER_LOOKUP_FAILED", "temporary", 2, time.Hour); err != nil || terminal {
+		t.Fatalf("first reconciliation result terminal=%v err=%v", terminal, err)
+	}
+	if terminal, err := cs.RecordExecutionReconciliationFailure(intent.ID, "ORDER_LOOKUP_FAILED", "again", 2, time.Hour); err != nil || !terminal {
+		t.Fatalf("second reconciliation result terminal=%v err=%v", terminal, err)
+	}
+	var status, reason string
+	if err = st.DB().QueryRow(`SELECT status,reason_code FROM copy_trade_execution_intents WHERE id=?`, intent.ID).Scan(&status, &reason); err != nil {
+		t.Fatal(err)
+	}
+	if status != ExecutionIntentFailed || reason != "MANUAL_REVIEW_REQUIRED" {
+		t.Fatalf("unexpected reconciliation terminal: %s/%s", status, reason)
+	}
+}
+
+func TestSubmittedExecutionReconciliationNeverStopsAutomaticLookup(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "submitted-reconcile-bound.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cs := st.CopyTrade()
+	intent, claimed, err := cs.ReserveExecutionIntent(&CopyTradeExecutionIntent{
+		TraderID: "t1", LeaderPosID: "p1", SourceRevision: 1,
+		CanonicalKey: "leader|t1|p1|1", Action: "open_long",
+		ClientOrderID: "stable-client-id",
+	})
+	if err != nil || !claimed {
+		t.Fatalf("reserve claimed=%v err=%v", claimed, err)
+	}
+	if _, err = cs.PrepareExecutionOrderAttempt(intent.ID, "stable-client-id", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err = cs.UpdateExecutionIntent(intent.ID, ExecutionIntentSubmitted, "", "", "", 1, 1, 0); err != nil {
+		t.Fatal(err)
+	}
+	for attempt := 0; attempt < 3; attempt++ {
+		terminal, recordErr := cs.RecordExecutionReconciliationFailure(
+			intent.ID, "ORDER_LOOKUP_FAILED", "exchange temporarily unavailable", 1, time.Nanosecond,
+		)
+		if recordErr != nil {
+			t.Fatal(recordErr)
+		}
+		if terminal {
+			t.Fatalf("submitted intent became terminal on reconciliation attempt %d", attempt+1)
+		}
+	}
+	var status, reason string
+	if err = st.DB().QueryRow(`SELECT status,reason_code FROM copy_trade_execution_intents WHERE id=?`, intent.ID).Scan(&status, &reason); err != nil {
+		t.Fatal(err)
+	}
+	if status != ExecutionIntentReconciling || reason != "ORDER_LOOKUP_FAILED" {
+		t.Fatalf("submitted intent must keep automatic reconciliation: status=%s reason=%s", status, reason)
+	}
+}
+
 func TestSourceRevalidationIntentCanOnlyBeReclaimedWithoutAttempts(t *testing.T) {
 	st, err := New(filepath.Join(t.TempDir(), "source-revalidation.db"))
 	if err != nil {
@@ -429,6 +699,104 @@ func TestSourceRevalidationIntentCanOnlyBeReclaimedWithoutAttempts(t *testing.T)
 	}
 }
 
+func TestExecutionOrderAttemptCompletionRequiresDurablePreparation(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "attempt-completion.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cs := st.CopyTrade()
+	intent, claimed, err := cs.ReserveExecutionIntent(&CopyTradeExecutionIntent{
+		TraderID: "t1", LeaderPosID: "p1", SourceRevision: 1,
+		CanonicalKey: "leader|t1|p1|1", Action: "open_long",
+	})
+	if err != nil || !claimed {
+		t.Fatalf("reserve claimed=%v err=%v", claimed, err)
+	}
+	if err = cs.CompleteExecutionOrderAttempt(intent.ID, "missing-client-id", ExecutionOrderAttemptFilled, "order-1", "FILLED", "", 1); err == nil {
+		t.Fatal("missing durable order attempt was silently accepted")
+	}
+	if _, err = cs.PrepareExecutionOrderAttempt(intent.ID, "stable-client-id", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err = cs.CompleteExecutionOrderAttempt(intent.ID, "stable-client-id", ExecutionOrderAttemptFilled, "order-1", "FILLED", "", 1); err != nil {
+		t.Fatalf("prepared order attempt completion failed: %v", err)
+	}
+}
+
+func TestSourceRevalidationIntentRebindsToAuthoritativeAction(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "source-revalidation-action.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cs := st.CopyTrade()
+	base := &CopyTradeExecutionIntent{
+		TraderID: "t1", LeaderPosID: "p1", SourceRevision: 1,
+		CanonicalKey: "leader|t1|p1|1", Action: "open_long", Symbol: "ETHUSDT",
+		Side: "long", SourceFillID: "f1", LeaderTargetSize: 1, ClientOrderID: "open-order",
+	}
+	intent, claimed, err := cs.ReserveExecutionIntent(base)
+	if err != nil || !claimed {
+		t.Fatalf("reserve claimed=%v err=%v", claimed, err)
+	}
+	if err = cs.UpdateExecutionIntent(intent.ID, ExecutionIntentReconciling, "SOURCE_REVALIDATION_REQUIRED", "", "", 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	revalidated := *base
+	revalidated.Action = "close_long"
+	revalidated.SourceFillID = "f2"
+	revalidated.SourceFillIDs = []string{"f2"}
+	revalidated.LeaderTargetSize = 0
+	revalidated.ClientOrderID = "close-order"
+	got, claimed, err := cs.ReserveExecutionIntent(&revalidated)
+	if err != nil || !claimed {
+		t.Fatalf("authoritative action rebind claimed=%v err=%v", claimed, err)
+	}
+	if got.ID != intent.ID || got.Action != "close_long" || got.LeaderTargetSize != 0 ||
+		got.ClientOrderID != "close-order" || got.Status != ExecutionIntentReserved {
+		t.Fatalf("unexpected rebound intent: %+v", got)
+	}
+}
+
+func TestSupersedeUnsubmittedExecutionIntentAllowsLaterReplay(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "source-superseded.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cs := st.CopyTrade()
+	base := &CopyTradeExecutionIntent{
+		TraderID: "t1", LeaderPosID: "p1", SourceRevision: 1,
+		CanonicalKey: "leader|t1|p1|1", Action: "open_long", Symbol: "ETHUSDT",
+		Side: "long", SourceFillID: "f1", LeaderTargetSize: 1, ClientOrderID: "open-order",
+	}
+	intent, claimed, err := cs.ReserveExecutionIntent(base)
+	if err != nil || !claimed {
+		t.Fatalf("reserve claimed=%v err=%v", claimed, err)
+	}
+	if err = cs.UpdateExecutionIntent(intent.ID, ExecutionIntentReconciling, "SOURCE_REVALIDATION_REQUIRED", "", "", 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err = cs.SupersedeUnsubmittedExecutionIntent(intent.ID, "t1", "p1"); err != nil {
+		t.Fatal(err)
+	}
+	var status, reason string
+	if err = st.DB().QueryRow(`SELECT status,reason_code FROM copy_trade_execution_intents WHERE id=?`, intent.ID).Scan(&status, &reason); err != nil {
+		t.Fatal(err)
+	}
+	if status != ExecutionIntentSkipped || reason != "SOURCE_SUPERSEDED" {
+		t.Fatalf("unexpected superseded terminal: %s/%s", status, reason)
+	}
+	replayed := *base
+	replayed.SourceFillID = "f2"
+	replayed.SourceFillIDs = []string{"f2"}
+	got, claimed, err := cs.ReserveExecutionIntent(&replayed)
+	if err != nil || !claimed || got.ID != intent.ID || got.Status != ExecutionIntentReserved {
+		t.Fatalf("later source replay must safely reclaim zero-side-effect intent: got=%+v claimed=%v err=%v", got, claimed, err)
+	}
+}
+
 func TestCopyGuardBackfillBaselineUsesConfirmedInitialOpenOnly(t *testing.T) {
 	st, err := New(filepath.Join(t.TempDir(), "baseline-evidence.db"))
 	if err != nil {
@@ -468,5 +836,45 @@ func TestCopyGuardBackfillBaselineUsesConfirmedInitialOpenOnly(t *testing.T) {
 	}
 	if !cycle.BaselineAvailable || cycle.BaselineLeaderSize != 8 || cycle.ShadowLeaderSize != 6 {
 		t.Fatalf("immutable baseline and current shadow were conflated: %+v", cycle)
+	}
+}
+
+func TestCopyGuardBackfillBaselineUsesCurrentReopenedLifecycle(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "baseline-reopen.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cs := st.CopyTrade()
+	commit := func(revision int64, action string, target float64, isAdd bool) {
+		t.Helper()
+		intent, claimed, reserveErr := cs.ReserveExecutionIntent(&CopyTradeExecutionIntent{
+			TraderID: "t1", LeaderPosID: "p1", SourceRevision: revision,
+			CanonicalKey: fmt.Sprintf("baseline-reopen-%d", revision),
+			Action:       action, Symbol: "ETHUSDT", Side: "long", MarginMode: "cross",
+			LeaderTargetSize: target, ClientOrderID: fmt.Sprintf("baseline-order-%d", revision),
+		})
+		if reserveErr != nil || !claimed {
+			t.Fatalf("reserve revision %d claimed=%v err=%v", revision, claimed, reserveErr)
+		}
+		if commitErr := cs.CommitLeaderExecutionFill(LeaderExecutionCommit{
+			IntentID: intent.ID, TraderID: "t1", LeaderID: "leader", LeaderPosID: "p1",
+			SourceRevision: revision, Action: action, IsAdd: isAdd, Symbol: "ETHUSDT", Side: "long",
+			MarginMode: "cross", LeaderTargetSize: target, FillPrice: 100, FilledQuantity: 1,
+			FilledNotional: 100, ExchangeOrderID: fmt.Sprintf("order-%d", revision), ExchangeState: "FILLED",
+		}); commitErr != nil {
+			t.Fatalf("commit revision %d: %v", revision, commitErr)
+		}
+	}
+
+	commit(1, "open_long", 8, false)
+	commit(2, "open_long", 10, true)
+	commit(3, "close_long", 0, false)
+	commit(4, "open_long", 5, false)
+	commit(5, "open_long", 7, true)
+
+	size, available, err := cs.GetConfirmedInitialLeaderSize("t1", "p1")
+	if err != nil || !available || size != 5 {
+		t.Fatalf("current reopened lifecycle baseline must use revision 4 open, not old open/add: size=%v available=%v err=%v", size, available, err)
 	}
 }

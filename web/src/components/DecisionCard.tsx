@@ -140,7 +140,13 @@ function executionStatusColor(action: DecisionAction): string {
   }
   if (
     action.protection_status &&
-    ['UNKNOWN', 'DEGRADED', 'UNPROTECTABLE'].includes(action.protection_status)
+    [
+      'UNKNOWN',
+      'DEGRADED',
+      'UNPROTECTABLE',
+      'UNPROTECTED_WARNING',
+      'FORCED_EXIT_PENDING',
+    ].includes(action.protection_status)
   ) {
     return '#F6465D'
   }

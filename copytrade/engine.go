@@ -2,6 +2,7 @@ package copytrade
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -989,18 +990,30 @@ func (e *Engine) detectBinancePositionSnapshotFills() []Fill {
 			continue
 		}
 		if mapping == nil {
-			revision := int64(0)
-			if e.isSmartMoneyMode() {
-				revision, err = e.store.CopyTrade().GetSourceSnapshotRevision(e.traderID, posID)
-				if err != nil {
-					logger.Warnf("⚠️ [%s] Smart Money 查询快照修订号失败: %v (posId=%s)", e.traderID, err, posID)
-					continue
-				}
+			revision, revisionErr := e.store.CopyTrade().GetSourceSnapshotRevision(e.traderID, posID)
+			if revisionErr != nil {
+				logger.Warnf("⚠️ [%s] %s 查询快照修订号失败: %v (posId=%s)", e.traderID, e.config.ProviderType, revisionErr, posID)
+				continue
 			}
 			fills = append(fills, e.buildBinanceSnapshotFillForPosition(pos, posID, ActionOpen, pos.Size, 0, pos.Size, revision))
 			continue
 		}
 		if mapping.Status == "ignored" {
+			if SideType(mapping.Side) != pos.Side {
+				// ignored 代表旧方向从未在跟随账户执行。领航员复用同一
+				// posId 原地反向时，旧生命周期已经确定结束，可以原子地
+				// 关闭 ignored 记录并在本轮生成新方向开仓；无需制造虚假
+				// 的跟随者平仓动作。
+				if err := e.store.CopyTrade().MarkIgnoredAsClosed(e.traderID, posID); err != nil {
+					logger.Warnf("⚠️ [%s] %s 历史仓位反向但关闭 ignored 生命周期失败: %v (posId=%s)", e.traderID, e.config.ProviderType, err, posID)
+					continue
+				}
+				nextRevision := mapping.SourceRevision + 1
+				fills = append(fills, e.buildBinanceSnapshotFillForPosition(pos, posID, ActionOpen, pos.Size, 0, pos.Size, nextRevision))
+				logger.Infof("🔄 [%s] %s 历史仓位原地反向 | posId=%s %s→%s，旧 ignored 生命周期已关闭并跟随新方向",
+					e.traderID, e.config.ProviderType, posID, mapping.Side, pos.Side)
+				continue
+			}
 			logger.Debugf("📊 [%s] %s 历史仓位仍在持仓中 | posId=%s → 持仓兜底跳过", e.traderID, e.config.ProviderType, posID)
 			continue
 		}
@@ -1009,6 +1022,24 @@ func (e *Engine) detectBinancePositionSnapshotFills() []Fill {
 		}
 
 		lastKnownSize := mapping.LastKnownSize
+		if SideType(mapping.Side) != pos.Side {
+			// 相同 leader_pos_id 的方向变化不是加减仓，而是旧生命周期
+			// 全平后建立新生命周期。这里只生成旧方向 close，等待交易所
+			// 成交、保护撤销、cycle/mapping 提交完成；下一轮 mapping 已
+			// closed 后才会生成新方向 open，从而保证严格串行。
+			fills = append(fills, e.buildBinanceSnapshotFill(
+				posID,
+				mapping.Symbol,
+				SideType(mapping.Side),
+				ActionClose,
+				lastKnownSize,
+				e.positionSignalPrice(pos),
+				lastKnownSize,
+				0,
+				mapping.SourceRevision,
+			))
+			continue
+		}
 		if pos.Size > lastKnownSize+binancePositionSizeEpsilon {
 			sizeDelta := pos.Size - lastKnownSize
 			fills = append(fills, e.buildBinanceSnapshotFillForPosition(pos, posID, ActionAdd, sizeDelta, lastKnownSize, pos.Size, mapping.SourceRevision))
@@ -1081,6 +1112,22 @@ func binanceSnapshotActionPriority(action ActionType) int {
 
 func (e *Engine) buildBinanceSnapshotFillForPosition(pos *Position, posID string, action ActionType, size, previousSize, currentSize float64, sourceRevision int64) Fill {
 	fill := e.buildBinanceSnapshotFill(posID, pos.Symbol, pos.Side, action, size, e.positionSignalPrice(pos), previousSize, currentSize, sourceRevision)
+	if e.config != nil && e.config.ProviderType == ProviderOKX {
+		fill.RawValue = math.Abs(size * fill.Price)
+		fill.ValueCurrency = "USD"
+		if pos != nil && pos.Size > 0 && pos.PositionValue > 0 {
+			// OKX public position size is native contract count. notionalUsd is
+			// already ctVal-aware, so scale the authoritative total notional by
+			// the native size delta instead of guessing contracts*price.
+			fill.Value = math.Abs(size/pos.Size) * math.Abs(pos.PositionValue)
+			fill.ValueUSDValid = fill.Value > 0
+		} else {
+			fill.Value = 0
+			fill.ValueUSDValid = false
+			fill.ValueError = "OKX position notionalUsd is unavailable for native contract conversion"
+		}
+		return fill
+	}
 	if !e.isSmartMoneyMode() || pos == nil {
 		return fill
 	}
@@ -1123,6 +1170,21 @@ func (e *Engine) buildBinanceSnapshotFill(posID, symbol string, side SideType, a
 		// also prevents identity reuse after a configured source change.
 		fillID = fmt.Sprintf("binance_snapshot|smart|g%d|r%d|%s|%s|%.8f|%.8f",
 			e.config.SourceGeneration, sourceRevision, posID, action, previousSize, currentSize)
+	} else if e.config != nil && e.config.ProviderType == ProviderOKX {
+		// OKX can reuse a posId after a complete close. Persisted source
+		// revision therefore belongs to the canonical identity just as it does
+		// for Smart Money snapshots; otherwise 0->same-size reopens inside the
+		// seen-fill TTL are indistinguishable from the previous lifecycle.
+		fillID = fmt.Sprintf("okx_snapshot|r%d|%s|%s|%.8f|%.8f",
+			sourceRevision, posID, action, previousSize, currentSize)
+	} else if e.config != nil && e.config.ProviderType == ProviderBinance &&
+		action == ActionOpen && sourceRevision > 0 {
+		// Preserve the historical Copy Management identity for all active
+		// lifecycle transitions. Only a reopened canonical position needs the
+		// persisted revision suffix; otherwise a same-size reopen/reversal can
+		// collide with the old open still held in the in-memory seen set.
+		fillID = fmt.Sprintf("binance_snapshot|r%d|%s|%s|%.8f|%.8f",
+			sourceRevision, posID, action, previousSize, currentSize)
 	}
 
 	return Fill{
@@ -1364,6 +1426,11 @@ func (e *Engine) matchOpenAddSignal(signal *TradeSignal, leaderPosMap map[string
 		// 用户如果启用了二次进场（RiskReentryEnabled），由 reentryMonitor 异步推决策，不走这里
 		if mapping.Status == store.MappingStatusStoppedByRisk {
 			logger.Infof("🛑 [%s] 账户保护止损熔断中 | posId=%s → 忽略开仓/加仓信号（等领航员平掉旧 posId 或触发二次进场）",
+				e.traderID, posID)
+			continue
+		}
+		if mapping.Status == store.MappingStatusDetached {
+			logger.Infof("🟠 [%s] 跟随仓位已脱离 | posId=%s → 仅跟踪领航员终态，不再开仓/加仓或触发 AI",
 				e.traderID, posID)
 			continue
 		}
@@ -1710,7 +1777,7 @@ func (e *Engine) processSignal(signal *TradeSignal) {
 			// hid positions or the credential expired. Never process it against
 			// cached state; release the dedup key so a complete healthy snapshot
 			// can replay the risk-reducing change after recovery.
-			e.UnmarkSeen(fill.ID)
+			e.unmarkFillSources(fill)
 			e.stats.SignalsSkipped++
 			return
 		}
@@ -1735,17 +1802,14 @@ func (e *Engine) processSignal(signal *TradeSignal) {
 	// 回填匹配结果到 signal（供后续逻辑使用）
 	signal.LeaderPosID = matchResult.PosID
 	signal.LeaderPosition = matchResult.LeaderPosition
-	if e.blockInvalidSmartMoneyRiskIncrease(signal, matchResult) {
-		e.stats.SignalsSkipped++
-		return
-	}
+	invalidSourceRiskIncrease := e.blockInvalidSourceRiskIncrease(signal, matchResult)
 
 	// ========================================
 	// Step 3: 计算跟单仓位（基于持仓变化量）
 	// ========================================
 	copySize := 0.0
 	var warnings []Warning
-	if matchResult.Action == ActionOpen || matchResult.Action == ActionAdd {
+	if !invalidSourceRiskIncrease && (matchResult.Action == ActionOpen || matchResult.Action == ActionAdd) {
 		copySize, warnings = e.calculateCopySizeByPositionChange(signal, matchResult)
 	} else {
 		logger.Debugf("📊 [%s] %s 不需要计算开仓金额，跳过金额锚定", e.traderID, matchResult.Action)
@@ -1761,6 +1825,13 @@ func (e *Engine) processSignal(signal *TradeSignal) {
 	// has an auditable terminal intent, including zero/minimum/risk skips.
 	dec := e.buildDecisionV2(signal, matchResult, copySize)
 	if !e.reserveExecutionIntent(&dec) {
+		return
+	}
+
+	if invalidSourceRiskIncrease {
+		e.commitSkippedReservedIntent(&dec, "SOURCE_VALUE_UNAVAILABLE")
+		logger.Infof("🎯 [%s] ⏭️ %s跳过 | %s | USD 价值换算不可用", e.traderID, matchResult.Action, fill.Symbol)
+		e.stats.SignalsSkipped++
 		return
 	}
 
@@ -1812,7 +1883,7 @@ func (e *Engine) processSignal(signal *TradeSignal) {
 		// 通道满时旧逻辑直接丢弃，但 fill 已 markSeen → 该信号永久丢失。
 		// 释放去重标记让下轮 poll 重放（fill 仍在回看窗口内时可恢复），
 		// 并升级为 ERROR：这是会造成漏单的严重拥塞信号。
-		e.UnmarkSeen(fill.ID)
+		e.UnmarkDecisionSources(&dec)
 		if dec.ExecutionIntentID > 0 && e.store != nil {
 			_ = e.store.CopyTrade().UpdateExecutionIntent(dec.ExecutionIntentID, store.ExecutionIntentFailed, "DECISION_CHANNEL_BUSY", "decision channel is full before execution", "", 0, 0, 0)
 		}
@@ -1842,6 +1913,9 @@ func (e *Engine) commitSkippedReservedIntent(dec *decision.Decision, reasonCode 
 	}
 	if err != nil {
 		logger.Errorf("❌ [%s] 提交跳过执行意图失败 | intent=%d reason=%s: %v", e.traderID, dec.ExecutionIntentID, reasonCode, err)
+		_ = e.store.CopyTrade().UpdateExecutionIntent(dec.ExecutionIntentID, store.ExecutionIntentReconciling,
+			"SOURCE_REVALIDATION_REQUIRED", reasonCode+" local commit failed: "+err.Error(), "", 0, 0, 0)
+		e.UnmarkDecisionSources(dec)
 	}
 }
 
@@ -1856,9 +1930,7 @@ func (e *Engine) reserveExecutionIntent(dec *decision.Decision) bool {
 	lastRevision, err := e.store.CopyTrade().GetSourceSnapshotRevision(e.traderID, dec.LeaderPosID)
 	if err != nil {
 		logger.Errorf("❌ [%s] 查询执行意图修订号失败 | posId=%s: %v", e.traderID, dec.LeaderPosID, err)
-		if dec.SourceFillID != "" {
-			e.UnmarkSeen(dec.SourceFillID)
-		}
+		e.UnmarkDecisionSources(dec)
 		return false
 	}
 	revision := lastRevision + 1
@@ -1881,14 +1953,26 @@ func (e *Engine) reserveExecutionIntent(dec *decision.Decision) bool {
 	})
 	if err != nil {
 		logger.Errorf("❌ [%s] 预留执行意图失败 | posId=%s action=%s: %v", e.traderID, dec.LeaderPosID, dec.Action, err)
-		if dec.SourceFillID != "" {
-			e.UnmarkSeen(dec.SourceFillID)
-		}
+		e.UnmarkDecisionSources(dec)
 		return false
 	}
 	if !claimed {
-		logger.Infof("⏭️ [%s] 同仓位过渡已有执行意图，合并重复 fill | intent=%d posId=%s rev=%d action=%s fill=%s",
-			e.traderID, intent.ID, dec.LeaderPosID, revision, dec.Action, dec.SourceFillID)
+		if intent.Status == store.ExecutionIntentFailed && intent.ReasonCode == "MANUAL_REVIEW_REQUIRED" {
+			logger.Errorf("🚨 [%s] 源过渡被人工复核意图阻塞，不自动重放或重复下单 | intent=%d posId=%s rev=%d target=%.8f",
+				e.traderID, intent.ID, dec.LeaderPosID, revision, dec.LeaderPosSize)
+			return false
+		}
+		replayRequired := intent.Action != dec.Action || intent.LeaderTargetSize != dec.LeaderPosSize ||
+			intent.Status == store.ExecutionIntentFilled || intent.Status == store.ExecutionIntentProtected ||
+			intent.Status == store.ExecutionIntentSkipped || intent.Status == store.ExecutionIntentFailed
+		if replayRequired {
+			e.UnmarkDecisionSources(dec)
+			logger.Infof("⏳ [%s] 后续源过渡等待前一意图推进，已释放去重键供下轮重放 | intent=%d posId=%s rev=%d current_target=%.8f next_target=%.8f",
+				e.traderID, intent.ID, dec.LeaderPosID, revision, intent.LeaderTargetSize, dec.LeaderPosSize)
+		} else {
+			logger.Infof("⏭️ [%s] 同仓位同目标过渡已有执行意图，合并重复 fill | intent=%d posId=%s rev=%d action=%s fill=%s",
+				e.traderID, intent.ID, dec.LeaderPosID, revision, dec.Action, dec.SourceFillID)
+		}
 		return false
 	}
 	dec.ExecutionIntentID = intent.ID
@@ -1900,17 +1984,24 @@ func (e *Engine) reserveExecutionIntent(dec *decision.Decision) bool {
 	return true
 }
 
-// blockInvalidSmartMoneyRiskIncrease enforces the value/conversion fail-closed
-// boundary. A missing catalog entry or FX rate can never authorize an open or
-// add, while reduce/close remains available from the persisted exact mapping.
-func (e *Engine) blockInvalidSmartMoneyRiskIncrease(signal *TradeSignal, match *SignalMatchResult) bool {
-	if !e.isSmartMoneyMode() || signal == nil || signal.Fill == nil || match == nil {
+// blockInvalidSourceRiskIncrease enforces the value/unit conversion fail-closed
+// boundary for position-snapshot sources that require explicit USD
+// normalization. A missing OKX contract notional, catalog entry or FX rate can
+// never authorize an open/add; reduce/close remains available from the exact
+// persisted mapping and live follower position.
+func (e *Engine) blockInvalidSourceRiskIncrease(signal *TradeSignal, match *SignalMatchResult) bool {
+	if signal == nil || signal.Fill == nil || match == nil {
+		return false
+	}
+	fill := signal.Fill
+	requiresValidatedValue := e.isSmartMoneyMode() ||
+		(e.config != nil && e.config.ProviderType == ProviderOKX && strings.HasPrefix(fill.ID, "okx_snapshot|"))
+	if !requiresValidatedValue {
 		return false
 	}
 	if match.Action != ActionOpen && match.Action != ActionAdd {
 		return false
 	}
-	fill := signal.Fill
 	if fill.ValueUSDValid && fill.Value > 0 {
 		return false
 	}
@@ -1918,44 +2009,28 @@ func (e *Engine) blockInvalidSmartMoneyRiskIncrease(signal *TradeSignal, match *
 	if reason == "" {
 		reason = "USD value conversion is unavailable"
 	}
-	logger.Warnf("🚫 [%s] Smart Money 禁止风险增加 | %s %s | %s", e.traderID, match.Action, fill.Symbol, reason)
-
-	if e.store != nil && match.LeaderPosition != nil {
-		pos := match.LeaderPosition
-		mapping, err := e.store.CopyTrade().GetMapping(e.traderID, match.PosID)
-		if err != nil {
-			logger.Warnf("⚠️ [%s] 查询 Smart Money 基线映射失败: %v", e.traderID, err)
-		} else if mapping == nil || mapping.Status == store.MappingStatusClosed {
-			if err := e.store.CopyTrade().RebaselineIgnoredPosition(e.traderID, e.config.LeaderID, match.PosID, pos.Symbol, string(pos.Side), pos.MarginMode, pos.Size); err != nil {
-				logger.Warnf("⚠️ [%s] 保存 Smart Money 已跳过仓位基线失败: %v", e.traderID, err)
-			}
-		} else if mapping.Status == store.MappingStatusActive && pos.Size > mapping.LastKnownSize {
-			if err := e.store.CopyTrade().UpdateLastKnownSize(e.traderID, match.PosID, pos.Size); err != nil {
-				logger.Warnf("⚠️ [%s] 更新 Smart Money 已跳过加仓基线失败: %v", e.traderID, err)
-			}
-		}
-	}
+	logger.Warnf("🚫 [%s] 领航员快照禁止风险增加 | provider=%s %s %s | %s", e.traderID, e.config.ProviderType, match.Action, fill.Symbol, reason)
 
 	traderName := e.traderID
 	if e.store != nil {
 		traderName = e.store.Trader().ResolveDisplayName(e.traderID)
 	}
-	dedup := fmt.Sprintf("smart_money_value|%s|%s|%s|%d", e.traderID, fill.Symbol, match.Action, time.Now().Unix()/3600)
+	dedup := fmt.Sprintf("source_value|%s|%s|%s|%s|%d", e.traderID, e.config.ProviderType, fill.Symbol, match.Action, time.Now().Unix()/3600)
 	notifier.Notify(notifier.Alert{
 		Time: time.Now(), Category: "copy_trade", TraderID: e.traderID, TraderName: traderName,
-		Title:   fmt.Sprintf("Smart Money 已跳过 %s 风险增加", fill.Symbol),
+		Title:   fmt.Sprintf("跟单已跳过 %s 风险增加", fill.Symbol),
 		Body:    fmt.Sprintf("领航员: %s\n合约: %s\n动作: %s\n原因: %s\n处理: 本次不开仓/不加仓并重建基线；后续减仓、平仓仍允许。", e.config.LeaderID, fill.Symbol, match.Action, reason),
 		RateKey: dedup, DedupKey: dedup,
 	})
 	if e.store != nil {
 		if err := e.store.CopyTrade().LogCopyEvent(&store.CopyTradeEvent{
-			TraderID: e.traderID, LeaderID: e.config.LeaderID, ProviderType: string(ProviderBinance),
+			TraderID: e.traderID, LeaderID: e.config.LeaderID, ProviderType: string(e.config.ProviderType),
 			Category: store.CopyEventCategoryError, EventType: "SOURCE_VALUE_UNAVAILABLE",
 			Severity: store.CopyEventSeverityWarn, Symbol: fill.Symbol, Side: string(fill.PositionSide), LeaderPosID: match.PosID,
-			SignalID: fill.ID, Status: "skipped", Summary: "Smart Money 风险增加因合约目录或汇率不可用被拒绝",
+			SignalID: fill.ID, Status: "skipped", Summary: "领航员风险增加因合约单位或美元名义不可验证被拒绝",
 			Detail: map[string]interface{}{"action": match.Action, "value_currency": fill.ValueCurrency, "reason": reason}, DedupKey: dedup,
 		}); err != nil {
-			logger.Warnf("⚠️ [%s] 保存 Smart Money 价值异常事件失败: %v", e.traderID, err)
+			logger.Warnf("⚠️ [%s] 保存领航员价值异常事件失败: %v", e.traderID, err)
 		}
 	}
 	return true
@@ -2015,7 +2090,7 @@ func (e *Engine) buildDecisionV2(signal *TradeSignal, match *SignalMatchResult, 
 	}
 
 	// ============================================================
-	// 减仓：计算比例 + 累积减仓检测
+	// 减仓：只按本次权威仓位变化计算比例。
 	// ============================================================
 	if match.Action == ActionReduce {
 		ratio := e.calculateReduceRatioV2(signal, match)
@@ -2585,6 +2660,13 @@ func (e *Engine) syncLeaderState() error {
 			e.traderID, key, pos.PosID, pos.Symbol, pos.Side, pos.MarginMode, pos.Size)
 	}
 
+	// A restart can leave a source transition reserved before any exchange
+	// submission. Only a successfully installed healthy snapshot may decide
+	// whether that reservation is still actionable. Existing positions are
+	// left for the normal transition detector to reclaim and re-run preflight;
+	// missing positions are terminally superseded without advancing a mapping.
+	e.supersedeMissingUnsubmittedIntents()
+
 	// 🔑 检查 ignored 仓位是否已被领航员平仓
 	// 如果是，标记为 closed，这样后续重新开仓可以跟随
 	// 同时处理 stopped_by_risk → closed（v3 风控恢复机制）
@@ -2607,6 +2689,38 @@ func (e *Engine) syncLeaderState() error {
 	return nil
 }
 
+func (e *Engine) supersedeMissingUnsubmittedIntents() {
+	if e.store == nil {
+		return
+	}
+	intents, err := e.store.CopyTrade().ListUnfinishedExecutionIntents(e.traderID)
+	if err != nil {
+		logger.Warnf("⚠️ [%s] 获取待恢复执行意图失败: %v", e.traderID, err)
+		return
+	}
+	leaderPosMap := e.buildLeaderPosMap()
+	for _, intent := range intents {
+		if intent == nil ||
+			intent.SourceKind != "LEADER_TRANSITION" ||
+			intent.Status != store.ExecutionIntentReconciling ||
+			intent.ReasonCode != "SOURCE_REVALIDATION_REQUIRED" {
+			continue
+		}
+		if _, stillExists := leaderPosMap[intent.LeaderPosID]; stillExists {
+			continue
+		}
+		if err := e.store.CopyTrade().SupersedeUnsubmittedExecutionIntent(
+			intent.ID, e.traderID, intent.LeaderPosID,
+		); err != nil {
+			logger.Warnf("⚠️ [%s] 淘汰已失效的未提交执行意图失败: intent=%d posId=%s err=%v",
+				e.traderID, intent.ID, intent.LeaderPosID, err)
+			continue
+		}
+		logger.Infof("⏭️ [%s] 未提交执行意图已被健康快照淘汰 | intent=%d posId=%s reason=SOURCE_SUPERSEDED",
+			e.traderID, intent.ID, intent.LeaderPosID)
+	}
+}
+
 // lookupLeaderHistory 从领航员公共历史仓位里找 leaderPosId 对应的平仓记录。
 // 只读补强：查询失败或未命中都返回 nil，调用方必须有降级路径。
 func (e *Engine) lookupLeaderHistory(leaderPosID, symbol, side string) *OKXLeaderPositionHistoryRecord {
@@ -2620,6 +2734,67 @@ func (e *Engine) lookupLeaderHistory(leaderPosID, symbol, side string) *OKXLeade
 		return nil
 	}
 	return matchLeaderHistoryRecord(records, leaderPosID, symbol, side)
+}
+
+// closeCopyGuardCycleAtLeaderExit is the single attribution close path for a
+// source position that has disappeared. It is shared by verified protective
+// stops and protection-establishment exits: both need the leader's final price
+// before no-Guard baseline and net protection effect can be scored.
+func (e *Engine) closeCopyGuardCycleAtLeaderExit(mapping *store.CopyTradePositionMapping) bool {
+	if mapping == nil || e.config == nil || e.config.RiskPolicyVersion < 4 {
+		return true
+	}
+	cycle, err := e.store.CopyTrade().GetOpenCopyGuardCycle(e.traderID, mapping.LeaderPosID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return true
+		}
+		logger.Warnf("⚠️ [%s] 查询待关闭 Copy Guard 周期失败: %v | posId=%s", e.traderID, err, mapping.LeaderPosID)
+		return false
+	}
+
+	// Prefer authoritative public leader history. When it is delayed, close
+	// with the latest healthy observation and let refreshEstimatedBaselines
+	// calibrate the outcome later.
+	closePrice, baselineSource := cycle.LastObservedPrice, "last_observed"
+	if rec := e.lookupLeaderHistory(mapping.LeaderPosID, cycle.Symbol, cycle.Side); rec != nil && rec.ExitPrice > 0 {
+		closePrice, baselineSource = rec.ExitPrice, "leader_history"
+	}
+	attempts, _ := e.store.CopyTrade().ListCopyGuardAttempts(cycle.ID)
+	baseline, baselineOK := ComputeOwnPathBaseline(cycle, attempts, closePrice)
+	if !baselineOK {
+		baseline = cycle.BaselineRealizedPnL
+		if cycle.LeaderEntryPrice > 0 && closePrice > 0 {
+			move := (closePrice - cycle.LeaderEntryPrice) / cycle.LeaderEntryPrice
+			if cycle.Side == "short" {
+				move = -move
+			}
+			baseline += cycle.BaselineNotional * move
+		}
+	}
+
+	// The observation summary must be persisted before CloseCopyGuardCycle
+	// invalidates all still-open evaluation state.
+	emitWatchSummary(e.store.CopyTrade(), e.traderID, cycle, closePrice)
+	// CloseCopyGuardCycle may synchronously emit the final reconciled summary.
+	// Persist evidence quality first so every downstream reader observes the
+	// same attribution source.
+	if err := e.store.CopyTrade().SetCopyGuardBaselineSource(cycle.ID, baselineSource); err != nil {
+		logger.Warnf("⚠️ [%s] Copy Guard 基线来源保存失败: %v | cycle=%d", e.traderID, err, cycle.ID)
+		return false
+	}
+	if err := e.store.CopyTrade().CloseCopyGuardCycle(cycle.ID, store.CopyGuardLeaderClosed, cycle.ActualPnL, baseline, cycle.Fees, cycle.FundingFee, cycle.LiquidationPenalty, cycle.Slippage); err != nil {
+		logger.Warnf("⚠️ [%s] Copy Guard 周期关闭失败: %v | cycle=%d posId=%s", e.traderID, err, cycle.ID, mapping.LeaderPosID)
+		return false
+	}
+	_ = e.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{
+		CycleID: cycle.ID, TraderID: e.traderID, Type: "LEADER_CLOSED", Price: closePrice,
+		Metadata: map[string]interface{}{
+			"baseline_estimated": baselineSource != "leader_history",
+			"baseline_source":    baselineSource,
+		},
+	})
+	return true
 }
 
 func matchLeaderHistoryRecord(records []OKXLeaderPositionHistoryRecord, leaderPosID, symbol, side string) *OKXLeaderPositionHistoryRecord {
@@ -2738,6 +2913,9 @@ func (e *Engine) checkIgnoredPositionsClosed() {
 	}
 	for _, mapping := range stoppedMappings {
 		if _, exists := leaderPosIds[mapping.LeaderPosID]; !exists {
+			if !e.closeCopyGuardCycleAtLeaderExit(mapping) {
+				continue
+			}
 			// 领航员完全平掉了该 posId → 熔断解除（标 closed）
 			if err := e.store.CopyTrade().MarkStoppedByRiskAsClosed(e.traderID, mapping.LeaderPosID); err != nil {
 				logger.Warnf("⚠️ [%s] 更新 stopped_by_risk→closed 失败: %v (posId=%s)",
@@ -2745,35 +2923,29 @@ func (e *Engine) checkIgnoredPositionsClosed() {
 			} else {
 				logger.Infof("✅ [%s] 风控熔断解除 | posId=%s %s %s → stopped_by_risk→closed（领航员已平掉旧仓）",
 					e.traderID, mapping.LeaderPosID, mapping.Symbol, mapping.Side)
-				if e.config.RiskPolicyVersion >= 4 {
-					if cycle, cerr := e.store.CopyTrade().GetOpenCopyGuardCycle(e.traderID, mapping.LeaderPosID); cerr == nil {
-						// 优先用领航员公共历史仓位的真实平仓价校准未兜底基线；
-						// 查不到时先用最后观测价关闭，后台 refreshEstimatedBaselines 补全。
-						closePrice, baselineSource := cycle.LastObservedPrice, "last_observed"
-						if rec := e.lookupLeaderHistory(mapping.LeaderPosID, cycle.Symbol, cycle.Side); rec != nil && rec.ExitPrice > 0 {
-							closePrice, baselineSource = rec.ExitPrice, "leader_history"
-						}
-						// own-path 口径；attempt 数据不完整时回退旧口径（影子名义）
-						attempts, _ := e.store.CopyTrade().ListCopyGuardAttempts(cycle.ID)
-						baseline, baselineOK := ComputeOwnPathBaseline(cycle, attempts, closePrice)
-						if !baselineOK {
-							baseline = cycle.BaselineRealizedPnL
-							if cycle.LeaderEntryPrice > 0 && closePrice > 0 {
-								move := (closePrice - cycle.LeaderEntryPrice) / cycle.LeaderEntryPrice
-								if cycle.Side == "short" {
-									move = -move
-								}
-								baseline += cycle.BaselineNotional * move
-							}
-						}
-						// 观察期收尾统计（挽回/错过、门控占比等）须在周期关闭前写入
-						emitWatchSummary(e.store.CopyTrade(), e.traderID, cycle, closePrice)
-						_ = e.store.CopyTrade().CloseCopyGuardCycle(cycle.ID, store.CopyGuardLeaderClosed, cycle.ActualPnL, baseline, cycle.Fees, cycle.FundingFee, cycle.LiquidationPenalty, cycle.Slippage)
-						_ = e.store.CopyTrade().SetCopyGuardBaselineSource(cycle.ID, baselineSource)
-						_ = e.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: e.traderID, Type: "LEADER_CLOSED", Price: closePrice, Metadata: map[string]interface{}{"baseline_estimated": true, "baseline_source": baselineSource}})
-					}
-				}
 			}
+		}
+	}
+
+	// Detached mappings have no follower position and no stop-loss evidence.
+	// They remain source-tracked only until the leader's position disappears.
+	detachedMappings, err := e.store.CopyTrade().ListDetachedMappings(e.traderID)
+	if err != nil {
+		logger.Warnf("⚠️ [%s] 获取 detached 映射失败: %v", e.traderID, err)
+		return
+	}
+	for _, mapping := range detachedMappings {
+		if _, exists := leaderPosIds[mapping.LeaderPosID]; exists {
+			continue
+		}
+		if !e.closeCopyGuardCycleAtLeaderExit(mapping) {
+			continue
+		}
+		if err := e.store.CopyTrade().MarkDetachedAsClosed(e.traderID, mapping.LeaderPosID); err != nil {
+			logger.Warnf("⚠️ [%s] 更新 detached→closed 失败: %v (posId=%s)", e.traderID, err, mapping.LeaderPosID)
+		} else {
+			logger.Infof("📊 [%s] 脱离仓位的领航员生命周期结束 | posId=%s → detached→closed",
+				e.traderID, mapping.LeaderPosID)
 		}
 	}
 }
@@ -2833,6 +3005,44 @@ func (e *Engine) UnmarkSeen(id string) {
 	e.seenMu.Lock()
 	defer e.seenMu.Unlock()
 	delete(e.seenFills, id)
+}
+
+// UnmarkDecisionSources releases every raw fill collapsed into one normalized
+// leader transition, plus the synthetic snapshot id. Releasing only one id can
+// leave the remaining evidence permanently seen and make a failed transition
+// impossible to reconstruct on the next healthy poll.
+func (e *Engine) UnmarkDecisionSources(dec *decision.Decision) {
+	if dec == nil {
+		return
+	}
+	unique := make(map[string]struct{}, len(dec.SourceFillIDs)+1)
+	for _, id := range append(append([]string(nil), dec.SourceFillIDs...), dec.SourceFillID) {
+		if id == "" {
+			continue
+		}
+		if _, exists := unique[id]; exists {
+			continue
+		}
+		unique[id] = struct{}{}
+		e.UnmarkSeen(id)
+	}
+}
+
+func (e *Engine) unmarkFillSources(fill *Fill) {
+	if fill == nil {
+		return
+	}
+	unique := make(map[string]struct{}, len(fill.SourceFillIDs)+1)
+	for _, id := range append(append([]string(nil), fill.SourceFillIDs...), fill.ID) {
+		if id == "" {
+			continue
+		}
+		if _, exists := unique[id]; exists {
+			continue
+		}
+		unique[id] = struct{}{}
+		e.UnmarkSeen(id)
+	}
 }
 
 func (e *Engine) cleanExpiredFills() {

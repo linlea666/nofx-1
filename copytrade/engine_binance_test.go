@@ -241,6 +241,110 @@ func TestBinancePositionSnapshotDetectsOpenAddReduceCloseAndIgnoresHistorical(t 
 	})
 }
 
+func TestOKXSnapshotRevisionDistinguishesCloseReopen(t *testing.T) {
+	e, st := newTestCopyTradeEngine(t, ProviderOKX)
+	const posID = "okx-reused-position"
+	pos := binanceTestPosition(posID, 0.01)
+	pos.PositionValue = 20
+	pos.ValueUSDValid = true
+	e.leaderState.Positions[posID] = pos
+
+	first := e.detectBinancePositionSnapshotFills()
+	retry := e.detectBinancePositionSnapshotFills()
+	if len(first) != 1 || len(retry) != 1 || first[0].ID != retry[0].ID {
+		t.Fatalf("unacknowledged OKX snapshot must retain one identity: first=%+v retry=%+v", first, retry)
+	}
+	if err := st.CopyTrade().SavePositionMapping(&store.CopyTradePositionMapping{
+		TraderID: e.traderID, LeaderPosID: posID, LeaderID: e.config.LeaderID,
+		Symbol: pos.Symbol, Side: string(pos.Side), MarginMode: pos.MarginMode,
+		OpenedAt: time.Now(), OpenPrice: pos.EntryPrice, LastKnownSize: pos.Size,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CopyTrade().CloseMapping(e.traderID, posID, pos.MarkPrice); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened := e.detectBinancePositionSnapshotFills()
+	if len(reopened) != 1 || reopened[0].Action != ActionOpen {
+		t.Fatalf("expected OKX reopen snapshot: %+v", reopened)
+	}
+	if reopened[0].ID == first[0].ID {
+		t.Fatalf("reused OKX posId and size must not reuse prior lifecycle identity: %s", reopened[0].ID)
+	}
+}
+
+func TestPositionSnapshotSerializesSameIDDirectionReversal(t *testing.T) {
+	for _, providerType := range []ProviderType{ProviderBinance, ProviderOKX} {
+		t.Run(string(providerType), func(t *testing.T) {
+			e, st := newTestCopyTradeEngine(t, providerType)
+			const posID = "reused-direction-position"
+			saveActiveMapping(t, st, posID, 0.02)
+
+			reversed := binanceTestPosition(posID, 0.02)
+			reversed.Side = SideShort
+			reversed.PositionValue = reversed.Size * reversed.MarkPrice
+			reversed.ValueUSDValid = true
+			e.leaderState.Positions[posID] = reversed
+
+			closeOld := e.detectBinancePositionSnapshotFills()
+			if len(closeOld) != 1 {
+				t.Fatalf("direction reversal close fills=%d want 1: %+v", len(closeOld), closeOld)
+			}
+			if closeOld[0].Action != ActionClose || closeOld[0].PositionSide != SideLong ||
+				closeOld[0].Size != 0.02 {
+				t.Fatalf("direction reversal must close old long lifecycle first: %+v", closeOld[0])
+			}
+
+			// Until the old lifecycle is durably committed, every poll must
+			// retain the same close identity and must not emit the new open.
+			retry := e.detectBinancePositionSnapshotFills()
+			if len(retry) != 1 || retry[0].ID != closeOld[0].ID {
+				t.Fatalf("uncommitted reversal close changed identity: first=%+v retry=%+v", closeOld, retry)
+			}
+			if err := st.CopyTrade().CloseMapping(e.traderID, posID, reversed.MarkPrice); err != nil {
+				t.Fatal(err)
+			}
+
+			openNew := e.detectBinancePositionSnapshotFills()
+			if len(openNew) != 1 || openNew[0].Action != ActionOpen || openNew[0].PositionSide != SideShort {
+				t.Fatalf("new short lifecycle must open only after old mapping closed: %+v", openNew)
+			}
+			if openNew[0].ID == closeOld[0].ID {
+				t.Fatalf("new lifecycle reused reversal close identity: %s", openNew[0].ID)
+			}
+		})
+	}
+}
+
+func TestIgnoredSnapshotDirectionReversalStartsNewLifecycleWithoutFollowerClose(t *testing.T) {
+	e, st := newTestCopyTradeEngine(t, ProviderOKX)
+	const posID = "ignored-reused-direction"
+	if err := st.CopyTrade().SaveIgnoredPosition(e.traderID, e.config.LeaderID, posID, "ETHUSDT", string(SideLong), "cross"); err != nil {
+		t.Fatal(err)
+	}
+	reversed := binanceTestPosition(posID, 0.02)
+	reversed.Side = SideShort
+	reversed.PositionValue = reversed.Size * reversed.MarkPrice
+	reversed.ValueUSDValid = true
+	e.leaderState.Positions[posID] = reversed
+
+	fills := e.detectBinancePositionSnapshotFills()
+	if len(fills) != 1 || fills[0].Action != ActionOpen || fills[0].PositionSide != SideShort {
+		t.Fatalf("ignored reversal should create only the new open lifecycle: %+v", fills)
+	}
+	mapping, err := st.CopyTrade().GetMappingForReconciliation(e.traderID, posID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mapping == nil || mapping.Status != "closed" || mapping.SourceRevision != 1 {
+		t.Fatalf("old ignored lifecycle was not durably closed: %+v", mapping)
+	}
+	if !strings.Contains(fills[0].ID, "|r1|") {
+		t.Fatalf("new ignored-reversal snapshot must use advanced revision: %s", fills[0].ID)
+	}
+}
+
 func TestBinancePollUsesRealtimeSnapshotBeforeDelayedTradeHistory(t *testing.T) {
 	const posID = "1239518824_ETHUSDT_LONG"
 	e, st := newTestCopyTradeEngine(t, ProviderBinance)

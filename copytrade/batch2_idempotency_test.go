@@ -4,11 +4,12 @@ package copytrade
 //   - S2 OKX 分页截断 fail-closed（同毫秒满页停滞 / 页数硬顶用尽）
 //   - S3 copyPortfolioID 绑定 60s TTL + stale 降级
 //   - S4 Provider 指纹去重降级为单次调用内去重（跨轮去重收敛到引擎）
-//   - S9 STOP_PARTIAL 残仓重试耗尽后升级 GUARD_UNPROTECTABLE 处置
+//   - S9 STOP_PARTIAL 残仓在常规重试耗尽后继续慢速退出并保留真实止损证据
 
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -193,7 +194,7 @@ func TestBinanceGetFillsKeepsFillsVisibleAcrossPollsForEngineReplay(t *testing.T
 }
 
 // ---------------------------------------------------------------------------
-// S9: STOP_PARTIAL 残仓强平耗尽后升级 GUARD_UNPROTECTABLE 处置
+// S9: STOP_PARTIAL 残仓强平耗尽后继续慢速退出，归零后按真实止损结算
 // ---------------------------------------------------------------------------
 
 func TestStopPartialEscalatesToUnprotectableAfterRetriesExhausted(t *testing.T) {
@@ -229,11 +230,178 @@ func TestStopPartialEscalatesToUnprotectableAfterRetriesExhausted(t *testing.T) 
 	if executor.closeCalls != 1 {
 		t.Fatalf("escalation must issue exactly one forced exit: %d", executor.closeCalls)
 	}
+	// The close ACK is not a stop settlement. Fresh flatness on the next poll
+	// finalizes the already-triggered protective stop.
+	executor.positions = nil
+	ti.pollV4ProtectiveStops()
 	got, err := st.CopyTrade().GetCopyGuardCycle(cycle.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Status != store.CopyGuardStoppedWatching {
-		t.Fatalf("exhausted residual retries must escape STOP_PARTIAL via unprotectable handling: %+v", got.Status)
+	if got.Status != store.CopyGuardStoppedWatching || got.StopCount != 1 {
+		t.Fatalf("residual cleanup must preserve the real protective-stop outcome: status=%s stop_count=%d", got.Status, got.StopCount)
+	}
+}
+
+func TestOrdinaryCopyUnprotectableDefaultsToWarningWithoutMarketExit(t *testing.T) {
+	st, err := store.New(filepath.Join(t.TempDir(), "unprotected-warning.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	executor := &stopMgrExecutor{mockStopMgr: &mockStopMgr{}}
+	ti := NewTraderIntegration("trader-1", executor, st)
+	ti.engine = &Engine{
+		traderID: "trader-1",
+		config: &CopyConfig{
+			ProviderType:                 ProviderOKX,
+			RiskPolicyVersion:            4,
+			RiskUnprotectableDisposition: "warn",
+		},
+		store:       st,
+		leaderState: &AccountState{Positions: map[string]*Position{}},
+	}
+	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{
+		TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "leader-pos",
+		Symbol: "ETHUSDT", Side: "long", MarginMode: "cross",
+		Status: store.CopyGuardFollowing, PolicySnapshot: `{"defaults_version":8,"unprotectable_disposition":"warn"}`,
+		FollowerEntryPrice: 100, FollowerNotional: 10, AccountEquity: 100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if outcome := ti.handleUnprotectableCycle(cycle, errors.New("exchange rejected stop"), false); outcome != "warn" {
+		t.Fatalf("ordinary-copy default outcome=%q want warn", outcome)
+	}
+	if executor.closeCalls != 0 {
+		t.Fatalf("warning policy must not market-exit: close_calls=%d", executor.closeCalls)
+	}
+	got, err := st.CopyTrade().GetCopyGuardCycle(cycle.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != store.CopyGuardFollowing || got.ProtectionStatus != store.CopyGuardProtectionUnprotectedWarning {
+		t.Fatalf("warning policy must retain the cycle and expose the naked-position state: %+v", got)
+	}
+}
+
+func TestUnprotectableMarketExitWaitsForConfirmedFlatBeforeDetaching(t *testing.T) {
+	st, err := store.New(filepath.Join(t.TempDir(), "unprotected-close-confirm.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	executor := &stopMgrExecutor{mockStopMgr: &mockStopMgr{}, positions: []map[string]interface{}{
+		{"symbol": "ETHUSDT", "side": "long", "mgnMode": "cross", "positionAmt": .1, "entryPrice": 100.0},
+	}}
+	ti := NewTraderIntegration("trader-1", executor, st)
+	ti.engine = &Engine{
+		traderID: "trader-1",
+		config: &CopyConfig{
+			ProviderType:                 ProviderOKX,
+			RiskPolicyVersion:            4,
+			RiskUnprotectableDisposition: "close",
+		},
+		store:       st,
+		leaderState: &AccountState{Positions: map[string]*Position{}},
+	}
+	if err = st.CopyTrade().SavePositionMapping(&store.CopyTradePositionMapping{
+		TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "leader-pos",
+		Symbol: "ETHUSDT", Side: "long", MarginMode: "cross",
+		Status: store.MappingStatusActive, OpenedAt: time.Now(), LastKnownSize: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{
+		TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "leader-pos",
+		Symbol: "ETHUSDT", Side: "long", MarginMode: "cross",
+		Status: store.CopyGuardFollowing, PolicySnapshot: `{"defaults_version":8,"unprotectable_disposition":"close"}`,
+		FollowerEntryPrice: 100, FollowerNotional: 10, AccountEquity: 100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = st.CopyTrade().OpenCopyGuardAttempt(cycle.ID, 0, 100, 10, .1, 2); err != nil {
+		t.Fatal(err)
+	}
+
+	if outcome := ti.handleUnprotectableCycle(cycle, errors.New("exchange rejected stop"), false); outcome != "close_pending" {
+		t.Fatalf("submission ACK with live position must remain pending, got %q", outcome)
+	}
+	mapping, err := st.CopyTrade().GetMapping("trader-1", "leader-pos")
+	if err != nil || mapping.Status != store.MappingStatusActive {
+		t.Fatalf("ACK alone must not detach mapping: mapping=%+v err=%v", mapping, err)
+	}
+	got, err := st.CopyTrade().GetCopyGuardCycle(cycle.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != store.CopyGuardFollowing || got.ClosedAt != nil ||
+		got.ProtectionStatus != store.CopyGuardProtectionForcedExitPending {
+		t.Fatalf("ACK alone must preserve open lifecycle: %+v", got)
+	}
+	attempts, err := st.CopyTrade().ListCopyGuardAttempts(cycle.ID)
+	if err != nil || len(attempts) != 1 || attempts[0].ExitOrderID != "forced-close" {
+		t.Fatalf("pending forced exit must retain the submitted close-order evidence: attempts=%+v err=%v", attempts, err)
+	}
+
+	executor.positions = nil
+	if outcome := ti.finalizeUnprotectedMarketExit(got, "exchange rejected stop"); outcome != "close_confirmed" {
+		t.Fatalf("fresh flat confirmation must finalize the exit, got %q", outcome)
+	}
+	mapping, err = st.CopyTrade().GetMapping("trader-1", "leader-pos")
+	if err != nil || mapping.Status != store.MappingStatusDetached {
+		t.Fatalf("confirmed flat must detach mapping from AI reentry: mapping=%+v err=%v", mapping, err)
+	}
+	got, err = st.CopyTrade().GetCopyGuardCycle(cycle.ID)
+	if err != nil || got.Status != store.CopyGuardProtectionExited || got.ClosedAt != nil || got.StopCount != 0 {
+		t.Fatalf("confirmed forced exit must remain distinct from protective stop: cycle=%+v err=%v", got, err)
+	}
+}
+
+func TestUnprotectableMarketExitRequiresDurablePendingStateBeforeSubmission(t *testing.T) {
+	st, err := store.New(filepath.Join(t.TempDir(), "unprotected-state-barrier.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := &stopMgrExecutor{mockStopMgr: &mockStopMgr{}}
+	ti := NewTraderIntegration("trader-1", executor, st)
+	cycle := &store.CopyGuardCycle{
+		ID: 1, TraderID: "trader-1", LeaderPosID: "leader-pos",
+		Symbol: "ETHUSDT", Side: "long", MarginMode: "cross",
+		Status:         store.CopyGuardFollowing,
+		PolicySnapshot: `{"defaults_version":8,"unprotectable_disposition":"close"}`,
+	}
+
+	// A close ACK without a durable FORCED_EXIT_PENDING transition leaves no
+	// restart evidence. Simulate a persistence outage and prove the executor is
+	// never called before that state barrier succeeds.
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if outcome := ti.handleUnprotectableCycle(cycle, errors.New("exchange rejected stop"), false); outcome != "state_error" {
+		t.Fatalf("persistence failure outcome=%q want state_error", outcome)
+	}
+	if executor.closeCalls != 0 {
+		t.Fatalf("forced exit submitted without durable pending state: close_calls=%d", executor.closeCalls)
+	}
+}
+
+func TestUnprotectablePolicyMigratesOldForcedCloseButHonorsV8ExplicitClose(t *testing.T) {
+	ti := &TraderIntegration{}
+	legacy := &store.CopyGuardCycle{PolicySnapshot: `{"defaults_version":7,"unprotectable_action":"close"}`}
+	if got := ti.unprotectableDisposition(legacy); got != "warn" {
+		t.Fatalf("pre-v8 forced close cannot be distinguished from the old default and must migrate to warn: %s", got)
+	}
+	explicitV8 := &store.CopyGuardCycle{PolicySnapshot: `{"defaults_version":8,"unprotectable_disposition":"close","unprotectable_action":"close"}`}
+	if got := ti.unprotectableDisposition(explicitV8); got != "close" {
+		t.Fatalf("v8 explicit close must remain effective: %s", got)
+	}
+	if requiresUnprotectedForcedExit(&store.CopyGuardCycle{Status: store.CopyGuardFollowing}) {
+		t.Fatal("ordinary initial copy must use the configured warn/close policy")
+	}
+	if !requiresUnprotectedForcedExit(&store.CopyGuardCycle{Status: store.CopyGuardFollowingReentry, ReentryCount: 1}) {
+		t.Fatal("an AI/legacy reentry must never downgrade a failed forced exit to naked warning mode")
 	}
 }

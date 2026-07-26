@@ -84,7 +84,7 @@ func TestPartialCloseSkipsWhenNoMatchingPosition(t *testing.T) {
 	at := &AutoTrader{trader: fake, exchange: "okx"}
 
 	err := at.executeCloseLongWithRecord(newPartialCloseDecision("close_long", 0.5), &store.DecisionAction{})
-	if !errors.Is(err, ErrPartialCloseSkipped) {
+	if !errors.Is(err, ErrFollowerPositionMissing) {
 		t.Fatalf("unmatched position must be skipped, got %v", err)
 	}
 	if len(fake.closedLong) != 0 {
@@ -92,14 +92,14 @@ func TestPartialCloseSkipsWhenNoMatchingPosition(t *testing.T) {
 	}
 
 	err = at.executeCloseShortWithRecord(newPartialCloseDecision("close_short", 0.5), &store.DecisionAction{})
-	if !errors.Is(err, ErrPartialCloseSkipped) || len(fake.closedShort) != 0 {
+	if !errors.Is(err, ErrFollowerPositionMissing) || len(fake.closedShort) != 0 {
 		t.Fatalf("short path must be symmetric: err=%v orders=%v", err, fake.closedShort)
 	}
 }
 
-// S5: OKX ctVal=1 的币种，1 张仓位减 50% 会被向上取整回 1 张（即全平）。
-// 精确步长可用时必须预判并跳过。
-func TestPartialCloseSkipsWhenStepRoundingWouldCloseAll(t *testing.T) {
+// S5: OKX ctVal=1 的币种，1 张仓位减 50% 不足一个完整交易步长。
+// 动作级量化必须向下处理为 sub-lot 并跳过，禁止向上提升为 1 张导致全平。
+func TestPartialCloseSkipsSubLotWithoutRoundingUpToFullPosition(t *testing.T) {
 	fake := &partialCloseFakeTrader{
 		positions: []map[string]interface{}{
 			{"symbol": "ETHUSDT", "side": "long", "mgnMode": "cross", "positionAmt": 1.0, "entryPrice": 100.0},
@@ -109,8 +109,8 @@ func TestPartialCloseSkipsWhenStepRoundingWouldCloseAll(t *testing.T) {
 	at := &AutoTrader{trader: fake, exchange: "okx"}
 
 	err := at.executeCloseLongWithRecord(newPartialCloseDecision("close_long", 0.5), &store.DecisionAction{})
-	if !errors.Is(err, ErrPartialCloseSkipped) {
-		t.Fatalf("rounded-up close covering the whole position must be skipped, got %v", err)
+	if !errors.Is(err, ErrPartialCloseSubLot) {
+		t.Fatalf("sub-lot partial close must be skipped without rounding up, got %v", err)
 	}
 	if len(fake.closedLong) != 0 {
 		t.Fatalf("no order may be placed: %v", fake.closedLong)
@@ -146,7 +146,7 @@ func TestPartialCloseFallsBackToLegacyThresholdWithoutResolver(t *testing.T) {
 	at := &AutoTrader{trader: fake, exchange: "okx"}
 
 	err := at.executeCloseLongWithRecord(newPartialCloseDecision("close_long", 0.5), &store.DecisionAction{})
-	if !errors.Is(err, ErrPartialCloseSkipped) {
+	if !errors.Is(err, ErrPartialCloseBelowMinimum) {
 		t.Fatalf("tiny position without resolver must fall back to legacy skip, got %v", err)
 	}
 	if len(fake.closedLong) != 0 {

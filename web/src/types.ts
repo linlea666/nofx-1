@@ -324,7 +324,8 @@ export interface CopyConfigRequest {
   risk_reentry_recovery_escalation?: number // 默认 1.5：第 N 次重入恢复幅度倍率
 
   // v5 可保护性状态机 / 噪音档重入
-  risk_unprotectable_action?: 'close' | 'follow' // follow 仅旧协议兼容；所有新保存与运行时均强制 close
+  risk_unprotectable_disposition?: 'warn' | 'close'
+  risk_unprotectable_action?: 'close' | 'follow' // 旧协议兼容：follow 等价于 warn
   risk_reentry_noise_override?: boolean // 默认 false：距离/ATR<0.3 的噪音档仍允许重入（默认该档禁止重入）
 }
 
@@ -833,6 +834,7 @@ export interface CopyTradeConfig {
   risk_reentry_cooldown_escalation?: number
   risk_reentry_recovery_escalation?: number
   // v5 可保护性状态机 / 噪音档重入
+  risk_unprotectable_disposition?: 'warn' | 'close'
   risk_unprotectable_action?: 'close' | 'follow'
   risk_reentry_noise_override?: boolean
   created_at?: string
@@ -958,10 +960,12 @@ export interface CopyGuardCycle {
     | 'VERIFIED'
     | 'UNKNOWN'
     | 'DEGRADED'
+    | 'UNPROTECTED_WARNING'
+    | 'FORCED_EXIT_PENDING'
     | 'TRIGGERED'
     | 'CANCELED'
     | 'CLAMPED' // v5：止损价被强平缓冲夹紧（比目标更紧），保护单有效
-    | 'UNPROTECTABLE' // v5：确认无法建立有效保护（终态，按 unprotectable_action 处理）
+    | 'UNPROTECTABLE' // 历史兼容状态；新周期使用 UNPROTECTED_WARNING/FORCED_EXIT_PENDING
   protection_coverage: number
   protection_retries: number
   protection_error: string

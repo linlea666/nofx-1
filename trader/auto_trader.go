@@ -1032,6 +1032,20 @@ var ErrPartialCloseSkipped = errors.New("partial close skipped (no order placed)
 // exchange order: the requested reduction is smaller than one executable lot.
 var ErrPartialCloseSubLot = fmt.Errorf("%w: %w", ErrPartialCloseSkipped, ErrQuantitySubLot)
 
+// ErrPartialCloseWouldFlatten is a successful source acknowledgement with no
+// exchange order. A partial reduction rounded to the entire follower position,
+// so executing it would violate the leader's still-open target.
+var ErrPartialCloseWouldFlatten = fmt.Errorf("%w: partial close would flatten follower", ErrPartialCloseSkipped)
+
+// ErrPartialCloseBelowMinimum is a successful source acknowledgement with no
+// exchange order because the venue would reject the quantized reduction.
+var ErrPartialCloseBelowMinimum = fmt.Errorf("%w: partial close below exchange minimum", ErrPartialCloseSkipped)
+
+// ErrFollowerPositionMissing is not an execution failure and must not be
+// treated as a filled/skipped reduction. It tells the copy layer to detach the
+// stale mapping after a fresh exchange position read and suppress AI reentry.
+var ErrFollowerPositionMissing = fmt.Errorf("%w: follower position missing", ErrPartialCloseSkipped)
+
 // deriveHalvedRetryClientOrderID 为保证金不足的减半重试生成派生幂等 ID：
 // 原 ID 追加 "h1" 后缀（超长时截断原 ID 保留后缀，按 OKX clOrdId 32 字符
 // 上限取最严格值）。初次失败单可能已在交易所留下零成交终态记录并永久占用
@@ -1159,7 +1173,7 @@ func (at *AutoTrader) guardPartialCloseQuantity(symbol string, totalQuantity, cl
 				logger.Warnf("  ⚠️ 减仓量 %.8f 取整到步长 %.8f 后 (%.8f) 覆盖全仓 %.8f，跳过本次减仓",
 					closeQuantity, inst.BaseQuantityStep, rounded, totalQuantity)
 				return 0, fmt.Errorf("%w: 减仓量 %.8f 取整到步长 %.8f 后覆盖全仓 %.8f",
-					ErrPartialCloseSkipped, closeQuantity, inst.BaseQuantityStep, totalQuantity)
+					ErrPartialCloseWouldFlatten, closeQuantity, inst.BaseQuantityStep, totalQuantity)
 			}
 			return rounded, nil
 		}
@@ -1170,7 +1184,7 @@ func (at *AutoTrader) guardPartialCloseQuantity(symbol string, totalQuantity, cl
 		logger.Warnf("  ⚠️ 仓位太小 (%.4f < %.4f)，无法按 %.0f%% 比例减仓，跳过本次操作",
 			totalQuantity, minPositionForPartialClose, closeRatio*100)
 		return 0, fmt.Errorf("%w: 仓位 %.4f 过小无法按 %.0f%% 减仓",
-			ErrPartialCloseSkipped, totalQuantity, closeRatio*100)
+			ErrPartialCloseBelowMinimum, totalQuantity, closeRatio*100)
 	}
 	return closeQuantity, nil
 }
@@ -1294,8 +1308,9 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 
 	// 检查是否为跟单操作（显式 IsCopyTrade 标志；旧 Reasoning 文案匹配向后兼容）
 	isCopyTrade := decision.IsCopyTrade || strings.Contains(decision.Reasoning, "Copy trading")
-	// 检查是否为加仓操作（跟单加仓时 Reasoning 包含 "add"）
-	isAddPosition := isCopyTrade && strings.Contains(strings.ToLower(decision.Reasoning), "add")
+	// Explicit CopyTradeAction is the canonical action identity. The helper
+	// retains Reasoning parsing only for decisions persisted by old clients.
+	isAddPosition := isCopyTrade && copyOpenQuantityKind(decision) == QuantityAdd
 
 	// 跟单开仓 MarginMode 为空（SyncMarginMode=false 或数据源未提供）：
 	// 回填为交易员自身配置的模式，让后续的重复仓位检查、mapping 记录、
@@ -1388,6 +1403,8 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 	} else {
 		adjustedPositionSize, wasCapped := at.enforcePositionValueRatio(decision.PositionSizeUSD, equity, decision.Symbol)
 		if wasCapped {
+			logger.Infof("  ⚠️ [RISK CONTROL] Position %.2f USDT exceeds configured value-ratio limit; capping to %.2f USDT for %s",
+				decision.PositionSizeUSD, adjustedPositionSize, decision.Symbol)
 			decision.PositionSizeUSD = adjustedPositionSize
 		}
 	}
@@ -1551,8 +1568,9 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 
 	// 检查是否为跟单操作（显式 IsCopyTrade 标志；旧 Reasoning 文案匹配向后兼容）
 	isCopyTrade := decision.IsCopyTrade || strings.Contains(decision.Reasoning, "Copy trading")
-	// 检查是否为加仓操作（跟单加仓时 Reasoning 包含 "add"）
-	isAddPosition := isCopyTrade && strings.Contains(strings.ToLower(decision.Reasoning), "add")
+	// Keep duplicate-position gating on the same canonical action classifier
+	// used by quantity policy so UI/log wording cannot turn an add into an open.
+	isAddPosition := isCopyTrade && copyOpenQuantityKind(decision) == QuantityAdd
 
 	// 跟单开仓 MarginMode 回填（与 executeOpenLongWithRecord 对称，见其注释）
 	at.fillCopyTradeMarginMode(isCopyTrade, decision)
@@ -1643,6 +1661,8 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 	} else {
 		adjustedPositionSize, wasCapped := at.enforcePositionValueRatio(decision.PositionSizeUSD, equity, decision.Symbol)
 		if wasCapped {
+			logger.Infof("  ⚠️ [RISK CONTROL] Position %.2f USDT exceeds configured value-ratio limit; capping to %.2f USDT for %s",
+				decision.PositionSizeUSD, adjustedPositionSize, decision.Symbol)
 			decision.PositionSizeUSD = adjustedPositionSize
 		}
 	}
@@ -1860,7 +1880,7 @@ func (at *AutoTrader) executeCloseLongWithRecord(decision *decision.Decision, ac
 		}
 		if totalQuantity <= 0 {
 			return fmt.Errorf("%w: 未找到匹配的多头仓位，无法按 %.0f%% 减仓",
-				ErrPartialCloseSkipped, decision.CloseRatio*100)
+				ErrFollowerPositionMissing, decision.CloseRatio*100)
 		}
 		closeQuantity = totalQuantity * decision.CloseRatio
 		logger.Infof("  📊 Partial close: %.0f%% of %.4f = %.4f", decision.CloseRatio*100, totalQuantity, closeQuantity)
@@ -1883,7 +1903,7 @@ func (at *AutoTrader) executeCloseLongWithRecord(decision *decision.Decision, ac
 			logger.Warnf("  ⚠️ 减仓价值太小 (%.2f < $%.0f)，跳过本次操作（等待后续全平）",
 				closeValue, minOrderValue)
 			return fmt.Errorf("%w: 减仓价值 %.2f 低于 Hyperliquid 最小订单价值 $%.0f",
-				ErrPartialCloseSkipped, closeValue, minOrderValue)
+				ErrPartialCloseBelowMinimum, closeValue, minOrderValue)
 		}
 	}
 
@@ -2013,7 +2033,7 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *decision.Decision, a
 		}
 		if totalQuantity <= 0 {
 			return fmt.Errorf("%w: 未找到匹配的空头仓位，无法按 %.0f%% 减仓",
-				ErrPartialCloseSkipped, decision.CloseRatio*100)
+				ErrFollowerPositionMissing, decision.CloseRatio*100)
 		}
 		closeQuantity = totalQuantity * decision.CloseRatio
 		logger.Infof("  📊 Partial close: %.0f%% of %.4f = %.4f", decision.CloseRatio*100, totalQuantity, closeQuantity)
@@ -2034,7 +2054,7 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *decision.Decision, a
 			logger.Warnf("  ⚠️ 减仓价值太小 (%.2f < $%.0f)，跳过本次操作（等待后续全平）",
 				closeValue, minOrderValue)
 			return fmt.Errorf("%w: 减仓价值 %.2f 低于 Hyperliquid 最小订单价值 $%.0f",
-				ErrPartialCloseSkipped, closeValue, minOrderValue)
+				ErrPartialCloseBelowMinimum, closeValue, minOrderValue)
 		}
 	}
 
@@ -2780,8 +2800,6 @@ func (at *AutoTrader) enforcePositionValueRatio(positionSizeUSD float64, equity 
 
 	// Check if position size exceeds limit
 	if positionSizeUSD > maxPositionValue {
-		logger.Infof("  ⚠️ [RISK CONTROL] Position %.2f USDT exceeds limit (equity %.2f × %.1fx = %.2f USDT max for %s), capping",
-			positionSizeUSD, equity, maxPositionValueRatio, maxPositionValue, symbol)
 		return maxPositionValue, true
 	}
 

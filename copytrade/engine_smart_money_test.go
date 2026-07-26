@@ -25,6 +25,55 @@ func makeSmartPosition(id, symbol string, size float64, valid bool) *Position {
 		ValueCurrency: "USDC", ValueUSDValid: valid, ValueError: "USDC/USD rate unavailable"}
 }
 
+func TestAttachRawFillSourcesKeepsUniqueMatchingEvidence(t *testing.T) {
+	snapshot := []Fill{{ID: "snapshot", Symbol: "SOXSUSDT", PositionSide: SideLong}}
+	raw := []Fill{
+		{ID: "f1", Symbol: "SOXSUSDT", PositionSide: SideLong},
+		{ID: "f1", Symbol: "SOXSUSDT", PositionSide: SideLong},
+		{ID: "f2", Symbol: "SOXSUSDT", PositionSide: SideLong},
+		{ID: "other-side", Symbol: "SOXSUSDT", PositionSide: SideShort},
+		{ID: "other-symbol", Symbol: "BTCUSDT", PositionSide: SideLong},
+	}
+	attachRawFillSources(snapshot, raw)
+	if len(snapshot[0].SourceFillIDs) != 2 ||
+		snapshot[0].SourceFillIDs[0] != "f1" ||
+		snapshot[0].SourceFillIDs[1] != "f2" {
+		t.Fatalf("snapshot source evidence must be unique and narrowly matched: %+v", snapshot[0].SourceFillIDs)
+	}
+}
+
+func TestOKXSnapshotUsesContractAwareUSDNotional(t *testing.T) {
+	e, st := newTestCopyTradeEngine(t, ProviderOKX)
+	pos := &Position{
+		PosID: "okx-pos", Symbol: "TESTUSDT", Side: SideLong,
+		Size: 100, MarkPrice: 10, PositionValue: 50, MarginMode: "cross",
+	}
+	e.leaderState = &AccountState{TotalEquity: 1000, Positions: map[string]*Position{pos.PosID: pos}}
+	open := e.detectBinancePositionSnapshotFills()
+	if len(open) != 1 || open[0].Value != 50 || !open[0].ValueUSDValid || open[0].ValueCurrency != "USD" {
+		t.Fatalf("OKX open must use ctVal-aware notionalUsd, not contracts*price: %+v", open)
+	}
+	saveActiveMapping(t, st, pos.PosID, 80)
+	add := e.detectBinancePositionSnapshotFills()
+	if len(add) != 1 || add[0].Action != ActionAdd || add[0].Size != 20 || add[0].Value != 10 || !add[0].ValueUSDValid {
+		t.Fatalf("OKX add must scale authoritative total notional by contract delta: %+v", add)
+	}
+}
+
+func TestOKXSnapshotMissingUSDNotionalFailsClosedForRiskIncrease(t *testing.T) {
+	e, _ := newTestCopyTradeEngine(t, ProviderOKX)
+	pos := &Position{
+		PosID: "okx-pos", Symbol: "TESTUSDT", Side: SideLong,
+		Size: 100, MarkPrice: 10, PositionValue: 0, MarginMode: "cross",
+	}
+	fill := e.buildBinanceSnapshotFillForPosition(pos, pos.PosID, ActionOpen, pos.Size, 0, pos.Size, 0)
+	signal := &TradeSignal{Fill: &fill}
+	match := &SignalMatchResult{Action: ActionOpen, PosID: pos.PosID, LeaderPosition: pos}
+	if fill.Value != 0 || fill.ValueUSDValid || !e.blockInvalidSourceRiskIncrease(signal, match) {
+		t.Fatalf("missing OKX notionalUsd must block risk increase: %+v", fill)
+	}
+}
+
 func TestSmartMoneySnapshotCarriesValueIdentityAndFailsClosedOnOpen(t *testing.T) {
 	e, st := newTestCopyTradeEngine(t, ProviderBinance)
 	e.config.BinanceSourceMode = BinanceSourceSmartMoney
@@ -47,6 +96,14 @@ func TestSmartMoneySnapshotCarriesValueIdentityAndFailsClosedOnOpen(t *testing.T
 	mapping, err := st.CopyTrade().GetMapping(e.traderID, pos.PosID)
 	if err != nil || mapping == nil || mapping.Status != "ignored" {
 		t.Fatalf("blocked open must become baseline: %+v err=%v", mapping, err)
+	}
+	var intentStatus, reasonCode string
+	if err = st.DB().QueryRow(`SELECT status,reason_code FROM copy_trade_execution_intents
+		WHERE trader_id=? AND leader_pos_id=? ORDER BY id DESC LIMIT 1`, e.traderID, pos.PosID).Scan(&intentStatus, &reasonCode); err != nil {
+		t.Fatal(err)
+	}
+	if intentStatus != store.ExecutionIntentSkipped || reasonCode != "SOURCE_VALUE_UNAVAILABLE" {
+		t.Fatalf("recognized but unvalued open must keep an auditable skipped intent: %s/%s", intentStatus, reasonCode)
 	}
 }
 

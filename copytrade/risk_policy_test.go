@@ -275,33 +275,3 @@ func TestAvailableCopyGuardRiskUsesSmallestRemainingBudget(t *testing.T) {
 		t.Fatal("exhausted portfolio budget must reject sizing")
 	}
 }
-
-func TestAvailableCopyGuardFollowFirstIgnoresAttemptButKeepsHardCaps(t *testing.T) {
-	c := &CopyConfig{RiskAccountPct: .02, RiskCycleLossBudgetPct: .05, RiskPortfolioLossBudgetPct: .08}
-	available, err := AvailableCopyGuardFollowFirstRiskUSD(c, 100, store.CopyGuardRiskUsage{CycleUsedUSD: 2.98, PortfolioUsedUSD: 5.5})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if available < 2.019999 || available > 2.020001 {
-		t.Fatalf("available=%v, want 2.02 cycle remaining", available)
-	}
-	if _, err := AvailableCopyGuardFollowFirstRiskUSD(c, 100, store.CopyGuardRiskUsage{CycleUsedUSD: 5}); err == nil {
-		t.Fatal("cycle hard cap must remain enforced")
-	}
-	if _, err := AvailableCopyGuardFollowFirstRiskUSD(c, 100, store.CopyGuardRiskUsage{PortfolioUsedUSD: 8}); err == nil {
-		t.Fatal("portfolio hard cap must remain enforced")
-	}
-}
-
-func TestIsSingleStepFollowFirstOverflow(t *testing.T) {
-	entry := 1935.6375
-	if !IsSingleStepFollowFirstOverflow(123.8808, 122.6309, 0.001, entry) {
-		t.Fatal("one execution step above the normal plan must be recognized after restart")
-	}
-	if IsSingleStepFollowFirstOverflow(126, 122.6309, 0.001, entry) {
-		t.Fatal("more than one execution step must remain a hard rejection")
-	}
-	if IsSingleStepFollowFirstOverflow(122.7, 122.6309, 0.001, entry) {
-		t.Fatal("floating tolerance must not create a synthetic override")
-	}
-}

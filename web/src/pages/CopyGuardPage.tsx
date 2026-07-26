@@ -44,9 +44,11 @@ const statusLabels: Record<string, string> = {
   AI_ABANDONED: 'AI 已确认放弃',
   BUDGET_SUSPENDED: 'AI 调用额度耗尽',
   WATCH_TIMEOUT: '观察超时·等待领航员平仓',
+  PROTECTION_EXITED: '无法保护·已按配置市价离场',
+  DETACHED: '跟随仓位已脱离·仅跟踪领航员',
   CYCLE_LOSS_CAPPED: '周期亏损熔断·等待领航员平仓（v5 前历史）',
-  // 注：不可保护（裸跑）不是周期状态——follow 模式下周期保持 FOLLOWING，
-  // 信号载体是 protection_status=UNPROTECTABLE（下方保护状态标红）
+  // 注：不可保护（裸跑）不是周期状态——warn 模式下周期保持 FOLLOWING，
+  // 信号载体是 protection_status=UNPROTECTED_WARNING（下方保护状态标红）
 }
 // 空仓观察态：止损成交后跟随者无本地持仓，protection_status 残留 TRIGGERED
 // 是上一笔保护单的终态，不是"保护异常"——按中性"观察中·无持仓"呈现，
@@ -74,6 +76,8 @@ const protectionLabels: Record<string, string> = {
   CANCELED: '已撤销',
   CLAMPED: '已保护·止损被强平价挤紧',
   UNPROTECTABLE: '无法保护·裸跑（高危）',
+  UNPROTECTED_WARNING: '无保护·已警告并继续重试',
+  FORCED_EXIT_PENDING: '无法保护·市价离场确认中',
 }
 const accountingLabels: Record<string, string> = {
   OPEN: '交易进行中',
@@ -1623,7 +1627,8 @@ function ManualSignalsBanner() {
               {!confirming.protectable && (
                 <span className="text-[#F6465D]">
                   {' '}
-                  注意：预检显示重入后可能无法建立有效保护止损；若成交后确实无法保护，系统将按您配置的「不可保护处置」（默认：立即平仓）自动兜底。
+                  注意：预检显示重入后可能无法建立有效保护止损；AI
+                  重入成交后若无法确认保护，系统始终立即市价退出，且不会把该退出再次计为止损重入信号。
                 </span>
               )}
             </div>
@@ -2384,7 +2389,9 @@ export function CopyGuardPage() {
                         ? 'text-[#0ECB81]'
                         : c.protection_status === 'UNKNOWN' ||
                             c.protection_status === 'DEGRADED' ||
-                            c.protection_status === 'UNPROTECTABLE'
+                            c.protection_status === 'UNPROTECTABLE' ||
+                            c.protection_status === 'UNPROTECTED_WARNING' ||
+                            c.protection_status === 'FORCED_EXIT_PENDING'
                           ? 'text-[#F6465D] font-bold'
                           : 'text-[#F0B90B]'
                   }`}
@@ -2393,7 +2400,9 @@ export function CopyGuardPage() {
                   (c.protection_status === 'UNKNOWN' ||
                     c.protection_status === 'DEGRADED' ||
                     c.protection_status === 'PENDING' ||
-                    c.protection_status === 'UNPROTECTABLE')
+                    c.protection_status === 'UNPROTECTABLE' ||
+                    c.protection_status === 'UNPROTECTED_WARNING' ||
+                    c.protection_status === 'FORCED_EXIT_PENDING')
                     ? '已结束'
                     : isWatchingFlat(c)
                       ? '观察中·无持仓'

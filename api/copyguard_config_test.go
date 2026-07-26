@@ -4,6 +4,7 @@ import (
 	"math"
 	"testing"
 
+	"nofx/copytrade"
 	"nofx/store"
 )
 
@@ -85,6 +86,28 @@ func TestApplyCopyConfigRiskFieldsV4DefaultsAndExplicitZero(t *testing.T) {
 	if cfg.RiskMaxReentries != 0 || cfg.RiskReentryBandATR != 0 || cfg.RiskReentryCooldownSeconds != 0 || cfg.RiskSlippageBufferBPS != 0 || cfg.RiskLiquidationBufferATR != 0 {
 		t.Fatalf("explicit zero was overwritten: %+v", cfg)
 	}
+	cfg = store.NewCopyGuardDefaults()
+	cfg.ProviderType = "okx"
+	cfg.RiskReentryMinRecoveryATR = 0.5
+	applyCopyConfigRiskFields(cfg, &CopyConfigReq{
+		RiskPolicyVersion:         4,
+		RiskReentryMinRecoveryATR: &zeroFloat,
+	})
+	if cfg.RiskReentryMinRecoveryATR != 0 {
+		t.Fatalf("valid zero recovery threshold was ignored: %+v", cfg)
+	}
+}
+
+func TestCopyGuardSaveEntryDefaultsShareCanonicalFactory(t *testing.T) {
+	cfg := &store.CopyTradeConfig{ProviderType: "okx", RiskPolicyVersion: 4, RiskReentryDecisionMode: "ai_guarded"}
+	applyCopyGuardV4Request(cfg, nil, &CopyTradeConfigRequest{})
+	defaults := store.NewCopyGuardDefaults()
+	if cfg.RiskMaxReentries != defaults.RiskMaxReentries ||
+		cfg.RiskReentryCooldownSeconds != defaults.RiskReentryCooldownSeconds ||
+		cfg.RiskReentryBandATR != defaults.RiskReentryBandATR ||
+		cfg.RiskReentryMaxChaseATR != defaults.RiskReentryMaxChaseATR {
+		t.Fatalf("standalone config endpoint defaults drifted from trader create/update endpoint: got=%+v defaults=%+v", cfg, defaults)
+	}
 }
 
 // 不支持 Copy Guard 的数据源（Hyperliquid）即使前端携带 risk_policy_version=4
@@ -108,8 +131,37 @@ func TestApplyCopyConfigRiskFieldsStripsUnsupportedProvider(t *testing.T) {
 	if cfg.RiskStopLossEnabled || cfg.RiskReentryEnabled {
 		t.Fatalf("[hyperliquid] risk switches should stay off: %+v", cfg)
 	}
-	if cfg.RiskManualReentryEnabled || cfg.RiskUnprotectableAction != "close" {
+	if cfg.RiskManualReentryEnabled || cfg.RiskUnprotectableDisposition != "warn" || cfg.RiskUnprotectableAction != "follow" {
 		t.Fatalf("[hyperliquid] retired settings must be normalized on every write: %+v", cfg)
+	}
+}
+
+func TestApplyCopyConfigRiskFieldsMapsCanonicalAndLegacyUnprotectablePolicy(t *testing.T) {
+	cfg := store.NewCopyGuardDefaults()
+	cfg.ProviderType = "okx"
+	applyCopyConfigRiskFields(cfg, &CopyConfigReq{RiskUnprotectableDisposition: "close"})
+	if cfg.RiskUnprotectableDisposition != "close" || cfg.RiskUnprotectableAction != "close" {
+		t.Fatalf("canonical close was not persisted: %+v", cfg)
+	}
+	cfg = store.NewCopyGuardDefaults()
+	cfg.ProviderType = "okx"
+	applyCopyConfigRiskFields(cfg, &CopyConfigReq{RiskUnprotectableAction: "follow"})
+	if cfg.RiskUnprotectableDisposition != "warn" || cfg.RiskUnprotectableAction != "follow" {
+		t.Fatalf("legacy follow was not mapped to warn: %+v", cfg)
+	}
+	cfg = store.NewCopyGuardDefaults()
+	cfg.ProviderType = "okx"
+	applyCopyConfigRiskFields(cfg, &CopyConfigReq{RiskUnprotectableDisposition: "typo"})
+	if err := copytrade.ValidateStoredRiskPolicy(cfg); err == nil {
+		t.Fatalf("invalid canonical disposition must reach shared validation instead of being silently normalized: %+v", cfg)
+	}
+	old := store.NewCopyGuardDefaults()
+	old.RiskUnprotectableDisposition = "close"
+	old.RiskUnprotectableAction = "close"
+	cfg = store.NewCopyGuardDefaults()
+	applyCopyGuardV4Request(cfg, old, &CopyTradeConfigRequest{})
+	if cfg.RiskUnprotectableDisposition != "close" || cfg.RiskUnprotectableAction != "close" {
+		t.Fatalf("partial config update must preserve an existing explicit close policy: %+v", cfg)
 	}
 }
 

@@ -19,11 +19,14 @@ type copyFlowFakeTrader struct {
 	openLongClientIDs       []string
 	closePreservingCalls    int
 	plainCloseCalls         int
+	positions               []map[string]interface{}
 }
 
-func (f *copyFlowFakeTrader) GetPositions() ([]map[string]interface{}, error) { return nil, nil }
-func (f *copyFlowFakeTrader) GetMarketPrice(string) (float64, error)          { return 100, nil }
-func (f *copyFlowFakeTrader) SetMarginMode(string, bool) error                { return nil }
+func (f *copyFlowFakeTrader) GetPositions() ([]map[string]interface{}, error) {
+	return f.positions, nil
+}
+func (f *copyFlowFakeTrader) GetMarketPrice(string) (float64, error) { return 100, nil }
+func (f *copyFlowFakeTrader) SetMarginMode(string, bool) error       { return nil }
 func (f *copyFlowFakeTrader) GetBalance() (map[string]interface{}, error) {
 	return map[string]interface{}{"availableBalance": 10000.0, "totalEquity": 10000.0}, nil
 }
@@ -125,6 +128,26 @@ func TestLeaderCopyInsufficientMarginDoesNotSilentlyShrink(t *testing.T) {
 	}
 	if dec.PositionSizeUSD != 100 {
 		t.Fatalf("ordinary leader target must stay explicit, got %.2f", dec.PositionSizeUSD)
+	}
+}
+
+func TestExplicitAddActionBypassesDuplicatePositionGate(t *testing.T) {
+	fake := &copyFlowFakeTrader{
+		positions: []map[string]interface{}{
+			{"symbol": "ETHUSDT", "side": "long", "mgnMode": "cross", "positionAmt": 1.0},
+		},
+	}
+	at := newCopyFlowAutoTrader(fake)
+	dec := &decision.Decision{
+		Symbol: "ETHUSDT", Action: "open_long", IsCopyTrade: true,
+		CopyTradeAction: "add", Reasoning: "leader size changed", ClientOrderID: "cg44a0",
+		PositionSizeUSD: 100, Leverage: 5, EntryPrice: 100, MarginMode: "cross",
+	}
+	if err := at.executeOpenLongWithRecord(dec, &store.DecisionAction{}); err != nil {
+		t.Fatalf("explicit add action must not depend on reasoning wording: %v", err)
+	}
+	if len(fake.openLongClientIDs) != 1 {
+		t.Fatalf("explicit add must submit exactly once: %v", fake.openLongClientIDs)
 	}
 }
 

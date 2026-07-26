@@ -498,14 +498,15 @@ type CopyConfigReq struct {
 	RiskExtremeConfirmValue     *float64 `json:"risk_extreme_risk_confirm_value,omitempty"`
 	RiskStopExtremeConfirmValue *float64 `json:"risk_stop_extreme_confirm_value,omitempty"`
 
-	// v4.1 重入加严（零值由 store.FillRiskDefaults 兜底）
-	RiskReentryMinRecoveryATR     float64 `json:"risk_reentry_min_recovery_atr,omitempty"`
-	RiskReentryCooldownEscalation float64 `json:"risk_reentry_cooldown_escalation,omitempty"`
-	RiskReentryRecoveryEscalation float64 `json:"risk_reentry_recovery_escalation,omitempty"`
+	// v4.1 重入加严（缺失时兼容旧默认；显式零值可关闭恢复幅度门槛）
+	RiskReentryMinRecoveryATR     *float64 `json:"risk_reentry_min_recovery_atr,omitempty"`
+	RiskReentryCooldownEscalation float64  `json:"risk_reentry_cooldown_escalation,omitempty"`
+	RiskReentryRecoveryEscalation float64  `json:"risk_reentry_recovery_escalation,omitempty"`
 
 	// v5 可保护性状态机 / 噪音档重入
-	RiskUnprotectableAction  string `json:"risk_unprotectable_action,omitempty"`
-	RiskReentryNoiseOverride *bool  `json:"risk_reentry_noise_override,omitempty"`
+	RiskUnprotectableDisposition string `json:"risk_unprotectable_disposition,omitempty"`
+	RiskUnprotectableAction      string `json:"risk_unprotectable_action,omitempty"`
+	RiskReentryNoiseOverride     *bool  `json:"risk_reentry_noise_override,omitempty"`
 }
 
 // applyCopyConfigRiskFields 把 CopyConfigReq 中的 Copy Guard 风控字段透传到 store.CopyTradeConfig
@@ -522,7 +523,7 @@ func applyCopyConfigRiskFields(copyConfig *store.CopyTradeConfig, req *CopyConfi
 	// Retired fields remain readable for old clients, but every write path
 	// normalizes them before provider-specific early returns.
 	manualDeprecated := applyRetiredCopyGuardCompatibility(copyConfig, req.RiskManualReentryEnabled)
-	copyConfig.RiskUnprotectableAction = "close"
+	applyUnprotectableCompatibility(copyConfig, req.RiskUnprotectableDisposition, req.RiskUnprotectableAction, req.RiskUnprotectableAction != "")
 	// Copy Guard（risk_policy_version >= 4）支持 OKX 与 Binance 领航员数据源。
 	// 不支持的数据源（Hyperliquid）对所有 Copy Guard 风控字段无意义，若不剥离
 	// risk_policy_version，后续 "v4 only for OKX/Binance" 校验会把其正常跟单
@@ -595,9 +596,10 @@ func applyCopyConfigRiskFields(copyConfig *store.CopyTradeConfig, req *CopyConfi
 	if req.RiskAddonBudgetPct != nil {
 		copyConfig.RiskAddonBudgetPct = *req.RiskAddonBudgetPct
 	}
-	// v4.1 重入加严：零值由 store.FillRiskDefaults 兜底
-	if req.RiskReentryMinRecoveryATR != 0 {
-		copyConfig.RiskReentryMinRecoveryATR = req.RiskReentryMinRecoveryATR
+	// v4.1 重入加严：字段缺失沿用旧值/默认值；显式 0 表示关闭该恢复幅度门槛。
+	if req.RiskReentryMinRecoveryATR != nil {
+		copyConfig.RiskReentryMinRecoveryATR = *req.RiskReentryMinRecoveryATR
+		copyConfig.RiskReentryMinRecoveryATRExplicit = true
 	}
 	if req.RiskReentryCooldownEscalation != 0 {
 		copyConfig.RiskReentryCooldownEscalation = req.RiskReentryCooldownEscalation
@@ -605,9 +607,6 @@ func applyCopyConfigRiskFields(copyConfig *store.CopyTradeConfig, req *CopyConfi
 	if req.RiskReentryRecoveryEscalation != 0 {
 		copyConfig.RiskReentryRecoveryEscalation = req.RiskReentryRecoveryEscalation
 	}
-	// "follow" is retained in the request schema only for old clients.
-	// New saves always fail closed; known unprotected positions may not run.
-	copyConfig.RiskUnprotectableAction = "close"
 	if req.RiskReentryDecisionMode != nil {
 		copyConfig.RiskReentryDecisionMode = *req.RiskReentryDecisionMode
 	}

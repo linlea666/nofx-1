@@ -61,10 +61,6 @@ const (
 	// 用于 Engine 层判断 currentSize/lastKnownSize
 	NearZeroThreshold = 0.05
 
-	// AccumulatedCloseThreshold 累积减仓触发全平阈值
-	// 当累积减仓比例 >= 90% 时，自动触发全量平仓
-	AccumulatedCloseThreshold = 0.90
-
 	// MinOrderValue 最小订单价值（适用于 Hyperliquid 等有此限制的交易所）
 	// 减仓价值低于此值时跳过，等待后续全平
 	MinOrderValue = 10.0
@@ -243,12 +239,15 @@ type CopyConfig struct {
 	// adds are proportional and never read this field.
 	RiskAddonBudgetPct float64 `json:"risk_addon_budget_pct"`
 	// v4.1 重入加严（字段含义见 store.CopyTradeConfig 同名注释）
-	RiskReentryMinRecoveryATR     float64 `json:"risk_reentry_min_recovery_atr"`
-	RiskReentryCooldownEscalation float64 `json:"risk_reentry_cooldown_escalation"`
-	RiskReentryRecoveryEscalation float64 `json:"risk_reentry_recovery_escalation"`
-	// RiskUnprotectableAction: 保护单不可建立（clamp 也不可行）时的处置模式（v5）。
-	//   "close"（默认）：保护优先——立即平掉跟单仓位，周期进入观察期
-	//   "follow"：跟单优先——继续裸跑，UI 标红 + 升级告警（用户显式选择）
+	RiskReentryMinRecoveryATR         float64 `json:"risk_reentry_min_recovery_atr"`
+	RiskReentryMinRecoveryATRExplicit bool    `json:"-"`
+	RiskReentryCooldownEscalation     float64 `json:"risk_reentry_cooldown_escalation"`
+	RiskReentryRecoveryEscalation     float64 `json:"risk_reentry_recovery_escalation"`
+	// RiskUnprotectableDisposition is the runtime policy for ordinary
+	// leader-following positions. AI reentry keeps its independent fail-closed
+	// post-fill protection barrier.
+	RiskUnprotectableDisposition string `json:"risk_unprotectable_disposition,omitempty"`
+	// RiskUnprotectableAction is the legacy close/follow wire field.
 	RiskUnprotectableAction string `json:"risk_unprotectable_action"`
 	// RiskReentryNoiseOverride: 止损距离/ATR < 0.3（极易扫损档）时默认禁用自动
 	// 重入；置 true 可强制放行（按谨慎档执行）。
@@ -334,7 +333,7 @@ func (c *CopyConfig) FillRiskDefaults() {
 		if c.RiskAddonBudgetPct == 0 {
 			c.RiskAddonBudgetPct = 0.15
 		}
-		if c.RiskReentryMinRecoveryATR == 0 {
+		if c.RiskReentryMinRecoveryATR == 0 && !c.RiskReentryMinRecoveryATRExplicit {
 			c.RiskReentryMinRecoveryATR = 0.5
 		}
 		if c.RiskReentryCooldownEscalation == 0 {
@@ -343,8 +342,11 @@ func (c *CopyConfig) FillRiskDefaults() {
 		if c.RiskReentryRecoveryEscalation == 0 {
 			c.RiskReentryRecoveryEscalation = 1.5
 		}
+		if c.RiskUnprotectableDisposition == "" {
+			c.RiskUnprotectableDisposition = "warn"
+		}
 		if c.RiskUnprotectableAction == "" {
-			c.RiskUnprotectableAction = "close"
+			c.RiskUnprotectableAction = "follow"
 		}
 	}
 }

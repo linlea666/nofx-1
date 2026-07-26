@@ -80,6 +80,17 @@ func TestLaterExecutionOutsideFixedWindowIsNotAttributed(t *testing.T) {
 	}
 }
 
+func TestExecutionFunnelBackfillsMissingLegacyIntermediateEvents(t *testing.T) {
+	requested, submitted, filled, protected := monotonicExecutionFunnel(false, false, false, true)
+	if !requested || !submitted || !filled || !protected {
+		t.Fatalf("protection evidence must imply every earlier lifecycle stage: %v %v %v %v", requested, submitted, filled, protected)
+	}
+	requested, submitted, filled, protected = monotonicExecutionFunnel(false, false, true, false)
+	if !requested || !submitted || !filled || protected {
+		t.Fatalf("fill evidence must imply requested/submitted without inventing protection: %v %v %v %v", requested, submitted, filled, protected)
+	}
+}
+
 func TestEvaluateCyclePersistsImmutableOutcomeAndEventsOnce(t *testing.T) {
 	st, err := store.New(filepath.Join(t.TempDir(), "evaluation.db"))
 	if err != nil {
