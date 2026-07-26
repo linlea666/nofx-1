@@ -1085,6 +1085,16 @@ func copyOpenQuantityKind(dec *decision.Decision) QuantityIntentKind {
 	return QuantityInitialOpen
 }
 
+func isAIReentryCopyTrade(dec *decision.Decision) bool {
+	if dec == nil {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(dec.CopyTradeAction), "ai_reentry") {
+		return true
+	}
+	return dec.CopyTradeAction == "" && strings.Contains(strings.ToLower(dec.Reasoning), "reentry")
+}
+
 func (at *AutoTrader) quantizeCopyOpenQuantity(dec *decision.Decision, currentPrice, requested float64, preferReserved bool) (float64, error) {
 	resolver, ok := at.trader.(ExecutionInstrumentResolver)
 	if !ok {
@@ -1102,13 +1112,14 @@ func (at *AutoTrader) quantizeCopyOpenQuantity(dec *decision.Decision, currentPr
 	}
 	kind := copyOpenQuantityKind(dec)
 	if preferReserved && dec.QuantizedQuantity > 0 {
-		locked := dec.QuantizedQuantity
-		check, checkErr := QuantizeOrderIntentAtPrice(inst, locked, currentPrice, kind)
-		if checkErr != nil || math.Abs(check.Quantized-locked) > math.Max(inst.BaseQuantityStep*1e-9, 1e-12) {
-			return 0, fmt.Errorf("reserved quantity %.12f is not valid for execution step %.12f", locked, inst.BaseQuantityStep)
+		// Price and venue metadata may move between deterministic reservation and
+		// the actual exchange boundary. Re-run the action-specific quantizer
+		// instead of rejecting a formerly valid reservation. Initial opens may
+		// move to the new exact venue minimum; adds remain floor-only and fail
+		// with ErrQuantityBelowMinimum rather than being promoted.
+		if dec.RequestedQuantity > 0 {
+			requested = dec.RequestedQuantity
 		}
-		dec.PositionSizeUSD = locked * currentPrice
-		return locked, nil
 	}
 	q, err := QuantizeOrderIntentAtPrice(inst, requested, currentPrice, kind)
 	if err != nil {
@@ -1388,7 +1399,8 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 	maxAffordablePositionSize := availableBalance / marginFactor
 
 	actualPositionSize := decision.PositionSizeUSD
-	if actualPositionSize > maxAffordablePositionSize {
+	leaderCopy := isCopyTrade && !isAIReentryCopyTrade(decision)
+	if actualPositionSize > maxAffordablePositionSize && !leaderCopy {
 		// Use 98% of max to leave buffer for price fluctuation
 		adjustedSize := maxAffordablePositionSize * 0.98
 		logger.Infof("  ⚠️ Position size %.2f exceeds max affordable %.2f, auto-reducing to %.2f",
@@ -1437,19 +1449,21 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 	order, err := at.openLongOrder(isCopyTrade, decision.Symbol, quantity, decision.Leverage, decision.ClientOrderID)
 	finishCopyOrderAttempt(decision, isCopyTrade, decision.ClientOrderID, order, err)
 	if err != nil {
-		// 🔁 PR-4 / 修复 E'：跟单开仓遇到保证金不足，自动减半重试一次。
+		// AI 二次入场遇到保证金不足时允许按独立风险预算减半重试一次。
+		// 普通领航员开仓/加仓必须保持比例语义，禁止静默缩量或重试。
 		//
 		// 触发条件（同时满足）：
-		//   1. isCopyTrade（仅跟单路径，AI 决策不受影响）
+		//   1. isCopyTrade 且 CopyTradeAction=ai_reentry
 		//   2. isInsufficientMarginError(err)（精确识别保证金/可用余额不足）
 		//
 		// 重试动作：quantity / actualPositionSize 各减半，再次调用 OpenLong。
 		// 重试失败：返回包装错误（包含原始错误 + 重试错误），便于熔断与告警识别。
 		//
 		// 不重试的情况：
-		//   - 非跟单（AI 决策已有自己的余额预扣逻辑）
+		//   - 普通领航员跟单
+		//   - 非跟单
 		//   - 非保证金错误（如 size below minSz、风控拒单等，减半通常无济于事）
-		if isCopyTrade && isInsufficientMarginError(err) {
+		if isCopyTrade && isAIReentryCopyTrade(decision) && isInsufficientMarginError(err) {
 			retryQty, quantizeErr := at.quantizeCopyOpenQuantity(decision, currentPrice, quantity*0.5, false)
 			if quantizeErr != nil {
 				return fmt.Errorf("open long retry quantity invalid: initial=%v quantize=%v", err, quantizeErr)
@@ -1640,7 +1654,8 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 	maxAffordablePositionSize := availableBalance / marginFactor
 
 	actualPositionSize := decision.PositionSizeUSD
-	if actualPositionSize > maxAffordablePositionSize {
+	leaderCopy := isCopyTrade && !isAIReentryCopyTrade(decision)
+	if actualPositionSize > maxAffordablePositionSize && !leaderCopy {
 		// Use 98% of max to leave buffer for price fluctuation
 		adjustedSize := maxAffordablePositionSize * 0.98
 		logger.Infof("  ⚠️ Position size %.2f exceeds max affordable %.2f, auto-reducing to %.2f",
@@ -1689,9 +1704,9 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 	order, err := at.openShortOrder(isCopyTrade, decision.Symbol, quantity, decision.Leverage, decision.ClientOrderID)
 	finishCopyOrderAttempt(decision, isCopyTrade, decision.ClientOrderID, order, err)
 	if err != nil {
-		// 🔁 PR-4 / 修复 E'：跟单开空保证金不足，自动减半重试一次。逻辑与 OpenLong 对称。
+		// AI 二次入场开空保证金不足减半重试；普通领航员跟单不缩量。
 		// 详见 executeOpenLongWithRecord 中相同位置的注释。
-		if isCopyTrade && isInsufficientMarginError(err) {
+		if isCopyTrade && isAIReentryCopyTrade(decision) && isInsufficientMarginError(err) {
 			retryQty, quantizeErr := at.quantizeCopyOpenQuantity(decision, currentPrice, quantity*0.5, false)
 			if quantizeErr != nil {
 				return fmt.Errorf("open short retry quantity invalid: initial=%v quantize=%v", err, quantizeErr)

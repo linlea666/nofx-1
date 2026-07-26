@@ -2108,7 +2108,7 @@ export function CopyGuardPage() {
           <option value="open">进行中</option>
         </select>
       </div>
-      <div className="grid md:grid-cols-3 gap-4">
+      <div className="grid md:grid-cols-5 gap-4">
         <Card
           title="帮你少亏"
           value={money(summary?.avoided_loss ?? 0)}
@@ -2129,7 +2129,30 @@ export function CopyGuardPage() {
               : undefined
           }
         />
+        <Card
+          title="仅止损路径"
+          value={money(summary?.stop_only_pnl ?? 0)}
+          color={(summary?.stop_only_pnl ?? 0) >= 0 ? '#0ECB81' : '#F6465D'}
+          note="初始仓位止损后的实际结果，不包含 AI 重入"
+        />
+        <Card
+          title="AI 重入贡献"
+          value={money(summary?.reentry_contribution ?? 0)}
+          color={
+            (summary?.reentry_contribution ?? 0) >= 0 ? '#0ECB81' : '#F6465D'
+          }
+          note="所有已对账二次入场 attempt 的独立盈亏贡献"
+        />
       </div>
+      {summary?.mean_net_guard_effect_estimate?.status === 'AVAILABLE' && (
+        <div className="border border-[#2B3139] bg-[#181A20] rounded-lg p-4 text-sm text-[#B7BDC6]">
+          已验证净保护效果均值：
+          {money(summary.mean_net_guard_effect_estimate.mean)}；Bootstrap 95%
+          区间 [{money(summary.mean_net_guard_effect_estimate.ci95_low)},{' '}
+          {money(summary.mean_net_guard_effect_estimate.ci95_high)}]（
+          {summary.mean_net_guard_effect_estimate.sample_count} 个已验证周期）
+        </div>
+      )}
       {(summary?.unscorable_baseline_cycles ?? 0) > 0 && (
         <div className="border border-[#F0B90B] bg-[#F0B90B]/10 rounded-lg p-4 text-sm text-[#F0B90B]">
           有 {summary?.unscorable_baseline_cycles}{' '}
@@ -2140,7 +2163,7 @@ export function CopyGuardPage() {
       {(summary?.unprotectable_count ?? 0) > 0 && (
         <div className="border border-[#F6465D] bg-[#F6465D]/10 rounded-lg p-4 text-sm text-[#F6465D]">
           高危：当前有 {summary?.unprotectable_count}{' '}
-          个活跃仓位确认无法建立有效止损保护，正在裸跟运行（仅受账户兜底线与交易所强平约束）。建议立即人工检查或手动平仓。
+          个周期确认无法建立有效止损保护，系统正在执行强制退出或等待交易所终态确认；不会继续采用裸仓跟随。
         </div>
       )}
       {(summary?.clamped_count ?? 0) > 0 && (
@@ -2229,18 +2252,30 @@ export function CopyGuardPage() {
         <Metric
           label="重入成功率"
           value={
-            (summary?.reentry_sample_count ?? 0) > 0
-              ? `${((summary?.reentry_success_rate ?? 0) * 100).toFixed(1)}%（${summary?.reentry_sample_count} 样本${(summary?.reentry_sample_count ?? 0) < 10 ? '·样本过少仅供参考' : ''}）`
+            (summary?.reentry_success_estimate?.denominator ?? 0) > 0
+              ? `${((summary?.reentry_success_estimate?.rate ?? 0) * 100).toFixed(1)}%（${summary?.reentry_success_estimate?.numerator}/${summary?.reentry_success_estimate?.denominator}；95% CI ${((summary?.reentry_success_estimate?.ci95_low ?? 0) * 100).toFixed(1)}%–${((summary?.reentry_success_estimate?.ci95_high ?? 0) * 100).toFixed(1)}%）`
               : '暂无样本'
           }
         />
         <Metric
           label="误杀率"
           value={
-            (summary?.stopped_cycle_count ?? 0) > 0
-              ? `${((summary?.false_kill_rate ?? 0) * 100).toFixed(1)}%（${summary?.false_kill_count}/${summary?.stopped_cycle_count}${(summary?.stopped_cycle_count ?? 0) < 10 ? '·样本过少仅供参考' : ''}）`
+            (summary?.false_kill_estimate?.denominator ?? 0) > 0
+              ? `${((summary?.false_kill_estimate?.rate ?? 0) * 100).toFixed(1)}%（${summary?.false_kill_estimate?.numerator}/${summary?.false_kill_estimate?.denominator}；95% CI ${((summary?.false_kill_estimate?.ci95_low ?? 0) * 100).toFixed(1)}%–${((summary?.false_kill_estimate?.ci95_high ?? 0) * 100).toFixed(1)}%）`
               : '暂无样本'
           }
+        />
+        <Metric
+          label="已验证基线"
+          value={summary?.verified_baseline_cycles ?? 0}
+        />
+        <Metric
+          label="估算基线"
+          value={summary?.estimated_baseline_cycles ?? 0}
+        />
+        <Metric
+          label="不可评分"
+          value={summary?.unscorable_baseline_cycles ?? 0}
         />
         <Metric label="对账中" value={summary?.accounting_pending_count ?? 0} />
         <Metric

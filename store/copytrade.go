@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"time"
 )
 
@@ -242,8 +243,8 @@ func (c *CopyTradeConfig) FillRiskDefaults() {
 // 存量配置读取仍走 FillRiskDefaults 的兼容语义，不会被静默切换到 AI。
 func NewCopyGuardDefaults() *CopyTradeConfig {
 	c := &CopyTradeConfig{
-		// 最小跟单金额默认 12 USDT（预留交易所 10 USDT 最小名义 + 精度损失
-		// 余量），与引擎侧 fallback（copytrade.DefaultMinTradeNotional）统一。
+		// 纯运营小额预警默认 12 USDT；交易可执行性始终来自实时交易所
+		// minQty/minNotional/step，不读取本字段。
 		MinTradeWarn:               12,
 		RiskStopLossEnabled:        true,
 		RiskAccountPct:             0.02,
@@ -346,39 +347,50 @@ func (s *CopyTradeStore) initTables() error {
 		return err
 	}
 
-	// 给 traders 表添加 decision_mode 字段
-	s.db.Exec(`ALTER TABLE traders ADD COLUMN decision_mode TEXT DEFAULT 'ai'`)
-
-	// 给 copy_trade_configs 表添加 Binance 凭证字段（兼容旧库）
-	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN binance_p20t TEXT DEFAULT ''`)
-	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN binance_csrf_token TEXT DEFAULT ''`)
-	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN binance_source_mode TEXT DEFAULT 'copy_management'`)
-	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN binance_top_trader_id TEXT DEFAULT ''`)
-	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN source_generation INTEGER DEFAULT 1`)
+	// Additive migrations must distinguish "already exists" from real SQLite
+	// failures. Silently swallowing every ALTER can let a partial production DB
+	// start and fail only when the next live trade touches the missing column.
+	configMigrations := []struct {
+		table, column, definition string
+	}{
+		{"traders", "decision_mode", "TEXT DEFAULT 'ai'"},
+		{"copy_trade_configs", "binance_p20t", "TEXT DEFAULT ''"},
+		{"copy_trade_configs", "binance_csrf_token", "TEXT DEFAULT ''"},
+		{"copy_trade_configs", "binance_source_mode", "TEXT DEFAULT 'copy_management'"},
+		{"copy_trade_configs", "binance_top_trader_id", "TEXT DEFAULT ''"},
+		{"copy_trade_configs", "source_generation", "INTEGER DEFAULT 1"},
+		{"copy_trade_configs", "risk_stop_loss_enabled", "INTEGER DEFAULT 1"},
+		{"copy_trade_configs", "risk_account_pct", "REAL DEFAULT 0"},
+		{"copy_trade_configs", "risk_atr_multiplier", "REAL DEFAULT 2.0"},
+		{"copy_trade_configs", "risk_atr_timeframe", "TEXT DEFAULT '1h'"},
+		{"copy_trade_configs", "risk_leverage_fallback", "INTEGER DEFAULT 0"},
+		{"copy_trade_configs", "risk_leverage_max_loss", "REAL DEFAULT 0"},
+		{"copy_trade_configs", "risk_reentry_enabled", "INTEGER DEFAULT 0"},
+		{"copy_trade_configs", "risk_reentry_ratio", "REAL DEFAULT 0.5"},
+		{"copy_trade_configs", "risk_manual_reentry_enabled", "INTEGER DEFAULT 0"},
+	}
+	for _, migration := range configMigrations {
+		if err := ensureSQLiteColumn(s.db, migration.table, migration.column, migration.definition); err != nil {
+			return fmt.Errorf("migrate %s.%s: %w", migration.table, migration.column, err)
+		}
+	}
 
 	// 给 copy_trade_configs 表添加风控字段（账户保护 / 止损兜底）
-	// 旧库 ALTER 失败说明已存在，忽略；新库随表创建即有这些列
 	// v5 注：v3 时代的 risk_atr_enabled / risk_reentry_tolerance /
 	// risk_reentry_block_addback / risk_reentry_addback_tolerance 列不再
 	// 创建也不再读写（旧库中的存量列保留为休眠数据）
-	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_stop_loss_enabled INTEGER DEFAULT 1`)
-	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_account_pct REAL DEFAULT 0`)
-	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_atr_multiplier REAL DEFAULT 2.0`)
-	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_atr_timeframe TEXT DEFAULT '1h'`)
-	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_leverage_fallback INTEGER DEFAULT 0`)
-	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_leverage_max_loss REAL DEFAULT 0`)
-	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_reentry_enabled INTEGER DEFAULT 0`)
-	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_reentry_ratio REAL DEFAULT 0.5`)
-	// v5.1 人工重入：DEFAULT 1 = 新旧配置默认开启（ALTER 对存量行生效 DEFAULT）
-	s.db.Exec(`ALTER TABLE copy_trade_configs ADD COLUMN risk_manual_reentry_enabled INTEGER DEFAULT 1`)
-
 	return nil
 }
 
 // Create 创建跟单配置
 func (s *CopyTradeStore) Create(config *CopyTradeConfig) error {
 	config.FillRiskDefaults()
-	_, err := s.db.Exec(`
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	_, err = tx.Exec(`
 		INSERT INTO copy_trade_configs 
 			(trader_id, provider_type, leader_id, copy_ratio, sync_leverage, sync_margin_mode, 
 			 min_trade_warn, max_trade_warn, enabled, binance_p20t, binance_csrf_token,
@@ -397,13 +409,21 @@ func (s *CopyTradeStore) Create(config *CopyTradeConfig) error {
 	if err != nil {
 		return err
 	}
-	return s.saveCopyGuardPolicy(config)
+	if err = saveCopyGuardPolicyWithExecutor(tx, config); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // Update 更新跟单配置
 func (s *CopyTradeStore) Update(config *CopyTradeConfig) error {
 	config.FillRiskDefaults()
-	_, err := s.db.Exec(`
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	_, err = tx.Exec(`
 		UPDATE copy_trade_configs SET
 			provider_type = ?,
 			leader_id = ?,
@@ -439,13 +459,21 @@ func (s *CopyTradeStore) Update(config *CopyTradeConfig) error {
 	if err != nil {
 		return err
 	}
-	return s.saveCopyGuardPolicy(config)
+	if err = saveCopyGuardPolicyWithExecutor(tx, config); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // Upsert 创建或更新跟单配置
 func (s *CopyTradeStore) Upsert(config *CopyTradeConfig) error {
 	config.FillRiskDefaults()
-	_, err := s.db.Exec(`
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	_, err = tx.Exec(`
 		INSERT INTO copy_trade_configs 
 			(trader_id, provider_type, leader_id, copy_ratio, sync_leverage, sync_margin_mode, 
 			 min_trade_warn, max_trade_warn, enabled, binance_p20t, binance_csrf_token,
@@ -487,7 +515,10 @@ func (s *CopyTradeStore) Upsert(config *CopyTradeConfig) error {
 	if err != nil {
 		return err
 	}
-	return s.saveCopyGuardPolicy(config)
+	if err = saveCopyGuardPolicyWithExecutor(tx, config); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // Delete 删除跟单配置
@@ -530,7 +561,7 @@ const copyTradeConfigSelectColumns = `
 	COALESCE(risk_leverage_max_loss, 0) AS risk_leverage_max_loss,
 	COALESCE(risk_reentry_enabled, 0) AS risk_reentry_enabled,
 	COALESCE(risk_reentry_ratio, 0.5) AS risk_reentry_ratio,
-	COALESCE(risk_manual_reentry_enabled, 1) AS risk_manual_reentry_enabled,
+	COALESCE(risk_manual_reentry_enabled, 0) AS risk_manual_reentry_enabled,
 	created_at, updated_at`
 
 // scanCopyTradeConfig 共用 Scan 逻辑（避免 GetByTraderID 与 ListEnabled 重复实现）
@@ -848,32 +879,38 @@ func (s *CopyTradeStore) initPositionMappingTable() error {
 		return err
 	}
 
-	// 创建索引
-	s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_mapping_trader_status ON copy_trade_position_mappings(trader_id, status)`)
-	s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_mapping_trader_symbol ON copy_trade_position_mappings(trader_id, symbol, side, status)`)
-
-	// 添加 last_known_size 字段（如果不存在）
-	s.db.Exec(`ALTER TABLE copy_trade_position_mappings ADD COLUMN last_known_size REAL DEFAULT 0`)
-
-	// 添加 accumulated_reduce_ratio 字段（用于累积减仓触发全平）
-	s.db.Exec(`ALTER TABLE copy_trade_position_mappings ADD COLUMN accumulated_reduce_ratio REAL DEFAULT 0`)
-
-	// 添加连续失败熔断字段（兼容旧库；ALTER 失败说明已存在，忽略）
-	s.db.Exec(`ALTER TABLE copy_trade_position_mappings ADD COLUMN consecutive_fail_count INTEGER DEFAULT 0`)
-	s.db.Exec(`ALTER TABLE copy_trade_position_mappings ADD COLUMN last_failure_at DATETIME`)
-	s.db.Exec(`ALTER TABLE copy_trade_position_mappings ADD COLUMN last_failure_reason TEXT DEFAULT ''`)
-
-	// 添加账户保护止损触发快照字段（v3 风控）
-	s.db.Exec(`ALTER TABLE copy_trade_position_mappings ADD COLUMN stopped_at DATETIME`)
-	s.db.Exec(`ALTER TABLE copy_trade_position_mappings ADD COLUMN leader_pnl_at_stop REAL DEFAULT 0`)
-	s.db.Exec(`ALTER TABLE copy_trade_position_mappings ADD COLUMN leader_size_at_stop REAL DEFAULT 0`)
-	s.db.Exec(`ALTER TABLE copy_trade_position_mappings ADD COLUMN add_count_at_stop INTEGER DEFAULT 0`)
-	s.db.Exec(`ALTER TABLE copy_trade_position_mappings ADD COLUMN reentry_used INTEGER DEFAULT 0`)
-	s.db.Exec(`ALTER TABLE copy_trade_position_mappings ADD COLUMN source_symbol TEXT DEFAULT ''`)
-	s.db.Exec(`ALTER TABLE copy_trade_position_mappings ADD COLUMN execution_symbol TEXT DEFAULT ''`)
-	s.db.Exec(`ALTER TABLE copy_trade_position_mappings ADD COLUMN source_quote_asset TEXT DEFAULT ''`)
-	s.db.Exec(`ALTER TABLE copy_trade_position_mappings ADD COLUMN execution_settle_asset TEXT DEFAULT ''`)
-	s.db.Exec(`ALTER TABLE copy_trade_position_mappings ADD COLUMN source_revision INTEGER DEFAULT 0`)
+	for _, query := range []string{
+		`CREATE INDEX IF NOT EXISTS idx_mapping_trader_status ON copy_trade_position_mappings(trader_id, status)`,
+		`CREATE INDEX IF NOT EXISTS idx_mapping_trader_symbol ON copy_trade_position_mappings(trader_id, symbol, side, status)`,
+	} {
+		if _, err := s.db.Exec(query); err != nil {
+			return err
+		}
+	}
+	mappingMigrations := []struct {
+		column, definition string
+	}{
+		{"last_known_size", "REAL DEFAULT 0"},
+		{"accumulated_reduce_ratio", "REAL DEFAULT 0"},
+		{"consecutive_fail_count", "INTEGER DEFAULT 0"},
+		{"last_failure_at", "DATETIME"},
+		{"last_failure_reason", "TEXT DEFAULT ''"},
+		{"stopped_at", "DATETIME"},
+		{"leader_pnl_at_stop", "REAL DEFAULT 0"},
+		{"leader_size_at_stop", "REAL DEFAULT 0"},
+		{"add_count_at_stop", "INTEGER DEFAULT 0"},
+		{"reentry_used", "INTEGER DEFAULT 0"},
+		{"source_symbol", "TEXT DEFAULT ''"},
+		{"execution_symbol", "TEXT DEFAULT ''"},
+		{"source_quote_asset", "TEXT DEFAULT ''"},
+		{"execution_settle_asset", "TEXT DEFAULT ''"},
+		{"source_revision", "INTEGER DEFAULT 0"},
+	}
+	for _, migration := range mappingMigrations {
+		if err := ensureSQLiteColumn(s.db, "copy_trade_position_mappings", migration.column, migration.definition); err != nil {
+			return fmt.Errorf("migrate copy_trade_position_mappings.%s: %w", migration.column, err)
+		}
+	}
 
 	return nil
 }

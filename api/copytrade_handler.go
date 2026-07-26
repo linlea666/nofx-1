@@ -1167,6 +1167,7 @@ func (h *CopyTradeHandler) GetAccountRiskPolicy(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"policy": policy, "open_protected_positions": count,
 		"aggregate_worst_case_risk_usd": worst, "aggregate_is_warning_only": true,
+		"aggregate_risk_quality": "ESTIMATED_CONFIG_CAP",
 	})
 }
 
@@ -1187,6 +1188,11 @@ func (h *CopyTradeHandler) SaveAccountRiskPolicy(c *gin.Context) {
 	}
 	if err := h.store.CopyTrade().UpsertCopyGuardAccountPolicy(exchangeID, req.MaxPositionLossPct); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := copytrade.ReloadCopyTradingForExchange(exchangeID); err != nil {
+		logger.Errorf("❌ Account risk policy persisted but runtime reload failed: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error(), "persisted": true})
 		return
 	}
 	policy, _ := h.store.CopyTrade().GetCopyGuardAccountPolicy(exchangeID)
@@ -1409,6 +1415,11 @@ func (h *CopyTradeHandler) SaveConfig(c *gin.Context) {
 	} else {
 		h.store.CopyTrade().UpdateDecisionMode(traderID, "ai")
 	}
+	if err := copytrade.ReloadCopyTradingForTrader(traderID); err != nil {
+		logger.Errorf("❌ Copy trade config persisted but runtime reload failed: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error(), "persisted": true})
+		return
+	}
 
 	logger.Infof("✓ Saved copy trade config for trader %s: provider=%s leader=%s ratio=%.0f%%",
 		traderID, req.ProviderType, req.LeaderID, req.CopyRatio*100)
@@ -1520,9 +1531,10 @@ func applyCopyGuardV4Request(c, old *store.CopyTradeConfig, r *CopyTradeConfigRe
 		c.RiskReentryRecoveryEscalation = old.RiskReentryRecoveryEscalation
 	}
 	if r.RiskUnprotectableAction != nil {
-		c.RiskUnprotectableAction = *r.RiskUnprotectableAction
+		// Protocol-compatible read, fail-closed write.
+		c.RiskUnprotectableAction = "close"
 	} else if old != nil {
-		c.RiskUnprotectableAction = old.RiskUnprotectableAction
+		c.RiskUnprotectableAction = "close"
 	}
 	if r.RiskReentryNoiseOverride != nil {
 		c.RiskReentryNoiseOverride = *r.RiskReentryNoiseOverride

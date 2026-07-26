@@ -89,6 +89,7 @@ type DecisionAction struct {
 	ExecutionReasonCode       string    `json:"execution_reason_code,omitempty"`
 	ProtectionStatus          string    `json:"protection_status,omitempty"`
 	ProtectionCoverage        float64   `json:"protection_coverage,omitempty"`
+	CopyGuardCycleStatus      string    `json:"copy_guard_cycle_status,omitempty"`
 }
 
 // Statistics statistics information
@@ -133,11 +134,16 @@ func (s *DecisionStore) initTables() error {
 		}
 	}
 
-	// Migration: add raw_response column if not exists
-	s.db.Exec(`ALTER TABLE decision_records ADD COLUMN raw_response TEXT DEFAULT ''`)
-
-	// Migration: add decisions column if not exists
-	s.db.Exec(`ALTER TABLE decision_records ADD COLUMN decisions TEXT DEFAULT '[]'`)
+	for _, migration := range []struct {
+		column, definition string
+	}{
+		{"raw_response", "TEXT DEFAULT ''"},
+		{"decisions", "TEXT DEFAULT '[]'"},
+	} {
+		if err := ensureSQLiteColumn(s.db, "decision_records", migration.column, migration.definition); err != nil {
+			return fmt.Errorf("migrate decision_records.%s: %w", migration.column, err)
+		}
+	}
 
 	return nil
 }
@@ -422,13 +428,20 @@ func (s *DecisionStore) fillRecordDetails(record *DecisionRecord) {
 		action.ExchangeMinQuantity = exchangeMinQuantity
 		action.ExchangeMinNotional = exchangeMinNotional
 		action.MinimumExecutableQuantity = minimumExecutableQuantity
-		action.Success = status == ExecutionIntentFilled || status == ExecutionIntentProtected || status == ExecutionIntentSkipped
-		if !action.Success {
+		action.Success = status == ExecutionIntentFilled || status == ExecutionIntentProtected
+		terminalWithoutExecution := status == ExecutionIntentSkipped
+		if !action.Success && !terminalWithoutExecution {
 			overall = false
 			if lastError != "" {
 				action.Error = lastError
 				errors = append(errors, lastError)
 			}
+		}
+		if action.LeaderPosID != "" {
+			_ = s.db.QueryRow(`SELECT COALESCE(status,''),COALESCE(protection_status,''),COALESCE(protection_coverage,0)
+				FROM copy_guard_cycles WHERE trader_id=? AND leader_pos_id=? ORDER BY id DESC LIMIT 1`,
+				record.TraderID, action.LeaderPosID).
+				Scan(&action.CopyGuardCycleStatus, &action.ProtectionStatus, &action.ProtectionCoverage)
 		}
 	}
 	record.Success = overall

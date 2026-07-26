@@ -719,3 +719,35 @@ func TestSendCopyActionAlertRateKeyDistinguishesActions(t *testing.T) {
 		t.Fatalf("期望 %d 个不同 RateKey，实际 %d", len(actions), len(seen))
 	}
 }
+
+func TestStopCopyTradingForTraderClearsLifecycleReservation(t *testing.T) {
+	integrationsMu.Lock()
+	oldIntegrations, oldStarting, oldEpoch := integrations, integrationsStarting, integrationsEpoch
+	integrations = make(map[string]*TraderIntegration)
+	integrationsStarting = make(map[string]struct{})
+	integrationsEpoch = 0
+	integrationsMu.Unlock()
+	t.Cleanup(func() {
+		integrationsMu.Lock()
+		integrations, integrationsStarting, integrationsEpoch = oldIntegrations, oldStarting, oldEpoch
+		integrationsMu.Unlock()
+	})
+
+	ti := NewTraderIntegration("lifecycle-trader", nil, nil)
+	ti.running.Store(true)
+	integrationsMu.Lock()
+	integrations[ti.traderID] = ti
+	integrationsMu.Unlock()
+
+	if err := StopCopyTradingForTrader(ti.traderID); err != nil {
+		t.Fatalf("stop integration: %v", err)
+	}
+	integrationsMu.RLock()
+	_, exists := integrations[ti.traderID]
+	_, reserved := integrationsStarting[ti.traderID]
+	integrationsMu.RUnlock()
+	if exists || reserved || ti.IsRunning() {
+		t.Fatalf("stop must remove integration and release lifecycle reservation: exists=%v reserved=%v running=%v",
+			exists, reserved, ti.IsRunning())
+	}
+}

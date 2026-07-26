@@ -79,13 +79,14 @@ func TestExplicitIsCopyTradeFlagGatesCopyTradePath(t *testing.T) {
 	}
 }
 
-// M13：保证金不足减半重试必须使用派生 clOrdId，并把实际使用的 ID 回写决策。
-func TestHalvedRetryUsesDerivedClientOrderID(t *testing.T) {
+// AI reentry may make one explicitly audited adaptive-size retry. The retry
+// must use a distinct durable client id so restart reconciliation can find it.
+func TestAIReentryHalvedRetryUsesDerivedClientOrderID(t *testing.T) {
 	fake := &copyFlowFakeTrader{failFirstOpenWithMargin: true}
 	at := newCopyFlowAutoTrader(fake)
 	dec := &decision.Decision{
 		Symbol: "ETHUSDT", Action: "open_long", IsCopyTrade: true,
-		Reasoning: "Copy trading: open following leader", ClientOrderID: "cg42a0",
+		CopyTradeAction: "ai_reentry", Reasoning: "Copy trading: AI reentry", ClientOrderID: "cg42a0",
 		PositionSizeUSD: 100, Leverage: 5, EntryPrice: 100, MarginMode: "cross",
 	}
 
@@ -104,6 +105,26 @@ func TestHalvedRetryUsesDerivedClientOrderID(t *testing.T) {
 	}
 	if dec.ClientOrderID != retryID {
 		t.Fatalf("decision must carry the actually used id for downstream confirmation: %q vs %q", dec.ClientOrderID, retryID)
+	}
+}
+
+func TestLeaderCopyInsufficientMarginDoesNotSilentlyShrink(t *testing.T) {
+	fake := &copyFlowFakeTrader{failFirstOpenWithMargin: true}
+	at := newCopyFlowAutoTrader(fake)
+	dec := &decision.Decision{
+		Symbol: "ETHUSDT", Action: "open_long", IsCopyTrade: true,
+		CopyTradeAction: "open", Reasoning: "Copy trading: open following leader", ClientOrderID: "cg43a0",
+		PositionSizeUSD: 100, Leverage: 5, EntryPrice: 100, MarginMode: "cross",
+	}
+	err := at.executeOpenLongWithRecord(dec, &store.DecisionAction{})
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "insufficient margin") {
+		t.Fatalf("ordinary leader copy must surface the exchange rejection: %v", err)
+	}
+	if len(fake.openLongClientIDs) != 1 {
+		t.Fatalf("ordinary leader copy must not silently retry a smaller target: %v", fake.openLongClientIDs)
+	}
+	if dec.PositionSizeUSD != 100 {
+		t.Fatalf("ordinary leader target must stay explicit, got %.2f", dec.PositionSizeUSD)
 	}
 }
 

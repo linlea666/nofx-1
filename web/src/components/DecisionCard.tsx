@@ -118,7 +118,33 @@ function executionLifecycle(action: DecisionAction): string[] {
       )
       break
   }
+  if (
+    action.protection_status &&
+    !['VERIFIED', 'CLAMPED'].includes(action.protection_status)
+  ) {
+    steps.push(
+      `当前保护：${action.protection_status}${action.copy_guard_cycle_status ? `（周期 ${action.copy_guard_cycle_status}）` : ''}`
+    )
+  }
   return steps
+}
+
+function executionStatusColor(action: DecisionAction): string {
+  if (action.execution_status === 'SKIPPED') return '#848E9C'
+  if (
+    action.execution_status === 'RESERVED' ||
+    action.execution_status === 'SUBMITTED' ||
+    action.execution_status === 'RECONCILING'
+  ) {
+    return '#F0B90B'
+  }
+  if (
+    action.protection_status &&
+    ['UNKNOWN', 'DEGRADED', 'UNPROTECTABLE'].includes(action.protection_status)
+  ) {
+    return '#F6465D'
+  }
+  return action.success ? '#0ECB81' : '#F6465D'
 }
 
 // Single Action Card Component
@@ -180,7 +206,7 @@ function ActionCard({
           )}
           <div
             className="w-2 h-2 rounded-full"
-            style={{ background: action.success ? '#0ECB81' : '#F6465D' }}
+            style={{ background: executionStatusColor(action) }}
           />
         </div>
       </div>

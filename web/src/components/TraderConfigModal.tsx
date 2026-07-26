@@ -543,8 +543,7 @@ export function TraderConfigModal({
             risk_reentry_recovery_escalation:
               cfg.risk_reentry_recovery_escalation ?? 1.5,
             // v5 可保护性状态机 / 噪音档重入
-            risk_unprotectable_action:
-              cfg.risk_unprotectable_action === 'follow' ? 'follow' : 'close',
+            risk_unprotectable_action: 'close',
             risk_reentry_noise_override:
               cfg.risk_reentry_noise_override ?? false,
           }))
@@ -607,8 +606,7 @@ export function TraderConfigModal({
             cfg.risk_reentry_cooldown_seconds ?? 300,
           risk_watch_timeout_minutes: cfg.risk_watch_timeout_minutes ?? 4320,
           risk_addon_budget_pct: (cfg.risk_addon_budget_pct ?? 0.15) * 100,
-          risk_unprotectable_action:
-            cfg.risk_unprotectable_action === 'follow' ? 'follow' : 'close',
+          risk_unprotectable_action: 'close',
         }))
       })
     return () => {
@@ -952,7 +950,6 @@ export function TraderConfigModal({
               formData.risk_reentry_max_atr_expansion,
             risk_watch_timeout_minutes: formData.risk_watch_timeout_minutes,
             risk_migration_confirmed: formData.risk_migration_confirmed,
-            risk_addon_budget_pct: formData.risk_addon_budget_pct / 100,
             risk_high_risk_confirmed: highRiskConfirmed,
             risk_extreme_risk_confirm_value: extremeRiskConfirmValue,
             risk_stop_extreme_confirm_value: stopExtremeRiskConfirmValue,
@@ -964,7 +961,7 @@ export function TraderConfigModal({
             risk_reentry_recovery_escalation:
               formData.risk_reentry_recovery_escalation,
             // v5 可保护性状态机 / 噪音档重入
-            risk_unprotectable_action: formData.risk_unprotectable_action,
+            risk_unprotectable_action: 'close',
             risk_reentry_noise_override: formData.risk_reentry_noise_override,
           })
         }
@@ -2224,12 +2221,12 @@ export function TraderConfigModal({
                                 <div>
                                   <label className="text-sm text-[#EAECEF]">
                                     {formData.risk_policy_version >= 4
-                                      ? '仓位保证金止损上限'
+                                      ? 'AI 重入保证金止损上限'
                                       : '杠杆兜底封顶'}
                                   </label>
                                   <p className="text-xs text-[#848E9C]">
                                     {formData.risk_policy_version >= 4
-                                      ? '可选的更严保证金封顶，默认关闭。高杠杆下会把止损压进噪音区（如 100x×20%≈0.2% 就止损），易被正常波动扫出；仅低杠杆或想要更小单次亏损时开启，开启后与 ATR 距离取更紧者'
+                                      ? '仅作用于 AI/旧规则二次入场的风险距离，不改变普通领航员开仓、加仓或账户远止损。默认关闭'
                                       : '保证金亏损达此比例时强制平仓（高杠杆兜底）'}
                                   </p>
                                 </div>
@@ -2306,16 +2303,10 @@ export function TraderConfigModal({
                                 <option value="close">
                                   立即市价离场（推荐）
                                 </option>
-                                {formData.risk_reentry_decision_mode ===
-                                  'legacy_rule' && (
-                                  <option value="follow">
-                                    继续裸跟并标红告警（旧规则兼容）
-                                  </option>
-                                )}
                               </select>
                               <p className="text-xs text-[#848E9C] mt-1">
-                                AI 模式强制立即离场；只有存量 legacy_rule
-                                才能保留裸跟兼容选项。
+                                所有模式统一失败关闭；旧客户端的 follow
+                                值仅兼容读取，保存时自动迁移为 close。
                               </p>
                             </div>
                           )}
@@ -2689,10 +2680,13 @@ export function TraderConfigModal({
                               <line x1="12" x2="12.01" y1="16" y2="16" />
                             </svg>
                             <span className="text-xs text-[#848E9C]">
-                              Copy Guard v7：止损距离取 2.0×ATR、结构失效位
-                              +0.25×ATR 与执行最小距离中的较宽者，超过 4×ATR
-                              则拒绝入场；风险预算通过缩小仓位控制，绝不为了下足仓位把止损压进噪音区。
-                              保护单由执行交易所托管并验证完整覆盖，无法建立或止损价已被行情穿越时立即受控退出；加仓超预算自动缩量，低于最小下单量则拒绝。
+                              普通跟单按领航员开仓、加仓、减仓和平仓变化执行，不受
+                              AI
+                              风险预算缩量。首次开仓不足交易所真实最低量时只提升到最低有效量；
+                              微量加仓、部分减仓不足门槛时直接记录跳过。保护单按关键位、
+                              ATR
+                              与账户/交易员单仓亏损上限计算并由执行交易所托管，
+                              无法确认完整保护时受控退出。
                             </span>
                           </div>
                         </>

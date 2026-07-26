@@ -220,8 +220,9 @@ func convertSymbolToOKXInstID(symbol string) string {
 
 // alignToTickSize 把价格对齐到价格档位
 //
-// 多单 SL（应低于入场价）→ floor 向下对齐（让 SL 更紧 / 提前触发）
-// 空单 SL（应高于入场价）→ ceil 向上对齐
+// 对止损价格调用时，安全方向由调用方选择：
+// 多单 SL（低于入场价）应 ceil 向上对齐，空单 SL（高于入场价）应 floor
+// 向下对齐，才能只收紧而不突破账户亏损上限。
 //
 // 设计原则：「宁可更安全（更早触发），不要因为档位失配挂单失败」
 //

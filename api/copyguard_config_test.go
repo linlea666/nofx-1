@@ -91,13 +91,25 @@ func TestApplyCopyConfigRiskFieldsV4DefaultsAndExplicitZero(t *testing.T) {
 // 也必须被剥离，否则后续 "v4 only for OKX/Binance" 校验会把正常跟单保存整体
 // 400 拒绝（P0 修复回归钉）。
 func TestApplyCopyConfigRiskFieldsStripsUnsupportedProvider(t *testing.T) {
-	cfg := &store.CopyTradeConfig{ProviderType: "hyperliquid"}
-	applyCopyConfigRiskFields(cfg, &CopyConfigReq{RiskPolicyVersion: 4})
+	cfg := &store.CopyTradeConfig{
+		ProviderType:             "hyperliquid",
+		RiskManualReentryEnabled: true,
+		RiskUnprotectableAction:  "follow",
+	}
+	manual := true
+	applyCopyConfigRiskFields(cfg, &CopyConfigReq{
+		RiskPolicyVersion:        4,
+		RiskManualReentryEnabled: &manual,
+		RiskUnprotectableAction:  "follow",
+	})
 	if cfg.RiskPolicyVersion != 0 {
 		t.Fatalf("[hyperliquid] risk_policy_version should be stripped, got %d", cfg.RiskPolicyVersion)
 	}
 	if cfg.RiskStopLossEnabled || cfg.RiskReentryEnabled {
 		t.Fatalf("[hyperliquid] risk switches should stay off: %+v", cfg)
+	}
+	if cfg.RiskManualReentryEnabled || cfg.RiskUnprotectableAction != "close" {
+		t.Fatalf("[hyperliquid] retired settings must be normalized on every write: %+v", cfg)
 	}
 }
 

@@ -232,6 +232,10 @@ func liquidationSafetyBuffer(tickSize, atrValue, entryPrice, bufferATR float64) 
 //   - 不可保护：clamp 后距离 < 0.1%（连极紧止损都无意义）→ Unprotectable=true，
 //     调用方必须走 GUARD_UNPROTECTABLE 处置，禁止静默裸跑
 func finalizeStopLossPrice(input *StopLossCalcInput, result *StopLossCalcResult, liquidationBufferATR float64) (*StopLossCalcResult, error) {
+	frictionRate := float64(0)
+	if input.PositionValue > 0 && input.EntryPrice > 0 {
+		frictionRate = result.ExpectedLossUSD/input.PositionValue - result.SLDistance/input.EntryPrice
+	}
 	if result.SLDistance/input.EntryPrice < 0.001 {
 		result.OpenImmediateHit = true
 		return result, nil
@@ -253,9 +257,10 @@ func finalizeStopLossPrice(input *StopLossCalcInput, result *StopLossCalcResult,
 	}
 	result.TickSize = tickSz
 	if input.Side == SideLong {
-		result.SLPrice = alignToTickSize(input.EntryPrice-result.SLDistance, tickSz, true)
+		// Tick alignment may only tighten the account loss ceiling.
+		result.SLPrice = alignToTickSize(input.EntryPrice-result.SLDistance, tickSz, false)
 	} else {
-		result.SLPrice = alignToTickSize(input.EntryPrice+result.SLDistance, tickSz, false)
+		result.SLPrice = alignToTickSize(input.EntryPrice+result.SLDistance, tickSz, true)
 	}
 	if result.SLPrice <= 0 || math.Abs(result.SLPrice-input.EntryPrice) < 1e-9 {
 		result.SLPrice = 0
@@ -266,37 +271,49 @@ func finalizeStopLossPrice(input *StopLossCalcInput, result *StopLossCalcResult,
 			// Direction-implausible liquidation price: ignore it and keep the
 			// ATR stop; the caller records a diagnostic event.
 			result.LiquidationPriceIgnored = true
-			return result, nil
-		}
-		buffer := liquidationSafetyBuffer(tickSz, result.ATRValue, input.EntryPrice, liquidationBufferATR)
-		needClamp := (input.Side == SideLong && result.SLPrice <= input.LiquidationPrice+buffer) ||
-			(input.Side == SideShort && result.SLPrice >= input.LiquidationPrice-buffer)
-		if needClamp {
-			var clamped float64
-			if input.Side == SideLong {
-				// 多单：钳到安全线上方（向上取整保证不落回缓冲区）
-				clamped = alignToTickSize(input.LiquidationPrice+buffer, tickSz, false)
-			} else {
-				clamped = alignToTickSize(input.LiquidationPrice-buffer, tickSz, true)
-			}
-			dist := math.Abs(input.EntryPrice - clamped)
-			validSide := (input.Side == SideLong && clamped > 0 && clamped < input.EntryPrice) ||
-				(input.Side == SideShort && clamped > input.EntryPrice)
-			if !validSide || dist/input.EntryPrice < 0.001 {
-				result.SLPrice = 0
-				result.Unprotectable = true
-				return result, nil
-			}
-			result.SLPrice = clamped
-			result.SLDistance = dist
-			result.GovernedBy = "clamp"
-			result.Clamped = true
-			// 极紧止损的实际损失小于原预估（预估字段保留原值即偏保守），但
-			// 易扫损比值必须反映真实距离
-			if result.ATRValue > 0 {
-				result.DistanceATRRatio = dist / result.ATRValue
+		} else {
+			buffer := liquidationSafetyBuffer(tickSz, result.ATRValue, input.EntryPrice, liquidationBufferATR)
+			needClamp := (input.Side == SideLong && result.SLPrice <= input.LiquidationPrice+buffer) ||
+				(input.Side == SideShort && result.SLPrice >= input.LiquidationPrice-buffer)
+			if needClamp {
+				var clamped float64
+				if input.Side == SideLong {
+					// 多单：钳到安全线上方（向上取整保证不落回缓冲区）
+					clamped = alignToTickSize(input.LiquidationPrice+buffer, tickSz, false)
+				} else {
+					clamped = alignToTickSize(input.LiquidationPrice-buffer, tickSz, true)
+				}
+				dist := math.Abs(input.EntryPrice - clamped)
+				validSide := (input.Side == SideLong && clamped > 0 && clamped < input.EntryPrice) ||
+					(input.Side == SideShort && clamped > input.EntryPrice)
+				if !validSide || dist/input.EntryPrice < 0.001 {
+					result.SLPrice = 0
+					result.Unprotectable = true
+					return result, nil
+				}
+				result.SLPrice = clamped
+				result.GovernedBy = "clamp"
+				result.Clamped = true
 			}
 		}
+	}
+	// Recompute all risk metrics from the actual aligned/clamped trigger.
+	// Persisting the pre-alignment distance understates risk when tick size is
+	// coarse and makes the configured account ceiling unauditable.
+	result.SLDistance = math.Abs(input.EntryPrice - result.SLPrice)
+	if frictionRate < 0 {
+		frictionRate = 0
+	}
+	result.ExpectedLossUSD = input.PositionValue * (result.SLDistance/input.EntryPrice + frictionRate)
+	result.ExpectedLossPct = result.ExpectedLossUSD / input.FollowerEquity
+	if margin := input.PositionValue / float64(input.Leverage); margin > 0 {
+		result.ExpectedMarginLossPct = result.ExpectedLossUSD / margin
+	}
+	if result.ATRValue > 0 {
+		result.DistanceATRRatio = result.SLDistance / result.ATRValue
+	}
+	if input.MaxAccountLossPct > 0 && result.ExpectedLossPct > input.MaxAccountLossPct+1e-9 {
+		return nil, fmt.Errorf("aligned stop exceeds account loss cap: expected %.8f cap %.8f", result.ExpectedLossPct, input.MaxAccountLossPct)
 	}
 	return result, nil
 }

@@ -400,12 +400,18 @@ func (s *CopyTradeStore) initCopyGuardTables() error {
 		}
 		// Existing closed cycles were produced before deterministic settlement was
 		// available. Preserve their raw values but never present them as verified.
-		_, _ = s.db.Exec(`UPDATE copy_guard_cycles SET accounting_status=?,accounting_error=CASE WHEN COALESCE(accounting_error,'')='' THEN 'created before deterministic OKX settlement; raw values preserved' ELSE accounting_error END WHERE closed_at IS NOT NULL AND COALESCE(accounting_status,'OPEN')='OPEN'`, CopyGuardAccountingLegacyUnverified)
+		if _, migrationErr := s.db.Exec(`UPDATE copy_guard_cycles SET accounting_status=?,accounting_error=CASE WHEN COALESCE(accounting_error,'')='' THEN 'created before deterministic OKX settlement; raw values preserved' ELSE accounting_error END WHERE closed_at IS NOT NULL AND COALESCE(accounting_status,'OPEN')='OPEN'`, CopyGuardAccountingLegacyUnverified); migrationErr != nil {
+			return fmt.Errorf("mark legacy copy guard accounting: %w", migrationErr)
+		}
 		// NEEDS_REVIEW was renamed to DELAYED (automatic retry continues);
 		// idempotent so it can run on every startup.
-		_, _ = s.db.Exec(`UPDATE copy_guard_cycles SET accounting_status=? WHERE accounting_status='NEEDS_REVIEW'`, CopyGuardAccountingDelayed)
+		if _, migrationErr := s.db.Exec(`UPDATE copy_guard_cycles SET accounting_status=? WHERE accounting_status='NEEDS_REVIEW'`, CopyGuardAccountingDelayed); migrationErr != nil {
+			return fmt.Errorf("migrate copy guard delayed accounting status: %w", migrationErr)
+		}
 		// v4.1 默认值代次迁移（幂等，defaults_version 书签控制）
-		s.migrateCopyGuardPolicyDefaults()
+		if migrationErr := s.migrateCopyGuardPolicyDefaults(); migrationErr != nil {
+			return migrationErr
+		}
 		// v5.1 人工重入信号表
 		if merr := s.initManualReentryTables(); merr != nil {
 			return merr
@@ -525,17 +531,31 @@ func policyFromConfig(c *CopyTradeConfig) CopyGuardPolicy {
 	return CopyGuardPolicy{Version: c.RiskPolicyVersion, StopMode: c.RiskStopMode, StopMaxAccountLossPct: c.RiskStopMaxAccountLossPct, ATRPeriod: c.RiskATRPeriod, ATRCacheMaxAgeMinutes: c.RiskATRCacheMaxAgeMinutes, ATRFallbackPct: c.RiskATRFallbackPct, TriggerPriceType: c.RiskTriggerPriceType, SlippageBufferBPS: c.RiskSlippageBufferBPS, RoundTripFeeBPS: c.RiskRoundTripFeeBPS, LiquidationBufferATR: c.RiskLiquidationBufferATR, MaxReentries: c.RiskMaxReentries, ReentryBandATR: c.RiskReentryBandATR, ReentryCooldownSec: c.RiskReentryCooldownSeconds, ReentryMaxChaseATR: c.RiskReentryMaxChaseATR, MaxATRExpansion: c.RiskReentryMaxATRExpansion, WatchTimeoutMinutes: c.RiskWatchTimeoutMinutes, MigrationConfirmed: c.RiskMigrationConfirmed, AddonBudgetPct: c.RiskAddonBudgetPct, CycleLossBudgetPct: c.RiskCycleLossBudgetPct, PortfolioLossBudgetPct: c.RiskPortfolioLossBudgetPct, ReentryDecisionMode: c.RiskReentryDecisionMode, ReentryMinNotional: c.RiskReentryMinNotional, AIConfidenceThreshold: c.RiskAIConfidenceThreshold, AIMinReviewSeconds: c.RiskAIMinReviewSeconds, AIDailyCallLimit: c.RiskAIDailyCallLimit, AILifecycleCallLimit: c.RiskAILifecycleCallLimit, NotificationLevel: c.RiskNotificationLevel, ReentryMinRecoveryATR: c.RiskReentryMinRecoveryATR, ReentryCooldownEscalation: c.RiskReentryCooldownEscalation, ReentryRecoveryEscalation: c.RiskReentryRecoveryEscalation, UnprotectableAction: c.RiskUnprotectableAction, ReentryNoiseOverride: c.RiskReentryNoiseOverride, DefaultsVersion: copyGuardPolicyDefaultsVersion}
 }
 
-func (s *CopyTradeStore) saveCopyGuardPolicy(c *CopyTradeConfig) error {
-	if c == nil || c.RiskPolicyVersion < 4 {
+type sqlExecer interface {
+	Exec(query string, args ...interface{}) (sql.Result, error)
+}
+
+func saveCopyGuardPolicyWithExecutor(exec sqlExecer, c *CopyTradeConfig) error {
+	if c == nil {
 		return nil
+	}
+	if c.RiskPolicyVersion < 4 {
+		// A stale v4 JSON row would otherwise override the downgraded base
+		// config on the next read and silently reactivate Copy Guard.
+		_, err := exec.Exec(`DELETE FROM copy_guard_policies WHERE trader_id=?`, c.TraderID)
+		return err
 	}
 	b, err := json.Marshal(policyFromConfig(c))
 	if err != nil {
 		return err
 	}
-	_, err = s.db.Exec(`INSERT INTO copy_guard_policies(trader_id, policy_json, updated_at) VALUES(?,?,CURRENT_TIMESTAMP)
+	_, err = exec.Exec(`INSERT INTO copy_guard_policies(trader_id, policy_json, updated_at) VALUES(?,?,CURRENT_TIMESTAMP)
 		ON CONFLICT(trader_id) DO UPDATE SET policy_json=excluded.policy_json, updated_at=CURRENT_TIMESTAMP`, c.TraderID, string(b))
 	return err
+}
+
+func (s *CopyTradeStore) saveCopyGuardPolicy(c *CopyTradeConfig) error {
+	return saveCopyGuardPolicyWithExecutor(s.db, c)
 }
 
 func (s *CopyTradeStore) loadCopyGuardPolicy(c *CopyTradeConfig) error {
@@ -582,10 +602,10 @@ func (s *CopyTradeStore) loadCopyGuardPolicy(c *CopyTradeConfig) error {
 // user explicitly choosing that same number. v7 therefore preserves every
 // stored risk value, pins legacy policies to legacy_rule, and advances only
 // the defaults-version bookmark. Recommended v7 values apply to new configs.
-func (s *CopyTradeStore) migrateCopyGuardPolicyDefaults() {
+func (s *CopyTradeStore) migrateCopyGuardPolicyDefaults() error {
 	rows, err := s.db.Query(`SELECT trader_id, policy_json FROM copy_guard_policies`)
 	if err != nil {
-		return
+		return fmt.Errorf("read copy guard policy defaults migration: %w", err)
 	}
 	type pendingPolicy struct {
 		traderID string
@@ -595,18 +615,26 @@ func (s *CopyTradeStore) migrateCopyGuardPolicyDefaults() {
 	for rows.Next() {
 		var traderID, raw string
 		if err := rows.Scan(&traderID, &raw); err != nil {
-			continue
+			_ = rows.Close()
+			return fmt.Errorf("scan copy guard policy defaults migration: %w", err)
 		}
 		var p CopyGuardPolicy
 		if err := json.Unmarshal([]byte(raw), &p); err != nil {
-			continue
+			_ = rows.Close()
+			return fmt.Errorf("decode copy guard policy for trader %s: %w", traderID, err)
 		}
 		if p.Version < 4 || p.DefaultsVersion >= copyGuardPolicyDefaultsVersion {
 			continue
 		}
 		pending = append(pending, pendingPolicy{traderID: traderID, policy: p})
 	}
-	rows.Close()
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("iterate copy guard policy defaults migration: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close copy guard policy defaults migration rows: %w", err)
+	}
 	for _, item := range pending {
 		p := item.policy
 		if p.ReentryDecisionMode == "" {
@@ -615,10 +643,13 @@ func (s *CopyTradeStore) migrateCopyGuardPolicyDefaults() {
 		p.DefaultsVersion = copyGuardPolicyDefaultsVersion
 		b, err := json.Marshal(p)
 		if err != nil {
-			continue
+			return fmt.Errorf("encode copy guard policy for trader %s: %w", item.traderID, err)
 		}
-		_, _ = s.db.Exec(`UPDATE copy_guard_policies SET policy_json=?, updated_at=CURRENT_TIMESTAMP WHERE trader_id=?`, string(b), item.traderID)
+		if _, err := s.db.Exec(`UPDATE copy_guard_policies SET policy_json=?, updated_at=CURRENT_TIMESTAMP WHERE trader_id=?`, string(b), item.traderID); err != nil {
+			return fmt.Errorf("persist copy guard policy defaults for trader %s: %w", item.traderID, err)
+		}
 	}
+	return nil
 }
 
 func (s *CopyTradeStore) EnsureCopyGuardCycle(c *CopyGuardCycle) (*CopyGuardCycle, error) {
@@ -629,7 +660,9 @@ func (s *CopyTradeStore) EnsureCopyGuardCycle(c *CopyGuardCycle) (*CopyGuardCycl
 	err := s.db.QueryRow(`SELECT id FROM copy_guard_cycles WHERE trader_id=? AND leader_pos_id=? AND closed_at IS NULL ORDER BY id DESC LIMIT 1`, c.TraderID, c.LeaderPosID).Scan(&existing)
 	if err == nil {
 		if c.BaselineLeaderSize > 0 {
-			_, _ = s.db.Exec(`UPDATE copy_guard_cycles SET baseline_leader_size=?,shadow_leader_size=?,baseline_leader_size_available=1,baseline_leader_size_quality='VERIFIED' WHERE id=? AND baseline_leader_size<=0`, c.BaselineLeaderSize, c.BaselineLeaderSize, existing)
+			if _, updateErr := s.db.Exec(`UPDATE copy_guard_cycles SET baseline_leader_size=?,shadow_leader_size=CASE WHEN shadow_leader_size<=0 THEN ? ELSE shadow_leader_size END,baseline_leader_size_available=1,baseline_leader_size_quality='VERIFIED' WHERE id=? AND baseline_leader_size<=0`, c.BaselineLeaderSize, c.BaselineLeaderSize, existing); updateErr != nil {
+				return nil, updateErr
+			}
 		}
 		return s.GetCopyGuardCycle(existing)
 	}
@@ -643,13 +676,36 @@ func (s *CopyTradeStore) EnsureCopyGuardCycle(c *CopyGuardCycle) (*CopyGuardCycl
 	if available {
 		quality = "VERIFIED"
 	}
+	shadow := c.ShadowLeaderSize
+	if shadow <= 0 {
+		shadow = c.BaselineLeaderSize
+	}
 	res, err := s.db.Exec(`INSERT INTO copy_guard_cycles(trader_id,leader_id,leader_pos_id,symbol,side,margin_mode,status,policy_snapshot,leader_entry_price,follower_entry_price,follower_notional,baseline_notional,baseline_leader_size,shadow_leader_size,baseline_leader_size_available,baseline_leader_size_quality,account_equity,atr_at_entry,last_observed_price,protection_status,baseline_version,pending_since) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,2,CURRENT_TIMESTAMP)`,
-		c.TraderID, c.LeaderID, c.LeaderPosID, c.Symbol, c.Side, c.MarginMode, c.Status, c.PolicySnapshot, c.LeaderEntryPrice, c.FollowerEntryPrice, c.FollowerNotional, c.FollowerNotional, c.BaselineLeaderSize, c.BaselineLeaderSize, available, quality, c.AccountEquity, c.ATRAtEntry, c.LastObservedPrice, c.ProtectionStatus)
+		c.TraderID, c.LeaderID, c.LeaderPosID, c.Symbol, c.Side, c.MarginMode, c.Status, c.PolicySnapshot, c.LeaderEntryPrice, c.FollowerEntryPrice, c.FollowerNotional, c.FollowerNotional, c.BaselineLeaderSize, shadow, available, quality, c.AccountEquity, c.ATRAtEntry, c.LastObservedPrice, c.ProtectionStatus)
 	if err != nil {
 		return nil, err
 	}
 	id, _ := res.LastInsertId()
 	return s.GetCopyGuardCycle(id)
+}
+
+// GetConfirmedInitialLeaderSize returns the only evidence accepted for an
+// immutable cycle baseline: the earliest exchange-confirmed leader open.
+func (s *CopyTradeStore) GetConfirmedInitialLeaderSize(traderID, leaderPosID string) (float64, bool, error) {
+	var size float64
+	err := s.db.QueryRow(`SELECT leader_target_size FROM copy_trade_execution_intents
+		WHERE trader_id=? AND leader_pos_id=?
+		  AND action IN ('open_long','open_short')
+		  AND status IN ('FILLED','PROTECTED')
+		  AND leader_target_size>0
+		ORDER BY source_revision,id LIMIT 1`, traderID, leaderPosID).Scan(&size)
+	if err == sql.ErrNoRows {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	return size, true, nil
 }
 
 func (s *CopyTradeStore) InitializeCopyGuardLeaderBaseline(id int64, leaderSize float64) error {
@@ -1606,7 +1662,8 @@ type CopyGuardSummary struct {
 	PendingProtectionCount int     `json:"pending_protection_count"`
 	UnknownCount           int     `json:"unknown_count"`
 	DegradedCount          int     `json:"degraded_count"`
-	// v5 可保护性状态机：活跃仓位中止损被强平价钳紧 / 完全无法保护（裸跑）的数量
+	// v5 可保护性状态机：活跃仓位中止损被强平价钳紧 / 无法保护且正在
+	// 强制退出或等待交易所终态的数量。
 	ClampedCount           int `json:"clamped_count"`
 	UnprotectableCount     int `json:"unprotectable_count"`
 	AccountingPendingCount int `json:"accounting_pending_count"`
@@ -1802,13 +1859,19 @@ func (s *CopyTradeStore) CopyGuardSummary(traderIDs []string, from, to time.Time
 	for i, id := range traderIDs {
 		ignoredArgs[i] = id
 	}
-	_ = s.db.QueryRow(`SELECT COUNT(*) FROM copy_trade_position_mappings WHERE trader_id IN (`+marks+`) AND status='ignored'`, ignoredArgs...).Scan(&x.IgnoredCount)
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM copy_trade_position_mappings WHERE trader_id IN (`+marks+`) AND status='ignored'`, ignoredArgs...).Scan(&x.IgnoredCount); err != nil {
+		return &x, err
+	}
 	rateArgs := append(append([]interface{}{}, ignoredArgs...), from.UTC().Format("2006-01-02 15:04:05"), to.UTC().Format("2006-01-02 15:04:05"))
 	filteredCycleQuery := `SELECT id FROM copy_guard_cycles WHERE trader_id IN (` + marks + `) AND opened_at>=? AND opened_at<?`
 	filteredCycleQuery, rateArgs = appendCopyGuardFilter(filteredCycleQuery, rateArgs, filter)
 	var endedReentries, winningReentries, stoppedCycles, falseKills int
-	_ = s.db.QueryRow(`SELECT COUNT(*),COALESCE(SUM(CASE WHEN pnl>0 THEN 1 ELSE 0 END),0) FROM copy_guard_attempts WHERE cycle_id IN (`+filteredCycleQuery+`) AND attempt_no>0 AND closed_at IS NOT NULL`, rateArgs...).Scan(&endedReentries, &winningReentries)
-	_ = s.db.QueryRow(`SELECT COALESCE(SUM(CASE WHEN stop_count>0 AND accounting_status='RECONCILED' AND COALESCE(baseline_source,'')<>'missing' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN stop_count>0 AND accounting_status='RECONCILED' AND COALESCE(baseline_source,'')<>'missing' AND baseline_pnl>0 AND net_guard_effect<0 THEN 1 ELSE 0 END),0) FROM copy_guard_cycles WHERE id IN (`+filteredCycleQuery+`)`, rateArgs...).Scan(&stoppedCycles, &falseKills)
+	if err := s.db.QueryRow(`SELECT COUNT(*),COALESCE(SUM(CASE WHEN pnl>0 THEN 1 ELSE 0 END),0) FROM copy_guard_attempts WHERE cycle_id IN (`+filteredCycleQuery+`) AND attempt_no>0 AND closed_at IS NOT NULL`, rateArgs...).Scan(&endedReentries, &winningReentries); err != nil {
+		return &x, err
+	}
+	if err := s.db.QueryRow(`SELECT COALESCE(SUM(CASE WHEN stop_count>0 AND accounting_status='RECONCILED' AND COALESCE(baseline_source,'')<>'missing' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN stop_count>0 AND accounting_status='RECONCILED' AND COALESCE(baseline_source,'')<>'missing' AND baseline_pnl>0 AND net_guard_effect<0 THEN 1 ELSE 0 END),0) FROM copy_guard_cycles WHERE id IN (`+filteredCycleQuery+`)`, rateArgs...).Scan(&stoppedCycles, &falseKills); err != nil {
+		return &x, err
+	}
 	x.ReentrySampleCount, x.StoppedCycleCount, x.FalseKillCount = endedReentries, stoppedCycles, falseKills
 	if endedReentries > 0 {
 		x.ReentrySuccessRate = float64(winningReentries) / float64(endedReentries)
@@ -1818,17 +1881,25 @@ func (s *CopyTradeStore) CopyGuardSummary(traderIDs []string, from, to time.Time
 	}
 	x.ReentrySuccessEstimate = wilsonRate(winningReentries, endedReentries)
 	x.FalseKillEstimate = wilsonRate(falseKills, stoppedCycles)
-	_ = s.db.QueryRow(`SELECT
+	if err := s.db.QueryRow(`SELECT
 		COALESCE(SUM(CASE WHEN a.attempt_no=0 THEN a.pnl ELSE 0 END),0),
 		COALESCE(SUM(CASE WHEN a.attempt_no>0 THEN a.pnl ELSE 0 END),0)
 		FROM copy_guard_attempts a JOIN copy_guard_cycles c ON c.id=a.cycle_id
-		WHERE c.id IN (`+filteredCycleQuery+`) AND c.accounting_status='RECONCILED'`, rateArgs...).Scan(&x.StopOnlyPnL, &x.ReentryContribution)
+		WHERE c.id IN (`+filteredCycleQuery+`) AND c.accounting_status='RECONCILED'`, rateArgs...).Scan(&x.StopOnlyPnL, &x.ReentryContribution); err != nil {
+		return &x, err
+	}
 	// v5 统计分层：估算基线（最后观测价，领航员真实离场价未获得）的周期
 	// 单列，避免估算值混入 headline 后误导（实测口径 = 总值 − 估算部分）。
 	// 计数与求和口径一致：都只统计 stop_count>0（headline 净效果的组成部分）
-	_ = s.db.QueryRow(`SELECT COUNT(*),COALESCE(SUM(net_guard_effect),0) FROM copy_guard_cycles WHERE id IN (`+filteredCycleQuery+`) AND accounting_status='RECONCILED' AND baseline_source='last_observed' AND stop_count>0`, rateArgs...).Scan(&x.EstimatedBaselineCycles, &x.EstimatedNetGuardEffect)
-	_ = s.db.QueryRow(`SELECT COUNT(*) FROM copy_guard_cycles WHERE id IN (`+filteredCycleQuery+`) AND accounting_status='RECONCILED' AND baseline_source='missing' AND stop_count>0`, rateArgs...).Scan(&x.UnscorableBaselineCycles)
-	_ = s.db.QueryRow(`SELECT COUNT(*) FROM copy_guard_cycles WHERE id IN (`+filteredCycleQuery+`) AND accounting_status='RECONCILED' AND COALESCE(baseline_source,'') NOT IN ('missing','last_observed') AND stop_count>0`, rateArgs...).Scan(&x.VerifiedBaselineCycles)
+	if err := s.db.QueryRow(`SELECT COUNT(*),COALESCE(SUM(net_guard_effect),0) FROM copy_guard_cycles WHERE id IN (`+filteredCycleQuery+`) AND accounting_status='RECONCILED' AND baseline_source='last_observed' AND stop_count>0`, rateArgs...).Scan(&x.EstimatedBaselineCycles, &x.EstimatedNetGuardEffect); err != nil {
+		return &x, err
+	}
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM copy_guard_cycles WHERE id IN (`+filteredCycleQuery+`) AND accounting_status='RECONCILED' AND baseline_source='missing' AND stop_count>0`, rateArgs...).Scan(&x.UnscorableBaselineCycles); err != nil {
+		return &x, err
+	}
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM copy_guard_cycles WHERE id IN (`+filteredCycleQuery+`) AND accounting_status='RECONCILED' AND COALESCE(baseline_source,'') NOT IN ('missing','last_observed') AND stop_count>0`, rateArgs...).Scan(&x.VerifiedBaselineCycles); err != nil {
+		return &x, err
+	}
 	verifiedRows, verifiedErr := s.db.Query(`SELECT net_guard_effect FROM copy_guard_cycles WHERE id IN (`+filteredCycleQuery+`) AND accounting_status='RECONCILED' AND COALESCE(baseline_source,'') NOT IN ('missing','last_observed') AND stop_count>0 ORDER BY id`, rateArgs...)
 	if verifiedErr != nil {
 		return &x, verifiedErr
@@ -1875,14 +1946,20 @@ func (s *CopyTradeStore) CopyGuardSummary(traderIDs []string, from, to time.Time
 	trendQuery := `SELECT date(opened_at),COALESCE(SUM(actual_pnl),0),COALESCE(SUM(CASE WHEN COALESCE(baseline_source,'')<>'missing' THEN baseline_pnl ELSE 0 END),0),COALESCE(SUM(CASE WHEN stop_count>0 AND COALESCE(baseline_source,'')<>'missing' THEN net_guard_effect ELSE 0 END),0) FROM copy_guard_cycles WHERE trader_id IN (` + marks + `) AND opened_at>=? AND opened_at<? AND accounting_status='RECONCILED'`
 	trendQuery, trendArgs = appendCopyGuardFilter(trendQuery, trendArgs, filter)
 	trendQuery += ` GROUP BY date(opened_at) ORDER BY date(opened_at)`
-	if rows, queryErr := s.db.Query(trendQuery, trendArgs...); queryErr == nil {
-		defer rows.Close()
-		for rows.Next() {
-			var point CopyGuardTrendPoint
-			if scanErr := rows.Scan(&point.Date, &point.Actual, &point.Baseline, &point.NetEffect); scanErr == nil {
-				x.Trend = append(x.Trend, point)
-			}
+	rows, queryErr = s.db.Query(trendQuery, trendArgs...)
+	if queryErr != nil {
+		return &x, queryErr
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var point CopyGuardTrendPoint
+		if scanErr := rows.Scan(&point.Date, &point.Actual, &point.Baseline, &point.NetEffect); scanErr != nil {
+			return &x, scanErr
 		}
+		x.Trend = append(x.Trend, point)
+	}
+	if rowsErr := rows.Err(); rowsErr != nil {
+		return &x, rowsErr
 	}
 	return &x, nil
 }

@@ -149,22 +149,33 @@ func (s *ReentryAIStore) initTables() error {
 	if err != nil {
 		return err
 	}
-	s.db.Exec(`ALTER TABLE reentry_ai_analyses ADD COLUMN candidate_id INTEGER NOT NULL DEFAULT 0`)
-	s.db.Exec(`ALTER TABLE reentry_ai_analyses ADD COLUMN snapshot_price REAL DEFAULT 0`)
-	s.db.Exec(`ALTER TABLE reentry_ai_analyses ADD COLUMN attempt_no INTEGER NOT NULL DEFAULT 0`)
-	s.db.Exec(`ALTER TABLE reentry_ai_analyses ADD COLUMN decision_generation INTEGER NOT NULL DEFAULT 0`)
-	s.db.Exec(`ALTER TABLE reentry_ai_analyses ADD COLUMN call_status TEXT NOT NULL DEFAULT 'PENDING'`)
-	s.db.Exec(`ALTER TABLE reentry_ai_analyses ADD COLUMN call_error TEXT NOT NULL DEFAULT ''`)
-	s.db.Exec(`ALTER TABLE reentry_ai_analyses ADD COLUMN data_hash TEXT NOT NULL DEFAULT ''`)
-	s.db.Exec(`ALTER TABLE reentry_ai_analyses ADD COLUMN model_started_at DATETIME`)
-	s.db.Exec(`ALTER TABLE reentry_ai_analyses ADD COLUMN model_completed_at DATETIME`)
-	s.db.Exec(`ALTER TABLE reentry_ai_analyses ADD COLUMN decision_expires_at DATETIME`)
-	s.db.Exec(`UPDATE reentry_ai_analyses SET call_status=CASE WHEN verdict<>'' THEN 'COMPLETED' WHEN raw_response<>'' THEN 'INVALID' ELSE call_status END WHERE call_status='PENDING'`)
-	s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_reentry_ai_analyses_candidate ON reentry_ai_analyses(candidate_id,id)`)
-	// 早期建表缺列时老库补列（重复执行报 duplicate column 忽略）
-	s.db.Exec(`ALTER TABLE reentry_ai_config ADD COLUMN ai_enabled BOOLEAN DEFAULT 0`)
-	s.db.Exec(`ALTER TABLE reentry_ai_config ADD COLUMN auto_entry_enabled BOOLEAN DEFAULT 0`)
-	s.db.Exec(`ALTER TABLE reentry_ai_config ADD COLUMN analysis_focus TEXT DEFAULT ''`)
+	for _, migration := range []struct {
+		table, column, definition string
+	}{
+		{"reentry_ai_analyses", "candidate_id", "INTEGER NOT NULL DEFAULT 0"},
+		{"reentry_ai_analyses", "snapshot_price", "REAL DEFAULT 0"},
+		{"reentry_ai_analyses", "attempt_no", "INTEGER NOT NULL DEFAULT 0"},
+		{"reentry_ai_analyses", "decision_generation", "INTEGER NOT NULL DEFAULT 0"},
+		{"reentry_ai_analyses", "call_status", "TEXT NOT NULL DEFAULT 'PENDING'"},
+		{"reentry_ai_analyses", "call_error", "TEXT NOT NULL DEFAULT ''"},
+		{"reentry_ai_analyses", "data_hash", "TEXT NOT NULL DEFAULT ''"},
+		{"reentry_ai_analyses", "model_started_at", "DATETIME"},
+		{"reentry_ai_analyses", "model_completed_at", "DATETIME"},
+		{"reentry_ai_analyses", "decision_expires_at", "DATETIME"},
+		{"reentry_ai_config", "ai_enabled", "BOOLEAN DEFAULT 0"},
+		{"reentry_ai_config", "auto_entry_enabled", "BOOLEAN DEFAULT 0"},
+		{"reentry_ai_config", "analysis_focus", "TEXT DEFAULT ''"},
+	} {
+		if err := ensureSQLiteColumn(s.db, migration.table, migration.column, migration.definition); err != nil {
+			return fmt.Errorf("migrate %s.%s: %w", migration.table, migration.column, err)
+		}
+	}
+	if _, err := s.db.Exec(`UPDATE reentry_ai_analyses SET call_status=CASE WHEN verdict<>'' THEN 'COMPLETED' WHEN raw_response<>'' THEN 'INVALID' ELSE call_status END WHERE call_status='PENDING'`); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_reentry_ai_analyses_candidate ON reentry_ai_analyses(candidate_id,id)`); err != nil {
+		return err
+	}
 	if err := s.initReentryCandidateTables(); err != nil {
 		return err
 	}

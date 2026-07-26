@@ -1122,6 +1122,41 @@ func TestAIReentryAmbiguousErrorsNeverReleaseForRetry(t *testing.T) {
 	}
 }
 
+func TestAIReentryFinalPreflightUsesPersistedDisableBarrier(t *testing.T) {
+	st, err := store.New(filepath.Join(t.TempDir(), "ai-disable-barrier.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if _, err := st.DB().Exec(`INSERT INTO traders(id,name,ai_model_id,exchange_id,initial_balance)
+		VALUES('trader-1','test','','exchange-1',100)`); err != nil {
+		t.Fatal(err)
+	}
+	cfg := store.NewCopyGuardDefaults()
+	cfg.TraderID = "trader-1"
+	cfg.ProviderType = string(ProviderOKX)
+	cfg.LeaderID = "leader"
+	cfg.Enabled = true
+	cfg.RiskPolicyVersion = 7
+	cfg.RiskStopLossEnabled = false
+	cfg.RiskReentryEnabled = true
+	cfg.RiskReentryDecisionMode = "ai_guarded"
+	if err := st.CopyTrade().Upsert(cfg); err != nil {
+		t.Fatal(err)
+	}
+	ti := NewTraderIntegration("trader-1", flatExecutor{}, st)
+	ti.engine = &Engine{config: &CopyConfig{
+		RiskPolicyVersion:       7,
+		RiskStopLossEnabled:     true, // stale pre-save runtime snapshot
+		RiskReentryEnabled:      true,
+		RiskReentryDecisionMode: "ai_guarded",
+	}}
+	err = ti.validateAIReentryImmediatelyBeforeOrder(&decision.Decision{})
+	if !errors.Is(err, errAIReentryOrderPreflight) || ReasonCodeOf(err) != "EXECUTION_DISABLED" {
+		t.Fatalf("persisted stop disable must block an in-flight AI order, got code=%s err=%v", ReasonCodeOf(err), err)
+	}
+}
+
 func TestAIReentryAmbiguousFailureKeepsLeaseAndReservation(t *testing.T) {
 	st, err := store.New(filepath.Join(t.TempDir(), "ai-ambiguous-failure.db"))
 	if err != nil {

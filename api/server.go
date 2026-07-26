@@ -515,17 +515,21 @@ type CopyConfigReq struct {
 //
 // 调用点：Create handler / Update handler 内部，构造 copyConfig 后调用一次。
 // 复用理由：两个 handler 透传逻辑完全一致，提取避免重复
-func applyCopyConfigRiskFields(copyConfig *store.CopyTradeConfig, req *CopyConfigReq) {
+func applyCopyConfigRiskFields(copyConfig *store.CopyTradeConfig, req *CopyConfigReq) bool {
 	if copyConfig == nil || req == nil {
-		return
+		return false
 	}
+	// Retired fields remain readable for old clients, but every write path
+	// normalizes them before provider-specific early returns.
+	manualDeprecated := applyRetiredCopyGuardCompatibility(copyConfig, req.RiskManualReentryEnabled)
+	copyConfig.RiskUnprotectableAction = "close"
 	// Copy Guard（risk_policy_version >= 4）支持 OKX 与 Binance 领航员数据源。
 	// 不支持的数据源（Hyperliquid）对所有 Copy Guard 风控字段无意义，若不剥离
 	// risk_policy_version，后续 "v4 only for OKX/Binance" 校验会把其正常跟单
 	// 保存整体 400 拒绝。语义：不支持的数据源忽略全部风控字段，只保留基础跟单配置。
 	if !copytrade.SupportsCopyGuard(copytrade.ProviderType(copyConfig.ProviderType)) {
 		copyConfig.RiskPolicyVersion = 0
-		return
+		return manualDeprecated
 	}
 	// 开关：nil 用合理默认；非 nil 用 *值
 	copyConfig.RiskStopLossEnabled = derefBoolDefault(req.RiskStopLossEnabled, copyConfig.RiskStopLossEnabled)
@@ -537,7 +541,6 @@ func applyCopyConfigRiskFields(copyConfig *store.CopyTradeConfig, req *CopyConfi
 	// ATR 基线 + 账户线决定，用户可显式开启恢复严格保证金封顶。
 	copyConfig.RiskLeverageFallback = derefBoolDefault(req.RiskLeverageFallback, copyConfig.RiskLeverageFallback)
 	copyConfig.RiskReentryEnabled = derefBoolDefault(req.RiskReentryEnabled, copyConfig.RiskReentryEnabled)
-	applyRetiredCopyGuardCompatibility(copyConfig, req.RiskManualReentryEnabled)
 	copyConfig.RiskReentryNoiseOverride = derefBoolDefault(req.RiskReentryNoiseOverride, copyConfig.RiskReentryNoiseOverride)
 	// 旧请求结构中部分数值不是指针；零值只能表示“未传”，因此仅用非零值
 	// 覆盖已经由统一默认工厂或存量配置提供的值。
@@ -602,10 +605,9 @@ func applyCopyConfigRiskFields(copyConfig *store.CopyTradeConfig, req *CopyConfi
 	if req.RiskReentryRecoveryEscalation != 0 {
 		copyConfig.RiskReentryRecoveryEscalation = req.RiskReentryRecoveryEscalation
 	}
-	// v5 可保护性处置模式（空值由 FillRiskDefaults 兜底为 close）
-	if req.RiskUnprotectableAction != "" {
-		copyConfig.RiskUnprotectableAction = req.RiskUnprotectableAction
-	}
+	// "follow" is retained in the request schema only for old clients.
+	// New saves always fail closed; known unprotected positions may not run.
+	copyConfig.RiskUnprotectableAction = "close"
 	if req.RiskReentryDecisionMode != nil {
 		copyConfig.RiskReentryDecisionMode = *req.RiskReentryDecisionMode
 	}
@@ -637,6 +639,7 @@ func applyCopyConfigRiskFields(copyConfig *store.CopyTradeConfig, req *CopyConfi
 		copyConfig.RiskNotificationLevel = *req.RiskNotificationLevel
 	}
 	copyConfig.FillRiskDefaults()
+	return manualDeprecated
 }
 
 // derefBoolDefault 安全解引用 *bool：nil 返回 def，非 nil 返回 *p
@@ -971,6 +974,7 @@ func (s *Server) handleCreateTrader(c *gin.Context) {
 	if decisionMode == "" {
 		decisionMode = "ai" // Default to AI mode
 	}
+	manualReentryDeprecated := false
 
 	// Update decision_mode in database
 	if err := s.store.CopyTrade().UpdateDecisionMode(traderID, decisionMode); err != nil {
@@ -1009,7 +1013,7 @@ func (s *Server) handleCreateTrader(c *gin.Context) {
 		}
 
 		// v3 风控字段透传（修复 bug：之前 CopyConfigReq 无 risk_* 字段，前端传值被 JSON unmarshal 静默丢弃）
-		applyCopyConfigRiskFields(copyConfig, req.CopyConfig)
+		manualReentryDeprecated = applyCopyConfigRiskFields(copyConfig, req.CopyConfig)
 		if err := copytrade.ValidateStoredRiskPolicy(copyConfig); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
@@ -1072,13 +1076,17 @@ func (s *Server) handleCreateTrader(c *gin.Context) {
 
 	logger.Infof("✓ Trader created successfully: %s (model: %s, exchange: %s, mode: %s)", req.Name, req.AIModelID, req.ExchangeID, decisionMode)
 
-	c.JSON(http.StatusCreated, gin.H{
+	response := gin.H{
 		"trader_id":     traderID,
 		"trader_name":   req.Name,
 		"ai_model":      req.AIModelID,
 		"is_running":    false,
 		"decision_mode": decisionMode,
-	})
+	}
+	if manualReentryDeprecated {
+		response["deprecated"] = manualReentryDeprecatedMessage
+	}
+	c.JSON(http.StatusCreated, response)
 }
 
 // UpdateTraderRequest Update trader request
@@ -1227,6 +1235,7 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 
 	// Handle copy trading configuration update
 	decisionMode := req.DecisionMode
+	manualReentryDeprecated := false
 	if decisionMode != "" {
 		// Update decision_mode in database
 		if err := s.store.CopyTrade().UpdateDecisionMode(traderID, decisionMode); err != nil {
@@ -1271,7 +1280,7 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 			copyConfig.BinanceTopTraderID = req.CopyConfig.BinanceTopTraderID
 
 			// v3 风控字段透传（修复 bug：之前 CopyConfigReq 无 risk_* 字段，前端传值被 JSON unmarshal 静默丢弃）
-			applyCopyConfigRiskFields(copyConfig, req.CopyConfig)
+			manualReentryDeprecated = applyCopyConfigRiskFields(copyConfig, req.CopyConfig)
 			if err := validateLegacyReentrySelection(existingCopyCfg, copyConfig.RiskReentryDecisionMode); err != nil {
 				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 				return
@@ -1326,6 +1335,11 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 				return
 			}
 			disableReentryCandidatesAfterConfigSave(s.store, existingCopyCfg, copyConfig)
+			if err := copytrade.ReloadCopyTradingForTrader(traderID); err != nil {
+				logger.Errorf("❌ Copy trade config persisted but runtime reload failed: %v", err)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error(), "persisted": true})
+				return
+			}
 			logger.Infof("✓ Copy trade config updated: provider=%s, leader=%s, ratio=%.0f%% (risk SL=%v reentry=%v)",
 				copyConfig.ProviderType, copyConfig.LeaderID, copyConfig.CopyRatio*100,
 				copyConfig.RiskStopLossEnabled, copyConfig.RiskReentryEnabled)
@@ -1346,13 +1360,17 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 
 	logger.Infof("✓ Trader updated successfully: %s (model: %s, exchange: %s, strategy: %s)", req.Name, req.AIModelID, req.ExchangeID, strategyID)
 
-	c.JSON(http.StatusOK, gin.H{
+	response := gin.H{
 		"trader_id":     traderID,
 		"trader_name":   req.Name,
 		"ai_model":      req.AIModelID,
 		"decision_mode": decisionMode,
 		"message":       "Trader updated successfully",
-	})
+	}
+	if manualReentryDeprecated {
+		response["deprecated"] = manualReentryDeprecatedMessage
+	}
+	c.JSON(http.StatusOK, response)
 }
 
 // handleDeleteTrader Delete trader

@@ -446,7 +446,9 @@ func TestMigratePolicyDefaults(t *testing.T) {
 	// 已是当前代次：即使值等于旧默认也不得再动（用户设回旧值的选择）
 	seed("t-current", CopyGuardPolicy{Version: 4, ReentryMaxChaseATR: 0, ReentryCooldownSec: 60, MaxReentries: 1, DefaultsVersion: copyGuardPolicyDefaultsVersion})
 
-	cs.migrateCopyGuardPolicyDefaults()
+	if err := cs.migrateCopyGuardPolicyDefaults(); err != nil {
+		t.Fatal(err)
+	}
 
 	if p := load("t-old-defaults"); p.ReentryMaxChaseATR != 0 || p.ReentryCooldownSec != 60 || p.MaxReentries != 2 || p.ReentryDecisionMode != "legacy_rule" || p.DefaultsVersion != copyGuardPolicyDefaultsVersion {
 		t.Fatalf("v7 migration must preserve stored values and pin legacy mode: %+v", p)
@@ -506,7 +508,9 @@ func TestMigratePolicyDefaultsGen6(t *testing.T) {
 	// 已达当前代次：不重扫（即使值等于旧默认）
 	seed("t-current", copyGuardPolicyDefaultsVersion, 1.5, 1)
 
-	cs.migrateCopyGuardPolicyDefaults()
+	if err := cs.migrateCopyGuardPolicyDefaults(); err != nil {
+		t.Fatal(err)
+	}
 
 	if atr, lev := loadCfg("t-old"); atr != 1.5 || lev != 1 {
 		t.Fatalf("存量主表值不得自动覆盖，got atr=%.2f lev=%d", atr, lev)
@@ -516,5 +520,34 @@ func TestMigratePolicyDefaultsGen6(t *testing.T) {
 	}
 	if atr, lev := loadCfg("t-current"); atr != 1.5 || lev != 1 {
 		t.Fatalf("已达当前代次的行不得被重扫，got atr=%.2f lev=%d", atr, lev)
+	}
+}
+
+func TestDowngradingRiskPolicyDeletesStaleV4Overlay(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "policy-downgrade.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if _, err = st.DB().Exec(`INSERT INTO traders(id, name, ai_model_id, exchange_id, initial_balance) VALUES(?,?,?,?,0)`,
+		"trader-downgrade", "trader-downgrade", "m", "e"); err != nil {
+		t.Fatal(err)
+	}
+	cs := st.CopyTrade()
+	cfg := &CopyTradeConfig{TraderID: "trader-downgrade", RiskPolicyVersion: 4}
+	cfg.FillRiskDefaults()
+	if err = cs.saveCopyGuardPolicy(cfg); err != nil {
+		t.Fatal(err)
+	}
+	cfg.RiskPolicyVersion = 0
+	if err = cs.saveCopyGuardPolicy(cfg); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err = st.DB().QueryRow(`SELECT COUNT(*) FROM copy_guard_policies WHERE trader_id=?`, cfg.TraderID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("stale v4 policy overlay survived downgrade: count=%d", count)
 	}
 }

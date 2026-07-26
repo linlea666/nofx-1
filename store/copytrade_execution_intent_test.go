@@ -76,6 +76,31 @@ func TestRiskSkippedAddReclaimsOnlyForNewSourceFill(t *testing.T) {
 	}
 }
 
+func TestPrecheckInfrastructureFailureReplaysSameSourceTransition(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "precheck-replay.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cs := st.CopyTrade()
+	base := &CopyTradeExecutionIntent{
+		TraderID: "t1", LeaderPosID: "p1", SourceRevision: 1,
+		SourceFillID: "snapshot-1", Action: "open_long", Symbol: "ETHUSDT",
+		LeaderTargetSize: 1, ClientOrderID: "stable",
+	}
+	intent, claimed, err := cs.ReserveExecutionIntent(base)
+	if err != nil || !claimed {
+		t.Fatalf("reserve: claimed=%v err=%v", claimed, err)
+	}
+	if err = cs.UpdateExecutionIntent(intent.ID, ExecutionIntentFailed, "PRECHECK_PRICE_UNAVAILABLE", "temporary price failure", "", 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	replayed, claimed, err := cs.ReserveExecutionIntent(base)
+	if err != nil || !claimed || replayed.ID != intent.ID || replayed.ClientOrderID != "stable" {
+		t.Fatalf("same authoritative transition must retry after precheck recovery: intent=%+v claimed=%v err=%v", replayed, claimed, err)
+	}
+}
+
 func TestExecutionIntentAdditiveMigrationIsIdempotent(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "legacy-intent.db")
 	raw, err := sql.Open("sqlite", dbPath)
@@ -354,5 +379,94 @@ func TestSubmittedAndReconcilingIntentMaySettleAsSkipped(t *testing.T) {
 		if updateErr := cs.UpdateExecutionIntent(intent.ID, ExecutionIntentSkipped, "POSITION_ALREADY_FLAT", "", "", 0, 0, 0); updateErr != nil {
 			t.Fatalf("case %d skip transition: %v", index, updateErr)
 		}
+	}
+}
+
+func TestSourceRevalidationIntentCanOnlyBeReclaimedWithoutAttempts(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "source-revalidation.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cs := st.CopyTrade()
+	base := &CopyTradeExecutionIntent{
+		TraderID: "t1", LeaderPosID: "p1", SourceRevision: 1,
+		CanonicalKey: "leader|t1|p1|1", Action: "open_long", Symbol: "ETHUSDT",
+		SourceFillID: "f1", LeaderTargetSize: 1, ClientOrderID: "stable",
+	}
+	intent, claimed, err := cs.ReserveExecutionIntent(base)
+	if err != nil || !claimed {
+		t.Fatalf("reserve claimed=%v err=%v", claimed, err)
+	}
+	if pending, pendingErr := cs.HasUnfinishedLeaderExecutionIntent("t1", "p1"); pendingErr != nil || !pending {
+		t.Fatalf("reserved leader intent must block startup ignored baseline: pending=%v err=%v", pending, pendingErr)
+	}
+	if err = cs.UpdateExecutionIntent(intent.ID, ExecutionIntentReconciling, "SOURCE_REVALIDATION_REQUIRED", "", "", 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	replayed := *base
+	replayed.SourceFillID = "f2"
+	replayed.SourceFillIDs = []string{"f1", "f2"}
+	replayed.LeaderTargetSize = 2
+	got, claimed, err := cs.ReserveExecutionIntent(&replayed)
+	if err != nil || !claimed || got.ID != intent.ID || got.Status != ExecutionIntentReserved {
+		t.Fatalf("healthy replay must reclaim pre-submit intent: got=%+v claimed=%v err=%v", got, claimed, err)
+	}
+	if _, err = cs.PrepareExecutionOrderAttempt(intent.ID, "stable", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err = cs.UpdateExecutionIntent(intent.ID, ExecutionIntentReconciling, "SOURCE_REVALIDATION_REQUIRED", "", "", 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, claimed, err = cs.ReserveExecutionIntent(&replayed); err != nil || claimed {
+		t.Fatalf("an intent with a durable attempt must never be reclaimed: claimed=%v err=%v", claimed, err)
+	}
+	if err = cs.UpdateExecutionIntent(intent.ID, ExecutionIntentFailed, "EXCHANGE_TERMINAL_NO_FILL", "", "", 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if pending, pendingErr := cs.HasUnfinishedLeaderExecutionIntent("t1", "p1"); pendingErr != nil || pending {
+		t.Fatalf("terminal leader intent must not block startup baseline: pending=%v err=%v", pending, pendingErr)
+	}
+}
+
+func TestCopyGuardBackfillBaselineUsesConfirmedInitialOpenOnly(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "baseline-evidence.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cs := st.CopyTrade()
+	if size, available, err := cs.GetConfirmedInitialLeaderSize("t1", "p1"); err != nil || available || size != 0 {
+		t.Fatalf("missing evidence must remain unavailable: size=%v available=%v err=%v", size, available, err)
+	}
+	intent, claimed, err := cs.ReserveExecutionIntent(&CopyTradeExecutionIntent{
+		TraderID: "t1", LeaderPosID: "p1", SourceRevision: 1, CanonicalKey: "baseline",
+		Action: "open_long", Symbol: "ETHUSDT", Side: "long", MarginMode: "cross",
+		LeaderTargetSize: 8, ClientOrderID: "baseline-order",
+	})
+	if err != nil || !claimed {
+		t.Fatalf("reserve claimed=%v err=%v", claimed, err)
+	}
+	if err = cs.CommitLeaderExecutionFill(LeaderExecutionCommit{
+		IntentID: intent.ID, TraderID: "t1", LeaderID: "leader", LeaderPosID: "p1",
+		SourceRevision: 1, Action: "open_long", Symbol: "ETHUSDT", Side: "long",
+		MarginMode: "cross", LeaderTargetSize: 8, FillPrice: 100, FilledQuantity: 1,
+		FilledNotional: 100, ExchangeOrderID: "order", ExchangeState: "FILLED",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	size, available, err := cs.GetConfirmedInitialLeaderSize("t1", "p1")
+	if err != nil || !available || size != 8 {
+		t.Fatalf("confirmed initial evidence not recovered: size=%v available=%v err=%v", size, available, err)
+	}
+	cycle, err := cs.EnsureCopyGuardCycle(&CopyGuardCycle{
+		TraderID: "t1", LeaderID: "leader", LeaderPosID: "p1", Symbol: "ETHUSDT",
+		Side: "long", Status: CopyGuardFollowing, BaselineLeaderSize: size, ShadowLeaderSize: 6,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cycle.BaselineAvailable || cycle.BaselineLeaderSize != 8 || cycle.ShadowLeaderSize != 6 {
+		t.Fatalf("immutable baseline and current shadow were conflated: %+v", cycle)
 	}
 }

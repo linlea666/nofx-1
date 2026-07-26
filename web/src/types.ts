@@ -80,6 +80,9 @@ export interface DecisionAction {
     | 'FAILED'
     | 'RECONCILING'
   execution_reason_code?: string
+  protection_status?: string
+  protection_coverage?: number
+  copy_guard_cycle_status?: string
 }
 
 export interface AccountSnapshot {
@@ -176,6 +179,7 @@ export interface CopyGuardAccountRiskPolicyResponse {
   open_protected_positions: number
   aggregate_worst_case_risk_usd: number
   aggregate_is_warning_only: boolean
+  aggregate_risk_quality: 'ESTIMATED_CONFIG_CAP'
 }
 
 export interface CreateExchangeRequest {
@@ -320,7 +324,7 @@ export interface CopyConfigRequest {
   risk_reentry_recovery_escalation?: number // 默认 1.5：第 N 次重入恢复幅度倍率
 
   // v5 可保护性状态机 / 噪音档重入
-  risk_unprotectable_action?: 'close' | 'follow' // 默认 close：确认不可保护时立即离场；follow=标红裸跑并周期性复查
+  risk_unprotectable_action?: 'close' | 'follow' // follow 仅旧协议兼容；所有新保存与运行时均强制 close
   risk_reentry_noise_override?: boolean // 默认 false：距离/ATR<0.3 的噪音档仍允许重入（默认该档禁止重入）
 }
 
@@ -867,7 +871,7 @@ export interface CopyGuardSummary {
   unknown_count: number
   degraded_count: number
   clamped_count: number // v5：活跃仓位中止损被强平价钳紧的数量
-  unprotectable_count: number // v5：活跃仓位中无法保护、裸跑中的数量
+  unprotectable_count: number // v5：无法保护，正在强制退出或等待交易所终态的周期数
   accounting_pending_count: number
   accounting_delayed_count: number
   accounting_unrecoverable_count: number

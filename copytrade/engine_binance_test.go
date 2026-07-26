@@ -105,6 +105,38 @@ func binanceTestPosition(posID string, size float64) *Position {
 	}
 }
 
+func TestInitIgnoredPositionsPreservesPreCrashLeaderIntentForHealthyReplay(t *testing.T) {
+	e, st := newTestCopyTradeEngine(t, ProviderOKX)
+	posID := "pre-crash-position"
+	e.provider = &okxPollTestProvider{&binancePollTestProvider{
+		state: &AccountState{TotalEquity: 1000, Positions: map[string]*Position{
+			posID: binanceTestPosition(posID, 2),
+		}},
+	}}
+	intent, claimed, err := st.CopyTrade().ReserveExecutionIntent(&store.CopyTradeExecutionIntent{
+		TraderID: "test-trader", LeaderPosID: posID, SourceRevision: 1,
+		Action: "open_long", Symbol: "ETHUSDT", LeaderTargetSize: 2,
+		SourceFillID: "source-before-crash", ClientOrderID: "stable-before-crash",
+	})
+	if err != nil || !claimed {
+		t.Fatalf("reserve pre-crash intent: intent=%+v claimed=%v err=%v", intent, claimed, err)
+	}
+	if err = st.CopyTrade().UpdateExecutionIntent(intent.ID, store.ExecutionIntentReconciling,
+		"SOURCE_REVALIDATION_REQUIRED", "", "", 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err = e.InitIgnoredPositions(); err != nil {
+		t.Fatal(err)
+	}
+	mapping, err := st.CopyTrade().GetMapping("test-trader", posID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mapping != nil {
+		t.Fatalf("startup baseline suppressed healthy source replay with mapping: %+v", mapping)
+	}
+}
+
 func saveActiveMapping(t *testing.T, st *store.Store, posID string, lastKnownSize float64) {
 	t.Helper()
 	err := st.CopyTrade().SavePositionMapping(&store.CopyTradePositionMapping{

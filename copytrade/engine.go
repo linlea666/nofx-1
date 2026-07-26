@@ -388,6 +388,18 @@ func (e *Engine) InitIgnoredPositions() error {
 			posID = key
 			logger.Debugf("📊 [%s] 持仓 %s %s 使用虚拟 posId: %s", e.traderID, pos.Symbol, pos.Side, posID)
 		}
+		pending, pendingErr := e.store.CopyTrade().HasUnfinishedLeaderExecutionIntent(e.traderID, posID)
+		if pendingErr != nil {
+			return fmt.Errorf("查询未完成执行意图失败 posId=%s: %w", posID, pendingErr)
+		}
+		if pending {
+			// A crash between reservation/submission and mapping commit is not a
+			// historical startup position. Leaving it unmapped lets the first
+			// healthy authoritative snapshot reclaim and reconcile the same
+			// canonical revision instead of permanently suppressing it.
+			logger.Warnf("🟡 [%s] 启动持仓存在未完成执行意图，等待健康快照重验而不标记 ignored | posId=%s", e.traderID, posID)
+			continue
+		}
 
 		err := e.store.CopyTrade().SaveIgnoredPosition(
 			e.traderID,
@@ -2000,44 +2012,6 @@ func (e *Engine) buildDecisionV2(signal *TradeSignal, match *SignalMatchResult, 
 		dec.Confidence = 90
 		logger.Infof("📊 [%s] %s | 金额=%.2f 杠杆=%dx 模式=%s 入场价=%.4f",
 			e.traderID, match.Action, copySize, dec.Leverage, dec.MarginMode, fill.Price)
-
-		// 🛑 Copy Guard：开仓时预估止损价（仅日志参考，不随开仓单附带）。
-		// 真实保护单由 integration 层在成交后用实际成交价计算并经
-		// upsertV4Protection 状态机挂出（含 clamp / GUARD_UNPROTECTABLE 处置）。
-		// v5：账户线已是硬 cap（ExpectedLossPct 不可能超过 RiskAccountPct），
-		// 旧的"预计损失超警戒"告警已无意义，随 v3 一并移除。
-		if SupportsCopyGuard(e.config.ProviderType) && e.config.RiskPolicyVersion >= 4 && e.config.RiskStopLossEnabled && copySize > 0 {
-			slInput := &StopLossCalcInput{
-				Symbol:         fill.Symbol,
-				Side:           fill.PositionSide,
-				EntryPrice:     fill.Price,
-				Leverage:       dec.Leverage,
-				PositionValue:  copySize, // PositionSizeUSD 已是名义价值，不能重复乘杠杆
-				FollowerEquity: e.getFollowerEquity(),
-			}
-			if slResult, err := calcStopLossPrice(e.config, slInput); err == nil && slResult.SLPrice > 0 {
-				// C 观测（仅日志，不改止损计算）：margin_cap/clamp 主控且止损距离
-				// < 0.5×ATR（噪音区，易被行情波动扫掉）时升为 WARN，供实盘早发现。
-				const slLogFmt = "SL 估算 | %s %s | SL=%.4f 距离=%.4f(%.2f%%) 控线=%s ATR=%.4f 距离/ATR=%.2f tickSz=%.6f"
-				noiseTight := (slResult.GovernedBy == "margin_cap" || slResult.GovernedBy == "clamp") &&
-					slResult.DistanceATRRatio > 0 && slResult.DistanceATRRatio < reentryNoiseCautiousRatio
-				if noiseTight {
-					logger.Warnf("⚠️ [%s] 止损偏紧·易扫损 "+slLogFmt,
-						e.traderID, fill.Symbol, fill.PositionSide,
-						slResult.SLPrice, slResult.SLDistance,
-						(slResult.SLDistance/fill.Price)*100, slResult.GovernedBy, slResult.ATRValue, slResult.DistanceATRRatio, slResult.TickSize)
-				} else {
-					logger.Infof("🛑 [%s] "+slLogFmt,
-						e.traderID, fill.Symbol, fill.PositionSide,
-						slResult.SLPrice, slResult.SLDistance,
-						(slResult.SLDistance/fill.Price)*100, slResult.GovernedBy, slResult.ATRValue, slResult.DistanceATRRatio, slResult.TickSize)
-				}
-			} else if err != nil {
-				logger.Warnf("⚠️ [%s] SL 估算失败（仅记录，integration 层会用实际成交价重算）: %v", e.traderID, err)
-			} else if slResult != nil && slResult.OpenImmediateHit {
-				logger.Warnf("⚠️ [%s] SL 距离过近(<0.1%%)，跳过挂单 | %s 入场=%.4f", e.traderID, fill.Symbol, fill.Price)
-			}
-		}
 	}
 
 	// ============================================================
@@ -2132,20 +2106,6 @@ func (e *Engine) calculateReduceRatioV2(signal *TradeSignal, match *SignalMatchR
 	logger.Infof("📊 [%s] %s 减仓比例 | 减仓量=%.4f 当前=%.4f 减仓前=%.4f → %.1f%%",
 		e.traderID, signal.Fill.Symbol, reduceSize, leaderCurrentSize, leaderPreviousSize, ratio*100)
 
-	return ratio
-}
-
-// getAccumulatedReduceRatio 获取累积减仓比例
-// 用于跟踪多次小额减仓的累计进度，当超过阈值时触发全平
-func (e *Engine) getAccumulatedReduceRatio(posID string) float64 {
-	if e.store == nil {
-		return 0
-	}
-	ratio, err := e.store.CopyTrade().GetAccumulatedReduceRatio(e.traderID, posID)
-	if err != nil {
-		// 可能是新仓位，没有记录
-		return 0
-	}
 	return ratio
 }
 

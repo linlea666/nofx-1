@@ -471,7 +471,10 @@ func (s *CopyTradeStore) initExecutionIntentTable() error {
 // ReserveExecutionIntent atomically claims a source transition. Concurrent
 // fills that observe the same mapping revision collapse to the same intent.
 // FAILED intents may be reclaimed with the same client order id after a
-// proven pre-submit failure; every other existing state is returned unclaimed.
+// proven pre-submit failure. A restart-recovered RESERVED intent may also be
+// reclaimed only after the healthy source pipeline emits the authoritative
+// transition again; the guards below prove that no exchange submission exists.
+// Every other existing state is returned unclaimed.
 func (s *CopyTradeStore) ReserveExecutionIntent(intent *CopyTradeExecutionIntent) (*CopyTradeExecutionIntent, bool, error) {
 	if intent == nil || intent.TraderID == "" || intent.LeaderPosID == "" || intent.SourceRevision <= 0 || intent.Action == "" {
 		return nil, false, fmt.Errorf("invalid copy trade execution intent")
@@ -507,8 +510,10 @@ func (s *CopyTradeStore) ReserveExecutionIntent(intent *CopyTradeExecutionIntent
 			WHERE trader_id=? AND leader_pos_id=? AND source_revision=? AND action=?
 			  AND submitted_at IS NULL AND COALESCE(exchange_order_id,'')=''
 			  AND (
-			    (status='FAILED' AND reason_code IN ('PRE_SUBMIT','DECISION_CHANNEL_BUSY','STARTUP_REPLAY_REQUIRED'))
+			    (status='FAILED' AND (reason_code IN ('PRE_SUBMIT','DECISION_CHANNEL_BUSY','STARTUP_REPLAY_REQUIRED') OR reason_code LIKE 'PRECHECK_%'))
 			    OR (status='SKIPPED' AND reason_code IN ('RISK_CAP','MIN_NOTIONAL') AND ?<>'' AND COALESCE(source_fill_id,'')<>?)
+			    OR (status='RECONCILING' AND reason_code='SOURCE_REVALIDATION_REQUIRED'
+			        AND NOT EXISTS (SELECT 1 FROM copy_trade_execution_order_attempts a WHERE a.intent_id=copy_trade_execution_intents.id))
 			  )
 		`, intent.SourceFillID, intent.CycleID, intent.CandidateID, intent.AnalysisID, intent.AttemptNo, intent.DecisionGeneration,
 			intent.Symbol, intent.Side, intent.MarginMode, intent.LeaderTargetSize,
@@ -799,6 +804,23 @@ func (s *CopyTradeStore) ListUnfinishedExecutionIntents(traderID string) ([]*Cop
 		out = append(out, x)
 	}
 	return out, rows.Err()
+}
+
+// HasUnfinishedLeaderExecutionIntent prevents startup baseline initialization
+// from relabeling a pre-crash source transition as a historical ignored
+// position. The first healthy source snapshot must be allowed to reclaim a
+// RESERVED/SOURCE_REVALIDATION_REQUIRED intent and run the normal preflight.
+func (s *CopyTradeStore) HasUnfinishedLeaderExecutionIntent(traderID, leaderPosID string) (bool, error) {
+	if strings.TrimSpace(traderID) == "" || strings.TrimSpace(leaderPosID) == "" {
+		return false, nil
+	}
+	var exists bool
+	err := s.db.QueryRow(`SELECT EXISTS(
+		SELECT 1 FROM copy_trade_execution_intents
+		WHERE trader_id=? AND leader_pos_id=? AND source_kind='LEADER_TRANSITION'
+		  AND status IN ('RESERVED','SUBMITTED','RECONCILING')
+	)`, traderID, leaderPosID).Scan(&exists)
+	return exists, err
 }
 
 func (s *CopyTradeStore) ListExecutionIntentsByCycle(cycleID int64) ([]*CopyTradeExecutionIntent, error) {
