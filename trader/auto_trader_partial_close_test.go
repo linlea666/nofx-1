@@ -159,10 +159,33 @@ func TestFullCloseStillClosesAllWhenPositionQueryFails(t *testing.T) {
 	fake := &partialCloseFakeTrader{positionsErr: errors.New("okx 5xx")}
 	at := &AutoTrader{trader: fake, exchange: "okx"}
 
-	if err := at.executeCloseLongWithRecord(newPartialCloseDecision("close_long", 0), &store.DecisionAction{}); err != nil {
+	var prepared []float64
+	closeLong := newPartialCloseDecision("close_long", 0)
+	closeLong.ClientOrderID = "close-long-all"
+	closeLong.BeforeOrderSubmit = func(_ string, quantity float64) error {
+		prepared = append(prepared, quantity)
+		return nil
+	}
+	if err := at.executeCloseLongWithRecord(closeLong, &store.DecisionAction{}); err != nil {
 		t.Fatalf("full close must keep tolerating position query failures: %v", err)
 	}
 	if len(fake.closedLong) != 1 || fake.closedLong[0] != 0 {
 		t.Fatalf("expected one close-all order (quantity=0): %v", fake.closedLong)
+	}
+
+	closeShort := newPartialCloseDecision("close_short", 0)
+	closeShort.ClientOrderID = "close-short-all"
+	closeShort.BeforeOrderSubmit = func(_ string, quantity float64) error {
+		prepared = append(prepared, quantity)
+		return nil
+	}
+	if err := at.executeCloseShortWithRecord(closeShort, &store.DecisionAction{}); err != nil {
+		t.Fatalf("short full close must keep tolerating position query failures: %v", err)
+	}
+	if len(fake.closedShort) != 1 || fake.closedShort[0] != 0 {
+		t.Fatalf("expected one short close-all order (quantity=0): %v", fake.closedShort)
+	}
+	if len(prepared) != 2 || prepared[0] != 0 || prepared[1] != 0 {
+		t.Fatalf("durable attempt callback must receive the close-all sentinel: %v", prepared)
 	}
 }

@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 )
@@ -638,14 +639,28 @@ func (s *CopyTradeStore) ReserveExecutionIntent(intent *CopyTradeExecutionIntent
 			UPDATE copy_trade_execution_intents SET
 				source_fill_id=?,cycle_id=?,candidate_id=?,analysis_id=?,attempt_no=?,decision_generation=?,symbol=?,side=?,margin_mode=?,leader_target_size=?,requested_notional=?,
 				requested_quantity=?,quantized_quantity=?,client_order_id=CASE WHEN client_order_id='' THEN ? ELSE client_order_id END,
-				status='RESERVED',reason_code='',last_error='',failure_counted=0,terminal_at=NULL,updated_at=CURRENT_TIMESTAMP
+				status='RESERVED',reason_code='',last_error='',failure_counted=0,
+				reconciliation_attempts=0,first_reconciling_at=NULL,
+				submitted_at=NULL,filled_at=NULL,protected_at=NULL,terminal_at=NULL,updated_at=CURRENT_TIMESTAMP
 			WHERE trader_id=? AND leader_pos_id=? AND source_revision=? AND action=?
-			  AND submitted_at IS NULL AND COALESCE(exchange_order_id,'')=''
+			  AND COALESCE(exchange_order_id,'')=''
+			  AND NOT EXISTS (SELECT 1 FROM copy_trade_execution_order_attempts a WHERE a.intent_id=copy_trade_execution_intents.id)
 			  AND (
-			    (status='FAILED' AND (reason_code IN ('PRE_SUBMIT','DECISION_CHANNEL_BUSY','STARTUP_REPLAY_REQUIRED') OR reason_code LIKE 'PRECHECK_%'))
-			    OR (status='SKIPPED' AND reason_code IN ('RISK_CAP','MIN_NOTIONAL','SOURCE_SUPERSEDED') AND ?<>'' AND COALESCE(source_fill_id,'')<>?)
-			    OR (status='RECONCILING' AND reason_code='SOURCE_REVALIDATION_REQUIRED'
-			        AND NOT EXISTS (SELECT 1 FROM copy_trade_execution_order_attempts a WHERE a.intent_id=copy_trade_execution_intents.id))
+			    (submitted_at IS NULL AND (
+			      (status='FAILED' AND (reason_code IN ('PRE_SUBMIT','DECISION_CHANNEL_BUSY','STARTUP_REPLAY_REQUIRED') OR reason_code LIKE 'PRECHECK_%'))
+			      OR (status='SKIPPED' AND reason_code IN ('RISK_CAP','MIN_NOTIONAL','SOURCE_SUPERSEDED') AND ?<>'' AND COALESCE(source_fill_id,'')<>?)
+			      OR (status='RECONCILING' AND reason_code='SOURCE_REVALIDATION_REQUIRED')
+			    ))
+			    OR (
+			      status='FAILED' AND reason_code='EXECUTION_FAILED'
+			      AND action IN ('close_long','close_short')
+			      AND COALESCE(requested_quantity,0)=0 AND COALESCE(quantized_quantity,0)=0
+			      AND COALESCE(filled_quantity,0)=0 AND COALESCE(exchange_state,'')=''
+			      AND last_error IN (
+			        'persist close long attempt: invalid execution order attempt',
+			        'persist close short attempt: invalid execution order attempt'
+			      )
+			    )
 			  )
 		`, intent.SourceFillID, intent.CycleID, intent.CandidateID, intent.AnalysisID, intent.AttemptNo, intent.DecisionGeneration,
 			intent.Symbol, intent.Side, intent.MarginMode, intent.LeaderTargetSize,
@@ -721,9 +736,21 @@ func (s *CopyTradeStore) ReserveExecutionIntent(intent *CopyTradeExecutionIntent
 }
 
 // PrepareExecutionOrderAttempt durably records a concrete exchange submission
-// before the adapter is called. Reusing the same client id is idempotent.
+// and advances the parent intent to SUBMITTED in the same transaction, before
+// the adapter is called. Quantity zero is the established close-all sentinel
+// and is valid only for close actions. Reusing the same client id is idempotent.
 func (s *CopyTradeStore) PrepareExecutionOrderAttempt(intentID int64, clientOrderID string, quantity float64) (*CopyTradeExecutionOrderAttempt, error) {
-	if intentID <= 0 || strings.TrimSpace(clientOrderID) == "" || quantity <= 0 {
+	return s.PrepareExecutionOrderAttemptWithQuantities(intentID, clientOrderID, quantity, quantity)
+}
+
+// PrepareExecutionOrderAttemptWithQuantities preserves both the raw requested
+// quantity and the concrete quantized exchange quantity at the same durable
+// submission boundary.
+func (s *CopyTradeStore) PrepareExecutionOrderAttemptWithQuantities(intentID int64, clientOrderID string, requestedQuantity, quantizedQuantity float64) (*CopyTradeExecutionOrderAttempt, error) {
+	clientOrderID = strings.TrimSpace(clientOrderID)
+	if intentID <= 0 || clientOrderID == "" ||
+		requestedQuantity < 0 || math.IsNaN(requestedQuantity) || math.IsInf(requestedQuantity, 0) ||
+		quantizedQuantity < 0 || math.IsNaN(quantizedQuantity) || math.IsInf(quantizedQuantity, 0) {
 		return nil, fmt.Errorf("invalid execution order attempt")
 	}
 	tx, err := s.db.Begin()
@@ -731,6 +758,17 @@ func (s *CopyTradeStore) PrepareExecutionOrderAttempt(intentID int64, clientOrde
 		return nil, err
 	}
 	defer tx.Rollback()
+	var action, intentStatus string
+	if err = tx.QueryRow(`SELECT action,status FROM copy_trade_execution_intents WHERE id=?`, intentID).Scan(&action, &intentStatus); err != nil {
+		return nil, err
+	}
+	closeAll := quantizedQuantity == 0 && (action == "close_long" || action == "close_short")
+	if quantizedQuantity == 0 && !closeAll {
+		return nil, fmt.Errorf("zero quantity execution order attempt is only valid for close actions")
+	}
+	if intentStatus != ExecutionIntentReserved && intentStatus != ExecutionIntentSubmitted {
+		return nil, fmt.Errorf("execution intent %d cannot prepare order attempt from %s", intentID, intentStatus)
+	}
 	var attemptNo int
 	err = tx.QueryRow(`SELECT attempt_no FROM copy_trade_execution_order_attempts WHERE intent_id=? AND client_order_id=?`, intentID, clientOrderID).Scan(&attemptNo)
 	if err == sql.ErrNoRows {
@@ -738,10 +776,28 @@ func (s *CopyTradeStore) PrepareExecutionOrderAttempt(intentID int64, clientOrde
 			return nil, err
 		}
 		if _, err = tx.Exec(`INSERT INTO copy_trade_execution_order_attempts(intent_id,attempt_no,client_order_id,requested_quantity,quantized_quantity,status) VALUES(?,?,?,?,?,'PREPARED')`,
-			intentID, attemptNo, clientOrderID, quantity, quantity); err != nil {
+			intentID, attemptNo, clientOrderID, requestedQuantity, quantizedQuantity); err != nil {
 			return nil, err
 		}
 	} else if err != nil {
+		return nil, err
+	}
+	res, err := tx.Exec(`UPDATE copy_trade_execution_intents SET
+		status='SUBMITTED',
+		requested_quantity=CASE WHEN ?>0 THEN ? ELSE requested_quantity END,
+		quantized_quantity=CASE WHEN ?>0 THEN ? ELSE quantized_quantity END,
+		submitted_at=COALESCE(submitted_at,CURRENT_TIMESTAMP),updated_at=CURRENT_TIMESTAMP
+		WHERE id=? AND status IN ('RESERVED','SUBMITTED')`,
+		requestedQuantity, requestedQuantity, quantizedQuantity, quantizedQuantity, intentID)
+	if err != nil {
+		return nil, err
+	}
+	if updated, rowsErr := res.RowsAffected(); rowsErr != nil {
+		return nil, rowsErr
+	} else if updated != 1 {
+		return nil, fmt.Errorf("execution intent %d changed before order attempt preparation", intentID)
+	}
+	if _, err = tx.Exec(`UPDATE copy_trade_source_transitions SET status='SUBMITTED',updated_at=CURRENT_TIMESTAMP WHERE intent_id=?`, intentID); err != nil {
 		return nil, err
 	}
 	row := tx.QueryRow(`SELECT id,intent_id,attempt_no,client_order_id,requested_quantity,quantized_quantity,filled_quantity,exchange_order_id,exchange_state,status,last_error,created_at,updated_at,submitted_at,filled_at,terminal_at FROM copy_trade_execution_order_attempts WHERE intent_id=? AND client_order_id=?`, intentID, clientOrderID)

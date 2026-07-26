@@ -2,6 +2,7 @@ package copytrade
 
 import (
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -11,6 +12,72 @@ import (
 	"nofx/notifier"
 	"nofx/store"
 )
+
+func TestClassifyExecutionFailurePreservesTypedPreSubmitReason(t *testing.T) {
+	err := fmt.Errorf("persist close short attempt: %w",
+		reasonError("PRE_SUBMIT", "prepare durable execution order attempt: database busy"))
+	if got := classifyExecutionFailure(err); got != "PRE_SUBMIT" {
+		t.Fatalf("typed pre-submit failure was flattened to %q", got)
+	}
+}
+
+func TestExecutionFailurePhaseOnlyMarksErrorsBeforeDurableSubmission(t *testing.T) {
+	baseErr := errors.New("market price temporarily unavailable")
+	dec := &decision.Decision{
+		ExecutionIntentID: 42,
+		ExecutionStatus:   store.ExecutionIntentReserved,
+		BeforeOrderSubmit: func(string, float64) error { return nil },
+	}
+	preSubmitErr := preservePreSubmitExecutionFailure(dec, baseErr)
+	if ReasonCodeOf(preSubmitErr) != "PRE_SUBMIT" || !errors.Is(preSubmitErr, baseErr) {
+		t.Fatalf("pre-adapter failure lost phase/cause: code=%s err=%v", ReasonCodeOf(preSubmitErr), preSubmitErr)
+	}
+	dec.ExecutionStatus = store.ExecutionIntentSubmitted
+	afterSubmitErr := preservePreSubmitExecutionFailure(dec, baseErr)
+	if afterSubmitErr != baseErr || ReasonCodeOf(afterSubmitErr) != "" {
+		t.Fatalf("post-submission failure was incorrectly made replayable: code=%s err=%v", ReasonCodeOf(afterSubmitErr), afterSubmitErr)
+	}
+}
+
+func TestExecutionAttemptRecorderAcceptsCloseAllSentinel(t *testing.T) {
+	st, err := store.New(filepath.Join(t.TempDir(), "close-all-recorder.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	intent, claimed, err := st.CopyTrade().ReserveExecutionIntent(&store.CopyTradeExecutionIntent{
+		TraderID: "trader-1", LeaderPosID: "leader-light-short", SourceRevision: 3,
+		CanonicalKey: "leader|trader-1|leader-light-short|3",
+		Action:       "close_short", Symbol: "LIGHTUSDT", Side: "short",
+		ClientOrderID: "stable-close-all",
+	})
+	if err != nil || !claimed {
+		t.Fatalf("reserve claimed=%v err=%v", claimed, err)
+	}
+	ti := &TraderIntegration{traderID: "trader-1", store: st}
+	dec := &decision.Decision{
+		Action: "close_short", Symbol: "LIGHTUSDT", IsCopyTrade: true,
+		ExecutionIntentID: intent.ID, ClientOrderID: "stable-close-all",
+	}
+	ti.bindExecutionAttemptRecorder(dec)
+	if dec.BeforeOrderSubmit == nil {
+		t.Fatal("execution attempt recorder was not bound")
+	}
+	if err = dec.BeforeOrderSubmit(dec.ClientOrderID, 0); err != nil {
+		t.Fatalf("close-all sentinel was rejected before adapter submission: %v", err)
+	}
+	var status string
+	var attemptCount int
+	if err = st.DB().QueryRow(`SELECT status FROM copy_trade_execution_intents WHERE id=?`, intent.ID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if err = st.DB().QueryRow(`SELECT COUNT(*) FROM copy_trade_execution_order_attempts WHERE intent_id=?`, intent.ID).Scan(&attemptCount); err != nil {
+		t.Fatal(err)
+	}
+	if status != store.ExecutionIntentSubmitted || attemptCount != 1 || dec.ExecutionStatus != store.ExecutionIntentSubmitted {
+		t.Fatalf("close-all submission boundary incomplete: db_status=%s attempts=%d decision_status=%s", status, attemptCount, dec.ExecutionStatus)
+	}
+}
 
 func TestExecFailureDedupKeyStableForSameFailureState(t *testing.T) {
 	ti := &TraderIntegration{

@@ -724,6 +724,154 @@ func TestExecutionOrderAttemptCompletionRequiresDurablePreparation(t *testing.T)
 	}
 }
 
+func TestExecutionOrderAttemptAllowsZeroOnlyForCloseAllAndSubmitsAtomically(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "close-all-attempt.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cs := st.CopyTrade()
+
+	closeIntent, claimed, err := cs.ReserveExecutionIntent(&CopyTradeExecutionIntent{
+		TraderID: "t1", LeaderPosID: "close-pos", SourceRevision: 2,
+		SourceFillID: "close-snapshot", CanonicalKey: "leader|t1|close-pos|2",
+		Action: "close_short", Symbol: "LIGHTUSDT", Side: "short",
+		ClientOrderID: "close-all-client",
+	})
+	if err != nil || !claimed {
+		t.Fatalf("reserve close intent claimed=%v err=%v", claimed, err)
+	}
+	attempt, err := cs.PrepareExecutionOrderAttempt(closeIntent.ID, "close-all-client", 0)
+	if err != nil {
+		t.Fatalf("close-all zero quantity must be durable: %v", err)
+	}
+	if attempt.QuantizedQuantity != 0 || attempt.Status != ExecutionOrderAttemptPrepared {
+		t.Fatalf("unexpected close-all attempt: %+v", attempt)
+	}
+	var closeStatus string
+	var closeSubmitted sql.NullString
+	if err = st.DB().QueryRow(`SELECT status,submitted_at FROM copy_trade_execution_intents WHERE id=?`, closeIntent.ID).
+		Scan(&closeStatus, &closeSubmitted); err != nil {
+		t.Fatal(err)
+	}
+	if closeStatus != ExecutionIntentSubmitted || !closeSubmitted.Valid {
+		t.Fatalf("attempt and parent submission must commit atomically: status=%s submitted=%v", closeStatus, closeSubmitted)
+	}
+
+	openIntent, claimed, err := cs.ReserveExecutionIntent(&CopyTradeExecutionIntent{
+		TraderID: "t1", LeaderPosID: "open-pos", SourceRevision: 1,
+		CanonicalKey: "leader|t1|open-pos|1", Action: "open_long",
+		Symbol: "ETHUSDT", Side: "long", ClientOrderID: "open-zero-client",
+	})
+	if err != nil || !claimed {
+		t.Fatalf("reserve open intent claimed=%v err=%v", claimed, err)
+	}
+	if _, err = cs.PrepareExecutionOrderAttempt(openIntent.ID, "open-zero-client", 0); err == nil {
+		t.Fatal("zero quantity open must be rejected")
+	}
+	var openStatus string
+	var openSubmitted sql.NullString
+	var attemptCount int
+	if err = st.DB().QueryRow(`SELECT status,submitted_at FROM copy_trade_execution_intents WHERE id=?`, openIntent.ID).
+		Scan(&openStatus, &openSubmitted); err != nil {
+		t.Fatal(err)
+	}
+	if err = st.DB().QueryRow(`SELECT COUNT(*) FROM copy_trade_execution_order_attempts WHERE intent_id=?`, openIntent.ID).Scan(&attemptCount); err != nil {
+		t.Fatal(err)
+	}
+	if openStatus != ExecutionIntentReserved || openSubmitted.Valid || attemptCount != 0 {
+		t.Fatalf("rejected open mutated durable state: status=%s submitted=%v attempts=%d", openStatus, openSubmitted, attemptCount)
+	}
+	openAttempt, err := cs.PrepareExecutionOrderAttemptWithQuantities(openIntent.ID, "open-zero-client", 1.234, 1.2)
+	if err != nil {
+		t.Fatalf("valid quantized open attempt failed: %v", err)
+	}
+	if openAttempt.RequestedQuantity != 1.234 || openAttempt.QuantizedQuantity != 1.2 {
+		t.Fatalf("raw and quantized quantities were conflated: %+v", openAttempt)
+	}
+	var storedRequested, storedQuantized float64
+	if err = st.DB().QueryRow(`SELECT requested_quantity,quantized_quantity FROM copy_trade_execution_intents WHERE id=?`, openIntent.ID).
+		Scan(&storedRequested, &storedQuantized); err != nil {
+		t.Fatal(err)
+	}
+	if storedRequested != 1.234 || storedQuantized != 1.2 {
+		t.Fatalf("parent intent lost quantity audit fields: requested=%v quantized=%v", storedRequested, storedQuantized)
+	}
+}
+
+func TestLegacyZeroQuantityCloseFailureIsNarrowlyReclaimable(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "legacy-close-reclaim.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cs := st.CopyTrade()
+	base := &CopyTradeExecutionIntent{
+		TraderID: "t1", LeaderPosID: "legacy-close", SourceRevision: 3,
+		SourceFillID: "snapshot-close-1", CanonicalKey: "leader|t1|legacy-close|3",
+		Action: "close_short", Symbol: "LIGHTUSDT", Side: "short",
+		ClientOrderID: "stable-close-client",
+	}
+	intent, claimed, err := cs.ReserveExecutionIntent(base)
+	if err != nil || !claimed {
+		t.Fatalf("reserve claimed=%v err=%v", claimed, err)
+	}
+	// Reproduce the old ordering: the parent was marked SUBMITTED before
+	// attempt preparation rejected quantity=0, so no exchange call or durable
+	// attempt could have occurred.
+	if err = cs.UpdateExecutionIntent(intent.ID, ExecutionIntentSubmitted, "", "", "", 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err = cs.UpdateExecutionIntent(intent.ID, ExecutionIntentFailed, "EXECUTION_FAILED",
+		"persist close short attempt: invalid execution order attempt", "", 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	replayed := *base
+	replayed.SourceFillID = "snapshot-close-2"
+	reclaimed, claimed, err := cs.ReserveExecutionIntent(&replayed)
+	if err != nil || !claimed || reclaimed.ID != intent.ID || reclaimed.Status != ExecutionIntentReserved {
+		t.Fatalf("proven pre-adapter legacy failure was not reclaimed: intent=%+v claimed=%v err=%v", reclaimed, claimed, err)
+	}
+	var submitted sql.NullString
+	if err = st.DB().QueryRow(`SELECT submitted_at FROM copy_trade_execution_intents WHERE id=?`, intent.ID).Scan(&submitted); err != nil {
+		t.Fatal(err)
+	}
+	if submitted.Valid {
+		t.Fatalf("legacy false submission evidence was not cleared: %v", submitted)
+	}
+	if _, err = cs.PrepareExecutionOrderAttempt(intent.ID, "stable-close-client", 0); err != nil {
+		t.Fatalf("reclaimed close-all intent must reach durable submission: %v", err)
+	}
+}
+
+func TestLegacyCloseFailureWithAmbiguousEvidenceIsNotReclaimed(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "legacy-close-ambiguous.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cs := st.CopyTrade()
+	base := &CopyTradeExecutionIntent{
+		TraderID: "t1", LeaderPosID: "ambiguous-close", SourceRevision: 3,
+		CanonicalKey: "leader|t1|ambiguous-close|3", Action: "close_short",
+		Symbol: "LIGHTUSDT", Side: "short", ClientOrderID: "ambiguous-client",
+	}
+	intent, claimed, err := cs.ReserveExecutionIntent(base)
+	if err != nil || !claimed {
+		t.Fatalf("reserve claimed=%v err=%v", claimed, err)
+	}
+	if err = cs.UpdateExecutionIntent(intent.ID, ExecutionIntentSubmitted, "", "", "", 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err = cs.UpdateExecutionIntent(intent.ID, ExecutionIntentFailed, "EXECUTION_FAILED",
+		"exchange response was lost", "", 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, claimed, err = cs.ReserveExecutionIntent(base); err != nil || claimed {
+		t.Fatalf("ambiguous submitted close must remain terminal: claimed=%v err=%v", claimed, err)
+	}
+}
+
 func TestSourceRevalidationIntentRebindsToAuthoritativeAction(t *testing.T) {
 	st, err := New(filepath.Join(t.TempDir(), "source-revalidation-action.db"))
 	if err != nil {

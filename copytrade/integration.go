@@ -2055,8 +2055,6 @@ func (ti *TraderIntegration) executeFullDecision(fullDec *decision.FullDecision)
 		}
 		if err == nil {
 			ti.bindExecutionAttemptRecorder(dec)
-			ti.transitionExecutionIntent(dec, store.ExecutionIntentSubmitted, "", "")
-			ti.recordAIReentrySubmitted(dec)
 			err = ti.executeDecisionWithRetry(dec)
 			if err == nil {
 				err = ti.confirmExecutionFill(dec)
@@ -2074,6 +2072,7 @@ func (ti *TraderIntegration) executeFullDecision(fullDec *decision.FullDecision)
 		}
 
 		if err != nil {
+			err = preservePreSubmitExecutionFailure(dec, err)
 			action.Error = err.Error()
 			pendingReconciliation := errors.Is(err, ErrExecutionReconciliationPending)
 			reentryExecution := ti.engine.config.RiskPolicyVersion >= 4 && strings.Contains(dec.Reasoning, "reentry")
@@ -2225,6 +2224,17 @@ func (ti *TraderIntegration) executeFullDecision(fullDec *decision.FullDecision)
 					ti.engine.UnmarkDecisionSources(dec)
 				}
 				executionLogs = append(executionLogs, fmt.Sprintf("⏳ %s %s 下单前置条件暂不可用，保留源变化等待重放: %v", dec.Action, dec.Symbol, err))
+				ti.saveSignalLog(dec, "reconciling", err.Error())
+			} else if ReasonCodeOf(err) == "PRE_SUBMIT" {
+				// The adapter was never called because durable attempt
+				// preparation failed. Keep the source transition replayable
+				// and do not count it as a venue/mapping circuit-breaker
+				// failure.
+				ti.transitionExecutionIntent(dec, store.ExecutionIntentFailed, "PRE_SUBMIT", err.Error())
+				if ti.engine != nil {
+					ti.engine.UnmarkDecisionSources(dec)
+				}
+				executionLogs = append(executionLogs, fmt.Sprintf("⏳ %s %s 下单记录暂不可用，未触达交易所并等待源变化重放: %v", dec.Action, dec.Symbol, err))
 				ti.saveSignalLog(dec, "reconciling", err.Error())
 			} else if ti.isBenignCloseError(dec, err) {
 				if ti.benignCloseConfirmedFlat(dec) {
@@ -2440,6 +2450,21 @@ func (ti *TraderIntegration) executeFullDecision(fullDec *decision.FullDecision)
 
 	// 保存到 decision_records 表，复用现有日志系统
 	ti.saveDecisionRecord(fullDec, decisionActions, executionLogs)
+}
+
+// preservePreSubmitExecutionFailure adds durable phase evidence to errors
+// raised after the recorder was bound but before its callback successfully
+// prepared an order attempt. At that point the adapter cannot have been called,
+// so the canonical source transition is safe to replay. Once the callback sets
+// SUBMITTED, every later error keeps its original classification and must use
+// exchange reconciliation/idempotency instead.
+func preservePreSubmitExecutionFailure(dec *decision.Decision, err error) error {
+	if err == nil || dec == nil || dec.ExecutionIntentID <= 0 || dec.BeforeOrderSubmit == nil ||
+		(dec.ExecutionStatus != "" && dec.ExecutionStatus != store.ExecutionIntentReserved) ||
+		ReasonCodeOf(err) != "" {
+		return err
+	}
+	return &ReasonCodedError{Code: "PRE_SUBMIT", Cause: err}
 }
 
 func (ti *TraderIntegration) recordAIReentrySubmitted(dec *decision.Decision) {
@@ -2756,15 +2781,21 @@ func (ti *TraderIntegration) bindExecutionAttemptRecorder(dec *decision.Decision
 		return
 	}
 	intentID := dec.ExecutionIntentID
+	var reentrySubmittedOnce sync.Once
 	dec.BeforeOrderSubmit = func(clientOrderID string, quantity float64) error {
-		if err := ti.store.CopyTrade().UpdateExecutionIntent(
-			intentID, store.ExecutionIntentSubmitted, dec.ExecutionReasonCode, "",
-			"", dec.RequestedQuantity, quantity, 0,
+		if _, err := ti.store.CopyTrade().PrepareExecutionOrderAttemptWithQuantities(
+			intentID, clientOrderID, dec.RequestedQuantity, quantity,
 		); err != nil {
-			return err
+			return reasonError("PRE_SUBMIT", "prepare durable execution order attempt: %w", err)
 		}
-		_, err := ti.store.CopyTrade().PrepareExecutionOrderAttempt(intentID, clientOrderID, quantity)
-		return err
+		dec.ExecutionStatus = store.ExecutionIntentSubmitted
+		if quantity > 0 {
+			dec.QuantizedQuantity = quantity
+		}
+		reentrySubmittedOnce.Do(func() {
+			ti.recordAIReentrySubmitted(dec)
+		})
+		return nil
 	}
 	dec.AfterOrderSubmit = func(clientOrderID string, order map[string]interface{}, submitErr error) {
 		status := store.ExecutionOrderAttemptSubmitted
@@ -2896,6 +2927,9 @@ func isTerminalExchangeOrderState(state string) bool {
 func classifyExecutionFailure(err error) string {
 	if err == nil {
 		return ""
+	}
+	if code := ReasonCodeOf(err); code != "" {
+		return code
 	}
 	msg := strings.ToLower(err.Error())
 	switch {
