@@ -74,6 +74,7 @@ export interface DecisionAction {
   execution_status?:
     | 'RESERVED'
     | 'SUBMITTED'
+    | 'PARTIALLY_FILLED'
     | 'FILLED'
     | 'PROTECTED'
     | 'SKIPPED'
@@ -264,6 +265,8 @@ export interface CopyConfigRequest {
   sync_margin_mode?: boolean // 同步保证金模式（OKX 区分全仓/逐仓）
   min_trade_warn?: number // 纯运营预警阈值；不参与交易所最小量或订单量化
   max_trade_warn?: number // 最大跟单金额预警阈值（USDT），0=不预警；未传保留存量值
+  copy_catchup_window_seconds?: number
+  copy_catchup_max_adverse_bps?: number
   // Binance Web 凭证（仅 provider_type=binance 时使用）
   binance_p20t?: string // 登录 cookie p20t
   binance_csrf_token?: string // CSRF header csrftoken
@@ -300,6 +303,7 @@ export interface CopyConfigRequest {
 
   risk_policy_version?: number
   risk_stop_mode?: 'volatility_priority' | 'account_hard_limit'
+  risk_stop_priority?: 'volatility_first' | 'account_cap'
   risk_atr_period?: number
   risk_atr_cache_max_age_minutes?: number
   risk_atr_fallback_pct?: number
@@ -783,6 +787,8 @@ export interface CopyTradeConfig {
   sync_margin_mode: boolean
   min_trade_warn: number
   max_trade_warn: number
+  copy_catchup_window_seconds?: number
+  copy_catchup_max_adverse_bps?: number
   enabled: boolean
   // Binance Web 凭证（仅 provider_type=binance 时使用，明文返回，用于编辑表单回填）
   binance_p20t?: string
@@ -813,6 +819,7 @@ export interface CopyTradeConfig {
   risk_manual_reentry_enabled?: boolean // 历史兼容字段；v7 固定 false
   risk_policy_version?: number
   risk_stop_mode?: 'volatility_priority' | 'account_hard_limit'
+  risk_stop_priority?: 'volatility_first' | 'account_cap'
   risk_atr_period?: number
   risk_atr_cache_max_age_minutes?: number
   risk_atr_fallback_pct?: number
@@ -1096,6 +1103,10 @@ export interface CopyGuardAICandidate {
   attention_price_high: number
   last_analysis_id: number
   last_error: string
+  decision_expires_at?: string
+  regular_review_at?: string
+  event_review_at?: string
+  budget_blocked_until?: string
   ai_confidence_threshold: number
   ai_min_review_seconds: number
   ai_daily_call_limit: number

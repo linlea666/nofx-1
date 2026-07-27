@@ -140,7 +140,6 @@ func NewEngine(
 		traderID:                 traderID,
 		config:                   config,
 		getFollowerBalance:       getBalance,
-		getFollowerEquity:        getBalance,
 		getFollowerPositions:     getPositions,
 		seenFills:                make(map[string]time.Time),
 		seenTTL:                  1 * time.Hour,
@@ -152,6 +151,15 @@ func NewEngine(
 		stopRiskSuspectCount:     make(map[string]int),
 		reentryCandidateTicks:    make(map[string]int),
 		lastAICandleFeatureCheck: make(map[int64]time.Time),
+	}
+	// Keep legacy constructor callers compatible while ensuring later balance
+	// callback replacement (common in tests/adapters) is reflected. Production
+	// injects an explicit total-equity callback via WithFollowerEquity.
+	e.getFollowerEquity = func() float64 {
+		if e.getFollowerBalance == nil {
+			return 0
+		}
+		return e.getFollowerBalance()
 	}
 
 	// 应用选项
@@ -2214,21 +2222,24 @@ func (e *Engine) calculateCopySizeByPositionChange(signal *TradeSignal, match *S
 		} else if anchorErr != nil {
 			// 凭证类错误兜底告警（避免用户错过过期通知）
 			e.reportBinanceCredentialsExpired(anchorErr, "calculateCopySize/anchor")
-			// 仅在"完全没有 stale 缓存"的极端场景才会走到这里：
-			//   - 启动后首次拉 detail-list 就失败
-			//   - 且无凭证 / 凭证从未成功过
-			// 此时回退到 LeaderEquity 量纲会偏小，但能"跟动作"不至于完全停摆；
-			// 同时记录 high 级 warning 让用户感知（搜 "ANCHOR_FALLBACK" 即可定位）。
-			anchorSource = "leader_equity_FALLBACK"
-			logger.Warnf("⚠️ [%s] ANCHOR_FALLBACK Binance 跟随者权益获取失败，本次跟单金额量纲可能偏小: %v",
+			// fill.Value belongs to the Binance copy-portfolio scale. Falling
+			// back to leader equity mixes units and silently produces a wrong
+			// proportional target. Fail closed and let the same source revision
+			// retry after the authoritative anchor recovers.
+			logger.Warnf("⚠️ [%s] ANCHOR_UNAVAILABLE Binance 权威权益锚点不可用，暂停本次比例跟单: %v",
 				e.traderID, anchorErr)
-			warnings = append(warnings, Warning{
-				Timestamp: time.Now(),
-				Symbol:    fill.Symbol,
-				Type:      "anchor_fallback",
-				Message:   fmt.Sprintf("跟随者权益接口失败，回退用领航员权益锚定，本次跟单金额可能偏小: %v", anchorErr),
-				Executed:  true,
-			})
+			if _, productionProvider := e.provider.(*BinanceProvider); productionProvider {
+				warnings = append(warnings, Warning{
+					Timestamp: time.Now(),
+					Symbol:    fill.Symbol,
+					Type:      WarnLeaderEquityUnavailable,
+					Message:   fmt.Sprintf("Binance 权威权益锚点不可用，暂停并等待重试: %v", anchorErr),
+					Executed:  false,
+				})
+				return 0, warnings
+			}
+			// Test/in-process providers put their authoritative equity directly
+			// on the signal and have no private detail endpoint.
 		}
 	}
 	if leaderEquity <= 0 {
@@ -2248,13 +2259,16 @@ func (e *Engine) calculateCopySizeByPositionChange(signal *TradeSignal, match *S
 		return 0, warnings
 	}
 
-	// Smart Money sizing is defined against total follower equity, not
-	// available balance. Existing providers keep their historical balance
-	// anchor for backward compatibility; only the new source uses the explicit
-	// equity callback injected by TraderIntegration.
-	followerEquity := e.getFollowerBalance()
-	if e.isSmartMoneyMode() && e.getFollowerEquity != nil {
+	// Proportional copy always targets the same percentage of total account
+	// equity as the leader. Available balance is strictly an execution
+	// constraint and must never change the ordinary target.
+	followerEquity := float64(0)
+	if e.getFollowerEquity != nil {
 		followerEquity = e.getFollowerEquity()
+	} else if e.getFollowerBalance != nil {
+		// Compatibility for directly constructed engines. TraderIntegration
+		// always injects the authoritative total-equity callback.
+		followerEquity = e.getFollowerBalance()
 	}
 	if followerEquity <= 0 {
 		warnings = append(warnings, Warning{

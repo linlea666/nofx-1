@@ -174,6 +174,40 @@ func TestSubmittedExecutionIntentCannotBeReclaimed(t *testing.T) {
 	}
 }
 
+func TestTerminalUnknownAttemptNormalizesOnStartup(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "terminal-unknown.db")
+	st, err := New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cs := st.CopyTrade()
+	intent, claimed, err := cs.ReserveExecutionIntent(&CopyTradeExecutionIntent{
+		TraderID: "t1", LeaderPosID: "p1", SourceRevision: 1,
+		CanonicalKey: "leader|t1|p1|1", Action: "open_long", ClientOrderID: "client-1",
+	})
+	if err != nil || !claimed {
+		t.Fatalf("reserve claimed=%v err=%v", claimed, err)
+	}
+	if _, err = cs.PrepareExecutionOrderAttemptWithQuantities(intent.ID, "client-1", 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err = cs.CompleteExecutionOrderAttempt(intent.ID, "client-1", ExecutionOrderAttemptUnknown, "", "REJECTED", "legacy ambiguous status", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err = st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	st, err = New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	attempts, err := st.CopyTrade().ListExecutionOrderAttempts(intent.ID)
+	if err != nil || len(attempts) != 1 || attempts[0].Status != ExecutionOrderAttemptTerminalNoFill {
+		t.Fatalf("terminal no-fill normalization failed: attempts=%+v err=%v", attempts, err)
+	}
+}
+
 func TestCommitLeaderExecutionFillAtomicallyAdvancesMappingAndIntent(t *testing.T) {
 	st, err := New(filepath.Join(t.TempDir(), "atomic-fill.db"))
 	if err != nil {
@@ -202,6 +236,68 @@ func TestCommitLeaderExecutionFillAtomicallyAdvancesMappingAndIntent(t *testing.
 	}
 	if err = cs.CommitLeaderExecutionFill(commit); err != nil {
 		t.Fatalf("idempotent replay failed: %v", err)
+	}
+	mapping, err = cs.GetMapping("t1", "p1")
+	if err != nil || mapping.OpenSizeUSD != commit.FilledNotional {
+		t.Fatalf("idempotent replay duplicated mapping notional: mapping=%+v err=%v", mapping, err)
+	}
+}
+
+func TestLeaderExecutionPartialFillKeepsDurableGapAndAccumulatesCatchup(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "partial-fill.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cs := st.CopyTrade()
+	intent, claimed, err := cs.ReserveExecutionIntent(&CopyTradeExecutionIntent{
+		TraderID: "t1", LeaderPosID: "p1", SourceRevision: 1, SourceFillID: "s1",
+		Action: "open_long", Symbol: "ETHUSDT", Side: "long", MarginMode: "cross",
+		LeaderTargetSize: 1, RequestedNotional: 1000, RequestedQuantity: 10,
+		QuantizedQuantity: 10, ClientOrderID: "initial",
+	})
+	if err != nil || !claimed {
+		t.Fatalf("reserve claimed=%v err=%v", claimed, err)
+	}
+	first := LeaderExecutionCommit{
+		IntentID: intent.ID, TraderID: "t1", LeaderID: "leader", LeaderPosID: "p1",
+		SourceRevision: 1, Action: "open_long", Symbol: "ETHUSDT", Side: "long",
+		MarginMode: "cross", LeaderTargetSize: 1, FillPrice: 100,
+		FilledQuantity: 6, FilledNotional: 600, ExchangeOrderID: "o1", ExchangeState: "FILLED",
+	}
+	if err = cs.CommitLeaderExecutionFill(first); err != nil {
+		t.Fatal(err)
+	}
+	partial, _, err := cs.ReserveExecutionIntent(&CopyTradeExecutionIntent{
+		TraderID: "t1", LeaderPosID: "p1", SourceRevision: 1, SourceFillID: "s1",
+		Action: "open_long", Symbol: "ETHUSDT",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if partial.Status != ExecutionIntentPartiallyFilled || partial.FilledQuantity != 6 {
+		t.Fatalf("partial gap was not persisted: %+v", partial)
+	}
+	if _, err = cs.PrepareExecutionOrderAttemptWithQuantities(intent.ID, "catchup", 4, 4); err != nil {
+		t.Fatal(err)
+	}
+	second := first
+	second.FilledQuantity, second.FilledNotional, second.ExchangeOrderID = 4, 400, "o2"
+	if err = cs.CommitLeaderExecutionFill(second); err != nil {
+		t.Fatal(err)
+	}
+	if err = cs.CommitLeaderExecutionFill(second); err != nil {
+		t.Fatalf("catch-up replay was not idempotent: %v", err)
+	}
+	done, _, err := cs.ReserveExecutionIntent(&CopyTradeExecutionIntent{
+		TraderID: "t1", LeaderPosID: "p1", SourceRevision: 1, SourceFillID: "s1",
+		Action: "open_long", Symbol: "ETHUSDT",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if done.Status != ExecutionIntentFilled || done.FilledQuantity != 10 {
+		t.Fatalf("catch-up was not accumulated exactly once: %+v", done)
 	}
 }
 

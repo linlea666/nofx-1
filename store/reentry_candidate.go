@@ -61,6 +61,10 @@ type CopyGuardReentryCandidate struct {
 	FailureBackoffUntil     *time.Time `json:"failure_backoff_until,omitempty"`
 	LastUnactionableCode    string     `json:"last_unactionable_code,omitempty"`
 	LastUnactionableEventAt *time.Time `json:"last_unactionable_event_at,omitempty"`
+	DecisionExpiresAt       *time.Time `json:"decision_expires_at,omitempty"`
+	RegularReviewAt         *time.Time `json:"regular_review_at,omitempty"`
+	EventReviewAt           *time.Time `json:"event_review_at,omitempty"`
+	BudgetBlockedUntil      *time.Time `json:"budget_blocked_until,omitempty"`
 
 	// Effective per-trader policy is populated by the API and is not persisted
 	// on the candidate row. This prevents the dashboard from presenting the
@@ -102,6 +106,7 @@ func (s *ReentryAIStore) initReentryCandidateTables() error {
 			consecutive_abandons INTEGER DEFAULT 0, last_abandon_candle TEXT DEFAULT '',
 			last_analysis_id INTEGER DEFAULT 0, decision_ttl_seconds INTEGER DEFAULT 30, last_error TEXT DEFAULT '',
 			failure_backoff_until DATETIME, last_unactionable_code TEXT DEFAULT '', last_unactionable_event_at DATETIME,
+			decision_expires_at DATETIME, regular_review_at DATETIME, event_review_at DATETIME, budget_blocked_until DATETIME,
 			snapshot_at DATETIME DEFAULT CURRENT_TIMESTAMP, last_review_at DATETIME,
 			next_review_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP, closed_at DATETIME
@@ -127,6 +132,10 @@ func (s *ReentryAIStore) initReentryCandidateTables() error {
 		{"copy_guard_reentry_candidates", "failure_backoff_until", "DATETIME"},
 		{"copy_guard_reentry_candidates", "last_unactionable_code", "TEXT DEFAULT ''"},
 		{"copy_guard_reentry_candidates", "last_unactionable_event_at", "DATETIME"},
+		{"copy_guard_reentry_candidates", "decision_expires_at", "DATETIME"},
+		{"copy_guard_reentry_candidates", "regular_review_at", "DATETIME"},
+		{"copy_guard_reentry_candidates", "event_review_at", "DATETIME"},
+		{"copy_guard_reentry_candidates", "budget_blocked_until", "DATETIME"},
 		{"copy_guard_risk_reservations", "account_key", "TEXT NOT NULL DEFAULT ''"},
 		{"copy_guard_risk_reservations", "intent_id", "INTEGER NOT NULL DEFAULT 0"},
 		{"copy_guard_risk_reservations", "replace_cycle_id", "INTEGER NOT NULL DEFAULT 0"},
@@ -137,6 +146,9 @@ func (s *ReentryAIStore) initReentryCandidateTables() error {
 		if err = ensureSQLiteColumn(s.db, migration.table, migration.name, migration.definition); err != nil {
 			return fmt.Errorf("migrate %s.%s: %w", migration.table, migration.name, err)
 		}
+	}
+	if _, err = s.db.Exec(`UPDATE copy_guard_reentry_candidates SET regular_review_at=next_review_at WHERE regular_review_at IS NULL`); err != nil {
+		return err
 	}
 	if _, err = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_cg_risk_reservation_intent ON copy_guard_risk_reservations(intent_id,status)`); err != nil {
 		return err
@@ -164,19 +176,20 @@ const reentryCandidateColumns = `id,cycle_id,trader_id,leader_pos_id,symbol,side
 	last_decision,regime,confidence,size_factor,entry_price_low,entry_price_high,attention_price_low,attention_price_high,
 	consecutive_abandons,last_abandon_candle,last_analysis_id,decision_ttl_seconds,last_error,
 	failure_backoff_until,COALESCE(last_unactionable_code,''),last_unactionable_event_at,
+	decision_expires_at,regular_review_at,event_review_at,budget_blocked_until,
 	snapshot_at,last_review_at,next_review_at,
 	created_at,updated_at,closed_at`
 
 func scanReentryCandidate(row rowScanner) (*CopyGuardReentryCandidate, error) {
 	var c CopyGuardReentryCandidate
 	var snapshot, next, created, updated string
-	var last, closed, failureBackoff, unactionableEvent sql.NullString
+	var last, closed, failureBackoff, unactionableEvent, decisionExpires, regularReview, eventReview, budgetBlocked sql.NullString
 	if err := row.Scan(&c.ID, &c.CycleID, &c.TraderID, &c.LeaderPosID, &c.Symbol, &c.Side, &c.MarginMode, &c.Status,
 		&c.TriggerPrice, &c.ATR, &c.MaxNotional, &c.StopCount, &c.ReentryCount, &c.LeaderSize, &c.LeaderEntryPrice, &c.LastStopPrice,
 		&c.DistanceATRRatio, &c.Protectable, &c.FeatureHash, &c.PendingTrigger, &c.DecisionGeneration, &c.ReviewCount, &c.FailureCount,
 		&c.LastDecision, &c.Regime, &c.Confidence, &c.SizeFactor, &c.EntryPriceLow, &c.EntryPriceHigh, &c.AttentionPriceLow, &c.AttentionPriceHigh,
 		&c.ConsecutiveAbandons, &c.LastAbandonCandle, &c.LastAnalysisID, &c.DecisionTTLSeconds, &c.LastError,
-		&failureBackoff, &c.LastUnactionableCode, &unactionableEvent,
+		&failureBackoff, &c.LastUnactionableCode, &unactionableEvent, &decisionExpires, &regularReview, &eventReview, &budgetBlocked,
 		&snapshot, &last, &next, &created, &updated, &closed); err != nil {
 		return nil, err
 	}
@@ -202,6 +215,18 @@ func scanReentryCandidate(row rowScanner) (*CopyGuardReentryCandidate, error) {
 	if c.LastUnactionableEventAt, err = parseNullableDBTime(unactionableEvent); err != nil {
 		return nil, err
 	}
+	if c.DecisionExpiresAt, err = parseNullableDBTime(decisionExpires); err != nil {
+		return nil, err
+	}
+	if c.RegularReviewAt, err = parseNullableDBTime(regularReview); err != nil {
+		return nil, err
+	}
+	if c.EventReviewAt, err = parseNullableDBTime(eventReview); err != nil {
+		return nil, err
+	}
+	if c.BudgetBlockedUntil, err = parseNullableDBTime(budgetBlocked); err != nil {
+		return nil, err
+	}
 	if c.ClosedAt, err = parseNullableDBTime(closed); err != nil {
 		return nil, err
 	}
@@ -216,32 +241,61 @@ func (s *ReentryAIStore) GetReentryCandidateByCycle(cycleID int64) (*CopyGuardRe
 	return scanReentryCandidate(s.db.QueryRow(`SELECT `+reentryCandidateColumns+` FROM copy_guard_reentry_candidates WHERE cycle_id=?`, cycleID))
 }
 
+func (s *ReentryAIStore) ListPendingEntryLeases(traderID string, limit int) ([]*CopyGuardReentryCandidate, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 50
+	}
+	rows, err := s.db.Query(`SELECT `+reentryCandidateColumns+` FROM copy_guard_reentry_candidates
+		WHERE trader_id=? AND status=? ORDER BY id LIMIT ?`, traderID, ReentryCandidateEntryPending, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*CopyGuardReentryCandidate
+	for rows.Next() {
+		c, scanErr := scanReentryCandidate(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+func (s *ReentryAIStore) ExpireEntryLease(id int64) error {
+	res, err := s.db.Exec(`UPDATE copy_guard_reentry_candidates SET status=?,last_error='ENTER_WINDOW_EXPIRED',pending_trigger='ENTER_WINDOW_EXPIRED',next_review_at=CURRENT_TIMESTAMP,decision_expires_at=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=? AND status=?`,
+		ReentryCandidateWaiting, id, ReentryCandidateEntryPending)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return fmt.Errorf("candidate entry lease is no longer pending")
+	}
+	return nil
+}
+
 // EnsureReentryCandidate 创建候选或在同周期再次止损后重置为观察态。
 func (s *ReentryAIStore) EnsureReentryCandidate(c *CopyGuardReentryCandidate, firstReview time.Time) (*CopyGuardReentryCandidate, error) {
 	if c == nil || c.CycleID <= 0 {
 		return nil, fmt.Errorf("invalid reentry candidate")
 	}
 	_, err := s.db.Exec(`INSERT INTO copy_guard_reentry_candidates
-		(cycle_id,trader_id,leader_pos_id,symbol,side,margin_mode,status,trigger_price,atr,max_notional,stop_count,reentry_count,leader_size,leader_entry_price,last_stop_price,distance_atr_ratio,protectable,feature_hash,pending_trigger,next_review_at,snapshot_at)
-		VALUES(?,?,?,?,?,?,?, ?,?,?,?,?,?,?,?,?,?,?,?, ?,CURRENT_TIMESTAMP)
+		(cycle_id,trader_id,leader_pos_id,symbol,side,margin_mode,status,trigger_price,atr,max_notional,stop_count,reentry_count,leader_size,leader_entry_price,last_stop_price,distance_atr_ratio,protectable,feature_hash,pending_trigger,next_review_at,regular_review_at,snapshot_at)
+		VALUES(?,?,?,?,?,?,?, ?,?,?,?,?,?,?,?,?,?,?,?, ?,?,CURRENT_TIMESTAMP)
 		ON CONFLICT(cycle_id) DO UPDATE SET trader_id=excluded.trader_id,leader_pos_id=excluded.leader_pos_id,
 		symbol=excluded.symbol,side=excluded.side,margin_mode=excluded.margin_mode,status=CASE WHEN copy_guard_reentry_candidates.reentry_count<>excluded.reentry_count THEN 'WATCHING' ELSE copy_guard_reentry_candidates.status END,
 		trigger_price=excluded.trigger_price,atr=excluded.atr,max_notional=excluded.max_notional,stop_count=excluded.stop_count,reentry_count=excluded.reentry_count,
 		leader_size=excluded.leader_size,leader_entry_price=excluded.leader_entry_price,last_stop_price=excluded.last_stop_price,
 		distance_atr_ratio=excluded.distance_atr_ratio,protectable=excluded.protectable,
 		pending_trigger=CASE WHEN copy_guard_reentry_candidates.feature_hash<>excluded.feature_hash THEN excluded.pending_trigger ELSE copy_guard_reentry_candidates.pending_trigger END,
-		next_review_at=CASE WHEN copy_guard_reentry_candidates.feature_hash<>excluded.feature_hash THEN
-			CASE
-				WHEN copy_guard_reentry_candidates.failure_backoff_until IS NOT NULL AND copy_guard_reentry_candidates.failure_backoff_until>excluded.next_review_at THEN copy_guard_reentry_candidates.failure_backoff_until
-				WHEN excluded.next_review_at>CURRENT_TIMESTAMP THEN excluded.next_review_at
-				ELSE CURRENT_TIMESTAMP
-			END
-			ELSE copy_guard_reentry_candidates.next_review_at END,
+		next_review_at=CASE WHEN copy_guard_reentry_candidates.reentry_count<>excluded.reentry_count THEN excluded.next_review_at ELSE copy_guard_reentry_candidates.next_review_at END,
+		regular_review_at=CASE WHEN copy_guard_reentry_candidates.reentry_count<>excluded.reentry_count THEN excluded.regular_review_at ELSE copy_guard_reentry_candidates.regular_review_at END,
+		event_review_at=CASE WHEN copy_guard_reentry_candidates.reentry_count<>excluded.reentry_count THEN NULL ELSE copy_guard_reentry_candidates.event_review_at END,
 		feature_hash=excluded.feature_hash,
 		closed_at=CASE WHEN copy_guard_reentry_candidates.reentry_count<>excluded.reentry_count THEN NULL ELSE copy_guard_reentry_candidates.closed_at END,
 		snapshot_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP
 		WHERE copy_guard_reentry_candidates.status IN ('WATCHING','WAITING') OR copy_guard_reentry_candidates.reentry_count<>excluded.reentry_count`,
-		c.CycleID, c.TraderID, c.LeaderPosID, c.Symbol, c.Side, c.MarginMode, ReentryCandidateWatching, c.TriggerPrice, c.ATR, c.MaxNotional, c.StopCount, c.ReentryCount, c.LeaderSize, c.LeaderEntryPrice, c.LastStopPrice, c.DistanceATRRatio, c.Protectable, c.FeatureHash, c.PendingTrigger, firstReview.UTC())
+		c.CycleID, c.TraderID, c.LeaderPosID, c.Symbol, c.Side, c.MarginMode, ReentryCandidateWatching, c.TriggerPrice, c.ATR, c.MaxNotional, c.StopCount, c.ReentryCount, c.LeaderSize, c.LeaderEntryPrice, c.LastStopPrice, c.DistanceATRRatio, c.Protectable, c.FeatureHash, c.PendingTrigger, firstReview.UTC(), firstReview.UTC())
 	if err != nil {
 		return nil, err
 	}
@@ -255,6 +309,7 @@ func (s *ReentryAIStore) ListDueReentryCandidates(limit int) ([]*CopyGuardReentr
 	rows, err := s.db.Query(`SELECT `+reentryCandidateColumns+` FROM copy_guard_reentry_candidates
 		WHERE status IN ('WATCHING','WAITING') AND next_review_at<=CURRENT_TIMESTAMP
 		AND (failure_backoff_until IS NULL OR failure_backoff_until<=CURRENT_TIMESTAMP)
+		AND (budget_blocked_until IS NULL OR budget_blocked_until<=CURRENT_TIMESTAMP)
 		ORDER BY next_review_at,id LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
@@ -309,7 +364,16 @@ func (s *ReentryAIStore) ClaimReentryCandidateReview(id int64, minInterval time.
 		return nil, false, err
 	}
 	if daily >= dailyLimit {
-		_, err = tx.Exec(`UPDATE copy_guard_reentry_candidates SET next_review_at=datetime('now','+2 hours'),pending_trigger='DAILY_BUDGET',updated_at=CURRENT_TIMESTAMP WHERE id=?`, id)
+		var oldest string
+		if err = tx.QueryRow(`SELECT MIN(created_at) FROM reentry_ai_analyses WHERE candidate_id=? AND call_status IN ('RUNNING','COMPLETED','INVALID','FAILED') AND created_at>=datetime('now','-24 hours')`, id).Scan(&oldest); err != nil {
+			return nil, false, err
+		}
+		oldestAt, parseErr := parseDBTime(oldest)
+		if parseErr != nil {
+			return nil, false, parseErr
+		}
+		unblock := oldestAt.Add(24 * time.Hour).UTC()
+		_, err = tx.Exec(`UPDATE copy_guard_reentry_candidates SET next_review_at=?,budget_blocked_until=?,pending_trigger='DAILY_BUDGET',updated_at=CURRENT_TIMESTAMP WHERE id=?`, unblock, unblock, id)
 		if err != nil {
 			return nil, false, err
 		}
@@ -323,7 +387,7 @@ func (s *ReentryAIStore) ClaimReentryCandidateReview(id int64, minInterval time.
 			return nil, false, nil
 		}
 	}
-	res, err := tx.Exec(`UPDATE copy_guard_reentry_candidates SET status=?,decision_generation=decision_generation+1,review_count=review_count+1,last_review_at=CURRENT_TIMESTAMP,next_review_at=?,pending_trigger='',updated_at=CURRENT_TIMESTAMP WHERE id=? AND status IN ('WATCHING','WAITING')`, ReentryCandidateReviewing, time.Now().Add(minInterval).UTC(), id)
+	res, err := tx.Exec(`UPDATE copy_guard_reentry_candidates SET status=?,decision_generation=decision_generation+1,review_count=review_count+1,last_review_at=CURRENT_TIMESTAMP,next_review_at=?,event_review_at=NULL,budget_blocked_until=NULL,pending_trigger='',updated_at=CURRENT_TIMESTAMP WHERE id=? AND status IN ('WATCHING','WAITING')`, ReentryCandidateReviewing, time.Now().Add(minInterval).UTC(), id)
 	if err != nil {
 		return nil, false, err
 	}
@@ -359,7 +423,19 @@ func (s *ReentryAIStore) FinishReentryCandidateReview(id int64, d ReentryCandida
 	if d.Decision == ReentryVerdictAbandon {
 		status = ReentryCandidateWaiting
 	}
-	res, err := s.db.Exec(`UPDATE copy_guard_reentry_candidates SET status=?,last_decision=?,regime=?,confidence=?,size_factor=?,entry_price_low=?,entry_price_high=?,attention_price_low=?,attention_price_high=?,next_review_at=?,last_analysis_id=?,decision_ttl_seconds=?,failure_count=0,last_error='',failure_backoff_until=NULL,consecutive_abandons=CASE WHEN ? AND last_abandon_candle<>? THEN consecutive_abandons+1 WHEN ? THEN consecutive_abandons ELSE 0 END,last_abandon_candle=CASE WHEN ? THEN ? ELSE '' END,updated_at=CURRENT_TIMESTAMP WHERE id=? AND status=?`, status, d.Decision, d.Regime, d.Confidence, d.SizeFactor, d.EntryPriceLow, d.EntryPriceHigh, d.AttentionPriceLow, d.AttentionPriceHigh, d.NextReview.UTC(), d.AnalysisID, d.TTLSeconds, d.ConfirmAbandon, d.CandleKey, d.ConfirmAbandon, d.ConfirmAbandon, d.CandleKey, id, ReentryCandidateReviewing)
+	var decisionExpires interface{}
+	if status == ReentryCandidateEntryPending {
+		ttl := d.TTLSeconds
+		if ttl < 15 {
+			ttl = 15
+		}
+		if ttl > 60 {
+			ttl = 60
+		}
+		d.TTLSeconds = ttl
+		decisionExpires = time.Now().Add(time.Duration(ttl) * time.Second).UTC()
+	}
+	res, err := s.db.Exec(`UPDATE copy_guard_reentry_candidates SET status=?,last_decision=?,regime=?,confidence=?,size_factor=?,entry_price_low=?,entry_price_high=?,attention_price_low=?,attention_price_high=?,next_review_at=?,regular_review_at=?,event_review_at=NULL,last_analysis_id=?,decision_ttl_seconds=?,decision_expires_at=?,failure_count=0,last_error='',failure_backoff_until=NULL,consecutive_abandons=CASE WHEN ? AND last_abandon_candle<>? THEN consecutive_abandons+1 WHEN ? THEN consecutive_abandons ELSE 0 END,last_abandon_candle=CASE WHEN ? THEN ? ELSE '' END,updated_at=CURRENT_TIMESTAMP WHERE id=? AND status=?`, status, d.Decision, d.Regime, d.Confidence, d.SizeFactor, d.EntryPriceLow, d.EntryPriceHigh, d.AttentionPriceLow, d.AttentionPriceHigh, d.NextReview.UTC(), d.NextReview.UTC(), d.AnalysisID, d.TTLSeconds, decisionExpires, d.ConfirmAbandon, d.CandleKey, d.ConfirmAbandon, d.ConfirmAbandon, d.CandleKey, id, ReentryCandidateReviewing)
 	if err != nil {
 		return err
 	}
@@ -674,7 +750,7 @@ func (s *ReentryAIStore) RequestImmediateReentryCandidateReview(id int64, minInt
 			eligible = next.UTC()
 		}
 	}
-	res, err := tx.Exec(`UPDATE copy_guard_reentry_candidates SET next_review_at=?,pending_trigger='OPERATOR_REVIEW_REQUEST',last_error='',updated_at=CURRENT_TIMESTAMP WHERE id=? AND status IN (?,?)`, eligible, id, ReentryCandidateWatching, ReentryCandidateWaiting)
+	res, err := tx.Exec(`UPDATE copy_guard_reentry_candidates SET event_review_at=?,next_review_at=CASE WHEN budget_blocked_until IS NOT NULL AND budget_blocked_until>? THEN budget_blocked_until ELSE ? END,pending_trigger='OPERATOR_REVIEW_REQUEST',last_error='',updated_at=CURRENT_TIMESTAMP WHERE id=? AND status IN (?,?)`, eligible, eligible, eligible, id, ReentryCandidateWatching, ReentryCandidateWaiting)
 	if err != nil {
 		return nil, err
 	}

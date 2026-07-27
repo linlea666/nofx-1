@@ -1017,14 +1017,16 @@ func (h *CopyTradeHandler) DismissManualSignal(c *gin.Context) {
 
 // CopyTradeConfigRequest 跟单配置请求
 type CopyTradeConfigRequest struct {
-	ProviderType   string  `json:"provider_type" binding:"required,oneof=hyperliquid okx binance"`
-	LeaderID       string  `json:"leader_id"`
-	CopyRatio      float64 `json:"copy_ratio" binding:"required,gt=0"`
-	SyncLeverage   bool    `json:"sync_leverage"`
-	SyncMarginMode bool    `json:"sync_margin_mode"`
-	MinTradeWarn   float64 `json:"min_trade_warn"`
-	MaxTradeWarn   float64 `json:"max_trade_warn"`
-	Enabled        bool    `json:"enabled"`
+	ProviderType             string   `json:"provider_type" binding:"required,oneof=hyperliquid okx binance"`
+	LeaderID                 string   `json:"leader_id"`
+	CopyRatio                float64  `json:"copy_ratio" binding:"required,gt=0"`
+	SyncLeverage             bool     `json:"sync_leverage"`
+	SyncMarginMode           bool     `json:"sync_margin_mode"`
+	MinTradeWarn             float64  `json:"min_trade_warn"`
+	MaxTradeWarn             float64  `json:"max_trade_warn"`
+	CopyCatchupWindowSeconds *int     `json:"copy_catchup_window_seconds,omitempty"`
+	CopyCatchupMaxAdverseBPS *float64 `json:"copy_catchup_max_adverse_bps,omitempty"`
+	Enabled                  bool     `json:"enabled"`
 
 	// Binance Web 凭证（仅 ProviderType=binance 时使用）
 	BinanceP20T        string `json:"binance_p20t"`
@@ -1063,6 +1065,7 @@ type CopyTradeConfigRequest struct {
 
 	RiskPolicyVersion           *int     `json:"risk_policy_version,omitempty"`
 	RiskStopMode                *string  `json:"risk_stop_mode,omitempty"`
+	RiskStopPriority            *string  `json:"risk_stop_priority,omitempty"`
 	RiskATRPeriod               *int     `json:"risk_atr_period,omitempty"`
 	RiskATRCacheMaxAgeMinutes   *int     `json:"risk_atr_cache_max_age_minutes,omitempty"`
 	RiskATRFallbackPct          *float64 `json:"risk_atr_fallback_pct,omitempty"`
@@ -1300,6 +1303,16 @@ func (h *CopyTradeHandler) SaveConfig(c *gin.Context) {
 		BinanceSourceMode:  req.BinanceSourceMode,
 		BinanceTopTraderID: req.BinanceTopTraderID,
 	}
+	if req.CopyCatchupWindowSeconds != nil {
+		config.CopyCatchupWindowSeconds = *req.CopyCatchupWindowSeconds
+	} else if existing != nil {
+		config.CopyCatchupWindowSeconds = existing.CopyCatchupWindowSeconds
+	}
+	if req.CopyCatchupMaxAdverseBPS != nil {
+		config.CopyCatchupMaxAdverseBPS = *req.CopyCatchupMaxAdverseBPS
+	} else if existing != nil {
+		config.CopyCatchupMaxAdverseBPS = existing.CopyCatchupMaxAdverseBPS
+	}
 
 	// 风控字段透传（指针类型，未传则使用旧值或默认值）
 	if req.RiskStopLossEnabled != nil {
@@ -1485,6 +1498,11 @@ func applyCopyGuardV4Request(c, old *store.CopyTradeConfig, r *CopyTradeConfigRe
 		c.RiskStopMode = *r.RiskStopMode
 	} else if old != nil {
 		c.RiskStopMode = old.RiskStopMode
+	}
+	if r.RiskStopPriority != nil {
+		c.RiskStopPriority = *r.RiskStopPriority
+	} else if old != nil {
+		c.RiskStopPriority = old.RiskStopPriority
 	}
 	if r.RiskATRPeriod != nil {
 		c.RiskATRPeriod = *r.RiskATRPeriod

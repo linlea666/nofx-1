@@ -181,8 +181,10 @@ type CopyConfig struct {
 	SyncMarginMode bool         `json:"sync_margin_mode"` // 同步保证金模式
 
 	// 预警阈值（不限制，只记录预警）
-	MinTradeWarn float64 `json:"min_trade_warn"` // 低于此金额记录预警
-	MaxTradeWarn float64 `json:"max_trade_warn"` // 高于此金额记录预警 (0=不预警)
+	MinTradeWarn             float64 `json:"min_trade_warn"` // 低于此金额记录预警
+	MaxTradeWarn             float64 `json:"max_trade_warn"` // 高于此金额记录预警 (0=不预警)
+	CopyCatchupWindowSeconds int     `json:"copy_catchup_window_seconds"`
+	CopyCatchupMaxAdverseBPS float64 `json:"copy_catchup_max_adverse_bps"`
 
 	// Binance Web 私有接口凭证（仅 ProviderType=binance 时使用）
 	// 由用户从浏览器开发者工具中抓取，会过期，过期时通过邮件告警
@@ -222,6 +224,7 @@ type CopyConfig struct {
 
 	RiskPolicyVersion          int     `json:"risk_policy_version"` // >=4 = Copy Guard 启用标记（v3 行为已下线）
 	RiskStopMode               string  `json:"risk_stop_mode"`      // 兼容字段：不再影响计算（见 store.CopyTradeConfig.RiskStopMode）
+	RiskStopPriority           string  `json:"risk_stop_priority"`
 	RiskATRPeriod              int     `json:"risk_atr_period"`
 	RiskATRCacheMaxAgeMinutes  int     `json:"risk_atr_cache_max_age_minutes"`
 	RiskATRFallbackPct         float64 `json:"risk_atr_fallback_pct"`
@@ -262,6 +265,12 @@ type CopyConfig struct {
 //   - RiskAccountPct 0.02：v7 单次尝试风险预算（含费用与滑点）
 //   - RiskLeverageMaxLoss 0.20：仅当 RiskLeverageFallback 开启时的保证金封顶（默认关）
 func (c *CopyConfig) FillRiskDefaults() {
+	if c.CopyCatchupWindowSeconds <= 0 {
+		c.CopyCatchupWindowSeconds = 60
+	}
+	if c.CopyCatchupMaxAdverseBPS <= 0 {
+		c.CopyCatchupMaxAdverseBPS = 20
+	}
 	if c.RiskAccountPct == 0 {
 		c.RiskAccountPct = 0.02
 	}
@@ -314,6 +323,9 @@ func (c *CopyConfig) FillRiskDefaults() {
 	if c.RiskPolicyVersion >= 4 {
 		if c.RiskStopMode == "" {
 			c.RiskStopMode = "volatility_priority"
+		}
+		if c.RiskStopPriority == "" {
+			c.RiskStopPriority = "volatility_first"
 		}
 		if c.RiskATRPeriod == 0 {
 			c.RiskATRPeriod = 14

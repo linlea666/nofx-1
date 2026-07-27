@@ -119,6 +119,50 @@ func TestLowConfidenceEnterRemainsWaitingWithoutFailure(t *testing.T) {
 	}
 }
 
+func TestFeatureHashChangeDoesNotPullForwardRegularReviewOrEntryLease(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "candidate-schedule.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	rs := st.ReentryAI()
+	regular := time.Now().Add(2 * time.Hour).UTC()
+	c, err := rs.EnsureReentryCandidate(&CopyGuardReentryCandidate{
+		CycleID: 711, TraderID: "trader-a", LeaderPosID: "p", Symbol: "ETHUSDT",
+		Side: "short", FeatureHash: "h1", PendingTrigger: "SCHEDULED",
+	}, regular)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err = rs.EnsureReentryCandidate(&CopyGuardReentryCandidate{
+		CycleID: 711, TraderID: "trader-a", LeaderPosID: "p", Symbol: "ETHUSDT",
+		Side: "short", FeatureHash: "h2", PendingTrigger: "ATR_TICK",
+	}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.NextReviewAt.Before(regular.Add(-time.Second)) || c.RegularReviewAt == nil || c.RegularReviewAt.Before(regular.Add(-time.Second)) {
+		t.Fatalf("feature jitter pulled a 2h cadence forward: next=%s persisted_regular=%v regular=%s", c.NextReviewAt, c.RegularReviewAt, regular)
+	}
+	if _, err = st.db.Exec(`UPDATE copy_guard_reentry_candidates SET status=? WHERE id=?`, ReentryCandidateReviewing, c.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err = rs.FinishReentryCandidateReview(c.ID, ReentryCandidateDecision{
+		Decision: ReentryVerdictEnter, Confidence: .84, SizeFactor: .5,
+		EntryPriceLow: 1900, EntryPriceHigh: 1910, NextReview: regular,
+		AnalysisID: 10, TTLSeconds: 5, EnterApproved: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := rs.GetReentryCandidate(c.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh.DecisionExpiresAt == nil || fresh.DecisionTTLSeconds != 15 {
+		t.Fatalf("ENTER lease must persist and clamp to 15-60s: %+v", fresh)
+	}
+}
+
 func TestDisableReentryCandidatesKeepsSubmittedIntentOwnedByReconciler(t *testing.T) {
 	st, err := New(filepath.Join(t.TempDir(), "candidate-disable.db"))
 	if err != nil {

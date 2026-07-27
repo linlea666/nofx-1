@@ -86,6 +86,7 @@ function executionLifecycle(action: DecisionAction): string[] {
   const steps = ['已识别', '已预留']
   const submitted = [
     'SUBMITTED',
+    'PARTIALLY_FILLED',
     'FILLED',
     'PROTECTED',
     'RECONCILING',
@@ -109,6 +110,9 @@ function executionLifecycle(action: DecisionAction): string[] {
       steps.push(
         `对账/保护中${action.execution_reason_code ? `：${action.execution_reason_code}` : ''}`
       )
+      break
+    case 'PARTIALLY_FILLED':
+      steps.push('部分成交，等待限时补齐')
       break
     case 'FAILED':
       steps.push(
@@ -134,6 +138,7 @@ function executionStatusColor(action: DecisionAction): string {
   if (
     action.execution_status === 'RESERVED' ||
     action.execution_status === 'SUBMITTED' ||
+    action.execution_status === 'PARTIALLY_FILLED' ||
     action.execution_status === 'RECONCILING'
   ) {
     return '#F0B90B'
@@ -353,6 +358,16 @@ function ActionCard({
             </span>
             <span>
               量化数量：{action.quantized_quantity?.toPrecision(8) || '-'}
+            </span>
+            <span>
+              实际成交：{action.filled_quantity?.toPrecision(8) || '-'}
+            </span>
+            <span>
+              待补差额：
+              {Math.max(
+                0,
+                (action.quantized_quantity || 0) - (action.filled_quantity || 0)
+              ).toPrecision(8)}
             </span>
             <span>
               最小可执行：

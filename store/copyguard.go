@@ -84,6 +84,7 @@ const (
 type CopyGuardPolicy struct {
 	Version                int     `json:"version"`
 	StopMode               string  `json:"stop_mode"`
+	StopPriority           string  `json:"stop_priority"`
 	StopMaxAccountLossPct  float64 `json:"stop_max_account_loss_pct,omitempty"`
 	ATRPeriod              int     `json:"atr_period"`
 	ATRCacheMaxAgeMinutes  int     `json:"atr_cache_max_age_minutes"`
@@ -569,7 +570,7 @@ func scanCopyGuardWatchSample(scan func(dest ...interface{}) error) (*CopyGuardW
 
 func policyFromConfig(c *CopyTradeConfig) CopyGuardPolicy {
 	return CopyGuardPolicy{
-		Version: c.RiskPolicyVersion, StopMode: c.RiskStopMode,
+		Version: c.RiskPolicyVersion, StopMode: c.RiskStopMode, StopPriority: c.RiskStopPriority,
 		StopMaxAccountLossPct: c.RiskStopMaxAccountLossPct,
 		ATRPeriod:             c.RiskATRPeriod, ATRCacheMaxAgeMinutes: c.RiskATRCacheMaxAgeMinutes,
 		ATRFallbackPct: c.RiskATRFallbackPct, TriggerPriceType: c.RiskTriggerPriceType,
@@ -632,6 +633,7 @@ func (s *CopyTradeStore) loadCopyGuardPolicy(c *CopyTradeConfig) error {
 		return err
 	}
 	c.RiskPolicyVersion, c.RiskStopMode, c.RiskATRPeriod = p.Version, p.StopMode, p.ATRPeriod
+	c.RiskStopPriority = p.StopPriority
 	c.RiskStopMaxAccountLossPct = p.StopMaxAccountLossPct
 	c.RiskATRCacheMaxAgeMinutes = p.ATRCacheMaxAgeMinutes
 	c.RiskATRFallbackPct, c.RiskTriggerPriceType = p.ATRFallbackPct, p.TriggerPriceType

@@ -41,9 +41,11 @@ type StopLossCalcInput struct {
 	LiquidationPrice float64  // 跟随者强平价；0 表示交易所未返回
 	PriceTickSize    float64  // 执行交易所精确价格步长；0 时仅兼容旧 OKX 路径
 	BaseQuantityStep float64  // 执行交易所精确基础币数量步长
-	// MaxAccountLossPct is the effective account-level hard cap for this real
-	// follower position. Zero preserves the legacy/AI sizing calculation.
+	// MaxAccountLossPct is the account-risk warning threshold for this real
+	// follower position. AccountCapHard selects the backward-compatible mode
+	// that also uses it as a hard stop-distance cap.
 	MaxAccountLossPct     float64
+	AccountCapHard        bool
 	StructureInvalidation float64
 }
 
@@ -63,8 +65,9 @@ type StopLossCalcResult struct {
 	ExpectedMarginLossPct float64
 	// DistanceATRRatio 止损距离/原始 ATR 比值；< 0.5 表示止损落在正常噪音
 	// 区内，预计高频止损（UI 易扫损提示 + 重入自适应加严的输入）
-	DistanceATRRatio float64
-	NoiseConflict    bool // 硬 cap 比 ATR 基线更紧（止损落在噪音区内）
+	DistanceATRRatio             float64
+	NoiseConflict                bool // 硬 cap 比 ATR 基线更紧（止损落在噪音区内）
+	AccountRiskThresholdExceeded bool
 	// LiquidationPriceIgnored: 交易所返回的强平价方向不合理（多单强平价高于
 	// 入场价 / 空单低于入场价），已忽略强平价校验、按 ATR 止损继续挂单
 	LiquidationPriceIgnored bool
@@ -127,6 +130,7 @@ func calcStopLossPrice(cfg *CopyConfig, input *StopLossCalcInput) (*StopLossCalc
 		return nil, fmt.Errorf("no valid ATR or fallback distance")
 	}
 	if input.MaxAccountLossPct > 0 {
+		input.AccountCapHard = cfg.RiskStopPriority == "account_cap"
 		computed, err := ComputeAccountProtectionDistance(
 			cfg, input.Side, input.EntryPrice, input.PositionValue,
 			input.FollowerEquity, result.ATRValue, result.ATRDistance,
@@ -138,6 +142,7 @@ func calcStopLossPrice(cfg *CopyConfig, input *StopLossCalcInput) (*StopLossCalc
 		result.SLDistance = computed.Distance
 		result.GovernedBy = computed.GovernedBy
 		result.NoiseConflict = computed.NoiseConflict
+		result.AccountRiskThresholdExceeded = computed.AccountRiskThresholdExceeded
 		result.ExpectedLossUSD = computed.ExpectedLossUSD
 		result.ExpectedLossPct = computed.ExpectedLossPct
 		if margin := input.PositionValue / float64(input.Leverage); margin > 0 {
@@ -314,7 +319,8 @@ func finalizeStopLossPrice(input *StopLossCalcInput, result *StopLossCalcResult,
 	if result.ATRValue > 0 {
 		result.DistanceATRRatio = result.SLDistance / result.ATRValue
 	}
-	if input.MaxAccountLossPct > 0 && result.ExpectedLossPct > input.MaxAccountLossPct+1e-9 {
+	result.AccountRiskThresholdExceeded = input.MaxAccountLossPct > 0 && result.ExpectedLossPct > input.MaxAccountLossPct+1e-9
+	if input.AccountCapHard && result.AccountRiskThresholdExceeded {
 		return nil, fmt.Errorf("aligned stop exceeds account loss cap: expected %.8f cap %.8f", result.ExpectedLossPct, input.MaxAccountLossPct)
 	}
 	return result, nil

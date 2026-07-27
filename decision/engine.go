@@ -133,9 +133,12 @@ type Decision struct {
 	// Opening position parameters
 	Leverage        int     `json:"leverage,omitempty"`
 	PositionSizeUSD float64 `json:"position_size_usd,omitempty"`
-	StopLoss        float64 `json:"stop_loss,omitempty"`
-	TakeProfit      float64 `json:"take_profit,omitempty"`
-	MarginMode      string  `json:"margin_mode,omitempty"` // "cross" | "isolated"，跟单时同步领航员的保证金模式
+	// TargetPositionSizeUSD preserves the ordinary proportional-copy target
+	// when execution can currently afford only a partial fill.
+	TargetPositionSizeUSD float64 `json:"target_position_size_usd,omitempty"`
+	StopLoss              float64 `json:"stop_loss,omitempty"`
+	TakeProfit            float64 `json:"take_profit,omitempty"`
+	MarginMode            string  `json:"margin_mode,omitempty"` // "cross" | "isolated"，跟单时同步领航员的保证金模式
 
 	// Closing position parameters (for partial close/reduce)
 	CloseRatio float64 `json:"close_ratio,omitempty"` // 0 = close all, 0.5 = close 50%, etc.

@@ -1417,10 +1417,13 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 
 	actualPositionSize := decision.PositionSizeUSD
 	leaderCopy := isCopyTrade && !isAIReentryCopyTrade(decision)
-	if actualPositionSize > maxAffordablePositionSize && !leaderCopy {
+	if actualPositionSize > maxAffordablePositionSize {
 		// Use 98% of max to leave buffer for price fluctuation
 		adjustedSize := maxAffordablePositionSize * 0.98
-		logger.Infof("  ⚠️ Position size %.2f exceeds max affordable %.2f, auto-reducing to %.2f",
+		if leaderCopy && decision.TargetPositionSizeUSD <= 0 {
+			decision.TargetPositionSizeUSD = actualPositionSize
+		}
+		logger.Infof("  ⚠️ Position size %.2f exceeds max affordable %.2f, executing %.2f now",
 			actualPositionSize, maxAffordablePositionSize, adjustedSize)
 		actualPositionSize = adjustedSize
 		decision.PositionSizeUSD = actualPositionSize
@@ -1675,10 +1678,13 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 
 	actualPositionSize := decision.PositionSizeUSD
 	leaderCopy := isCopyTrade && !isAIReentryCopyTrade(decision)
-	if actualPositionSize > maxAffordablePositionSize && !leaderCopy {
+	if actualPositionSize > maxAffordablePositionSize {
 		// Use 98% of max to leave buffer for price fluctuation
 		adjustedSize := maxAffordablePositionSize * 0.98
-		logger.Infof("  ⚠️ Position size %.2f exceeds max affordable %.2f, auto-reducing to %.2f",
+		if leaderCopy && decision.TargetPositionSizeUSD <= 0 {
+			decision.TargetPositionSizeUSD = actualPositionSize
+		}
+		logger.Infof("  ⚠️ Position size %.2f exceeds max affordable %.2f, executing %.2f now",
 			actualPositionSize, maxAffordablePositionSize, adjustedSize)
 		actualPositionSize = adjustedSize
 		decision.PositionSizeUSD = actualPositionSize

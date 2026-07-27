@@ -9,19 +9,21 @@ import (
 )
 
 const (
-	ExecutionIntentReserved    = "RESERVED"
-	ExecutionIntentSubmitted   = "SUBMITTED"
-	ExecutionIntentFilled      = "FILLED"
-	ExecutionIntentProtected   = "PROTECTED"
-	ExecutionIntentSkipped     = "SKIPPED"
-	ExecutionIntentFailed      = "FAILED"
-	ExecutionIntentReconciling = "RECONCILING"
+	ExecutionIntentReserved        = "RESERVED"
+	ExecutionIntentSubmitted       = "SUBMITTED"
+	ExecutionIntentFilled          = "FILLED"
+	ExecutionIntentPartiallyFilled = "PARTIALLY_FILLED"
+	ExecutionIntentProtected       = "PROTECTED"
+	ExecutionIntentSkipped         = "SKIPPED"
+	ExecutionIntentFailed          = "FAILED"
+	ExecutionIntentReconciling     = "RECONCILING"
 
-	ExecutionOrderAttemptPrepared  = "PREPARED"
-	ExecutionOrderAttemptSubmitted = "SUBMITTED"
-	ExecutionOrderAttemptFilled    = "FILLED"
-	ExecutionOrderAttemptFailed    = "FAILED"
-	ExecutionOrderAttemptUnknown   = "UNKNOWN"
+	ExecutionOrderAttemptPrepared       = "PREPARED"
+	ExecutionOrderAttemptSubmitted      = "SUBMITTED"
+	ExecutionOrderAttemptFilled         = "FILLED"
+	ExecutionOrderAttemptFailed         = "FAILED"
+	ExecutionOrderAttemptUnknown        = "UNKNOWN"
+	ExecutionOrderAttemptTerminalNoFill = "TERMINAL_NO_FILL"
 )
 
 type CopyTradeExecutionIntentSource struct {
@@ -115,6 +117,7 @@ type LeaderExecutionCommit struct {
 	FillPrice            float64
 	FilledQuantity       float64
 	FilledNotional       float64
+	ClientOrderID        string
 	ExchangeOrderID      string
 	ExchangeState        string
 }
@@ -132,12 +135,40 @@ func (s *CopyTradeStore) CommitLeaderExecutionFill(c LeaderExecutionCommit) erro
 	}
 	defer tx.Rollback()
 	var intentStatus string
-	if err = tx.QueryRow(`SELECT status FROM copy_trade_execution_intents WHERE id=? AND trader_id=? AND leader_pos_id=? AND source_revision=?`, c.IntentID, c.TraderID, c.LeaderPosID, c.SourceRevision).Scan(&intentStatus); err != nil {
+	var targetQuantity, previousFilled float64
+	if err = tx.QueryRow(`SELECT status,COALESCE(quantized_quantity,requested_quantity),COALESCE(filled_quantity,0) FROM copy_trade_execution_intents WHERE id=? AND trader_id=? AND leader_pos_id=? AND source_revision=?`, c.IntentID, c.TraderID, c.LeaderPosID, c.SourceRevision).Scan(&intentStatus, &targetQuantity, &previousFilled); err != nil {
 		return err
 	}
 	if intentStatus != ExecutionIntentFilled && intentStatus != ExecutionIntentProtected &&
-		intentStatus != ExecutionIntentSubmitted && intentStatus != ExecutionIntentReconciling && intentStatus != ExecutionIntentReserved {
+		intentStatus != ExecutionIntentSubmitted && intentStatus != ExecutionIntentReconciling &&
+		intentStatus != ExecutionIntentReserved && intentStatus != ExecutionIntentPartiallyFilled {
 		return fmt.Errorf("intent %d cannot commit fill from %s", c.IntentID, intentStatus)
+	}
+	fillKey := strings.TrimSpace(c.ExchangeOrderID)
+	if fillKey == "" {
+		fillKey = strings.TrimSpace(c.ClientOrderID)
+	}
+	if fillKey == "" {
+		return fmt.Errorf("intent %d acknowledged fill has no durable order identity", c.IntentID)
+	}
+	fillClaim, err := tx.Exec(`INSERT OR IGNORE INTO copy_trade_execution_fill_commits(intent_id,fill_key,filled_quantity,filled_notional) VALUES(?,?,?,?)`,
+		c.IntentID, fillKey, c.FilledQuantity, c.FilledNotional)
+	if err != nil {
+		return err
+	}
+	if claimed, _ := fillClaim.RowsAffected(); claimed != 1 {
+		// The claim is in the same transaction as the mapping and cumulative
+		// fill update, so replaying a confirmed exchange/client order is a
+		// durable no-op after a crash.
+		return tx.Commit()
+	}
+	cumulativeFilled := previousFilled + c.FilledQuantity
+	if intentStatus == ExecutionIntentFilled || intentStatus == ExecutionIntentProtected {
+		cumulativeFilled = math.Max(previousFilled, c.FilledQuantity)
+	}
+	nextStatus := ExecutionIntentFilled
+	if targetQuantity > 0 && cumulativeFilled+math.Max(1e-12, targetQuantity*1e-8) < targetQuantity {
+		nextStatus = ExecutionIntentPartiallyFilled
 	}
 	open := c.Action == "open_long" || c.Action == "open_short"
 	reduce := c.Action == "reduce_long" || c.Action == "reduce_short"
@@ -155,14 +186,19 @@ func (s *CopyTradeStore) CommitLeaderExecutionFill(c LeaderExecutionCommit) erro
 		if !stateMatches {
 			return fmt.Errorf("mapping revision %d has incompatible state %s/%s for %s", currentRevision, mappingStatus, mappingSide, c.Action)
 		}
-		if intentStatus == ExecutionIntentProtected {
+		if intentStatus == ExecutionIntentFilled || intentStatus == ExecutionIntentProtected {
 			return tx.Commit()
 		}
-		_, err = tx.Exec(`UPDATE copy_trade_execution_intents SET status='FILLED',filled_quantity=?,exchange_order_id=CASE WHEN ?<>'' THEN ? ELSE exchange_order_id END,exchange_state=?,filled_at=COALESCE(filled_at,CURRENT_TIMESTAMP),updated_at=CURRENT_TIMESTAMP WHERE id=?`, c.FilledQuantity, c.ExchangeOrderID, c.ExchangeOrderID, c.ExchangeState, c.IntentID)
+		_, err = tx.Exec(`UPDATE copy_trade_execution_intents SET status=?,filled_quantity=?,exchange_order_id=CASE WHEN ?<>'' THEN ? ELSE exchange_order_id END,exchange_state=?,filled_at=COALESCE(filled_at,CURRENT_TIMESTAMP),terminal_at=CASE WHEN ?='FILLED' THEN COALESCE(terminal_at,CURRENT_TIMESTAMP) ELSE NULL END,updated_at=CURRENT_TIMESTAMP WHERE id=?`, nextStatus, cumulativeFilled, c.ExchangeOrderID, c.ExchangeOrderID, c.ExchangeState, nextStatus, c.IntentID)
 		if err != nil {
 			return err
 		}
-		if _, err = tx.Exec(`UPDATE copy_trade_source_transitions SET status='FILLED',updated_at=CURRENT_TIMESTAMP WHERE intent_id=?`, c.IntentID); err != nil {
+		if open {
+			if _, err = tx.Exec(`UPDATE copy_trade_position_mappings SET open_size_usd=COALESCE(open_size_usd,0)+?,updated_at=CURRENT_TIMESTAMP WHERE trader_id=? AND leader_pos_id=?`, c.FilledNotional, c.TraderID, c.LeaderPosID); err != nil {
+				return err
+			}
+		}
+		if _, err = tx.Exec(`UPDATE copy_trade_source_transitions SET status=?,updated_at=CURRENT_TIMESTAMP WHERE intent_id=?`, nextStatus, c.IntentID); err != nil {
 			return err
 		}
 		return tx.Commit()
@@ -201,14 +237,14 @@ func (s *CopyTradeStore) CommitLeaderExecutionFill(c LeaderExecutionCommit) erro
 	if err != nil {
 		return err
 	}
-	res, err := tx.Exec(`UPDATE copy_trade_execution_intents SET status='FILLED',filled_quantity=?,exchange_order_id=CASE WHEN ?<>'' THEN ? ELSE exchange_order_id END,exchange_state=?,filled_at=COALESCE(filled_at,CURRENT_TIMESTAMP),updated_at=CURRENT_TIMESTAMP WHERE id=? AND status IN ('RESERVED','SUBMITTED','RECONCILING')`, c.FilledQuantity, c.ExchangeOrderID, c.ExchangeOrderID, c.ExchangeState, c.IntentID)
+	res, err := tx.Exec(`UPDATE copy_trade_execution_intents SET status=?,filled_quantity=?,exchange_order_id=CASE WHEN ?<>'' THEN ? ELSE exchange_order_id END,exchange_state=?,filled_at=COALESCE(filled_at,CURRENT_TIMESTAMP),terminal_at=CASE WHEN ?='FILLED' THEN COALESCE(terminal_at,CURRENT_TIMESTAMP) ELSE NULL END,updated_at=CURRENT_TIMESTAMP WHERE id=? AND status IN ('RESERVED','SUBMITTED','RECONCILING','PARTIALLY_FILLED')`, nextStatus, cumulativeFilled, c.ExchangeOrderID, c.ExchangeOrderID, c.ExchangeState, nextStatus, c.IntentID)
 	if err != nil {
 		return err
 	}
 	if n, _ := res.RowsAffected(); n != 1 {
 		return fmt.Errorf("intent %d fill commit lost state race", c.IntentID)
 	}
-	if _, err = tx.Exec(`UPDATE copy_trade_source_transitions SET status='FILLED',updated_at=CURRENT_TIMESTAMP WHERE intent_id=?`, c.IntentID); err != nil {
+	if _, err = tx.Exec(`UPDATE copy_trade_source_transitions SET status=?,updated_at=CURRENT_TIMESTAMP WHERE intent_id=?`, nextStatus, c.IntentID); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -248,7 +284,7 @@ func (s *CopyTradeStore) GetExecutionReconciliationReport(traderID string) (*Exe
 		target *int
 		sql    string
 	}{
-		{&report.UnfinishedIntents, `SELECT COUNT(*) FROM copy_trade_execution_intents WHERE trader_id=? AND status IN ('RESERVED','SUBMITTED','RECONCILING')`},
+		{&report.UnfinishedIntents, `SELECT COUNT(*) FROM copy_trade_execution_intents WHERE trader_id=? AND status IN ('RESERVED','SUBMITTED','RECONCILING','PARTIALLY_FILLED')`},
 		{&report.OpenCyclesWithoutMapping, `SELECT COUNT(*) FROM copy_guard_cycles c WHERE c.trader_id=? AND c.closed_at IS NULL AND NOT EXISTS (SELECT 1 FROM copy_trade_position_mappings m WHERE m.trader_id=c.trader_id AND m.leader_pos_id=c.leader_pos_id AND m.status IN ('active','stopped_by_risk','detached'))`},
 		{&report.ActiveMappingsWithoutCycle, `SELECT COUNT(*) FROM copy_trade_position_mappings m WHERE m.trader_id=? AND m.status='active' AND NOT EXISTS (SELECT 1 FROM copy_guard_cycles c WHERE c.trader_id=m.trader_id AND c.leader_pos_id=m.leader_pos_id AND c.closed_at IS NULL)`},
 		{&report.UnprotectedOpenCycles, `SELECT COUNT(*) FROM copy_guard_cycles WHERE trader_id=? AND closed_at IS NULL AND status IN ('FOLLOWING','FOLLOWING_REENTRY') AND (protection_status NOT IN ('VERIFIED','CLAMPED') OR protection_coverage<0.999)`},
@@ -570,6 +606,26 @@ func (s *CopyTradeStore) initExecutionIntentTable() error {
 	if _, err = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_copy_order_attempt_intent ON copy_trade_execution_order_attempts(intent_id,attempt_no)`); err != nil {
 		return err
 	}
+	if _, err = s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS copy_trade_execution_fill_commits (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			intent_id INTEGER NOT NULL,
+			fill_key TEXT NOT NULL,
+			filled_quantity REAL NOT NULL,
+			filled_notional REAL NOT NULL,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(intent_id,fill_key),
+			FOREIGN KEY(intent_id) REFERENCES copy_trade_execution_intents(id) ON DELETE CASCADE
+		)
+	`); err != nil {
+		return err
+	}
+	if _, err = s.db.Exec(`UPDATE copy_trade_execution_order_attempts
+		SET status='TERMINAL_NO_FILL',terminal_at=COALESCE(terminal_at,updated_at,CURRENT_TIMESTAMP),updated_at=CURRENT_TIMESTAMP
+		WHERE status='UNKNOWN' AND COALESCE(filled_quantity,0)=0
+		  AND UPPER(COALESCE(exchange_state,'')) IN ('REJECTED','CANCELED','CANCELLED','EXPIRED')`); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -766,7 +822,7 @@ func (s *CopyTradeStore) PrepareExecutionOrderAttemptWithQuantities(intentID int
 	if quantizedQuantity == 0 && !closeAll {
 		return nil, fmt.Errorf("zero quantity execution order attempt is only valid for close actions")
 	}
-	if intentStatus != ExecutionIntentReserved && intentStatus != ExecutionIntentSubmitted {
+	if intentStatus != ExecutionIntentReserved && intentStatus != ExecutionIntentSubmitted && intentStatus != ExecutionIntentPartiallyFilled {
 		return nil, fmt.Errorf("execution intent %d cannot prepare order attempt from %s", intentID, intentStatus)
 	}
 	var attemptNo int
@@ -784,10 +840,10 @@ func (s *CopyTradeStore) PrepareExecutionOrderAttemptWithQuantities(intentID int
 	}
 	res, err := tx.Exec(`UPDATE copy_trade_execution_intents SET
 		status='SUBMITTED',
-		requested_quantity=CASE WHEN ?>0 THEN ? ELSE requested_quantity END,
-		quantized_quantity=CASE WHEN ?>0 THEN ? ELSE quantized_quantity END,
+		requested_quantity=CASE WHEN requested_quantity<=0 AND ?>0 THEN ? ELSE requested_quantity END,
+		quantized_quantity=CASE WHEN quantized_quantity<=0 AND ?>0 THEN ? ELSE quantized_quantity END,
 		submitted_at=COALESCE(submitted_at,CURRENT_TIMESTAMP),updated_at=CURRENT_TIMESTAMP
-		WHERE id=? AND status IN ('RESERVED','SUBMITTED')`,
+		WHERE id=? AND status IN ('RESERVED','SUBMITTED','PARTIALLY_FILLED')`,
 		requestedQuantity, requestedQuantity, quantizedQuantity, quantizedQuantity, intentID)
 	if err != nil {
 		return nil, err
@@ -821,7 +877,7 @@ func (s *CopyTradeStore) CompleteExecutionOrderAttempt(intentID int64, clientOrd
 		filled_quantity=CASE WHEN ?>0 THEN ? ELSE filled_quantity END,last_error=?,
 		submitted_at=CASE WHEN ? IN ('SUBMITTED','FILLED') THEN COALESCE(submitted_at,CURRENT_TIMESTAMP) ELSE submitted_at END,
 		filled_at=CASE WHEN ?='FILLED' THEN COALESCE(filled_at,CURRENT_TIMESTAMP) ELSE filled_at END,
-		terminal_at=CASE WHEN ? IN ('FILLED','FAILED') THEN COALESCE(terminal_at,CURRENT_TIMESTAMP) ELSE terminal_at END,
+		terminal_at=CASE WHEN ? IN ('FILLED','FAILED','TERMINAL_NO_FILL') THEN COALESCE(terminal_at,CURRENT_TIMESTAMP) ELSE terminal_at END,
 		updated_at=CURRENT_TIMESTAMP WHERE intent_id=? AND client_order_id=?`,
 		status, exchangeOrderID, exchangeOrderID, exchangeState, exchangeState, filledQuantity, filledQuantity, lastError,
 		status, status, status, intentID, clientOrderID)
@@ -954,7 +1010,7 @@ func (s *CopyTradeStore) UpdateExecutionIntent(id int64, status, reasonCode, las
 		terminal_at=CASE WHEN ? IN ('SKIPPED','FAILED') THEN COALESCE(terminal_at,CURRENT_TIMESTAMP) ELSE terminal_at END,
 		updated_at=CURRENT_TIMESTAMP WHERE id=? AND (`+validExecutionIntentTransitionSQL()+`)`, status, reasonCode, reasonCode, lastError,
 		exchangeOrderID, exchangeOrderID, requestedQty, requestedQty, quantizedQty, quantizedQty, filledQty, filledQty,
-		status, status, status, status, id, status, status, status, status, status)
+		status, status, status, status, id, status, status, status, status, status, status)
 	if err != nil {
 		return err
 	}
@@ -1086,9 +1142,10 @@ func (s *CopyTradeStore) UpdateExecutionIntentQuantityConstraints(id int64, requ
 
 func validExecutionIntentTransitionSQL() string {
 	return `(status=? OR
-		(status='RESERVED' AND ? IN ('SUBMITTED','FILLED','SKIPPED','FAILED','RECONCILING')) OR
-		(status='SUBMITTED' AND ? IN ('FILLED','SKIPPED','FAILED','RECONCILING')) OR
-		(status='RECONCILING' AND ? IN ('FILLED','SKIPPED','FAILED','RECONCILING')) OR
+		(status='RESERVED' AND ? IN ('SUBMITTED','FILLED','PARTIALLY_FILLED','SKIPPED','FAILED','RECONCILING')) OR
+		(status='SUBMITTED' AND ? IN ('FILLED','PARTIALLY_FILLED','SKIPPED','FAILED','RECONCILING')) OR
+		(status='RECONCILING' AND ? IN ('FILLED','PARTIALLY_FILLED','SKIPPED','FAILED','RECONCILING')) OR
+		(status='PARTIALLY_FILLED' AND ? IN ('SUBMITTED','FILLED','PARTIALLY_FILLED','FAILED','RECONCILING')) OR
 		(status='FILLED' AND ? IN ('PROTECTED','FAILED','RECONCILING')))`
 }
 
@@ -1116,7 +1173,7 @@ func (s *CopyTradeStore) ListUnfinishedExecutionIntents(traderID string) ([]*Cop
 		COALESCE(filled_quantity,0),COALESCE(client_order_id,''),COALESCE(exchange_order_id,''),status,
 		COALESCE(exchange_state,''),COALESCE(reason_code,''),COALESCE(last_error,''),COALESCE(failure_counted,0),created_at,updated_at,
 		submitted_at,filled_at,protected_at,terminal_at
-		FROM copy_trade_execution_intents WHERE trader_id=? AND status IN ('RESERVED','SUBMITTED','RECONCILING') ORDER BY id`, traderID)
+		FROM copy_trade_execution_intents WHERE trader_id=? AND status IN ('RESERVED','SUBMITTED','RECONCILING','PARTIALLY_FILLED') ORDER BY id`, traderID)
 	if err != nil {
 		return nil, err
 	}

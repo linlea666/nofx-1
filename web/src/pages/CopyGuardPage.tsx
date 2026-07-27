@@ -1766,7 +1766,7 @@ function AICandidatesPanel() {
                 <span>
                   上次决策：{candidate.last_decision || '尚未分析'}{' '}
                   {candidate.confidence > 0
-                    ? `${(candidate.confidence * 100).toFixed(0)}%`
+                    ? `（对 ${candidate.last_decision} 结论的置信度 ${(candidate.confidence * 100).toFixed(0)}%）`
                     : ''}
                 </span>
                 <span>
@@ -1798,6 +1798,26 @@ function AICandidatesPanel() {
                     0
                   )}
                   % · 最短间隔 {candidate.ai_min_review_seconds || 300} 秒
+                </span>
+                <span>
+                  常规复审：
+                  {candidate.regular_review_at
+                    ? new Date(candidate.regular_review_at).toLocaleString()
+                    : '—'}
+                  {' · '}事件复审：
+                  {candidate.event_review_at
+                    ? new Date(candidate.event_review_at).toLocaleString()
+                    : '—'}
+                </span>
+                <span>
+                  ENTER 租约：
+                  {candidate.decision_expires_at
+                    ? new Date(candidate.decision_expires_at).toLocaleString()
+                    : '—'}
+                  {' · '}预算封锁：
+                  {candidate.budget_blocked_until
+                    ? new Date(candidate.budget_blocked_until).toLocaleString()
+                    : '—'}
                 </span>
               </div>
               {(candidate.pending_trigger || candidate.last_error) && (

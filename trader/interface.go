@@ -60,6 +60,7 @@ type ClosedPnLRecord struct {
 	OrderID            string    // Close order ID
 	CloseType          string    // "manual", "stop_loss", "take_profit", "liquidation", "unknown"
 	ExchangeID         string    // Exchange-specific position ID
+	Fills              []ClosedPnLRecord
 }
 
 // TradeRecord represents a single trade/fill from exchange

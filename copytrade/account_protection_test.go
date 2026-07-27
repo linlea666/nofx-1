@@ -6,7 +6,7 @@ import (
 )
 
 func TestAccountProtectionUsesStructureThenHardLossCap(t *testing.T) {
-	cfg := &CopyConfig{RiskSlippageBufferBPS: 0, RiskRoundTripFeeBPS: 0}
+	cfg := &CopyConfig{RiskSlippageBufferBPS: 0, RiskRoundTripFeeBPS: 0, RiskStopPriority: "account_cap"}
 	got, err := ComputeAccountProtectionDistance(
 		cfg, SideLong, 100, 1000, 100,
 		2, 4, 90, 0.10,
@@ -33,6 +33,29 @@ func TestAccountProtectionKeepsDistantStructureWithinCap(t *testing.T) {
 	}
 	if got.GovernedBy != "structure" || math.Abs(got.Distance-10.5) > 1e-9 {
 		t.Fatalf("structure should remain when inside account cap: %+v", got)
+	}
+}
+
+func TestAccountProtectionVolatilityFirstWarnsWithoutCompressingATR(t *testing.T) {
+	cfg := &CopyConfig{
+		RiskStopPriority:  "volatility_first",
+		RiskATRMultiplier: 2,
+	}
+	got, err := ComputeAccountProtectionDistance(
+		cfg, SideShort, 1974.41, 2918, 100,
+		11, 22, 0, 0.10,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if math.Abs(got.Distance-22) > 1e-9 || got.GovernedBy != "atr" {
+		t.Fatalf("volatility-first must preserve 2 ATR distance: %+v", got)
+	}
+	if !got.AccountRiskThresholdExceeded || got.NoiseConflict {
+		t.Fatalf("10%% must be a warning, not a noise-producing cap: %+v", got)
+	}
+	if got.DistanceATRRatio < 1.99 {
+		t.Fatalf("expected roughly 2 ATR, got %.4f", got.DistanceATRRatio)
 	}
 }
 

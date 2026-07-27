@@ -23,7 +23,8 @@ type RiskDistanceResult struct {
 	// ATR 走 fallback 时该比值为等效近似；原始 ATR 由 atrDistance/multiplier 反推。
 	DistanceATRRatio float64
 	// NoiseConflict: 最终生效的硬 cap 比 ATR 基线更紧（止损落在噪音区内）
-	NoiseConflict bool
+	NoiseConflict                bool
+	AccountRiskThresholdExceeded bool
 }
 
 type ProtectionPlan struct {
@@ -79,16 +80,18 @@ func ComputeAccountProtectionDistance(c *CopyConfig, side SideType, entryPrice, 
 	if frictionRate < 0 {
 		frictionRate = 0
 	}
-	priceRiskBudget := accountEquity*maxAccountLossPct - positionNotional*frictionRate
-	if priceRiskBudget <= 0 {
-		return RiskDistanceResult{}, fmt.Errorf("trading friction exhausts account position loss cap")
-	}
-	accountCapDistance := priceRiskBudget / positionNotional * entryPrice
 	noiseConflict := false
-	if accountCapDistance < distance {
-		distance = accountCapDistance
-		governedBy = "account_cap"
-		noiseConflict = true
+	if c.RiskStopPriority == "account_cap" {
+		priceRiskBudget := accountEquity*maxAccountLossPct - positionNotional*frictionRate
+		if priceRiskBudget <= 0 {
+			return RiskDistanceResult{}, fmt.Errorf("trading friction exhausts account position loss cap")
+		}
+		accountCapDistance := priceRiskBudget / positionNotional * entryPrice
+		if accountCapDistance < distance {
+			distance = accountCapDistance
+			governedBy = "account_cap"
+			noiseConflict = true
+		}
 	}
 	if distance <= 0 || distance >= entryPrice {
 		return RiskDistanceResult{}, fmt.Errorf("account protection distance %.8f is invalid", distance)
@@ -96,11 +99,12 @@ func ComputeAccountProtectionDistance(c *CopyConfig, side SideType, entryPrice, 
 
 	expected := positionNotional * (distance/entryPrice + frictionRate)
 	result := RiskDistanceResult{
-		Distance:        distance,
-		ExpectedLossUSD: expected,
-		ExpectedLossPct: expected / accountEquity,
-		GovernedBy:      governedBy,
-		NoiseConflict:   noiseConflict,
+		Distance:                     distance,
+		ExpectedLossUSD:              expected,
+		ExpectedLossPct:              expected / accountEquity,
+		GovernedBy:                   governedBy,
+		NoiseConflict:                noiseConflict,
+		AccountRiskThresholdExceeded: expected/accountEquity > maxAccountLossPct+1e-12,
 	}
 	if atr > 0 {
 		result.DistanceATRRatio = distance / atr
@@ -378,6 +382,9 @@ func ValidateRiskPolicyV4(c *CopyConfig) error {
 	if c.RiskStopMode != "volatility_priority" && c.RiskStopMode != "account_hard_limit" {
 		return fmt.Errorf("invalid risk_stop_mode %q", c.RiskStopMode)
 	}
+	if c.RiskStopPriority != "volatility_first" && c.RiskStopPriority != "account_cap" {
+		return fmt.Errorf("risk_stop_priority must be volatility_first or account_cap")
+	}
 	if c.RiskATRPeriod < 5 || c.RiskATRPeriod > 100 {
 		return fmt.Errorf("risk_atr_period must be 5..100")
 	}
@@ -484,9 +491,18 @@ func invalidRange(v, min, max float64) bool {
 }
 
 func ValidateStoredRiskPolicy(c *store.CopyTradeConfig) error {
-	if c == nil || c.RiskPolicyVersion < 4 {
+	if c == nil {
 		return nil
 	}
 	c.FillRiskDefaults()
-	return ValidateRiskPolicyV4(&CopyConfig{ProviderType: ProviderType(c.ProviderType), RiskPolicyVersion: c.RiskPolicyVersion, RiskStopMode: c.RiskStopMode, RiskATRPeriod: c.RiskATRPeriod, RiskATRCacheMaxAgeMinutes: c.RiskATRCacheMaxAgeMinutes, RiskATRMultiplier: c.RiskATRMultiplier, RiskATRFallbackPct: c.RiskATRFallbackPct, RiskTriggerPriceType: c.RiskTriggerPriceType, RiskAccountPct: c.RiskAccountPct, RiskCycleLossBudgetPct: c.RiskCycleLossBudgetPct, RiskPortfolioLossBudgetPct: c.RiskPortfolioLossBudgetPct, RiskRoundTripFeeBPS: c.RiskRoundTripFeeBPS, RiskSlippageBufferBPS: c.RiskSlippageBufferBPS, RiskLiquidationBufferATR: c.RiskLiquidationBufferATR, RiskMaxReentries: c.RiskMaxReentries, RiskReentryRatio: c.RiskReentryRatio, RiskReentryDecisionMode: c.RiskReentryDecisionMode, RiskReentryMinNotional: c.RiskReentryMinNotional, RiskAIConfidenceThreshold: c.RiskAIConfidenceThreshold, RiskAIMinReviewSeconds: c.RiskAIMinReviewSeconds, RiskAIDailyCallLimit: c.RiskAIDailyCallLimit, RiskAILifecycleCallLimit: c.RiskAILifecycleCallLimit, RiskNotificationLevel: c.RiskNotificationLevel, RiskReentryBandATR: c.RiskReentryBandATR, RiskReentryCooldownSeconds: c.RiskReentryCooldownSeconds, RiskReentryMaxChaseATR: c.RiskReentryMaxChaseATR, RiskReentryMaxATRExpansion: c.RiskReentryMaxATRExpansion, RiskWatchTimeoutMinutes: c.RiskWatchTimeoutMinutes, RiskAddonBudgetPct: c.RiskAddonBudgetPct, RiskReentryMinRecoveryATR: c.RiskReentryMinRecoveryATR, RiskReentryCooldownEscalation: c.RiskReentryCooldownEscalation, RiskReentryRecoveryEscalation: c.RiskReentryRecoveryEscalation, RiskUnprotectableDisposition: c.RiskUnprotectableDisposition, RiskUnprotectableAction: c.RiskUnprotectableAction})
+	if c.CopyCatchupWindowSeconds < 1 || c.CopyCatchupWindowSeconds > 600 {
+		return fmt.Errorf("copy_catchup_window_seconds must be 1..600")
+	}
+	if invalidRange(c.CopyCatchupMaxAdverseBPS, 0.1, 500) {
+		return fmt.Errorf("copy_catchup_max_adverse_bps must be 0.1..500")
+	}
+	if c.RiskPolicyVersion < 4 {
+		return nil
+	}
+	return ValidateRiskPolicyV4(&CopyConfig{ProviderType: ProviderType(c.ProviderType), RiskPolicyVersion: c.RiskPolicyVersion, RiskStopMode: c.RiskStopMode, RiskStopPriority: c.RiskStopPriority, RiskATRPeriod: c.RiskATRPeriod, RiskATRCacheMaxAgeMinutes: c.RiskATRCacheMaxAgeMinutes, RiskATRMultiplier: c.RiskATRMultiplier, RiskATRFallbackPct: c.RiskATRFallbackPct, RiskTriggerPriceType: c.RiskTriggerPriceType, RiskAccountPct: c.RiskAccountPct, RiskCycleLossBudgetPct: c.RiskCycleLossBudgetPct, RiskPortfolioLossBudgetPct: c.RiskPortfolioLossBudgetPct, RiskRoundTripFeeBPS: c.RiskRoundTripFeeBPS, RiskSlippageBufferBPS: c.RiskSlippageBufferBPS, RiskLiquidationBufferATR: c.RiskLiquidationBufferATR, RiskMaxReentries: c.RiskMaxReentries, RiskReentryRatio: c.RiskReentryRatio, RiskReentryDecisionMode: c.RiskReentryDecisionMode, RiskReentryMinNotional: c.RiskReentryMinNotional, RiskAIConfidenceThreshold: c.RiskAIConfidenceThreshold, RiskAIMinReviewSeconds: c.RiskAIMinReviewSeconds, RiskAIDailyCallLimit: c.RiskAIDailyCallLimit, RiskAILifecycleCallLimit: c.RiskAILifecycleCallLimit, RiskNotificationLevel: c.RiskNotificationLevel, RiskReentryBandATR: c.RiskReentryBandATR, RiskReentryCooldownSeconds: c.RiskReentryCooldownSeconds, RiskReentryMaxChaseATR: c.RiskReentryMaxChaseATR, RiskReentryMaxATRExpansion: c.RiskReentryMaxATRExpansion, RiskWatchTimeoutMinutes: c.RiskWatchTimeoutMinutes, RiskAddonBudgetPct: c.RiskAddonBudgetPct, RiskReentryMinRecoveryATR: c.RiskReentryMinRecoveryATR, RiskReentryCooldownEscalation: c.RiskReentryCooldownEscalation, RiskReentryRecoveryEscalation: c.RiskReentryRecoveryEscalation, RiskUnprotectableDisposition: c.RiskUnprotectableDisposition, RiskUnprotectableAction: c.RiskUnprotectableAction})
 }

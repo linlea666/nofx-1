@@ -512,6 +512,11 @@ func (a *Advisor) finishCandidateAnalysis(analysis *store.ReentryAIAnalysis, cfg
 	}
 	if err := copytrade.ExecuteAIReentryForTrader(c.TraderID, c.ID, analysis.ID); err != nil {
 		logger.Warnf("[ReentryAdvisor] AI 重入预检拒绝 candidate=%d: %v", c.ID, err)
+		if copytrade.ReasonCodeOf(err) == "PRICE_OUT_OF_RANGE" {
+			a.updateCandidateCycleStatus(c, store.CopyGuardAIWaiting)
+			a.recordCandidateEvent(c, "ENTER_LEASE_WAITING_PRICE", c.TriggerPrice, 0, map[string]interface{}{"analysis_id": analysis.ID, "reason_code": "PRICE_OUT_OF_RANGE", "error": err.Error(), "ttl_seconds": d.TTLSeconds})
+			return nil
+		}
 		if errors.Is(err, copytrade.ErrAIReentryAlreadyReserved) {
 			a.recordCandidateEvent(c, "REENTRY_RECONCILIATION_PENDING", c.TriggerPrice, 0, map[string]interface{}{"analysis_id": analysis.ID, "reason_code": "INTENT_ALREADY_RESERVED", "error": err.Error()})
 			return nil

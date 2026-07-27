@@ -203,7 +203,7 @@ func (s *Server) getDashboardSummary() (*DashboardSummary, error) {
 			COALESCE(SUM(fee), 0),
 			COUNT(*)
 		FROM trader_positions
-		WHERE status = 'CLOSED'
+		WHERE status = 'CLOSED' AND COALESCE(accounting_quality,'VERIFIED')='VERIFIED'
 	`).Scan(&summary.TotalPnL, &summary.TotalFees, &summary.TotalTrades)
 	if err != nil && err != sql.ErrNoRows {
 		logger.Warnf("Dashboard: 查询全局统计失败: %v", err)
@@ -213,7 +213,7 @@ func (s *Server) getDashboardSummary() (*DashboardSummary, error) {
 	var winTrades int
 	err = db.QueryRow(`
 		SELECT COUNT(*) FROM trader_positions
-		WHERE status = 'CLOSED' AND realized_pnl > 0
+		WHERE status = 'CLOSED' AND COALESCE(accounting_quality,'VERIFIED')='VERIFIED' AND realized_pnl > 0
 	`).Scan(&winTrades)
 	if err == nil && summary.TotalTrades > 0 {
 		summary.AvgWinRate = float64(winTrades) / float64(summary.TotalTrades) * 100
@@ -231,7 +231,7 @@ func (s *Server) getDashboardSummary() (*DashboardSummary, error) {
 	todayStart := getTimeRangeStart("today")
 	err = db.QueryRow(`
 		SELECT COALESCE(SUM(realized_pnl), 0) FROM trader_positions
-		WHERE status = 'CLOSED' AND exit_time >= ?
+		WHERE status = 'CLOSED' AND COALESCE(accounting_quality,'VERIFIED')='VERIFIED' AND exit_time >= ?
 	`, todayStart.Format("2006-01-02 15:04:05")).Scan(&summary.TodayPnL)
 	if err != nil && err != sql.ErrNoRows {
 		logger.Warnf("Dashboard: 查询今日盈亏失败: %v", err)
@@ -241,7 +241,7 @@ func (s *Server) getDashboardSummary() (*DashboardSummary, error) {
 	weekStart := getTimeRangeStart("week")
 	err = db.QueryRow(`
 		SELECT COALESCE(SUM(realized_pnl), 0) FROM trader_positions
-		WHERE status = 'CLOSED' AND exit_time >= ?
+		WHERE status = 'CLOSED' AND COALESCE(accounting_quality,'VERIFIED')='VERIFIED' AND exit_time >= ?
 	`, weekStart.Format("2006-01-02 15:04:05")).Scan(&summary.WeekPnL)
 	if err != nil && err != sql.ErrNoRows {
 		logger.Warnf("Dashboard: 查询本周盈亏失败: %v", err)
@@ -251,7 +251,7 @@ func (s *Server) getDashboardSummary() (*DashboardSummary, error) {
 	monthStart := getTimeRangeStart("month")
 	err = db.QueryRow(`
 		SELECT COALESCE(SUM(realized_pnl), 0) FROM trader_positions
-		WHERE status = 'CLOSED' AND exit_time >= ?
+		WHERE status = 'CLOSED' AND COALESCE(accounting_quality,'VERIFIED')='VERIFIED' AND exit_time >= ?
 	`, monthStart.Format("2006-01-02 15:04:05")).Scan(&summary.MonthPnL)
 	if err != nil && err != sql.ErrNoRows {
 		logger.Warnf("Dashboard: 查询本月盈亏失败: %v", err)
@@ -324,7 +324,7 @@ func (s *Server) getTraderDashboardStats(traderID string) (*TraderDashboardStats
 			COALESCE(SUM(CASE WHEN realized_pnl > 0 THEN realized_pnl ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN realized_pnl < 0 THEN ABS(realized_pnl) ELSE 0 END), 0)
 		FROM trader_positions
-		WHERE trader_id = ? AND status = 'CLOSED'
+		WHERE trader_id = ? AND status = 'CLOSED' AND COALESCE(accounting_quality,'VERIFIED')='VERIFIED'
 	`, traderID).Scan(
 		&stats.TotalPnL, &stats.TotalFees, &stats.TotalTrades,
 		&stats.WinTrades, &stats.LossTrades, &totalWin, &totalLoss,
@@ -346,7 +346,7 @@ func (s *Server) getTraderDashboardStats(traderID string) (*TraderDashboardStats
 	err = db.QueryRow(`
 		SELECT COALESCE(SUM(realized_pnl), 0), COUNT(*)
 		FROM trader_positions
-		WHERE trader_id = ? AND status = 'CLOSED' AND exit_time >= ?
+		WHERE trader_id = ? AND status = 'CLOSED' AND COALESCE(accounting_quality,'VERIFIED')='VERIFIED' AND exit_time >= ?
 	`, traderID, todayStart.Format("2006-01-02 15:04:05")).Scan(&stats.TodayPnL, &stats.TodayTrades)
 	if err != nil && err != sql.ErrNoRows {
 		logger.Warnf("Dashboard: 查询今日统计失败: %v", err)
@@ -357,7 +357,7 @@ func (s *Server) getTraderDashboardStats(traderID string) (*TraderDashboardStats
 	err = db.QueryRow(`
 		SELECT COALESCE(SUM(realized_pnl), 0), COUNT(*)
 		FROM trader_positions
-		WHERE trader_id = ? AND status = 'CLOSED' AND exit_time >= ?
+		WHERE trader_id = ? AND status = 'CLOSED' AND COALESCE(accounting_quality,'VERIFIED')='VERIFIED' AND exit_time >= ?
 	`, traderID, weekStart.Format("2006-01-02 15:04:05")).Scan(&stats.WeekPnL, &stats.WeekTrades)
 	if err != nil && err != sql.ErrNoRows {
 		logger.Warnf("Dashboard: 查询本周统计失败: %v", err)
@@ -368,7 +368,7 @@ func (s *Server) getTraderDashboardStats(traderID string) (*TraderDashboardStats
 	err = db.QueryRow(`
 		SELECT COALESCE(SUM(realized_pnl), 0), COUNT(*)
 		FROM trader_positions
-		WHERE trader_id = ? AND status = 'CLOSED' AND exit_time >= ?
+		WHERE trader_id = ? AND status = 'CLOSED' AND COALESCE(accounting_quality,'VERIFIED')='VERIFIED' AND exit_time >= ?
 	`, traderID, monthStart.Format("2006-01-02 15:04:05")).Scan(&stats.MonthPnL, &stats.MonthTrades)
 	if err != nil && err != sql.ErrNoRows {
 		logger.Warnf("Dashboard: 查询本月统计失败: %v", err)
@@ -408,7 +408,7 @@ func (s *Server) calculateMaxDrawdown(traderID string) float64 {
 
 	rows, err := db.Query(`
 		SELECT realized_pnl FROM trader_positions
-		WHERE trader_id = ? AND status = 'CLOSED'
+		WHERE trader_id = ? AND status = 'CLOSED' AND COALESCE(accounting_quality,'VERIFIED')='VERIFIED'
 		ORDER BY exit_time ASC
 	`, traderID)
 	if err != nil {
@@ -614,7 +614,7 @@ func (s *Server) calculateRiskAlerts() []RiskAlert {
 		recentPnLs := []float64{}
 		pnlRows, err := db.Query(`
 			SELECT realized_pnl FROM trader_positions 
-			WHERE trader_id = ? AND status = 'CLOSED'
+			WHERE trader_id = ? AND status = 'CLOSED' AND COALESCE(accounting_quality,'VERIFIED')='VERIFIED'
 			ORDER BY exit_time DESC LIMIT 5
 		`, traderID)
 		if err == nil {
@@ -657,7 +657,7 @@ func (s *Server) calculateRiskAlerts() []RiskAlert {
 		var totalTrades, winTrades int
 		db.QueryRow(`
 			SELECT COUNT(*), COALESCE(SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END), 0)
-			FROM trader_positions WHERE trader_id = ? AND status = 'CLOSED'
+			FROM trader_positions WHERE trader_id = ? AND status = 'CLOSED' AND COALESCE(accounting_quality,'VERIFIED')='VERIFIED'
 		`, traderID).Scan(&totalTrades, &winTrades)
 
 		if totalTrades >= 10 {
@@ -728,7 +728,7 @@ func (s *Server) getPnLTrend(traderID string, days int) ([]PnLTrendPoint, error)
 			COALESCE(SUM(realized_pnl), 0) as daily_pnl,
 			COUNT(*) as trades
 		FROM trader_positions
-		WHERE status = 'CLOSED'
+		WHERE status = 'CLOSED' AND COALESCE(accounting_quality,'VERIFIED')='VERIFIED'
 	`
 	args := []interface{}{}
 

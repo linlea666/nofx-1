@@ -655,8 +655,8 @@ func TestBinanceCalculateUsesFollowerMarginBalance(t *testing.T) {
 	}
 }
 
-// TestBinanceCalculateFallbackOnDetailListFailure 验证：detail-list 失败时降级到
-// 旧逻辑（用领航员 marginBalance 当分母），保留当前行为，不会崩。
+// TestBinanceCalculateFallbackOnDetailListFailure verifies that a missing
+// authoritative scale fails closed instead of mixing leader and mirror units.
 func TestBinanceCalculateFallbackOnDetailListFailure(t *testing.T) {
 	bp := newBinanceProviderWithTransport(func(req *http.Request) (*http.Response, error) {
 		return &http.Response{
@@ -687,10 +687,8 @@ func TestBinanceCalculateFallbackOnDetailListFailure(t *testing.T) {
 
 	copySize, _ := e.calculateCopySizeByPositionChange(signal, match)
 
-	// 降级路径只决定比例金额；交易所最小量由执行边界处理。
-	expected := 341.16 / 3493.16 * 100 * 1.2
-	if math.Abs(copySize-expected) > 1e-9 {
-		t.Fatalf("expected proportional fallback %.8f USDT, got %.8f", expected, copySize)
+	if copySize != 0 {
+		t.Fatalf("expected fail-closed zero target, got %.8f", copySize)
 	}
 }
 
@@ -966,6 +964,21 @@ func TestOKXCalculateNotAffectedByBinanceLogic(t *testing.T) {
 	// 期望走 OKX 老逻辑：100 × 1.0 × 200/1000 = 20
 	if copySize < 18 || copySize > 22 {
 		t.Fatalf("OKX copySize=%.2f want ~20 (老逻辑未被影响)", copySize)
+	}
+}
+
+func TestOKXProportionalSizingUsesTotalEquityNotAvailableBalance(t *testing.T) {
+	e, _ := newTestCopyTradeEngine(t, ProviderOKX)
+	e.getFollowerBalance = func() float64 { return 20 }
+	e.getFollowerEquity = func() float64 { return 100 }
+	signal := &TradeSignal{
+		ProviderType: ProviderOKX,
+		Fill:         &Fill{Symbol: "ETHUSDT", PositionSide: SideLong, Price: 2000, Value: 200},
+		LeaderEquity: 1000,
+	}
+	copySize, _ := e.calculateCopySizeByPositionChange(signal, &SignalMatchResult{Action: ActionOpen})
+	if math.Abs(copySize-20) > 1e-9 {
+		t.Fatalf("target must use total equity 100, not available 20: got %.8f", copySize)
 	}
 }
 

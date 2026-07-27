@@ -14,11 +14,11 @@ import (
 type PositionSyncManager struct {
 	store                *store.Store
 	interval             time.Duration
-	historySyncInterval  time.Duration        // Interval for full history sync
+	historySyncInterval  time.Duration // Interval for full history sync
 	stopCh               chan struct{}
 	wg                   sync.WaitGroup
-	traderCache          map[string]Trader                    // trader_id -> Trader instance cache
-	configCache          map[string]*store.TraderFullConfig   // trader_id -> config cache
+	traderCache          map[string]Trader                  // trader_id -> Trader instance cache
+	configCache          map[string]*store.TraderFullConfig // trader_id -> config cache
 	cacheMutex           sync.RWMutex
 	lastHistorySync      map[string]time.Time // trader_id -> last history sync time
 	lastHistorySyncMutex sync.RWMutex
@@ -128,7 +128,7 @@ func (m *PositionSyncManager) syncTraderPositions(traderID string, localPosition
 	exchangeID := ""
 	exchangeType := ""
 	if config != nil {
-		exchangeID = config.Exchange.ID           // UUID for database association
+		exchangeID = config.Exchange.ID             // UUID for database association
 		exchangeType = config.Exchange.ExchangeType // "binance", "bybit" etc for trader creation
 	}
 
@@ -189,7 +189,7 @@ func (m *PositionSyncManager) closeLocalPosition(pos *store.TraderPosition, trad
 	closedPnLRecord := m.findClosedPnLRecord(trader, pos)
 
 	var exitPrice, realizedPnL, fee float64
-	var closeReason, exitOrderID string
+	var closeReason string
 
 	if closedPnLRecord != nil {
 		// Use accurate data from exchange
@@ -197,7 +197,6 @@ func (m *PositionSyncManager) closeLocalPosition(pos *store.TraderPosition, trad
 		realizedPnL = closedPnLRecord.RealizedPnL
 		fee = closedPnLRecord.Fee
 		closeReason = closedPnLRecord.CloseType
-		exitOrderID = closedPnLRecord.OrderID
 		logger.Infof("📊 Found accurate closure data from exchange for %s %s", pos.Symbol, pos.Side)
 	} else {
 		// Fallback: use market price and calculate PnL
@@ -214,19 +213,37 @@ func (m *PositionSyncManager) closeLocalPosition(pos *store.TraderPosition, trad
 		}
 		closeReason = reason
 		fee = 0
-		exitOrderID = ""
 		logger.Infof("⚠️  Using market price for closure (no exchange data): %s %s", pos.Symbol, pos.Side)
 	}
 
-	// Update database
-	err := m.store.Position().ClosePosition(
-		pos.ID,
-		exitPrice,
-		exitOrderID,
-		realizedPnL,
-		fee,
-		closeReason,
-	)
+	var err error
+	if closedPnLRecord != nil {
+		records := closedPnLRecord.Fills
+		if len(records) == 0 {
+			records = []ClosedPnLRecord{*closedPnLRecord}
+		}
+		fills := make([]store.PositionCloseFill, 0, len(records))
+		for _, record := range records {
+			tradeID := record.ExchangeID
+			if tradeID == "" {
+				tradeID = record.OrderID
+			}
+			if tradeID == "" {
+				tradeID = fmt.Sprintf("%s|%s|%d|%.12g|%.12g", record.Symbol, record.Side, record.ExitTime.UnixNano(), record.Quantity, record.ExitPrice)
+			}
+			fills = append(fills, store.PositionCloseFill{
+				TradeID: tradeID, Symbol: record.Symbol, Side: record.Side,
+				Quantity: record.Quantity, ExitPrice: record.ExitPrice,
+				RealizedPnL: record.RealizedPnL, Fee: record.Fee,
+			})
+		}
+		_, err = m.store.Position().ClosePositionWithAllocations(pos.ID, pos.ExchangeID, fills, exitPrice, closeReason)
+	} else {
+		// A mark-price estimate is useful for diagnostics but is not a real
+		// settlement record. Keep the row unscorable rather than polluting
+		// trusted realized PnL.
+		err = m.store.Position().ClosePositionUnscorable(pos.ID, exitPrice, closeReason)
+	}
 
 	if err != nil {
 		logger.Infof("⚠️  Failed to update position status: %v", err)
@@ -276,6 +293,7 @@ func (m *PositionSyncManager) findClosedPnLFromBinanceTrades(trader *FuturesTrad
 	var latestExitTime time.Time
 	var latestTradeID string
 	matchCount := 0
+	var matchedFills []ClosedPnLRecord
 
 	posSide := strings.ToLower(pos.Side)
 
@@ -315,6 +333,16 @@ func (m *PositionSyncManager) findClosedPnLFromBinanceTrades(trader *FuturesTrad
 		totalFee += trade.Fee
 		weightedExitPrice += trade.Price * trade.Quantity
 		matchCount++
+		tradeID := trade.TradeID
+		if tradeID == "" {
+			tradeID = fmt.Sprintf("%s|%s|%d|%.12g|%.12g", trade.OrderID, trade.Symbol, trade.Time.UnixNano(), trade.Quantity, trade.Price)
+		}
+		matchedFills = append(matchedFills, ClosedPnLRecord{
+			Symbol: trade.Symbol, Side: posSide, ExitPrice: trade.Price,
+			Quantity: trade.Quantity, RealizedPnL: trade.RealizedPnL,
+			Fee: trade.Fee, ExitTime: trade.Time, OrderID: trade.OrderID,
+			ExchangeID: tradeID,
+		})
 
 		if trade.Time.After(latestExitTime) {
 			latestExitTime = trade.Time
@@ -345,6 +373,7 @@ func (m *PositionSyncManager) findClosedPnLFromBinanceTrades(trader *FuturesTrad
 		OrderID:     latestTradeID,
 		ExchangeID:  latestTradeID,
 		CloseType:   "unknown",
+		Fills:       matchedFills,
 	}
 }
 
@@ -367,6 +396,9 @@ func (m *PositionSyncManager) aggregateClosedRecords(records []ClosedPnLRecord, 
 		if recordSide != posSide {
 			continue
 		}
+		if !record.ExitTime.IsZero() && record.ExitTime.Before(pos.EntryTime) {
+			continue
+		}
 
 		matchingRecords = append(matchingRecords, *record)
 	}
@@ -379,12 +411,18 @@ func (m *PositionSyncManager) aggregateClosedRecords(records []ClosedPnLRecord, 
 	var weightedExitPrice float64
 	var latestExitTime time.Time
 	var latestOrderID, latestExchangeID string
+	var matchedFills []ClosedPnLRecord
 
 	for _, rec := range matchingRecords {
 		totalQty += rec.Quantity
 		totalPnL += rec.RealizedPnL
 		totalFee += rec.Fee
 		weightedExitPrice += rec.ExitPrice * rec.Quantity
+		if len(rec.Fills) > 0 {
+			matchedFills = append(matchedFills, rec.Fills...)
+		} else {
+			matchedFills = append(matchedFills, rec)
+		}
 
 		if rec.ExitTime.After(latestExitTime) {
 			latestExitTime = rec.ExitTime
@@ -411,6 +449,7 @@ func (m *PositionSyncManager) aggregateClosedRecords(records []ClosedPnLRecord, 
 		OrderID:     latestOrderID,
 		ExchangeID:  latestExchangeID,
 		CloseType:   "unknown",
+		Fills:       matchedFills,
 	}
 }
 
@@ -617,8 +656,8 @@ func (m *PositionSyncManager) startupSync() {
 			logger.Infof("⚠️  Failed to get trader config for startup sync (ID: %s): %v", traderID, err)
 			continue
 		}
-		exchangeID := config.Exchange.ID               // UUID
-		exchangeType := config.Exchange.ExchangeType  // "binance", "bybit" etc
+		exchangeID := config.Exchange.ID             // UUID
+		exchangeType := config.Exchange.ExchangeType // "binance", "bybit" etc
 
 		// 1. Sync current open positions from exchange
 		m.syncExternalPositions(traderID, exchangeID, exchangeType, trader)

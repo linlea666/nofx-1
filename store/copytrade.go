@@ -14,15 +14,17 @@ type CopyTradeStore struct {
 
 // CopyTradeConfig 跟单配置（存储在数据库中）
 type CopyTradeConfig struct {
-	TraderID       string  `json:"trader_id"`
-	ProviderType   string  `json:"provider_type"`    // "hyperliquid" | "okx" | "binance"
-	LeaderID       string  `json:"leader_id"`        // 领航员地址/uniqueName，Binance 模式下复用为 portfolioId
-	CopyRatio      float64 `json:"copy_ratio"`       // 跟单系数 (1.0 = 100%)
-	SyncLeverage   bool    `json:"sync_leverage"`    // 同步杠杆
-	SyncMarginMode bool    `json:"sync_margin_mode"` // 同步保证金模式
-	MinTradeWarn   float64 `json:"min_trade_warn"`   // 纯运营小额预警，不参与交易所可执行性判断
-	MaxTradeWarn   float64 `json:"max_trade_warn"`   // 大额预警阈值 (0=不预警)
-	Enabled        bool    `json:"enabled"`          // 是否启用
+	TraderID                 string  `json:"trader_id"`
+	ProviderType             string  `json:"provider_type"`    // "hyperliquid" | "okx" | "binance"
+	LeaderID                 string  `json:"leader_id"`        // 领航员地址/uniqueName，Binance 模式下复用为 portfolioId
+	CopyRatio                float64 `json:"copy_ratio"`       // 跟单系数 (1.0 = 100%)
+	SyncLeverage             bool    `json:"sync_leverage"`    // 同步杠杆
+	SyncMarginMode           bool    `json:"sync_margin_mode"` // 同步保证金模式
+	MinTradeWarn             float64 `json:"min_trade_warn"`   // 纯运营小额预警，不参与交易所可执行性判断
+	MaxTradeWarn             float64 `json:"max_trade_warn"`   // 大额预警阈值 (0=不预警)
+	CopyCatchupWindowSeconds int     `json:"copy_catchup_window_seconds"`
+	CopyCatchupMaxAdverseBPS float64 `json:"copy_catchup_max_adverse_bps"`
+	Enabled                  bool    `json:"enabled"` // 是否启用
 
 	// Binance Web 私有接口凭证（仅 ProviderType=binance 时使用，明文存储）
 	BinanceP20T        string `json:"binance_p20t,omitempty"`       // 登录 cookie p20t
@@ -92,6 +94,7 @@ type CopyTradeConfig struct {
 	// 双通道取更远口径，该值不再影响计算（仅 ValidateRiskPolicyV4 做枚举校验、
 	// 序列化保持向后兼容）。固定写 "volatility_priority"。
 	RiskStopMode               string  `json:"risk_stop_mode"`
+	RiskStopPriority           string  `json:"risk_stop_priority"`
 	RiskATRPeriod              int     `json:"risk_atr_period"`
 	RiskATRCacheMaxAgeMinutes  int     `json:"risk_atr_cache_max_age_minutes"`
 	RiskATRFallbackPct         float64 `json:"risk_atr_fallback_pct"`
@@ -148,6 +151,12 @@ type CopyTradeConfig struct {
 //   - RiskAccountPct 0.02：v7 单次尝试风险预算（含费用与滑点）
 //   - RiskLeverageMaxLoss 0.20：仅当 RiskLeverageFallback 开启时的保证金封顶（默认关）
 func (c *CopyTradeConfig) FillRiskDefaults() {
+	if c.CopyCatchupWindowSeconds <= 0 {
+		c.CopyCatchupWindowSeconds = 60
+	}
+	if c.CopyCatchupMaxAdverseBPS <= 0 {
+		c.CopyCatchupMaxAdverseBPS = 20
+	}
 	if c.BinanceSourceMode == "" {
 		c.BinanceSourceMode = "copy_management"
 	}
@@ -211,6 +220,9 @@ func (c *CopyTradeConfig) FillRiskDefaults() {
 		if c.RiskStopMode == "" {
 			c.RiskStopMode = "volatility_priority"
 		}
+		if c.RiskStopPriority == "" {
+			c.RiskStopPriority = "volatility_first"
+		}
 		if c.RiskATRPeriod == 0 {
 			c.RiskATRPeriod = 14
 		}
@@ -254,6 +266,8 @@ func NewCopyGuardDefaults() *CopyTradeConfig {
 		// 纯运营小额预警默认 12 USDT；交易可执行性始终来自实时交易所
 		// minQty/minNotional/step，不读取本字段。
 		MinTradeWarn:                 12,
+		CopyCatchupWindowSeconds:     60,
+		CopyCatchupMaxAdverseBPS:     20,
 		RiskStopLossEnabled:          true,
 		RiskAccountPct:               0.02,
 		RiskATRMultiplier:            2.0,
@@ -263,6 +277,7 @@ func NewCopyGuardDefaults() *CopyTradeConfig {
 		RiskReentryDecisionMode:      "ai_guarded",
 		RiskPolicyVersion:            4,
 		RiskStopMode:                 "volatility_priority",
+		RiskStopPriority:             "volatility_first",
 		RiskATRPeriod:                14,
 		RiskATRCacheMaxAgeMinutes:    120,
 		RiskATRFallbackPct:           0.02,
@@ -334,6 +349,8 @@ func (s *CopyTradeStore) initTables() error {
 			sync_margin_mode BOOLEAN DEFAULT 1,
 			min_trade_warn REAL DEFAULT 10,
 			max_trade_warn REAL DEFAULT 0,
+			copy_catchup_window_seconds INTEGER DEFAULT 60,
+			copy_catchup_max_adverse_bps REAL DEFAULT 20,
 			enabled BOOLEAN DEFAULT 0,
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -368,6 +385,8 @@ func (s *CopyTradeStore) initTables() error {
 		{"copy_trade_configs", "binance_source_mode", "TEXT DEFAULT 'copy_management'"},
 		{"copy_trade_configs", "binance_top_trader_id", "TEXT DEFAULT ''"},
 		{"copy_trade_configs", "source_generation", "INTEGER DEFAULT 1"},
+		{"copy_trade_configs", "copy_catchup_window_seconds", "INTEGER DEFAULT 60"},
+		{"copy_trade_configs", "copy_catchup_max_adverse_bps", "REAL DEFAULT 20"},
 		{"copy_trade_configs", "risk_stop_loss_enabled", "INTEGER DEFAULT 1"},
 		{"copy_trade_configs", "risk_account_pct", "REAL DEFAULT 0"},
 		{"copy_trade_configs", "risk_atr_multiplier", "REAL DEFAULT 2.0"},
@@ -402,14 +421,16 @@ func (s *CopyTradeStore) Create(config *CopyTradeConfig) error {
 	_, err = tx.Exec(`
 		INSERT INTO copy_trade_configs 
 			(trader_id, provider_type, leader_id, copy_ratio, sync_leverage, sync_margin_mode, 
-			 min_trade_warn, max_trade_warn, enabled, binance_p20t, binance_csrf_token,
+			 min_trade_warn, max_trade_warn, copy_catchup_window_seconds, copy_catchup_max_adverse_bps,
+			 enabled, binance_p20t, binance_csrf_token,
 			 binance_source_mode, binance_top_trader_id, source_generation,
 			 risk_stop_loss_enabled, risk_account_pct, risk_atr_multiplier,
 			 risk_atr_timeframe, risk_leverage_fallback, risk_leverage_max_loss,
 			 risk_reentry_enabled, risk_reentry_ratio, risk_manual_reentry_enabled)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, config.TraderID, config.ProviderType, config.LeaderID, config.CopyRatio,
-		config.SyncLeverage, config.SyncMarginMode, config.MinTradeWarn, config.MaxTradeWarn, config.Enabled,
+		config.SyncLeverage, config.SyncMarginMode, config.MinTradeWarn, config.MaxTradeWarn,
+		config.CopyCatchupWindowSeconds, config.CopyCatchupMaxAdverseBPS, config.Enabled,
 		config.BinanceP20T, config.BinanceCSRFToken, config.BinanceSourceMode,
 		config.BinanceTopTraderID, config.SourceGeneration,
 		config.RiskStopLossEnabled, config.RiskAccountPct, config.RiskATRMultiplier,
@@ -441,6 +462,8 @@ func (s *CopyTradeStore) Update(config *CopyTradeConfig) error {
 			sync_margin_mode = ?,
 			min_trade_warn = ?,
 			max_trade_warn = ?,
+			copy_catchup_window_seconds = ?,
+			copy_catchup_max_adverse_bps = ?,
 			enabled = ?,
 			binance_p20t = ?,
 			binance_csrf_token = ?,
@@ -459,6 +482,7 @@ func (s *CopyTradeStore) Update(config *CopyTradeConfig) error {
 		WHERE trader_id = ?
 	`, config.ProviderType, config.LeaderID, config.CopyRatio,
 		config.SyncLeverage, config.SyncMarginMode, config.MinTradeWarn, config.MaxTradeWarn,
+		config.CopyCatchupWindowSeconds, config.CopyCatchupMaxAdverseBPS,
 		config.Enabled, config.BinanceP20T, config.BinanceCSRFToken,
 		config.BinanceSourceMode, config.BinanceTopTraderID, config.SourceGeneration,
 		config.RiskStopLossEnabled, config.RiskAccountPct, config.RiskATRMultiplier,
@@ -485,12 +509,13 @@ func (s *CopyTradeStore) Upsert(config *CopyTradeConfig) error {
 	_, err = tx.Exec(`
 		INSERT INTO copy_trade_configs 
 			(trader_id, provider_type, leader_id, copy_ratio, sync_leverage, sync_margin_mode, 
-			 min_trade_warn, max_trade_warn, enabled, binance_p20t, binance_csrf_token,
+			 min_trade_warn, max_trade_warn, copy_catchup_window_seconds, copy_catchup_max_adverse_bps,
+			 enabled, binance_p20t, binance_csrf_token,
 			 binance_source_mode, binance_top_trader_id, source_generation,
 			 risk_stop_loss_enabled, risk_account_pct, risk_atr_multiplier,
 			 risk_atr_timeframe, risk_leverage_fallback, risk_leverage_max_loss,
 			 risk_reentry_enabled, risk_reentry_ratio, risk_manual_reentry_enabled)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(trader_id) DO UPDATE SET
 			provider_type = excluded.provider_type,
 			leader_id = excluded.leader_id,
@@ -499,6 +524,8 @@ func (s *CopyTradeStore) Upsert(config *CopyTradeConfig) error {
 			sync_margin_mode = excluded.sync_margin_mode,
 			min_trade_warn = excluded.min_trade_warn,
 			max_trade_warn = excluded.max_trade_warn,
+			copy_catchup_window_seconds = excluded.copy_catchup_window_seconds,
+			copy_catchup_max_adverse_bps = excluded.copy_catchup_max_adverse_bps,
 			enabled = excluded.enabled,
 			binance_p20t = excluded.binance_p20t,
 			binance_csrf_token = excluded.binance_csrf_token,
@@ -515,7 +542,8 @@ func (s *CopyTradeStore) Upsert(config *CopyTradeConfig) error {
 			risk_reentry_ratio = excluded.risk_reentry_ratio,
 			risk_manual_reentry_enabled = excluded.risk_manual_reentry_enabled
 	`, config.TraderID, config.ProviderType, config.LeaderID, config.CopyRatio,
-		config.SyncLeverage, config.SyncMarginMode, config.MinTradeWarn, config.MaxTradeWarn, config.Enabled,
+		config.SyncLeverage, config.SyncMarginMode, config.MinTradeWarn, config.MaxTradeWarn,
+		config.CopyCatchupWindowSeconds, config.CopyCatchupMaxAdverseBPS, config.Enabled,
 		config.BinanceP20T, config.BinanceCSRFToken, config.BinanceSourceMode,
 		config.BinanceTopTraderID, config.SourceGeneration,
 		config.RiskStopLossEnabled, config.RiskAccountPct, config.RiskATRMultiplier,
@@ -556,7 +584,10 @@ func (s *CopyTradeStore) Delete(traderID string) error {
 // 提取为常量便于 GetByTraderID / ListEnabled 共用，新增字段时一处改动
 const copyTradeConfigSelectColumns = `
 	trader_id, provider_type, leader_id, copy_ratio, sync_leverage, sync_margin_mode,
-	min_trade_warn, max_trade_warn, enabled,
+	min_trade_warn, max_trade_warn,
+	COALESCE(copy_catchup_window_seconds, 60) AS copy_catchup_window_seconds,
+	COALESCE(copy_catchup_max_adverse_bps, 20) AS copy_catchup_max_adverse_bps,
+	enabled,
 	COALESCE(binance_p20t, '') AS binance_p20t,
 	COALESCE(binance_csrf_token, '') AS binance_csrf_token,
 	COALESCE(binance_source_mode, 'copy_management') AS binance_source_mode,
@@ -585,6 +616,7 @@ func scanCopyTradeConfig(scanner interface {
 	err := scanner.Scan(
 		&config.TraderID, &config.ProviderType, &config.LeaderID, &config.CopyRatio,
 		&config.SyncLeverage, &config.SyncMarginMode, &config.MinTradeWarn, &config.MaxTradeWarn,
+		&config.CopyCatchupWindowSeconds, &config.CopyCatchupMaxAdverseBPS,
 		&config.Enabled, &p20t, &csrf, &config.BinanceSourceMode,
 		&config.BinanceTopTraderID, &config.SourceGeneration,
 		&config.RiskStopLossEnabled, &config.RiskAccountPct, &config.RiskATRMultiplier,

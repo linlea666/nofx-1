@@ -228,6 +228,8 @@ interface FormState {
   copy_sync_margin_mode: boolean // 同步保证金模式（OKX 区分全仓/逐仓）
   copy_min_trade_warn: number // 纯运营预警阈值，不参与订单最小量判断
   copy_max_trade_warn: number // 最大跟单金额预警（USDT），0=不预警
+  copy_catchup_window_seconds: number
+  copy_catchup_max_adverse_bps: number
   copy_binance_source_mode: BinanceSourceMode
   copy_binance_top_trader_id: string
   // Binance Web 私有接口凭证（仅 copy_provider_type=binance 时使用）
@@ -260,8 +262,9 @@ interface FormState {
   risk_notification_level: 'important' | 'critical' | 'verbose'
   risk_manual_reentry_enabled: boolean // 废弃兼容字段，始终 false
   risk_policy_version: number
-  // v5：不再影响止损计算（账户线在任何模式下都是硬 cap），仅作兼容透传，无 UI
+  // 历史兼容字段；实际账户阈值语义由 risk_stop_priority 决定
   risk_stop_mode: 'volatility_priority' | 'account_hard_limit'
+  risk_stop_priority: 'volatility_first' | 'account_cap'
   risk_atr_period: number
   risk_atr_cache_max_age_minutes: number
   risk_atr_fallback_pct: number
@@ -321,6 +324,8 @@ export function TraderConfigModal({
     copy_sync_margin_mode: true, // 默认同步保证金模式
     copy_min_trade_warn: 12, // 纯运营预警，不参与交易所最小量判断
     copy_max_trade_warn: 0,
+    copy_catchup_window_seconds: 60,
+    copy_catchup_max_adverse_bps: 20,
     copy_binance_source_mode: 'copy_management',
     copy_binance_top_trader_id: '',
     copy_binance_p20t: '',
@@ -348,6 +353,7 @@ export function TraderConfigModal({
     risk_manual_reentry_enabled: false,
     risk_policy_version: 4,
     risk_stop_mode: 'volatility_priority',
+    risk_stop_priority: 'volatility_first',
     risk_atr_period: 14,
     risk_atr_cache_max_age_minutes: 120,
     risk_atr_fallback_pct: 2,
@@ -472,6 +478,9 @@ export function TraderConfigModal({
             copy_sync_margin_mode: cfg.sync_margin_mode ?? true, // 默认 true
             copy_min_trade_warn: cfg.min_trade_warn ?? 12,
             copy_max_trade_warn: cfg.max_trade_warn ?? 0,
+            copy_catchup_window_seconds: cfg.copy_catchup_window_seconds ?? 60,
+            copy_catchup_max_adverse_bps:
+              cfg.copy_catchup_max_adverse_bps ?? 20,
             copy_binance_p20t: cfg.binance_p20t ?? '',
             copy_binance_csrf_token: cfg.binance_csrf_token ?? '',
             // 风控字段回填（× 100 转百分比展示，与 store.FillRiskDefaults 保持一致）
@@ -515,6 +524,7 @@ export function TraderConfigModal({
             // 自锁状态（激活仍需用户显式保存，opt-in 语义不变）。
             risk_policy_version: cfg.risk_policy_version || 4,
             risk_stop_mode: cfg.risk_stop_mode ?? 'volatility_priority',
+            risk_stop_priority: cfg.risk_stop_priority ?? 'volatility_first',
             risk_atr_period: cfg.risk_atr_period ?? 14,
             risk_atr_cache_max_age_minutes:
               cfg.risk_atr_cache_max_age_minutes ?? 120,
@@ -582,6 +592,9 @@ export function TraderConfigModal({
           risk_stop_loss_enabled: cfg.risk_stop_loss_enabled ?? true,
           risk_stop_max_account_loss_pct:
             (cfg.risk_stop_max_account_loss_pct ?? 0) * 100,
+          copy_catchup_window_seconds: cfg.copy_catchup_window_seconds ?? 60,
+          copy_catchup_max_adverse_bps: cfg.copy_catchup_max_adverse_bps ?? 20,
+          risk_stop_priority: cfg.risk_stop_priority ?? 'volatility_first',
           risk_account_pct: (cfg.risk_account_pct ?? 0.02) * 100,
           risk_cycle_loss_budget_pct:
             (cfg.risk_cycle_loss_budget_pct ?? 0.05) * 100,
@@ -653,6 +666,8 @@ export function TraderConfigModal({
         copy_sync_margin_mode: true, // 默认同步保证金模式
         copy_min_trade_warn: 12,
         copy_max_trade_warn: 0,
+        copy_catchup_window_seconds: 60,
+        copy_catchup_max_adverse_bps: 20,
         copy_binance_source_mode: 'copy_management',
         copy_binance_top_trader_id: '',
         copy_binance_p20t: '',
@@ -680,6 +695,7 @@ export function TraderConfigModal({
         risk_manual_reentry_enabled: false,
         risk_policy_version: 4,
         risk_stop_mode: 'volatility_priority',
+        risk_stop_priority: 'volatility_first',
         risk_atr_period: 14,
         risk_atr_cache_max_age_minutes: 120,
         risk_atr_fallback_pct: 2,
@@ -911,6 +927,8 @@ export function TraderConfigModal({
           sync_margin_mode: formData.copy_sync_margin_mode, // 同步保证金模式（仅 OKX 生效）
           min_trade_warn: formData.copy_min_trade_warn,
           max_trade_warn: formData.copy_max_trade_warn,
+          copy_catchup_window_seconds: formData.copy_catchup_window_seconds,
+          copy_catchup_max_adverse_bps: formData.copy_catchup_max_adverse_bps,
         }
         // 账户保护 v5 风控（Copy Guard）支持 OKX 与 Binance 领航员数据源：
         // 不支持的数据源（Hyperliquid）不携带任何 risk_* 字段（含
@@ -944,6 +962,7 @@ export function TraderConfigModal({
             risk_manual_reentry_enabled: false,
             risk_policy_version: formData.risk_policy_version,
             risk_stop_mode: formData.risk_stop_mode,
+            risk_stop_priority: formData.risk_stop_priority,
             risk_atr_period: formData.risk_atr_period,
             risk_atr_cache_max_age_minutes:
               formData.risk_atr_cache_max_age_minutes,
@@ -1598,6 +1617,46 @@ export function TraderConfigModal({
                     </p>
                   </div>
 
+                  <div className="grid grid-cols-2 gap-4">
+                    <label className="text-sm text-[#EAECEF]">
+                      补齐窗口（秒）
+                      <input
+                        type="number"
+                        min="1"
+                        max="600"
+                        value={formData.copy_catchup_window_seconds}
+                        onChange={(e) =>
+                          handleInputChange(
+                            'copy_catchup_window_seconds',
+                            Number(e.target.value)
+                          )
+                        }
+                        className="mt-2 w-full px-3 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF]"
+                      />
+                    </label>
+                    <label className="text-sm text-[#EAECEF]">
+                      最大不利偏差（bps）
+                      <input
+                        type="number"
+                        min="0.1"
+                        max="500"
+                        step="0.1"
+                        value={formData.copy_catchup_max_adverse_bps}
+                        onChange={(e) =>
+                          handleInputChange(
+                            'copy_catchup_max_adverse_bps',
+                            Number(e.target.value)
+                          )
+                        }
+                        className="mt-2 w-full px-3 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF]"
+                      />
+                    </label>
+                    <p className="col-span-2 text-xs text-[#848E9C]">
+                      仅用于保证金暂时不足后的普通比例补齐；不会改变止损或 AI
+                      二次入场预算。
+                    </p>
+                  </div>
+
                   {/* 跟单运营预警阈值（不参与交易所可执行性判断） */}
                   <div className="grid grid-cols-2 gap-4">
                     <div>
@@ -1816,7 +1875,7 @@ export function TraderConfigModal({
                                 />
                                 <span className="mt-1 block">
                                   技术关键位 / ATR
-                                  优先，账户百分比为硬封顶；加减仓后止损只会保持或收紧
+                                  优先，账户百分比只做预计损失预警，不压缩普通仓位止损距离
                                 </span>
                               </label>
                               <div className="col-span-2 flex items-center justify-between rounded border border-[#F0B90B44] bg-[#F0B90B0D] p-3 text-xs">
@@ -1834,6 +1893,7 @@ export function TraderConfigModal({
                                     setFormData((v) => ({
                                       ...v,
                                       risk_stop_mode: 'volatility_priority',
+                                      risk_stop_priority: 'volatility_first',
                                       risk_trigger_price_type: 'mark',
                                       risk_atr_period: 14,
                                       risk_atr_cache_max_age_minutes: 120,
