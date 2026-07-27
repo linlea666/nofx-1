@@ -50,6 +50,9 @@ type Engine struct {
 	seenFills map[string]time.Time
 	seenMu    sync.RWMutex
 	seenTTL   time.Duration
+	// pollNowCh lets lifecycle reconciliation request an immediate authoritative
+	// snapshot pass without calling poll concurrently with the ticker goroutine.
+	pollNowCh chan struct{}
 
 	// 状态缓存
 	leaderState       *AccountState
@@ -143,6 +146,7 @@ func NewEngine(
 		getFollowerPositions:     getPositions,
 		seenFills:                make(map[string]time.Time),
 		seenTTL:                  1 * time.Hour,
+		pollNowCh:                make(chan struct{}, 1),
 		stateSyncInterval:        20 * time.Second,
 		decisionCh:               make(chan *decision.FullDecision, 10),
 		riskEventCh:              make(chan *RiskEvent, 32),
@@ -781,6 +785,8 @@ func (e *Engine) pollLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			e.poll()
+		case <-e.pollNowCh:
+			e.poll()
 		}
 	}
 }
@@ -1373,6 +1379,44 @@ func (e *Engine) buildLeaderPosMap() map[string]*Position {
 		}
 	}
 	return posMap
+}
+
+// authoritativeLeaderSnapshot returns a position map only while the last
+// successfully installed source snapshot is fresh. Smart Money installs state
+// only after its complete-snapshot and source-health checks pass, so freshness
+// here is also the fail-closed health boundary for ownership recovery.
+func (e *Engine) authoritativeLeaderSnapshot() (map[string]*Position, bool) {
+	e.leaderStateMu.RLock()
+	defer e.leaderStateMu.RUnlock()
+	maxAge := 2 * e.stateSyncInterval
+	if maxAge < 30*time.Second {
+		maxAge = 30 * time.Second
+	}
+	if e.leaderState == nil || e.lastStateSync.IsZero() || time.Since(e.lastStateSync) > maxAge {
+		return nil, false
+	}
+	positions := make(map[string]*Position, len(e.leaderState.Positions))
+	for key, pos := range e.leaderState.Positions {
+		if pos == nil {
+			continue
+		}
+		if pos.PosID != "" {
+			positions[pos.PosID] = pos
+		} else {
+			positions[key] = pos
+		}
+	}
+	return positions, true
+}
+
+func (e *Engine) requestAuthoritativePoll() {
+	if e == nil || e.pollNowCh == nil {
+		return
+	}
+	select {
+	case e.pollNowCh <- struct{}{}:
+	default:
+	}
 }
 
 // matchOpenAddSignal 匹配开仓/加仓信号

@@ -657,6 +657,8 @@ type IgnoredLeaderTransition struct {
 type ExecutionReconciliationReport struct {
 	UnfinishedIntents          int `json:"unfinished_intents"`
 	OpenCyclesWithoutMapping   int `json:"open_cycles_without_mapping"`
+	RecoverableOwnershipGaps   int `json:"recoverable_ownership_gaps"`
+	AmbiguousOwnershipGaps     int `json:"ambiguous_ownership_gaps"`
 	ActiveMappingsWithoutCycle int `json:"active_mappings_without_cycle"`
 	UnprotectedOpenCycles      int `json:"unprotected_open_cycles"`
 	PendingIntentRisk          int `json:"pending_intent_risk"`
@@ -680,6 +682,17 @@ func (s *CopyTradeStore) GetExecutionReconciliationReport(traderID string) (*Exe
 	for _, query := range queries {
 		if err := s.db.QueryRow(query.sql, traderID).Scan(query.target); err != nil {
 			return report, err
+		}
+	}
+	gaps, err := s.ListOpenCycleOwnershipGaps(traderID)
+	if err != nil {
+		return report, err
+	}
+	for _, gap := range gaps {
+		if gap.Recoverable {
+			report.RecoverableOwnershipGaps++
+		} else {
+			report.AmbiguousOwnershipGaps++
 		}
 	}
 	return report, nil
@@ -941,6 +954,16 @@ func (s *CopyTradeStore) initExecutionIntentTable() error {
 	}
 	if _, err = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_copy_intent_trader_status ON copy_trade_execution_intents(trader_id,status,updated_at)`); err != nil {
 		return err
+	}
+	// This secondary index is fully derivable but is on the write path of every
+	// execution-intent status transition. A production database from the legacy
+	// pre-durable-attempt build was observed with two missing index entries:
+	// reads still passed quick_check, while the next UPDATE failed with
+	// SQLITE_CORRUPT_INDEX (779). Store.New already owns the process lock, so a
+	// bounded rebuild here safely repairs that exact blocker before trading can
+	// start without changing table data or schema.
+	if _, err = s.db.Exec(`REINDEX idx_copy_intent_trader_status`); err != nil {
+		return fmt.Errorf("rebuild execution intent status index: %w", err)
 	}
 	if _, err = s.db.Exec(`
 		CREATE TABLE IF NOT EXISTS copy_trade_execution_intent_sources (

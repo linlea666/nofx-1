@@ -138,8 +138,9 @@ type TraderIntegration struct {
 	protectiveQueryFailures map[int64]int
 	// lastV4Backfill rate-limits the lifecycle backfill sweep for positions
 	// followed before Copy Guard v4 was enabled.
-	lastV4Backfill       time.Time
-	lastCycleSummaryScan time.Time
+	lastV4Backfill         time.Time
+	lastCycleSummaryScan   time.Time
+	lastOwnershipReconcile time.Time
 	// lastProtectionEvent rate-limits repeated identical protection-issue
 	// events (poll runs every 3s; a stuck failure used to write thousands of
 	// duplicate rows per cycle). Guarded by protectionEventMu because
@@ -351,6 +352,11 @@ func (ti *TraderIntegration) StartCopyTrading() error {
 		return fmt.Errorf("failed to start copy trade engine: %w", err)
 	}
 
+	// Engine.Start installs the first healthy authoritative leader snapshot.
+	// Repair proven legacy ownership gaps before decision consumption begins so
+	// the next snapshot can emit the already-missed reduce/close transition.
+	ti.reconcileMappingOwnershipGaps(true)
+
 	// 启动决策消费协程
 	go ti.consumeDecisions()
 	// 启动风控事件消费协程（v3 风控：SL 触发 / 二次进场告警邮件）
@@ -451,8 +457,8 @@ func (ti *TraderIntegration) logExecutionReconciliationReport() {
 		logger.Infof("✅ [%s] 启动执行生命周期对账无异常（只读，未自动补单）", ti.traderID)
 		return
 	}
-	logger.Warnf("⚠️ [%s] 启动执行生命周期对账待处理（只读，未自动补单） | unfinished_intents=%d open_cycles_without_mapping=%d active_mappings_without_cycle=%d unprotected_open_cycles=%d pending_intent_risk=%d",
-		ti.traderID, report.UnfinishedIntents, report.OpenCyclesWithoutMapping, report.ActiveMappingsWithoutCycle, report.UnprotectedOpenCycles, report.PendingIntentRisk)
+	logger.Warnf("⚠️ [%s] 启动执行生命周期对账待处理 | unfinished_intents=%d open_cycles_without_mapping=%d recoverable_ownership_gaps=%d ambiguous_ownership_gaps=%d active_mappings_without_cycle=%d unprotected_open_cycles=%d pending_intent_risk=%d",
+		ti.traderID, report.UnfinishedIntents, report.OpenCyclesWithoutMapping, report.RecoverableOwnershipGaps, report.AmbiguousOwnershipGaps, report.ActiveMappingsWithoutCycle, report.UnprotectedOpenCycles, report.PendingIntentRisk)
 }
 
 func (ti *TraderIntegration) reconcileExecutionIntents(startup bool) {
@@ -1150,9 +1156,242 @@ func (ti *TraderIntegration) monitorExecutionIntents() {
 		case <-ti.ctx.Done():
 			return
 		case <-ticker.C:
+			ti.reconcileMappingOwnershipGaps(false)
 			ti.reconcileExecutionIntents(false)
 		}
 	}
+}
+
+const ownershipReconcileEvery = 30 * time.Second
+
+type followerOwnershipSnapshot struct {
+	Quantity      float64
+	FollowerPosID string
+}
+
+func followerPositionForOwnershipGap(positions []map[string]interface{}, gap *store.CopyTradeOwnershipGap) followerOwnershipSnapshot {
+	if gap == nil {
+		return followerOwnershipSnapshot{}
+	}
+	symbols := map[string]struct{}{strings.ToUpper(strings.TrimSpace(gap.Symbol)): {}}
+	if execution := strings.ToUpper(strings.TrimSpace(gap.ExecutionSymbol)); execution != "" {
+		symbols[execution] = struct{}{}
+	}
+	var out followerOwnershipSnapshot
+	for _, pos := range positions {
+		symbol := strings.ToUpper(strings.TrimSpace(getStringField(pos, "symbol")))
+		if _, ok := symbols[symbol]; !ok {
+			continue
+		}
+		if !strings.EqualFold(getStringField(pos, "side"), gap.Side) {
+			continue
+		}
+		mode := getStringField(pos, "mgnMode", "marginMode")
+		if gap.MarginMode != "" && !strings.EqualFold(mode, gap.MarginMode) {
+			continue
+		}
+		quantity := absFloat(getFloatField(pos, "positionAmt", "quantity"))
+		if quantity <= 0 {
+			continue
+		}
+		out.Quantity += quantity
+		if out.FollowerPosID == "" {
+			out.FollowerPosID = getStringField(pos, "posId", "positionId", "position_id")
+		}
+	}
+	return out
+}
+
+func leaderPositionForOwnershipGap(positions map[string]*Position, gap *store.CopyTradeOwnershipGap) (*Position, bool) {
+	if gap == nil {
+		return nil, false
+	}
+	pos := positions[gap.LeaderPosID]
+	if pos == nil || pos.Size <= 0 || !strings.EqualFold(string(pos.Side), gap.Side) || !strings.EqualFold(pos.Symbol, gap.Symbol) {
+		return pos, false
+	}
+	return pos, true
+}
+
+// reconcileMappingOwnershipGaps repairs only the historical state where an
+// exchange-confirmed Copy Guard entry still owns a live follower position but
+// the unique source mapping was left closed. It never adopts a manual position,
+// never infers source health, and never submits a business order itself.
+func (ti *TraderIntegration) reconcileMappingOwnershipGaps(startup bool) {
+	if ti == nil || ti.store == nil || ti.engine == nil || ti.engine.config == nil ||
+		!SupportsCopyGuard(ti.engine.config.ProviderType) || ti.engine.config.RiskPolicyVersion < 4 {
+		return
+	}
+	if !startup && !ti.lastOwnershipReconcile.IsZero() && time.Since(ti.lastOwnershipReconcile) < ownershipReconcileEvery {
+		return
+	}
+	ti.lastOwnershipReconcile = time.Now()
+
+	ti.executionMu.Lock()
+	defer ti.executionMu.Unlock()
+
+	gaps, err := ti.store.CopyTrade().ListOpenCycleOwnershipGaps(ti.traderID)
+	if err != nil {
+		logger.Warnf("⚠️ [%s] 读取跟单所有权缺口失败: %v", ti.traderID, err)
+		return
+	}
+	if len(gaps) == 0 {
+		return
+	}
+	leaderPositions, healthy := ti.engine.authoritativeLeaderSnapshot()
+	if !healthy {
+		for _, gap := range gaps {
+			ti.markOwnershipAmbiguous(gap, "SOURCE_SNAPSHOT_UNAVAILABLE")
+		}
+		return
+	}
+	followerPositions, err := ti.getFreshPositions()
+	if err != nil {
+		for _, gap := range gaps {
+			ti.markOwnershipAmbiguous(gap, store.OwnershipGapFollowerStateUnavailable+": "+err.Error())
+		}
+		return
+	}
+
+	recoveredAny := false
+	for _, gap := range gaps {
+		follower := followerPositionForOwnershipGap(followerPositions, gap)
+		leader, leaderStillOwnsSide := leaderPositionForOwnershipGap(leaderPositions, gap)
+		if follower.Quantity <= 0 {
+			if !gap.Recoverable {
+				ti.markOwnershipAmbiguous(gap, gap.ReasonCode+": ownership evidence is insufficient for flat retirement")
+				continue
+			}
+			if gap.MappingID <= 0 || gap.MappingStatus != store.MappingStatusClosed {
+				ti.markOwnershipAmbiguous(gap, gap.ReasonCode+": exact execution identity unavailable for flat retirement")
+				continue
+			}
+			if retireErr := ti.retireFlatOwnershipGap(gap, leaderStillOwnsSide); retireErr != nil {
+				ti.markOwnershipAmbiguous(gap, "FLAT_RETIREMENT_PENDING: "+retireErr.Error())
+			} else {
+				logger.Warnf("🟡 [%s] 跟单所有权缺口已按交易所实时空仓安全收尾 | cycle=%d posId=%s leader_open=%t",
+					ti.traderID, gap.CycleID, gap.LeaderPosID, leaderStillOwnsSide)
+			}
+			continue
+		}
+		if !gap.Recoverable {
+			ti.markOwnershipAmbiguous(gap, gap.ReasonCode)
+			continue
+		}
+		leaderTarget := float64(0)
+		if leaderStillOwnsSide {
+			leaderTarget = leader.Size
+		}
+		result, restoreErr := ti.store.CopyTrade().RestoreConfirmedMappingOwnership(store.RestoreMappingOwnershipRequest{
+			TraderID: ti.traderID, LeaderPosID: gap.LeaderPosID, CycleID: gap.CycleID,
+			EntryIntentID: gap.EntryIntentID, FollowerQuantity: follower.Quantity,
+			FollowerPosID: follower.FollowerPosID, LeaderTargetSize: leaderTarget,
+		})
+		if restoreErr != nil {
+			ti.markOwnershipAmbiguous(gap, "RECOVERY_REVALIDATION_FAILED: "+restoreErr.Error())
+			continue
+		}
+		recoveredAny = true
+		logger.Warnf("✅ [%s] 已恢复跟单仓位所有权 | cycle=%d posId=%s revision=%d follower_qty=%.8f superseded=%v leader_open=%t",
+			ti.traderID, gap.CycleID, gap.LeaderPosID, result.MappingRevision, follower.Quantity, result.SupersededIntentIDs, leaderStillOwnsSide)
+		ti.notifyOwnershipRecovered(gap, result, follower.Quantity, leaderStillOwnsSide)
+	}
+	if recoveredAny {
+		// The engine owns polling serialization. Waking that goroutine avoids a
+		// second trading path while making an already-missed leader close visible
+		// immediately from the restored active mapping.
+		ti.engine.requestAuthoritativePoll()
+	}
+}
+
+func (ti *TraderIntegration) markOwnershipAmbiguous(gap *store.CopyTradeOwnershipGap, reason string) {
+	if gap == nil {
+		return
+	}
+	changed, err := ti.store.CopyTrade().MarkCopyGuardOwnershipAmbiguous(gap.CycleID, ti.traderID, reason)
+	if err != nil {
+		logger.Warnf("⚠️ [%s] 保存跟单所有权歧义失败 | cycle=%d: %v", ti.traderID, gap.CycleID, err)
+		return
+	}
+	if !changed {
+		return
+	}
+	logger.Errorf("🚨 [%s] 跟单所有权证据不足，保留仓位且禁止自动认领 | cycle=%d posId=%s reason=%s",
+		ti.traderID, gap.CycleID, gap.LeaderPosID, reason)
+	traderName := ti.traderDisplayName()
+	dedup := fmt.Sprintf("ownership-ambiguous|%s|%d|%s", ti.traderID, gap.CycleID, reason)
+	notifier.Notify(notifier.Alert{
+		Category: "copy_trade", TraderID: ti.traderID, TraderName: traderName,
+		Title: fmt.Sprintf("%s | %s 跟单所有权待核验", traderName, gap.Symbol),
+		Body: fmt.Sprintf("Cycle: %d\nLeader Pos ID: %s\n方向: %s\n原因: %s\n处理: 未认领、未下单、保留现有保护并等待强证据。",
+			gap.CycleID, gap.LeaderPosID, gap.Side, reason),
+		RateKey: dedup, DedupKey: dedup,
+	})
+}
+
+func (ti *TraderIntegration) notifyOwnershipRecovered(gap *store.CopyTradeOwnershipGap, result *store.RestoreMappingOwnershipResult, followerQty float64, leaderOpen bool) {
+	if gap == nil || result == nil {
+		return
+	}
+	traderName := ti.traderDisplayName()
+	action := "领航员仍持仓，已恢复正常比例状态跟踪"
+	if !leaderOpen {
+		action = "领航员已平仓，已唤醒正常 reduce-only 全平链"
+	}
+	dedup := fmt.Sprintf("ownership-recovered|%s|%d|%d", ti.traderID, gap.CycleID, result.MappingRevision)
+	notifier.Notify(notifier.Alert{
+		Category: "copy_trade", TraderID: ti.traderID, TraderName: traderName,
+		Title: fmt.Sprintf("%s | %s 跟单所有权已恢复", traderName, gap.Symbol),
+		Body: fmt.Sprintf("Cycle: %d\nLeader Pos ID: %s\nFollower Qty: %.8f\nMapping Revision: %d\nSuperseded Intents: %v\n处理: %s。",
+			gap.CycleID, gap.LeaderPosID, followerQty, result.MappingRevision, result.SupersededIntentIDs, action),
+		RateKey: dedup, DedupKey: dedup,
+	})
+}
+
+func (ti *TraderIntegration) retireFlatOwnershipGap(gap *store.CopyTradeOwnershipGap, leaderOpen bool) error {
+	cycle, err := ti.store.CopyTrade().GetOpenCopyGuardCycle(ti.traderID, gap.LeaderPosID)
+	if err != nil {
+		return err
+	}
+	if !leaderOpen {
+		action := "close_long"
+		if strings.EqualFold(gap.Side, "short") {
+			action = "close_short"
+		}
+		dec := &decision.Decision{
+			Symbol: gap.Symbol, Action: action, IsCopyTrade: true, LeaderPosID: gap.LeaderPosID,
+			MarginMode: gap.MarginMode, SourceSymbol: gap.SourceSymbol, ExecutionSymbol: gap.ExecutionSymbol,
+			ValueCurrency: gap.SourceQuoteAsset, ExecutionSettleAsset: gap.ExecutionSettleAsset,
+			Reasoning: "Copy trading: leader closed while recovering flat ownership gap",
+		}
+		ti.finalizeCopyGuardCycle(dec)
+		closed, getErr := ti.store.CopyTrade().GetCopyGuardCycle(gap.CycleID)
+		if getErr != nil {
+			return getErr
+		}
+		if closed.ClosedAt == nil || closed.Status != store.CopyGuardLeaderClosed {
+			return fmt.Errorf("leader-close lifecycle finalization is still pending")
+		}
+		return nil
+	}
+	order, orderErr := ti.store.CopyTrade().GetCopyGuardProtectiveOrder(cycle.ID)
+	switch {
+	case orderErr == nil:
+		mgr, ok := ti.executor.(ProtectiveStopManagerV4)
+		if !ok {
+			return fmt.Errorf("executor cannot retire protective order %s", order.AlgoID)
+		}
+		if err = ti.cancelProtectiveOrderForCycle(mgr, cycle, order); err != nil {
+			return err
+		}
+		if err = ti.store.CopyTrade().UpdateCopyGuardProtectionHealth(cycle.ID, store.CopyGuardProtectionCanceled, 0, "", cycle.FollowerPosID, cycle.EntryOrderID, false); err != nil {
+			return err
+		}
+	case errors.Is(orderErr, sql.ErrNoRows):
+	default:
+		return orderErr
+	}
+	return ti.store.CopyTrade().CloseCopyGuardOwnershipGapFlat(cycle.ID, ti.traderID, store.OwnershipGapFollowerAlreadyFlat)
 }
 
 // backfillV4CyclesEvery: cadence of the lifecycle backfill sweep. The sweep is
