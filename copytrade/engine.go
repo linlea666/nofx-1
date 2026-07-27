@@ -18,7 +18,14 @@ import (
 	"nofx/store"
 )
 
-const binancePositionSizeEpsilon = 1e-10
+const (
+	binancePositionSizeEpsilon = 1e-10
+	leaderReversalFillIDSuffix = "|transition=leader_reversed"
+)
+
+func sourceFillMarksLeaderReversal(sourceFillID string) bool {
+	return strings.HasSuffix(sourceFillID, leaderReversalFillIDSuffix)
+}
 
 type binancePositionHistoryProvider interface {
 	GetPositionHistory(leadPortfolioID string) ([]BinancePositionHistoryRecord, error)
@@ -1012,6 +1019,16 @@ func (e *Engine) detectBinancePositionSnapshotFills() []Fill {
 			fills = append(fills, e.buildBinanceSnapshotFillForPosition(pos, posID, ActionOpen, pos.Size, 0, pos.Size, revision))
 			continue
 		}
+		if mapping.Status == store.MappingStatusClosed {
+			// A completed lifecycle may reuse the same stable posId (same-side
+			// reopen or reversal). Generate a fresh open transition using the
+			// persisted revision in its snapshot identity; reservation advances to
+			// the next canonical revision and prevents replay of the old lifecycle.
+			fills = append(fills, e.buildBinanceSnapshotFillForPosition(
+				pos, posID, ActionOpen, pos.Size, 0, pos.Size, mapping.SourceRevision,
+			))
+			continue
+		}
 		if mapping.Status == "ignored" {
 			if SideType(mapping.Side) != pos.Side {
 				// ignored 代表旧方向从未在跟随账户执行。领航员复用同一
@@ -1041,7 +1058,7 @@ func (e *Engine) detectBinancePositionSnapshotFills() []Fill {
 			// 全平后建立新生命周期。这里只生成旧方向 close，等待交易所
 			// 成交、保护撤销、cycle/mapping 提交完成；下一轮 mapping 已
 			// closed 后才会生成新方向 open，从而保证严格串行。
-			fills = append(fills, e.buildBinanceSnapshotFill(
+			fill := e.buildBinanceSnapshotFill(
 				posID,
 				mapping.Symbol,
 				SideType(mapping.Side),
@@ -1051,7 +1068,13 @@ func (e *Engine) detectBinancePositionSnapshotFills() []Fill {
 				lastKnownSize,
 				0,
 				mapping.SourceRevision,
-			))
+			)
+			// Persist reversal attribution in the canonical source transition
+			// identity. Execution-intent reconciliation can then retain
+			// LEADER_REVERSED across a restart without overloading mutable
+			// failure reason codes or adding a schema field.
+			fill.ID += leaderReversalFillIDSuffix
+			fills = append(fills, fill)
 			continue
 		}
 		if pos.Size > lastKnownSize+binancePositionSizeEpsilon {
@@ -1309,6 +1332,7 @@ type SignalMatchResult struct {
 	ExecutionSymbol      string     // 活动映射保存的精确执行合约
 	SourceQuoteAsset     string     // 源合约报价币种
 	ExecutionSettleAsset string     // 执行合约结算币种
+	LeaderReversed       bool       // 同一稳定 posId 已由旧方向反手到新方向
 }
 
 // matchSignalWithMapping 统一信号匹配（核心方法）
@@ -1714,6 +1738,23 @@ func (e *Engine) matchCloseReduceSignal(signal *TradeSignal, leaderPosMap map[st
 				PosID:          mapping.LeaderPosID,
 				MarginMode:     mapping.MarginMode,
 				LeaderPosition: nil, // nil 表示已平仓
+			}
+		}
+		// A provider may reuse the same stable position id when the source flips
+		// direction. The opposite-side position is not a residual of the mapped
+		// lifecycle: the old side is fully closed and must never be interpreted
+		// as a partial size reduction merely because its new size is smaller.
+		if !strings.EqualFold(string(leaderPos.Side), mapping.Side) {
+			logger.Infof("📊 [%s] 领航员已反手 | posId=%s %s→%s → 旧方向全量平仓",
+				e.traderID, mapping.LeaderPosID, mapping.Side, leaderPos.Side)
+			return &SignalMatchResult{
+				ShouldFollow:   true,
+				Reason:         fmt.Sprintf("领航员已反手(posId=%s %s→%s)", mapping.LeaderPosID, mapping.Side, leaderPos.Side),
+				Action:         ActionClose,
+				PosID:          mapping.LeaderPosID,
+				MarginMode:     mapping.MarginMode,
+				LeaderPosition: nil,
+				LeaderReversed: true,
 			}
 		}
 
@@ -2144,6 +2185,7 @@ func (e *Engine) buildDecisionV2(signal *TradeSignal, match *SignalMatchResult, 
 		SourceFillIDs:   append([]string(nil), fill.SourceFillIDs...),
 		SourceSymbol:    fill.Symbol,
 		ValueCurrency:   fill.ValueCurrency,
+		LeaderReversed:  match.LeaderReversed,
 	}
 	if match.SourceSymbol != "" {
 		dec.SourceSymbol = match.SourceSymbol
@@ -3034,7 +3076,8 @@ func (e *Engine) checkIgnoredPositionsClosed() {
 		return
 	}
 	for _, mapping := range detachedMappings {
-		if _, exists := leaderPosIds[mapping.LeaderPosID]; exists {
+		leader, exists := leaderPosMap[mapping.LeaderPosID]
+		if exists && leader != nil && strings.EqualFold(string(leader.Side), mapping.Side) {
 			continue
 		}
 		if !e.closeCopyGuardCycleAtLeaderExit(mapping) {
@@ -3043,8 +3086,9 @@ func (e *Engine) checkIgnoredPositionsClosed() {
 		if err := e.store.CopyTrade().MarkDetachedAsClosed(e.traderID, mapping.LeaderPosID); err != nil {
 			logger.Warnf("⚠️ [%s] 更新 detached→closed 失败: %v (posId=%s)", e.traderID, err, mapping.LeaderPosID)
 		} else {
-			logger.Infof("📊 [%s] 脱离仓位的领航员生命周期结束 | posId=%s → detached→closed",
-				e.traderID, mapping.LeaderPosID)
+			logger.Infof("📊 [%s] 脱离仓位的领航员生命周期结束 | posId=%s source_missing=%t side_reversed=%t → detached→closed",
+				e.traderID, mapping.LeaderPosID, !exists,
+				exists && leader != nil && !strings.EqualFold(string(leader.Side), mapping.Side))
 		}
 	}
 }

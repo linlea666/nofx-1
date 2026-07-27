@@ -31,6 +31,23 @@ type ownershipProtectiveExecutor struct {
 	*mockStopMgr
 }
 
+func TestOwnershipAmbiguityNotifyKeysAreStableAndHourly(t *testing.T) {
+	now := time.Date(2026, 7, 28, 10, 15, 0, 0, time.UTC)
+	rate1, dedup1 := ownershipAmbiguityNotifyKeys("trader", 42, "FOLLOWER_POSITION_UNAVAILABLE", now)
+	rate2, dedup2 := ownershipAmbiguityNotifyKeys("trader", 42, "FOLLOWER_POSITION_UNAVAILABLE", now.Add(30*time.Minute))
+	if rate1 != rate2 || dedup1 != dedup2 {
+		t.Fatalf("same reason within an hour changed notification identity: %q/%q vs %q/%q", rate1, dedup1, rate2, dedup2)
+	}
+	_, nextHour := ownershipAmbiguityNotifyKeys("trader", 42, "FOLLOWER_POSITION_UNAVAILABLE", now.Add(time.Hour))
+	if nextHour == dedup1 {
+		t.Fatalf("persistent ownership ambiguity cannot notify again in next hour: %q", nextHour)
+	}
+	differentRate, _ := ownershipAmbiguityNotifyKeys("trader", 42, "SOURCE_SNAPSHOT_UNAVAILABLE", now)
+	if differentRate == rate1 {
+		t.Fatalf("reason transition reused notification rate key: %q", differentRate)
+	}
+}
+
 func (e *failingFreshPositionsExecutor) GetPositionsFresh() ([]map[string]interface{}, error) {
 	return nil, e.err
 }
@@ -197,6 +214,7 @@ func TestOwnershipRecoverySupportsConfiguredLeaderFamilies(t *testing.T) {
 		provider   ProviderType
 		sourceMode BinanceSourceMode
 	}{
+		{name: "binance_copy_management", provider: ProviderBinance, sourceMode: BinanceSourceCopyManagement},
 		{name: "binance_smart_money", provider: ProviderBinance, sourceMode: BinanceSourceSmartMoney},
 		{name: "okx", provider: ProviderOKX},
 	} {
@@ -217,7 +235,7 @@ func TestOwnershipRecoverySupportsConfiguredLeaderFamilies(t *testing.T) {
 
 func TestOwnershipRecoveryWhileLeaderOpenAbsorbsMissedRiskIncrease(t *testing.T) {
 	const posID = "1239518824_BTCUSDT_LONG"
-	leader := &Position{PosID: posID, Symbol: "BTCUSDT", Side: SideLong, Size: 0.003, MarginMode: "cross", MarkPrice: 65000}
+	leader := &Position{PosID: posID, Symbol: "BTCUSDT", Side: SideLong, Size: 0.004, MarginMode: "cross", MarkPrice: 65000}
 	f := newOwnershipIntegrationFixture(t, []map[string]interface{}{{
 		"symbol": "BTCUSDT", "side": "long", "mgnMode": "cross", "positionAmt": 0.0032,
 	}}, map[string]*Position{posID: leader})
@@ -228,6 +246,74 @@ func TestOwnershipRecoveryWhileLeaderOpenAbsorbsMissedRiskIncrease(t *testing.T)
 	}
 	if fills := f.engine.detectBinancePositionSnapshotFills(); len(fills) != 0 {
 		t.Fatalf("recovery must not chase missed risk increase: %+v", fills)
+	}
+}
+
+func TestOwnershipRecoveryPreservesMissedRiskReduction(t *testing.T) {
+	const posID = "1239518824_BTCUSDT_LONG"
+	leader := &Position{PosID: posID, Symbol: "BTCUSDT", Side: SideLong, Size: 0.002, MarginMode: "cross", MarkPrice: 65000}
+	f := newOwnershipIntegrationFixture(t, []map[string]interface{}{{
+		"symbol": "BTCUSDT", "side": "long", "mgnMode": "cross", "positionAmt": 0.0032,
+	}}, map[string]*Position{posID: leader})
+	f.integration.reconcileMappingOwnershipGaps(true)
+	mapping, err := f.store.CopyTrade().GetActiveMapping(f.traderID, f.leaderPosID)
+	if err != nil || mapping == nil || mapping.LastKnownSize != 0.003 || mapping.SourceRevision != 3 {
+		t.Fatalf("missed source reduction was swallowed by recovery: mapping=%+v err=%v", mapping, err)
+	}
+	fills := f.engine.detectBinancePositionSnapshotFills()
+	if len(fills) != 1 || fills[0].Action != ActionReduce {
+		t.Fatalf("missed source reduction was not exposed to normal diff chain: %+v", fills)
+	}
+	signal := f.engine.buildSignal(&fills[0])
+	match := f.engine.matchSignalWithMapping(signal)
+	if !match.ShouldFollow || match.Action != ActionReduce {
+		t.Fatalf("normal reduce matcher rejected recovered reduction: %+v", match)
+	}
+	dec := f.engine.buildDecisionV2(signal, match, 0)
+	if dec.Action != "reduce_long" || !f.engine.reserveExecutionIntent(&dec) || dec.SourceRevision != 4 {
+		t.Fatalf("recovered reduction did not reserve next canonical revision: %+v", dec)
+	}
+}
+
+func TestOwnershipRecoveryPreservesLeaderReversalClose(t *testing.T) {
+	const posID = "1239518824_BTCUSDT_LONG"
+	leader := &Position{PosID: posID, Symbol: "BTCUSDT", Side: SideShort, Size: 0.002, MarginMode: "cross", MarkPrice: 65000}
+	f := newOwnershipIntegrationFixture(t, []map[string]interface{}{{
+		"symbol": "BTCUSDT", "side": "long", "mgnMode": "cross", "positionAmt": 0.0032,
+	}}, map[string]*Position{posID: leader})
+	f.integration.reconcileMappingOwnershipGaps(true)
+	mapping, err := f.store.CopyTrade().GetActiveMapping(f.traderID, f.leaderPosID)
+	if err != nil || mapping == nil || mapping.LastKnownSize != 0.003 {
+		t.Fatalf("leader reversal was absorbed by ownership recovery: mapping=%+v err=%v", mapping, err)
+	}
+	fills := f.engine.detectBinancePositionSnapshotFills()
+	var closeFill *Fill
+	for i := range fills {
+		if fills[i].Action == ActionClose {
+			closeFill = &fills[i]
+			break
+		}
+	}
+	if closeFill == nil {
+		t.Fatalf("leader reversal did not expose old-side close: %+v", fills)
+	}
+	if !sourceFillMarksLeaderReversal(closeFill.ID) {
+		t.Fatalf("leader reversal source identity lost durable attribution: %s", closeFill.ID)
+	}
+	match := f.engine.matchSignalWithMapping(f.engine.buildSignal(closeFill))
+	if !match.ShouldFollow || match.Action != ActionClose || match.PosID != f.leaderPosID {
+		t.Fatalf("recovered reversal close was rejected: %+v", match)
+	}
+	dec := f.engine.buildDecisionV2(f.engine.buildSignal(closeFill), match, 0)
+	if !dec.LeaderReversed || dec.Action != "close_long" {
+		t.Fatalf("reversal attribution was lost before ordinary close execution: %+v", dec)
+	}
+	if !f.engine.reserveExecutionIntent(&dec) {
+		t.Fatalf("reversal close intent was not reserved: %+v", dec)
+	}
+	intent, err := f.store.CopyTrade().GetExecutionIntentByID(dec.ExecutionIntentID)
+	if err != nil || !sourceFillMarksLeaderReversal(intent.SourceFillID) {
+		t.Fatalf("reversal attribution was not persisted for restart reconciliation: intent=%+v err=%v", intent, err)
 	}
 }
 
@@ -258,6 +344,9 @@ func TestOwnershipRecoveryFailsClosedWithoutFreshSourceOrFollowerState(t *testin
 
 func TestOwnershipGapAlreadyFlatClosesLeaderLifecycleWithoutOrder(t *testing.T) {
 	f := newOwnershipIntegrationFixture(t, nil, map[string]*Position{})
+	if _, err := f.store.DB().Exec(`UPDATE trader_positions SET status='CLOSED' WHERE trader_id=? AND entry_order_id<>''`, f.traderID); err != nil {
+		t.Fatal(err)
+	}
 	manual, err := f.store.CopyTrade().SaveManualReentrySignal(&store.CopyGuardManualReentrySignal{
 		CycleID: f.cycle.ID, TraderID: f.traderID, LeaderPosID: f.leaderPosID,
 		Symbol: "BTCUSDT", Side: "long", MarginMode: "cross", TriggerPrice: 64000,
@@ -286,6 +375,10 @@ func TestOwnershipGapAlreadyFlatClosesLeaderLifecycleWithoutOrder(t *testing.T) 
 	if closeIntents != 0 {
 		t.Fatalf("flat ownership gap created a redundant close order intent: %d", closeIntents)
 	}
+	duplicate, err := f.store.CopyTrade().GetExecutionIntentByID(f.duplicateIntent)
+	if err != nil || duplicate.Status != store.ExecutionIntentSkipped || duplicate.ReasonCode != store.OwnershipRecoveredReason {
+		t.Fatalf("flat ownership gap did not terminalize duplicate open intent: intent=%+v err=%v", duplicate, err)
+	}
 	manual, err = f.store.CopyTrade().GetManualReentrySignal(manual.ID)
 	if err != nil || manual.Status != store.ManualReentryStatusInvalidated {
 		t.Fatalf("leader close did not invalidate manual reentry: signal=%+v err=%v", manual, err)
@@ -293,6 +386,74 @@ func TestOwnershipGapAlreadyFlatClosesLeaderLifecycleWithoutOrder(t *testing.T) 
 	candidate, err := f.store.ReentryAI().GetReentryCandidateByCycle(f.cycle.ID)
 	if err != nil || candidate.Status != store.ReentryCandidateInvalidated || candidate.ClosedAt == nil {
 		t.Fatalf("leader close did not invalidate AI reentry: candidate=%+v err=%v", candidate, err)
+	}
+}
+
+func TestOwnershipGapFollowerFlatLeaderOpenDetachesAndBlocksReopen(t *testing.T) {
+	const posID = "1239518824_BTCUSDT_LONG"
+	leader := &Position{PosID: posID, Symbol: "BTCUSDT", Side: SideLong, Size: 0.003, MarginMode: "cross"}
+	f := newOwnershipIntegrationFixture(t, nil, map[string]*Position{posID: leader})
+	f.integration.reconcileMappingOwnershipGaps(true)
+	mapping, err := f.store.CopyTrade().GetMappingForReconciliation(f.traderID, f.leaderPosID)
+	if err != nil || mapping.Status != store.MappingStatusDetached || mapping.SourceRevision != 3 || mapping.LastKnownSize != leader.Size {
+		t.Fatalf("flat follower with live leader was not detached: mapping=%+v err=%v", mapping, err)
+	}
+	cycle, err := f.store.CopyTrade().GetCopyGuardCycle(f.cycle.ID)
+	if err != nil || cycle.Status != store.CopyGuardDetached || cycle.ClosedAt == nil || cycle.AccountingStatus != store.CopyGuardAccountingUnscorable {
+		t.Fatalf("detached flat lifecycle state mismatch: cycle=%+v err=%v", cycle, err)
+	}
+	duplicate, err := f.store.CopyTrade().GetExecutionIntentByID(f.duplicateIntent)
+	if err != nil || duplicate.Status != store.ExecutionIntentSkipped || duplicate.ReasonCode != store.OwnershipRecoveredReason {
+		t.Fatalf("detached ownership gap did not terminalize duplicate open: intent=%+v err=%v", duplicate, err)
+	}
+	if fills := f.engine.detectBinancePositionSnapshotFills(); len(fills) != 0 {
+		t.Fatalf("detached lifecycle must not recreate follower exposure: %+v", fills)
+	}
+	leader.Size = 0.004
+	if fills := f.engine.detectBinancePositionSnapshotFills(); len(fills) != 0 {
+		t.Fatalf("detached lifecycle must block later source adds: %+v", fills)
+	}
+}
+
+func TestOwnershipGapFollowerFlatLeaderReversalFinalizesAsReversed(t *testing.T) {
+	const posID = "1239518824_BTCUSDT_LONG"
+	leader := &Position{PosID: posID, Symbol: "BTCUSDT", Side: SideShort, Size: 0.002, MarginMode: "cross", MarkPrice: 65000}
+	f := newOwnershipIntegrationFixture(t, nil, map[string]*Position{posID: leader})
+	f.integration.reconcileMappingOwnershipGaps(true)
+	cycle, err := f.store.CopyTrade().GetCopyGuardCycle(f.cycle.ID)
+	if err != nil || cycle.Status != store.CopyGuardLeaderReversed || cycle.ClosedAt == nil {
+		t.Fatalf("flat follower reversal lifecycle attribution mismatch: cycle=%+v err=%v", cycle, err)
+	}
+	var closeIntents int
+	if err = f.store.DB().QueryRow(`SELECT COUNT(*) FROM copy_trade_execution_intents WHERE trader_id=? AND leader_pos_id=? AND action='close_long'`, f.traderID, f.leaderPosID).Scan(&closeIntents); err != nil {
+		t.Fatal(err)
+	}
+	if closeIntents != 0 {
+		t.Fatalf("flat follower reversal created redundant close intent: %d", closeIntents)
+	}
+	var reversalEvents int
+	if err = f.store.DB().QueryRow(`SELECT COUNT(*) FROM copy_guard_events WHERE cycle_id=? AND type='LEADER_REVERSED'`, f.cycle.ID).Scan(&reversalEvents); err != nil {
+		t.Fatal(err)
+	}
+	if reversalEvents != 1 {
+		t.Fatalf("flat follower reversal event missing: %d", reversalEvents)
+	}
+}
+
+func TestDetachedOwnershipLifecycleClosesOnLeaderReversal(t *testing.T) {
+	const posID = "1239518824_BTCUSDT_LONG"
+	leader := &Position{PosID: posID, Symbol: "BTCUSDT", Side: SideLong, Size: 0.003, MarginMode: "cross"}
+	f := newOwnershipIntegrationFixture(t, nil, map[string]*Position{posID: leader})
+	f.integration.reconcileMappingOwnershipGaps(true)
+	f.engine.leaderState.Positions[posID] = &Position{PosID: posID, Symbol: "BTCUSDT", Side: SideShort, Size: 0.002, MarginMode: "cross"}
+	f.engine.checkIgnoredPositionsClosed()
+	mapping, err := f.store.CopyTrade().GetMappingForReconciliation(f.traderID, f.leaderPosID)
+	if err != nil || mapping.Status != store.MappingStatusClosed {
+		t.Fatalf("leader reversal did not end detached lifecycle: mapping=%+v err=%v", mapping, err)
+	}
+	fills := f.engine.detectBinancePositionSnapshotFills()
+	if len(fills) != 1 || fills[0].Action != ActionOpen || fills[0].PositionSide != SideShort {
+		t.Fatalf("new reversed lifecycle was not exposed after detached close: %+v", fills)
 	}
 }
 

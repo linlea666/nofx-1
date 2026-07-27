@@ -332,7 +332,7 @@ var copyGuardEventSpecs = map[string]CopyGuardEventSpec{
 	"WATCH_SUMMARY":                    {CopyEventCategoryReconcile, CopyEventSeverityInfo, "verbose", false},
 	"BASELINE_CALIBRATED":              {CopyEventCategoryReconcile, CopyEventSeverityInfo, "verbose", true},
 	"MAPPING_OWNERSHIP_RECOVERED":      {CopyEventCategoryReconcile, CopyEventSeverityWarn, "important", true},
-	"OWNERSHIP_AMBIGUOUS":              {CopyEventCategoryReconcile, CopyEventSeverityWarn, "important", true},
+	"OWNERSHIP_AMBIGUOUS":              {CopyEventCategoryReconcile, CopyEventSeverityError, "critical", true},
 	"OWNERSHIP_GAP_FLAT_RETIRED":       {CopyEventCategoryReconcile, CopyEventSeverityWarn, "important", true},
 	"SUPERSEDED_BY_RECOVERED_POSITION": {CopyEventCategoryReconcile, CopyEventSeverityInfo, "verbose", true},
 	"LEADER_CLOSED":                    {CopyEventCategoryReconcile, CopyEventSeverityInfo, "important", true},
@@ -507,6 +507,14 @@ func guardEventSummary(eventType, symbol, side, operator string) string {
 		return fmt.Sprintf("对账数据延迟，系统重试中 | %s", pair)
 	case "ACCOUNTING_UNRECOVERABLE":
 		return fmt.Sprintf("对账数据不可恢复 | %s", pair)
+	case "MAPPING_OWNERSHIP_RECOVERED":
+		return fmt.Sprintf("跟单仓位所有权已恢复 | %s", pair)
+	case "OWNERSHIP_AMBIGUOUS":
+		return fmt.Sprintf("跟单仓位所有权待核验 | %s", pair)
+	case "OWNERSHIP_GAP_FLAT_RETIRED":
+		return fmt.Sprintf("所有权缺口已按实时空仓安全收尾 | %s", pair)
+	case "SUPERSEDED_BY_RECOVERED_POSITION":
+		return fmt.Sprintf("重复开仓意图已由恢复仓位取代 | %s", pair)
 	case "BASELINE_CALIBRATED":
 		return fmt.Sprintf("兜底基线已校准 | %s", pair)
 	case "LEADER_CLOSED":

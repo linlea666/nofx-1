@@ -85,6 +85,7 @@ const accountingLabels: Record<string, string> = {
   RECONCILED: '已对账',
   DELAYED: '对账延迟·自动重试中',
   UNRECOVERABLE: '数据不可自动恢复',
+  UNSCORABLE: '不可评分',
   NEEDS_REVIEW: '对账延迟·自动重试中', // 兼容旧导出数据
   LEGACY_UNVERIFIED: '历史未验证',
 }
@@ -145,6 +146,10 @@ const eventLabels: Record<string, string> = {
   REENTRY_WINDOW_COLLAPSED: '旧规则重入窗口不可行',
   WATCH_RESUMED: '观察采样断档后恢复',
   WATCH_SUMMARY: '观察期收尾统计',
+  MAPPING_OWNERSHIP_RECOVERED: '跟单仓位所有权已恢复',
+  OWNERSHIP_AMBIGUOUS: '跟单仓位所有权待核验',
+  OWNERSHIP_GAP_FLAT_RETIRED: '所有权缺口已按实时空仓安全收尾',
+  SUPERSEDED_BY_RECOVERED_POSITION: '重复开仓意图已由恢复仓位取代',
   // v5.1 人工重入
   GUARD_MANUAL_REENTRY_SIGNAL: '人工重入信号（等待确认）',
   GUARD_MANUAL_REENTRY_CONFIRMED: '人工重入已确认（系统代执行）',
@@ -172,8 +177,10 @@ const gateLabels: Record<string, string> = {
 
 const baselineSourceLabels: Record<string, string> = {
   '': '真实跟随结果',
+  leader_fill: '领航员成交价',
   last_observed: '估算·待领航员历史补全',
   leader_history: '领航员公共历史校准',
+  missing: '缺少有效领航员离场价',
 }
 
 const localized = (labels: Record<string, string>, value: string) =>
@@ -2155,6 +2162,7 @@ export function CopyGuardPage() {
           <option value="FOLLOWING_REENTRY">重入跟随</option>
           <option value="LEADER_CLOSED">领航员平仓</option>
           <option value="LEADER_REVERSED">领航员反手</option>
+          <option value="DETACHED">跟随仓位已脱离</option>
           <option value="ATTEMPTS_EXHAUSTED">次数耗尽</option>
           <option value="WATCH_TIMEOUT">观察超时</option>
           <option value="CYCLE_LOSS_CAPPED">周期亏损熔断（历史）</option>
@@ -2263,6 +2271,12 @@ export function CopyGuardPage() {
           个周期的对账数据不可自动恢复，请查看日志并人工核对。
         </div>
       )}
+      {(summary?.ownership_ambiguous_count ?? 0) > 0 && (
+        <div className="border border-[#F6465D] bg-[#F6465D]/10 rounded-lg p-4 text-sm text-[#F6465D]">
+          高危：当前有 {summary?.ownership_ambiguous_count ?? 0}{' '}
+          个开放周期的跟单仓位所有权无法由强证据确认。系统已禁止自动认领和下单，并保留现有保护等待核验。
+        </div>
+      )}
       {(summary?.ignored_count ?? 0) > 0 && (
         <div className="border border-[#2B3139] bg-[#181A20] rounded-lg p-4 text-sm text-[#848E9C]">
           当前忽略 {summary?.ignored_count ?? 0} 个启用 v4
@@ -2348,6 +2362,14 @@ export function CopyGuardPage() {
         <Metric
           label="不可自动恢复"
           value={summary?.accounting_unrecoverable_count ?? 0}
+        />
+        <Metric
+          label="不可评分周期"
+          value={summary?.accounting_unscorable_count ?? 0}
+        />
+        <Metric
+          label="所有权待核验"
+          value={summary?.ownership_ambiguous_count ?? 0}
         />
         <Metric
           label="历史未验证"

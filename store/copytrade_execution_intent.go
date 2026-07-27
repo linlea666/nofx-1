@@ -18,6 +18,8 @@ const (
 	ExecutionIntentFailed          = "FAILED"
 	ExecutionIntentReconciling     = "RECONCILING"
 
+	ExecutionIntentCycleTerminatedBeforeSubmit = "CYCLE_TERMINATED_BEFORE_SUBMIT"
+
 	ExecutionOrderAttemptPrepared        = "PREPARED"
 	ExecutionOrderAttemptSubmitted       = "SUBMITTED"
 	ExecutionOrderAttemptPartiallyFilled = "PARTIALLY_FILLED"
@@ -813,6 +815,12 @@ func (s *CopyTradeStore) CommitDetachedLeaderTransition(intentID int64, traderID
 		return err
 	}
 	defer tx.Rollback()
+	var cycleID int64
+	if err = tx.QueryRow(`SELECT id FROM copy_guard_cycles
+		WHERE trader_id=? AND leader_pos_id=? AND closed_at IS NULL ORDER BY id DESC LIMIT 1`,
+		traderID, leaderPosID).Scan(&cycleID); err != nil && err != sql.ErrNoRows {
+		return err
+	}
 	res, err := tx.Exec(`UPDATE copy_trade_position_mappings
 		SET status='detached',last_known_size=?,source_revision=?,last_failure_reason=?,
 		    consecutive_fail_count=0,updated_at=CURRENT_TIMESTAMP
@@ -845,16 +853,15 @@ func (s *CopyTradeStore) CommitDetachedLeaderTransition(intentID int64, traderID
 	// analytics/AI lifecycle as unscorable; protective-order cleanup remains in
 	// the exchange reconciliation loop and must be terminally confirmed.
 	if _, err = tx.Exec(`UPDATE copy_guard_cycles
-		SET status=?,accounting_status='UNSCORABLE',
+		SET status=?,accounting_status=?,
 		    accounting_error=?,closed_at=COALESCE(closed_at,CURRENT_TIMESTAMP),updated_at=CURRENT_TIMESTAMP
-		WHERE trader_id=? AND leader_pos_id=? AND closed_at IS NULL`, CopyGuardDetached, reasonCode, traderID, leaderPosID); err != nil {
+		WHERE trader_id=? AND leader_pos_id=? AND closed_at IS NULL`, CopyGuardDetached, CopyGuardAccountingUnscorable, reasonCode, traderID, leaderPosID); err != nil {
 		return err
 	}
-	if _, err = tx.Exec(`UPDATE copy_guard_reentry_candidates
-		SET status='INVALIDATED',last_error=?,closed_at=COALESCE(closed_at,CURRENT_TIMESTAMP),updated_at=CURRENT_TIMESTAMP
-		WHERE trader_id=? AND leader_pos_id=? AND status IN ('WATCHING','REVIEWING','WAITING','ENTRY_PENDING','PAUSED')`,
-		reasonCode, traderID, leaderPosID); err != nil {
-		return err
+	if cycleID > 0 {
+		if err = terminalizeCopyGuardAuxiliaryStateTx(tx, cycleID, CopyGuardDetached); err != nil {
+			return err
+		}
 	}
 	if _, err = tx.Exec(`UPDATE copy_trade_source_transitions SET status='DETACHED',updated_at=CURRENT_TIMESTAMP WHERE intent_id=?`, intentID); err != nil {
 		return err

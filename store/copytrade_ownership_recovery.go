@@ -63,12 +63,30 @@ type RestoreMappingOwnershipRequest struct {
 	EntryIntentID    int64
 	FollowerQuantity float64
 	FollowerPosID    string
-	LeaderTargetSize float64
+	// CurrentLeaderSize is the latest healthy authoritative source size. It is
+	// used only to absorb missed risk increases; reductions remain actionable.
+	CurrentLeaderSize float64
+	LeaderStillOpen   bool
+	LeaderReversed    bool
 }
 
 type RestoreMappingOwnershipResult struct {
-	MappingRevision     int64
-	SupersededIntentIDs []int64
+	MappingRevision        int64
+	SupersededIntentIDs    []int64
+	HistoricalLeaderTarget float64
+	RestoredLeaderBaseline float64
+	PendingRiskReduction   bool
+}
+
+type ResolveFlatOwnershipGapRequest struct {
+	TraderID          string
+	LeaderPosID       string
+	CycleID           int64
+	EntryIntentID     int64
+	LeaderStillOpen   bool
+	LeaderReversed    bool
+	CurrentLeaderSize float64
+	ReasonCode        string
 }
 
 type ownershipGapQueryer interface {
@@ -196,7 +214,7 @@ func loadCopyTradeOwnershipGap(q ownershipGapQueryer, traderID string, cycleID i
 	}
 	err = q.QueryRow(`SELECT COALESCE(MIN(id),0),COALESCE(MAX(quantity),0)
 		FROM trader_positions
-		WHERE trader_id=? AND status='OPEN' AND UPPER(symbol)=UPPER(?)
+		WHERE trader_id=? AND UPPER(symbol)=UPPER(?)
 		  AND UPPER(side)=UPPER(?) AND entry_order_id=? AND quantity>0`,
 		traderID, executionSymbol, cycle.Side, gap.EntryOrderID).Scan(&gap.LocalPositionID, &gap.LocalPositionQuantity)
 	if err != nil {
@@ -275,43 +293,36 @@ func ownershipIntentHasNoExchangeSideEffect(x supersedableOwnershipIntent) bool 
 	return x.PositionConflict != 0 && strings.Contains(errText, "51603") && strings.Contains(errText, "order does not exist")
 }
 
-// RestoreConfirmedMappingOwnership atomically reopens the closed mapping and
-// consumes only contiguous, proven-no-side-effect duplicate open intents. It
-// does not place an order or manufacture a fill.
-func (s *CopyTradeStore) RestoreConfirmedMappingOwnership(req RestoreMappingOwnershipRequest) (*RestoreMappingOwnershipResult, error) {
-	if req.TraderID == "" || req.LeaderPosID == "" || req.CycleID <= 0 || req.EntryIntentID <= 0 || req.FollowerQuantity <= 0 {
-		return nil, fmt.Errorf("invalid mapping ownership recovery")
-	}
-	tx, err := s.db.Begin()
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-	gap, err := loadCopyTradeOwnershipGap(tx, req.TraderID, req.CycleID)
-	if err != nil {
-		return nil, err
-	}
-	if !gap.Recoverable || gap.EntryIntentID != req.EntryIntentID || gap.LeaderPosID != req.LeaderPosID {
-		return nil, fmt.Errorf("mapping ownership evidence changed: reason=%s", gap.ReasonCode)
+type ownershipIntentConsumption struct {
+	Revision            int64
+	HistoricalTarget    float64
+	SupersededIntentIDs []int64
+	SupersededEvents    []map[string]interface{}
+}
+
+// consumeSupersedableOwnershipIntentsTx advances only through contiguous
+// source revisions that are proven never to have reached the exchange. The
+// latest positive target is the last trustworthy source baseline before the
+// ownership gap was repaired.
+func consumeSupersedableOwnershipIntentsTx(tx *sql.Tx, gap *CopyTradeOwnershipGap) (*ownershipIntentConsumption, error) {
+	if tx == nil || gap == nil {
+		return nil, fmt.Errorf("invalid ownership intent consumption")
 	}
 	expectedAction := "open_long"
 	if strings.EqualFold(gap.Side, "short") {
 		expectedAction = "open_short"
 	}
-	pending, err := loadSupersedableOwnershipIntents(tx, req.TraderID, req.LeaderPosID, gap.MappingRevision)
+	pending, err := loadSupersedableOwnershipIntents(tx, gap.TraderID, gap.LeaderPosID, gap.MappingRevision)
 	if err != nil {
 		return nil, err
 	}
-	revision := gap.MappingRevision
-	leaderTarget := req.LeaderTargetSize
-	if leaderTarget <= 0 {
-		leaderTarget = gap.EntryIntentLeaderTarget
+	out := &ownershipIntentConsumption{
+		Revision:         gap.MappingRevision,
+		HistoricalTarget: gap.EntryIntentLeaderTarget,
 	}
-	result := &RestoreMappingOwnershipResult{}
-	var supersededEvents []map[string]interface{}
 	for _, intent := range pending {
-		if intent.Revision != revision+1 {
-			return nil, fmt.Errorf("%s: non-contiguous intent=%d revision=%d expected=%d", OwnershipGapUnsafeRevision, intent.ID, intent.Revision, revision+1)
+		if intent.Revision != out.Revision+1 {
+			return nil, fmt.Errorf("%s: non-contiguous intent=%d revision=%d expected=%d", OwnershipGapUnsafeRevision, intent.ID, intent.Revision, out.Revision+1)
 		}
 		if intent.Action != expectedAction {
 			return nil, fmt.Errorf("%s: intent=%d revision=%d action=%s", OwnershipGapUnsafeRevision, intent.ID, intent.Revision, intent.Action)
@@ -327,7 +338,7 @@ func (s *CopyTradeStore) RestoreConfirmedMappingOwnership(req RestoreMappingOwne
 		res, updateErr := tx.Exec(`UPDATE copy_trade_execution_intents SET
 			status='SKIPPED',reason_code=?,last_error=?,terminal_at=COALESCE(terminal_at,CURRENT_TIMESTAMP),updated_at=CURRENT_TIMESTAMP
 			WHERE id=? AND trader_id=? AND leader_pos_id=? AND source_revision=?`,
-			OwnershipRecoveredReason, detail, intent.ID, req.TraderID, req.LeaderPosID, intent.Revision)
+			OwnershipRecoveredReason, detail, intent.ID, gap.TraderID, gap.LeaderPosID, intent.Revision)
 		if updateErr != nil {
 			return nil, updateErr
 		}
@@ -350,15 +361,56 @@ func (s *CopyTradeStore) RestoreConfirmedMappingOwnership(req RestoreMappingOwne
 			gap.CycleID, gap.TraderID, OwnershipRecoveredReason, string(raw)); updateErr != nil {
 			return nil, updateErr
 		}
-		supersededEvents = append(supersededEvents, metadata)
-		revision = intent.Revision
-		if req.LeaderTargetSize <= 0 && intent.LeaderTargetSize > 0 {
-			leaderTarget = intent.LeaderTargetSize
+		out.SupersededEvents = append(out.SupersededEvents, metadata)
+		out.SupersededIntentIDs = append(out.SupersededIntentIDs, intent.ID)
+		out.Revision = intent.Revision
+		if intent.LeaderTargetSize > 0 {
+			out.HistoricalTarget = intent.LeaderTargetSize
 		}
-		result.SupersededIntentIDs = append(result.SupersededIntentIDs, intent.ID)
 	}
-	if leaderTarget <= 0 {
-		leaderTarget = gap.EntryIntentLeaderTarget
+	if out.HistoricalTarget <= 0 {
+		return nil, fmt.Errorf("%s: authoritative leader target is unavailable", OwnershipGapUnsafeRevision)
+	}
+	return out, nil
+}
+
+// RestoreConfirmedMappingOwnership atomically reopens the closed mapping and
+// consumes only contiguous, proven-no-side-effect duplicate open intents. It
+// does not place an order or manufacture a fill.
+func (s *CopyTradeStore) RestoreConfirmedMappingOwnership(req RestoreMappingOwnershipRequest) (*RestoreMappingOwnershipResult, error) {
+	if req.TraderID == "" || req.LeaderPosID == "" || req.CycleID <= 0 || req.EntryIntentID <= 0 || req.FollowerQuantity <= 0 ||
+		req.CurrentLeaderSize < 0 || (req.LeaderStillOpen && req.CurrentLeaderSize <= 0) ||
+		(req.LeaderStillOpen && req.LeaderReversed) {
+		return nil, fmt.Errorf("invalid mapping ownership recovery")
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	gap, err := loadCopyTradeOwnershipGap(tx, req.TraderID, req.CycleID)
+	if err != nil {
+		return nil, err
+	}
+	if !gap.Recoverable || gap.EntryIntentID != req.EntryIntentID || gap.LeaderPosID != req.LeaderPosID {
+		return nil, fmt.Errorf("mapping ownership evidence changed: reason=%s", gap.ReasonCode)
+	}
+	consumed, err := consumeSupersedableOwnershipIntentsTx(tx, gap)
+	if err != nil {
+		return nil, err
+	}
+	currentLeaderSize := req.CurrentLeaderSize
+	leaderStillOpen := req.LeaderStillOpen
+	leaderTarget := consumed.HistoricalTarget
+	if leaderStillOpen {
+		leaderTarget = riskSafeRecoveryBaseline(consumed.HistoricalTarget, currentLeaderSize)
+	}
+	result := &RestoreMappingOwnershipResult{
+		MappingRevision:        consumed.Revision,
+		SupersededIntentIDs:    consumed.SupersededIntentIDs,
+		HistoricalLeaderTarget: consumed.HistoricalTarget,
+		RestoredLeaderBaseline: leaderTarget,
+		PendingRiskReduction:   !leaderStillOpen || currentLeaderSize < consumed.HistoricalTarget,
 	}
 	res, err := tx.Exec(`UPDATE copy_trade_position_mappings SET
 		leader_id=?,symbol=?,source_symbol=CASE WHEN COALESCE(source_symbol,'')='' THEN ? ELSE source_symbol END,
@@ -371,7 +423,7 @@ func (s *CopyTradeStore) RestoreConfirmedMappingOwnership(req RestoreMappingOwne
 		reentry_used=CASE WHEN (SELECT status FROM copy_guard_cycles WHERE id=?)=? THEN 1 ELSE 0 END,
 		updated_at=CURRENT_TIMESTAMP
 		WHERE id=? AND trader_id=? AND leader_pos_id=? AND status='closed' AND COALESCE(source_revision,0)=?`,
-		gap.LeaderID, gap.Symbol, gap.Symbol, gap.Symbol, revision, gap.Side, gap.MarginMode, gap.CycleID,
+		gap.LeaderID, gap.Symbol, gap.Symbol, gap.Symbol, consumed.Revision, gap.Side, gap.MarginMode, gap.CycleID,
 		gap.FollowerEntryPrice, gap.FollowerNotional, leaderTarget,
 		gap.CycleID, CopyGuardFollowingReentry,
 		gap.MappingID, req.TraderID, req.LeaderPosID, gap.MappingRevision)
@@ -396,10 +448,14 @@ func (s *CopyTradeStore) RestoreConfirmedMappingOwnership(req RestoreMappingOwne
 	}
 	metadata := normalizeCopyGuardEventMetadata(gap.CycleID, gap.TraderID, "MAPPING_OWNERSHIP_RECOVERED", map[string]interface{}{
 		"leader_pos_id": gap.LeaderPosID, "entry_intent_id": gap.EntryIntentID,
-		"entry_order_id": gap.EntryOrderID, "mapping_revision": revision,
-		"superseded_intent_ids": result.SupersededIntentIDs,
-		"follower_quantity":     req.FollowerQuantity, "leader_target_size": leaderTarget,
-		"reason_code": "MAPPING_OWNERSHIP_RECOVERED",
+		"entry_order_id": gap.EntryOrderID, "mapping_revision": consumed.Revision,
+		"superseded_intent_ids":    result.SupersededIntentIDs,
+		"follower_quantity":        req.FollowerQuantity,
+		"historical_leader_target": consumed.HistoricalTarget,
+		"leader_current_size":      currentLeaderSize, "leader_target_size": leaderTarget,
+		"leader_reversed":        req.LeaderReversed,
+		"pending_risk_reduction": result.PendingRiskReduction,
+		"reason_code":            "MAPPING_OWNERSHIP_RECOVERED",
 	})
 	raw, _ := json.Marshal(metadata)
 	if _, err = tx.Exec(`INSERT INTO copy_guard_events(cycle_id,trader_id,type,quantity,metadata_json) VALUES(?,?,?,?,?)`, gap.CycleID, gap.TraderID, "MAPPING_OWNERSHIP_RECOVERED", req.FollowerQuantity, string(raw)); err != nil {
@@ -408,8 +464,7 @@ func (s *CopyTradeStore) RestoreConfirmedMappingOwnership(req RestoreMappingOwne
 	if err = tx.Commit(); err != nil {
 		return nil, err
 	}
-	result.MappingRevision = revision
-	for _, eventMetadata := range supersededEvents {
+	for _, eventMetadata := range consumed.SupersededEvents {
 		s.mirrorGuardEventToCopyEvents(gap.CycleID, gap.TraderID, OwnershipRecoveredReason, 0, 0, 0, 0, eventMetadata)
 	}
 	s.mirrorGuardEventToCopyEvents(gap.CycleID, gap.TraderID, "MAPPING_OWNERSHIP_RECOVERED", 0, req.FollowerQuantity, gap.FollowerNotional, 0, metadata)
@@ -419,28 +474,44 @@ func (s *CopyTradeStore) RestoreConfirmedMappingOwnership(req RestoreMappingOwne
 // MarkCopyGuardOwnershipAmbiguous makes an unsafe ownership gap explicit while
 // keeping the trading lifecycle open for later evidence/recovery. Repeated
 // identical observations are idempotent and do not spam the event timeline.
-func (s *CopyTradeStore) MarkCopyGuardOwnershipAmbiguous(cycleID int64, traderID, reason string) (bool, error) {
-	if cycleID <= 0 || traderID == "" || strings.TrimSpace(reason) == "" {
+func (s *CopyTradeStore) MarkCopyGuardOwnershipAmbiguous(cycleID int64, traderID, reasonCode, detail string) (bool, error) {
+	reasonCode = strings.TrimSpace(reasonCode)
+	detail = strings.TrimSpace(detail)
+	if cycleID <= 0 || traderID == "" || reasonCode == "" {
 		return false, fmt.Errorf("invalid ambiguous ownership gap")
 	}
-	message := "OWNERSHIP_AMBIGUOUS: " + reason
+	message := "OWNERSHIP_AMBIGUOUS:" + reasonCode
+	if detail != "" {
+		message += ": " + detail
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return false, err
 	}
 	defer tx.Rollback()
-	res, err := tx.Exec(`UPDATE copy_guard_cycles SET accounting_status='UNSCORABLE',accounting_error=?,updated_at=CURRENT_TIMESTAMP
-		WHERE id=? AND trader_id=? AND closed_at IS NULL
-		  AND (accounting_status<>'UNSCORABLE' OR COALESCE(accounting_error,'')<>?)`, message, cycleID, traderID, message)
-	if err != nil {
+	var priorStatus, priorError string
+	if err = tx.QueryRow(`SELECT accounting_status,COALESCE(accounting_error,'')
+		FROM copy_guard_cycles WHERE id=? AND trader_id=? AND closed_at IS NULL`, cycleID, traderID).Scan(&priorStatus, &priorError); err != nil {
 		return false, err
 	}
-	changed, _ := res.RowsAffected()
-	if changed == 0 {
+	prefix := "OWNERSHIP_AMBIGUOUS:"
+	priorCode := ""
+	if strings.HasPrefix(priorError, prefix) {
+		priorCode = strings.TrimSpace(strings.SplitN(strings.TrimPrefix(priorError, prefix), ":", 2)[0])
+	}
+	reasonChanged := priorStatus != CopyGuardAccountingUnscorable || priorCode != reasonCode
+	if priorStatus == CopyGuardAccountingUnscorable && priorError == message {
+		return false, tx.Commit()
+	}
+	if _, err = tx.Exec(`UPDATE copy_guard_cycles SET accounting_status=?,accounting_error=?,updated_at=CURRENT_TIMESTAMP
+		WHERE id=? AND trader_id=? AND closed_at IS NULL`, CopyGuardAccountingUnscorable, message, cycleID, traderID); err != nil {
+		return false, err
+	}
+	if !reasonChanged {
 		return false, tx.Commit()
 	}
 	metadata := normalizeCopyGuardEventMetadata(cycleID, traderID, "OWNERSHIP_AMBIGUOUS", map[string]interface{}{
-		"reason_code": "OWNERSHIP_AMBIGUOUS", "reason": reason,
+		"reason_code": reasonCode, "detail": detail,
 	})
 	raw, _ := json.Marshal(metadata)
 	if _, err = tx.Exec(`INSERT INTO copy_guard_events(cycle_id,trader_id,type,metadata_json) VALUES(?,?,?,?)`, cycleID, traderID, "OWNERSHIP_AMBIGUOUS", string(raw)); err != nil {
@@ -453,50 +524,113 @@ func (s *CopyTradeStore) MarkCopyGuardOwnershipAmbiguous(cycleID int64, traderID
 	return true, nil
 }
 
-// CloseCopyGuardOwnershipGapFlat retires an orphan lifecycle after the caller
-// has freshly proved the follower position is flat and terminally retired its
-// protective order. It never records a stop fill or fabricates PnL.
-func (s *CopyTradeStore) CloseCopyGuardOwnershipGapFlat(cycleID int64, traderID, reason string) error {
-	if cycleID <= 0 || traderID == "" {
-		return fmt.Errorf("invalid flat ownership gap")
+// ResolveConfirmedOwnershipGapFlat consumes only safe duplicate-open intents
+// after the caller has freshly proved the follower position is flat and every
+// protective order is terminal. A still-open leader becomes detached so the
+// old lifecycle cannot be reopened; a closed leader remains open only long
+// enough for the normal LEADER_CLOSED accounting path to finish it.
+func (s *CopyTradeStore) ResolveConfirmedOwnershipGapFlat(req ResolveFlatOwnershipGapRequest) (*RestoreMappingOwnershipResult, error) {
+	if req.TraderID == "" || req.LeaderPosID == "" || req.CycleID <= 0 || req.EntryIntentID <= 0 ||
+		req.CurrentLeaderSize < 0 || (req.LeaderStillOpen && req.CurrentLeaderSize <= 0) ||
+		(req.LeaderStillOpen && req.LeaderReversed) {
+		return nil, fmt.Errorf("invalid flat ownership gap resolution")
 	}
-	if strings.TrimSpace(reason) == "" {
-		reason = OwnershipGapFollowerAlreadyFlat
+	if strings.TrimSpace(req.ReasonCode) == "" {
+		req.ReasonCode = OwnershipGapFollowerAlreadyFlat
 	}
 	tx, err := s.db.Begin()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer tx.Rollback()
-	res, err := tx.Exec(`UPDATE copy_guard_cycles SET status=?,accounting_status='UNSCORABLE',accounting_error=?,
-		protection_status='CANCELED',protection_coverage=0,closed_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP
-		WHERE id=? AND trader_id=? AND closed_at IS NULL`, CopyGuardDetached, reason, cycleID, traderID)
+	gap, err := loadCopyTradeOwnershipGap(tx, req.TraderID, req.CycleID)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if n, _ := res.RowsAffected(); n != 1 {
-		return fmt.Errorf("flat ownership gap is no longer open")
+	if !gap.Recoverable || gap.EntryIntentID != req.EntryIntentID || gap.LeaderPosID != req.LeaderPosID {
+		return nil, fmt.Errorf("flat ownership evidence changed: reason=%s", gap.ReasonCode)
 	}
-	if _, err = tx.Exec(`UPDATE copy_guard_attempts SET status='DETACHED',closed_at=COALESCE(closed_at,CURRENT_TIMESTAMP) WHERE cycle_id=? AND status='OPEN'`, cycleID); err != nil {
-		return err
+	consumed, err := consumeSupersedableOwnershipIntentsTx(tx, gap)
+	if err != nil {
+		return nil, err
 	}
-	if _, err = tx.Exec(`UPDATE copy_guard_manual_reentry_signals SET status=?,error=? WHERE cycle_id=? AND status=?`, ManualReentryStatusInvalidated, reason, cycleID, ManualReentryStatusPending); err != nil {
-		return err
+	result := &RestoreMappingOwnershipResult{
+		MappingRevision:        consumed.Revision,
+		SupersededIntentIDs:    consumed.SupersededIntentIDs,
+		HistoricalLeaderTarget: consumed.HistoricalTarget,
 	}
-	if _, err = tx.Exec(`UPDATE copy_guard_reentry_candidates SET status=?,last_error=?,closed_at=COALESCE(closed_at,CURRENT_TIMESTAMP),updated_at=CURRENT_TIMESTAMP WHERE cycle_id=? AND status IN (?,?,?,?,?)`, ReentryCandidateInvalidated, reason, cycleID, ReentryCandidateWatching, ReentryCandidateReviewing, ReentryCandidateWaiting, ReentryCandidateEntryPending, ReentryCandidatePaused); err != nil {
-		return err
+	terminalStatus := CopyGuardLeaderClosed
+	if req.LeaderReversed {
+		terminalStatus = CopyGuardLeaderReversed
 	}
-	if _, err = tx.Exec(`UPDATE copy_guard_risk_reservations SET status='RELEASED',released_at=CURRENT_TIMESTAMP WHERE cycle_id=? AND status IN ('ACTIVE','CONSUMED')`, cycleID); err != nil {
-		return err
+	if req.LeaderStillOpen {
+		terminalStatus = CopyGuardDetached
+		result.RestoredLeaderBaseline = req.CurrentLeaderSize
+		res, updateErr := tx.Exec(`UPDATE copy_trade_position_mappings SET
+			status='detached',source_revision=?,last_known_size=?,closed_at=NULL,close_price=0,
+			last_failure_reason=?,consecutive_fail_count=0,updated_at=CURRENT_TIMESTAMP
+			WHERE id=? AND trader_id=? AND leader_pos_id=? AND status='closed' AND COALESCE(source_revision,0)=?`,
+			consumed.Revision, req.CurrentLeaderSize, req.ReasonCode,
+			gap.MappingID, req.TraderID, req.LeaderPosID, gap.MappingRevision)
+		if updateErr != nil {
+			return nil, updateErr
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			return nil, fmt.Errorf("flat ownership resolution lost mapping race")
+		}
+		if _, err = tx.Exec(`UPDATE copy_guard_cycles SET
+			status=?,accounting_status=?,accounting_error=?,protection_status='CANCELED',protection_coverage=0,
+			closed_at=COALESCE(closed_at,CURRENT_TIMESTAMP),updated_at=CURRENT_TIMESTAMP
+			WHERE id=? AND trader_id=? AND closed_at IS NULL`,
+			CopyGuardDetached, CopyGuardAccountingUnscorable, req.ReasonCode, req.CycleID, req.TraderID); err != nil {
+			return nil, err
+		}
+		if _, err = tx.Exec(`UPDATE copy_guard_attempts SET status='DETACHED',closed_at=COALESCE(closed_at,CURRENT_TIMESTAMP)
+			WHERE cycle_id=? AND status='OPEN'`, req.CycleID); err != nil {
+			return nil, err
+		}
+	} else {
+		res, updateErr := tx.Exec(`UPDATE copy_trade_position_mappings SET
+			source_revision=?,last_known_size=0,updated_at=CURRENT_TIMESTAMP
+			WHERE id=? AND trader_id=? AND leader_pos_id=? AND status='closed' AND COALESCE(source_revision,0)=?`,
+			consumed.Revision, gap.MappingID, req.TraderID, req.LeaderPosID, gap.MappingRevision)
+		if updateErr != nil {
+			return nil, updateErr
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			return nil, fmt.Errorf("flat ownership resolution lost mapping race")
+		}
+		if _, err = tx.Exec(`UPDATE copy_guard_cycles SET protection_status='CANCELED',protection_coverage=0,updated_at=CURRENT_TIMESTAMP
+			WHERE id=? AND trader_id=? AND closed_at IS NULL`, req.CycleID, req.TraderID); err != nil {
+			return nil, err
+		}
 	}
-	metadata := normalizeCopyGuardEventMetadata(cycleID, traderID, "OWNERSHIP_GAP_FLAT_RETIRED", map[string]interface{}{"reason_code": reason})
+	if err = terminalizeCopyGuardAuxiliaryStateTx(tx, req.CycleID, terminalStatus); err != nil {
+		return nil, err
+	}
+	metadata := normalizeCopyGuardEventMetadata(req.CycleID, req.TraderID, "OWNERSHIP_GAP_FLAT_RETIRED", map[string]interface{}{
+		"reason_code": req.ReasonCode, "leader_pos_id": req.LeaderPosID,
+		"leader_open": req.LeaderStillOpen, "leader_current_size": req.CurrentLeaderSize,
+		"leader_reversed":  req.LeaderReversed,
+		"mapping_revision": consumed.Revision, "superseded_intent_ids": consumed.SupersededIntentIDs,
+	})
 	raw, _ := json.Marshal(metadata)
-	if _, err = tx.Exec(`INSERT INTO copy_guard_events(cycle_id,trader_id,type,metadata_json) VALUES(?,?,?,?)`, cycleID, traderID, "OWNERSHIP_GAP_FLAT_RETIRED", string(raw)); err != nil {
-		return err
+	eventRes, err := tx.Exec(`INSERT INTO copy_guard_events(cycle_id,trader_id,type,metadata_json)
+		SELECT ?,?,?,? WHERE NOT EXISTS (
+			SELECT 1 FROM copy_guard_events WHERE cycle_id=? AND type='OWNERSHIP_GAP_FLAT_RETIRED'
+		)`, req.CycleID, req.TraderID, "OWNERSHIP_GAP_FLAT_RETIRED", string(raw), req.CycleID)
+	if err != nil {
+		return nil, err
 	}
+	eventInserted, _ := eventRes.RowsAffected()
 	if err = tx.Commit(); err != nil {
-		return err
+		return nil, err
 	}
-	s.mirrorGuardEventToCopyEvents(cycleID, traderID, "OWNERSHIP_GAP_FLAT_RETIRED", 0, 0, 0, 0, metadata)
-	return nil
+	for _, eventMetadata := range consumed.SupersededEvents {
+		s.mirrorGuardEventToCopyEvents(gap.CycleID, gap.TraderID, OwnershipRecoveredReason, 0, 0, 0, 0, eventMetadata)
+	}
+	if eventInserted == 1 {
+		s.mirrorGuardEventToCopyEvents(req.CycleID, req.TraderID, "OWNERSHIP_GAP_FLAT_RETIRED", 0, 0, 0, 0, metadata)
+	}
+	return result, nil
 }

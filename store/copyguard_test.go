@@ -207,6 +207,118 @@ func TestCopyGuardSummaryExcludesMissingBaselineFromEffect(t *testing.T) {
 	}
 }
 
+func TestCopyGuardSummaryCountsUnscorableOwnershipRisk(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "copyguard-unscorable-summary.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&CopyGuardCycle{
+		TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "ownership-ambiguous",
+		Symbol: "BTCUSDT", Side: "long", MarginMode: "cross", Status: CopyGuardFollowing,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = st.DB().Exec(`UPDATE copy_guard_cycles SET accounting_status=?,accounting_error=? WHERE id=?`,
+		CopyGuardAccountingUnscorable, "OWNERSHIP_AMBIGUOUS:FOLLOWER_POSITION_UNAVAILABLE: transient detail", cycle.ID); err != nil {
+		t.Fatal(err)
+	}
+	summary, err := st.CopyTrade().CopyGuardSummary([]string{"trader-1"}, time.Now().Add(-time.Hour), time.Now().Add(time.Hour), CopyGuardFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.AccountingUnscorableCount != 1 || summary.OwnershipAmbiguousCount != 1 {
+		t.Fatalf("ownership accounting risk missing from summary: %+v", summary)
+	}
+	if _, err = st.DB().Exec(`UPDATE copy_guard_cycles SET closed_at=CURRENT_TIMESTAMP WHERE id=?`, cycle.ID); err != nil {
+		t.Fatal(err)
+	}
+	summary, err = st.CopyTrade().CopyGuardSummary([]string{"trader-1"}, time.Now().Add(-time.Hour), time.Now().Add(time.Hour), CopyGuardFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.AccountingUnscorableCount != 1 || summary.OwnershipAmbiguousCount != 0 {
+		t.Fatalf("closed ambiguity should remain unscorable but not current high risk: %+v", summary)
+	}
+}
+
+func TestCycleTerminationFailsOnlyProvablyPreSubmitAIIntent(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "copyguard-terminal-boundary.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cs := st.CopyTrade()
+	cycle, err := cs.EnsureCopyGuardCycle(&CopyGuardCycle{
+		TraderID: "trader-a", LeaderID: "leader", LeaderPosID: "position-a",
+		Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", Status: CopyGuardFollowing,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manual, err := cs.SaveManualReentrySignal(&CopyGuardManualReentrySignal{
+		CycleID: cycle.ID, TraderID: "trader-a", LeaderPosID: "position-a",
+		Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", TriggerPrice: 2000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = st.ReentryAI().EnsureReentryCandidate(&CopyGuardReentryCandidate{
+		CycleID: cycle.ID, TraderID: "trader-a", LeaderPosID: "position-a",
+		Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", Status: ReentryCandidateWatching,
+	}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	preSubmit, claimed, err := cs.ReserveExecutionIntent(&CopyTradeExecutionIntent{
+		TraderID: "trader-a", LeaderPosID: "position-a", SourceRevision: 10,
+		SourceKind: "AI_REENTRY", CanonicalKey: "ai|terminal|pre", CycleID: cycle.ID,
+		CandidateID: 1, AnalysisID: 1, AttemptNo: 1, DecisionGeneration: 1,
+		Action: "open_long", Symbol: "ETHUSDT", Side: "long", MarginMode: "cross",
+	})
+	if err != nil || !claimed {
+		t.Fatalf("reserve pre-submit AI intent claimed=%v err=%v", claimed, err)
+	}
+	durable, claimed, err := cs.ReserveExecutionIntent(&CopyTradeExecutionIntent{
+		TraderID: "trader-a", LeaderPosID: "position-a", SourceRevision: 11,
+		SourceKind: "AI_REENTRY", CanonicalKey: "ai|terminal|durable", CycleID: cycle.ID,
+		CandidateID: 1, AnalysisID: 1, AttemptNo: 2, DecisionGeneration: 1,
+		Action: "open_long", Symbol: "ETHUSDT", Side: "long", MarginMode: "cross",
+	})
+	if err != nil || !claimed {
+		t.Fatalf("reserve durable AI intent claimed=%v err=%v", claimed, err)
+	}
+	if _, err = cs.PrepareExecutionOrderAttempt(durable.ID, "durable-order-attempt", 0.01); err != nil {
+		t.Fatal(err)
+	}
+	if err = st.ReentryAI().ReserveCopyGuardRisk("trader-a", cycle.ID, 0, 2, 100, .02, .05, .08); err != nil {
+		t.Fatal(err)
+	}
+	if err = cs.CloseCopyGuardCycle(cycle.ID, CopyGuardLeaderClosed, 0, 0, 0, 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	preSubmit, err = cs.GetExecutionIntentByID(preSubmit.ID)
+	if err != nil || preSubmit.Status != ExecutionIntentFailed || preSubmit.ReasonCode != ExecutionIntentCycleTerminatedBeforeSubmit {
+		t.Fatalf("provably pre-submit intent was not terminalized: intent=%+v err=%v", preSubmit, err)
+	}
+	durable, err = cs.GetExecutionIntentByID(durable.ID)
+	if err != nil || durable.Status == ExecutionIntentFailed {
+		t.Fatalf("durable/uncertain intent was guessed terminal: intent=%+v err=%v", durable, err)
+	}
+	manual, err = cs.GetManualReentrySignal(manual.ID)
+	if err != nil || manual.Status != ManualReentryStatusInvalidated {
+		t.Fatalf("manual signal survived terminal cycle: signal=%+v err=%v", manual, err)
+	}
+	candidate, err := st.ReentryAI().GetReentryCandidateByCycle(cycle.ID)
+	if err != nil || candidate.Status != ReentryCandidateInvalidated {
+		t.Fatalf("AI candidate survived terminal cycle: candidate=%+v err=%v", candidate, err)
+	}
+	usage, err := st.ReentryAI().GetCopyGuardRiskUsage("trader-a", cycle.ID)
+	if err != nil || usage.CycleUsedUSD != 0 || usage.PortfolioUsedUSD != 0 {
+		t.Fatalf("terminal cycle leaked risk reservation: usage=%+v err=%v", usage, err)
+	}
+}
+
 func TestCopyGuardProtectionRetryIsAtomic(t *testing.T) {
 	st, err := New(filepath.Join(t.TempDir(), "copyguard-retry.db"))
 	if err != nil {

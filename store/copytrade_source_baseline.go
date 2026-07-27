@@ -15,6 +15,16 @@ type CopyTradeBaselinePosition struct {
 	Size        float64
 }
 
+// riskSafeRecoveryBaseline absorbs only source changes that would increase
+// follower exposure. A reduction remains visible to the next authoritative
+// diff and therefore cannot be silently rebaselined away.
+func riskSafeRecoveryBaseline(previous, current float64) float64 {
+	if current > previous {
+		return current
+	}
+	return previous
+}
+
 func (s *CopyTradeStore) initSourceBaselineTable() error {
 	_, err := s.db.Exec(`
 		CREATE TABLE IF NOT EXISTS copy_trade_source_baselines (
@@ -115,8 +125,11 @@ func (s *CopyTradeStore) RebaselineSourceRecovery(traderID, leaderID string, pos
 			`, traderID, position.LeaderPosID, leaderID, position.Symbol, position.Side, position.MarginMode, position.Size)
 		case err != nil:
 			return err
-		case status == MappingStatusActive && position.Size > lastKnown:
-			_, err = tx.Exec(`UPDATE copy_trade_position_mappings SET last_known_size=?,source_revision=COALESCE(source_revision, 0) + 1,updated_at=CURRENT_TIMESTAMP WHERE trader_id=? AND leader_pos_id=? AND status='active'`, position.Size, traderID, position.LeaderPosID)
+		case status == MappingStatusActive:
+			baseline := riskSafeRecoveryBaseline(lastKnown, position.Size)
+			if baseline > lastKnown {
+				_, err = tx.Exec(`UPDATE copy_trade_position_mappings SET last_known_size=?,source_revision=COALESCE(source_revision, 0) + 1,updated_at=CURRENT_TIMESTAMP WHERE trader_id=? AND leader_pos_id=? AND status='active'`, baseline, traderID, position.LeaderPosID)
+			}
 		}
 		if err != nil {
 			return err

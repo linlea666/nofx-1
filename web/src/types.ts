@@ -884,6 +884,8 @@ export interface CopyGuardSummary {
   accounting_pending_count: number
   accounting_delayed_count: number
   accounting_unrecoverable_count: number
+  accounting_unscorable_count: number
+  ownership_ambiguous_count: number
   legacy_unverified_count: number
   average_coverage: number
   ignored_count: number
@@ -955,9 +957,15 @@ export interface CopyGuardCycle {
     | 'RECONCILED'
     | 'DELAYED'
     | 'UNRECOVERABLE'
+    | 'UNSCORABLE'
     | 'LEGACY_UNVERIFIED'
   accounting_error: string
-  baseline_source: '' | 'last_observed' | 'leader_history'
+  baseline_source:
+    | ''
+    | 'leader_fill'
+    | 'leader_history'
+    | 'last_observed'
+    | 'missing'
   fees: number
   funding_fee: number
   liquidation_penalty: number

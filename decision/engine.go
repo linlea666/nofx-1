@@ -179,6 +179,9 @@ type Decision struct {
 	ExecutionSymbol       string  `json:"execution_symbol,omitempty"`
 	ValueCurrency         string  `json:"value_currency,omitempty"`
 	ExecutionSettleAsset  string  `json:"execution_settle_asset,omitempty"`
+	// LeaderReversed is internal execution context for lifecycle attribution.
+	// It is deliberately excluded from JSON/API payloads.
+	LeaderReversed bool `json:"-"`
 
 	// SourceFillIDs contains every source fill collapsed into this normalized
 	// leader transition. SourceFillID remains the compatibility/primary id.

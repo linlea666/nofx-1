@@ -131,7 +131,7 @@ func TestRestoreConfirmedMappingOwnershipRepairsLegacyRevisionGap(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.MappingRevision != 3 || len(result.SupersededIntentIDs) != 1 || result.SupersededIntentIDs[0] != f.duplicateIntent.ID {
+	if result.MappingRevision != 3 || len(result.SupersededIntentIDs) != 1 || result.SupersededIntentIDs[0] != f.duplicateIntent.ID || !result.PendingRiskReduction {
 		t.Fatalf("unexpected recovery result: %+v", result)
 	}
 	mapping, err := cs.GetActiveMapping(f.traderID, f.leaderPosID)
@@ -253,16 +253,57 @@ func TestRestoreConfirmedMappingOwnershipSupportsShortIsolatedLifecycle(t *testi
 	}
 }
 
-func TestCloseCopyGuardOwnershipGapFlatIsUnscorableAndTerminal(t *testing.T) {
+func TestOwnershipAmbiguityDeduplicatesDynamicDetailByStableReason(t *testing.T) {
 	f := newOwnershipRecoveryFixture(t, true)
-	if err := f.store.CopyTrade().CloseCopyGuardOwnershipGapFlat(f.cycle.ID, f.traderID, OwnershipGapFollowerAlreadyFlat); err != nil {
+	cs := f.store.CopyTrade()
+	changed, err := cs.MarkCopyGuardOwnershipAmbiguous(f.cycle.ID, f.traderID, "FOLLOWER_POSITION_UNAVAILABLE", "request_id=one")
+	if err != nil || !changed {
+		t.Fatalf("first ambiguity reason was not persisted: changed=%v err=%v", changed, err)
+	}
+	changed, err = cs.MarkCopyGuardOwnershipAmbiguous(f.cycle.ID, f.traderID, "FOLLOWER_POSITION_UNAVAILABLE", "request_id=two")
+	if err != nil || changed {
+		t.Fatalf("dynamic detail created a duplicate state transition: changed=%v err=%v", changed, err)
+	}
+	cycle, err := cs.GetCopyGuardCycle(f.cycle.ID)
+	if err != nil || !strings.Contains(cycle.AccountingError, "request_id=two") {
+		t.Fatalf("latest ambiguity detail was not retained: cycle=%+v err=%v", cycle, err)
+	}
+	changed, err = cs.MarkCopyGuardOwnershipAmbiguous(f.cycle.ID, f.traderID, "SOURCE_SNAPSHOT_UNAVAILABLE", "")
+	if err != nil || !changed {
+		t.Fatalf("reason-code transition was not recorded: changed=%v err=%v", changed, err)
+	}
+	var events int
+	if err = f.store.DB().QueryRow(`SELECT COUNT(*) FROM copy_guard_events WHERE cycle_id=? AND type='OWNERSHIP_AMBIGUOUS'`, f.cycle.ID).Scan(&events); err != nil {
 		t.Fatal(err)
 	}
-	cycle, err := f.store.CopyTrade().GetCopyGuardCycle(f.cycle.ID)
-	if err != nil {
+	if events != 2 {
+		t.Fatalf("stable ambiguity reasons should produce two transitions, got %d", events)
+	}
+}
+
+func TestFlatOwnershipResolutionIsIdempotentBeforeLeaderAccounting(t *testing.T) {
+	f := newOwnershipRecoveryFixture(t, true)
+	req := ResolveFlatOwnershipGapRequest{
+		TraderID: f.traderID, LeaderPosID: f.leaderPosID, CycleID: f.cycle.ID,
+		EntryIntentID: f.entryIntent.ID, LeaderStillOpen: false,
+		ReasonCode: OwnershipGapFollowerAlreadyFlat,
+	}
+	first, err := f.store.CopyTrade().ResolveConfirmedOwnershipGapFlat(req)
+	if err != nil || first.MappingRevision != 3 || len(first.SupersededIntentIDs) != 1 {
+		t.Fatalf("first flat resolution failed: result=%+v err=%v", first, err)
+	}
+	second, err := f.store.CopyTrade().ResolveConfirmedOwnershipGapFlat(req)
+	if err != nil || second.MappingRevision != 3 || len(second.SupersededIntentIDs) != 0 {
+		t.Fatalf("flat resolution was not restart-idempotent: result=%+v err=%v", second, err)
+	}
+	var flatEvents, supersededEvents int
+	if err = f.store.DB().QueryRow(`SELECT COUNT(*) FROM copy_guard_events WHERE cycle_id=? AND type='OWNERSHIP_GAP_FLAT_RETIRED'`, f.cycle.ID).Scan(&flatEvents); err != nil {
 		t.Fatal(err)
 	}
-	if cycle.Status != CopyGuardDetached || cycle.AccountingStatus != "UNSCORABLE" || cycle.ClosedAt == nil || cycle.AccountingError != OwnershipGapFollowerAlreadyFlat {
-		t.Fatalf("flat ownership gap was not terminally retired: %+v", cycle)
+	if err = f.store.DB().QueryRow(`SELECT COUNT(*) FROM copy_guard_events WHERE cycle_id=? AND type=?`, f.cycle.ID, OwnershipRecoveredReason).Scan(&supersededEvents); err != nil {
+		t.Fatal(err)
+	}
+	if flatEvents != 1 || supersededEvents != 1 {
+		t.Fatalf("idempotent flat resolution duplicated audit events: flat=%d superseded=%d", flatEvents, supersededEvents)
 	}
 }

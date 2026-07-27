@@ -295,6 +295,9 @@ func TestPositionSnapshotSerializesSameIDDirectionReversal(t *testing.T) {
 				closeOld[0].Size != 0.02 {
 				t.Fatalf("direction reversal must close old long lifecycle first: %+v", closeOld[0])
 			}
+			if !sourceFillMarksLeaderReversal(closeOld[0].ID) {
+				t.Fatalf("direction reversal source identity lost durable attribution: %s", closeOld[0].ID)
+			}
 
 			// Until the old lifecycle is durably committed, every poll must
 			// retain the same close identity and must not emit the new open.
