@@ -14,6 +14,16 @@ func (m *quantityResolverMock) ResolveExecutionInstrument(string) (*ExecutionIns
 	return &ExecutionInstrument{BaseQuantityStep: 0.01, MinBaseQuantity: 0.01}, nil
 }
 
+type minimumQuantityResolverMock struct{ Trader }
+
+func (m *minimumQuantityResolverMock) ResolveExecutionInstrument(string) (*ExecutionInstrument, error) {
+	return &ExecutionInstrument{
+		BaseQuantityStep: 0.01,
+		MinBaseQuantity:  0.01,
+		MinNotional:      10,
+	}, nil
+}
+
 func TestQuantizeOrderIntentDirectionalPolicy(t *testing.T) {
 	inst := &ExecutionInstrument{BaseQuantityStep: 0.01, MinBaseQuantity: 0.01}
 	increase, err := QuantizeOrderIntent(inst, 0.366, QuantityRiskIncrease)
@@ -64,7 +74,10 @@ func TestQuantizeOrderIntentAtPriceUsesVenueMinimumByAction(t *testing.T) {
 		t.Fatalf("initial open must promote exactly to exchange minimum: %+v", open)
 	}
 	if _, err := QuantizeOrderIntentAtPrice(inst, 0.06, 100, QuantityAdd); !errors.Is(err, ErrQuantityBelowMinimum) {
-		t.Fatalf("small add must be skipped, got %v", err)
+		t.Fatalf("small add must remain unsubmitted for later reconciliation, got %v", err)
+	}
+	if _, err := QuantizeOrderIntentAtPrice(inst, 0.099, 100, QuantityCatchup); !errors.Is(err, ErrQuantityBelowMinimum) {
+		t.Fatalf("catch-up must never be promoted to the venue minimum and overbuy, got %v", err)
 	}
 	closeQty, err := QuantizeOrderIntentAtPrice(inst, 0.06, 100, QuantityFinalClose)
 	if err != nil || closeQty.Quantized != 0.06 {
@@ -84,15 +97,26 @@ func TestMinimumExecutableQuantityCeilsNotionalToStep(t *testing.T) {
 	}
 }
 
-func TestAutoTraderUsesReservedCopyQuantityExactlyOnce(t *testing.T) {
+func TestAutoTraderQuantizesConcreteAttemptWithoutRestoringReservedTarget(t *testing.T) {
 	at := &AutoTrader{trader: &quantityResolverMock{}}
 	dec := &decision.Decision{Symbol: "BTCUSDT", RequestedQuantity: 0.366, QuantizedQuantity: 0.37, QuantityStepOverride: true}
 	got, err := at.quantizeCopyOpenQuantity(dec, 100, 0.369, true)
 	if err != nil || got != 0.37 || !dec.QuantityStepOverride {
-		t.Fatalf("reserved quantity was re-quantized: got=%v decision=%+v err=%v", got, dec, err)
+		t.Fatalf("concrete executable attempt was not quantized independently: got=%v decision=%+v err=%v", got, dec, err)
 	}
 	retry, err := at.quantizeCopyOpenQuantity(dec, 100, got*0.5, false)
 	if err != nil || retry != 0.19 {
 		t.Fatalf("explicit retry must quantize its new request: got=%v err=%v", retry, err)
+	}
+}
+
+func TestMarginReducedInitialAttemptNeverPromotesAboveAffordableQuantity(t *testing.T) {
+	at := &AutoTrader{trader: &minimumQuantityResolverMock{}}
+	dec := &decision.Decision{
+		Symbol: "BTCUSDT", CopyTradeAction: "open",
+		TargetPositionSizeUSD: 10, PositionSizeUSD: 6,
+	}
+	if _, err := at.quantizeCopyOpenQuantity(dec, 100, .06, true); !errors.Is(err, ErrQuantityBelowMinimum) {
+		t.Fatalf("margin-reduced initial attempt must wait below venue minimum instead of overbuying: %v", err)
 	}
 }

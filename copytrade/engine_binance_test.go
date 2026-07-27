@@ -982,6 +982,47 @@ func TestOKXProportionalSizingUsesTotalEquityNotAvailableBalance(t *testing.T) {
 	}
 }
 
+func TestProportionalSizingUsesTotalEquityAcrossProviderFamilies(t *testing.T) {
+	tests := []struct {
+		name       string
+		provider   ProviderType
+		sourceMode BinanceSourceMode
+	}{
+		{"binance copy portfolio", ProviderBinance, BinanceSourceCopyManagement},
+		{"binance smart money", ProviderBinance, BinanceSourceSmartMoney},
+		{"okx", ProviderOKX, ""},
+		{"hyperliquid", ProviderHyperliquid, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e, _ := newTestCopyTradeEngine(t, tt.provider)
+			e.config.CopyRatio = 1
+			e.config.BinanceSourceMode = tt.sourceMode
+			e.getFollowerBalance = func() float64 { return 20 }
+			e.getFollowerEquity = func() float64 { return 100 }
+			signal := &TradeSignal{
+				ProviderType: tt.provider,
+				LeaderEquity: 1000,
+				Fill: &Fill{
+					Symbol: "ETHUSDT", PositionSide: SideLong,
+					Price: 2000, Size: .1, Value: 200,
+				},
+			}
+			match := &SignalMatchResult{
+				Action: ActionOpen,
+				LeaderPosition: &Position{
+					Symbol: "ETHUSDT", Side: SideLong, Size: .1, EntryPrice: 2000,
+				},
+			}
+			copySize, warnings := e.calculateCopySizeByPositionChange(signal, match)
+			if math.Abs(copySize-20) > 1e-9 {
+				t.Fatalf("target must be 200/1000*totalEquity(100), not available(20): got=%.8f warnings=%+v",
+					copySize, warnings)
+			}
+		})
+	}
+}
+
 // TestBinanceSnapshotFillsDeduplicateAcrossPolls 验证修复 A：
 //
 // 场景重现（"大爷的弟弟"日志）：

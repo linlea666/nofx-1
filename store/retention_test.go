@@ -36,11 +36,34 @@ func TestRetentionKeepsOpenPositions(t *testing.T) {
 	old := time.Now().AddDate(0, 0, -120)
 
 	// Old CLOSED position: should be deleted.
-	_, err := st.db.Exec(`
-		INSERT INTO trader_positions (trader_id, symbol, side, quantity, entry_price, entry_time, exit_time, status, updated_at)
-		VALUES ('t1','BTC','LONG',1,100,?,?,'CLOSED',?)`,
+	oldResult, err := st.db.Exec(`
+		INSERT INTO trader_positions (trader_id, exchange_id, symbol, side, quantity, entry_price, entry_time, exit_time, status, updated_at)
+		VALUES ('t1','account-1','BTC','LONG',1,100,?,?,'CLOSED',?)`,
 		old.Format(time.RFC3339), old.Format(time.RFC3339), old.Format(time.RFC3339))
 	if err != nil {
+		t.Fatal(err)
+	}
+	oldPositionID, err := oldResult.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fillResult, err := st.db.Exec(`INSERT INTO position_close_fills
+		(trader_id,exchange_id,exchange_trade_id,symbol,side,quantity,exit_price,realized_pnl,fill_time)
+		VALUES('t1','account-1','old-fill','BTC','LONG',1,90,-10,?)`, old.Format(time.RFC3339))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fillID, err := fillResult.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = st.db.Exec(`INSERT INTO position_close_allocations
+		(fill_id,exchange_id,exchange_trade_id,position_id,symbol,side,quantity,exit_price,realized_pnl)
+		VALUES(?,'account-1','old-fill',?,'BTC','LONG',1,90,-10)`, fillID, oldPositionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = st.db.Exec(`INSERT INTO position_accounting_audits(position_id,reason_code)
+		VALUES(?,'TEST_OLD')`, oldPositionID); err != nil {
 		t.Fatal(err)
 	}
 	// Equally old but still OPEN: must survive.
@@ -66,6 +89,11 @@ func TestRetentionKeepsOpenPositions(t *testing.T) {
 
 	if got := countRows(t, st, "trader_positions"); got != 2 {
 		t.Fatalf("expected 2 surviving positions (open + recent), got %d", got)
+	}
+	for _, table := range []string{"position_close_allocations", "position_close_fills", "position_accounting_audits"} {
+		if got := countRows(t, st, table); got != 0 {
+			t.Fatalf("expected old position accounting rows to be removed from %s, got %d", table, got)
+		}
 	}
 	var status string
 	if err := st.db.QueryRow(`SELECT status FROM trader_positions WHERE symbol='ETH'`).Scan(&status); err != nil {

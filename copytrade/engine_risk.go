@@ -1063,6 +1063,7 @@ func (e *Engine) handleAIGuardedReentry(mapping *store.CopyTradePositionMapping,
 	leaderBucket := math.Floor(leaderPos.Size / math.Max(cycle.BaselineLeaderSize*0.05, 1e-9))
 	featureHash := fmt.Sprintf("initial|p%.0f|l%.0f|r%d|s%d", priceBucket, leaderBucket, cycle.ReentryCount, cycle.StopCount)
 	pendingTrigger := "STOP_FLAT_CONFIRMED"
+	highSignalEvent := false
 	if beforeErr == nil && before != nil {
 		featureHash = before.FeatureHash
 		pendingTrigger = before.PendingTrigger
@@ -1071,8 +1072,6 @@ func (e *Engine) handleAIGuardedReentry(mapping *store.CopyTradePositionMapping,
 			prevATR = atr
 		}
 		inRange := func(price, low, high float64) bool { return low > 0 && high >= low && price >= low && price <= high }
-		currentNearLeader := leaderPos.EntryPrice > 0 && math.Abs(mark-leaderPos.EntryPrice) <= 0.5*atr
-		previousNearLeader := before.LeaderEntryPrice > 0 && math.Abs(before.TriggerPrice-before.LeaderEntryPrice) <= 0.5*prevATR
 		currentRecovered, previousRecovered := false, false
 		if lastStop > 0 {
 			if mapping.Side == string(SideLong) {
@@ -1085,31 +1084,21 @@ func (e *Engine) handleAIGuardedReentry(mapping *store.CopyTradePositionMapping,
 		}
 		leaderStep := math.Max(cycle.BaselineLeaderSize*0.05, 1e-9)
 		prevLeaderBucket := math.Floor(before.LeaderSize / leaderStep)
-		atrReference := cycle.ATRAtStop
-		if atrReference <= 0 {
-			atrReference = before.ATR
-		}
-		atrStep := math.Max(atrReference*0.20, mark*0.000001)
-		currentATRBucket, previousATRBucket := math.Floor(atr/atrStep), math.Floor(before.ATR/atrStep)
-		costStep := math.Max(atr*0.25, mark*0.0001)
-		currentCostBucket, previousCostBucket := math.Floor(leaderPos.EntryPrice/costStep), math.Floor(before.LeaderEntryPrice/costStep)
 		candleTrigger, candleHash := e.aiClosedCandleFeature(cycle.ID, mapping.Symbol, mapping.Side, before)
 		switch {
 		case inRange(mark, before.AttentionPriceLow, before.AttentionPriceHigh) && !inRange(before.TriggerPrice, before.AttentionPriceLow, before.AttentionPriceHigh):
 			pendingTrigger = "AI_ATTENTION_ZONE"
+			highSignalEvent = true
 		case candleTrigger != "":
 			pendingTrigger = candleTrigger
 			featureHash = candleHash
+			highSignalEvent = true
 		case leaderBucket != prevLeaderBucket:
 			pendingTrigger = "LEADER_SIZE_CHANGE"
-		case before.LeaderEntryPrice > 0 && currentCostBucket != previousCostBucket:
-			pendingTrigger = "LEADER_COST_CHANGE"
-		case before.ATR > 0 && currentATRBucket != previousATRBucket:
-			pendingTrigger = "ATR_CHANGE"
-		case currentNearLeader && !previousNearLeader:
-			pendingTrigger = "LEADER_ENTRY_ZONE"
+			highSignalEvent = true
 		case currentRecovered && !previousRecovered:
 			pendingTrigger = "STOP_RECOVERY"
+			highSignalEvent = true
 		default:
 			pendingTrigger = before.PendingTrigger
 		}
@@ -1135,6 +1124,20 @@ func (e *Engine) handleAIGuardedReentry(mapping *store.CopyTradePositionMapping,
 	if err != nil {
 		logger.Warnf("[CopyGuard] trader=%s cycle=%d event=AI_CANDIDATE_CREATE_FAILED reason=%v", e.traderID, cycle.ID, err)
 		return
+	}
+	if highSignalEvent && before != nil && pendingTrigger != before.PendingTrigger {
+		minInterval := time.Duration(e.config.RiskAIMinReviewSeconds) * time.Second
+		if minInterval < 5*time.Minute {
+			minInterval = 5 * time.Minute
+		}
+		if _, scheduleErr := e.store.ReentryAI().ScheduleReentryCandidateEventReview(
+			candidate.ID, pendingTrigger, minInterval,
+		); scheduleErr != nil {
+			logger.Warnf("[CopyGuard] trader=%s cycle=%d event=AI_EVENT_REVIEW_SCHEDULE_FAILED trigger=%s reason=%v",
+				e.traderID, cycle.ID, pendingTrigger, scheduleErr)
+		} else if refreshed, refreshErr := e.store.ReentryAI().GetReentryCandidate(candidate.ID); refreshErr == nil {
+			candidate = refreshed
+		}
 	}
 	cycleStatus := copyGuardCycleStatusForCandidate(candidate.Status)
 	_ = e.store.CopyTrade().UpdateCopyGuardObservation(cycle.ID, cycleStatus, leaderPos.EntryPrice, mark, atr)

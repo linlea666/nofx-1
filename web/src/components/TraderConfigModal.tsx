@@ -823,7 +823,11 @@ export function TraderConfigModal({
       window.alert('单仓最大账户亏损必须为 0（继承）或 0.1%～30%')
       return
     }
-    if (isCopyGuardEnabled && formData.risk_stop_max_account_loss_pct > 10) {
+    if (
+      isCopyGuardEnabled &&
+      formData.risk_stop_priority === 'account_cap' &&
+      formData.risk_stop_max_account_loss_pct > 10
+    ) {
       const typed = window.prompt(
         `单仓最大账户亏损 ${formData.risk_stop_max_account_loss_pct.toFixed(2)}% 超过默认 10%。请输入该百分比数值确认：`
       )
@@ -1856,7 +1860,32 @@ export function TraderConfigModal({
                           {formData.risk_policy_version >= 4 && (
                             <div className="grid grid-cols-2 gap-3">
                               <label className="col-span-2 text-xs text-[#848E9C]">
-                                单仓最大账户亏损 %（0 = 继承执行账户默认 10%）
+                                止损优先级
+                                <select
+                                  value={formData.risk_stop_priority}
+                                  onChange={(e) =>
+                                    handleInputChange(
+                                      'risk_stop_priority',
+                                      e.target.value as
+                                        | 'volatility_first'
+                                        | 'account_cap'
+                                    )
+                                  }
+                                  className="mt-1 w-full px-2 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF]"
+                                >
+                                  <option value="volatility_first">
+                                    ATR / 结构优先（账户比例仅预警）
+                                  </option>
+                                  <option value="account_cap">
+                                    账户比例硬上限（可能压缩止损）
+                                  </option>
+                                </select>
+                              </label>
+                              <label className="col-span-2 text-xs text-[#848E9C]">
+                                {formData.risk_stop_priority === 'account_cap'
+                                  ? '单仓最大账户亏损硬上限 %'
+                                  : '预计损失预警线 %'}
+                                （0 = 继承执行账户默认 10%）
                                 <input
                                   type="number"
                                   min="0"
@@ -1874,8 +1903,9 @@ export function TraderConfigModal({
                                   className="mt-1 w-full px-2 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF]"
                                 />
                                 <span className="mt-1 block">
-                                  技术关键位 / ATR
-                                  优先，账户百分比只做预计损失预警，不压缩普通仓位止损距离
+                                  {formData.risk_stop_priority === 'account_cap'
+                                    ? '超过该账户损失上限时会收紧止损；可能进入 ATR 噪声区，请明确评估。'
+                                    : '技术关键位 / ATR 优先；超过该比例只告警，不改变普通仓位或止损距离。'}
                                 </span>
                               </label>
                               <div className="col-span-2 flex items-center justify-between rounded border border-[#F0B90B44] bg-[#F0B90B0D] p-3 text-xs">
@@ -1936,9 +1966,6 @@ export function TraderConfigModal({
                                   应用推荐值
                                 </button>
                               </div>
-                              {/* v5：止损模式（risk_stop_mode）不再影响计算——
-                                  账户线在任何模式下都是硬 cap，字段仅作兼容保留，
-                                  故不再提供选择器（避免 UI 暗示不存在的行为差异） */}
                               <label className="text-xs text-[#848E9C]">
                                 触发价格
                                 <select

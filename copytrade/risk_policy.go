@@ -44,8 +44,9 @@ type ProtectionPlan struct {
 
 // ComputeAccountProtectionDistance protects the real ordinary-copy position
 // without resizing it. Market structure/ATR choose the preferred distant stop;
-// the account percentage is a hard loss ceiling, so it may only tighten that
-// distance. Liquidation safety is applied later by finalizeStopLossPrice.
+// volatility_first treats the account percentage as an observability threshold,
+// while the backward-compatible account_cap mode may tighten that distance.
+// Liquidation safety is applied later by finalizeStopLossPrice.
 func ComputeAccountProtectionDistance(c *CopyConfig, side SideType, entryPrice, positionNotional, accountEquity, atr, atrDistance, structureInvalidation, maxAccountLossPct float64) (RiskDistanceResult, error) {
 	if c == nil || entryPrice <= 0 || positionNotional <= 0 || accountEquity <= 0 || atrDistance <= 0 {
 		return RiskDistanceResult{}, fmt.Errorf("invalid account protection input")
@@ -193,7 +194,8 @@ func BuildProtectionPlan(c *CopyConfig, side SideType, entryPrice, atr, structur
 // v4.1 的噪音下限（noise_floor）放宽机制已删除：它在高杠杆下覆盖保证金 cap，
 // 是实盘 -40% 止损（周期 64）的直接根因。ATR 不再放宽硬止损，但保留基线、
 // 重入边界/追价/波动扩张与易扫损提示等全部其他职能。
-// RiskStopMode 不再影响计算（账户线在任何模式下都是硬 cap），字段仅作兼容保留。
+// RiskStopMode 不再影响计算，字段仅作兼容保留。普通跟单是否启用账户
+// 硬 cap 由 RiskStopPriority 决定；本函数属于 AI 独立风险预算链。
 func ComputeRiskDistanceV4(c *CopyConfig, entryPrice, positionNotional, accountEquity, atrDistance float64, leverage int) (RiskDistanceResult, error) {
 	if c == nil || entryPrice <= 0 || positionNotional <= 0 || accountEquity <= 0 || atrDistance <= 0 {
 		return RiskDistanceResult{}, fmt.Errorf("invalid v4 risk calculation input")

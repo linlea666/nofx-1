@@ -984,6 +984,35 @@ export interface CopyGuardCycle {
   reconciled_at?: string
 }
 
+export interface CopyTradeExecutionIntent {
+  id: number
+  source_kind: 'LEADER_TRANSITION' | 'AI_REENTRY' | string
+  action: string
+  symbol: string
+  side: string
+  status: string
+  reason_code: string
+  target_quantity: number
+  requested_quantity: number
+  quantized_quantity: number
+  filled_quantity: number
+  requested_notional: number
+  filled_notional: number
+  follower_equity_at_target: number
+  target_account_pct: number
+  catchup_deadline_at?: string
+  catchup_anchor_price: number
+  last_catchup_reason: string
+  client_order_id: string
+  exchange_order_id: string
+  exchange_state: string
+  candidate_id?: number
+  analysis_id?: number
+  decision_generation?: number
+  created_at: string
+  updated_at: string
+}
+
 // 统一跟单事件日志（开仓/加仓/减仓/平仓 + 止损/二次入场/接手/保护/对账）
 export type CopyEventCategory =
   | 'action'

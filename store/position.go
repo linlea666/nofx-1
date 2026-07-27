@@ -104,8 +104,28 @@ func (s *PositionStore) InitTables() error {
 	if err := ensureSQLiteColumn(s.db, "trader_positions", "accounting_quality", "TEXT NOT NULL DEFAULT 'VERIFIED'"); err != nil {
 		return err
 	}
+	if _, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS position_close_fills (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		trader_id TEXT NOT NULL,
+		exchange_id TEXT NOT NULL,
+		exchange_trade_id TEXT NOT NULL,
+		symbol TEXT NOT NULL,
+		side TEXT NOT NULL,
+		quantity REAL NOT NULL,
+		exit_price REAL NOT NULL,
+		realized_pnl REAL NOT NULL DEFAULT 0,
+		fee REAL NOT NULL DEFAULT 0,
+		fill_time DATETIME,
+		data_quality TEXT NOT NULL DEFAULT 'VERIFIED',
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		UNIQUE(exchange_id,exchange_trade_id)
+	)`); err != nil {
+		return err
+	}
 	if _, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS position_close_allocations (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		fill_id INTEGER NOT NULL DEFAULT 0,
 		exchange_id TEXT NOT NULL,
 		exchange_trade_id TEXT NOT NULL,
 		position_id INTEGER NOT NULL,
@@ -115,18 +135,91 @@ func (s *PositionStore) InitTables() error {
 		exit_price REAL NOT NULL DEFAULT 0,
 		realized_pnl REAL NOT NULL DEFAULT 0,
 		fee REAL NOT NULL DEFAULT 0,
+		allocation_quality TEXT NOT NULL DEFAULT 'ALLOCATED_ESTIMATE',
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		UNIQUE(exchange_id,exchange_trade_id,position_id)
 	)`); err != nil {
 		return err
 	}
+	if err := ensureSQLiteColumn(s.db, "position_close_allocations", "fill_id", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
 	if err := ensureSQLiteColumn(s.db, "position_close_allocations", "exit_price", "REAL NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
-	// Preserve raw legacy rows while excluding obvious duplicate attribution
-	// from trusted aggregates.
-	if _, err := s.db.Exec(`UPDATE trader_positions SET accounting_quality='LEGACY_DUPLICATED'
-		WHERE status='CLOSED' AND EXISTS (
+	if err := ensureSQLiteColumn(s.db, "position_close_allocations", "allocation_quality", "TEXT NOT NULL DEFAULT 'ALLOCATED_ESTIMATE'"); err != nil {
+		return err
+	}
+	// 51eab63 already persisted uniquely allocated exchange fills, but the old
+	// table had no authoritative-fill parent. Reconstruct only evidence that is
+	// uniquely present in that allocation ledger, then link every old row to
+	// its parent. This is deterministic and restart-idempotent.
+	if _, err := s.db.Exec(`INSERT OR IGNORE INTO position_close_fills
+		(trader_id,exchange_id,exchange_trade_id,symbol,side,quantity,exit_price,realized_pnl,fee,fill_time,data_quality)
+		SELECT MIN(p.trader_id),a.exchange_id,a.exchange_trade_id,MIN(a.symbol),UPPER(MIN(a.side)),
+		       SUM(a.quantity),
+		       CASE WHEN SUM(a.quantity)>0 THEN SUM(a.exit_price*a.quantity)/SUM(a.quantity) ELSE 0 END,
+		       SUM(a.realized_pnl),SUM(a.fee),MAX(p.exit_time),'MIGRATED_VERIFIED'
+		FROM position_close_allocations a
+		JOIN trader_positions p ON p.id=a.position_id
+		WHERE a.exchange_trade_id<>'' AND a.quantity>0
+		GROUP BY a.exchange_id,a.exchange_trade_id`); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(`UPDATE position_close_allocations
+		SET fill_id=(
+			SELECT f.id FROM position_close_fills f
+			WHERE f.exchange_id=position_close_allocations.exchange_id
+			  AND f.exchange_trade_id=position_close_allocations.exchange_trade_id
+		)
+		WHERE fill_id=0 AND EXISTS (
+			SELECT 1 FROM position_close_fills f
+			WHERE f.exchange_id=position_close_allocations.exchange_id
+			  AND f.exchange_trade_id=position_close_allocations.exchange_trade_id
+		)`); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS position_accounting_audits (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		position_id INTEGER NOT NULL,
+		reason_code TEXT NOT NULL,
+		evidence TEXT NOT NULL DEFAULT '',
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		UNIQUE(position_id,reason_code)
+	)`); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(`CREATE VIEW IF NOT EXISTS trusted_closed_positions AS
+		SELECT p.* FROM trader_positions p
+		WHERE p.status='CLOSED' AND (
+			COALESCE(p.accounting_quality,'')='ALLOCATED_ESTIMATE'
+			OR (
+				COALESCE(p.accounting_quality,'')='VERIFIED'
+				AND (
+					EXISTS (
+						SELECT 1 FROM position_close_allocations a
+						WHERE a.position_id=p.id AND a.fill_id>0
+					)
+					OR EXISTS (
+						SELECT 1 FROM position_close_fills f
+						WHERE f.exchange_id=p.exchange_id
+						  AND f.exchange_trade_id IN (
+							COALESCE(p.exchange_position_id,''),
+							COALESCE(p.exit_order_id,'')
+						  )
+					)
+				)
+			)
+		)`); err != nil {
+		return err
+	}
+	// Historical equality is only a suspicion, not proof that two legitimate
+	// local lots shared one exchange fill. Preserve every raw row and record an
+	// audit flag for operator review instead of mutating accounting quality at
+	// startup.
+	if _, err := s.db.Exec(`INSERT OR IGNORE INTO position_accounting_audits(position_id,reason_code,evidence)
+		SELECT trader_positions.id,'POSSIBLE_LEGACY_DUPLICATION','same trader/symbol/side/order/time/pnl as an earlier local row'
+		FROM trader_positions WHERE status='CLOSED' AND EXISTS (
 			SELECT 1 FROM trader_positions p2
 			WHERE p2.id<trader_positions.id
 			  AND p2.trader_id=trader_positions.trader_id
@@ -146,6 +239,9 @@ func (s *PositionStore) InitTables() error {
 		`CREATE INDEX IF NOT EXISTS idx_positions_symbol ON trader_positions(trader_id, symbol, side, status)`,
 		`CREATE INDEX IF NOT EXISTS idx_positions_entry ON trader_positions(trader_id, entry_time DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_positions_exit ON trader_positions(trader_id, exit_time DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_position_close_fills_trader_time ON position_close_fills(trader_id,fill_time)`,
+		`CREATE INDEX IF NOT EXISTS idx_position_close_fills_symbol ON position_close_fills(exchange_id,symbol,side,fill_time)`,
+		`CREATE INDEX IF NOT EXISTS idx_position_close_allocations_fill ON position_close_allocations(fill_id,position_id)`,
 		// Unique index based on exchange_id (account UUID), not trader_id
 		// This ensures the same position from an exchange account is not duplicated across different traders
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_positions_exchange_pos_unique ON trader_positions(exchange_id, exchange_position_id) WHERE exchange_position_id != ''`,
@@ -215,106 +311,251 @@ type PositionCloseFill struct {
 	ExitPrice   float64
 	RealizedPnL float64
 	Fee         float64
+	FillTime    time.Time
+	DataQuality string
 }
 
 // ClosePositionWithAllocation is the single-fill compatibility wrapper.
 func (s *PositionStore) ClosePositionWithAllocation(id int64, exchangeID, tradeID, symbol, side string, quantity, exitPrice, realizedPnL, fee float64, closeReason string) (bool, error) {
 	return s.ClosePositionWithAllocations(id, exchangeID, []PositionCloseFill{{
 		TradeID: tradeID, Symbol: symbol, Side: side, Quantity: quantity,
-		ExitPrice: exitPrice, RealizedPnL: realizedPnL, Fee: fee,
+		ExitPrice: exitPrice, RealizedPnL: realizedPnL, Fee: fee, FillTime: time.Now(),
 	}}, exitPrice, closeReason)
 }
 
-// ClosePositionWithAllocations uniquely allocates every exchange fill by
-// quantity across local lots. Overlapping aggregate history responses cannot
-// copy one fill's PnL into multiple local positions.
+// ClosePositionWithAllocations first stores each exchange fill exactly once,
+// then allocates the remaining quantity across compatible local lots in FIFO
+// order. Authoritative account totals come from position_close_fills; local
+// lots are estimates because one exchange fill may span multiple lots.
 func (s *PositionStore) ClosePositionWithAllocations(id int64, exchangeID string, fills []PositionCloseFill, fallbackExitPrice float64, closeReason string) (bool, error) {
-	if exchangeID == "" {
-		exchangeID = "unknown"
-	}
+	exchangeID = strings.TrimSpace(exchangeID)
 	tx, err := s.db.Begin()
 	if err != nil {
 		return false, err
 	}
 	defer tx.Rollback()
+	var traderID, positionExchangeID, positionSymbol, positionSide string
 	var positionQuantity float64
-	var positionStatus string
-	if err = tx.QueryRow(`SELECT quantity,status FROM trader_positions WHERE id=?`, id).Scan(&positionQuantity, &positionStatus); err != nil {
+	if err = tx.QueryRow(`SELECT trader_id,COALESCE(exchange_id,''),symbol,side,quantity FROM trader_positions WHERE id=?`,
+		id).Scan(&traderID, &positionExchangeID, &positionSymbol, &positionSide, &positionQuantity); err != nil {
 		return false, err
 	}
-	if positionStatus == "CLOSED" {
-		var existing int
-		if err = tx.QueryRow(`SELECT COUNT(*) FROM position_close_allocations WHERE exchange_id=? AND position_id=?`, exchangeID, id).Scan(&existing); err != nil {
-			return false, err
-		}
-		return existing > 0, tx.Commit()
+	positionExchangeID = strings.TrimSpace(positionExchangeID)
+	if exchangeID != "" && positionExchangeID != "" && exchangeID != positionExchangeID {
+		return false, fmt.Errorf("close fill account mismatch: position=%s fill=%s", positionExchangeID, exchangeID)
 	}
-	localRemaining := math.Max(0, positionQuantity)
-	newAllocated := float64(0)
+	if exchangeID == "" {
+		exchangeID = positionExchangeID
+	}
+	if exchangeID == "" {
+		exchangeID = "unknown:" + traderID
+	}
+	type authoritativeFill struct {
+		id          int64
+		tradeID     string
+		symbol      string
+		side        string
+		quantity    float64
+		exitPrice   float64
+		realizedPnL float64
+		fee         float64
+		fillTime    sql.NullString
+	}
+	var authoritative []authoritativeFill
 	for _, fill := range fills {
-		if strings.TrimSpace(fill.TradeID) == "" || fill.Quantity <= 0 || localRemaining <= 0 {
+		fill.TradeID = strings.TrimSpace(fill.TradeID)
+		if fill.TradeID == "" || fill.Quantity <= 0 || fill.ExitPrice <= 0 {
 			continue
 		}
-		var tradeAllocated float64
-		if err = tx.QueryRow(`SELECT COALESCE(SUM(quantity),0) FROM position_close_allocations WHERE exchange_id=? AND exchange_trade_id=?`,
-			exchangeID, fill.TradeID).Scan(&tradeAllocated); err != nil {
+		symbol := fill.Symbol
+		if symbol == "" {
+			symbol = positionSymbol
+		}
+		side := strings.ToUpper(fill.Side)
+		if side == "" {
+			side = strings.ToUpper(positionSide)
+		}
+		if !strings.EqualFold(symbol, positionSymbol) || !strings.EqualFold(side, positionSide) {
+			return false, fmt.Errorf("close fill instrument mismatch: position=%s/%s fill=%s/%s",
+				positionSymbol, positionSide, symbol, side)
+		}
+		quality := fill.DataQuality
+		if quality == "" {
+			quality = "VERIFIED"
+		}
+		var fillTime interface{}
+		if !fill.FillTime.IsZero() {
+			fillTime = fill.FillTime.UTC().Format(time.RFC3339Nano)
+		}
+		if _, err = tx.Exec(`INSERT OR IGNORE INTO position_close_fills
+			(trader_id,exchange_id,exchange_trade_id,symbol,side,quantity,exit_price,realized_pnl,fee,fill_time,data_quality)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+			traderID, exchangeID, fill.TradeID, symbol, side, fill.Quantity,
+			fill.ExitPrice, fill.RealizedPnL, fill.Fee, fillTime, quality); err != nil {
 			return false, err
 		}
-		allocated := math.Min(localRemaining, math.Max(0, fill.Quantity-tradeAllocated))
-		if allocated <= math.Max(1e-12, fill.Quantity*1e-8) {
-			continue
+		var stored authoritativeFill
+		var storedTrader, storedQuality string
+		if err = tx.QueryRow(`SELECT id,trader_id,exchange_trade_id,symbol,side,quantity,exit_price,realized_pnl,fee,fill_time,data_quality
+			FROM position_close_fills WHERE exchange_id=? AND exchange_trade_id=?`,
+			exchangeID, fill.TradeID).Scan(
+			&stored.id, &storedTrader, &stored.tradeID, &stored.symbol, &stored.side,
+			&stored.quantity, &stored.exitPrice, &stored.realizedPnL, &stored.fee,
+			&stored.fillTime, &storedQuality,
+		); err != nil {
+			return false, err
 		}
-		share := allocated / fill.Quantity
-		res, insertErr := tx.Exec(`INSERT OR IGNORE INTO position_close_allocations(exchange_id,exchange_trade_id,position_id,symbol,side,quantity,exit_price,realized_pnl,fee) VALUES(?,?,?,?,?,?,?,?,?)`,
-			exchangeID, fill.TradeID, id, fill.Symbol, fill.Side, allocated, fill.ExitPrice, fill.RealizedPnL*share, fill.Fee*share)
-		if insertErr != nil {
-			return false, insertErr
+		tolerance := func(a float64) float64 { return math.Max(1e-9, math.Abs(a)*1e-8) }
+		if !strings.EqualFold(stored.symbol, symbol) || !strings.EqualFold(stored.side, side) ||
+			math.Abs(stored.quantity-fill.Quantity) > tolerance(fill.Quantity) ||
+			math.Abs(stored.exitPrice-fill.ExitPrice) > tolerance(fill.ExitPrice) ||
+			math.Abs(stored.realizedPnL-fill.RealizedPnL) > tolerance(fill.RealizedPnL) ||
+			math.Abs(stored.fee-fill.Fee) > tolerance(fill.Fee) {
+			return false, fmt.Errorf("authoritative close fill conflict for account=%s trade=%s", exchangeID, fill.TradeID)
 		}
-		if claimed, _ := res.RowsAffected(); claimed == 1 {
-			newAllocated += allocated
-			localRemaining -= allocated
-		}
+		authoritative = append(authoritative, stored)
 	}
-	var allocatedQuantity, allocatedPnL, allocatedFee, weightedExit float64
-	if err = tx.QueryRow(`SELECT COALESCE(SUM(quantity),0),COALESCE(SUM(realized_pnl),0),COALESCE(SUM(fee),0),COALESCE(SUM(exit_price*quantity),0)
-		FROM position_close_allocations WHERE exchange_id=? AND position_id=?`, exchangeID, id).
-		Scan(&allocatedQuantity, &allocatedPnL, &allocatedFee, &weightedExit); err != nil {
+
+	type localLot struct {
+		id        int64
+		quantity  float64
+		status    string
+		entryTime time.Time
+	}
+	rows, err := tx.Query(`SELECT id,quantity,status,entry_time FROM trader_positions
+		WHERE (exchange_id=? OR (id=? AND COALESCE(exchange_id,'')=''))
+		  AND symbol=? AND UPPER(side)=UPPER(?)
+		  AND (status='OPEN' OR COALESCE(accounting_quality,'') IN ('PENDING','UNSCORABLE','ALLOCATED_ESTIMATE'))
+		ORDER BY datetime(entry_time),id`,
+		exchangeID, id, positionSymbol, positionSide)
+	if err != nil {
 		return false, err
 	}
-	quality := "VERIFIED"
-	if allocatedQuantity <= math.Max(1e-12, positionQuantity*1e-8) {
-		allocatedPnL, allocatedFee = 0, 0
-		quality = "LEGACY_DUPLICATED"
-	} else if allocatedQuantity+math.Max(1e-12, positionQuantity*1e-8) < positionQuantity {
-		// The exchange proves some fills, but not enough to reconstruct this
-		// local lot completely. Preserve allocation rows for audit and exclude
-		// the incomplete aggregate from trusted PnL.
-		allocatedPnL, allocatedFee = 0, 0
-		quality = "UNSCORABLE"
+	var lots []localLot
+	for rows.Next() {
+		var lot localLot
+		var entryTime string
+		if err = rows.Scan(&lot.id, &lot.quantity, &lot.status, &entryTime); err != nil {
+			_ = rows.Close()
+			return false, err
+		}
+		lot.entryTime, _ = parseDBTime(entryTime)
+		lots = append(lots, lot)
 	}
-	exitPrice := fallbackExitPrice
-	if allocatedQuantity > 0 {
-		exitPrice = weightedExit / allocatedQuantity
+	if err = rows.Close(); err != nil {
+		return false, err
 	}
-	exitOrderID := ""
-	if len(fills) > 0 {
-		exitOrderID = fills[len(fills)-1].TradeID
+	newAllocatedToTarget := false
+	for _, fill := range authoritative {
+		var allocatedFromFill float64
+		if err = tx.QueryRow(`SELECT COALESCE(SUM(quantity),0) FROM position_close_allocations WHERE fill_id=?`,
+			fill.id).Scan(&allocatedFromFill); err != nil {
+			return false, err
+		}
+		fillRemaining := math.Max(0, fill.quantity-allocatedFromFill)
+		for _, lot := range lots {
+			if fillRemaining <= math.Max(1e-12, fill.quantity*1e-8) {
+				break
+			}
+			if fill.fillTime.Valid {
+				fillTimestamp, parseErr := parseDBTime(fill.fillTime.String)
+				if parseErr == nil && !lot.entryTime.IsZero() && fillTimestamp.Before(lot.entryTime) {
+					continue
+				}
+			}
+			var allocatedToLot float64
+			if err = tx.QueryRow(`SELECT COALESCE(SUM(quantity),0) FROM position_close_allocations WHERE position_id=?`,
+				lot.id).Scan(&allocatedToLot); err != nil {
+				return false, err
+			}
+			lotRemaining := math.Max(0, lot.quantity-allocatedToLot)
+			allocated := math.Min(fillRemaining, lotRemaining)
+			if allocated <= math.Max(1e-12, lot.quantity*1e-8) {
+				continue
+			}
+			share := allocated / fill.quantity
+			res, insertErr := tx.Exec(`INSERT OR IGNORE INTO position_close_allocations
+				(fill_id,exchange_id,exchange_trade_id,position_id,symbol,side,quantity,exit_price,realized_pnl,fee,allocation_quality)
+				VALUES(?,?,?,?,?,?,?,?,?,?,'ALLOCATED_ESTIMATE')`,
+				fill.id, exchangeID, fill.tradeID, lot.id, fill.symbol, fill.side,
+				allocated, fill.exitPrice, fill.realizedPnL*share, fill.fee*share)
+			if insertErr != nil {
+				return false, insertErr
+			}
+			if claimed, _ := res.RowsAffected(); claimed == 1 {
+				fillRemaining -= allocated
+				if lot.id == id {
+					newAllocatedToTarget = true
+				}
+			}
+		}
 	}
 	now := time.Now().Format(time.RFC3339)
-	if _, err = tx.Exec(`UPDATE trader_positions SET exit_price=?,exit_order_id=?,exit_time=?,realized_pnl=?,fee=?,status='CLOSED',close_reason=?,accounting_quality=?,updated_at=? WHERE id=?`,
-		exitPrice, exitOrderID, now, allocatedPnL, allocatedFee, closeReason, quality, now, id); err != nil {
-		return false, err
+	for _, lot := range lots {
+		var allocatedQuantity, allocatedPnL, allocatedFee, weightedExit float64
+		var exitOrderID string
+		if err = tx.QueryRow(`SELECT COALESCE(SUM(quantity),0),COALESCE(SUM(realized_pnl),0),COALESCE(SUM(fee),0),
+			COALESCE(SUM(exit_price*quantity),0),COALESCE(MAX(exchange_trade_id),'')
+			FROM position_close_allocations WHERE exchange_id=? AND position_id=?`,
+			exchangeID, lot.id).Scan(&allocatedQuantity, &allocatedPnL, &allocatedFee, &weightedExit, &exitOrderID); err != nil {
+			return false, err
+		}
+		if allocatedQuantity <= math.Max(1e-12, lot.quantity*1e-8) {
+			if lot.id == id {
+				if _, err = tx.Exec(`UPDATE trader_positions SET
+					exit_price=?,exit_time=COALESCE(exit_time,?),status='CLOSED',
+					close_reason=?,accounting_quality='UNSCORABLE',updated_at=? WHERE id=?`,
+					fallbackExitPrice, now, closeReason, now, lot.id); err != nil {
+					return false, err
+				}
+			}
+			continue
+		}
+		quality := "ALLOCATED_ESTIMATE"
+		if allocatedQuantity+math.Max(1e-12, lot.quantity*1e-8) < lot.quantity {
+			if strings.EqualFold(lot.status, "OPEN") {
+				// A partial close consumes only part of this local lot. Preserve
+				// the unclosed remainder as a new OPEN lot before shrinking the
+				// original row to the authoritative closed quantity.
+				remaining := lot.quantity - allocatedQuantity
+				if _, err = tx.Exec(`INSERT INTO trader_positions
+					(trader_id,exchange_id,exchange_type,exchange_position_id,symbol,side,quantity,
+					 entry_price,entry_order_id,entry_time,leverage,status,close_reason,source,
+					 accounting_quality,created_at,updated_at)
+					SELECT trader_id,exchange_id,exchange_type,'',symbol,side,?,
+					       entry_price,entry_order_id,entry_time,leverage,'OPEN','',source,
+					       'VERIFIED',?,?
+					FROM trader_positions WHERE id=?`,
+					remaining, now, now, lot.id); err != nil {
+					return false, err
+				}
+				lot.quantity = allocatedQuantity
+			} else {
+				quality = "PENDING"
+			}
+		}
+		exitPrice := weightedExit / allocatedQuantity
+		if _, err = tx.Exec(`UPDATE trader_positions SET quantity=?,exit_price=?,exit_order_id=?,exit_time=COALESCE(exit_time,?),
+			realized_pnl=?,fee=?,status='CLOSED',close_reason=?,accounting_quality=?,updated_at=? WHERE id=?`,
+			lot.quantity, exitPrice, exitOrderID, now, allocatedPnL, allocatedFee, closeReason, quality, now, lot.id); err != nil {
+			return false, err
+		}
 	}
 	if err = tx.Commit(); err != nil {
 		return false, err
 	}
-	return newAllocated > 0 && quality == "VERIFIED", nil
+	var targetAllocations int
+	if err = s.db.QueryRow(`SELECT COUNT(*) FROM position_close_allocations WHERE exchange_id=? AND position_id=?`,
+		exchangeID, id).Scan(&targetAllocations); err != nil {
+		return false, err
+	}
+	return newAllocatedToTarget || targetAllocations > 0, nil
 }
 
 func (s *PositionStore) ClosePositionUnscorable(id int64, exitPrice float64, closeReason string) error {
 	now := time.Now().Format(time.RFC3339)
 	_, err := s.db.Exec(`UPDATE trader_positions SET exit_price=?,exit_time=?,realized_pnl=0,fee=0,status='CLOSED',close_reason=?,accounting_quality='UNSCORABLE',updated_at=? WHERE id=?`,
-		exitPrice, closeReason, now, id)
+		exitPrice, now, closeReason, now, id)
 	return err
 }
 
@@ -384,6 +625,30 @@ func (s *PositionStore) GetClosedPositions(traderID string, limit int) ([]*Trade
 	return s.scanPositions(rows)
 }
 
+// GetPendingClosedPositions returns locally closed lots whose exchange
+// settlement is incomplete. They remain eligible for delayed authoritative
+// fills instead of being frozen by the first UNSCORABLE observation.
+func (s *PositionStore) GetPendingClosedPositions(traderID string, limit int) ([]*TraderPosition, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	rows, err := s.db.Query(`
+		SELECT id, trader_id, exchange_id, COALESCE(exchange_type, '') as exchange_type, symbol, side, quantity, entry_price, entry_order_id,
+			entry_time, exit_price, exit_order_id, exit_time, realized_pnl, fee,
+			leverage, status, close_reason, COALESCE(accounting_quality,'VERIFIED'), created_at, updated_at
+		FROM trader_positions
+		WHERE trader_id = ? AND status = 'CLOSED'
+		  AND COALESCE(accounting_quality,'') IN ('PENDING','UNSCORABLE')
+		ORDER BY datetime(entry_time), id
+		LIMIT ?
+	`, traderID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query pending closed positions: %w", err)
+	}
+	defer rows.Close()
+	return s.scanPositions(rows)
+}
+
 // GetAllOpenPositions gets all traders' open positions (for global sync)
 func (s *PositionStore) GetAllOpenPositions() ([]*TraderPosition, error) {
 	rows, err := s.db.Query(`
@@ -416,8 +681,8 @@ func (s *PositionStore) GetPositionStats(traderID string) (map[string]interface{
 			SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) as wins,
 			COALESCE(SUM(realized_pnl), 0) as total_pnl,
 			COALESCE(SUM(fee), 0) as total_fee
-		FROM trader_positions
-		WHERE trader_id = ? AND status = 'CLOSED' AND COALESCE(accounting_quality,'VERIFIED')='VERIFIED'
+		FROM trusted_closed_positions
+		WHERE trader_id = ?
 	`, traderID).Scan(&totalTrades, &winTrades, &totalPnL, &totalFee)
 	if err != nil {
 		return nil, err
@@ -443,8 +708,8 @@ func (s *PositionStore) GetFullStats(traderID string) (*TraderStats, error) {
 	// Query all closed positions
 	rows, err := s.db.Query(`
 		SELECT realized_pnl, fee, exit_time
-		FROM trader_positions
-		WHERE trader_id = ? AND status = 'CLOSED' AND COALESCE(accounting_quality,'VERIFIED')='VERIFIED'
+		FROM trusted_closed_positions
+		WHERE trader_id = ?
 		ORDER BY exit_time ASC
 	`, traderID)
 	if err != nil {
@@ -524,8 +789,8 @@ type RecentTrade struct {
 func (s *PositionStore) GetRecentTrades(traderID string, limit int) ([]RecentTrade, error) {
 	rows, err := s.db.Query(`
 		SELECT symbol, side, entry_price, exit_price, realized_pnl, leverage, entry_time, exit_time
-		FROM trader_positions
-		WHERE trader_id = ? AND status = 'CLOSED' AND COALESCE(accounting_quality,'VERIFIED')='VERIFIED'
+		FROM trusted_closed_positions
+		WHERE trader_id = ?
 		ORDER BY exit_time DESC
 		LIMIT ?
 	`, traderID, limit)
@@ -723,8 +988,8 @@ func (s *PositionStore) GetSymbolStats(traderID string, limit int) ([]SymbolStat
 			COALESCE(SUM(realized_pnl), 0) as total_pnl,
 			COALESCE(AVG(realized_pnl), 0) as avg_pnl,
 			COALESCE(AVG((julianday(exit_time) - julianday(entry_time)) * 24 * 60), 0) as avg_hold_mins
-		FROM trader_positions
-		WHERE trader_id = ? AND status = 'CLOSED' AND COALESCE(accounting_quality,'VERIFIED')='VERIFIED'
+		FROM trusted_closed_positions
+		WHERE trader_id = ?
 		GROUP BY symbol
 		ORDER BY total_pnl DESC
 		LIMIT ?
@@ -764,8 +1029,8 @@ func (s *PositionStore) GetHoldingTimeStats(traderID string) ([]HoldingTimeStats
 			SELECT
 				realized_pnl,
 				(julianday(exit_time) - julianday(entry_time)) * 24 as hold_hours
-			FROM trader_positions
-			WHERE trader_id = ? AND status = 'CLOSED' AND COALESCE(accounting_quality,'VERIFIED')='VERIFIED' AND exit_time IS NOT NULL
+			FROM trusted_closed_positions
+			WHERE trader_id = ? AND exit_time IS NOT NULL
 		)
 		SELECT
 			CASE
@@ -822,8 +1087,8 @@ func (s *PositionStore) GetDirectionStats(traderID string) ([]DirectionStats, er
 			SUM(CASE WHEN realized_pnl > 0 THEN 1.0 ELSE 0.0 END) / COUNT(*) * 100 as win_rate,
 			COALESCE(SUM(realized_pnl), 0) as total_pnl,
 			COALESCE(AVG(realized_pnl), 0) as avg_pnl
-		FROM trader_positions
-		WHERE trader_id = ? AND status = 'CLOSED' AND COALESCE(accounting_quality,'VERIFIED')='VERIFIED'
+		FROM trusted_closed_positions
+		WHERE trader_id = ?
 		GROUP BY side
 	`, traderID)
 	if err != nil {
@@ -934,8 +1199,8 @@ func (s *PositionStore) GetHistorySummary(traderID string) (*HistorySummary, err
 	var avgHold sql.NullFloat64
 	s.db.QueryRow(`
 		SELECT AVG((julianday(exit_time) - julianday(entry_time)) * 24 * 60)
-		FROM trader_positions
-		WHERE trader_id = ? AND status = 'CLOSED' AND COALESCE(accounting_quality,'VERIFIED')='VERIFIED' AND exit_time IS NOT NULL
+		FROM trusted_closed_positions
+		WHERE trader_id = ? AND exit_time IS NOT NULL
 	`, traderID).Scan(&avgHold)
 	if avgHold.Valid {
 		summary.AvgHoldingMins = avgHold.Float64
@@ -946,8 +1211,8 @@ func (s *PositionStore) GetHistorySummary(traderID string) (*HistorySummary, err
 	var recentTotal int
 	var recentPnL float64
 	rows, err := s.db.Query(`
-		SELECT realized_pnl FROM trader_positions
-		WHERE trader_id = ? AND status = 'CLOSED' AND COALESCE(accounting_quality,'VERIFIED')='VERIFIED'
+		SELECT realized_pnl FROM trusted_closed_positions
+		WHERE trader_id = ?
 		ORDER BY exit_time DESC LIMIT 20
 	`, traderID)
 	if err == nil {
@@ -976,8 +1241,8 @@ func (s *PositionStore) GetHistorySummary(traderID string) (*HistorySummary, err
 // calculateStreaks calculates win/loss streaks
 func (s *PositionStore) calculateStreaks(traderID string, summary *HistorySummary) {
 	rows, err := s.db.Query(`
-		SELECT realized_pnl FROM trader_positions
-		WHERE trader_id = ? AND status = 'CLOSED' AND COALESCE(accounting_quality,'VERIFIED')='VERIFIED'
+		SELECT realized_pnl FROM trusted_closed_positions
+		WHERE trader_id = ?
 		ORDER BY exit_time DESC
 	`, traderID)
 	if err != nil {
@@ -1135,14 +1400,26 @@ func (s *PositionStore) CreateFromClosedPnL(traderID, exchangeID, exchangeType s
 	// ==========================================================================
 	// Step 5: Insert into database
 	// ==========================================================================
-	_, err = s.db.Exec(`
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	if _, err = tx.Exec(`INSERT OR IGNORE INTO position_close_fills
+		(trader_id,exchange_id,exchange_trade_id,symbol,side,quantity,exit_price,realized_pnl,fee,fill_time,data_quality)
+		VALUES(?,?,?,?,?,?,?,?,?,?, 'VERIFIED')`,
+		traderID, exchangeID, exchangePositionID, record.Symbol, side, record.Quantity,
+		record.ExitPrice, record.RealizedPnL, record.Fee, exitTime.UTC().Format(time.RFC3339Nano)); err != nil {
+		return false, fmt.Errorf("persist authoritative closed position: %w", err)
+	}
+	_, err = tx.Exec(`
 		INSERT INTO trader_positions (
 			trader_id, exchange_id, exchange_type, exchange_position_id, symbol, side, quantity,
 			entry_price, entry_order_id, entry_time,
 			exit_price, exit_order_id, exit_time,
-			realized_pnl, fee, leverage, status, close_reason, source,
+			realized_pnl, fee, leverage, status, close_reason, source, accounting_quality,
 			created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'CLOSED', ?, 'sync', ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'CLOSED', ?, 'sync', 'VERIFIED', ?, ?)
 	`,
 		traderID, exchangeID, exchangeType, exchangePositionID, record.Symbol, side, record.Quantity,
 		record.EntryPrice, "", entryTime.Format(time.RFC3339),
@@ -1157,7 +1434,9 @@ func (s *PositionStore) CreateFromClosedPnL(traderID, exchangeID, exchangeType s
 		}
 		return false, fmt.Errorf("failed to create position from closed PnL: %w", err)
 	}
-
+	if err = tx.Commit(); err != nil {
+		return false, err
+	}
 	return true, nil
 }
 
@@ -1183,8 +1462,8 @@ type ClosedPnLRecord struct {
 func (s *PositionStore) GetLastClosedPositionTime(traderID string) (time.Time, error) {
 	var exitTime sql.NullString
 	err := s.db.QueryRow(`
-		SELECT exit_time FROM trader_positions
-		WHERE trader_id = ? AND status = 'CLOSED' AND COALESCE(accounting_quality,'VERIFIED')='VERIFIED' AND exit_time IS NOT NULL
+		SELECT exit_time FROM trusted_closed_positions
+		WHERE trader_id = ? AND exit_time IS NOT NULL
 		ORDER BY exit_time DESC LIMIT 1
 	`, traderID).Scan(&exitTime)
 
@@ -1269,6 +1548,57 @@ func (s *PositionStore) SyncClosedPositions(traderID, exchangeID, exchangeType s
 	created, skipped := 0, 0
 	for _, record := range records {
 		rec := record // Create local copy to avoid closure issues
+		side := strings.ToUpper(rec.Side)
+		if side == "BUY" {
+			side = "LONG"
+		} else if side == "SELL" {
+			side = "SHORT"
+		}
+		var pendingID int64
+		pendingErr := s.db.QueryRow(`SELECT id FROM trader_positions
+			WHERE trader_id=? AND exchange_id=? AND symbol=? AND UPPER(side)=?
+			  AND status='CLOSED' AND COALESCE(accounting_quality,'') IN ('PENDING','UNSCORABLE')
+			  AND datetime(entry_time)<=datetime(?)
+			ORDER BY datetime(entry_time),id LIMIT 1`,
+			traderID, exchangeID, rec.Symbol, side, rec.ExitTime.UTC().Format(time.RFC3339Nano)).Scan(&pendingID)
+		if pendingErr != nil && pendingErr != sql.ErrNoRows {
+			return created, skipped, pendingErr
+		}
+		if pendingErr == nil {
+			tradeID := strings.TrimSpace(rec.ExchangeID)
+			if tradeID == "" {
+				tradeID = strings.TrimSpace(rec.OrderID)
+			}
+			if tradeID == "" {
+				tradeID = fmt.Sprintf("%s|%s|%d|%.12g|%.12g", rec.Symbol, side, rec.ExitTime.UnixNano(), rec.Quantity, rec.ExitPrice)
+			}
+			claimed, reconcileErr := s.ClosePositionWithAllocations(pendingID, exchangeID, []PositionCloseFill{{
+				TradeID: tradeID, Symbol: rec.Symbol, Side: side, Quantity: rec.Quantity,
+				ExitPrice: rec.ExitPrice, RealizedPnL: rec.RealizedPnL, Fee: rec.Fee,
+				FillTime: rec.ExitTime, DataQuality: "VERIFIED",
+			}}, rec.ExitPrice, rec.CloseType)
+			if reconcileErr != nil {
+				return created, skipped, fmt.Errorf("reconcile delayed closed fill: %w", reconcileErr)
+			}
+			if claimed {
+				skipped++
+				continue
+			}
+			// The fill may have been consumed by an older compatible FIFO lot
+			// rather than the provisional row selected above. In that case its
+			// authoritative account record already exists and creating a new
+			// synthetic CLOSED position would duplicate strategy-level PnL.
+			var authoritativeExists int
+			if authorityErr := s.db.QueryRow(`SELECT COUNT(*) FROM position_close_fills
+				WHERE exchange_id=? AND exchange_trade_id=?`,
+				exchangeID, tradeID).Scan(&authoritativeExists); authorityErr != nil {
+				return created, skipped, authorityErr
+			}
+			if authoritativeExists > 0 {
+				skipped++
+				continue
+			}
+		}
 		wasCreated, err := s.CreateFromClosedPnL(traderID, exchangeID, exchangeType, &rec)
 		if err != nil {
 			return created, skipped, fmt.Errorf("failed to sync position: %w", err)

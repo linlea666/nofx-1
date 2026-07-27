@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"math"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -55,6 +56,9 @@ func TestReentryCandidateLifecycleAndRiskReservation(t *testing.T) {
 	}
 	analysis, err := rs.SaveReentryAnalysis(&ReentryAIAnalysis{CandidateID: candidate.ID, TraderID: "trader-a", CycleID: 7, Symbol: "ETHUSDT", Side: "long", SystemPrompt: "sys", UserPrompt: "user", DatapackJSON: "{}", PromptVersion: "v2", SnapshotPrice: 2010})
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rs.CompleteReentryInternalResult(analysis.ID, `{}`, ReentryVerdictEnter, .86, `[]`, 30); err != nil {
 		t.Fatal(err)
 	}
 	if err := rs.FinishReentryCandidateReview(candidate.ID, ReentryCandidateDecision{Decision: ReentryVerdictEnter, Regime: "REVERSAL", Confidence: .86, SizeFactor: .5, EntryPriceLow: 2000, EntryPriceHigh: 2020, AttentionPriceLow: 1980, AttentionPriceHigh: 1990, NextReview: time.Now().Add(15 * time.Minute), AnalysisID: analysis.ID, TTLSeconds: 30, CandleKey: "candle-1", EnterApproved: true}); err != nil {
@@ -147,10 +151,22 @@ func TestFeatureHashChangeDoesNotPullForwardRegularReviewOrEntryLease(t *testing
 	if _, err = st.db.Exec(`UPDATE copy_guard_reentry_candidates SET status=? WHERE id=?`, ReentryCandidateReviewing, c.ID); err != nil {
 		t.Fatal(err)
 	}
+	analysis, err := rs.SaveReentryAnalysis(&ReentryAIAnalysis{
+		CandidateID: c.ID, TraderID: "trader-a", CycleID: 711,
+		Symbol: "ETHUSDT", Side: "short", SystemPrompt: "sys",
+		UserPrompt: "user", DatapackJSON: "{}", PromptVersion: "v2",
+		SnapshotPrice: 1905,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = rs.CompleteReentryInternalResult(analysis.ID, `{}`, ReentryVerdictEnter, .84, `[]`, 5); err != nil {
+		t.Fatal(err)
+	}
 	if err = rs.FinishReentryCandidateReview(c.ID, ReentryCandidateDecision{
 		Decision: ReentryVerdictEnter, Confidence: .84, SizeFactor: .5,
 		EntryPriceLow: 1900, EntryPriceHigh: 1910, NextReview: regular,
-		AnalysisID: 10, TTLSeconds: 5, EnterApproved: true,
+		AnalysisID: analysis.ID, TTLSeconds: 5, EnterApproved: true,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -160,6 +176,59 @@ func TestFeatureHashChangeDoesNotPullForwardRegularReviewOrEntryLease(t *testing
 	}
 	if fresh.DecisionExpiresAt == nil || fresh.DecisionTTLSeconds != 15 {
 		t.Fatalf("ENTER lease must persist and clamp to 15-60s: %+v", fresh)
+	}
+}
+
+func TestEventReviewSchedulerHonorsRegularCadenceAndHardBlocks(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "candidate-event-schedule.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	rs := st.ReentryAI()
+	now := time.Now().UTC()
+	regular := now.Add(2 * time.Hour)
+	candidate, err := rs.EnsureReentryCandidate(&CopyGuardReentryCandidate{
+		CycleID: 712, TraderID: "trader-a", LeaderPosID: "p",
+		Symbol: "ETHUSDT", Side: "short", FeatureHash: "h1",
+		PendingTrigger: "SCHEDULED",
+	}, regular)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = st.db.Exec(`UPDATE copy_guard_reentry_candidates
+		SET last_review_at=?,regular_review_at=?,next_review_at=? WHERE id=?`,
+		now.Format(time.RFC3339Nano), regular.Format(time.RFC3339Nano),
+		regular.Format(time.RFC3339Nano), candidate.ID); err != nil {
+		t.Fatal(err)
+	}
+	scheduled, err := rs.ScheduleReentryCandidateEventReview(candidate.ID, "STOP_RECOVERY", 5*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventExpected := now.Add(5 * time.Minute)
+	if scheduled.EventReviewAt == nil ||
+		math.Abs(scheduled.EventReviewAt.Sub(eventExpected).Seconds()) > 2 ||
+		math.Abs(scheduled.NextReviewAt.Sub(eventExpected).Seconds()) > 2 {
+		t.Fatalf("high-signal event did not pull regular cadence forward: %+v", scheduled)
+	}
+
+	budgetBlocked := now.Add(3 * time.Hour)
+	failureBackoff := now.Add(4 * time.Hour)
+	if _, err = st.db.Exec(`UPDATE copy_guard_reentry_candidates
+		SET budget_blocked_until=?,failure_backoff_until=? WHERE id=?`,
+		budgetBlocked.Format(time.RFC3339Nano), failureBackoff.Format(time.RFC3339Nano),
+		candidate.ID); err != nil {
+		t.Fatal(err)
+	}
+	blocked, err := rs.ScheduleReentryCandidateEventReview(candidate.ID, "LEADER_SIZE_CHANGE", 5*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if blocked.EventReviewAt == nil ||
+		math.Abs(blocked.EventReviewAt.Sub(eventExpected).Seconds()) > 2 ||
+		math.Abs(blocked.NextReviewAt.Sub(failureBackoff).Seconds()) > 2 {
+		t.Fatalf("event signal bypassed failure/budget hard block: %+v", blocked)
 	}
 }
 
@@ -705,6 +774,33 @@ func TestRiskReservationAdditiveMigrationIsIdempotent(t *testing.T) {
 		}
 		if closeErr := st.Close(); closeErr != nil {
 			t.Fatal(closeErr)
+		}
+	}
+}
+
+func TestReduceCopyGuardRiskToFillUsesImmutableReservationBase(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "partial-risk-idempotency.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	rs := st.ReentryAI()
+	if err = rs.ReserveCopyGuardRisk("trader-a", 301, 1, 8, 100, .10, .20, .20); err != nil {
+		t.Fatal(err)
+	}
+	for pass := 0; pass < 2; pass++ {
+		if err = rs.ReduceCopyGuardRiskToFill(301, 1, 0.25, 1); err != nil {
+			t.Fatal(err)
+		}
+		var targetRisk, liveRisk float64
+		if err = st.db.QueryRow(`SELECT target_risk_usd,risk_usd
+			FROM copy_guard_risk_reservations WHERE cycle_id=301 AND attempt_no=1`).
+			Scan(&targetRisk, &liveRisk); err != nil {
+			t.Fatal(err)
+		}
+		if math.Abs(targetRisk-8) > 1e-9 || math.Abs(liveRisk-2) > 1e-9 {
+			t.Fatalf("pass %d repeated partial-fill reduction drifted: target=%v live=%v",
+				pass, targetRisk, liveRisk)
 		}
 	}
 }

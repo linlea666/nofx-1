@@ -39,7 +39,6 @@ func TestLegacyDatabaseMigration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("legacy database migration startup failed: %v", err)
 	}
-	defer st.Close()
 
 	for _, check := range []struct {
 		table  string
@@ -53,18 +52,33 @@ func TestLegacyDatabaseMigration(t *testing.T) {
 		{"copy_guard_reentry_candidates", "event_review_at"},
 		{"copy_guard_reentry_candidates", "budget_blocked_until"},
 		{"trader_positions", "accounting_quality"},
+		{"position_close_fills", "data_quality"},
+		{"position_close_allocations", "fill_id"},
 		{"position_close_allocations", "exit_price"},
+		{"position_close_allocations", "allocation_quality"},
 	} {
 		if !sqliteColumnExists(t, st.db, check.table, check.column) {
 			t.Fatalf("migration did not create %s.%s", check.table, check.column)
 		}
 	}
-	for _, table := range []string{"copy_trade_execution_fill_commits", "position_close_allocations"} {
+	for _, table := range []string{"copy_trade_execution_fill_commits", "position_close_fills", "position_close_allocations", "position_accounting_audits"} {
 		var found int
 		if err = st.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&found); err != nil || found != 1 {
 			t.Fatalf("migration did not create %s: found=%d err=%v", table, found, err)
 		}
 	}
+	var trustedView int
+	if err = st.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='view' AND name='trusted_closed_positions'`).Scan(&trustedView); err != nil || trustedView != 1 {
+		t.Fatalf("migration did not create trusted_closed_positions: found=%d err=%v", trustedView, err)
+	}
+	if err = st.Close(); err != nil {
+		t.Fatalf("close first migrated startup: %v", err)
+	}
+	reopened, err := New(target)
+	if err != nil {
+		t.Fatalf("second migration startup was not idempotent: %v", err)
+	}
+	defer reopened.Close()
 }
 
 func sqliteColumnExists(t *testing.T, db *sql.DB, table, column string) bool {

@@ -131,7 +131,7 @@ func TestExecFailureDedupKeyChangesWhenLeaderOperationChanges(t *testing.T) {
 	}
 }
 
-func TestInsufficientMarginInitialOpenTerminatesAsIgnoredLifecycle(t *testing.T) {
+func TestInsufficientMarginInitialOpenKeepsReplayableCatchupGap(t *testing.T) {
 	st, err := store.New(filepath.Join(t.TempDir(), "nofx-open-margin-skip.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -149,38 +149,30 @@ func TestInsufficientMarginInitialOpenTerminatesAsIgnoredLifecycle(t *testing.T)
 	if err != nil || !claimed {
 		t.Fatalf("reserve intent claimed=%v err=%v", claimed, err)
 	}
-	if err = st.CopyTrade().UpdateExecutionIntent(intent.ID, store.ExecutionIntentSubmitted, "", "", "", 0, 0, 0); err != nil {
-		t.Fatal(err)
-	}
 	dec := &decision.Decision{
 		Action: "open_long", Symbol: "ETHUSDT", IsCopyTrade: true, CopyTradeAction: "open",
 		LeaderPosID: "leader-pos", LeaderPosSize: 4, MarginMode: "cross",
 		ExecutionIntentID: intent.ID, SourceRevision: 1,
 	}
-	reasonCode, err := ti.commitInsufficientMarginLeaderTransition(dec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if reasonCode != "SKIPPED_OPEN_INSUFFICIENT_MARGIN" {
-		t.Fatalf("reason=%q", reasonCode)
-	}
-	mapping, err := st.CopyTrade().GetMapping("trader-1", "leader-pos")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if mapping.Status != store.MappingStatusIgnored || mapping.SourceRevision != 1 || mapping.LastKnownSize != 4 {
-		t.Fatalf("unexpected ignored mapping: %+v", mapping)
-	}
+	ti.deferOrdinaryLeaderCatchup(dec, errors.New("insufficient margin"))
 	var status, storedReason string
 	if err = st.DB().QueryRow(`SELECT status,reason_code FROM copy_trade_execution_intents WHERE id=?`, intent.ID).Scan(&status, &storedReason); err != nil {
 		t.Fatal(err)
 	}
-	if status != store.ExecutionIntentSkipped || storedReason != reasonCode {
-		t.Fatalf("unexpected intent terminal state: status=%s reason=%s", status, storedReason)
+	if status != store.ExecutionIntentPartiallyFilled || storedReason != "CATCHUP_WAITING_MARGIN" {
+		t.Fatalf("unexpected deferred intent state: status=%s reason=%s", status, storedReason)
+	}
+	var mappings int
+	if err = st.DB().QueryRow(`SELECT COUNT(*) FROM copy_trade_position_mappings WHERE trader_id=? AND leader_pos_id=?`,
+		"trader-1", "leader-pos").Scan(&mappings); err != nil {
+		t.Fatal(err)
+	}
+	if mappings != 0 {
+		t.Fatal("no-fill initial open must not create a permanent ignored mapping")
 	}
 }
 
-func TestInsufficientMarginAddAdvancesSourceWithoutCreatingFill(t *testing.T) {
+func TestInsufficientMarginAddDoesNotAdvanceSourceWithoutFill(t *testing.T) {
 	st, err := store.New(filepath.Join(t.TempDir(), "nofx-add-margin-skip.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -209,19 +201,66 @@ func TestInsufficientMarginAddAdvancesSourceWithoutCreatingFill(t *testing.T) {
 		LeaderPosID: "leader-pos", LeaderPosSize: 5, MarginMode: "cross",
 		ExecutionIntentID: intent.ID, SourceRevision: 2,
 	}
-	reasonCode, err := ti.commitInsufficientMarginLeaderTransition(dec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if reasonCode != "SKIPPED_ADD_INSUFFICIENT_MARGIN" {
-		t.Fatalf("reason=%q", reasonCode)
-	}
+	ti.deferOrdinaryLeaderCatchup(dec, errors.New("insufficient margin"))
 	mapping, err := st.CopyTrade().GetMapping("trader-1", "leader-pos")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if mapping.Status != store.MappingStatusActive || mapping.SourceRevision != 2 || mapping.LastKnownSize != 5 || mapping.AddCount != 0 {
-		t.Fatalf("unexpected active mapping after skipped add: %+v", mapping)
+	if mapping.Status != store.MappingStatusActive || mapping.SourceRevision != 1 || mapping.LastKnownSize != 4 || mapping.AddCount != 0 {
+		t.Fatalf("no-fill add must preserve the prior mapping revision: %+v", mapping)
+	}
+	var status, storedReason string
+	if err = st.DB().QueryRow(`SELECT status,reason_code FROM copy_trade_execution_intents WHERE id=?`, intent.ID).Scan(&status, &storedReason); err != nil {
+		t.Fatal(err)
+	}
+	if status != store.ExecutionIntentPartiallyFilled || storedReason != "CATCHUP_WAITING_MARGIN" {
+		t.Fatalf("unexpected deferred add state: status=%s reason=%s", status, storedReason)
+	}
+}
+
+func TestExpiredOrdinaryCatchupTerminatesWithoutSubmitting(t *testing.T) {
+	st, err := store.New(filepath.Join(t.TempDir(), "nofx-catchup-timeout.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	intent, claimed, err := st.CopyTrade().ReserveExecutionIntent(&store.CopyTradeExecutionIntent{
+		TraderID: "trader-1", LeaderPosID: "leader-pos", SourceRevision: 1,
+		CanonicalKey: "leader|trader-1|leader-pos|1", SourceFillID: "fill-1",
+		Action: "open_long", Symbol: "ETHUSDT", Side: "long",
+		MarginMode: "cross", LeaderTargetSize: 4, TargetQuantity: 1,
+	})
+	if err != nil || !claimed {
+		t.Fatalf("reserve intent claimed=%v err=%v", claimed, err)
+	}
+	expired := time.Now().Add(-time.Second).UTC()
+	if _, err = st.DB().Exec(`UPDATE copy_trade_execution_intents
+		SET status='PARTIALLY_FILLED',filled_quantity=0.4,catchup_deadline_at=?
+		WHERE id=?`, expired.Format(time.RFC3339Nano), intent.ID); err != nil {
+		t.Fatal(err)
+	}
+	intent, err = st.CopyTrade().GetExecutionIntentByID(intent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ti := &TraderIntegration{
+		traderID: "trader-1", store: st,
+		engine: &Engine{config: &CopyConfig{
+			ProviderType: ProviderBinance, LeaderID: "leader",
+			CopyCatchupWindowSeconds: 60, CopyCatchupMaxAdverseBPS: 20,
+		}},
+	}
+	ti.executeOrdinaryCatchup(intent)
+	stored, err := st.CopyTrade().GetExecutionIntentByID(intent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != store.ExecutionIntentFailed || stored.ReasonCode != "CATCHUP_TIMEOUT" {
+		t.Fatalf("expired catch-up was not terminalized: %+v", stored)
+	}
+	attempts, err := st.CopyTrade().ListExecutionOrderAttempts(intent.ID)
+	if err != nil || len(attempts) != 0 {
+		t.Fatalf("expired catch-up must not submit an order: attempts=%+v err=%v", attempts, err)
 	}
 }
 

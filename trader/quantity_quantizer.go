@@ -14,6 +14,7 @@ type QuantityIntentKind string
 const (
 	QuantityInitialOpen   QuantityIntentKind = "initial_open"
 	QuantityAdd           QuantityIntentKind = "add"
+	QuantityCatchup       QuantityIntentKind = "catchup"
 	QuantityPartialReduce QuantityIntentKind = "partial_reduce"
 	QuantityFinalClose    QuantityIntentKind = "final_close"
 	QuantityAIReentry     QuantityIntentKind = "ai_reentry"
@@ -74,7 +75,7 @@ func QuantizeOrderIntent(inst *ExecutionInstrument, requested float64, kind Quan
 		if quantized < minimum-epsilon {
 			quantized = minimum
 		}
-	case QuantityAdd, QuantityAIReentry:
+	case QuantityAdd, QuantityCatchup, QuantityAIReentry:
 		quantized = math.Floor(requested/step+epsilon) * step
 		if quantized < minimum-epsilon {
 			return QuantityQuantization{Requested: requested, Step: step, Minimum: minimum}, ErrQuantityBelowMinimum
@@ -110,9 +111,9 @@ func QuantizeOrderIntent(inst *ExecutionInstrument, requested float64, kind Quan
 }
 
 // QuantizeOrderIntentAtPrice applies the exchange minimum-notional boundary in
-// addition to quantity precision. Only an initial source open is allowed to be
-// promoted to that minimum. Adds and AI reentries are rounded down and skipped
-// when they cannot independently satisfy the venue.
+// addition to quantity precision. CATCHUP, adds and AI reentries are always
+// rounded down; only an initial source open keeps the legacy minimum-lot
+// compatibility behavior.
 func QuantizeOrderIntentAtPrice(inst *ExecutionInstrument, requested, price float64, kind QuantityIntentKind) (QuantityQuantization, error) {
 	if requested <= 0 || price <= 0 {
 		return QuantityQuantization{}, fmt.Errorf("invalid priced quantity quantization input")
@@ -134,7 +135,7 @@ func QuantizeOrderIntentAtPrice(inst *ExecutionInstrument, requested, price floa
 			q.UsedMinimum = true
 			q.StepOverride = q.Quantized > requested+epsilon
 		}
-	case QuantityAdd, QuantityAIReentry:
+	case QuantityAdd, QuantityCatchup, QuantityAIReentry:
 		if q.Quantized < minimum-epsilon {
 			return QuantityQuantization{Requested: requested, Step: inst.BaseQuantityStep, Minimum: minimum}, ErrQuantityBelowMinimum
 		}

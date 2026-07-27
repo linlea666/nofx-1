@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"math"
 	"path/filepath"
 	"testing"
 	"time"
@@ -181,18 +182,35 @@ func TestTerminalUnknownAttemptNormalizesOnStartup(t *testing.T) {
 		t.Fatal(err)
 	}
 	cs := st.CopyTrade()
-	intent, claimed, err := cs.ReserveExecutionIntent(&CopyTradeExecutionIntent{
-		TraderID: "t1", LeaderPosID: "p1", SourceRevision: 1,
-		CanonicalKey: "leader|t1|p1|1", Action: "open_long", ClientOrderID: "client-1",
-	})
-	if err != nil || !claimed {
-		t.Fatalf("reserve claimed=%v err=%v", claimed, err)
+	cases := []struct {
+		exchangeState  string
+		filledQuantity float64
+		wantStatus     string
+	}{
+		{exchangeState: "REJECTED", wantStatus: ExecutionOrderAttemptTerminalNoFill},
+		{exchangeState: "FAILED", wantStatus: ExecutionOrderAttemptTerminalNoFill},
+		{exchangeState: "FILLED", wantStatus: ExecutionOrderAttemptUnknown},
+		{exchangeState: "FILLED", filledQuantity: 0.4, wantStatus: ExecutionOrderAttemptFilled},
+		{exchangeState: "CANCELED", filledQuantity: 0.4, wantStatus: ExecutionOrderAttemptPartiallyFilled},
+		{exchangeState: "EXPIRED", filledQuantity: 0.4, wantStatus: ExecutionOrderAttemptPartiallyFilled},
 	}
-	if _, err = cs.PrepareExecutionOrderAttemptWithQuantities(intent.ID, "client-1", 1, 1); err != nil {
-		t.Fatal(err)
-	}
-	if err = cs.CompleteExecutionOrderAttempt(intent.ID, "client-1", ExecutionOrderAttemptUnknown, "", "REJECTED", "legacy ambiguous status", 0); err != nil {
-		t.Fatal(err)
+	intentIDs := make([]int64, 0, len(cases))
+	for index, testCase := range cases {
+		clientOrderID := fmt.Sprintf("client-%d", index+1)
+		intent, claimed, reserveErr := cs.ReserveExecutionIntent(&CopyTradeExecutionIntent{
+			TraderID: "t1", LeaderPosID: fmt.Sprintf("p%d", index+1), SourceRevision: 1,
+			CanonicalKey: fmt.Sprintf("leader|t1|p%d|1", index+1), Action: "open_long", ClientOrderID: clientOrderID,
+		})
+		if reserveErr != nil || !claimed {
+			t.Fatalf("case %d reserve claimed=%v err=%v", index, claimed, reserveErr)
+		}
+		if _, err = cs.PrepareExecutionOrderAttemptWithQuantities(intent.ID, clientOrderID, 1, 1); err != nil {
+			t.Fatal(err)
+		}
+		if err = cs.CompleteExecutionOrderAttempt(intent.ID, clientOrderID, ExecutionOrderAttemptUnknown, "", testCase.exchangeState, "legacy ambiguous status", testCase.filledQuantity); err != nil {
+			t.Fatal(err)
+		}
+		intentIDs = append(intentIDs, intent.ID)
 	}
 	if err = st.Close(); err != nil {
 		t.Fatal(err)
@@ -202,9 +220,11 @@ func TestTerminalUnknownAttemptNormalizesOnStartup(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	attempts, err := st.CopyTrade().ListExecutionOrderAttempts(intent.ID)
-	if err != nil || len(attempts) != 1 || attempts[0].Status != ExecutionOrderAttemptTerminalNoFill {
-		t.Fatalf("terminal no-fill normalization failed: attempts=%+v err=%v", attempts, err)
+	for index, testCase := range cases {
+		attempts, listErr := st.CopyTrade().ListExecutionOrderAttempts(intentIDs[index])
+		if listErr != nil || len(attempts) != 1 || attempts[0].Status != testCase.wantStatus {
+			t.Fatalf("case %d normalization failed: want=%s attempts=%+v err=%v", index, testCase.wantStatus, attempts, listErr)
+		}
 	}
 }
 
@@ -298,6 +318,121 @@ func TestLeaderExecutionPartialFillKeepsDurableGapAndAccumulatesCatchup(t *testi
 	}
 	if done.Status != ExecutionIntentFilled || done.FilledQuantity != 10 {
 		t.Fatalf("catch-up was not accumulated exactly once: %+v", done)
+	}
+}
+
+func TestLeaderExecutionCumulativeOrderSnapshotAppliesOnlyDelta(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "cumulative-order-fill.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cs := st.CopyTrade()
+	intent, claimed, err := cs.ReserveExecutionIntent(&CopyTradeExecutionIntent{
+		TraderID: "t1", LeaderPosID: "p1", SourceRevision: 1,
+		CanonicalKey: "leader|t1|p1|1", Action: "open_long",
+		Symbol: "ETHUSDT", Side: "long", MarginMode: "cross",
+		LeaderTargetSize: 1, RequestedQuantity: 10, QuantizedQuantity: 10,
+		ClientOrderID: "same-order",
+	})
+	if err != nil || !claimed {
+		t.Fatalf("reserve claimed=%v err=%v", claimed, err)
+	}
+	if err = cs.UpdateExecutionIntentQuantityConstraints(intent.ID, 10, 10, .1, .1, 5, .1); err != nil {
+		t.Fatal(err)
+	}
+	if err = cs.UpdateExecutionIntentQuantityConstraints(intent.ID, 6, 6, .1, .1, 5, .1); err != nil {
+		t.Fatal(err)
+	}
+	immutableTarget, err := cs.GetExecutionIntentByID(intent.ID)
+	if err != nil || immutableTarget.TargetQuantity != 10 {
+		t.Fatalf("executable retry quantity overwrote immutable target: %+v err=%v", immutableTarget, err)
+	}
+	if _, err = cs.PrepareExecutionOrderAttemptWithKind(intent.ID, "same-order", "initial_open", 10, 10); err != nil {
+		t.Fatal(err)
+	}
+	first := LeaderExecutionCommit{
+		IntentID: intent.ID, TraderID: "t1", LeaderID: "leader",
+		LeaderPosID: "p1", SourceRevision: 1, Action: "open_long",
+		Symbol: "ETHUSDT", Side: "long", MarginMode: "cross",
+		LeaderTargetSize: 1, FillPrice: 100, FilledQuantity: 4,
+		FilledNotional: 400, ClientOrderID: "same-order",
+		ExchangeState:   "PARTIALLY_FILLED",
+		AttemptQuantity: 10,
+	}
+	if err = cs.CommitLeaderExecutionFill(first); err != nil {
+		t.Fatal(err)
+	}
+	second := first
+	second.FilledQuantity = 7
+	second.FilledNotional = 700
+	second.ExchangeOrderID = "venue-order"
+	if err = cs.CommitLeaderExecutionFill(second); err != nil {
+		t.Fatal(err)
+	}
+	if err = cs.CommitLeaderExecutionFill(second); err != nil {
+		t.Fatalf("duplicate cumulative snapshot was not a no-op: %v", err)
+	}
+	stored, err := cs.GetExecutionIntentByID(intent.ID)
+	if err != nil || stored.Status != ExecutionIntentPartiallyFilled ||
+		math.Abs(stored.FilledQuantity-7) > 1e-9 || math.Abs(stored.FilledNotional-700) > 1e-9 {
+		t.Fatalf("cumulative intent snapshot was not applied once: %+v err=%v", stored, err)
+	}
+	mapping, err := cs.GetMapping("t1", "p1")
+	if err != nil || math.Abs(mapping.OpenSizeUSD-700) > 1e-9 {
+		t.Fatalf("mapping did not receive the later exchange delta once: %+v err=%v", mapping, err)
+	}
+	attempts, err := cs.ListExecutionOrderAttempts(intent.ID)
+	if err != nil || len(attempts) != 1 ||
+		attempts[0].Status != ExecutionOrderAttemptPartiallyFilled ||
+		math.Abs(attempts[0].FilledQuantity-7) > 1e-9 {
+		t.Fatalf("order attempt cumulative state mismatch: %+v err=%v", attempts, err)
+	}
+}
+
+func TestLeaderAddFillUpdatesMappingNotionalOnFirstAndLaterSnapshots(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "leader-add-fill.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cs := st.CopyTrade()
+	if err = cs.SavePositionMapping(&CopyTradePositionMapping{
+		TraderID: "t1", LeaderID: "leader", LeaderPosID: "p1",
+		Symbol: "ETHUSDT", Side: "long", MarginMode: "cross",
+		Status: MappingStatusActive, SourceRevision: 1,
+		OpenSizeUSD: 100, LastKnownSize: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	intent, claimed, err := cs.ReserveExecutionIntent(&CopyTradeExecutionIntent{
+		TraderID: "t1", LeaderPosID: "p1", SourceRevision: 2,
+		Action: "open_long", Symbol: "ETHUSDT", Side: "long",
+		LeaderTargetSize: 2, TargetQuantity: 1, ClientOrderID: "add-client",
+	})
+	if err != nil || !claimed {
+		t.Fatalf("reserve add claimed=%v err=%v", claimed, err)
+	}
+	first := LeaderExecutionCommit{
+		IntentID: intent.ID, TraderID: "t1", LeaderID: "leader",
+		LeaderPosID: "p1", SourceRevision: 2, Action: "open_long", IsAdd: true,
+		Symbol: "ETHUSDT", Side: "long", FillPrice: 100,
+		LeaderTargetSize: 2, FilledQuantity: .4, FilledNotional: 40,
+		ClientOrderID: "add-client", ExchangeState: "PARTIALLY_FILLED",
+		AttemptQuantity: 1,
+	}
+	if err = cs.CommitLeaderExecutionFill(first); err != nil {
+		t.Fatal(err)
+	}
+	second := first
+	second.ExchangeOrderID = "add-venue"
+	second.FilledQuantity, second.FilledNotional = .7, 70
+	if err = cs.CommitLeaderExecutionFill(second); err != nil {
+		t.Fatal(err)
+	}
+	mapping, err := cs.GetMapping("t1", "p1")
+	if err != nil || math.Abs(mapping.OpenSizeUSD-170) > 1e-9 || mapping.SourceRevision != 2 {
+		t.Fatalf("add fill notional was not accumulated exactly once: mapping=%+v err=%v", mapping, err)
 	}
 }
 
@@ -937,6 +1072,121 @@ func TestLegacyZeroQuantityCloseFailureIsNarrowlyReclaimable(t *testing.T) {
 	}
 	if _, err = cs.PrepareExecutionOrderAttempt(intent.ID, "stable-close-client", 0); err != nil {
 		t.Fatalf("reclaimed close-all intent must reach durable submission: %v", err)
+	}
+}
+
+func TestApplyAIReentryFillSnapshotCommitsOnlyCumulativeDelta(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "ai-partial-fill.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cs := st.CopyTrade()
+	if err = cs.SavePositionMapping(&CopyTradePositionMapping{
+		TraderID: "t1", LeaderID: "leader", LeaderPosID: "leader-pos",
+		Symbol: "ETHUSDT", Side: "long", MarginMode: "cross",
+		Status: MappingStatusStoppedByRisk, LastKnownSize: 5,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = st.DB().Exec(`UPDATE copy_trade_position_mappings SET status='stopped_by_risk' WHERE trader_id='t1' AND leader_pos_id='leader-pos'`); err != nil {
+		t.Fatal(err)
+	}
+	cycle, err := cs.EnsureCopyGuardCycle(&CopyGuardCycle{
+		TraderID: "t1", LeaderID: "leader", LeaderPosID: "leader-pos",
+		Symbol: "ETHUSDT", Side: "long", MarginMode: "cross",
+		Status: CopyGuardReentryPending, LeaderEntryPrice: 100,
+		FollowerEntryPrice: 95, FollowerNotional: 0, AccountEquity: 1000,
+		ProtectionStatus: CopyGuardProtectionCanceled,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent, claimed, err := cs.ReserveExecutionIntent(&CopyTradeExecutionIntent{
+		TraderID: "t1", LeaderPosID: "leader-pos", SourceRevision: 1_000_001,
+		SourceKind: "AI_REENTRY", CanonicalKey: "ai|t1|cycle|1",
+		CycleID: cycle.ID, CandidateID: 11, AnalysisID: 12, AttemptNo: 1, DecisionGeneration: 2,
+		Action: "open_long", Symbol: "ETHUSDT", Side: "long", MarginMode: "cross",
+		LeaderTargetSize: 5, RequestedNotional: 100, ClientOrderID: "ai-client",
+	})
+	if err != nil || !claimed {
+		t.Fatalf("reserve intent claimed=%v err=%v", claimed, err)
+	}
+	if _, err = cs.PrepareExecutionOrderAttemptWithKind(intent.ID, "ai-client", "ai_reentry", 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	first, err := cs.ApplyAIReentryFillSnapshot(AIReentryFillSnapshot{
+		IntentID: intent.ID, TraderID: "t1", ClientOrderID: "ai-client",
+		ExchangeState:      "PARTIALLY_FILLED",
+		CumulativeQuantity: .4, CumulativeNotional: 40, AveragePrice: 100,
+		AttemptQuantity: 1, LeaderTargetSize: 5,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !first.FirstFill || first.DeltaQuantity != .4 || first.IntentStatus != ExecutionIntentPartiallyFilled {
+		t.Fatalf("unexpected first fill: %+v", first)
+	}
+	duplicate, err := cs.ApplyAIReentryFillSnapshot(AIReentryFillSnapshot{
+		IntentID: intent.ID, TraderID: "t1", ClientOrderID: "ai-client",
+		ExchangeOrderID: "venue-order", ExchangeState: "PARTIALLY_FILLED",
+		CumulativeQuantity: .4, CumulativeNotional: 40, AveragePrice: 100,
+		AttemptQuantity: 1, LeaderTargetSize: 5,
+	})
+	if err != nil || duplicate.DeltaQuantity != 0 {
+		t.Fatalf("duplicate cumulative snapshot was not a no-op: %+v err=%v", duplicate, err)
+	}
+	final, err := cs.ApplyAIReentryFillSnapshot(AIReentryFillSnapshot{
+		IntentID: intent.ID, TraderID: "t1", ClientOrderID: "ai-client",
+		ExchangeOrderID: "venue-order", ExchangeState: "CANCELED",
+		CumulativeQuantity: .7, CumulativeNotional: 70, AveragePrice: 100,
+		AttemptQuantity: 1, LeaderTargetSize: 5, OrderTerminal: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if final.FirstFill || math.Abs(final.DeltaQuantity-.3) > 1e-9 || final.IntentStatus != ExecutionIntentFilled {
+		t.Fatalf("unexpected terminal partial result: %+v", final)
+	}
+	if err = cs.UpdateExecutionIntent(intent.ID, ExecutionIntentProtected, "", "", "", 0, 0, .7); err != nil {
+		t.Fatal(err)
+	}
+	protectedDuplicate, err := cs.ApplyAIReentryFillSnapshot(AIReentryFillSnapshot{
+		IntentID: intent.ID, TraderID: "t1", ClientOrderID: "ai-client",
+		ExchangeOrderID: "venue-order", ExchangeState: "CANCELED",
+		CumulativeQuantity: .7, CumulativeNotional: 70, AveragePrice: 100,
+		AttemptQuantity: 1, LeaderTargetSize: 5, OrderTerminal: true,
+	})
+	if err != nil || protectedDuplicate.DeltaQuantity != 0 ||
+		protectedDuplicate.IntentStatus != ExecutionIntentProtected {
+		t.Fatalf("duplicate terminal snapshot regressed protected intent: %+v err=%v", protectedDuplicate, err)
+	}
+	storedIntent, err := cs.GetExecutionIntentByID(intent.ID)
+	if err != nil || math.Abs(storedIntent.FilledQuantity-.7) > 1e-9 ||
+		math.Abs(storedIntent.FilledNotional-70) > 1e-9 || storedIntent.Status != ExecutionIntentProtected {
+		t.Fatalf("intent cumulative fill is wrong: %+v err=%v", storedIntent, err)
+	}
+	mapping, err := cs.GetMapping("t1", "leader-pos")
+	if err != nil || mapping.Status != MappingStatusActive || math.Abs(mapping.OpenSizeUSD-70) > 1e-9 {
+		t.Fatalf("mapping did not receive exact fill deltas: %+v err=%v", mapping, err)
+	}
+	cycle, err = cs.GetCopyGuardCycle(cycle.ID)
+	if err != nil || cycle.ReentryCount != 1 || cycle.Status != CopyGuardFollowingReentry ||
+		math.Abs(cycle.FollowerNotional-70) > 1e-9 {
+		t.Fatalf("cycle did not receive exact fill deltas: %+v err=%v", cycle, err)
+	}
+	var attemptQuantity, attemptNotional float64
+	if err = st.DB().QueryRow(`SELECT quantity,notional FROM copy_guard_attempts WHERE cycle_id=? AND attempt_no=1`,
+		cycle.ID).Scan(&attemptQuantity, &attemptNotional); err != nil {
+		t.Fatal(err)
+	}
+	if math.Abs(attemptQuantity-.7) > 1e-9 || math.Abs(attemptNotional-70) > 1e-9 {
+		t.Fatalf("copy guard attempt double-counted fill: quantity=%v notional=%v", attemptQuantity, attemptNotional)
+	}
+	attempts, err := cs.ListExecutionOrderAttempts(intent.ID)
+	if err != nil || len(attempts) != 1 || attempts[0].Status != ExecutionOrderAttemptPartiallyFilled ||
+		attempts[0].TerminalAt == nil || math.Abs(attempts[0].FilledQuantity-.7) > 1e-9 {
+		t.Fatalf("durable order attempt state is wrong: %+v err=%v", attempts, err)
 	}
 }
 

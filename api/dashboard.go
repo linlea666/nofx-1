@@ -196,24 +196,26 @@ func (s *Server) getDashboardSummary() (*DashboardSummary, error) {
 
 	db := s.store.DB()
 
-	// 全局统计
+	// Account-level PnL and fees come from each exchange fill exactly once.
+	// Strategy trade counts remain lot-based through the trusted allocation
+	// view, because a single exchange fill may close several local lots.
 	err := db.QueryRow(`
 		SELECT 
 			COALESCE(SUM(realized_pnl), 0),
-			COALESCE(SUM(fee), 0),
-			COUNT(*)
-		FROM trader_positions
-		WHERE status = 'CLOSED' AND COALESCE(accounting_quality,'VERIFIED')='VERIFIED'
-	`).Scan(&summary.TotalPnL, &summary.TotalFees, &summary.TotalTrades)
+			COALESCE(SUM(fee), 0)
+		FROM position_close_fills
+		WHERE data_quality IN ('VERIFIED','MIGRATED_VERIFIED')
+	`).Scan(&summary.TotalPnL, &summary.TotalFees)
 	if err != nil && err != sql.ErrNoRows {
 		logger.Warnf("Dashboard: 查询全局统计失败: %v", err)
 	}
+	_ = db.QueryRow(`SELECT COUNT(*) FROM trusted_closed_positions`).Scan(&summary.TotalTrades)
 
 	// 计算胜率
 	var winTrades int
 	err = db.QueryRow(`
-		SELECT COUNT(*) FROM trader_positions
-		WHERE status = 'CLOSED' AND COALESCE(accounting_quality,'VERIFIED')='VERIFIED' AND realized_pnl > 0
+		SELECT COUNT(*) FROM trusted_closed_positions
+		WHERE realized_pnl > 0
 	`).Scan(&winTrades)
 	if err == nil && summary.TotalTrades > 0 {
 		summary.AvgWinRate = float64(winTrades) / float64(summary.TotalTrades) * 100
@@ -230,8 +232,8 @@ func (s *Server) getDashboardSummary() (*DashboardSummary, error) {
 	// 今日盈亏
 	todayStart := getTimeRangeStart("today")
 	err = db.QueryRow(`
-		SELECT COALESCE(SUM(realized_pnl), 0) FROM trader_positions
-		WHERE status = 'CLOSED' AND COALESCE(accounting_quality,'VERIFIED')='VERIFIED' AND exit_time >= ?
+		SELECT COALESCE(SUM(realized_pnl), 0) FROM position_close_fills
+		WHERE data_quality IN ('VERIFIED','MIGRATED_VERIFIED') AND datetime(fill_time) >= datetime(?)
 	`, todayStart.Format("2006-01-02 15:04:05")).Scan(&summary.TodayPnL)
 	if err != nil && err != sql.ErrNoRows {
 		logger.Warnf("Dashboard: 查询今日盈亏失败: %v", err)
@@ -240,8 +242,8 @@ func (s *Server) getDashboardSummary() (*DashboardSummary, error) {
 	// 本周盈亏
 	weekStart := getTimeRangeStart("week")
 	err = db.QueryRow(`
-		SELECT COALESCE(SUM(realized_pnl), 0) FROM trader_positions
-		WHERE status = 'CLOSED' AND COALESCE(accounting_quality,'VERIFIED')='VERIFIED' AND exit_time >= ?
+		SELECT COALESCE(SUM(realized_pnl), 0) FROM position_close_fills
+		WHERE data_quality IN ('VERIFIED','MIGRATED_VERIFIED') AND datetime(fill_time) >= datetime(?)
 	`, weekStart.Format("2006-01-02 15:04:05")).Scan(&summary.WeekPnL)
 	if err != nil && err != sql.ErrNoRows {
 		logger.Warnf("Dashboard: 查询本周盈亏失败: %v", err)
@@ -250,8 +252,8 @@ func (s *Server) getDashboardSummary() (*DashboardSummary, error) {
 	// 本月盈亏
 	monthStart := getTimeRangeStart("month")
 	err = db.QueryRow(`
-		SELECT COALESCE(SUM(realized_pnl), 0) FROM trader_positions
-		WHERE status = 'CLOSED' AND COALESCE(accounting_quality,'VERIFIED')='VERIFIED' AND exit_time >= ?
+		SELECT COALESCE(SUM(realized_pnl), 0) FROM position_close_fills
+		WHERE data_quality IN ('VERIFIED','MIGRATED_VERIFIED') AND datetime(fill_time) >= datetime(?)
 	`, monthStart.Format("2006-01-02 15:04:05")).Scan(&summary.MonthPnL)
 	if err != nil && err != sql.ErrNoRows {
 		logger.Warnf("Dashboard: 查询本月盈亏失败: %v", err)
@@ -323,8 +325,8 @@ func (s *Server) getTraderDashboardStats(traderID string) (*TraderDashboardStats
 			COALESCE(SUM(CASE WHEN realized_pnl < 0 THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN realized_pnl > 0 THEN realized_pnl ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN realized_pnl < 0 THEN ABS(realized_pnl) ELSE 0 END), 0)
-		FROM trader_positions
-		WHERE trader_id = ? AND status = 'CLOSED' AND COALESCE(accounting_quality,'VERIFIED')='VERIFIED'
+		FROM trusted_closed_positions
+		WHERE trader_id = ?
 	`, traderID).Scan(
 		&stats.TotalPnL, &stats.TotalFees, &stats.TotalTrades,
 		&stats.WinTrades, &stats.LossTrades, &totalWin, &totalLoss,
@@ -345,8 +347,8 @@ func (s *Server) getTraderDashboardStats(traderID string) (*TraderDashboardStats
 	todayStart := getTimeRangeStart("today")
 	err = db.QueryRow(`
 		SELECT COALESCE(SUM(realized_pnl), 0), COUNT(*)
-		FROM trader_positions
-		WHERE trader_id = ? AND status = 'CLOSED' AND COALESCE(accounting_quality,'VERIFIED')='VERIFIED' AND exit_time >= ?
+		FROM trusted_closed_positions
+		WHERE trader_id = ? AND exit_time >= ?
 	`, traderID, todayStart.Format("2006-01-02 15:04:05")).Scan(&stats.TodayPnL, &stats.TodayTrades)
 	if err != nil && err != sql.ErrNoRows {
 		logger.Warnf("Dashboard: 查询今日统计失败: %v", err)
@@ -356,8 +358,8 @@ func (s *Server) getTraderDashboardStats(traderID string) (*TraderDashboardStats
 	weekStart := getTimeRangeStart("week")
 	err = db.QueryRow(`
 		SELECT COALESCE(SUM(realized_pnl), 0), COUNT(*)
-		FROM trader_positions
-		WHERE trader_id = ? AND status = 'CLOSED' AND COALESCE(accounting_quality,'VERIFIED')='VERIFIED' AND exit_time >= ?
+		FROM trusted_closed_positions
+		WHERE trader_id = ? AND exit_time >= ?
 	`, traderID, weekStart.Format("2006-01-02 15:04:05")).Scan(&stats.WeekPnL, &stats.WeekTrades)
 	if err != nil && err != sql.ErrNoRows {
 		logger.Warnf("Dashboard: 查询本周统计失败: %v", err)
@@ -367,8 +369,8 @@ func (s *Server) getTraderDashboardStats(traderID string) (*TraderDashboardStats
 	monthStart := getTimeRangeStart("month")
 	err = db.QueryRow(`
 		SELECT COALESCE(SUM(realized_pnl), 0), COUNT(*)
-		FROM trader_positions
-		WHERE trader_id = ? AND status = 'CLOSED' AND COALESCE(accounting_quality,'VERIFIED')='VERIFIED' AND exit_time >= ?
+		FROM trusted_closed_positions
+		WHERE trader_id = ? AND exit_time >= ?
 	`, traderID, monthStart.Format("2006-01-02 15:04:05")).Scan(&stats.MonthPnL, &stats.MonthTrades)
 	if err != nil && err != sql.ErrNoRows {
 		logger.Warnf("Dashboard: 查询本月统计失败: %v", err)
@@ -407,8 +409,8 @@ func (s *Server) calculateMaxDrawdown(traderID string) float64 {
 	db := s.store.DB()
 
 	rows, err := db.Query(`
-		SELECT realized_pnl FROM trader_positions
-		WHERE trader_id = ? AND status = 'CLOSED' AND COALESCE(accounting_quality,'VERIFIED')='VERIFIED'
+		SELECT realized_pnl FROM trusted_closed_positions
+		WHERE trader_id = ?
 		ORDER BY exit_time ASC
 	`, traderID)
 	if err != nil {
@@ -613,8 +615,8 @@ func (s *Server) calculateRiskAlerts() []RiskAlert {
 		// 1. 检查连续亏损 (最近5笔交易)
 		recentPnLs := []float64{}
 		pnlRows, err := db.Query(`
-			SELECT realized_pnl FROM trader_positions 
-			WHERE trader_id = ? AND status = 'CLOSED' AND COALESCE(accounting_quality,'VERIFIED')='VERIFIED'
+			SELECT realized_pnl FROM trusted_closed_positions
+			WHERE trader_id = ?
 			ORDER BY exit_time DESC LIMIT 5
 		`, traderID)
 		if err == nil {
@@ -657,7 +659,7 @@ func (s *Server) calculateRiskAlerts() []RiskAlert {
 		var totalTrades, winTrades int
 		db.QueryRow(`
 			SELECT COUNT(*), COALESCE(SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END), 0)
-			FROM trader_positions WHERE trader_id = ? AND status = 'CLOSED' AND COALESCE(accounting_quality,'VERIFIED')='VERIFIED'
+			FROM trusted_closed_positions WHERE trader_id = ?
 		`, traderID).Scan(&totalTrades, &winTrades)
 
 		if totalTrades >= 10 {
@@ -727,8 +729,8 @@ func (s *Server) getPnLTrend(traderID string, days int) ([]PnLTrendPoint, error)
 			DATE(exit_time) as date,
 			COALESCE(SUM(realized_pnl), 0) as daily_pnl,
 			COUNT(*) as trades
-		FROM trader_positions
-		WHERE status = 'CLOSED' AND COALESCE(accounting_quality,'VERIFIED')='VERIFIED'
+		FROM trusted_closed_positions
+		WHERE 1=1
 	`
 	args := []interface{}{}
 

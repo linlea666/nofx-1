@@ -1038,9 +1038,11 @@ func (s *Server) handleCreateTrader(c *gin.Context) {
 				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 				return
 			}
-			if err := validateStopLossPctConfirmation(copyConfig.RiskStopMaxAccountLossPct, req.CopyConfig.RiskHighRiskConfirmed, req.CopyConfig.RiskStopExtremeConfirmValue); err != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-				return
+			if copyConfig.RiskStopPriority == "account_cap" {
+				if err := validateStopLossPctConfirmation(copyConfig.RiskStopMaxAccountLossPct, req.CopyConfig.RiskHighRiskConfirmed, req.CopyConfig.RiskStopExtremeConfirmValue); err != nil {
+					c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+					return
+				}
 			}
 		}
 		if err := validateAIGuardedPrerequisites(s.store, copyConfig); err != nil {
@@ -1315,9 +1317,11 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 					c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 					return
 				}
-				if err := validateStopLossPctConfirmation(copyConfig.RiskStopMaxAccountLossPct, req.CopyConfig.RiskHighRiskConfirmed, req.CopyConfig.RiskStopExtremeConfirmValue); err != nil {
-					c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-					return
+				if copyConfig.RiskStopPriority == "account_cap" {
+					if err := validateStopLossPctConfirmation(copyConfig.RiskStopMaxAccountLossPct, req.CopyConfig.RiskHighRiskConfirmed, req.CopyConfig.RiskStopExtremeConfirmValue); err != nil {
+						c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+						return
+					}
 				}
 			}
 			if err := validateAIGuardedPrerequisites(s.store, copyConfig); err != nil {

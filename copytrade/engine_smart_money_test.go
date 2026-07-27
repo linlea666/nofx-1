@@ -94,16 +94,16 @@ func TestSmartMoneySnapshotCarriesValueIdentityAndFailsClosedOnOpen(t *testing.T
 	default:
 	}
 	mapping, err := st.CopyTrade().GetMapping(e.traderID, pos.PosID)
-	if err != nil || mapping == nil || mapping.Status != "ignored" {
-		t.Fatalf("blocked open must become baseline: %+v err=%v", mapping, err)
+	if err != nil || mapping != nil {
+		t.Fatalf("temporarily unvalued open must not create a permanent mapping: %+v err=%v", mapping, err)
 	}
 	var intentStatus, reasonCode string
 	if err = st.DB().QueryRow(`SELECT status,reason_code FROM copy_trade_execution_intents
 		WHERE trader_id=? AND leader_pos_id=? ORDER BY id DESC LIMIT 1`, e.traderID, pos.PosID).Scan(&intentStatus, &reasonCode); err != nil {
 		t.Fatal(err)
 	}
-	if intentStatus != store.ExecutionIntentSkipped || reasonCode != "SOURCE_VALUE_UNAVAILABLE" {
-		t.Fatalf("recognized but unvalued open must keep an auditable skipped intent: %s/%s", intentStatus, reasonCode)
+	if intentStatus != store.ExecutionIntentReconciling || reasonCode != "SOURCE_VALUE_UNAVAILABLE" {
+		t.Fatalf("recognized but unvalued open must stay replayable: %s/%s", intentStatus, reasonCode)
 	}
 }
 

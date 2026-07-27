@@ -433,6 +433,7 @@ func riskFilter(c *gin.Context) store.CopyGuardFilter {
 type copyGuardCycleArtifacts struct {
 	Attempts      []*store.CopyGuardAttempt            `json:"attempts"`
 	Events        []*store.CopyGuardEvent              `json:"events"`
+	Intents       []*store.CopyTradeExecutionIntent    `json:"execution_intents"`
 	Protection    *store.CopyGuardProtectiveOrder      `json:"protection,omitempty"`
 	WatchSamples  []*store.CopyGuardWatchSample        `json:"watch_samples"`
 	Candidates    []*store.CopyGuardReentryCandidate   `json:"ai_candidates"`
@@ -597,6 +598,12 @@ func (h *CopyTradeHandler) loadCopyGuardCycleArtifacts(cycleID int64) (*copyGuar
 	if artifacts.Attempts, err = h.store.CopyTrade().ListCopyGuardAttempts(cycleID); err != nil {
 		return nil, err
 	}
+	if artifacts.Intents, err = h.store.CopyTrade().ListExecutionIntentsByCycle(cycleID); err != nil {
+		return nil, err
+	}
+	if artifacts.Intents == nil {
+		artifacts.Intents = []*store.CopyTradeExecutionIntent{}
+	}
 	if artifacts.Protection, err = h.store.CopyTrade().GetCopyGuardProtectiveOrder(cycleID); err != nil {
 		artifacts.Protection = nil
 	}
@@ -617,10 +624,11 @@ func (h *CopyTradeHandler) loadCopyGuardCycleArtifacts(cycleID int64) (*copyGuar
 
 func copyGuardCycleDocument(cycle *store.CopyGuardCycle, artifacts *copyGuardCycleArtifacts) gin.H {
 	return gin.H{
-		"schema_version":          5,
+		"schema_version":          6,
 		"defaults_version":        store.CopyGuardDefaultsVersion(),
 		"cycle":                   cycle,
 		"attempts":                artifacts.Attempts,
+		"execution_intents":       artifacts.Intents,
 		"events":                  artifacts.Events,
 		"protection":              artifacts.Protection,
 		"watch_samples":           artifacts.WatchSamples,
@@ -1429,9 +1437,11 @@ func (h *CopyTradeHandler) SaveConfig(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
-		if err := validateStopLossPctConfirmation(config.RiskStopMaxAccountLossPct, req.RiskHighRiskConfirmed, req.RiskStopExtremeConfirmValue); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-			return
+		if config.RiskStopPriority == "account_cap" {
+			if err := validateStopLossPctConfirmation(config.RiskStopMaxAccountLossPct, req.RiskHighRiskConfirmed, req.RiskStopExtremeConfirmValue); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
 		}
 	}
 	if err := validateLegacyReentrySelection(existing, config.RiskReentryDecisionMode); err != nil {

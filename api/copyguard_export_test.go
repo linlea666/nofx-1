@@ -42,8 +42,8 @@ func TestExportRiskCycleUsesTraderNameAndOwnership(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("owner export status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
-	// schema_version 5 必须带完整 AI 候选/分析、后验评价和默认值代次。
-	if !strings.Contains(recorder.Body.String(), "156-平凡无奇交易员") || !strings.Contains(recorder.Body.String(), `"schema_version":5`) || !strings.Contains(recorder.Body.String(), `"watch_samples"`) || !strings.Contains(recorder.Body.String(), `"ai_candidates"`) || !strings.Contains(recorder.Body.String(), `"ai_analyses"`) || !strings.Contains(recorder.Body.String(), `"ai_decision_evaluations"`) || !strings.Contains(recorder.Body.String(), `"ai_effect_summary"`) || !strings.Contains(recorder.Body.String(), `"defaults_version":8`) {
+	// schema_version 6 必须带普通执行意图、完整 AI 候选/分析、后验评价和默认值代次。
+	if !strings.Contains(recorder.Body.String(), "156-平凡无奇交易员") || !strings.Contains(recorder.Body.String(), `"schema_version":6`) || !strings.Contains(recorder.Body.String(), `"execution_intents":[]`) || !strings.Contains(recorder.Body.String(), `"watch_samples"`) || !strings.Contains(recorder.Body.String(), `"ai_candidates"`) || !strings.Contains(recorder.Body.String(), `"ai_analyses"`) || !strings.Contains(recorder.Body.String(), `"ai_decision_evaluations"`) || !strings.Contains(recorder.Body.String(), `"ai_effect_summary"`) || !strings.Contains(recorder.Body.String(), `"defaults_version":8`) {
 		t.Fatalf("export missing display metadata: %s", recorder.Body.String())
 	}
 

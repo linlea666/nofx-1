@@ -931,6 +931,7 @@ export const api = {
   async getCopyGuardCycle(id: number) {
     const result = await httpClient.get<{
       cycle: import('../types').CopyGuardCycle
+      execution_intents: import('../types').CopyTradeExecutionIntent[]
       events: Array<{
         id: number
         type: string

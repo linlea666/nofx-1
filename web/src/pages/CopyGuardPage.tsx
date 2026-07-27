@@ -120,6 +120,12 @@ const eventLabels: Record<string, string> = {
   BASELINE_CALIBRATED: '基线已用领航员历史校准',
   CYCLE_BACKFILLED: '存量仓位补建生命周期',
   STOP_CONFIRMED: '保护止损确认（间接检测）',
+  STOP_RISK_THRESHOLD_EXCEEDED: '预计止损损失超过账户预警线',
+  CATCHUP_TIMEOUT: '普通跟单补齐超时',
+  CATCHUP_PRICE_LIMIT: '普通跟单补齐触发价格上限',
+  AI_ENTRY_LEASE_WAITING_PRICE: 'AI ENTER 租约等待价格回到区间',
+  ENTER_WINDOW_EXPIRED: 'AI ENTER 条件租约已到期',
+  REENTRY_FILL_INCREMENT: 'AI 重入新增成交',
   ATTEMPT_RECONCILED: '单次尝试盈亏已对账',
   PROTECTIVE_STOP_GONE: '保护单消失（仓位已平）',
   PROTECTION_CLAMPED: '止损价被强平价挤紧（保护降级）',
@@ -1416,6 +1422,7 @@ function MarketPreviewCard() {
   )
 }
 
+/** @deprecated 后端确认入口已退役；仅保留一个发布周期用于历史前端兼容。 */
 // v5.1 人工重入待确认横幅：自动重入次数用尽后出现合格信号时（邮件同步提醒），
 // 用户在此确认（系统代执行）或忽略。30 秒轮询，无待处理信号时不渲染。
 function ManualSignalsBanner() {
@@ -1978,6 +1985,37 @@ export function CopyGuardPage() {
         }
       | undefined
   }, [detail])
+  const executionSummary = useMemo(() => {
+    const intents = detail?.execution_intents ?? []
+    const ordinary = [...intents]
+      .reverse()
+      .find(
+        (intent) =>
+          intent.source_kind !== 'AI_REENTRY' &&
+          (intent.action === 'open_long' || intent.action === 'open_short')
+      )
+    const ai = [...intents]
+      .reverse()
+      .find((intent) => intent.source_kind === 'AI_REENTRY')
+    const targetQuantity =
+      ordinary?.target_quantity ||
+      ordinary?.quantized_quantity ||
+      ordinary?.requested_quantity ||
+      0
+    const filledQuantity = ordinary?.filled_quantity ?? 0
+    const actualAccountPct =
+      ordinary && ordinary.follower_equity_at_target > 0
+        ? (ordinary.filled_notional / ordinary.follower_equity_at_target) * 100
+        : 0
+    return {
+      ordinary,
+      ai,
+      targetQuantity,
+      filledQuantity,
+      remainingQuantity: Math.max(0, targetQuantity - filledQuantity),
+      actualAccountPct,
+    }
+  }, [detail])
   const watchChart = useMemo(
     () =>
       (detail?.watch_samples ?? []).map((w) => ({
@@ -2513,6 +2551,50 @@ export function CopyGuardPage() {
             </button>
           </div>
           <div className="grid md:grid-cols-3 gap-3 mb-4 text-sm">
+            <Metric
+              label="最近普通开/加仓目标账户占比"
+              value={
+                executionSummary.ordinary
+                  ? `${executionSummary.ordinary.target_account_pct.toFixed(2)}%`
+                  : '-'
+              }
+            />
+            <Metric
+              label="最近普通开/加仓实际账户占比"
+              value={
+                executionSummary.ordinary
+                  ? `${executionSummary.actualAccountPct.toFixed(2)}%`
+                  : '-'
+              }
+            />
+            <Metric
+              label="目标量 / 真实成交 / 待补差额"
+              value={
+                executionSummary.ordinary
+                  ? `${executionSummary.targetQuantity.toPrecision(8)} / ${executionSummary.filledQuantity.toPrecision(8)} / ${executionSummary.remainingQuantity.toPrecision(8)}`
+                  : '-'
+              }
+            />
+            <Metric
+              label="普通跟单执行状态"
+              value={
+                executionSummary.ordinary
+                  ? `${executionSummary.ordinary.status}${executionSummary.ordinary.reason_code ? ` · ${executionSummary.ordinary.reason_code}` : ''}`
+                  : '-'
+              }
+            />
+            <Metric
+              label="补齐截止时间"
+              value={dateLabel(executionSummary.ordinary?.catchup_deadline_at)}
+            />
+            <Metric
+              label="AI 独立执行状态"
+              value={
+                executionSummary.ai
+                  ? `${executionSummary.ai.status}${executionSummary.ai.reason_code ? ` · ${executionSummary.ai.reason_code}` : ''}`
+                  : '未进入 AI 执行链'
+              }
+            />
             <Metric
               label="保护状态"
               value={

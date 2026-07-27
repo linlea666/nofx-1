@@ -2,6 +2,7 @@ package trader
 
 import (
 	"fmt"
+	"math"
 	"nofx/logger"
 	"nofx/store"
 	"strings"
@@ -22,6 +23,7 @@ type PositionSyncManager struct {
 	cacheMutex           sync.RWMutex
 	lastHistorySync      map[string]time.Time // trader_id -> last history sync time
 	lastHistorySyncMutex sync.RWMutex
+	historyRunMutex      sync.Mutex
 }
 
 // NewPositionSyncManager Create position synchronization manager
@@ -86,14 +88,15 @@ func (m *PositionSyncManager) run() {
 
 // syncPositions Synchronize all position statuses
 func (m *PositionSyncManager) syncPositions() {
+	// Closed-accounting reconciliation is independent of whether any local
+	// position remains OPEN. This is what lets a late exchange fill repair a
+	// row that was provisionally closed as UNSCORABLE.
+	m.syncDueClosedAccounting()
+
 	// Get all OPEN status positions
 	localPositions, err := m.store.Position().GetAllOpenPositions()
 	if err != nil {
 		logger.Infof("⚠️  Failed to get local positions: %v", err)
-		return
-	}
-
-	if len(localPositions) == 0 {
 		return
 	}
 
@@ -159,32 +162,45 @@ func (m *PositionSyncManager) syncTraderPositions(traderID string, localPosition
 		exchangeMap[key] = pos
 	}
 
-	// Compare local and exchange positions
+	localByMarket := make(map[string][]*store.TraderPosition)
 	for _, localPos := range localPositions {
 		key := fmt.Sprintf("%s_%s", localPos.Symbol, localPos.Side)
+		localByMarket[key] = append(localByMarket[key], localPos)
+	}
+	missingOpenQuantity := false
+	for key, lots := range localByMarket {
 		exchangePos, exists := exchangeMap[key]
-
-		if !exists {
-			// Exchange doesn't have this position → it has been closed
-			m.closeLocalPosition(localPos, trader, "manual")
-			continue
+		exchangeQty := 0.0
+		if exists {
+			exchangeQty = math.Abs(getFloatFromMap(exchangePos, "positionAmt"))
 		}
-
-		// Check if quantity is 0 or very small
-		qty := getFloatFromMap(exchangePos, "positionAmt")
-		if qty < 0 {
-			qty = -qty // Short position quantity is negative
+		localQty := 0.0
+		var oldest *store.TraderPosition
+		for _, lot := range lots {
+			localQty += math.Abs(lot.Quantity)
+			if oldest == nil || lot.EntryTime.Before(oldest.EntryTime) {
+				oldest = lot
+			}
 		}
-
-		if qty < 0.0000001 {
-			// Quantity is 0, position closed
-			m.closeLocalPosition(localPos, trader, "manual")
+		tolerance := math.Max(1e-8, localQty*1e-8)
+		switch {
+		case exchangeQty+tolerance < localQty && oldest != nil:
+			// Reconcile once per account/symbol/side. The authoritative fill
+			// allocator distributes exact close quantity FIFO across all lots.
+			// If this is only a partial reduction and exchange history is still
+			// delayed, leave local lots open until evidence arrives.
+			m.closeLocalPosition(oldest, trader, "manual", exchangeQty <= tolerance)
+		case exchangeQty > localQty+tolerance:
+			missingOpenQuantity = true
 		}
+	}
+	if missingOpenQuantity && exchangeID != "" && exchangeType != "" {
+		m.syncExternalPositions(traderID, exchangeID, exchangeType, trader)
 	}
 }
 
 // closeLocalPosition Mark local position as closed
-func (m *PositionSyncManager) closeLocalPosition(pos *store.TraderPosition, trader Trader, reason string) {
+func (m *PositionSyncManager) closeLocalPosition(pos *store.TraderPosition, trader Trader, reason string, fullyClosed bool) {
 	// Try to get accurate closure data from exchange first
 	closedPnLRecord := m.findClosedPnLRecord(trader, pos)
 
@@ -199,6 +215,11 @@ func (m *PositionSyncManager) closeLocalPosition(pos *store.TraderPosition, trad
 		closeReason = closedPnLRecord.CloseType
 		logger.Infof("📊 Found accurate closure data from exchange for %s %s", pos.Symbol, pos.Side)
 	} else {
+		if !fullyClosed {
+			logger.Infof("⏳ Authoritative partial-close fill not visible yet; keeping local lot open: %s %s",
+				pos.Symbol, pos.Side)
+			return
+		}
 		// Fallback: use market price and calculate PnL
 		exitPrice = pos.EntryPrice // Default to entry price
 		if price, err := trader.GetMarketPrice(pos.Symbol); err == nil && price > 0 {
@@ -218,26 +239,9 @@ func (m *PositionSyncManager) closeLocalPosition(pos *store.TraderPosition, trad
 
 	var err error
 	if closedPnLRecord != nil {
-		records := closedPnLRecord.Fills
-		if len(records) == 0 {
-			records = []ClosedPnLRecord{*closedPnLRecord}
-		}
-		fills := make([]store.PositionCloseFill, 0, len(records))
-		for _, record := range records {
-			tradeID := record.ExchangeID
-			if tradeID == "" {
-				tradeID = record.OrderID
-			}
-			if tradeID == "" {
-				tradeID = fmt.Sprintf("%s|%s|%d|%.12g|%.12g", record.Symbol, record.Side, record.ExitTime.UnixNano(), record.Quantity, record.ExitPrice)
-			}
-			fills = append(fills, store.PositionCloseFill{
-				TradeID: tradeID, Symbol: record.Symbol, Side: record.Side,
-				Quantity: record.Quantity, ExitPrice: record.ExitPrice,
-				RealizedPnL: record.RealizedPnL, Fee: record.Fee,
-			})
-		}
-		_, err = m.store.Position().ClosePositionWithAllocations(pos.ID, pos.ExchangeID, fills, exitPrice, closeReason)
+		_, err = m.store.Position().ClosePositionWithAllocations(
+			pos.ID, pos.ExchangeID, closeRecordFills(closedPnLRecord), exitPrice, closeReason,
+		)
 	} else {
 		// A mark-price estimate is useful for diagnostics but is not a real
 		// settlement record. Keep the row unscorable rather than polluting
@@ -249,7 +253,7 @@ func (m *PositionSyncManager) closeLocalPosition(pos *store.TraderPosition, trad
 		logger.Infof("⚠️  Failed to update position status: %v", err)
 	} else {
 		logger.Infof("📊 Position closed [%s] %s %s @ %.4f → %.4f, PnL: %.2f, Fee: %.4f (%s)",
-			pos.TraderID[:8], pos.Symbol, pos.Side, pos.EntryPrice, exitPrice, realizedPnL, fee, closeReason)
+			pos.TraderID[:min(8, len(pos.TraderID))], pos.Symbol, pos.Side, pos.EntryPrice, exitPrice, realizedPnL, fee, closeReason)
 	}
 }
 
@@ -274,8 +278,13 @@ func (m *PositionSyncManager) findClosedPnLRecord(trader Trader, pos *store.Trad
 
 // findClosedPnLFromBinanceTrades queries Binance directly for trades of a specific symbol
 func (m *PositionSyncManager) findClosedPnLFromBinanceTrades(trader *FuturesTrader, pos *store.TraderPosition) *ClosedPnLRecord {
-	// Query trades for this specific symbol from the last hour
-	startTime := time.Now().Add(-1 * time.Hour)
+	// Use the local lot entry boundary, capped to a 24h reconciliation window.
+	// A one-hour-only query permanently stranded fills after a longer restart
+	// or exchange-history delay.
+	startTime := time.Now().Add(-24 * time.Hour)
+	if candidate := pos.EntryTime.Add(-time.Minute); candidate.After(startTime) {
+		startTime = candidate
+	}
 	trades, err := trader.GetTradesForSymbol(pos.Symbol, startTime, 100)
 	if err != nil {
 		logger.Infof("⚠️  Failed to get trades for %s: %v", pos.Symbol, err)
@@ -283,7 +292,7 @@ func (m *PositionSyncManager) findClosedPnLFromBinanceTrades(trader *FuturesTrad
 	}
 
 	if len(trades) == 0 {
-		logger.Infof("⚠️  No trades found for %s in the last hour", pos.Symbol)
+		logger.Infof("⚠️  No trades found for %s in the reconciliation window", pos.Symbol)
 		return nil
 	}
 
@@ -298,32 +307,14 @@ func (m *PositionSyncManager) findClosedPnLFromBinanceTrades(trader *FuturesTrad
 	posSide := strings.ToLower(pos.Side)
 
 	for _, trade := range trades {
-		// Skip opening trades
-		if trade.RealizedPnL == 0 {
+		// A break-even close legitimately has zero realized PnL. Direction and
+		// position side identify a close; PnL must never be used as the action
+		// classifier. Also reject fills from before this local lot existed.
+		if !trade.Time.IsZero() && trade.Time.Before(pos.EntryTime) {
 			continue
 		}
 
-		// Determine if this trade closes our position
-		// For LONG position: SELL closes it
-		// For SHORT position: BUY closes it
-		isClosingTrade := false
-		tradeSide := strings.ToUpper(trade.Side)
-		positionSide := strings.ToUpper(trade.PositionSide)
-
-		if positionSide == "LONG" && posSide == "long" {
-			isClosingTrade = true
-		} else if positionSide == "SHORT" && posSide == "short" {
-			isClosingTrade = true
-		} else if positionSide == "BOTH" || positionSide == "" {
-			// One-way mode
-			if tradeSide == "SELL" && posSide == "long" {
-				isClosingTrade = true
-			} else if tradeSide == "BUY" && posSide == "short" {
-				isClosingTrade = true
-			}
-		}
-
-		if !isClosingTrade {
+		if !isClosingTradeForPosition(trade, posSide) {
 			continue
 		}
 
@@ -374,6 +365,23 @@ func (m *PositionSyncManager) findClosedPnLFromBinanceTrades(trader *FuturesTrad
 		ExchangeID:  latestTradeID,
 		CloseType:   "unknown",
 		Fills:       matchedFills,
+	}
+}
+
+func isClosingTradeForPosition(trade TradeRecord, positionSide string) bool {
+	tradeSide := strings.ToUpper(strings.TrimSpace(trade.Side))
+	exchangePositionSide := strings.ToUpper(strings.TrimSpace(trade.PositionSide))
+	positionSide = strings.ToLower(strings.TrimSpace(positionSide))
+	switch exchangePositionSide {
+	case "LONG":
+		return positionSide == "long" && tradeSide == "SELL"
+	case "SHORT":
+		return positionSide == "short" && tradeSide == "BUY"
+	case "BOTH", "":
+		return (positionSide == "long" && tradeSide == "SELL") ||
+			(positionSide == "short" && tradeSide == "BUY")
+	default:
+		return false
 	}
 }
 
@@ -662,8 +670,8 @@ func (m *PositionSyncManager) startupSync() {
 		// 1. Sync current open positions from exchange
 		m.syncExternalPositions(traderID, exchangeID, exchangeType, trader)
 
-		// 2. Sync closed positions history from exchange
-		m.syncClosedPositionsHistory(traderID, exchangeID, exchangeType, trader)
+		// 2. Sync closed positions history and delayed local settlements.
+		m.maybeRunHistorySync(traderID, exchangeID, exchangeType, trader)
 	}
 
 	logger.Info("📊 Startup sync completed")
@@ -686,11 +694,13 @@ func (m *PositionSyncManager) syncExternalPositions(traderID, exchangeID, exchan
 		return
 	}
 
-	// Build local position map: symbol_side -> position
-	localMap := make(map[string]*store.TraderPosition)
+	// Build all local lots per symbol/side. A single exchange position may be
+	// composed of several local opens/adds; collapsing the map to one row made
+	// delayed exchange fills disappear whenever any row already existed.
+	localMap := make(map[string][]*store.TraderPosition)
 	for _, pos := range localPositions {
 		key := fmt.Sprintf("%s_%s", pos.Symbol, pos.Side)
-		localMap[key] = pos
+		localMap[key] = append(localMap[key], pos)
 	}
 
 	// Find positions that exist on exchange but not locally
@@ -711,12 +721,6 @@ func (m *PositionSyncManager) syncExternalPositions(traderID, exchangeID, exchan
 
 		key := fmt.Sprintf("%s_%s", symbol, normalizedSide)
 
-		// Check if we already have this position locally
-		if _, exists := localMap[key]; exists {
-			continue // Already tracking this position
-		}
-
-		// This is an external position - create local record
 		qty := getFloatFromMap(pos, "positionAmt")
 		if qty < 0 {
 			qty = -qty
@@ -740,8 +744,19 @@ func (m *PositionSyncManager) syncExternalPositions(traderID, exchangeID, exchan
 			entryTime = time.Now() // Use current time as fallback
 		}
 
-		// Generate unique exchange position ID
-		exchangePositionID := fmt.Sprintf("%s_%s_%d", symbol, normalizedSide, entryTime.UnixMilli())
+		localQuantity := 0.0
+		for _, local := range localMap[key] {
+			localQuantity += math.Abs(local.Quantity)
+		}
+		missingQuantity := qty - localQuantity
+		if missingQuantity <= math.Max(1e-8, qty*1e-8) {
+			continue
+		}
+
+		// Persist only the exchange-confirmed missing delta. This reconciles a
+		// delayed open/add fill without replacing existing strategy lots or
+		// creating the full exchange position again.
+		exchangePositionID := fmt.Sprintf("%s_%s_reconciled_%d", symbol, normalizedSide, entryTime.UnixMilli())
 
 		newPos := &store.TraderPosition{
 			TraderID:           traderID,
@@ -750,7 +765,7 @@ func (m *PositionSyncManager) syncExternalPositions(traderID, exchangeID, exchan
 			ExchangePositionID: exchangePositionID,
 			Symbol:             symbol,
 			Side:               normalizedSide,
-			Quantity:           qty,
+			Quantity:           missingQuantity,
 			EntryPrice:         entryPrice,
 			EntryTime:          entryTime,
 			Leverage:           leverage,
@@ -760,8 +775,8 @@ func (m *PositionSyncManager) syncExternalPositions(traderID, exchangeID, exchan
 		if err := m.store.Position().CreateOpenPosition(newPos); err != nil {
 			logger.Infof("⚠️  Failed to create external position record: %v", err)
 		} else {
-			logger.Infof("📊 Synced external position: [%s] %s %s @ %.4f (qty: %.4f)",
-				traderID[:8], symbol, normalizedSide, entryPrice, qty)
+			logger.Infof("📊 Reconciled exchange-confirmed missing position quantity: [%s] %s %s @ %.4f (delta: %.4f, exchange: %.4f, local: %.4f)",
+				traderID[:min(8, len(traderID))], symbol, normalizedSide, entryPrice, missingQuantity, qty, localQuantity)
 		}
 	}
 }
@@ -857,22 +872,111 @@ func (m *PositionSyncManager) syncClosedPositionsHistory(traderID, exchangeID, e
 
 	if totalCreated > 0 {
 		logger.Infof("📊 Synced %d new closed positions for trader %s (skipped %d duplicates)",
-			totalCreated, traderID[:8], totalSkipped)
+			totalCreated, traderID[:min(8, len(traderID))], totalSkipped)
 	}
 
-	// Update last history sync time
-	m.lastHistorySyncMutex.Lock()
-	m.lastHistorySync[traderID] = time.Now()
-	m.lastHistorySyncMutex.Unlock()
 }
 
-// maybeRunHistorySync checks if it's time to run history sync for a trader
+func closeRecordFills(record *ClosedPnLRecord) []store.PositionCloseFill {
+	if record == nil {
+		return nil
+	}
+	records := record.Fills
+	if len(records) == 0 {
+		records = []ClosedPnLRecord{*record}
+	}
+	fills := make([]store.PositionCloseFill, 0, len(records))
+	for _, item := range records {
+		tradeID := strings.TrimSpace(item.ExchangeID)
+		if tradeID == "" {
+			tradeID = strings.TrimSpace(item.OrderID)
+		}
+		if tradeID == "" {
+			tradeID = fmt.Sprintf("%s|%s|%d|%.12g|%.12g", item.Symbol, item.Side, item.ExitTime.UnixNano(), item.Quantity, item.ExitPrice)
+		}
+		fills = append(fills, store.PositionCloseFill{
+			TradeID: tradeID, Symbol: item.Symbol, Side: item.Side,
+			Quantity: item.Quantity, ExitPrice: item.ExitPrice,
+			RealizedPnL: item.RealizedPnL, Fee: item.Fee,
+			FillTime: item.ExitTime, DataQuality: "VERIFIED",
+		})
+	}
+	return fills
+}
+
+// reconcilePendingClosedPositions retries exchange settlement for lots that
+// were provisionally closed before authoritative fills became visible.
+func (m *PositionSyncManager) reconcilePendingClosedPositions(traderID, exchangeID string, trader Trader) {
+	positions, err := m.store.Position().GetPendingClosedPositions(traderID, 100)
+	if err != nil {
+		logger.Infof("⚠️ Failed to read pending closed positions (ID: %s): %v", traderID, err)
+		return
+	}
+	// One authoritative response for a symbol/side is allocated FIFO across all
+	// compatible lots. Re-querying it once per pending lot only wastes exchange
+	// rate limit and can make reconciliation ordering depend on response timing.
+	seenMarket := make(map[string]struct{})
+	for _, pos := range positions {
+		key := strings.ToUpper(pos.Symbol) + "|" + strings.ToUpper(pos.Side)
+		if _, seen := seenMarket[key]; seen {
+			continue
+		}
+		seenMarket[key] = struct{}{}
+		record := m.findClosedPnLRecord(trader, pos)
+		if record == nil {
+			continue
+		}
+		claimed, reconcileErr := m.store.Position().ClosePositionWithAllocations(
+			pos.ID, exchangeID, closeRecordFills(record), record.ExitPrice, record.CloseType,
+		)
+		if reconcileErr != nil {
+			logger.Infof("⚠️ Failed to reconcile delayed close fill (position=%d): %v", pos.ID, reconcileErr)
+			continue
+		}
+		if claimed {
+			logger.Infof("📊 Reconciled delayed authoritative close fill: [%s] %s %s",
+				traderID[:min(8, len(traderID))], pos.Symbol, pos.Side)
+		}
+	}
+}
+
+// syncDueClosedAccounting runs account-level history and delayed settlement
+// reconciliation even when the account has no currently open local positions.
+func (m *PositionSyncManager) syncDueClosedAccounting() {
+	traders, err := m.store.Trader().ListAll()
+	if err != nil {
+		logger.Infof("⚠️ Failed to get traders for periodic accounting sync: %v", err)
+		return
+	}
+	for _, traderInfo := range traders {
+		traderID := traderInfo.ID
+		trader, traderErr := m.getOrCreateTrader(traderID)
+		if traderErr != nil {
+			continue
+		}
+		config, configErr := m.getTraderConfig(traderID)
+		if configErr != nil || config == nil {
+			continue
+		}
+		m.maybeRunHistorySync(traderID, config.Exchange.ID, config.Exchange.ExchangeType, trader)
+	}
+}
+
+// maybeRunHistorySync checks if it's time to run authoritative close history
+// and delayed-settlement reconciliation for a trader.
 func (m *PositionSyncManager) maybeRunHistorySync(traderID, exchangeID, exchangeType string, trader Trader) {
+	m.historyRunMutex.Lock()
+	defer m.historyRunMutex.Unlock()
+
 	m.lastHistorySyncMutex.RLock()
 	lastSync, exists := m.lastHistorySync[traderID]
 	m.lastHistorySyncMutex.RUnlock()
 
 	if !exists || time.Since(lastSync) >= m.historySyncInterval {
 		m.syncClosedPositionsHistory(traderID, exchangeID, exchangeType, trader)
+		m.reconcilePendingClosedPositions(traderID, exchangeID, trader)
+		m.lastHistorySyncMutex.Lock()
+		m.lastHistorySync[traderID] = time.Now()
+		m.lastHistorySyncMutex.Unlock()
 	}
 }

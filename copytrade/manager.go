@@ -10,7 +10,10 @@ import (
 )
 
 // Manager 跟单管理器
-// 管理多个跟单引擎实例，每个 trader_id 一个引擎
+//
+// Deprecated: production lifecycle is owned by TraderIntegration and the
+// trader manager. This compatibility surface is retained for downstream code
+// for one release; new execution paths must not register here.
 type Manager struct {
 	engines map[string]*Engine
 	mu      sync.RWMutex

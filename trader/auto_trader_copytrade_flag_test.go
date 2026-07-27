@@ -151,6 +151,27 @@ func TestExplicitAddActionBypassesDuplicatePositionGate(t *testing.T) {
 	}
 }
 
+func TestExplicitCatchupActionBypassesDuplicatePositionGate(t *testing.T) {
+	fake := &copyFlowFakeTrader{
+		positions: []map[string]interface{}{
+			{"symbol": "ETHUSDT", "side": "long", "mgnMode": "cross", "positionAmt": 1.0},
+		},
+	}
+	at := newCopyFlowAutoTrader(fake)
+	dec := &decision.Decision{
+		Symbol: "ETHUSDT", Action: "open_long", IsCopyTrade: true,
+		CopyTradeAction: "catchup", Reasoning: "ordinary proportional catch-up", ClientOrderID: "nfx-catch-1-2",
+		PositionSizeUSD: 25, TargetPositionSizeUSD: 25,
+		Leverage: 5, EntryPrice: 100, MarginMode: "cross",
+	}
+	if err := at.executeOpenLongWithRecord(dec, &store.DecisionAction{}); err != nil {
+		t.Fatalf("catch-up must add to an existing same-side follower position: %v", err)
+	}
+	if len(fake.openLongClientIDs) != 1 || fake.openLongClientIDs[0] != dec.ClientOrderID {
+		t.Fatalf("catch-up must submit exactly one durable attempt: %v", fake.openLongClientIDs)
+	}
+}
+
 func TestDeriveHalvedRetryClientOrderIDRespectsLengthCap(t *testing.T) {
 	long := strings.Repeat("x", 32)
 	derived := deriveHalvedRetryClientOrderID(long)

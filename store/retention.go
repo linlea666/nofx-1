@@ -201,13 +201,40 @@ func (r *RetentionService) cleanPositions() int64 {
 	if r.policy.PositionDays <= 0 {
 		return 0
 	}
+	c := cutoff(r.policy.PositionDays)
+	var total int64
+	// Close allocations and audit flags have no FK cascade on legacy
+	// databases, so remove them before the owning closed lot.
+	total += r.batchDelete("position_close_allocations", fmt.Sprintf(`
+		DELETE FROM position_close_allocations WHERE id IN (
+			SELECT a.id FROM position_close_allocations a
+			JOIN trader_positions p ON p.id=a.position_id
+			WHERE p.status='CLOSED' AND datetime(COALESCE(p.exit_time,p.updated_at)) < ?
+			LIMIT %d)`, retentionBatchSize), c)
+	total += r.batchDelete("position_accounting_audits", fmt.Sprintf(`
+		DELETE FROM position_accounting_audits WHERE id IN (
+			SELECT a.id FROM position_accounting_audits a
+			JOIN trader_positions p ON p.id=a.position_id
+			WHERE p.status='CLOSED' AND datetime(COALESCE(p.exit_time,p.updated_at)) < ?
+			LIMIT %d)`, retentionBatchSize), c)
 	// Only CLOSED positions; open positions are never deleted.
-	return r.batchDelete("trader_positions", fmt.Sprintf(`
+	total += r.batchDelete("trader_positions", fmt.Sprintf(`
 		DELETE FROM trader_positions WHERE id IN (
 			SELECT id FROM trader_positions
 			WHERE status = 'CLOSED' AND datetime(COALESCE(exit_time, updated_at)) < ?
 			LIMIT %d)`, retentionBatchSize),
-		cutoff(r.policy.PositionDays))
+		c)
+	// Authoritative fills are retained for the same window. A fill still
+	// referenced by a retained allocation is never removed.
+	total += r.batchDelete("position_close_fills", fmt.Sprintf(`
+		DELETE FROM position_close_fills WHERE id IN (
+			SELECT f.id FROM position_close_fills f
+			WHERE datetime(COALESCE(f.fill_time,f.updated_at)) < ?
+			  AND NOT EXISTS (
+				SELECT 1 FROM position_close_allocations a WHERE a.fill_id=f.id
+			  )
+			LIMIT %d)`, retentionBatchSize), c)
+	return total
 }
 
 func (r *RetentionService) cleanDecisions() int64 {

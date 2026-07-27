@@ -1837,8 +1837,8 @@ func (e *Engine) processSignal(signal *TradeSignal) {
 	}
 
 	if invalidSourceRiskIncrease {
-		e.commitSkippedReservedIntent(&dec, "SOURCE_VALUE_UNAVAILABLE")
-		logger.Infof("🎯 [%s] ⏭️ %s跳过 | %s | USD 价值换算不可用", e.traderID, matchResult.Action, fill.Symbol)
+		e.deferReservedIntentForSourceData(&dec, "SOURCE_VALUE_UNAVAILABLE")
+		logger.Infof("🎯 [%s] ⏳ %s暂停 | %s | USD 价值换算不可用，等待权威数据恢复", e.traderID, matchResult.Action, fill.Symbol)
 		e.stats.SignalsSkipped++
 		return
 	}
@@ -1846,10 +1846,16 @@ func (e *Engine) processSignal(signal *TradeSignal) {
 	if (matchResult.Action == ActionOpen || matchResult.Action == ActionAdd) && copySize == 0 {
 		reasonCode := "MIN_NOTIONAL"
 		for _, w := range warnings {
-			if w.Type == WarnLeaderEquityUnavailable {
+			if w.Type == WarnLeaderEquityUnavailable || w.Type == WarnFollowerEquityUnavailable {
 				reasonCode = "SOURCE_DATA_UNAVAILABLE"
 				break
 			}
+		}
+		if reasonCode == "SOURCE_DATA_UNAVAILABLE" {
+			e.deferReservedIntentForSourceData(&dec, reasonCode)
+			logger.Infof("🎯 [%s] ⏳ %s暂停 | %s | 权威总权益暂不可用，等待恢复后重放", e.traderID, matchResult.Action, fill.Symbol)
+			e.stats.SignalsSkipped++
+			return
 		}
 		e.commitSkippedReservedIntent(&dec, reasonCode)
 		logger.Infof("🎯 [%s] ⏭️ %s跳过 | %s | 金额为零（低于阈值或余额不足）", e.traderID, matchResult.Action, fill.Symbol)
@@ -1898,6 +1904,21 @@ func (e *Engine) processSignal(signal *TradeSignal) {
 		logger.Errorf("❌ [%s] 决策通道已满，丢弃决策并释放去重标记等待重放 | %s %s fillID=%s",
 			e.traderID, dec.Action, dec.Symbol, fill.ID)
 	}
+}
+
+func (e *Engine) deferReservedIntentForSourceData(dec *decision.Decision, reasonCode string) {
+	if dec == nil || dec.ExecutionIntentID <= 0 || e.store == nil {
+		return
+	}
+	if reasonCode == "" {
+		reasonCode = "SOURCE_DATA_UNAVAILABLE"
+	}
+	if err := e.store.CopyTrade().UpdateExecutionIntent(dec.ExecutionIntentID,
+		store.ExecutionIntentReconciling, reasonCode,
+		"authoritative source value or total equity is temporarily unavailable", "", 0, 0, 0); err != nil {
+		logger.Errorf("❌ [%s] 保存权威数据暂停状态失败 | intent=%d: %v", e.traderID, dec.ExecutionIntentID, err)
+	}
+	e.UnmarkDecisionSources(dec)
 }
 
 func (e *Engine) commitSkippedReservedIntent(dec *decision.Decision, reasonCode string) {
@@ -1951,12 +1972,23 @@ func (e *Engine) reserveExecutionIntent(dec *decision.Decision) bool {
 	}
 	canonicalKey := fmt.Sprintf("leader|%s|%s|%d", e.traderID, dec.LeaderPosID, revision)
 	dec.ClientOrderID = stableClientOrderID(e.traderID, canonicalKey, dec.Action)
+	followerEquityAtTarget := 0.0
+	if e.getFollowerEquity != nil {
+		followerEquityAtTarget = e.getFollowerEquity()
+	} else if e.getFollowerBalance != nil {
+		followerEquityAtTarget = e.getFollowerBalance()
+	}
+	targetAccountPct := 0.0
+	if followerEquityAtTarget > 0 && dec.PositionSizeUSD > 0 {
+		targetAccountPct = dec.PositionSizeUSD / followerEquityAtTarget * 100
+	}
 	intent, claimed, err := e.store.CopyTrade().ReserveExecutionIntent(&store.CopyTradeExecutionIntent{
 		TraderID: e.traderID, LeaderPosID: dec.LeaderPosID, SourceRevision: revision,
 		SourceFillID: dec.SourceFillID, SourceKind: "LEADER_TRANSITION", CanonicalKey: canonicalKey,
 		Action: dec.Action, Symbol: dec.Symbol, Side: side,
 		MarginMode: dec.MarginMode, LeaderTargetSize: dec.LeaderPosSize,
 		RequestedNotional: dec.PositionSizeUSD, ClientOrderID: dec.ClientOrderID,
+		FollowerEquityAtTarget: followerEquityAtTarget, TargetAccountPct: targetAccountPct,
 		SourceFillIDs: dec.SourceFillIDs,
 	})
 	if err != nil {
@@ -2026,8 +2058,8 @@ func (e *Engine) blockInvalidSourceRiskIncrease(signal *TradeSignal, match *Sign
 	dedup := fmt.Sprintf("source_value|%s|%s|%s|%s|%d", e.traderID, e.config.ProviderType, fill.Symbol, match.Action, time.Now().Unix()/3600)
 	notifier.Notify(notifier.Alert{
 		Time: time.Now(), Category: "copy_trade", TraderID: e.traderID, TraderName: traderName,
-		Title:   fmt.Sprintf("跟单已跳过 %s 风险增加", fill.Symbol),
-		Body:    fmt.Sprintf("领航员: %s\n合约: %s\n动作: %s\n原因: %s\n处理: 本次不开仓/不加仓并重建基线；后续减仓、平仓仍允许。", e.config.LeaderID, fill.Symbol, match.Action, reason),
+		Title:   fmt.Sprintf("跟单已暂停 %s 风险增加", fill.Symbol),
+		Body:    fmt.Sprintf("领航员: %s\n合约: %s\n动作: %s\n原因: %s\n处理: 保留原 source revision，权威价值恢复后重试；减仓、平仓不受阻塞。", e.config.LeaderID, fill.Symbol, match.Action, reason),
 		RateKey: dedup, DedupKey: dedup,
 	})
 	if e.store != nil {
@@ -2035,7 +2067,7 @@ func (e *Engine) blockInvalidSourceRiskIncrease(signal *TradeSignal, match *Sign
 			TraderID: e.traderID, LeaderID: e.config.LeaderID, ProviderType: string(e.config.ProviderType),
 			Category: store.CopyEventCategoryError, EventType: "SOURCE_VALUE_UNAVAILABLE",
 			Severity: store.CopyEventSeverityWarn, Symbol: fill.Symbol, Side: string(fill.PositionSide), LeaderPosID: match.PosID,
-			SignalID: fill.ID, Status: "skipped", Summary: "领航员风险增加因合约单位或美元名义不可验证被拒绝",
+			SignalID: fill.ID, Status: "reconciling", Summary: "领航员风险增加因合约单位或美元名义不可验证而暂停",
 			Detail: map[string]interface{}{"action": match.Action, "value_currency": fill.ValueCurrency, "reason": reason}, DedupKey: dedup,
 		}); err != nil {
 			logger.Warnf("⚠️ [%s] 保存领航员价值异常事件失败: %v", e.traderID, err)
@@ -2091,6 +2123,7 @@ func (e *Engine) buildDecisionV2(signal *TradeSignal, match *SignalMatchResult, 
 	// ============================================================
 	if match.Action == ActionOpen || match.Action == ActionAdd {
 		dec.PositionSizeUSD = copySize
+		dec.TargetPositionSizeUSD = copySize
 		dec.Leverage = e.getLeaderLeverage(signal)
 		dec.Confidence = 90
 		logger.Infof("📊 [%s] %s | 金额=%.2f 杠杆=%dx 模式=%s 入场价=%.4f",
@@ -2266,16 +2299,18 @@ func (e *Engine) calculateCopySizeByPositionChange(signal *TradeSignal, match *S
 	if e.getFollowerEquity != nil {
 		followerEquity = e.getFollowerEquity()
 	} else if e.getFollowerBalance != nil {
-		// Compatibility for directly constructed engines. TraderIntegration
-		// always injects the authoritative total-equity callback.
+		// Legacy constructor compatibility: before WithFollowerEquity existed,
+		// this callback represented account balance/equity. Production
+		// integrations always inject the explicit total-equity callback, so
+		// available margin never reaches the proportional formula.
 		followerEquity = e.getFollowerBalance()
 	}
 	if followerEquity <= 0 {
 		warnings = append(warnings, Warning{
 			Timestamp: time.Now(),
 			Symbol:    fill.Symbol,
-			Type:      "zero_balance",
-			Message:   "跟随者余额为零，无法跟单",
+			Type:      WarnFollowerEquityUnavailable,
+			Message:   "跟随者账户总权益不可用，暂停比例跟单并等待恢复",
 			Executed:  false,
 		})
 		return 0, warnings
@@ -2602,6 +2637,12 @@ func (e *Engine) buildCoTTrace(signal *TradeSignal, action ActionType, copySize 
 			warningSection += fmt.Sprintf("- [%s] %s\n", w.Type, w.Message)
 		}
 	}
+	followerEquity := 0.0
+	if e.getFollowerEquity != nil {
+		followerEquity = e.getFollowerEquity()
+	} else if e.getFollowerBalance != nil {
+		followerEquity = e.getFollowerBalance()
+	}
 
 	return fmt.Sprintf(`# Copy Trading Decision
 
@@ -2624,7 +2665,7 @@ Following leader's %s action on %s.
 		fill.Symbol, fill.Action, action,
 		fill.Price, fill.Value,
 		signal.LeaderEquity, (fill.Value/signal.LeaderEquity)*100,
-		e.getFollowerBalance(), e.config.CopyRatio*100, copySize,
+		followerEquity, e.config.CopyRatio*100, copySize,
 		warningSection,
 		action, fill.Symbol)
 }

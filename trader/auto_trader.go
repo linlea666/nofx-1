@@ -1083,6 +1083,8 @@ func copyOpenQuantityKind(dec *decision.Decision) QuantityIntentKind {
 	switch strings.ToLower(strings.TrimSpace(dec.CopyTradeAction)) {
 	case "add":
 		return QuantityAdd
+	case "catchup":
+		return QuantityCatchup
 	case "ai_reentry":
 		return QuantityAIReentry
 	case "open":
@@ -1109,7 +1111,7 @@ func isAIReentryCopyTrade(dec *decision.Decision) bool {
 	return dec.CopyTradeAction == "" && strings.Contains(strings.ToLower(dec.Reasoning), "reentry")
 }
 
-func (at *AutoTrader) quantizeCopyOpenQuantity(dec *decision.Decision, currentPrice, requested float64, preferReserved bool) (float64, error) {
+func (at *AutoTrader) quantizeCopyOpenQuantity(dec *decision.Decision, currentPrice, requested float64, _ bool) (float64, error) {
 	resolver, ok := at.trader.(ExecutionInstrumentResolver)
 	if !ok {
 		// Compatibility for non-Copy-Guard executors and lightweight adapters.
@@ -1125,16 +1127,17 @@ func (at *AutoTrader) quantizeCopyOpenQuantity(dec *decision.Decision, currentPr
 		return 0, err
 	}
 	kind := copyOpenQuantityKind(dec)
-	if preferReserved && dec.QuantizedQuantity > 0 {
-		// Price and venue metadata may move between deterministic reservation and
-		// the actual exchange boundary. Re-run the action-specific quantizer
-		// instead of rejecting a formerly valid reservation. Initial opens may
-		// move to the new exact venue minimum; adds remain floor-only and fail
-		// with ErrQuantityBelowMinimum rather than being promoted.
-		if dec.RequestedQuantity > 0 {
-			requested = dec.RequestedQuantity
-		}
+	// If available margin already reduced an ordinary initial open below its
+	// immutable proportional target, this concrete attempt is a partial
+	// execution. It must use floor-only catch-up quantization: promoting it to
+	// the venue minimum would exceed the proven affordable amount.
+	if kind == QuantityInitialOpen && dec.TargetPositionSizeUSD > 0 &&
+		dec.TargetPositionSizeUSD > requested*currentPrice+math.Max(0.01, dec.TargetPositionSizeUSD*1e-9) {
+		kind = QuantityCatchup
 	}
+	// requested is the quantity executable by this concrete attempt. The
+	// immutable proportional target lives on the execution intent; reusing the
+	// reserved target here would undo the available-margin cap.
 	q, err := QuantizeOrderIntentAtPrice(inst, requested, currentPrice, kind)
 	if err != nil {
 		return 0, err
@@ -1142,9 +1145,6 @@ func (at *AutoTrader) quantizeCopyOpenQuantity(dec *decision.Decision, currentPr
 	dec.RequestedQuantity = requested
 	dec.QuantizedQuantity = q.Quantized
 	dec.QuantityStepOverride = q.StepOverride
-	if kind == QuantityInitialOpen && q.UsedMinimum {
-		dec.ExecutionReasonCode = "OPEN_PROMOTED_TO_EXCHANGE_MINIMUM"
-	}
 	dec.PositionSizeUSD = q.Quantized * currentPrice
 	return q.Quantized, nil
 }
@@ -1310,7 +1310,8 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 	isCopyTrade := decision.IsCopyTrade || strings.Contains(decision.Reasoning, "Copy trading")
 	// Explicit CopyTradeAction is the canonical action identity. The helper
 	// retains Reasoning parsing only for decisions persisted by old clients.
-	isAddPosition := isCopyTrade && copyOpenQuantityKind(decision) == QuantityAdd
+	quantityKind := copyOpenQuantityKind(decision)
+	isAddPosition := isCopyTrade && (quantityKind == QuantityAdd || quantityKind == QuantityCatchup)
 
 	// 跟单开仓 MarginMode 为空（SyncMarginMode=false 或数据源未提供）：
 	// 回填为交易员自身配置的模式，让后续的重复仓位检查、mapping 记录、
@@ -1412,6 +1413,9 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 	// ⚠️ Auto-adjust position size if insufficient margin
 	// Formula: totalRequired = positionSize/leverage + positionSize*0.001 + positionSize/leverage*0.01
 	//        = positionSize * (1.01/leverage + 0.001)
+	if decision.Leverage <= 0 {
+		return fmt.Errorf("invalid leverage %d for copy open", decision.Leverage)
+	}
 	marginFactor := 1.01/float64(decision.Leverage) + 0.001
 	maxAffordablePositionSize := availableBalance / marginFactor
 
@@ -1470,7 +1474,8 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 	finishCopyOrderAttempt(decision, isCopyTrade, decision.ClientOrderID, order, err)
 	if err != nil {
 		// AI 二次入场遇到保证金不足时允许按独立风险预算减半重试一次。
-		// 普通领航员开仓/加仓必须保持比例语义，禁止静默缩量或重试。
+		// 普通领航员开仓/加仓只执行预检得出的最大可执行量；目标数量
+		// 保持不变并由 CATCHUP 补齐，这里禁止 adapter 再隐式减半。
 		//
 		// 触发条件（同时满足）：
 		//   1. isCopyTrade 且 CopyTradeAction=ai_reentry
@@ -1573,7 +1578,8 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 	isCopyTrade := decision.IsCopyTrade || strings.Contains(decision.Reasoning, "Copy trading")
 	// Keep duplicate-position gating on the same canonical action classifier
 	// used by quantity policy so UI/log wording cannot turn an add into an open.
-	isAddPosition := isCopyTrade && copyOpenQuantityKind(decision) == QuantityAdd
+	quantityKind := copyOpenQuantityKind(decision)
+	isAddPosition := isCopyTrade && (quantityKind == QuantityAdd || quantityKind == QuantityCatchup)
 
 	// 跟单开仓 MarginMode 回填（与 executeOpenLongWithRecord 对称，见其注释）
 	at.fillCopyTradeMarginMode(isCopyTrade, decision)
@@ -1673,6 +1679,9 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 	// ⚠️ Auto-adjust position size if insufficient margin
 	// Formula: totalRequired = positionSize/leverage + positionSize*0.001 + positionSize/leverage*0.01
 	//        = positionSize * (1.01/leverage + 0.001)
+	if decision.Leverage <= 0 {
+		return fmt.Errorf("invalid leverage %d for copy open", decision.Leverage)
+	}
 	marginFactor := 1.01/float64(decision.Leverage) + 0.001
 	maxAffordablePositionSize := availableBalance / marginFactor
 
@@ -2659,33 +2668,24 @@ func (at *AutoTrader) recordAndConfirmOrder(orderResult map[string]interface{}, 
 		if err == nil {
 			statusStr, _ := status["status"].(string)
 			finalState = strings.ToUpper(statusStr)
-			if finalState == "FILLED" {
-				// Get actual fill price
-				if avgPrice, ok := status["avgPrice"].(float64); ok && avgPrice > 0 {
-					actualPrice = avgPrice
-				}
-				// Get actual executed quantity
-				if execQty, ok := status["executedQty"].(float64); ok && execQty > 0 {
-					actualQty = execQty
-				}
-				// Get commission/fee
-				if commission, ok := status["commission"].(float64); ok {
-					fee = commission
-				}
-				logger.Infof("  ✅ Order filled: avgPrice=%.6f, qty=%.6f, fee=%.6f", actualPrice, actualQty, fee)
-				confirmed = actualQty > 0
+			if avgPrice, ok := status["avgPrice"].(float64); ok && avgPrice > 0 {
+				actualPrice = avgPrice
+			}
+			if execQty, ok := status["executedQty"].(float64); ok && execQty > 0 {
+				actualQty = execQty
+			}
+			if commission, ok := status["commission"].(float64); ok {
+				fee = commission
+			}
+			if actualQty > 0 {
+				confirmed = true
+				logger.Infof("  ✅ Order fill observed: state=%s avgPrice=%.6f, cumulativeQty=%.6f, fee=%.6f",
+					finalState, actualPrice, actualQty, fee)
 				break
-			} else if finalState == "CANCELED" || finalState == "CANCELLED" || finalState == "EXPIRED" || finalState == "REJECTED" || finalState == "FAILED" {
-				if execQty, ok := status["executedQty"].(float64); ok && execQty > 0 {
-					actualQty, confirmed = execQty, true
-					if avgPrice, ok := status["avgPrice"].(float64); ok && avgPrice > 0 {
-						actualPrice = avgPrice
-					}
-				} else {
-					logger.Infof("  ⚠️ Order %s, skipping position record", finalState)
-					return 0, 0, finalState, false
-				}
-				break
+			}
+			if finalState == "CANCELED" || finalState == "CANCELLED" || finalState == "EXPIRED" || finalState == "REJECTED" || finalState == "FAILED" {
+				logger.Infof("  ⚠️ Order %s, skipping position record", finalState)
+				return 0, 0, finalState, false
 			}
 		}
 		time.Sleep(500 * time.Millisecond)
@@ -2694,6 +2694,9 @@ func (at *AutoTrader) recordAndConfirmOrder(orderResult map[string]interface{}, 
 	if !confirmed {
 		logger.Warnf("  ⏳ Order fill not yet confirmed (ID: %s, state: %s); deferring mapping and position record", orderID, finalState)
 		return 0, 0, finalState, false
+	}
+	if actualPrice <= 0 {
+		actualPrice = price
 	}
 	logger.Infof("  📝 Recording position (ID: %s, action: %s, price: %.6f, qty: %.6f, fee: %.4f)",
 		orderID, action, actualPrice, actualQty, fee)
@@ -2732,36 +2735,14 @@ func (at *AutoTrader) recordPositionChange(orderID, symbol, side, action string,
 		}
 
 	case "close_long", "close_short":
-		// Close position: find corresponding open position record and update
-		openPos, err := at.store.Position().GetOpenPositionBySymbol(at.id, symbol, side)
-		if err != nil || openPos == nil {
-			logger.Infof("  ⚠️ Cannot find corresponding open position record (%s %s)", symbol, side)
-			return
-		}
-
-		// Calculate P&L
-		var realizedPnL float64
-		if side == "LONG" {
-			realizedPnL = (price - openPos.EntryPrice) * openPos.Quantity
-		} else {
-			realizedPnL = (openPos.EntryPrice - price) * openPos.Quantity
-		}
-
-		// Update position record
-		err = at.store.Position().ClosePosition(
-			openPos.ID,
-			price,   // exitPrice
-			orderID, // exitOrderID
-			realizedPnL,
-			fee, // fee from exchange API
-			"ai_decision",
-		)
-		if err != nil {
-			logger.Infof("  ⚠️ Failed to update position: %v", err)
-		} else {
-			logger.Infof("  📊 Position closed [%s] %s %s @ %.4f → %.4f, P&L: %.2f, Fee: %.4f",
-				at.id[:8], symbol, side, openPos.EntryPrice, price, realizedPnL, fee)
-		}
+		// Order status proves the executed quantity/price but does not expose a
+		// stable trade ID and authoritative realized PnL on every adapter.
+		// Closing the whole local lot here used to turn partial closes into full
+		// closes and trusted a locally estimated PnL. Leave accounting to the
+		// account-level fill reconciler, which observes the reduced exchange
+		// position and allocates unique trade fills FIFO.
+		logger.Infof("  ⏳ Close fill confirmed [%s] %s %s qty=%.8f @ %.6f; awaiting authoritative settlement accounting",
+			at.id[:min(8, len(at.id))], symbol, side, quantity, price)
 	}
 }
 
