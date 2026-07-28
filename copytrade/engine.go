@@ -2087,9 +2087,45 @@ func (e *Engine) reserveExecutionIntent(dec *decision.Decision) bool {
 				e.traderID, intent.ID, dec.LeaderPosID, revision, dec.LeaderPosSize)
 			return false
 		}
+		transitionChanged := intent.Action != dec.Action || intent.LeaderTargetSize != dec.LeaderPosSize
+		catchupBlocker := intent.SourceKind == "LEADER_TRANSITION" &&
+			(intent.Action == "open_long" || intent.Action == "open_short") &&
+			(intent.Status == store.ExecutionIntentPartiallyFilled ||
+				intent.Status == store.ExecutionIntentReconciling ||
+				(intent.Status == store.ExecutionIntentFailed && strings.HasPrefix(intent.ReasonCode, "CATCHUP_")))
+		if transitionChanged && catchupBlocker {
+			reasonCode := "CATCHUP_SKIPPED_NO_FILL"
+			if intent.FilledQuantity > 0 {
+				reasonCode = "CATCHUP_RESIDUAL_SUPERSEDED"
+			}
+			detail := fmt.Sprintf("source revision %d superseded by %s target %.8f",
+				intent.SourceRevision, dec.Action, dec.LeaderPosSize)
+			_, settleErr := e.store.CopyTrade().SettleOrdinaryCatchupTransition(store.OrdinaryCatchupSettlement{
+				IntentID: intent.ID, TraderID: e.traderID, LeaderID: e.config.LeaderID,
+				ReasonCode: reasonCode, Detail: detail,
+			})
+			if settleErr == nil {
+				logger.Warnf("🟡 [%s] 已安全结算阻塞的普通补仓 revision，立即推进后续领航员动作 | intent=%d old_rev=%d next=%s",
+					e.traderID, intent.ID, intent.SourceRevision, dec.Action)
+				return e.reserveExecutionIntent(dec)
+			}
+			if errors.Is(settleErr, store.ErrOrdinaryCatchupUnsettled) {
+				pendingReason := "CATCHUP_RECONCILIATION_PENDING"
+				if dec.Action == "close_long" || dec.Action == "close_short" {
+					pendingReason = "LEADER_CLOSE_RECONCILIATION_PENDING"
+				}
+				_ = e.store.CopyTrade().MarkOrdinaryCatchupReconciliationPending(
+					intent.ID, e.traderID, pendingReason, detail)
+			}
+			e.UnmarkDecisionSources(dec)
+			logger.Warnf("⏳ [%s] 后续领航员动作等待旧补仓订单完成对账 | intent=%d rev=%d next=%s error=%v",
+				e.traderID, intent.ID, intent.SourceRevision, dec.Action, settleErr)
+			return false
+		}
 		replayRequired := intent.Action != dec.Action || intent.LeaderTargetSize != dec.LeaderPosSize ||
 			intent.Status == store.ExecutionIntentFilled || intent.Status == store.ExecutionIntentProtected ||
-			intent.Status == store.ExecutionIntentSkipped || intent.Status == store.ExecutionIntentFailed
+			intent.Status == store.ExecutionIntentSkipped || intent.Status == store.ExecutionIntentCompletedPartial ||
+			intent.Status == store.ExecutionIntentFailed
 		if replayRequired {
 			e.UnmarkDecisionSources(dec)
 			logger.Infof("⏳ [%s] 后续源过渡等待前一意图推进，已释放去重键供下轮重放 | intent=%d posId=%s rev=%d current_target=%.8f next_target=%.8f",
@@ -2283,6 +2319,19 @@ func stableClientOrderID(traderID, fillID, action string) string {
 	h.Write([]byte{'|'})
 	h.Write([]byte(action))
 	return fmt.Sprintf("ct%016x", h.Sum64())
+}
+
+func validOKXClientOrderID(clientOrderID string) bool {
+	if clientOrderID == "" || len(clientOrderID) > 32 {
+		return false
+	}
+	for i := 0; i < len(clientOrderID); i++ {
+		c := clientOrderID[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') {
+			return false
+		}
+	}
+	return true
 }
 
 // calculateReduceRatioV2 计算减仓比例（使用统一匹配结果）

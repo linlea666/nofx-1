@@ -1481,14 +1481,23 @@ func (s *PositionStore) GetLastClosedPositionTime(traderID string) (time.Time, e
 
 // CreateOpenPosition creates an open position record with exchange position ID
 func (s *PositionStore) CreateOpenPosition(pos *TraderPosition) error {
+	_, err := s.CreateOpenPositionIfAbsent(pos)
+	return err
+}
+
+// CreateOpenPositionIfAbsent preserves the legacy idempotent insert behavior
+// while exposing whether a row was actually created. Reconciliation callers
+// must not report a successful repair when a closed or differently-owned row
+// already holds the exchange identity.
+func (s *PositionStore) CreateOpenPositionIfAbsent(pos *TraderPosition) (bool, error) {
 	// Check if already exists by exchange position ID (based on exchange_id, not trader_id)
 	if pos.ExchangePositionID != "" && pos.ExchangeID != "" {
 		exists, err := s.ExistsWithExchangePositionID(pos.ExchangeID, pos.ExchangePositionID)
 		if err != nil {
-			return err
+			return false, err
 		}
 		if exists {
-			return nil // Already exists, skip
+			return false, nil // Already exists, skip
 		}
 	}
 
@@ -1513,14 +1522,14 @@ func (s *PositionStore) CreateOpenPosition(pos *TraderPosition) error {
 	)
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
-			return nil // Already exists
+			return false, nil // Already exists
 		}
-		return fmt.Errorf("failed to create open position: %w", err)
+		return false, fmt.Errorf("failed to create open position: %w", err)
 	}
 
 	id, _ := result.LastInsertId()
 	pos.ID = id
-	return nil
+	return true, nil
 }
 
 // ClosePositionWithAccurateData closes a position with accurate data from exchange

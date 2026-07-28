@@ -87,6 +87,7 @@ function executionLifecycle(action: DecisionAction): string[] {
   const submitted = [
     'SUBMITTED',
     'PARTIALLY_FILLED',
+    'COMPLETED_PARTIAL',
     'FILLED',
     'PROTECTED',
     'RECONCILING',
@@ -94,7 +95,9 @@ function executionLifecycle(action: DecisionAction): string[] {
   if (submitted || action.exchange_order_id) steps.push('已提交')
   if (
     (action.filled_quantity || 0) > 0 ||
-    ['FILLED', 'PROTECTED'].includes(action.execution_status || '')
+    ['COMPLETED_PARTIAL', 'FILLED', 'PROTECTED'].includes(
+      action.execution_status || ''
+    )
   ) {
     steps.push('已成交')
   }
@@ -113,6 +116,11 @@ function executionLifecycle(action: DecisionAction): string[] {
       break
     case 'PARTIALLY_FILLED':
       steps.push('部分成交，等待限时补齐')
+      break
+    case 'COMPLETED_PARTIAL':
+      steps.push(
+        `部分成交，剩余差额已安全终结${action.execution_reason_code ? `：${action.execution_reason_code}` : ''}`
+      )
       break
     case 'FAILED':
       steps.push(

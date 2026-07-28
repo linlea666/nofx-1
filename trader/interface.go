@@ -154,6 +154,10 @@ type ClientOrderStatusProvider interface {
 	GetOrderStatusByClientID(symbol, clientOrderID string) (map[string]interface{}, error)
 }
 
+type ClientOrderCanceler interface {
+	CancelOrderByClientID(symbol, clientOrderID string) error
+}
+
 // ClosedPnLByPositionProvider is OKX-only: it queries closed-position history
 // by the exchange position id so Copy Guard reconciliation can match exactly
 // one lifecycle instead of scanning a time window.

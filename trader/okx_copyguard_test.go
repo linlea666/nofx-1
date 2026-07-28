@@ -277,6 +277,46 @@ func TestAlgoRequestBodyShapes(t *testing.T) {
 	}
 }
 
+func TestCancelOrderByClientIDRequestAndAcknowledgement(t *testing.T) {
+	var captured []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == okxCancelOrderPath {
+			captured, _ = io.ReadAll(r.Body)
+			_, _ = w.Write([]byte(`{"code":"0","msg":"","data":[{"ordId":"123","clOrdId":"nfxABC123","sCode":"0","sMsg":""}]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"code":"0","msg":"","data":[]}`))
+	}))
+	old := okxBaseURL
+	okxBaseURL = srv.URL
+	t.Cleanup(func() {
+		okxBaseURL = old
+		srv.Close()
+	})
+	okx := NewOKXTrader("k", "s", "p")
+	if err := okx.CancelOrderByClientID("ETHUSDT", "nfxABC123"); err != nil {
+		t.Fatalf("CancelOrderByClientID: %v", err)
+	}
+	var body map[string]string
+	if err := json.Unmarshal(captured, &body); err != nil {
+		t.Fatalf("cancel-order body must be a JSON object, got %s: %v", captured, err)
+	}
+	if body["instId"] != "ETH-USDT-SWAP" || body["clOrdId"] != "nfxABC123" {
+		t.Fatalf("unexpected cancel-order body: %v", body)
+	}
+
+	t.Run("per-item rejection is returned", func(t *testing.T) {
+		rejecting := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte(`{"code":"0","msg":"","data":[{"clOrdId":"nfxABC123","sCode":"51400","sMsg":"already filled"}]}`))
+		}))
+		defer rejecting.Close()
+		okxBaseURL = rejecting.URL
+		if err := okx.CancelOrderByClientID("ETHUSDT", "nfxABC123"); err == nil {
+			t.Fatal("per-item cancel rejection must be returned")
+		}
+	})
+}
+
 func TestValidateOKXAlgoAckChecksPerItemResult(t *testing.T) {
 	if err := validateOKXAlgoAck([]byte(`[{"algoId":"1","sCode":"0","sMsg":""}]`), "amend"); err != nil {
 		t.Fatalf("successful acknowledgement rejected: %v", err)

@@ -989,6 +989,13 @@ func (at *AutoTrader) GetOrderStatusByClientID(symbol, clientOrderID string) (ma
 	}
 	return p.GetOrderStatusByClientID(symbol, clientOrderID)
 }
+func (at *AutoTrader) CancelOrderByClientID(symbol, clientOrderID string) error {
+	p, ok := at.trader.(ClientOrderCanceler)
+	if !ok {
+		return fmt.Errorf("exchange does not support client order cancellation")
+	}
+	return p.CancelOrderByClientID(symbol, clientOrderID)
+}
 
 // ExecuteDecision executes a trading decision from external sources (e.g., debate consensus)
 // This is a public method that can be called by other modules

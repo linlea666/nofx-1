@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"math"
 	"strings"
@@ -9,14 +10,15 @@ import (
 )
 
 const (
-	ExecutionIntentReserved        = "RESERVED"
-	ExecutionIntentSubmitted       = "SUBMITTED"
-	ExecutionIntentFilled          = "FILLED"
-	ExecutionIntentPartiallyFilled = "PARTIALLY_FILLED"
-	ExecutionIntentProtected       = "PROTECTED"
-	ExecutionIntentSkipped         = "SKIPPED"
-	ExecutionIntentFailed          = "FAILED"
-	ExecutionIntentReconciling     = "RECONCILING"
+	ExecutionIntentReserved         = "RESERVED"
+	ExecutionIntentSubmitted        = "SUBMITTED"
+	ExecutionIntentFilled           = "FILLED"
+	ExecutionIntentPartiallyFilled  = "PARTIALLY_FILLED"
+	ExecutionIntentCompletedPartial = "COMPLETED_PARTIAL"
+	ExecutionIntentProtected        = "PROTECTED"
+	ExecutionIntentSkipped          = "SKIPPED"
+	ExecutionIntentFailed           = "FAILED"
+	ExecutionIntentReconciling      = "RECONCILING"
 
 	ExecutionIntentCycleTerminatedBeforeSubmit = "CYCLE_TERMINATED_BEFORE_SUBMIT"
 
@@ -28,6 +30,8 @@ const (
 	ExecutionOrderAttemptUnknown         = "UNKNOWN"
 	ExecutionOrderAttemptTerminalNoFill  = "TERMINAL_NO_FILL"
 )
+
+var ErrOrdinaryCatchupUnsettled = errors.New("ordinary catch-up has unresolved exchange side effects")
 
 type CopyTradeExecutionIntentSource struct {
 	ID           int64     `json:"id"`
@@ -654,6 +658,179 @@ type IgnoredLeaderTransition struct {
 	MarginMode       string
 	LeaderTargetSize float64
 	ReasonCode       string
+}
+
+type OrdinaryCatchupSettlement struct {
+	IntentID   int64
+	TraderID   string
+	LeaderID   string
+	ReasonCode string
+	Detail     string
+}
+
+// SettleOrdinaryCatchupTransition is the source-revision acknowledgement
+// boundary for an ordinary open/add catch-up that will no longer submit more
+// quantity. It advances the mapping only after every durable order attempt is
+// terminal, so a later leader close cannot be blocked by a dead revision and
+// cannot race a late risk-increasing fill.
+func (s *CopyTradeStore) SettleOrdinaryCatchupTransition(c OrdinaryCatchupSettlement) (string, error) {
+	if c.IntentID <= 0 || strings.TrimSpace(c.TraderID) == "" {
+		return "", fmt.Errorf("invalid ordinary catch-up settlement")
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback()
+
+	var leaderPosID, sourceKind, action, symbol, side, marginMode, intentStatus, exchangeOrderID string
+	var sourceRevision int64
+	var leaderTargetSize, filledQuantity float64
+	if err = tx.QueryRow(`SELECT leader_pos_id,COALESCE(source_kind,'LEADER_TRANSITION'),action,
+		COALESCE(symbol,''),COALESCE(side,''),COALESCE(margin_mode,''),
+		source_revision,COALESCE(leader_target_size,0),COALESCE(filled_quantity,0),
+		status,COALESCE(exchange_order_id,'')
+		FROM copy_trade_execution_intents WHERE id=? AND trader_id=?`,
+		c.IntentID, c.TraderID).Scan(
+		&leaderPosID, &sourceKind, &action, &symbol, &side, &marginMode,
+		&sourceRevision, &leaderTargetSize, &filledQuantity, &intentStatus, &exchangeOrderID,
+	); err != nil {
+		return "", err
+	}
+	if sourceKind != "LEADER_TRANSITION" ||
+		(action != "open_long" && action != "open_short") ||
+		leaderPosID == "" || sourceRevision <= 0 || leaderTargetSize < 0 {
+		return "", fmt.Errorf("intent %d is not an ordinary risk-increase catch-up", c.IntentID)
+	}
+
+	terminalStatus := ExecutionIntentSkipped
+	if filledQuantity > 0 {
+		terminalStatus = ExecutionIntentCompletedPartial
+	}
+	if intentStatus == terminalStatus {
+		return terminalStatus, tx.Commit()
+	}
+	switch intentStatus {
+	case ExecutionIntentReserved, ExecutionIntentSubmitted, ExecutionIntentReconciling,
+		ExecutionIntentPartiallyFilled, ExecutionIntentFailed:
+	default:
+		return "", fmt.Errorf("intent %d cannot settle ordinary catch-up from %s", c.IntentID, intentStatus)
+	}
+
+	var attemptCount, unresolvedAttempts int
+	var attemptFilled float64
+	if err = tx.QueryRow(`SELECT COUNT(*),
+		COALESCE(SUM(CASE WHEN terminal_at IS NULL OR status NOT IN ('FILLED','FAILED','TERMINAL_NO_FILL') THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(filled_quantity),0)
+		FROM copy_trade_execution_order_attempts WHERE intent_id=?`, c.IntentID).
+		Scan(&attemptCount, &unresolvedAttempts, &attemptFilled); err != nil {
+		return "", err
+	}
+	tolerance := math.Max(1e-12, math.Abs(filledQuantity)*1e-8)
+	if unresolvedAttempts != 0 ||
+		(filledQuantity <= tolerance && attemptFilled > tolerance) ||
+		(filledQuantity > tolerance && (attemptCount == 0 || attemptFilled+tolerance < filledQuantity)) ||
+		(attemptCount == 0 && strings.TrimSpace(exchangeOrderID) != "") {
+		return "", ErrOrdinaryCatchupUnsettled
+	}
+
+	var currentRevision int64
+	var mappingStatus string
+	mappingErr := tx.QueryRow(`SELECT COALESCE(source_revision,0),status
+		FROM copy_trade_position_mappings WHERE trader_id=? AND leader_pos_id=?`,
+		c.TraderID, leaderPosID).Scan(&currentRevision, &mappingStatus)
+	switch {
+	case mappingErr == sql.ErrNoRows && sourceRevision == 1 && filledQuantity <= tolerance:
+		if strings.TrimSpace(c.LeaderID) == "" {
+			return "", fmt.Errorf("missing leader id for ignored initial catch-up")
+		}
+		_, err = tx.Exec(`INSERT INTO copy_trade_position_mappings
+			(trader_id,leader_pos_id,leader_id,symbol,source_revision,side,margin_mode,status,
+			 opened_at,open_price,open_size_usd,last_known_size,add_count,reduce_count,updated_at)
+			VALUES(?,?,?,?,?,?,?,'ignored',CURRENT_TIMESTAMP,0,0,?,0,0,CURRENT_TIMESTAMP)`,
+			c.TraderID, leaderPosID, c.LeaderID, symbol, sourceRevision, side, marginMode, leaderTargetSize)
+	case mappingErr == nil && mappingStatus == MappingStatusActive && currentRevision == sourceRevision-1 && filledQuantity <= tolerance:
+		_, err = tx.Exec(`UPDATE copy_trade_position_mappings
+			SET source_revision=?,last_known_size=?,updated_at=CURRENT_TIMESTAMP
+			WHERE trader_id=? AND leader_pos_id=? AND status='active' AND COALESCE(source_revision,0)=?`,
+			sourceRevision, leaderTargetSize, c.TraderID, leaderPosID, sourceRevision-1)
+	case mappingErr == nil && currentRevision == sourceRevision &&
+		(mappingStatus == MappingStatusActive || mappingStatus == MappingStatusIgnored ||
+			mappingStatus == MappingStatusStoppedByRisk || mappingStatus == MappingStatusDetached):
+		// A confirmed partial fill already advanced the mapping. Only the
+		// residual catch-up lifecycle remains to be terminalized.
+	case mappingErr != nil:
+		return "", mappingErr
+	default:
+		return "", fmt.Errorf("ordinary catch-up mapping revision conflict: status=%s current=%d expected=%d",
+			mappingStatus, currentRevision, sourceRevision)
+	}
+	if err != nil {
+		return "", err
+	}
+
+	reasonCode := strings.TrimSpace(c.ReasonCode)
+	if reasonCode == "" {
+		if filledQuantity > tolerance {
+			reasonCode = "CATCHUP_RESIDUAL_SUPERSEDED"
+		} else {
+			reasonCode = "CATCHUP_SKIPPED_NO_FILL"
+		}
+	}
+	res, err := tx.Exec(`UPDATE copy_trade_execution_intents
+		SET status=?,reason_code=?,last_error=?,last_catchup_reason=?,
+		    terminal_at=COALESCE(terminal_at,CURRENT_TIMESTAMP),updated_at=CURRENT_TIMESTAMP
+		WHERE id=? AND trader_id=? AND status IN ('RESERVED','SUBMITTED','RECONCILING','PARTIALLY_FILLED','FAILED')`,
+		terminalStatus, reasonCode, c.Detail, reasonCode, c.IntentID, c.TraderID)
+	if err != nil {
+		return "", err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return "", fmt.Errorf("ordinary catch-up intent %d lost state race", c.IntentID)
+	}
+	if _, err = tx.Exec(`UPDATE copy_trade_source_transitions SET status=?,updated_at=CURRENT_TIMESTAMP WHERE intent_id=?`,
+		terminalStatus, c.IntentID); err != nil {
+		return "", err
+	}
+	if _, err = tx.Exec(`UPDATE copy_guard_risk_reservations
+		SET status='RELEASED',released_at=CURRENT_TIMESTAMP
+		WHERE intent_id=? AND status='ACTIVE'`, c.IntentID); err != nil {
+		return "", err
+	}
+	if err = tx.Commit(); err != nil {
+		return "", err
+	}
+	return terminalStatus, nil
+}
+
+func (s *CopyTradeStore) MarkOrdinaryCatchupReconciliationPending(intentID int64, traderID, reasonCode, detail string) error {
+	if intentID <= 0 || strings.TrimSpace(traderID) == "" {
+		return fmt.Errorf("invalid ordinary catch-up reconciliation")
+	}
+	if strings.TrimSpace(reasonCode) == "" {
+		reasonCode = "CATCHUP_RECONCILIATION_PENDING"
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`UPDATE copy_trade_execution_intents
+		SET status='RECONCILING',reason_code=?,last_error=?,terminal_at=NULL,updated_at=CURRENT_TIMESTAMP
+		WHERE id=? AND trader_id=? AND source_kind='LEADER_TRANSITION'
+		  AND action IN ('open_long','open_short')
+		  AND status IN ('RESERVED','SUBMITTED','RECONCILING','PARTIALLY_FILLED','FAILED')`,
+		reasonCode, detail, intentID, traderID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return fmt.Errorf("ordinary catch-up intent %d lost reconciliation race", intentID)
+	}
+	if _, err = tx.Exec(`UPDATE copy_trade_source_transitions SET status='RECONCILING',updated_at=CURRENT_TIMESTAMP WHERE intent_id=?`, intentID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 type ExecutionReconciliationReport struct {
@@ -1560,9 +1737,9 @@ func (s *CopyTradeStore) UpdateExecutionIntent(id int64, status, reasonCode, las
 		quantized_quantity=CASE WHEN quantized_quantity<=0 AND ?>0 THEN ? ELSE quantized_quantity END,
 		filled_quantity=CASE WHEN ?>filled_quantity THEN ? ELSE filled_quantity END,
 		submitted_at=CASE WHEN ?='SUBMITTED' THEN COALESCE(submitted_at,CURRENT_TIMESTAMP) ELSE submitted_at END,
-		filled_at=CASE WHEN ?='FILLED' THEN COALESCE(filled_at,CURRENT_TIMESTAMP) ELSE filled_at END,
+		filled_at=CASE WHEN ? IN ('FILLED','COMPLETED_PARTIAL') THEN COALESCE(filled_at,CURRENT_TIMESTAMP) ELSE filled_at END,
 		protected_at=CASE WHEN ?='PROTECTED' THEN COALESCE(protected_at,CURRENT_TIMESTAMP) ELSE protected_at END,
-		terminal_at=CASE WHEN ? IN ('SKIPPED','FAILED') THEN COALESCE(terminal_at,CURRENT_TIMESTAMP) ELSE terminal_at END,
+		terminal_at=CASE WHEN ? IN ('SKIPPED','FAILED','COMPLETED_PARTIAL') THEN COALESCE(terminal_at,CURRENT_TIMESTAMP) ELSE terminal_at END,
 		updated_at=CURRENT_TIMESTAMP WHERE id=? AND (`+validExecutionIntentTransitionSQL()+`)`, status, reasonCode, reasonCode, lastError,
 		reasonCode, reasonCode,
 		exchangeOrderID, exchangeOrderID, requestedQty, requestedQty, quantizedQty, quantizedQty, filledQty, filledQty,
@@ -1715,10 +1892,10 @@ func (s *CopyTradeStore) InitializeExecutionCatchupPolicy(id int64, deadline tim
 
 func validExecutionIntentTransitionSQL() string {
 	return `(status=? OR
-		(status='RESERVED' AND ? IN ('SUBMITTED','FILLED','PARTIALLY_FILLED','SKIPPED','FAILED','RECONCILING')) OR
-		(status='SUBMITTED' AND ? IN ('FILLED','PARTIALLY_FILLED','SKIPPED','FAILED','RECONCILING')) OR
-		(status='RECONCILING' AND ? IN ('FILLED','PARTIALLY_FILLED','SKIPPED','FAILED','RECONCILING')) OR
-		(status='PARTIALLY_FILLED' AND ? IN ('SUBMITTED','FILLED','PARTIALLY_FILLED','FAILED','RECONCILING')) OR
+		(status='RESERVED' AND ? IN ('SUBMITTED','FILLED','PARTIALLY_FILLED','COMPLETED_PARTIAL','SKIPPED','FAILED','RECONCILING')) OR
+		(status='SUBMITTED' AND ? IN ('FILLED','PARTIALLY_FILLED','COMPLETED_PARTIAL','SKIPPED','FAILED','RECONCILING')) OR
+		(status='RECONCILING' AND ? IN ('FILLED','PARTIALLY_FILLED','COMPLETED_PARTIAL','SKIPPED','FAILED','RECONCILING')) OR
+		(status='PARTIALLY_FILLED' AND ? IN ('SUBMITTED','FILLED','PARTIALLY_FILLED','COMPLETED_PARTIAL','FAILED','RECONCILING')) OR
 		(status='FILLED' AND ? IN ('PROTECTED','FAILED','RECONCILING')))`
 }
 
@@ -1759,6 +1936,55 @@ func (s *CopyTradeStore) ListUnfinishedExecutionIntents(traderID string) ([]*Cop
 		x, err := scanExecutionIntent(rows)
 		if err != nil {
 			return nil, err
+		}
+		out = append(out, x)
+	}
+	return out, rows.Err()
+}
+
+// ListRecoverableOrdinaryCatchupIntents returns only terminal catch-up states
+// that may be source-revision blockers. SettleOrdinaryCatchupTransition still
+// performs the authoritative attempt-side-effect checks before changing them.
+func (s *CopyTradeStore) ListRecoverableOrdinaryCatchupIntents(traderID string) ([]*CopyTradeExecutionIntent, error) {
+	rows, err := s.db.Query(`SELECT id,trader_id,leader_pos_id,source_revision,COALESCE(source_fill_id,''),action,
+		COALESCE(source_kind,'LEADER_TRANSITION'),COALESCE(canonical_key,''),
+		COALESCE(cycle_id,0),COALESCE(candidate_id,0),COALESCE(analysis_id,0),COALESCE(attempt_no,0),COALESCE(decision_generation,0),
+		COALESCE(symbol,''),COALESCE(side,''),COALESCE(margin_mode,''),COALESCE(leader_target_size,0),
+		COALESCE(requested_notional,0),COALESCE(requested_quantity,0),COALESCE(quantized_quantity,0),
+		COALESCE(quantity_step,0),COALESCE(exchange_min_quantity,0),COALESCE(exchange_min_notional,0),COALESCE(minimum_executable_quantity,0),
+		COALESCE(filled_quantity,0),COALESCE(client_order_id,''),COALESCE(exchange_order_id,''),status,
+		COALESCE(exchange_state,''),COALESCE(reason_code,''),COALESCE(last_error,''),COALESCE(failure_counted,0),created_at,updated_at,
+		submitted_at,filled_at,protected_at,terminal_at,
+		COALESCE(target_quantity,0),COALESCE(filled_notional,0),
+		COALESCE(follower_equity_at_target,0),COALESCE(target_account_pct,0),
+		catchup_deadline_at,COALESCE(catchup_anchor_price,0),COALESCE(last_catchup_reason,'')
+		FROM copy_trade_execution_intents i
+		WHERE i.trader_id=? AND i.source_kind='LEADER_TRANSITION'
+		  AND i.action IN ('open_long','open_short')
+		  AND i.status='FAILED' AND i.reason_code LIKE 'CATCHUP_%'
+		  AND (
+			(i.source_revision=1 AND NOT EXISTS (
+				SELECT 1 FROM copy_trade_position_mappings m
+				WHERE m.trader_id=i.trader_id AND m.leader_pos_id=i.leader_pos_id))
+			OR EXISTS (
+				SELECT 1 FROM copy_trade_position_mappings m
+				WHERE m.trader_id=i.trader_id AND m.leader_pos_id=i.leader_pos_id
+				  AND (
+					(m.status='active' AND COALESCE(m.source_revision,0)=i.source_revision-1)
+					OR (m.status IN ('active','ignored','stopped_by_risk','detached')
+						AND COALESCE(m.source_revision,0)=i.source_revision)
+				  ))
+		  )
+		ORDER BY i.id`, traderID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*CopyTradeExecutionIntent
+	for rows.Next() {
+		x, scanErr := scanExecutionIntent(rows)
+		if scanErr != nil {
+			return nil, scanErr
 		}
 		out = append(out, x)
 	}

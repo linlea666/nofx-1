@@ -75,6 +75,7 @@ export interface DecisionAction {
     | 'RESERVED'
     | 'SUBMITTED'
     | 'PARTIALLY_FILLED'
+    | 'COMPLETED_PARTIAL'
     | 'FILLED'
     | 'PROTECTED'
     | 'SKIPPED'

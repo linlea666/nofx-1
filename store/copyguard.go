@@ -414,7 +414,7 @@ func (s *CopyTradeStore) initCopyGuardTables() error {
 				WHERE i.trader_id=copy_guard_cycles.trader_id
 				  AND i.leader_pos_id=copy_guard_cycles.leader_pos_id
 				  AND i.action IN ('open_long','open_short')
-				  AND i.status IN ('FILLED','PROTECTED')
+				  AND i.status IN ('COMPLETED_PARTIAL','FILLED','PROTECTED')
 				  AND i.leader_target_size>0
 				  AND i.source_revision > COALESCE((
 					SELECT MAX(closed.source_revision)
@@ -431,7 +431,7 @@ func (s *CopyTradeStore) initCopyGuardTables() error {
 				WHERE i.trader_id=copy_guard_cycles.trader_id
 				  AND i.leader_pos_id=copy_guard_cycles.leader_pos_id
 				  AND i.action IN ('open_long','open_short')
-				  AND i.status IN ('FILLED','PROTECTED')
+				  AND i.status IN ('COMPLETED_PARTIAL','FILLED','PROTECTED')
 				  AND i.leader_target_size>0
 				  AND i.source_revision > COALESCE((
 					SELECT MAX(closed.source_revision)
@@ -772,7 +772,7 @@ func (s *CopyTradeStore) GetConfirmedInitialLeaderSize(traderID, leaderPosID str
 	err := s.db.QueryRow(`SELECT leader_target_size FROM copy_trade_execution_intents
 		WHERE trader_id=? AND leader_pos_id=?
 		  AND action IN ('open_long','open_short')
-		  AND status IN ('FILLED','PROTECTED')
+		  AND status IN ('COMPLETED_PARTIAL','FILLED','PROTECTED')
 		  AND leader_target_size>0
 		  AND source_revision > COALESCE((
 			SELECT MAX(source_revision) FROM copy_trade_execution_intents

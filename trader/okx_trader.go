@@ -1844,6 +1844,40 @@ func (t *OKXTrader) GetOrderStatusByClientID(symbol, clientOrderID string) (map[
 	return t.getOrderStatus(symbol, path)
 }
 
+func (t *OKXTrader) CancelOrderByClientID(symbol, clientOrderID string) error {
+	clientOrderID = strings.TrimSpace(clientOrderID)
+	if clientOrderID == "" {
+		return fmt.Errorf("empty OKX client order id")
+	}
+	body := map[string]interface{}{
+		"instId":  t.convertSymbol(symbol),
+		"clOrdId": clientOrderID,
+	}
+	data, err := t.doRequest("POST", okxCancelOrderPath, body)
+	if err != nil {
+		return err
+	}
+	var rows []struct {
+		OrderID       string `json:"ordId"`
+		ClientOrderID string `json:"clOrdId"`
+		SCode         string `json:"sCode"`
+		SMsg          string `json:"sMsg"`
+	}
+	if err := json.Unmarshal(data, &rows); err != nil {
+		return fmt.Errorf("OKX cancel order acknowledgement parse failed: %w", err)
+	}
+	if len(rows) == 0 {
+		return fmt.Errorf("OKX cancel order acknowledgement is empty")
+	}
+	for _, row := range rows {
+		if row.SCode != "0" {
+			return fmt.Errorf("OKX cancel order rejected: ordId=%s clOrdId=%s sCode=%s sMsg=%s",
+				row.OrderID, row.ClientOrderID, row.SCode, row.SMsg)
+		}
+	}
+	return nil
+}
+
 // lookupIdempotentOKXOrder resolves a deterministic clOrdId before submission
 // and after ambiguous POST failures. A terminal zero-fill id is never reused:
 // callers must advance their durable source revision before issuing new risk.

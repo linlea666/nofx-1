@@ -428,7 +428,8 @@ func (s *DecisionStore) fillRecordDetails(record *DecisionRecord) {
 		action.ExchangeMinQuantity = exchangeMinQuantity
 		action.ExchangeMinNotional = exchangeMinNotional
 		action.MinimumExecutableQuantity = minimumExecutableQuantity
-		action.Success = status == ExecutionIntentFilled || status == ExecutionIntentProtected
+		action.Success = status == ExecutionIntentCompletedPartial ||
+			status == ExecutionIntentFilled || status == ExecutionIntentProtected
 		terminalWithoutExecution := status == ExecutionIntentSkipped
 		if !action.Success && !terminalWithoutExecution {
 			overall = false

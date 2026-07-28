@@ -24,6 +24,16 @@ type PositionSyncManager struct {
 	lastHistorySync      map[string]time.Time // trader_id -> last history sync time
 	lastHistorySyncMutex sync.RWMutex
 	historyRunMutex      sync.Mutex
+	externalSyncMutex    sync.Mutex
+	shortfallMutex       sync.Mutex
+	shortfallObserved    map[string]positionShortfallObservation
+	ownershipWarnedAt    map[string]time.Time
+}
+
+type positionShortfallObservation struct {
+	exchangeQuantity float64
+	localQuantity    float64
+	observedAt       time.Time
 }
 
 // NewPositionSyncManager Create position synchronization manager
@@ -39,6 +49,8 @@ func NewPositionSyncManager(st *store.Store, interval time.Duration) *PositionSy
 		traderCache:         make(map[string]Trader),
 		configCache:         make(map[string]*store.TraderFullConfig),
 		lastHistorySync:     make(map[string]time.Time),
+		shortfallObserved:   make(map[string]positionShortfallObservation),
+		ownershipWarnedAt:   make(map[string]time.Time),
 	}
 }
 
@@ -62,6 +74,10 @@ func (m *PositionSyncManager) Stop() {
 	m.traderCache = make(map[string]Trader)
 	m.configCache = make(map[string]*store.TraderFullConfig)
 	m.cacheMutex.Unlock()
+	m.shortfallMutex.Lock()
+	m.shortfallObserved = make(map[string]positionShortfallObservation)
+	m.ownershipWarnedAt = make(map[string]time.Time)
+	m.shortfallMutex.Unlock()
 
 	logger.Info("📊 Position sync manager stopped")
 }
@@ -185,18 +201,58 @@ func (m *PositionSyncManager) syncTraderPositions(traderID string, localPosition
 		tolerance := math.Max(1e-8, localQty*1e-8)
 		switch {
 		case exchangeQty+tolerance < localQty && oldest != nil:
-			// Reconcile once per account/symbol/side. The authoritative fill
-			// allocator distributes exact close quantity FIFO across all lots.
-			// If this is only a partial reduction and exchange history is still
-			// delayed, leave local lots open until evidence arrives.
-			m.closeLocalPosition(oldest, trader, "manual", exchangeQty <= tolerance)
+			// A just-filled position may be absent from one or more cached
+			// exchange snapshots. Require a stable shortfall across a visibility
+			// grace period before treating it as a manual/forced close.
+			if m.positionShortfallConfirmed(traderID, key, exchangeQty, localQty, oldest.EntryTime) {
+				// Reconcile once per account/symbol/side. The authoritative fill
+				// allocator distributes exact close quantity FIFO across all lots.
+				m.closeLocalPosition(oldest, trader, "manual", exchangeQty <= tolerance)
+			}
 		case exchangeQty > localQty+tolerance:
+			m.clearPositionShortfall(traderID, key)
 			missingOpenQuantity = true
+		default:
+			m.clearPositionShortfall(traderID, key)
 		}
 	}
 	if missingOpenQuantity && exchangeID != "" && exchangeType != "" {
 		m.syncExternalPositions(traderID, exchangeID, exchangeType, trader)
 	}
+}
+
+func (m *PositionSyncManager) positionVisibilityGrace() time.Duration {
+	grace := 2 * m.interval
+	if grace < 30*time.Second {
+		grace = 30 * time.Second
+	}
+	return grace
+}
+
+func (m *PositionSyncManager) positionShortfallConfirmed(traderID, marketKey string, exchangeQty, localQty float64, oldestEntry time.Time) bool {
+	now := time.Now()
+	key := traderID + "|" + marketKey
+	tolerance := math.Max(1e-8, math.Max(math.Abs(exchangeQty), math.Abs(localQty))*1e-8)
+	m.shortfallMutex.Lock()
+	defer m.shortfallMutex.Unlock()
+	observation, ok := m.shortfallObserved[key]
+	if !ok || math.Abs(observation.exchangeQuantity-exchangeQty) > tolerance ||
+		math.Abs(observation.localQuantity-localQty) > tolerance {
+		m.shortfallObserved[key] = positionShortfallObservation{
+			exchangeQuantity: exchangeQty,
+			localQuantity:    localQty,
+			observedAt:       now,
+		}
+		return false
+	}
+	grace := m.positionVisibilityGrace()
+	return now.Sub(observation.observedAt) >= grace && (oldestEntry.IsZero() || now.Sub(oldestEntry) >= grace)
+}
+
+func (m *PositionSyncManager) clearPositionShortfall(traderID, marketKey string) {
+	m.shortfallMutex.Lock()
+	delete(m.shortfallObserved, traderID+"|"+marketKey)
+	m.shortfallMutex.Unlock()
 }
 
 // closeLocalPosition Mark local position as closed
@@ -252,8 +308,9 @@ func (m *PositionSyncManager) closeLocalPosition(pos *store.TraderPosition, trad
 	if err != nil {
 		logger.Infof("⚠️  Failed to update position status: %v", err)
 	} else {
-		logger.Infof("📊 Position closed [%s] %s %s @ %.4f → %.4f, PnL: %.2f, Fee: %.4f (%s)",
-			pos.TraderID[:min(8, len(pos.TraderID))], pos.Symbol, pos.Side, pos.EntryPrice, exitPrice, realizedPnL, fee, closeReason)
+		logger.Infof("📊 Position closed trader=%q id=%s %s %s @ %.4f → %.4f, PnL: %.2f, Fee: %.4f (%s)",
+			m.store.Trader().ResolveDisplayName(pos.TraderID), pos.TraderID,
+			pos.Symbol, pos.Side, pos.EntryPrice, exitPrice, realizedPnL, fee, closeReason)
 	}
 }
 
@@ -680,6 +737,13 @@ func (m *PositionSyncManager) startupSync() {
 // syncExternalPositions syncs positions that exist on exchange but not locally
 // These could be positions opened manually or from other systems
 func (m *PositionSyncManager) syncExternalPositions(traderID, exchangeID, exchangeType string, trader Trader) {
+	m.externalSyncMutex.Lock()
+	defer m.externalSyncMutex.Unlock()
+	ok, runningOwners, reason := m.canClaimExternalPositions(traderID, exchangeID)
+	if !ok {
+		m.warnExternalOwnershipBlocked(traderID, exchangeID, reason)
+		return
+	}
 	// Get current positions from exchange
 	exchangePositions, err := trader.GetPositions()
 	if err != nil {
@@ -720,6 +784,17 @@ func (m *PositionSyncManager) syncExternalPositions(traderID, exchangeID, exchan
 		}
 
 		key := fmt.Sprintf("%s_%s", symbol, normalizedSide)
+		if runningOwners > 1 {
+			owner, candidates, ownerErr := m.store.Trader().ResolveExclusivePositionOwner(exchangeID, symbol, normalizedSide)
+			if ownerErr != nil {
+				m.warnExternalOwnershipBlocked(traderID, exchangeID, "POSITION_SYNC_OWNER_QUERY_FAILED")
+				continue
+			}
+			if candidates != 1 || owner != traderID {
+				m.warnExternalOwnershipBlocked(traderID, exchangeID, "POSITION_OWNERSHIP_AMBIGUOUS")
+				continue
+			}
+		}
 
 		qty := getFloatFromMap(pos, "positionAmt")
 		if qty < 0 {
@@ -772,13 +847,51 @@ func (m *PositionSyncManager) syncExternalPositions(traderID, exchangeID, exchan
 			Source:             "sync", // Mark as synced from exchange
 		}
 
-		if err := m.store.Position().CreateOpenPosition(newPos); err != nil {
-			logger.Infof("⚠️  Failed to create external position record: %v", err)
-		} else {
-			logger.Infof("📊 Reconciled exchange-confirmed missing position quantity: [%s] %s %s @ %.4f (delta: %.4f, exchange: %.4f, local: %.4f)",
-				traderID[:min(8, len(traderID))], symbol, normalizedSide, entryPrice, missingQuantity, qty, localQuantity)
+		created, createErr := m.store.Position().CreateOpenPositionIfAbsent(newPos)
+		if createErr != nil {
+			logger.Infof("⚠️  Failed to create external position record: %v", createErr)
+		} else if created {
+			logger.Infof("📊 Reconciled exchange-confirmed missing position quantity: trader=%q id=%s %s %s @ %.4f (delta: %.4f, exchange: %.4f, local: %.4f)",
+				m.store.Trader().ResolveDisplayName(traderID), traderID,
+				symbol, normalizedSide, entryPrice, missingQuantity, qty, localQuantity)
 		}
 	}
+}
+
+func (m *PositionSyncManager) canClaimExternalPositions(traderID, exchangeID string) (bool, int, string) {
+	traderInfo, err := m.store.Trader().GetByID(traderID)
+	if err != nil {
+		return false, 0, "POSITION_SYNC_TRADER_UNAVAILABLE"
+	}
+	if !traderInfo.IsRunning {
+		return false, 0, "POSITION_SYNC_TRADER_STOPPED"
+	}
+	if traderInfo.ExchangeID != exchangeID {
+		return false, 0, "POSITION_SYNC_EXCHANGE_MISMATCH"
+	}
+	running, err := m.store.Trader().CountRunningByExchange(exchangeID)
+	if err != nil {
+		return false, 0, "POSITION_SYNC_OWNER_QUERY_FAILED"
+	}
+	if running == 0 {
+		return false, 0, "POSITION_SYNC_OWNER_QUERY_FAILED"
+	}
+	return true, running, ""
+}
+
+func (m *PositionSyncManager) warnExternalOwnershipBlocked(traderID, exchangeID, reason string) {
+	key := exchangeID + "|" + traderID + "|" + reason
+	now := time.Now()
+	m.shortfallMutex.Lock()
+	last := m.ownershipWarnedAt[key]
+	if !last.IsZero() && now.Sub(last) < time.Hour {
+		m.shortfallMutex.Unlock()
+		return
+	}
+	m.ownershipWarnedAt[key] = now
+	m.shortfallMutex.Unlock()
+	logger.Warnf("⚠️ Position sync did not claim external quantity: reason=%s trader=%q id=%s exchange=%s",
+		reason, m.store.Trader().ResolveDisplayName(traderID), traderID, exchangeID)
 }
 
 // syncClosedPositionsHistory syncs closed positions from exchange history
@@ -871,8 +984,8 @@ func (m *PositionSyncManager) syncClosedPositionsHistory(traderID, exchangeID, e
 	}
 
 	if totalCreated > 0 {
-		logger.Infof("📊 Synced %d new closed positions for trader %s (skipped %d duplicates)",
-			totalCreated, traderID[:min(8, len(traderID))], totalSkipped)
+		logger.Infof("📊 Synced %d new closed positions for trader=%q id=%s (skipped %d duplicates)",
+			totalCreated, m.store.Trader().ResolveDisplayName(traderID), traderID, totalSkipped)
 	}
 
 }
@@ -934,8 +1047,8 @@ func (m *PositionSyncManager) reconcilePendingClosedPositions(traderID, exchange
 			continue
 		}
 		if claimed {
-			logger.Infof("📊 Reconciled delayed authoritative close fill: [%s] %s %s",
-				traderID[:min(8, len(traderID))], pos.Symbol, pos.Side)
+			logger.Infof("📊 Reconciled delayed authoritative close fill: trader=%q id=%s %s %s",
+				m.store.Trader().ResolveDisplayName(traderID), traderID, pos.Symbol, pos.Side)
 		}
 	}
 }

@@ -79,6 +79,59 @@ func TestExecutionAttemptRecorderAcceptsCloseAllSentinel(t *testing.T) {
 	}
 }
 
+func TestStableClientOrderIDMeetsOKXConstraint(t *testing.T) {
+	first := stableClientOrderID("trader-1", "catchup|98271|1", "open_short")
+	second := stableClientOrderID("trader-1", "catchup|98271|1", "open_short")
+	if first != second {
+		t.Fatalf("stable client id changed: %q != %q", first, second)
+	}
+	if !validOKXClientOrderID(first) {
+		t.Fatalf("generated client id violates OKX constraint: %q", first)
+	}
+	for _, invalid := range []string{"", "nfx-catch-98271-1", strings.Repeat("a", 33), "订单1"} {
+		if validOKXClientOrderID(invalid) {
+			t.Fatalf("invalid OKX client id accepted: %q", invalid)
+		}
+	}
+}
+
+func TestOKXAttemptRecorderRejectsInvalidClientIDBeforePersistence(t *testing.T) {
+	st, err := store.New(filepath.Join(t.TempDir(), "invalid-okx-client-id.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	intent, claimed, err := st.CopyTrade().ReserveExecutionIntent(&store.CopyTradeExecutionIntent{
+		TraderID: "trader-1", LeaderPosID: "leader-pos", SourceRevision: 2,
+		CanonicalKey: "leader|trader-1|leader-pos|2", Action: "open_short",
+		Symbol: "PROSUSDT", Side: "short", ClientOrderID: "nfx-catch-1-1",
+	})
+	if err != nil || !claimed {
+		t.Fatalf("reserve claimed=%v err=%v", claimed, err)
+	}
+	ti := &TraderIntegration{
+		traderID: "trader-1", store: st,
+		engine: &Engine{config: &CopyConfig{ProviderType: ProviderOKX}},
+	}
+	dec := &decision.Decision{
+		Action: "open_short", IsCopyTrade: true, CopyTradeAction: "catchup",
+		ExecutionIntentID: intent.ID, ClientOrderID: "nfx-catch-1-1",
+		RequestedQuantity: 1,
+	}
+	ti.bindExecutionAttemptRecorder(dec)
+	err = dec.BeforeOrderSubmit(dec.ClientOrderID, 1)
+	if err == nil || ReasonCodeOf(err) != "PRE_SUBMIT" {
+		t.Fatalf("invalid OKX client id was not rejected: %v", err)
+	}
+	var attempts int
+	if queryErr := st.DB().QueryRow(`SELECT COUNT(*) FROM copy_trade_execution_order_attempts WHERE intent_id=?`, intent.ID).Scan(&attempts); queryErr != nil {
+		t.Fatal(queryErr)
+	}
+	if attempts != 0 {
+		t.Fatalf("invalid client id reached durable attempt table: %d", attempts)
+	}
+}
+
 func TestExecFailureDedupKeyStableForSameFailureState(t *testing.T) {
 	ti := &TraderIntegration{
 		traderID: "test-trader",
@@ -218,6 +271,152 @@ func TestInsufficientMarginAddDoesNotAdvanceSourceWithoutFill(t *testing.T) {
 	}
 }
 
+func TestLeaderCloseUnblocksTerminalNoFillCatchupRevision(t *testing.T) {
+	st, err := store.New(filepath.Join(t.TempDir(), "leader-close-unblocks-catchup.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cs := st.CopyTrade()
+	if err = cs.SavePositionMapping(&store.CopyTradePositionMapping{
+		TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "pros-pos",
+		Symbol: "PROSUSDT", Side: "short", MarginMode: "cross",
+		Status: store.MappingStatusActive, SourceRevision: 4,
+		LastKnownSize: 13344, OpenedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = st.DB().Exec(`UPDATE copy_trade_position_mappings SET source_revision=4 WHERE trader_id='trader-1' AND leader_pos_id='pros-pos'`); err != nil {
+		t.Fatal(err)
+	}
+	blocker, claimed, err := cs.ReserveExecutionIntent(&store.CopyTradeExecutionIntent{
+		TraderID: "trader-1", LeaderPosID: "pros-pos", SourceRevision: 5,
+		SourceFillID: "pros-add-5", CanonicalKey: "leader|trader-1|pros-pos|5",
+		Action: "open_short", Symbol: "PROSUSDT", Side: "short",
+		MarginMode: "cross", LeaderTargetSize: 13389,
+		ClientOrderID: "ct1234567890abcdef",
+	})
+	if err != nil || !claimed {
+		t.Fatalf("reserve blocker claimed=%v err=%v", claimed, err)
+	}
+	if _, err = cs.PrepareExecutionOrderAttempt(blocker.ID, "ct1234567890abcdef", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err = cs.CompleteExecutionOrderAttempt(blocker.ID, "ct1234567890abcdef",
+		store.ExecutionOrderAttemptTerminalNoFill, "", "REJECTED", "OKX 51000", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err = cs.UpdateExecutionIntent(blocker.ID, store.ExecutionIntentFailed,
+		"CATCHUP_SUPERSEDED", "authoritative leader position changed", "", 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	engine := &Engine{
+		traderID: "trader-1", store: st,
+		config: &CopyConfig{ProviderType: ProviderOKX, LeaderID: "leader"},
+	}
+	closeDecision := &decision.Decision{
+		Action: "close_short", Symbol: "PROSUSDT", IsCopyTrade: true,
+		LeaderPosID: "pros-pos", LeaderPosSize: 0, MarginMode: "cross",
+		SourceFillID: "pros-close",
+	}
+	if !engine.reserveExecutionIntent(closeDecision) {
+		t.Fatal("leader close remained blocked by terminal no-fill catch-up")
+	}
+	if closeDecision.SourceRevision != 6 || closeDecision.ExecutionIntentID == 0 {
+		t.Fatalf("close did not reserve next revision: %+v", closeDecision)
+	}
+	settled, err := cs.GetExecutionIntentByID(blocker.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settled.Status != store.ExecutionIntentSkipped || settled.ReasonCode != "CATCHUP_SKIPPED_NO_FILL" {
+		t.Fatalf("blocker was not safely settled: %+v", settled)
+	}
+}
+
+type cancelPendingCatchupExecutor struct {
+	canceled bool
+}
+
+func (f *cancelPendingCatchupExecutor) ExecuteDecision(*decision.Decision) error {
+	return nil
+}
+func (f *cancelPendingCatchupExecutor) GetAccountInfo() (map[string]interface{}, error) {
+	return map[string]interface{}{}, nil
+}
+func (f *cancelPendingCatchupExecutor) GetPositions() ([]map[string]interface{}, error) {
+	return nil, nil
+}
+func (f *cancelPendingCatchupExecutor) GetOrderStatusByClientID(_, clientOrderID string) (map[string]interface{}, error) {
+	status := "NEW"
+	if f.canceled {
+		status = "CANCELED"
+	}
+	return map[string]interface{}{
+		"clOrdId": clientOrderID, "ordId": "venue-order", "status": status, "executedQty": 0.0,
+	}, nil
+}
+func (f *cancelPendingCatchupExecutor) CancelOrderByClientID(_, _ string) error {
+	f.canceled = true
+	return nil
+}
+
+func TestLeaderCloseReconciliationCancelsPendingCatchupBeforeSettlement(t *testing.T) {
+	st, err := store.New(filepath.Join(t.TempDir(), "leader-close-cancel-catchup.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cs := st.CopyTrade()
+	if err = cs.SavePositionMapping(&store.CopyTradePositionMapping{
+		TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "pros-pos",
+		Symbol: "PROSUSDT", Side: "short", MarginMode: "cross",
+		Status: store.MappingStatusActive, LastKnownSize: 13344, OpenedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = st.DB().Exec(`UPDATE copy_trade_position_mappings SET source_revision=4 WHERE trader_id='trader-1' AND leader_pos_id='pros-pos'`); err != nil {
+		t.Fatal(err)
+	}
+	intent, claimed, err := cs.ReserveExecutionIntent(&store.CopyTradeExecutionIntent{
+		TraderID: "trader-1", LeaderPosID: "pros-pos", SourceRevision: 5,
+		CanonicalKey: "leader|trader-1|pros-pos|5", Action: "open_short",
+		Symbol: "PROSUSDT", Side: "short", LeaderTargetSize: 13389,
+		ClientOrderID: "ct1234567890abcdef",
+	})
+	if err != nil || !claimed {
+		t.Fatalf("reserve claimed=%v err=%v", claimed, err)
+	}
+	if _, err = cs.PrepareExecutionOrderAttempt(intent.ID, "ct1234567890abcdef", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err = cs.MarkOrdinaryCatchupReconciliationPending(intent.ID, "trader-1",
+		"LEADER_CLOSE_RECONCILIATION_PENDING", "leader closed"); err != nil {
+		t.Fatal(err)
+	}
+	fake := &cancelPendingCatchupExecutor{}
+	ti := &TraderIntegration{
+		traderID: "trader-1", store: st, executor: fake,
+		engine: &Engine{config: &CopyConfig{ProviderType: ProviderOKX, LeaderID: "leader"}},
+	}
+	ti.reconcileExecutionIntents(false)
+	if !fake.canceled {
+		t.Fatal("pending risk-increasing order was not canceled before leader close")
+	}
+	stored, err := cs.GetExecutionIntentByID(intent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != store.ExecutionIntentSkipped || stored.ReasonCode != "CATCHUP_SKIPPED_NO_FILL" {
+		t.Fatalf("canceled blocker was not settled: %+v", stored)
+	}
+	mapping, err := cs.GetMapping("trader-1", "pros-pos")
+	if err != nil || mapping.SourceRevision != 5 {
+		t.Fatalf("source revision did not advance after cancel confirmation: mapping=%+v err=%v", mapping, err)
+	}
+}
+
 func TestExpiredOrdinaryCatchupTerminatesWithoutSubmitting(t *testing.T) {
 	st, err := store.New(filepath.Join(t.TempDir(), "nofx-catchup-timeout.db"))
 	if err != nil {
@@ -232,6 +431,21 @@ func TestExpiredOrdinaryCatchupTerminatesWithoutSubmitting(t *testing.T) {
 	})
 	if err != nil || !claimed {
 		t.Fatalf("reserve intent claimed=%v err=%v", claimed, err)
+	}
+	if err = st.CopyTrade().SavePositionMapping(&store.CopyTradePositionMapping{
+		TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "leader-pos",
+		Symbol: "ETHUSDT", Side: "long", MarginMode: "cross",
+		Status: store.MappingStatusActive, SourceRevision: 1, LastKnownSize: 4,
+		OpenedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = st.CopyTrade().PrepareExecutionOrderAttempt(intent.ID, "ct1234567890abcdef", 0.4); err != nil {
+		t.Fatal(err)
+	}
+	if err = st.CopyTrade().CompleteExecutionOrderAttempt(intent.ID, "ct1234567890abcdef",
+		store.ExecutionOrderAttemptFilled, "order-1", "FILLED", "", 0.4); err != nil {
+		t.Fatal(err)
 	}
 	expired := time.Now().Add(-time.Second).UTC()
 	if _, err = st.DB().Exec(`UPDATE copy_trade_execution_intents
@@ -255,12 +469,12 @@ func TestExpiredOrdinaryCatchupTerminatesWithoutSubmitting(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stored.Status != store.ExecutionIntentFailed || stored.ReasonCode != "CATCHUP_TIMEOUT" {
+	if stored.Status != store.ExecutionIntentCompletedPartial || stored.ReasonCode != "CATCHUP_RESIDUAL_SUPERSEDED" {
 		t.Fatalf("expired catch-up was not terminalized: %+v", stored)
 	}
 	attempts, err := st.CopyTrade().ListExecutionOrderAttempts(intent.ID)
-	if err != nil || len(attempts) != 0 {
-		t.Fatalf("expired catch-up must not submit an order: attempts=%+v err=%v", attempts, err)
+	if err != nil || len(attempts) != 1 {
+		t.Fatalf("expired catch-up must not submit another order: attempts=%+v err=%v", attempts, err)
 	}
 }
 

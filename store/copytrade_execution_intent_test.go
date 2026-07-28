@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"math"
 	"path/filepath"
@@ -598,6 +599,184 @@ func TestCommitIgnoredLeaderTransitionAtomicallyCreatesBaseline(t *testing.T) {
 	}
 	if err = cs.CommitIgnoredLeaderTransition(commit); err != nil {
 		t.Fatalf("idempotent commit failed: %v", err)
+	}
+}
+
+func TestSettleOrdinaryCatchupAdvancesZeroFillRevision(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "settle-catchup-zero.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cs := st.CopyTrade()
+	if err = cs.SavePositionMapping(&CopyTradePositionMapping{
+		TraderID: "trader-1", LeaderID: "leader-1", LeaderPosID: "pros-pos",
+		Symbol: "PROSUSDT", Side: "short", MarginMode: "cross",
+		Status: MappingStatusActive, SourceRevision: 4, LastKnownSize: 13344,
+		OpenedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = st.DB().Exec(`UPDATE copy_trade_position_mappings SET source_revision=4 WHERE trader_id='trader-1' AND leader_pos_id='pros-pos'`); err != nil {
+		t.Fatal(err)
+	}
+	intent, claimed, err := cs.ReserveExecutionIntent(&CopyTradeExecutionIntent{
+		TraderID: "trader-1", LeaderPosID: "pros-pos", SourceRevision: 5,
+		SourceFillID: "pros-add-5", CanonicalKey: "leader|trader-1|pros-pos|5",
+		Action: "open_short", Symbol: "PROSUSDT", Side: "short",
+		MarginMode: "cross", LeaderTargetSize: 13389,
+		ClientOrderID: "ct1234567890abcdef",
+	})
+	if err != nil || !claimed {
+		t.Fatalf("reserve claimed=%v err=%v", claimed, err)
+	}
+	if _, err = cs.PrepareExecutionOrderAttempt(intent.ID, "ct1234567890abcdef", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err = cs.CompleteExecutionOrderAttempt(intent.ID, "ct1234567890abcdef",
+		ExecutionOrderAttemptTerminalNoFill, "", "REJECTED", "OKX 51000", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err = cs.UpdateExecutionIntent(intent.ID, ExecutionIntentFailed,
+		"CATCHUP_SUPERSEDED", "authoritative leader position changed", "", 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	recoverable, err := cs.ListRecoverableOrdinaryCatchupIntents("trader-1")
+	if err != nil || len(recoverable) != 1 || recoverable[0].ID != intent.ID {
+		t.Fatalf("current revision blocker was not discoverable at startup: intents=%+v err=%v", recoverable, err)
+	}
+
+	status, err := cs.SettleOrdinaryCatchupTransition(OrdinaryCatchupSettlement{
+		IntentID: intent.ID, TraderID: "trader-1", LeaderID: "leader-1",
+		ReasonCode: "CATCHUP_SKIPPED_NO_FILL", Detail: "leader closed",
+	})
+	if err != nil || status != ExecutionIntentSkipped {
+		t.Fatalf("settle status=%s err=%v", status, err)
+	}
+	mapping, err := cs.GetMapping("trader-1", "pros-pos")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mapping.SourceRevision != 5 || mapping.LastKnownSize != 13389 {
+		t.Fatalf("mapping revision was not advanced: %+v", mapping)
+	}
+	stored, err := cs.GetExecutionIntentByID(intent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != ExecutionIntentSkipped || stored.ReasonCode != "CATCHUP_SKIPPED_NO_FILL" {
+		t.Fatalf("unexpected settled intent: %+v", stored)
+	}
+}
+
+func TestSettleOrdinaryCatchupRejectsUnknownAttempt(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "settle-catchup-unknown.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cs := st.CopyTrade()
+	if err = cs.SavePositionMapping(&CopyTradePositionMapping{
+		TraderID: "trader-1", LeaderID: "leader-1", LeaderPosID: "pros-pos",
+		Symbol: "PROSUSDT", Side: "short", MarginMode: "cross",
+		Status: MappingStatusActive, SourceRevision: 4, LastKnownSize: 13344,
+		OpenedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = st.DB().Exec(`UPDATE copy_trade_position_mappings SET source_revision=4 WHERE trader_id='trader-1' AND leader_pos_id='pros-pos'`); err != nil {
+		t.Fatal(err)
+	}
+	intent, claimed, err := cs.ReserveExecutionIntent(&CopyTradeExecutionIntent{
+		TraderID: "trader-1", LeaderPosID: "pros-pos", SourceRevision: 5,
+		CanonicalKey: "leader|trader-1|pros-pos|5", Action: "open_short",
+		Symbol: "PROSUSDT", Side: "short", LeaderTargetSize: 13389,
+		ClientOrderID: "ct1234567890abcdef",
+	})
+	if err != nil || !claimed {
+		t.Fatalf("reserve claimed=%v err=%v", claimed, err)
+	}
+	if _, err = cs.PrepareExecutionOrderAttempt(intent.ID, "ct1234567890abcdef", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err = cs.CompleteExecutionOrderAttempt(intent.ID, "ct1234567890abcdef",
+		ExecutionOrderAttemptUnknown, "", "", "transport timeout", 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = cs.SettleOrdinaryCatchupTransition(OrdinaryCatchupSettlement{
+		IntentID: intent.ID, TraderID: "trader-1", LeaderID: "leader-1",
+	}); !errors.Is(err, ErrOrdinaryCatchupUnsettled) {
+		t.Fatalf("unknown attempt must block source settlement: %v", err)
+	}
+	mapping, err := cs.GetMapping("trader-1", "pros-pos")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mapping.SourceRevision != 4 {
+		t.Fatalf("ambiguous attempt advanced mapping: %+v", mapping)
+	}
+}
+
+func TestSettleOrdinaryCatchupPreservesPartialFill(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "settle-catchup-partial.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cs := st.CopyTrade()
+	if err = cs.SavePositionMapping(&CopyTradePositionMapping{
+		TraderID: "trader-1", LeaderID: "leader-1", LeaderPosID: "sndk-pos",
+		Symbol: "SNDKUSDT", Side: "long", MarginMode: "cross",
+		Status: MappingStatusActive, SourceRevision: 8, LastKnownSize: 59.697,
+		OpenedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = st.DB().Exec(`UPDATE copy_trade_position_mappings SET source_revision=8 WHERE trader_id='trader-1' AND leader_pos_id='sndk-pos'`); err != nil {
+		t.Fatal(err)
+	}
+	intent, claimed, err := cs.ReserveExecutionIntent(&CopyTradeExecutionIntent{
+		TraderID: "trader-1", LeaderPosID: "sndk-pos", SourceRevision: 8,
+		CanonicalKey: "leader|trader-1|sndk-pos|8", Action: "open_long",
+		Symbol: "SNDKUSDT", Side: "long", LeaderTargetSize: 59.697,
+		TargetQuantity: 0.201, ClientOrderID: "ctabcdef1234567890",
+	})
+	if err != nil || !claimed {
+		t.Fatalf("reserve claimed=%v err=%v", claimed, err)
+	}
+	if _, err = cs.PrepareExecutionOrderAttempt(intent.ID, "ctabcdef1234567890", 0.2); err != nil {
+		t.Fatal(err)
+	}
+	if err = cs.CompleteExecutionOrderAttempt(intent.ID, "ctabcdef1234567890",
+		ExecutionOrderAttemptFilled, "order-1", "FILLED", "", 0.2); err != nil {
+		t.Fatal(err)
+	}
+	if err = cs.UpdateExecutionIntent(intent.ID, ExecutionIntentPartiallyFilled,
+		"CATCHUP_PENDING", "", "order-1", 0.201, 0.201, 0.2); err != nil {
+		t.Fatal(err)
+	}
+	if err = cs.UpdateExecutionIntent(intent.ID, ExecutionIntentFailed,
+		"CATCHUP_SUPERSEDED", "revision advanced", "order-1", 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	status, err := cs.SettleOrdinaryCatchupTransition(OrdinaryCatchupSettlement{
+		IntentID: intent.ID, TraderID: "trader-1", LeaderID: "leader-1",
+		ReasonCode: "CATCHUP_RESIDUAL_SUPERSEDED",
+	})
+	if err != nil || status != ExecutionIntentCompletedPartial {
+		t.Fatalf("settle status=%s err=%v", status, err)
+	}
+	stored, err := cs.GetExecutionIntentByID(intent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != ExecutionIntentCompletedPartial || stored.FilledQuantity != 0.2 {
+		t.Fatalf("partial fill was not preserved: %+v", stored)
+	}
+	baseline, available, err := cs.GetConfirmedInitialLeaderSize("trader-1", "sndk-pos")
+	if err != nil || !available || baseline != 59.697 {
+		t.Fatalf("completed partial fill disappeared from confirmed baseline: size=%v available=%v err=%v",
+			baseline, available, err)
 	}
 }
 

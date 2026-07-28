@@ -482,6 +482,71 @@ func (s *TraderStore) GetByID(traderID string) (*Trader, error) {
 	return &t, nil
 }
 
+func (s *TraderStore) CountRunningByExchange(exchangeID string) (int, error) {
+	if strings.TrimSpace(exchangeID) == "" {
+		return 0, nil
+	}
+	var count int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM traders WHERE exchange_id=? AND is_running=1`, exchangeID).Scan(&count)
+	return count, err
+}
+
+// ResolveExclusivePositionOwner returns the only running trader on an
+// exchange with durable ownership evidence for a symbol/side. An active
+// mapping proves strategy ownership; an unfinished submitted order proves a
+// possible exchange side effect before the mapping can safely advance.
+func (s *TraderStore) ResolveExclusivePositionOwner(exchangeID, symbol, side string) (string, int, error) {
+	rows, err := s.db.Query(`
+		SELECT owner_id FROM (
+			SELECT DISTINCT m.trader_id AS owner_id
+			FROM copy_trade_position_mappings m
+			JOIN traders t ON t.id=m.trader_id
+			WHERE t.exchange_id=? AND t.is_running=1
+			  AND UPPER(m.symbol)=UPPER(?) AND LOWER(m.side)=LOWER(?)
+			  AND m.status='active'
+			UNION
+			SELECT DISTINCT i.trader_id AS owner_id
+			FROM copy_trade_execution_intents i
+			JOIN traders t ON t.id=i.trader_id
+			WHERE t.exchange_id=? AND t.is_running=1
+			  AND UPPER(i.symbol)=UPPER(?) AND LOWER(i.side)=LOWER(?)
+			  AND (
+				(COALESCE(i.exchange_order_id,'')<>'' AND i.terminal_at IS NULL
+					AND i.status IN ('SUBMITTED','RECONCILING'))
+				OR (COALESCE(i.filled_quantity,0)>0
+					AND i.status IN ('PARTIALLY_FILLED','FILLED','PROTECTED')
+					AND EXISTS (
+						SELECT 1 FROM copy_guard_cycles c
+						WHERE c.trader_id=i.trader_id
+						  AND c.leader_pos_id=i.leader_pos_id
+						  AND c.closed_at IS NULL
+					))
+			  )
+		) ORDER BY owner_id`,
+		exchangeID, symbol, side, exchangeID, symbol, side)
+	if err != nil {
+		return "", 0, err
+	}
+	defer rows.Close()
+	var owner string
+	count := 0
+	for rows.Next() {
+		var candidate string
+		if err = rows.Scan(&candidate); err != nil {
+			return "", 0, err
+		}
+		owner = candidate
+		count++
+	}
+	if err = rows.Err(); err != nil {
+		return "", 0, err
+	}
+	if count != 1 {
+		return "", count, nil
+	}
+	return owner, count, nil
+}
+
 // ResolveDisplayName returns the user-facing trader/account name used by
 // Copy Guard emails and audit records. Identity lookup is best-effort because
 // notification failures must never enter the trading critical path; a missing

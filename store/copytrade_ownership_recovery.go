@@ -189,7 +189,7 @@ func loadCopyTradeOwnershipGap(q ownershipGapQueryer, traderID string, cycleID i
 		COALESCE(exchange_order_id,''),COALESCE(leader_target_size,0),COALESCE(filled_quantity,0)
 		FROM copy_trade_execution_intents
 		WHERE trader_id=? AND leader_pos_id=? AND source_kind='LEADER_TRANSITION'
-		  AND action=? AND status IN ('FILLED','PROTECTED')
+		  AND action=? AND status IN ('COMPLETED_PARTIAL','FILLED','PROTECTED')
 		  AND COALESCE(filled_quantity,0)>0 AND COALESCE(exchange_order_id,'')=?
 		ORDER BY source_revision DESC,id DESC LIMIT 1`, traderID, cycle.LeaderPosID, expectedAction, gap.EntryOrderID).Scan(
 		&gap.EntryIntentID, &gap.EntryIntentRevision, &intentSymbol, &intentSide, &intentMargin,
