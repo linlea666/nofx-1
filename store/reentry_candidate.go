@@ -214,8 +214,110 @@ func (s *ReentryAIStore) initReentryCandidateTables() error {
 		ON CONFLICT(cycle_id) DO NOTHING`); err != nil {
 		return err
 	}
-	_, err = s.db.Exec(`UPDATE copy_guard_manual_reentry_signals SET status='MIGRATED',error='migrated to AI candidate; manual confirmation endpoint retired' WHERE status='PENDING' AND EXISTS (SELECT 1 FROM copy_guard_reentry_candidates c WHERE c.cycle_id=copy_guard_manual_reentry_signals.cycle_id)`)
-	return err
+	if _, err = s.db.Exec(`UPDATE copy_guard_manual_reentry_signals SET status='MIGRATED',error='migrated to AI candidate; manual confirmation endpoint retired' WHERE status='PENDING' AND EXISTS (SELECT 1 FROM copy_guard_reentry_candidates c WHERE c.cycle_id=copy_guard_manual_reentry_signals.cycle_id)`); err != nil {
+		return err
+	}
+	return s.reconcileReentryCandidateLifecycleState()
+}
+
+// reconcileReentryCandidateLifecycleState repairs legacy rows created before
+// cycle termination and trader lifecycle were one authority. It delegates
+// terminal cycles to the existing all-or-nothing auxiliary cleanup, then uses
+// the same stop transaction helper as the API for still-open observations.
+func (s *ReentryAIStore) reconcileReentryCandidateLifecycleState() error {
+	rows, err := s.db.Query(`SELECT DISTINCT c.cycle_id,g.status
+		FROM copy_guard_reentry_candidates c
+		JOIN copy_guard_cycles g ON g.id=c.cycle_id
+		WHERE c.status IN ('WATCHING','WAITING','REVIEWING','ENTRY_PENDING','PAUSED','PAUSED_BY_TRADER')
+		  AND (
+			g.closed_at IS NOT NULL
+			OR g.status NOT IN (
+				'STOPPED_WATCHING','AI_WATCHING','AI_REVIEWING','AI_WAITING',
+				'ATTEMPTS_EXHAUSTED','BUDGET_SUSPENDED','REENTRY_PENDING'
+			)
+		  )
+		ORDER BY c.cycle_id`)
+	if err != nil {
+		return err
+	}
+	type terminalCycle struct {
+		id     int64
+		status string
+	}
+	var terminal []terminalCycle
+	for rows.Next() {
+		var cycle terminalCycle
+		if err = rows.Scan(&cycle.id, &cycle.status); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		terminal = append(terminal, cycle)
+	}
+	if err = rows.Close(); err != nil {
+		return err
+	}
+	for _, cycle := range terminal {
+		tx, txErr := s.db.Begin()
+		if txErr != nil {
+			return txErr
+		}
+		if txErr = terminalizeCopyGuardAuxiliaryStateTx(tx, cycle.id, cycle.status); txErr != nil {
+			_ = tx.Rollback()
+			return txErr
+		}
+		if txErr = tx.Commit(); txErr != nil {
+			return txErr
+		}
+	}
+
+	if _, err = s.db.Exec(`UPDATE copy_guard_reentry_candidates
+		SET status=?,pending_trigger='TRADER_ARCHIVED',
+		    last_error='candidate invalidated because trader is archived',
+		    closed_at=COALESCE(closed_at,CURRENT_TIMESTAMP),updated_at=CURRENT_TIMESTAMP
+		WHERE status IN ('WATCHING','WAITING','REVIEWING','ENTRY_PENDING','PAUSED_BY_TRADER')
+		  AND EXISTS (
+			SELECT 1 FROM traders t
+			WHERE t.id=copy_guard_reentry_candidates.trader_id
+			  AND t.lifecycle_status='ARCHIVED'
+		  )`, ReentryCandidateInvalidatedTraderArchived); err != nil {
+		return err
+	}
+
+	rows, err = s.db.Query(`SELECT DISTINCT t.id
+		FROM traders t
+		JOIN copy_guard_reentry_candidates c ON c.trader_id=t.id
+		WHERE t.lifecycle_status NOT IN ('RUNNING','ARCHIVED')
+		  AND c.status IN ('WATCHING','WAITING','REVIEWING','ENTRY_PENDING')
+		ORDER BY t.id`)
+	if err != nil {
+		return err
+	}
+	var stoppedTraderIDs []string
+	for rows.Next() {
+		var traderID string
+		if err = rows.Scan(&traderID); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		stoppedTraderIDs = append(stoppedTraderIDs, traderID)
+	}
+	if err = rows.Close(); err != nil {
+		return err
+	}
+	for _, traderID := range stoppedTraderIDs {
+		tx, txErr := s.db.Begin()
+		if txErr != nil {
+			return txErr
+		}
+		if txErr = pauseTraderRiskIncreaseTx(tx, traderID); txErr != nil {
+			_ = tx.Rollback()
+			return txErr
+		}
+		if txErr = tx.Commit(); txErr != nil {
+			return txErr
+		}
+	}
+	return nil
 }
 
 const reentryCandidateColumns = `id,cycle_id,trader_id,leader_pos_id,symbol,side,margin_mode,status,
@@ -355,12 +457,19 @@ func (s *ReentryAIStore) ListDueReentryCandidates(limit int) ([]*CopyGuardReentr
 		limit = 50
 	}
 	rows, err := s.db.Query(`SELECT `+reentryCandidateColumns+` FROM copy_guard_reentry_candidates
-		WHERE status IN ('WATCHING','WAITING') AND next_review_at<=CURRENT_TIMESTAMP
-		AND EXISTS(SELECT 1 FROM traders t
-			WHERE t.id=copy_guard_reentry_candidates.trader_id
-			  AND t.lifecycle_status='RUNNING' AND t.is_running=1)
-		AND (failure_backoff_until IS NULL OR failure_backoff_until<=CURRENT_TIMESTAMP)
-		ORDER BY next_review_at,id LIMIT ?`, limit)
+			WHERE status IN ('WATCHING','WAITING') AND next_review_at<=CURRENT_TIMESTAMP
+			AND EXISTS(SELECT 1 FROM traders t
+				WHERE t.id=copy_guard_reentry_candidates.trader_id
+				  AND t.lifecycle_status='RUNNING' AND t.is_running=1)
+			AND EXISTS(SELECT 1 FROM copy_guard_cycles g
+				WHERE g.id=copy_guard_reentry_candidates.cycle_id
+				  AND g.closed_at IS NULL
+				  AND g.status IN (
+					'STOPPED_WATCHING','AI_WATCHING','AI_REVIEWING','AI_WAITING',
+					'ATTEMPTS_EXHAUSTED','BUDGET_SUSPENDED'
+				  ))
+			AND (failure_backoff_until IS NULL OR failure_backoff_until<=CURRENT_TIMESTAMP)
+			ORDER BY next_review_at,id LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -398,17 +507,24 @@ func (s *ReentryAIStore) ClaimReentryCandidateReview(id int64, minInterval time.
 	var last sql.NullString
 	var lifecycleStatus string
 	var lifecycleGeneration int64
+	var cycleReviewable bool
 	if err = tx.QueryRow(`SELECT c.status,c.review_count,c.last_review_at,
-		COALESCE(t.lifecycle_status,''),COALESCE(t.lifecycle_generation,0)
-		FROM copy_guard_reentry_candidates c
-		LEFT JOIN traders t ON t.id=c.trader_id WHERE c.id=?`, id).
-		Scan(&status, &count, &last, &lifecycleStatus, &lifecycleGeneration); err != nil {
+			COALESCE(t.lifecycle_status,''),COALESCE(t.lifecycle_generation,0),
+			EXISTS(SELECT 1 FROM copy_guard_cycles g
+				WHERE g.id=c.cycle_id AND g.closed_at IS NULL
+				  AND g.status IN (
+					'STOPPED_WATCHING','AI_WATCHING','AI_REVIEWING','AI_WAITING',
+					'ATTEMPTS_EXHAUSTED','BUDGET_SUSPENDED'
+				  ))
+			FROM copy_guard_reentry_candidates c
+			LEFT JOIN traders t ON t.id=c.trader_id WHERE c.id=?`, id).
+		Scan(&status, &count, &last, &lifecycleStatus, &lifecycleGeneration, &cycleReviewable); err != nil {
 		return nil, false, err
 	}
 	if status != ReentryCandidateWatching && status != ReentryCandidateWaiting {
 		return nil, false, nil
 	}
-	if lifecycleStatus != TraderLifecycleRunning {
+	if lifecycleStatus != TraderLifecycleRunning || !cycleReviewable {
 		return nil, false, nil
 	}
 	if last.Valid {
@@ -851,14 +967,26 @@ func (s *ReentryAIStore) ScheduleReentryCandidateEventReview(id int64, trigger s
 	}
 	defer tx.Rollback()
 	var status string
+	var reviewAllowed bool
 	var last, regular, failureBackoff sql.NullString
-	if err = tx.QueryRow(`SELECT status,last_review_at,regular_review_at,failure_backoff_until
-		FROM copy_guard_reentry_candidates WHERE id=?`, id).
-		Scan(&status, &last, &regular, &failureBackoff); err != nil {
+	if err = tx.QueryRow(`SELECT c.status,c.last_review_at,c.regular_review_at,c.failure_backoff_until,
+			EXISTS(SELECT 1 FROM traders t
+				WHERE t.id=c.trader_id AND t.lifecycle_status='RUNNING' AND t.is_running=1)
+			AND EXISTS(SELECT 1 FROM copy_guard_cycles g
+				WHERE g.id=c.cycle_id AND g.closed_at IS NULL
+				  AND g.status IN (
+					'STOPPED_WATCHING','AI_WATCHING','AI_REVIEWING','AI_WAITING',
+					'ATTEMPTS_EXHAUSTED','BUDGET_SUSPENDED'
+				  ))
+			FROM copy_guard_reentry_candidates c WHERE c.id=?`, id).
+		Scan(&status, &last, &regular, &failureBackoff, &reviewAllowed); err != nil {
 		return nil, err
 	}
 	if status != ReentryCandidateWatching && status != ReentryCandidateWaiting {
 		return nil, fmt.Errorf("candidate status %s cannot be manually reviewed", status)
+	}
+	if !reviewAllowed {
+		return nil, fmt.Errorf("candidate trader or cycle is no longer reviewable")
 	}
 	eligible := time.Now().UTC()
 	if last.Valid {

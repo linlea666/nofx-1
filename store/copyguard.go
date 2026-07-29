@@ -1236,7 +1236,7 @@ func (s *CopyTradeStore) RecordCopyGuardUnprotectedExit(cycleID int64, traderID,
 	}
 	if _, err = tx.Exec(`UPDATE copy_guard_reentry_candidates SET
 		status='INVALIDATED',last_error=?,closed_at=COALESCE(closed_at,CURRENT_TIMESTAMP),updated_at=CURRENT_TIMESTAMP
-		WHERE trader_id=? AND leader_pos_id=? AND status IN ('WATCHING','REVIEWING','WAITING','ENTRY_PENDING','PAUSED')`,
+		WHERE trader_id=? AND leader_pos_id=? AND status IN ('WATCHING','REVIEWING','WAITING','ENTRY_PENDING','PAUSED','PAUSED_BY_TRADER')`,
 		"PROTECTION_EXITED: "+reason, traderID, leaderPosID); err != nil {
 		return err
 	}
@@ -1404,10 +1404,10 @@ func terminalizeCopyGuardAuxiliaryStateTx(tx *sql.Tx, cycleID int64, status stri
 	}
 	if _, err := tx.Exec(`UPDATE copy_guard_reentry_candidates
 		SET status=?,last_error='cycle ended: '||?,closed_at=COALESCE(closed_at,CURRENT_TIMESTAMP),updated_at=CURRENT_TIMESTAMP
-		WHERE cycle_id=? AND status IN (?,?,?,?,?)`,
+		WHERE cycle_id=? AND status IN (?,?,?,?,?,?)`,
 		ReentryCandidateInvalidated, status, cycleID,
 		ReentryCandidateWatching, ReentryCandidateReviewing, ReentryCandidateWaiting,
-		ReentryCandidateEntryPending, ReentryCandidatePaused); err != nil {
+		ReentryCandidateEntryPending, ReentryCandidatePaused, ReentryCandidatePausedByTrader); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`UPDATE copy_guard_risk_reservations

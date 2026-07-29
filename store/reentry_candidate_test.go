@@ -28,6 +28,25 @@ func newReentryCandidateTestStore(t *testing.T, path string) (*Store, error) {
 	return st, nil
 }
 
+func ensureReviewableReentryCycle(t *testing.T, st *Store, id int64, traderID, leaderPosID, symbol, side string) {
+	t.Helper()
+	if leaderPosID == "" {
+		leaderPosID = "leader-pos"
+	}
+	if symbol == "" {
+		symbol = "BTCUSDT"
+	}
+	if side == "" {
+		side = "long"
+	}
+	if _, err := st.DB().Exec(`INSERT INTO copy_guard_cycles
+		(id,trader_id,leader_id,leader_pos_id,symbol,side,margin_mode,status,policy_snapshot)
+		VALUES(?,?,?,?,?,?,?,'AI_WAITING','{}')`,
+		id, traderID, "leader", leaderPosID, symbol, side, "cross"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestReentryCandidateLifecycleAndRiskReservation(t *testing.T) {
 	st, err := newReentryCandidateTestStore(t, filepath.Join(t.TempDir(), "candidate.db"))
 	if err != nil {
@@ -35,6 +54,7 @@ func TestReentryCandidateLifecycleAndRiskReservation(t *testing.T) {
 	}
 	defer st.Close()
 	rs := st.ReentryAI()
+	ensureReviewableReentryCycle(t, st, 7, "trader-a", "leader-pos", "ETHUSDT", "long")
 
 	firstReview := time.Now().Add(5 * time.Minute).UTC()
 	candidate, err := rs.EnsureReentryCandidate(&CopyGuardReentryCandidate{
@@ -204,6 +224,7 @@ func TestEventReviewSchedulerHonorsRegularCadenceAndHardBlocks(t *testing.T) {
 	}
 	defer st.Close()
 	rs := st.ReentryAI()
+	ensureReviewableReentryCycle(t, st, 712, "trader-a", "p", "ETHUSDT", "short")
 	now := time.Now().UTC()
 	regular := now.Add(2 * time.Hour)
 	candidate, err := rs.EnsureReentryCandidate(&CopyGuardReentryCandidate{
@@ -333,6 +354,7 @@ func TestOperatorReviewRequestUsesSchedulerAndMinimumInterval(t *testing.T) {
 	}
 	defer st.Close()
 	rs := st.ReentryAI()
+	ensureReviewableReentryCycle(t, st, 712, "trader-a", "leader-pos", "BTCUSDT", "long")
 	candidate, err := rs.EnsureReentryCandidate(&CopyGuardReentryCandidate{CycleID: 712, TraderID: "trader-a", Symbol: "BTCUSDT", Side: "long", FeatureHash: "a"}, time.Now().Add(2*time.Hour))
 	if err != nil {
 		t.Fatal(err)
@@ -513,6 +535,7 @@ func TestCandidatePreparationFailureDoesNotConsumeCallQuota(t *testing.T) {
 	}
 	defer st.Close()
 	rs := st.ReentryAI()
+	ensureReviewableReentryCycle(t, st, 78, "trader-a", "p", "BTCUSDT", "long")
 	candidate, err := rs.EnsureReentryCandidate(&CopyGuardReentryCandidate{CycleID: 78, TraderID: "trader-a", LeaderPosID: "p", Symbol: "BTCUSDT", Side: "long", FeatureHash: "prepare"}, time.Now())
 	if err != nil {
 		t.Fatal(err)
@@ -549,6 +572,7 @@ func TestCandidateSoftCostWarningsNeverSuspendLaterReviews(t *testing.T) {
 	}
 	defer st.Close()
 	rs := st.ReentryAI()
+	ensureReviewableReentryCycle(t, st, 79, "trader-a", "p", "HYPEUSDT", "long")
 	candidate, err := rs.EnsureReentryCandidate(&CopyGuardReentryCandidate{
 		CycleID: 79, TraderID: "trader-a", LeaderPosID: "p",
 		Symbol: "HYPEUSDT", Side: "long", FeatureHash: "soft-warning",
@@ -1034,6 +1058,7 @@ func TestCandidateFeatureRefreshCannotShortenFailureBackoff(t *testing.T) {
 	}
 	defer st.Close()
 	rs := st.ReentryAI()
+	ensureReviewableReentryCycle(t, st, 9001, "trader-a", "pos-a", "ETHUSDT", "long")
 	candidate, err := rs.EnsureReentryCandidate(&CopyGuardReentryCandidate{
 		CycleID: 9001, TraderID: "trader-a", LeaderPosID: "pos-a", Symbol: "ETHUSDT",
 		Side: "long", FeatureHash: "v1", PendingTrigger: "INITIAL",
@@ -1068,6 +1093,95 @@ func TestCandidateFeatureRefreshCannotShortenFailureBackoff(t *testing.T) {
 	}
 	if len(due) != 0 {
 		t.Fatalf("backed-off candidate became due: %+v", due)
+	}
+}
+
+func TestCandidateSchedulerAndStartupRejectClosedCycle(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "candidate-closed-cycle.db")
+	st, err := newReentryCandidateTestStore(t, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rs := st.ReentryAI()
+	ensureReviewableReentryCycle(t, st, 9003, "trader-a", "pos-closed", "BTCUSDT", "long")
+	closedCandidate, err := rs.EnsureReentryCandidate(&CopyGuardReentryCandidate{
+		CycleID: 9003, TraderID: "trader-a", LeaderPosID: "pos-closed",
+		Symbol: "BTCUSDT", Side: "long", FeatureHash: "closed-cycle",
+	}, time.Now().Add(-time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = st.DB().Exec(`UPDATE copy_guard_cycles
+		SET status='LEADER_CLOSED',closed_at=CURRENT_TIMESTAMP WHERE id=9003`); err != nil {
+		t.Fatal(err)
+	}
+	due, err := rs.ListDueReentryCandidates(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, candidate := range due {
+		if candidate.ID == closedCandidate.ID {
+			t.Fatal("closed cycle remained eligible for scheduled AI review")
+		}
+	}
+	if claimed, ok, claimErr := rs.ClaimReentryCandidateReview(closedCandidate.ID, 0, 10, 10); claimErr != nil || ok || claimed != nil {
+		t.Fatalf("closed cycle claim candidate=%+v ok=%v err=%v", claimed, ok, claimErr)
+	}
+
+	ensureReviewableReentryCycle(t, st, 9004, "trader-b", "pos-stopped", "ETHUSDT", "short")
+	stoppedCandidate, err := rs.EnsureReentryCandidate(&CopyGuardReentryCandidate{
+		CycleID: 9004, TraderID: "trader-b", LeaderPosID: "pos-stopped",
+		Symbol: "ETHUSDT", Side: "short", FeatureHash: "stopped-trader",
+	}, time.Now().Add(-time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = st.DB().Exec(`UPDATE traders SET lifecycle_status='STOPPED',is_running=0
+		WHERE id='trader-b'`); err != nil {
+		t.Fatal(err)
+	}
+	if err = st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	st, err = New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	closedCandidate, err = st.ReentryAI().GetReentryCandidate(closedCandidate.ID)
+	if err != nil || closedCandidate.Status != ReentryCandidateInvalidated || closedCandidate.ClosedAt == nil {
+		t.Fatalf("terminal candidate was not invalidated at startup: candidate=%+v err=%v", closedCandidate, err)
+	}
+	stoppedCandidate, err = st.ReentryAI().GetReentryCandidate(stoppedCandidate.ID)
+	if err != nil || stoppedCandidate.Status != ReentryCandidatePausedByTrader {
+		t.Fatalf("stopped trader candidate was not paused at startup: candidate=%+v err=%v", stoppedCandidate, err)
+	}
+}
+
+func TestCycleTerminationInvalidatesTraderPausedCandidate(t *testing.T) {
+	st, err := newReentryCandidateTestStore(t, filepath.Join(t.TempDir(), "candidate-paused-terminal.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ensureReviewableReentryCycle(t, st, 9005, "trader-a", "pos-paused", "SOLUSDT", "long")
+	candidate, err := st.ReentryAI().EnsureReentryCandidate(&CopyGuardReentryCandidate{
+		CycleID: 9005, TraderID: "trader-a", LeaderPosID: "pos-paused",
+		Symbol: "SOLUSDT", Side: "long", FeatureHash: "paused",
+	}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = st.DB().Exec(`UPDATE copy_guard_reentry_candidates
+		SET status=? WHERE id=?`, ReentryCandidatePausedByTrader, candidate.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err = st.CopyTrade().CloseCopyGuardCycle(9005, CopyGuardLeaderClosed, 0, 0, 0, 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	candidate, err = st.ReentryAI().GetReentryCandidate(candidate.ID)
+	if err != nil || candidate.Status != ReentryCandidateInvalidated || candidate.ClosedAt == nil {
+		t.Fatalf("paused trader candidate survived terminal cycle: candidate=%+v err=%v", candidate, err)
 	}
 }
 
