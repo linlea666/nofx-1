@@ -78,6 +78,26 @@ type TradeRecord struct {
 	Time         time.Time // Trade execution time
 }
 
+// SymbolTradeHistoryProvider exposes immutable per-fill history. Position
+// history is often cumulative/mutable and must not be used as a fill identity
+// when several local lots share one exchange position lifecycle.
+type SymbolTradeHistoryProvider interface {
+	GetTradesForSymbol(symbol string, start time.Time, limit int) ([]TradeRecord, error)
+}
+
+type PendingOrderSnapshot struct {
+	ID         string
+	Symbol     string
+	Status     string
+	Protective bool
+}
+
+// PendingOrderProvider is optional. Explicit stopped-trader reconciliation
+// uses it together with a fresh position read before retiring stale local rows.
+type PendingOrderProvider interface {
+	GetPendingOrdersFresh() ([]PendingOrderSnapshot, error)
+}
+
 // ClosedPnLBySymbolProvider provides an exact symbol-scoped reconciliation
 // path for venues (such as Binance) that do not expose a stable position ID.
 type ClosedPnLBySymbolProvider interface {

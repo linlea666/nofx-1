@@ -1806,7 +1806,7 @@ func (s *CopyTradeStore) UpdateExecutionIntent(id int64, status, reasonCode, las
 		submitted_at=CASE WHEN ?='SUBMITTED' THEN COALESCE(submitted_at,CURRENT_TIMESTAMP) ELSE submitted_at END,
 		filled_at=CASE WHEN ? IN ('FILLED','COMPLETED_PARTIAL') THEN COALESCE(filled_at,CURRENT_TIMESTAMP) ELSE filled_at END,
 		protected_at=CASE WHEN ?='PROTECTED' THEN COALESCE(protected_at,CURRENT_TIMESTAMP) ELSE protected_at END,
-		terminal_at=CASE WHEN ? IN ('SKIPPED','FAILED','COMPLETED_PARTIAL') THEN COALESCE(terminal_at,CURRENT_TIMESTAMP) ELSE terminal_at END,
+		terminal_at=CASE WHEN ? IN ('SKIPPED','FAILED','COMPLETED_PARTIAL','PROTECTED') THEN COALESCE(terminal_at,CURRENT_TIMESTAMP) ELSE terminal_at END,
 		updated_at=CURRENT_TIMESTAMP WHERE id=? AND (`+validExecutionIntentTransitionSQL()+`)`, status, reasonCode, reasonCode, lastError,
 		reasonCode, reasonCode,
 		exchangeOrderID, exchangeOrderID, requestedQty, requestedQty, quantizedQty, quantizedQty, filledQty, filledQty,
@@ -1830,6 +1830,39 @@ func (s *CopyTradeStore) UpdateExecutionIntent(id int64, status, reasonCode, las
 		return nil
 	}
 	return fmt.Errorf("invalid execution intent transition %s -> %s for intent %d", current, status, id)
+}
+
+// finalizeExecutionIntentTerminalMigration runs after mapping and Copy Guard
+// tables exist. Historical PROTECTED rows are always terminal. A historical
+// FILLED row is terminal only when its surrounding ownership/cycle is already
+// closed; active unprotected opens deliberately remain non-terminal so stop
+// reconciliation cannot hide exchange risk.
+func (s *CopyTradeStore) finalizeExecutionIntentTerminalMigration() error {
+	if _, err := s.db.Exec(`UPDATE copy_trade_execution_intents
+		SET protected_at=COALESCE(protected_at,filled_at,updated_at,CURRENT_TIMESTAMP),
+		    terminal_at=COALESCE(terminal_at,protected_at,filled_at,updated_at,CURRENT_TIMESTAMP),
+		    updated_at=CURRENT_TIMESTAMP
+		WHERE status='PROTECTED' AND terminal_at IS NULL`); err != nil {
+		return err
+	}
+	_, err := s.db.Exec(`UPDATE copy_trade_execution_intents AS i
+		SET terminal_at=COALESCE(i.terminal_at,i.filled_at,i.updated_at,CURRENT_TIMESTAMP),
+		    updated_at=CURRENT_TIMESTAMP
+		WHERE i.status='FILLED' AND i.terminal_at IS NULL
+		  AND UPPER(COALESCE(i.exchange_state,''))='FILLED'
+		  AND (
+			LOWER(i.action) IN ('close_long','close_short','reduce_long','reduce_short')
+			OR EXISTS (
+				SELECT 1 FROM copy_guard_cycles c
+				WHERE c.id=i.cycle_id AND c.closed_at IS NOT NULL
+			)
+			OR EXISTS (
+				SELECT 1 FROM copy_trade_position_mappings m
+				WHERE m.trader_id=i.trader_id AND m.leader_pos_id=i.leader_pos_id
+				  AND m.status<>'active'
+			)
+		  )`)
+	return err
 }
 
 func (s *CopyTradeStore) UpdateExecutionIntentExchangeState(id int64, exchangeState string) error {

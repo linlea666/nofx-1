@@ -13,6 +13,7 @@ import (
 	"math"
 	"net/http"
 	"nofx/logger"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -39,7 +40,172 @@ const (
 	okxAlgoHistoryPath   = "/api/v5/trade/orders-algo-history"
 	okxAmendAlgoPath     = "/api/v5/trade/amend-algos"
 	okxPositionModePath  = "/api/v5/account/set-position-mode"
+	okxFillsHistoryPath  = "/api/v5/trade/fills-history"
 )
+
+// GetPendingOrdersFresh returns both regular and conditional pending orders.
+// Both endpoints must succeed: an empty result from one endpoint cannot prove
+// the account is order-free when the other query failed.
+func (t *OKXTrader) GetPendingOrdersFresh() ([]PendingOrderSnapshot, error) {
+	type pendingOrder struct {
+		OrdID       string `json:"ordId"`
+		AlgoID      string `json:"algoId"`
+		InstID      string `json:"instId"`
+		State       string `json:"state"`
+		OrdType     string `json:"ordType"`
+		SlTriggerPx string `json:"slTriggerPx"`
+		TpTriggerPx string `json:"tpTriggerPx"`
+	}
+	queries := []struct {
+		path       string
+		protective bool
+	}{
+		{okxPendingOrdersPath + "?instType=SWAP", false},
+		{okxAlgoPendingPath + "?ordType=conditional&instType=SWAP", true},
+	}
+	var snapshots []PendingOrderSnapshot
+	for _, query := range queries {
+		data, err := t.doRequest("GET", query.path, nil)
+		if err != nil {
+			return nil, fmt.Errorf("query OKX pending orders %s: %w", query.path, err)
+		}
+		var rows []pendingOrder
+		if err = json.Unmarshal(data, &rows); err != nil {
+			return nil, fmt.Errorf("parse OKX pending orders %s: %w", query.path, err)
+		}
+		for _, row := range rows {
+			id := row.OrdID
+			if id == "" {
+				id = row.AlgoID
+			}
+			protective := query.protective || row.SlTriggerPx != "" || row.TpTriggerPx != ""
+			snapshots = append(snapshots, PendingOrderSnapshot{
+				ID: id, Symbol: t.convertSymbolBack(row.InstID),
+				Status: row.State, Protective: protective,
+			})
+		}
+	}
+	return snapshots, nil
+}
+
+// GetTradesForSymbol reads immutable OKX fill rows and paginates the complete
+// requested window. tradeId (or billId fallback) is stable per fill, unlike
+// positions-history posId whose quantities and PnL are cumulative.
+func (t *OKXTrader) GetTradesForSymbol(symbol string, startTime time.Time, limit int) ([]TradeRecord, error) {
+	pageSize := limit
+	if pageSize <= 0 || pageSize > 100 {
+		pageSize = 100
+	}
+	if startTime.IsZero() || startTime.Before(time.Now().Add(-90*24*time.Hour)) {
+		startTime = time.Now().Add(-90 * 24 * time.Hour)
+	}
+	endTime := time.Now()
+	after := ""
+	seenCursor := make(map[string]struct{})
+	seenFill := make(map[string]struct{})
+	trades := make([]TradeRecord, 0)
+
+	for page := 0; ; page++ {
+		if page >= 1000 {
+			return nil, fmt.Errorf("OKX fills history exceeded 1000 pages")
+		}
+		path := fmt.Sprintf("%s?instType=SWAP&instId=%s&begin=%d&end=%d&limit=%d",
+			okxFillsHistoryPath, t.convertSymbol(symbol), startTime.UnixMilli(), endTime.UnixMilli(), pageSize)
+		if after != "" {
+			path += "&after=" + after
+		}
+		data, err := t.doRequest("GET", path, nil)
+		if err != nil {
+			return nil, fmt.Errorf("query OKX fills history page %d: %w", page+1, err)
+		}
+		var rows []struct {
+			BillID   string `json:"billId"`
+			TradeID  string `json:"tradeId"`
+			OrdID    string `json:"ordId"`
+			InstID   string `json:"instId"`
+			Side     string `json:"side"`
+			PosSide  string `json:"posSide"`
+			FillSz   string `json:"fillSz"`
+			FillPx   string `json:"fillPx"`
+			FillPnl  string `json:"fillPnl"`
+			Fee      string `json:"fee"`
+			FillTime string `json:"fillTime"`
+			Ts       string `json:"ts"`
+		}
+		if err = json.Unmarshal(data, &rows); err != nil {
+			return nil, fmt.Errorf("parse OKX fills history page %d: %w", page+1, err)
+		}
+		if len(rows) == 0 {
+			break
+		}
+		for _, row := range rows {
+			fillID := strings.TrimSpace(row.TradeID)
+			if fillID != "" {
+				// OKX tradeId is unique only within an instrument. The local
+				// accounting ledger is account-wide, so include instId.
+				fillID = "trade:" + row.InstID + ":" + fillID
+			} else if billID := strings.TrimSpace(row.BillID); billID != "" {
+				fillID = "bill:" + billID
+			}
+			if fillID == "" {
+				return nil, fmt.Errorf("OKX fill is missing tradeId and billId")
+			}
+			if _, exists := seenFill[fillID]; exists {
+				continue
+			}
+			contracts, parseErr := strconv.ParseFloat(row.FillSz, 64)
+			if parseErr != nil {
+				return nil, fmt.Errorf("parse OKX fill size %q: %w", row.FillSz, parseErr)
+			}
+			price, parseErr := strconv.ParseFloat(row.FillPx, 64)
+			if parseErr != nil {
+				return nil, fmt.Errorf("parse OKX fill price %q: %w", row.FillPx, parseErr)
+			}
+			pnl, parseErr := strconv.ParseFloat(row.FillPnl, 64)
+			if parseErr != nil && strings.TrimSpace(row.FillPnl) != "" {
+				return nil, fmt.Errorf("parse OKX fill PnL %q: %w", row.FillPnl, parseErr)
+			}
+			fee, parseErr := strconv.ParseFloat(row.Fee, 64)
+			if parseErr != nil && strings.TrimSpace(row.Fee) != "" {
+				return nil, fmt.Errorf("parse OKX fill fee %q: %w", row.Fee, parseErr)
+			}
+			baseQuantity, quantityErr := t.okxContractsToBaseQuantity(symbol, math.Abs(contracts))
+			if quantityErr != nil {
+				return nil, quantityErr
+			}
+			timeText := row.FillTime
+			if timeText == "" {
+				timeText = row.Ts
+			}
+			fillMillis, parseErr := strconv.ParseInt(timeText, 10, 64)
+			if parseErr != nil {
+				return nil, fmt.Errorf("parse OKX fill time %q: %w", timeText, parseErr)
+			}
+			seenFill[fillID] = struct{}{}
+			trades = append(trades, TradeRecord{
+				TradeID: fillID, OrderID: row.OrdID,
+				Symbol: t.convertSymbolBack(row.InstID),
+				Side:   strings.ToUpper(row.Side), PositionSide: strings.ToUpper(row.PosSide),
+				Price: price, Quantity: baseQuantity, RealizedPnL: pnl,
+				Fee: math.Abs(fee), Time: time.UnixMilli(fillMillis),
+			})
+		}
+		if len(rows) < pageSize {
+			break
+		}
+		next := strings.TrimSpace(rows[len(rows)-1].BillID)
+		if next == "" {
+			return nil, fmt.Errorf("OKX fills history pagination cursor is missing")
+		}
+		if _, exists := seenCursor[next]; exists {
+			return nil, fmt.Errorf("OKX fills history pagination cursor repeated: %s", next)
+		}
+		seenCursor[next] = struct{}{}
+		after = next
+	}
+	sort.Slice(trades, func(i, j int) bool { return trades[i].Time.Before(trades[j].Time) })
+	return trades, nil
+}
 
 func normalizeOKXTriggerType(v string) string {
 	switch strings.ToLower(v) {

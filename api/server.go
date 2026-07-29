@@ -40,22 +40,53 @@ func (s *Server) getExchangeArchiveBlockers(traderID string) []store.TraderLifec
 			Status: err.Error(),
 		}}
 	}
-	runtimeTrader, err := s.traderManager.GetTrader(traderID)
+	var exchangeTrader interface{}
+	if s.positionSyncManager != nil {
+		exchangeTrader, err = s.positionSyncManager.GetTraderForReconciliation(traderID)
+	} else {
+		exchangeTrader, err = s.traderManager.GetTrader(traderID)
+	}
 	if err != nil {
 		return []store.TraderLifecycleBlocker{{
 			Code: "EXCHANGE_POSITION_VERIFICATION_UNAVAILABLE", ResourceID: traderConfig.ExchangeID,
-			Status: "trader runtime unavailable for authoritative position read",
+			Status: err.Error(),
 		}}
 	}
-	positions, err := runtimeTrader.GetPositionsFresh()
+	freshProvider, ok := exchangeTrader.(trader.FreshPositionProvider)
+	if !ok {
+		return []store.TraderLifecycleBlocker{{
+			Code: "EXCHANGE_POSITION_VERIFICATION_UNAVAILABLE", ResourceID: traderConfig.ExchangeID,
+			Status: "exchange does not support authoritative fresh position reads",
+		}}
+	}
+	positions, err := freshProvider.GetPositionsFresh()
 	if err != nil {
 		return []store.TraderLifecycleBlocker{{
 			Code: "EXCHANGE_POSITION_VERIFICATION_FAILED", ResourceID: traderConfig.ExchangeID,
 			Status: err.Error(),
 		}}
 	}
+	var blockers []store.TraderLifecycleBlocker
+	if pendingProvider, ok := exchangeTrader.(trader.PendingOrderProvider); ok {
+		pendingOrders, pendingErr := pendingProvider.GetPendingOrdersFresh()
+		if pendingErr != nil {
+			return []store.TraderLifecycleBlocker{{
+				Code: "EXCHANGE_ORDER_VERIFICATION_FAILED", ResourceID: traderConfig.ExchangeID,
+				Status: pendingErr.Error(),
+			}}
+		}
+		for _, order := range pendingOrders {
+			code := "EXCHANGE_ORDER_PENDING"
+			if order.Protective {
+				code = "EXCHANGE_PROTECTIVE_ORDER_PENDING"
+			}
+			blockers = append(blockers, store.TraderLifecycleBlocker{
+				Code: code, ResourceID: order.ID, Symbol: order.Symbol, Status: order.Status,
+			})
+		}
+	}
 	if len(positions) == 0 {
-		return nil
+		return blockers
 	}
 	accountUsers, err := s.store.Trader().CountNonArchivedByExchange(traderConfig.ExchangeID)
 	if err != nil {
@@ -74,7 +105,6 @@ func (s *Server) getExchangeArchiveBlockers(traderID string) []store.TraderLifec
 			Status:     fmt.Sprintf("%d open exchange positions across %d non-archived traders", len(positions), accountUsers),
 		}}
 	}
-	blockers := make([]store.TraderLifecycleBlocker, 0, len(positions))
 	for index, position := range positions {
 		symbol, _ := position["symbol"].(string)
 		blockers = append(blockers, store.TraderLifecycleBlocker{
@@ -87,14 +117,15 @@ func (s *Server) getExchangeArchiveBlockers(traderID string) []store.TraderLifec
 
 // Server HTTP API server
 type Server struct {
-	router          *gin.Engine
-	traderManager   *manager.TraderManager
-	store           *store.Store
-	cryptoHandler   *CryptoHandler
-	backtestManager *backtest.Manager
-	debateHandler   *DebateHandler
-	httpServer      *http.Server
-	port            int
+	router              *gin.Engine
+	traderManager       *manager.TraderManager
+	positionSyncManager *trader.PositionSyncManager
+	store               *store.Store
+	cryptoHandler       *CryptoHandler
+	backtestManager     *backtest.Manager
+	debateHandler       *DebateHandler
+	httpServer          *http.Server
+	port                int
 }
 
 // NewServer Creates API server
@@ -132,6 +163,10 @@ func NewServer(traderManager *manager.TraderManager, st *store.Store, cryptoServ
 	s.setupRoutes()
 
 	return s
+}
+
+func (s *Server) SetPositionSyncManager(positionSyncManager *trader.PositionSyncManager) {
+	s.positionSyncManager = positionSyncManager
 }
 
 // corsMiddleware CORS middleware
@@ -206,6 +241,7 @@ func (s *Server) setupRoutes() {
 			protected.DELETE("/traders/:id", s.handleDeleteTrader)
 			protected.POST("/traders/:id/start", s.handleStartTrader)
 			protected.POST("/traders/:id/stop", s.handleStopTrader)
+			protected.POST("/traders/:id/reconcile", s.handleReconcileTrader)
 			protected.PUT("/traders/:id/prompt", s.handleUpdateTraderPrompt)
 			protected.POST("/traders/:id/sync-balance", s.handleSyncBalance)
 			protected.POST("/traders/:id/close-position", s.handleClosePosition)
@@ -1412,6 +1448,9 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 
 	// Remove old trader from memory first to ensure fresh config is loaded
 	s.traderManager.RemoveTrader(traderID)
+	if s.positionSyncManager != nil {
+		s.positionSyncManager.InvalidateCache(traderID)
+	}
 
 	// Reload traders into memory with fresh config
 	err = s.traderManager.LoadUserTradersFromStore(s.store, userID)
@@ -1717,6 +1756,83 @@ func (s *Server) handleStopTrader(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"status": store.TraderLifecycleStopped, "lifecycle_generation": lifecycle.Generation,
 		"pending_blockers": []store.TraderLifecycleBlocker{}, "message": "Trader stopped",
+	})
+}
+
+// handleReconcileTrader explicitly prepares a stopped trader for archive.
+// Stop completion and archive preparation are intentionally separate: STOPPED
+// may retain real positions, while archive requires authoritative flat/order-
+// free evidence and auditable local accounting.
+func (s *Server) handleReconcileTrader(c *gin.Context) {
+	userID := c.GetString("user_id")
+	traderID := c.Param("id")
+	lifecycle, err := s.store.Trader().GetLifecycleForUser(userID, traderID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Trader does not exist or no access permission"})
+		return
+	}
+	switch lifecycle.Status {
+	case store.TraderLifecycleStopping, store.TraderLifecycleStoppingReconcileRequired:
+		var executor copytrade.DecisionExecutor
+		if runtimeTrader, getErr := s.traderManager.GetTrader(traderID); getErr == nil {
+			executor = runtimeTrader
+		}
+		_ = copytrade.PrepareCopyTradingStopWithExecutor(traderID, executor, s.store)
+		_ = copytrade.StopCopyTradingForTrader(traderID)
+		_ = s.store.CopyTrade().SetEnabled(traderID, false)
+		blockers, blockerErr := s.store.Trader().GetStopBlockers(traderID)
+		if blockerErr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": blockerErr.Error()})
+			return
+		}
+		if len(blockers) > 0 {
+			_ = s.store.Trader().MarkStopReconcileRequired(
+				userID, traderID, lifecycle.Generation, store.FormatLifecycleBlockers(blockers),
+			)
+			c.JSON(http.StatusAccepted, gin.H{
+				"status":               store.TraderLifecycleStoppingReconcileRequired,
+				"lifecycle_generation": lifecycle.Generation,
+				"pending_blockers":     blockers,
+				"message":              "Submitted exchange work still requires reconciliation",
+			})
+			return
+		}
+		if err = s.store.Trader().CompleteStop(userID, traderID, lifecycle.Generation); err != nil {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
+	case store.TraderLifecycleStopped:
+	default:
+		c.JSON(http.StatusConflict, gin.H{
+			"error":            "Trader must be stopping or stopped before reconciliation",
+			"lifecycle_status": lifecycle.Status,
+		})
+		return
+	}
+	if s.positionSyncManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Position reconciliation service unavailable"})
+		return
+	}
+	s.positionSyncManager.InvalidateCache(traderID)
+	exchangeBlockers, err := s.positionSyncManager.ReconcileStoppedTrader(traderID)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{
+			"error":            "Authoritative exchange reconciliation failed: " + err.Error(),
+			"lifecycle_status": store.TraderLifecycleStopped,
+		})
+		return
+	}
+	archiveBlockers, err := s.store.Trader().GetArchiveBlockers(traderID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	archiveBlockers = append(archiveBlockers, exchangeBlockers...)
+	c.JSON(http.StatusOK, gin.H{
+		"status":               store.TraderLifecycleStopped,
+		"lifecycle_generation": lifecycle.Generation,
+		"pending_blockers":     archiveBlockers,
+		"message":              "Stopped trader reconciliation completed",
 	})
 }
 

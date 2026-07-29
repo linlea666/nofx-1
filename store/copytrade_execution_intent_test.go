@@ -1501,7 +1501,8 @@ func TestApplyAIReentryFillSnapshotCommitsOnlyCumulativeDelta(t *testing.T) {
 	}
 	storedIntent, err := cs.GetExecutionIntentByID(intent.ID)
 	if err != nil || math.Abs(storedIntent.FilledQuantity-.7) > 1e-9 ||
-		math.Abs(storedIntent.FilledNotional-70) > 1e-9 || storedIntent.Status != ExecutionIntentProtected {
+		math.Abs(storedIntent.FilledNotional-70) > 1e-9 || storedIntent.Status != ExecutionIntentProtected ||
+		storedIntent.ProtectedAt == nil || storedIntent.TerminalAt == nil {
 		t.Fatalf("intent cumulative fill is wrong: %+v err=%v", storedIntent, err)
 	}
 	mapping, err := cs.GetMapping("t1", "leader-pos")

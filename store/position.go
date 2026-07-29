@@ -553,10 +553,47 @@ func (s *PositionStore) ClosePositionWithAllocations(id int64, exchangeID string
 }
 
 func (s *PositionStore) ClosePositionUnscorable(id int64, exitPrice float64, closeReason string) error {
+	return s.ClosePositionUnscorableWithEvidence(id, exitPrice, closeReason, "")
+}
+
+// ClosePositionUnscorableWithEvidence retires a local row only after an
+// authoritative external check proved it is no longer open. It deliberately
+// records zero trusted PnL and preserves the evidence separately so accounting
+// reports cannot mistake a mark-price diagnostic for an exchange settlement.
+func (s *PositionStore) ClosePositionUnscorableWithEvidence(id int64, exitPrice float64, closeReason, evidence string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
 	now := time.Now().Format(time.RFC3339)
-	_, err := s.db.Exec(`UPDATE trader_positions SET exit_price=?,exit_time=?,realized_pnl=0,fee=0,status='CLOSED',close_reason=?,accounting_quality='UNSCORABLE',updated_at=? WHERE id=?`,
+	res, err := tx.Exec(`UPDATE trader_positions SET exit_price=?,exit_time=?,realized_pnl=0,fee=0,status='CLOSED',close_reason=?,accounting_quality='UNSCORABLE',updated_at=? WHERE id=? AND status='OPEN'`,
 		exitPrice, now, closeReason, now, id)
-	return err
+	if err != nil {
+		return err
+	}
+	updated, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if updated == 0 {
+		var status string
+		if err = tx.QueryRow(`SELECT status FROM trader_positions WHERE id=?`, id).Scan(&status); err != nil {
+			return err
+		}
+		if status != "CLOSED" {
+			return fmt.Errorf("position %d is not open or closed: %s", id, status)
+		}
+	}
+	if evidence != "" {
+		if _, err = tx.Exec(`INSERT INTO position_accounting_audits(position_id,reason_code,evidence)
+			VALUES(?,?,?)
+			ON CONFLICT(position_id,reason_code) DO UPDATE SET evidence=excluded.evidence`,
+			id, closeReason, evidence); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // GetOpenPositions gets all open positions

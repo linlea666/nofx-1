@@ -322,9 +322,23 @@ func (m *PositionSyncManager) closeLocalPosition(pos *store.TraderPosition, trad
 // findClosedPnLRecord Try to find matching ClosedPnL record from exchange
 // For Binance, directly query trades for the specific symbol (more reliable than Income API)
 func (m *PositionSyncManager) findClosedPnLRecord(trader Trader, pos *store.TraderPosition) *ClosedPnLRecord {
-	// Try to get trades directly for this symbol (Binance-specific, more reliable)
-	if binanceTrader, ok := trader.(*FuturesTrader); ok {
-		return m.findClosedPnLFromBinanceTrades(binanceTrader, pos)
+	// Prefer immutable fills. OKX position-history rows are cumulative under
+	// one posId and therefore cannot safely identify individual local lots.
+	if okxTrader, ok := trader.(*OKXTrader); ok {
+		record, err := m.findClosedPnLFromTrades(okxTrader, pos, 90*24*time.Hour)
+		if err != nil {
+			logger.Infof("⚠️  Failed to get immutable OKX fills for %s: %v", pos.Symbol, err)
+			return nil
+		}
+		return record
+	}
+	if provider, ok := trader.(SymbolTradeHistoryProvider); ok {
+		record, err := m.findClosedPnLFromTrades(provider, pos, 24*time.Hour)
+		if err != nil {
+			logger.Infof("⚠️  Failed to get immutable fills for %s: %v", pos.Symbol, err)
+			return nil
+		}
+		return record
 	}
 
 	// Fallback: use GetClosedPnL for other exchanges
@@ -338,24 +352,23 @@ func (m *PositionSyncManager) findClosedPnLRecord(trader Trader, pos *store.Trad
 	return m.aggregateClosedRecords(records, pos)
 }
 
-// findClosedPnLFromBinanceTrades queries Binance directly for trades of a specific symbol
-func (m *PositionSyncManager) findClosedPnLFromBinanceTrades(trader *FuturesTrader, pos *store.TraderPosition) *ClosedPnLRecord {
-	// Use the local lot entry boundary, capped to a 24h reconciliation window.
+// findClosedPnLFromTrades queries immutable fills for one symbol.
+func (m *PositionSyncManager) findClosedPnLFromTrades(trader SymbolTradeHistoryProvider, pos *store.TraderPosition, lookback time.Duration) (*ClosedPnLRecord, error) {
+	// Use the local lot entry boundary, capped to the venue's supported window.
 	// A one-hour-only query permanently stranded fills after a longer restart
 	// or exchange-history delay.
-	startTime := time.Now().Add(-24 * time.Hour)
+	startTime := time.Now().Add(-lookback)
 	if candidate := pos.EntryTime.Add(-time.Minute); candidate.After(startTime) {
 		startTime = candidate
 	}
 	trades, err := trader.GetTradesForSymbol(pos.Symbol, startTime, 100)
 	if err != nil {
-		logger.Infof("⚠️  Failed to get trades for %s: %v", pos.Symbol, err)
-		return nil
+		return nil, err
 	}
 
 	if len(trades) == 0 {
 		logger.Infof("⚠️  No trades found for %s in the reconciliation window", pos.Symbol)
-		return nil
+		return nil, nil
 	}
 
 	// Find all closing trades (realizedPnl != 0) that match this position
@@ -405,7 +418,7 @@ func (m *PositionSyncManager) findClosedPnLFromBinanceTrades(trader *FuturesTrad
 
 	if matchCount == 0 {
 		logger.Infof("⚠️  No closing trades found for %s %s", pos.Symbol, pos.Side)
-		return nil
+		return nil, nil
 	}
 
 	avgExitPrice := weightedExitPrice / totalQty
@@ -427,7 +440,158 @@ func (m *PositionSyncManager) findClosedPnLFromBinanceTrades(trader *FuturesTrad
 		ExchangeID:  latestTradeID,
 		CloseType:   "unknown",
 		Fills:       matchedFills,
+	}, nil
+}
+
+// GetTraderForReconciliation constructs an exchange client from durable
+// configuration even when the running AutoTrader has already been removed.
+func (m *PositionSyncManager) GetTraderForReconciliation(traderID string) (Trader, error) {
+	return m.getOrCreateTrader(traderID)
+}
+
+// ReconcileStoppedTrader is an explicit, fail-closed archive preparation.
+// It never runs for RUNNING traders and never mutates local rows unless fresh
+// exchange positions and both regular/algo pending-order snapshots are empty.
+func (m *PositionSyncManager) ReconcileStoppedTrader(traderID string) ([]store.TraderLifecycleBlocker, error) {
+	lifecycle, err := m.store.Trader().GetLifecycle(traderID)
+	if err != nil {
+		return nil, err
 	}
+	switch lifecycle.Status {
+	case store.TraderLifecycleStopping, store.TraderLifecycleStoppingReconcileRequired, store.TraderLifecycleStopped:
+	default:
+		return nil, fmt.Errorf("trader lifecycle %s does not allow stopped reconciliation", lifecycle.Status)
+	}
+	executor, err := m.getOrCreateTrader(traderID)
+	if err != nil {
+		return nil, err
+	}
+	traderConfig, err := m.store.Trader().GetByID(traderID)
+	if err != nil {
+		return nil, err
+	}
+	localPositions, err := m.store.Position().GetOpenPositions(traderID)
+	if err != nil {
+		return nil, err
+	}
+	for _, position := range localPositions {
+		if position.ExchangeID != "" && position.ExchangeID != traderConfig.ExchangeID {
+			return nil, fmt.Errorf(
+				"local position %d belongs to exchange %s, current trader exchange is %s",
+				position.ID, position.ExchangeID, traderConfig.ExchangeID,
+			)
+		}
+	}
+	freshProvider, ok := executor.(FreshPositionProvider)
+	if !ok {
+		return nil, fmt.Errorf("exchange does not support authoritative fresh position snapshots")
+	}
+	pendingProvider, ok := executor.(PendingOrderProvider)
+	if !ok {
+		return nil, fmt.Errorf("exchange does not support authoritative pending-order snapshots")
+	}
+	exchangePositions, err := freshProvider.GetPositionsFresh()
+	if err != nil {
+		return nil, fmt.Errorf("fresh exchange position read failed: %w", err)
+	}
+	pendingOrders, err := pendingProvider.GetPendingOrdersFresh()
+	if err != nil {
+		return nil, fmt.Errorf("fresh exchange pending-order read failed: %w", err)
+	}
+	blockers := make([]store.TraderLifecycleBlocker, 0, len(exchangePositions)+len(pendingOrders))
+	for index, position := range exchangePositions {
+		symbol, _ := position["symbol"].(string)
+		blockers = append(blockers, store.TraderLifecycleBlocker{
+			Code: "EXCHANGE_POSITION_PRESENT", ResourceID: fmt.Sprintf("position:%d", index),
+			Symbol: symbol, Status: "OPEN",
+		})
+	}
+	for _, order := range pendingOrders {
+		code := "EXCHANGE_ORDER_PENDING"
+		if order.Protective {
+			code = "EXCHANGE_PROTECTIVE_ORDER_PENDING"
+		}
+		blockers = append(blockers, store.TraderLifecycleBlocker{
+			Code: code, ResourceID: order.ID, Symbol: order.Symbol, Status: order.Status,
+		})
+	}
+	if len(blockers) > 0 {
+		return blockers, nil
+	}
+
+	if len(localPositions) == 0 {
+		return nil, nil
+	}
+	oldestByMarket := make(map[string]*store.TraderPosition)
+	for _, position := range localPositions {
+		key := strings.ToUpper(position.Symbol) + "|" + strings.ToUpper(position.Side)
+		if current := oldestByMarket[key]; current == nil || position.EntryTime.Before(current.EntryTime) {
+			oldestByMarket[key] = position
+		}
+	}
+	accountUsers, err := m.store.Trader().CountNonArchivedByExchange(traderConfig.ExchangeID)
+	if err != nil {
+		return nil, err
+	}
+	evidence := "fresh exchange positions=0; regular/algo pending orders=0; immutable fills allocated where available; residual historical attribution unavailable"
+	if accountUsers <= 1 {
+		tradeProvider, supported := executor.(SymbolTradeHistoryProvider)
+		if !supported {
+			return nil, fmt.Errorf("exchange does not support immutable symbol fill history")
+		}
+		fillLookback := 24 * time.Hour
+		if _, isOKX := executor.(*OKXTrader); isOKX {
+			fillLookback = 90 * 24 * time.Hour
+		}
+		for _, oldest := range oldestByMarket {
+			record, historyErr := m.findClosedPnLFromTrades(tradeProvider, oldest, fillLookback)
+			if historyErr != nil {
+				return nil, fmt.Errorf("immutable fill read failed for %s %s: %w", oldest.Symbol, oldest.Side, historyErr)
+			}
+			if record == nil {
+				continue
+			}
+			allocated, allocationErr := m.store.Position().ClosePositionWithAllocations(
+				oldest.ID, oldest.ExchangeID, closeRecordFills(record), record.ExitPrice,
+				"AUTHORITATIVE_EXCHANGE_FLAT",
+			)
+			if allocationErr != nil {
+				return nil, fmt.Errorf("allocate immutable close fills for %s %s: %w", oldest.Symbol, oldest.Side, allocationErr)
+			}
+			if !allocated {
+				if auditErr := m.store.Position().ClosePositionUnscorableWithEvidence(
+					oldest.ID, record.ExitPrice, "AUTHORITATIVE_EXCHANGE_FLAT", evidence,
+				); auditErr != nil {
+					return nil, auditErr
+				}
+			}
+		}
+	} else {
+		evidence = fmt.Sprintf(
+			"fresh exchange positions=0; regular/algo pending orders=0; shared exchange account has %d non-archived traders; fill ownership is ambiguous",
+			accountUsers,
+		)
+	}
+
+	// Any remainder cannot be attributed to a visible immutable fill. The
+	// account is authoritatively flat and order-free, so retain it as audit
+	// history but exclude it from trusted PnL.
+	residual, err := m.store.Position().GetOpenPositions(traderID)
+	if err != nil {
+		return nil, err
+	}
+	for _, position := range residual {
+		exitPrice := position.EntryPrice
+		if price, priceErr := executor.GetMarketPrice(position.Symbol); priceErr == nil && price > 0 {
+			exitPrice = price
+		}
+		if err = m.store.Position().ClosePositionUnscorableWithEvidence(
+			position.ID, exitPrice, "AUTHORITATIVE_EXCHANGE_FLAT", evidence,
+		); err != nil {
+			return nil, err
+		}
+	}
+	return nil, nil
 }
 
 func isClosingTradeForPosition(trade TradeRecord, positionSide string) bool {

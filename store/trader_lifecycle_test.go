@@ -166,6 +166,82 @@ func TestBeginStopInvalidatesGenerationAndPreservesSubmittedWork(t *testing.T) {
 	}
 }
 
+func TestStopBlockersDistinguishHistoricalTerminalWorkFromActiveRisk(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "stop-blocker-semantics.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	createLifecycleTestTrader(t, st, "trader-1", TraderLifecycleStoppingReconcileRequired, 2)
+
+	if _, err = st.DB().Exec(`INSERT INTO copy_trade_position_mappings
+		(trader_id,leader_pos_id,leader_id,symbol,side,margin_mode,status,closed_at)
+		VALUES('trader-1','closed-leader','leader','BTCUSDT','long','cross','closed',CURRENT_TIMESTAMP)`); err != nil {
+		t.Fatal(err)
+	}
+	for _, query := range []string{
+		`INSERT INTO copy_trade_execution_intents
+			(trader_id,leader_pos_id,source_revision,action,symbol,side,status,submitted_at,filled_at,protected_at,terminal_at,exchange_order_id,exchange_state,filled_quantity)
+		 VALUES('trader-1','protected-leader',1,'open_long','BTCUSDT','long','PROTECTED',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL,'protected-order','FILLED',0.1)`,
+		`INSERT INTO copy_trade_execution_intents
+			(trader_id,leader_pos_id,source_revision,action,symbol,side,status,submitted_at,filled_at,terminal_at,exchange_order_id,exchange_state,filled_quantity)
+		 VALUES('trader-1','closed-leader',1,'open_long','BTCUSDT','long','FILLED',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL,'closed-order','FILLED',0.1)`,
+		`INSERT INTO copy_trade_execution_intents
+			(trader_id,leader_pos_id,source_revision,action,symbol,side,status,submitted_at,filled_at,terminal_at,exchange_order_id,exchange_state,filled_quantity)
+		 VALUES('trader-1','active-leader',1,'open_long','ETHUSDT','long','FILLED',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'active-order','FILLED',1)`,
+	} {
+		if _, err = st.DB().Exec(query); err != nil {
+			t.Fatal(err)
+		}
+	}
+	blockers, err := st.Trader().GetStopBlockers("trader-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(blockers) != 1 || blockers[0].Symbol != "ETHUSDT" || blockers[0].Status != ExecutionIntentFilled {
+		t.Fatalf("historical terminal work polluted stop blockers: %+v", blockers)
+	}
+}
+
+func TestExecutionIntentTerminalMigrationBackfillsProtectedAndClosedFilled(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "execution-terminal-migration.db")
+	st, err := New(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	createLifecycleTestTrader(t, st, "trader-1", TraderLifecycleStopped, 1)
+	if _, err = st.DB().Exec(`INSERT INTO copy_trade_position_mappings
+		(trader_id,leader_pos_id,leader_id,symbol,side,margin_mode,status,closed_at)
+		VALUES('trader-1','closed-leader','leader','BTCUSDT','long','cross','closed',CURRENT_TIMESTAMP)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = st.DB().Exec(`INSERT INTO copy_trade_execution_intents
+		(trader_id,leader_pos_id,source_revision,action,symbol,side,status,submitted_at,filled_at,terminal_at,exchange_state)
+		VALUES
+		('trader-1','protected-leader',1,'open_long','BTCUSDT','long','PROTECTED',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL,'FILLED'),
+		('trader-1','closed-leader',1,'open_long','BTCUSDT','long','FILLED',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL,'FILLED')`); err != nil {
+		t.Fatal(err)
+	}
+	if err = st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	st, err = New(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	var terminalCount, protectedCount int
+	if err = st.DB().QueryRow(`SELECT COUNT(*) FROM copy_trade_execution_intents WHERE terminal_at IS NOT NULL`).Scan(&terminalCount); err != nil {
+		t.Fatal(err)
+	}
+	if err = st.DB().QueryRow(`SELECT COUNT(*) FROM copy_trade_execution_intents WHERE status='PROTECTED' AND protected_at IS NOT NULL`).Scan(&protectedCount); err != nil {
+		t.Fatal(err)
+	}
+	if terminalCount != 2 || protectedCount != 1 {
+		t.Fatalf("terminal migration incomplete: terminal=%d protected=%d", terminalCount, protectedCount)
+	}
+}
+
 func TestResumeTraderCandidatesRequiresAuthoritativeStoppedByRiskCycle(t *testing.T) {
 	st, err := New(filepath.Join(t.TempDir(), "resume-candidates.db"))
 	if err != nil {

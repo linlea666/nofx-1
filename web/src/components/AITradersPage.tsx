@@ -388,12 +388,20 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
     try {
       const status =
         trader.lifecycle_status || (trader.is_running ? 'RUNNING' : 'STOPPED')
-      if (
-        status === 'RUNNING' ||
-        status === 'STARTING' ||
-        status === 'STOPPING' ||
-        status === 'STOPPING_RECONCILE_REQUIRED'
-      ) {
+      if (status === 'STOPPING' || status === 'STOPPING_RECONCILE_REQUIRED') {
+        const result = await api.reconcileTrader(trader.trader_id)
+        if (result.status === 'STOPPED') {
+          toast.success(
+            result.pending_blockers?.length
+              ? `已停止，仍有 ${result.pending_blockers.length} 项归档阻塞`
+              : '已完成权威对账，可以归档'
+          )
+        } else {
+          toast.warning(
+            `仍有 ${result.pending_blockers?.length || 0} 项交易所状态待核实`
+          )
+        }
+      } else if (status === 'RUNNING' || status === 'STARTING') {
         const result = await api.stopTrader(trader.trader_id)
         if (result.status === 'STOPPED') {
           toast.success('已安全停止')
@@ -415,6 +423,25 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
     } catch (error) {
       console.error('Failed to toggle trader:', error)
       toast.error(t('operationFailed', language))
+    }
+  }
+
+  const handleReconcileTrader = async (trader: TraderInfo) => {
+    try {
+      const reconcilePromise = api.reconcileTrader(trader.trader_id)
+      toast.promise(reconcilePromise, {
+        loading: '正在核对交易所仓位、挂单与成交…',
+        success: '权威对账完成',
+        error: (error) =>
+          error instanceof Error ? error.message : '权威对账失败',
+      })
+      const result = await reconcilePromise
+      if (result.pending_blockers?.length) {
+        toast.warning(`仍有 ${result.pending_blockers.length} 项归档阻塞`)
+      }
+      await mutateTraders()
+    } catch (error) {
+      console.error('Failed to reconcile trader:', error)
     }
   }
 
@@ -1206,6 +1233,23 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
                       <BarChart3 className="w-3 h-3 md:w-4 md:h-4" />
                       {t('view', language)}
                     </button>
+
+                    {(trader.lifecycle_status ||
+                      (trader.is_running ? 'RUNNING' : 'STOPPED')) ===
+                      'STOPPED' &&
+                      !!trader.pending_blockers?.length && (
+                        <button
+                          onClick={() => handleReconcileTrader(trader)}
+                          className="px-2 md:px-3 py-1.5 md:py-2 rounded text-xs md:text-sm font-semibold transition-all hover:scale-105 whitespace-nowrap"
+                          style={{
+                            background: 'rgba(255, 193, 7, 0.1)',
+                            color: '#FFC107',
+                          }}
+                          title="重新读取交易所仓位、普通挂单、条件单和不可变成交记录；只有权威空仓且无挂单才会清理本地残留"
+                        >
+                          核对归档条件
+                        </button>
+                      )}
 
                     <button
                       onClick={() => handleEditTrader(trader.trader_id)}

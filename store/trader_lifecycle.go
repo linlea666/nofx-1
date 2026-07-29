@@ -334,13 +334,51 @@ func (s *TraderStore) finishStop(userID, traderID string, generation int64, targ
 }
 
 func (s *TraderStore) GetStopBlockers(traderID string) ([]TraderLifecycleBlocker, error) {
-	rows, err := s.db.Query(`SELECT CAST(id AS TEXT),COALESCE(symbol,''),status
-		FROM copy_trade_execution_intents
-		WHERE trader_id=? AND terminal_at IS NULL AND (
-			status IN ('SUBMITTED','PARTIALLY_FILLED','RECONCILING','FILLED')
-			OR submitted_at IS NOT NULL OR COALESCE(exchange_order_id,'')<>'' OR COALESCE(filled_quantity,0)>0
+	rows, err := s.db.Query(`SELECT CAST(i.id AS TEXT),COALESCE(i.symbol,''),i.status
+		FROM copy_trade_execution_intents i
+		WHERE i.trader_id=? AND (
+			(
+				i.terminal_at IS NULL AND (
+					i.status IN ('SUBMITTED','PARTIALLY_FILLED','RECONCILING')
+					OR (
+						i.status IN ('RESERVED','FAILED')
+						AND (
+							i.submitted_at IS NOT NULL
+							OR COALESCE(i.exchange_order_id,'')<>''
+							OR COALESCE(i.filled_quantity,0)>0
+							OR EXISTS (
+								SELECT 1 FROM copy_trade_execution_order_attempts a
+								WHERE a.intent_id=i.id AND (
+									a.terminal_at IS NULL
+									OR COALESCE(a.filled_quantity,0)>0
+									OR a.status IN ('SUBMITTED','PARTIALLY_FILLED','FILLED')
+								)
+							)
+						)
+					)
+				)
+			)
+			OR (
+				i.status='FILLED'
+				AND LOWER(i.action) IN ('open_long','open_short')
+				AND i.protected_at IS NULL
+				AND (
+					COALESCE(i.filled_quantity,0)>0
+					OR i.filled_at IS NOT NULL
+					OR UPPER(COALESCE(i.exchange_state,''))='FILLED'
+				)
+				AND NOT EXISTS (
+					SELECT 1 FROM copy_guard_cycles c
+					WHERE c.id=i.cycle_id AND c.closed_at IS NOT NULL
+				)
+				AND NOT EXISTS (
+					SELECT 1 FROM copy_trade_position_mappings m
+					WHERE m.trader_id=i.trader_id AND m.leader_pos_id=i.leader_pos_id
+					  AND m.status<>'active'
+				)
+			)
 		)
-		ORDER BY id`, traderID)
+		ORDER BY i.id`, traderID)
 	if err != nil {
 		return nil, err
 	}

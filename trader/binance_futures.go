@@ -967,6 +967,39 @@ func parseBinanceFloat(value string) float64 {
 	return parsed
 }
 
+// GetPendingOrdersFresh returns regular and Algo orders from independent
+// authoritative endpoints. A failure from either endpoint makes the snapshot
+// unknown; archive reconciliation must never interpret it as empty.
+func (t *FuturesTrader) GetPendingOrdersFresh() ([]PendingOrderSnapshot, error) {
+	orders, err := t.client.NewListOpenOrdersService().Do(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("list Binance regular pending orders: %w", err)
+	}
+	algoOrders, err := t.client.NewListOpenAlgoOrdersService().Do(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("list Binance algo pending orders: %w", err)
+	}
+	snapshots := make([]PendingOrderSnapshot, 0, len(orders)+len(algoOrders))
+	for _, order := range orders {
+		orderType := strings.ToUpper(string(order.Type))
+		protective := strings.Contains(orderType, "STOP") || strings.Contains(orderType, "TAKE_PROFIT")
+		snapshots = append(snapshots, PendingOrderSnapshot{
+			ID: strconv.FormatInt(order.OrderID, 10), Symbol: order.Symbol,
+			Status: string(order.Status), Protective: protective,
+		})
+	}
+	for _, order := range algoOrders {
+		snapshots = append(snapshots, PendingOrderSnapshot{
+			ID: strconv.FormatInt(order.AlgoId, 10), Symbol: order.Symbol,
+			Status: order.AlgoStatus, Protective: order.SlTriggerPrice != "" ||
+				order.TpTriggerPrice != "" ||
+				strings.Contains(strings.ToUpper(string(order.OrderType)), "STOP") ||
+				strings.Contains(strings.ToUpper(string(order.OrderType)), "TAKE_PROFIT"),
+		})
+	}
+	return snapshots, nil
+}
+
 // CancelStopLossOrders cancels only stop-loss orders (doesn't affect take-profit orders)
 // Now uses both legacy API and new Algo Order API
 func (t *FuturesTrader) CancelStopLossOrders(symbol string) error {

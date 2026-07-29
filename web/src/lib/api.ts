@@ -155,6 +155,24 @@ export const api = {
     return result.data!
   },
 
+  async reconcileTrader(traderId: string): Promise<{
+    status: string
+    lifecycle_generation: number
+    pending_blockers: TraderInfo['pending_blockers']
+    message: string
+  }> {
+    const result = await httpClient.post<{
+      status: string
+      lifecycle_generation: number
+      pending_blockers: TraderInfo['pending_blockers']
+      message: string
+    }>(`${API_BASE}/traders/${traderId}/reconcile`)
+    if (!result.success) {
+      throw new Error(result.message || '交易员权威对账失败')
+    }
+    return result.data!
+  },
+
   async toggleCompetition(
     traderId: string,
     showInCompetition: boolean

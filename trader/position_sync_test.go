@@ -1,6 +1,7 @@
 package trader
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -10,11 +11,31 @@ import (
 
 type positionSyncFakeTrader struct {
 	Trader
-	positions []map[string]interface{}
+	positions     []map[string]interface{}
+	pendingOrders []PendingOrderSnapshot
+	trades        []TradeRecord
+	tradeErr      error
+	marketPrice   float64
 }
 
 func (f *positionSyncFakeTrader) GetPositions() ([]map[string]interface{}, error) {
 	return f.positions, nil
+}
+
+func (f *positionSyncFakeTrader) GetPositionsFresh() ([]map[string]interface{}, error) {
+	return f.positions, nil
+}
+
+func (f *positionSyncFakeTrader) GetPendingOrdersFresh() ([]PendingOrderSnapshot, error) {
+	return f.pendingOrders, nil
+}
+
+func (f *positionSyncFakeTrader) GetTradesForSymbol(string, time.Time, int) ([]TradeRecord, error) {
+	return f.trades, f.tradeErr
+}
+
+func (f *positionSyncFakeTrader) GetMarketPrice(string) (float64, error) {
+	return f.marketPrice, nil
 }
 
 func insertPositionSyncTrader(t *testing.T, st *store.Store, id, name, exchangeID string, running bool) {
@@ -107,6 +128,124 @@ func TestPeriodicAccountingSyncSkipsStoppedTrader(t *testing.T) {
 	manager.lastHistorySyncMutex.RUnlock()
 	if synced {
 		t.Fatal("stopped trader continued periodic exchange accounting reconciliation")
+	}
+}
+
+func TestStoppedReconciliationUsesImmutableFillsAndAuditsResidual(t *testing.T) {
+	st, err := store.New(filepath.Join(t.TempDir(), "stopped-reconcile.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	insertPositionSyncTrader(t, st, "stopped-trader", "stopped", "exchange-1", false)
+	openedAt := time.Now().Add(-time.Hour)
+	position := &store.TraderPosition{
+		TraderID: "stopped-trader", ExchangeID: "exchange-1", ExchangeType: "okx",
+		Symbol: "BTCUSDT", Side: "LONG", Quantity: 0.1, EntryPrice: 60000,
+		EntryTime: openedAt, Leverage: 2,
+	}
+	if err = st.Position().Create(position); err != nil {
+		t.Fatal(err)
+	}
+	fake := &positionSyncFakeTrader{
+		marketPrice: 61000,
+		trades: []TradeRecord{{
+			TradeID: "fill-1", OrderID: "order-1", Symbol: "BTCUSDT",
+			Side: "SELL", PositionSide: "LONG", Price: 60500, Quantity: 0.06,
+			RealizedPnL: 30, Fee: 0.5, Time: openedAt.Add(30 * time.Minute),
+		}},
+	}
+	manager := NewPositionSyncManager(st, time.Second)
+	manager.traderCache["stopped-trader"] = fake
+	blockers, err := manager.ReconcileStoppedTrader("stopped-trader")
+	if err != nil || len(blockers) != 0 {
+		t.Fatalf("stopped reconciliation failed: blockers=%+v err=%v", blockers, err)
+	}
+	open, err := st.Position().GetOpenPositions("stopped-trader")
+	if err != nil || len(open) != 0 {
+		t.Fatalf("local residual remained open: %+v err=%v", open, err)
+	}
+	var fillCount, allocationCount, auditCount int
+	if err = st.DB().QueryRow(`SELECT COUNT(*) FROM position_close_fills WHERE exchange_trade_id='fill-1'`).Scan(&fillCount); err != nil {
+		t.Fatal(err)
+	}
+	if err = st.DB().QueryRow(`SELECT COUNT(*) FROM position_close_allocations WHERE exchange_trade_id='fill-1'`).Scan(&allocationCount); err != nil {
+		t.Fatal(err)
+	}
+	if err = st.DB().QueryRow(`SELECT COUNT(*) FROM position_accounting_audits WHERE reason_code='AUTHORITATIVE_EXCHANGE_FLAT'`).Scan(&auditCount); err != nil {
+		t.Fatal(err)
+	}
+	if fillCount != 1 || allocationCount != 1 || auditCount != 1 {
+		t.Fatalf("immutable allocation/audit mismatch: fills=%d allocations=%d audits=%d", fillCount, allocationCount, auditCount)
+	}
+	var unscorable int
+	if err = st.DB().QueryRow(`SELECT COUNT(*) FROM trader_positions
+		WHERE trader_id='stopped-trader' AND status='CLOSED' AND accounting_quality='UNSCORABLE'`).Scan(&unscorable); err != nil {
+		t.Fatal(err)
+	}
+	if unscorable != 1 {
+		t.Fatalf("residual was not isolated as UNSCORABLE: %d", unscorable)
+	}
+}
+
+func TestStoppedReconciliationDoesNotMutateWhileExchangeRiskExists(t *testing.T) {
+	st, err := store.New(filepath.Join(t.TempDir(), "stopped-reconcile-blocked.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	insertPositionSyncTrader(t, st, "stopped-trader", "stopped", "exchange-1", false)
+	position := &store.TraderPosition{
+		TraderID: "stopped-trader", ExchangeID: "exchange-1", ExchangeType: "okx",
+		Symbol: "ETHUSDT", Side: "LONG", Quantity: 1, EntryPrice: 2000,
+		EntryTime: time.Now().Add(-time.Hour), Leverage: 2,
+	}
+	if err = st.Position().Create(position); err != nil {
+		t.Fatal(err)
+	}
+	fake := &positionSyncFakeTrader{
+		positions: []map[string]interface{}{{"symbol": "ETHUSDT", "side": "long", "positionAmt": 1.0}},
+		pendingOrders: []PendingOrderSnapshot{{
+			ID: "algo-1", Symbol: "ETHUSDT", Status: "live", Protective: true,
+		}},
+	}
+	manager := NewPositionSyncManager(st, time.Second)
+	manager.traderCache["stopped-trader"] = fake
+	blockers, err := manager.ReconcileStoppedTrader("stopped-trader")
+	if err != nil || len(blockers) != 2 {
+		t.Fatalf("expected position and order blockers: %+v err=%v", blockers, err)
+	}
+	open, err := st.Position().GetOpenPositions("stopped-trader")
+	if err != nil || len(open) != 1 {
+		t.Fatalf("blocked reconciliation mutated local position: %+v err=%v", open, err)
+	}
+}
+
+func TestStoppedReconciliationDoesNotTreatFillQueryFailureAsNoFills(t *testing.T) {
+	st, err := store.New(filepath.Join(t.TempDir(), "stopped-reconcile-history-error.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	insertPositionSyncTrader(t, st, "stopped-trader", "stopped", "exchange-1", false)
+	position := &store.TraderPosition{
+		TraderID: "stopped-trader", ExchangeID: "exchange-1", ExchangeType: "okx",
+		Symbol: "BTCUSDT", Side: "LONG", Quantity: 0.1, EntryPrice: 60000,
+		EntryTime: time.Now().Add(-time.Hour), Leverage: 2,
+	}
+	if err = st.Position().Create(position); err != nil {
+		t.Fatal(err)
+	}
+	manager := NewPositionSyncManager(st, time.Second)
+	manager.traderCache["stopped-trader"] = &positionSyncFakeTrader{
+		tradeErr: errors.New("rate limited"), marketPrice: 61000,
+	}
+	if _, err = manager.ReconcileStoppedTrader("stopped-trader"); err == nil {
+		t.Fatal("fill-history failure was treated as an authoritative empty result")
+	}
+	open, queryErr := st.Position().GetOpenPositions("stopped-trader")
+	if queryErr != nil || len(open) != 1 {
+		t.Fatalf("fill-history failure mutated local position: %+v err=%v", open, queryErr)
 	}
 }
 

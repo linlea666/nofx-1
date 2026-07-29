@@ -118,6 +118,93 @@ func TestGetPositionsQuantityConversionFailsClosedWithoutInstrumentMetadata(t *t
 	}
 }
 
+func TestOKXImmutableFillHistoryPaginatesAndDeduplicates(t *testing.T) {
+	trader := newOKXTestServer(t, func(path string) (int, string) {
+		switch {
+		case strings.Contains(path, "public/instruments"):
+			return 200, `{"code":"0","msg":"","data":[{"instId":"BTC-USDT-SWAP","ctVal":"0.01","lotSz":"0.01"}]}`
+		case strings.Contains(path, "fills-history") && strings.Contains(path, "after=2"):
+			return 200, `{"code":"0","msg":"","data":[
+				{"billId":"2","tradeId":"trade-2","ordId":"order-2","instId":"BTC-USDT-SWAP","side":"sell","posSide":"long","fillSz":"2","fillPx":"62000","fillPnl":"-2","fee":"-0.2","fillTime":"2000"},
+				{"billId":"1","tradeId":"trade-1","ordId":"order-1","instId":"BTC-USDT-SWAP","side":"sell","posSide":"long","fillSz":"1","fillPx":"61000","fillPnl":"1","fee":"-0.1","fillTime":"1000"}
+			]}`
+		case strings.Contains(path, "fills-history") && strings.Contains(path, "after=1"):
+			return 200, `{"code":"0","msg":"","data":[]}`
+		case strings.Contains(path, "fills-history"):
+			if !strings.Contains(path, "begin=") || !strings.Contains(path, "end=") || !strings.Contains(path, "limit=2") {
+				t.Fatalf("missing bounded fill query: %s", path)
+			}
+			return 200, `{"code":"0","msg":"","data":[
+				{"billId":"3","tradeId":"trade-3","ordId":"order-3","instId":"BTC-USDT-SWAP","side":"sell","posSide":"long","fillSz":"3","fillPx":"63000","fillPnl":"3","fee":"-0.3","fillTime":"3000"},
+				{"billId":"2","tradeId":"trade-2","ordId":"order-2","instId":"BTC-USDT-SWAP","side":"sell","posSide":"long","fillSz":"2","fillPx":"62000","fillPnl":"-2","fee":"-0.2","fillTime":"2000"}
+			]}`
+		default:
+			return 200, `{"code":"0","msg":"","data":[]}`
+		}
+	})
+	trades, err := trader.GetTradesForSymbol("BTCUSDT", time.UnixMilli(500), 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(trades) != 3 {
+		t.Fatalf("deduplicated fills=%d want=3: %+v", len(trades), trades)
+	}
+	if trades[0].TradeID != "trade:BTC-USDT-SWAP:trade-1" ||
+		trades[2].TradeID != "trade:BTC-USDT-SWAP:trade-3" {
+		t.Fatalf("fills are not chronological: %+v", trades)
+	}
+	if trades[0].Quantity != 0.01 || trades[2].Quantity != 0.03 {
+		t.Fatalf("contracts were not converted to base quantity: %+v", trades)
+	}
+	if trades[1].Fee != 0.2 || trades[1].Side != "SELL" || trades[1].PositionSide != "LONG" {
+		t.Fatalf("fill economics/direction were not normalized: %+v", trades[1])
+	}
+}
+
+func TestOKXImmutableFillHistoryFailsClosedOnLaterPageError(t *testing.T) {
+	trader := newOKXTestServer(t, func(path string) (int, string) {
+		if strings.Contains(path, "fills-history") && strings.Contains(path, "after=2") {
+			return 200, `{"code":"50011","msg":"rate limited","data":[]}`
+		}
+		if strings.Contains(path, "fills-history") {
+			return 200, `{"code":"0","msg":"","data":[
+				{"billId":"3","tradeId":"trade-3","instId":"BTC-USDT-SWAP","side":"sell","posSide":"long","fillSz":"1","fillPx":"63000","fillPnl":"0","fee":"0","fillTime":"3000"},
+				{"billId":"2","tradeId":"trade-2","instId":"BTC-USDT-SWAP","side":"sell","posSide":"long","fillSz":"1","fillPx":"62000","fillPnl":"0","fee":"0","fillTime":"2000"}
+			]}`
+		}
+		if strings.Contains(path, "public/instruments") {
+			return 200, `{"code":"0","msg":"","data":[{"instId":"BTC-USDT-SWAP","ctVal":"0.01","lotSz":"0.01"}]}`
+		}
+		return 200, `{"code":"0","msg":"","data":[]}`
+	})
+	if _, err := trader.GetTradesForSymbol("BTCUSDT", time.UnixMilli(500), 2); err == nil {
+		t.Fatal("partial fill history was returned after a later-page failure")
+	}
+}
+
+func TestOKXPendingOrderSnapshotIncludesRegularAndConditional(t *testing.T) {
+	trader := newOKXTestServer(t, func(path string) (int, string) {
+		switch {
+		case strings.Contains(path, "orders-algo-pending"):
+			if !strings.Contains(path, "ordType=conditional") {
+				t.Fatalf("conditional query missing ordType: %s", path)
+			}
+			return 200, `{"code":"0","msg":"","data":[{"algoId":"algo-1","instId":"ETH-USDT-SWAP","state":"live","ordType":"conditional","slTriggerPx":"1700"}]}`
+		case strings.Contains(path, "orders-pending"):
+			return 200, `{"code":"0","msg":"","data":[{"ordId":"order-1","instId":"BTC-USDT-SWAP","state":"live","ordType":"limit"}]}`
+		default:
+			return 200, `{"code":"0","msg":"","data":[]}`
+		}
+	})
+	orders, err := trader.GetPendingOrdersFresh()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(orders) != 2 || orders[0].Protective || !orders[1].Protective {
+		t.Fatalf("unexpected pending-order snapshot: %+v", orders)
+	}
+}
+
 // TestGetProtectiveStopQueryParams reproduces the live failure where OKX
 // rejected our lookups: orders-algo-history requires state or algoId (error
 // 50015) and orders-algo-pending requires ordType. Both queries must carry
