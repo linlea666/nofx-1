@@ -759,6 +759,16 @@ func (s *CopyTradeStore) SettleOrdinaryCatchupTransition(c OrdinaryCatchupSettle
 			mappingStatus == MappingStatusStoppedByRisk || mappingStatus == MappingStatusDetached):
 		// A confirmed partial fill already advanced the mapping. Only the
 		// residual catch-up lifecycle remains to be terminalized.
+	case mappingErr == nil && mappingStatus == MappingStatusClosed &&
+		currentRevision == sourceRevision-1 && filledQuantity <= tolerance:
+		// The authoritative close retired the mapping before this zero-fill
+		// catch-up revision was acknowledged. Advance only the durable source
+		// sequence so the next leader transition receives a fresh canonical
+		// revision; never reopen the mapping or copy the stale catch-up target.
+		_, err = tx.Exec(`UPDATE copy_trade_position_mappings
+			SET source_revision=?,updated_at=CURRENT_TIMESTAMP
+			WHERE trader_id=? AND leader_pos_id=? AND status='closed' AND COALESCE(source_revision,0)=?`,
+			sourceRevision, c.TraderID, leaderPosID, sourceRevision-1)
 	case mappingErr == nil && mappingStatus == MappingStatusClosed && currentRevision >= sourceRevision:
 		// A later authoritative close already advanced and retired the mapping.
 		// The old risk-increasing intent may still carry a terminal no-fill or
@@ -2025,14 +2035,19 @@ func (s *CopyTradeStore) ListRecoverableOrdinaryCatchupIntents(traderID string) 
 				WHERE m.trader_id=i.trader_id AND m.leader_pos_id=i.leader_pos_id))
 			OR EXISTS (
 				SELECT 1 FROM copy_trade_position_mappings m
-				WHERE m.trader_id=i.trader_id AND m.leader_pos_id=i.leader_pos_id
-				  AND (
-					(m.status='active' AND COALESCE(m.source_revision,0)=i.source_revision-1)
-					OR (m.status IN ('active','ignored','stopped_by_risk','detached')
-						AND COALESCE(m.source_revision,0)=i.source_revision)
-				  ))
-		  )
-		ORDER BY i.id`, traderID)
+					WHERE m.trader_id=i.trader_id AND m.leader_pos_id=i.leader_pos_id
+					  AND (
+						(m.status='active' AND COALESCE(m.source_revision,0)=i.source_revision-1)
+						OR (m.status IN ('active','ignored','stopped_by_risk','detached')
+							AND COALESCE(m.source_revision,0)=i.source_revision)
+						OR (m.status='closed' AND (
+							COALESCE(m.source_revision,0)>=i.source_revision
+							OR (COALESCE(m.source_revision,0)=i.source_revision-1
+								AND COALESCE(i.filled_quantity,0)=0)
+						))
+					  ))
+			  )
+			ORDER BY i.id`, traderID)
 	if err != nil {
 		return nil, err
 	}

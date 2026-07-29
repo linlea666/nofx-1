@@ -833,6 +833,69 @@ func TestSettleOrdinaryCatchupDoesNotReopenClosedMapping(t *testing.T) {
 	}
 }
 
+func TestSettleOrdinaryCatchupAdvancesClosedMappingSequenceWithoutReopening(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "settle-closed-sequence.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cs := st.CopyTrade()
+	if err = cs.SavePositionMapping(&CopyTradePositionMapping{
+		TraderID: "trader-1", LeaderID: "leader-1", LeaderPosID: "closed-pos",
+		Symbol: "SNDKUSDT", Side: "long", MarginMode: "cross",
+		Status: MappingStatusActive, SourceRevision: 4, LastKnownSize: 20,
+		OpenedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	intent, claimed, err := cs.ReserveExecutionIntent(&CopyTradeExecutionIntent{
+		TraderID: "trader-1", LeaderPosID: "closed-pos", SourceRevision: 5,
+		CanonicalKey: "leader|trader-1|closed-pos|5", Action: "open_long",
+		Symbol: "SNDKUSDT", Side: "long", LeaderTargetSize: 25,
+		ClientOrderID: "closed-sequence-catchup",
+	})
+	if err != nil || !claimed {
+		t.Fatalf("reserve claimed=%v err=%v", claimed, err)
+	}
+	if _, err = cs.PrepareExecutionOrderAttempt(intent.ID, "closed-sequence-catchup", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err = cs.CompleteExecutionOrderAttempt(intent.ID, "closed-sequence-catchup",
+		ExecutionOrderAttemptTerminalNoFill, "", "CANCELED", "", 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = st.DB().Exec(`UPDATE copy_trade_execution_intents
+		SET status='FAILED',reason_code='CATCHUP_SUPERSEDED' WHERE id=?`, intent.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = st.DB().Exec(`UPDATE copy_trade_position_mappings
+		SET status='closed',source_revision=4,closed_at=CURRENT_TIMESTAMP
+		WHERE trader_id='trader-1' AND leader_pos_id='closed-pos'`); err != nil {
+		t.Fatal(err)
+	}
+	recoverable, err := cs.ListRecoverableOrdinaryCatchupIntents("trader-1")
+	if err != nil || len(recoverable) != 1 || recoverable[0].ID != intent.ID {
+		t.Fatalf("closed zero-fill blocker was not discoverable: intents=%+v err=%v", recoverable, err)
+	}
+
+	status, err := cs.SettleOrdinaryCatchupTransition(OrdinaryCatchupSettlement{
+		IntentID: intent.ID, TraderID: "trader-1", LeaderID: "leader-1",
+		ReasonCode: "CATCHUP_SKIPPED_NO_FILL", Detail: "closed mapping sequence acknowledgement",
+	})
+	if err != nil || status != ExecutionIntentSkipped {
+		t.Fatalf("settle closed sequence status=%s err=%v", status, err)
+	}
+	var mappingStatus string
+	var sourceRevision int64
+	err = st.DB().QueryRow(`SELECT status,source_revision FROM copy_trade_position_mappings
+		WHERE trader_id=? AND leader_pos_id=?`, "trader-1", "closed-pos").
+		Scan(&mappingStatus, &sourceRevision)
+	if err != nil || mappingStatus != MappingStatusClosed || sourceRevision != 5 {
+		t.Fatalf("closed mapping sequence mismatch: status=%s revision=%d err=%v",
+			mappingStatus, sourceRevision, err)
+	}
+}
+
 func TestReclaimUnsubmittedExecutionIntentRequiresNoExchangeEvidence(t *testing.T) {
 	st, err := New(filepath.Join(t.TempDir(), "reclaim-unsubmitted.db"))
 	if err != nil {
