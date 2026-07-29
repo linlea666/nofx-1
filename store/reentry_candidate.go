@@ -69,11 +69,14 @@ type CopyGuardReentryCandidate struct {
 	// Effective per-trader policy is populated by the API and is not persisted
 	// on the candidate row. This prevents the dashboard from presenting the
 	// retired global 0.7 field or hard-coded quota values as production truth.
-	AIConfidenceThreshold float64 `json:"ai_confidence_threshold,omitempty"`
-	AIMinReviewSeconds    int     `json:"ai_min_review_seconds,omitempty"`
-	AIDailyCallLimit      int     `json:"ai_daily_call_limit,omitempty"`
-	AIDailyCallsUsed      int     `json:"ai_daily_calls_used,omitempty"`
-	AILifecycleCallLimit  int     `json:"ai_lifecycle_call_limit,omitempty"`
+	AIConfidenceThreshold     float64 `json:"ai_confidence_threshold,omitempty"`
+	AIMinReviewSeconds        int     `json:"ai_min_review_seconds,omitempty"`
+	AIDailyCallLimit          int     `json:"ai_daily_call_limit,omitempty"`
+	AIDailyCallsUsed          int     `json:"ai_daily_calls_used,omitempty"`
+	AILifecycleCallLimit      int     `json:"ai_lifecycle_call_limit,omitempty"`
+	TraderLifecycleGeneration int64   `json:"trader_lifecycle_generation,omitempty"`
+	AICallLimitsDeprecated    bool    `json:"ai_call_limits_deprecated"`
+	AICostWarningExceeded     bool    `json:"ai_cost_warning_exceeded"`
 
 	SnapshotAt   time.Time  `json:"snapshot_at"`
 	LastReviewAt *time.Time `json:"last_review_at,omitempty"`
@@ -148,6 +151,51 @@ func (s *ReentryAIStore) initReentryCandidateTables() error {
 		}
 	}
 	if _, err = s.db.Exec(`UPDATE copy_guard_reentry_candidates SET regular_review_at=next_review_at WHERE regular_review_at IS NULL`); err != nil {
+		return err
+	}
+	// Legacy call quotas are retained as cost-warning configuration only.
+	// They must never strand a live observation cycle. Running traders resume
+	// scheduled reviews, stopped traders remain explicitly paused, and rows
+	// whose trader was physically deleted become auditable invalidations.
+	if _, err = s.db.Exec(`UPDATE copy_guard_reentry_candidates
+		SET status=CASE
+		      WHEN EXISTS(SELECT 1 FROM traders t
+		                  WHERE t.id=copy_guard_reentry_candidates.trader_id
+		                    AND t.lifecycle_status='RUNNING') THEN ?
+		      WHEN EXISTS(SELECT 1 FROM traders t
+		                  WHERE t.id=copy_guard_reentry_candidates.trader_id) THEN ?
+		      ELSE ?
+		    END,
+		    budget_blocked_until=NULL,
+		    pending_trigger=CASE
+		      WHEN EXISTS(SELECT 1 FROM traders t
+		                  WHERE t.id=copy_guard_reentry_candidates.trader_id
+		                    AND t.lifecycle_status='RUNNING')
+		        THEN 'SOFT_COST_WARNING_MIGRATED'
+		      WHEN EXISTS(SELECT 1 FROM traders t
+		                  WHERE t.id=copy_guard_reentry_candidates.trader_id)
+		        THEN 'TRADER_STOPPED'
+		      ELSE 'TRADER_ARCHIVED'
+		    END,
+		    closed_at=CASE
+		      WHEN EXISTS(SELECT 1 FROM traders t
+		                  WHERE t.id=copy_guard_reentry_candidates.trader_id
+		                    AND t.lifecycle_status='RUNNING') THEN NULL
+		      WHEN EXISTS(SELECT 1 FROM traders t
+		                  WHERE t.id=copy_guard_reentry_candidates.trader_id) THEN closed_at
+		      ELSE COALESCE(closed_at,CURRENT_TIMESTAMP)
+		    END,
+		    next_review_at=CASE
+		      WHEN EXISTS(SELECT 1 FROM traders t
+		                  WHERE t.id=copy_guard_reentry_candidates.trader_id
+		                    AND t.lifecycle_status='RUNNING') THEN CURRENT_TIMESTAMP
+		      ELSE next_review_at
+		    END,
+		    updated_at=CURRENT_TIMESTAMP
+		WHERE budget_blocked_until IS NOT NULL OR status=?`,
+		ReentryCandidateWaiting, ReentryCandidatePausedByTrader,
+		ReentryCandidateInvalidatedTraderArchived,
+		ReentryCandidateBudgetSuspended); err != nil {
 		return err
 	}
 	if _, err = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_cg_risk_reservation_intent ON copy_guard_risk_reservations(intent_id,status)`); err != nil {
@@ -308,8 +356,10 @@ func (s *ReentryAIStore) ListDueReentryCandidates(limit int) ([]*CopyGuardReentr
 	}
 	rows, err := s.db.Query(`SELECT `+reentryCandidateColumns+` FROM copy_guard_reentry_candidates
 		WHERE status IN ('WATCHING','WAITING') AND next_review_at<=CURRENT_TIMESTAMP
+		AND EXISTS(SELECT 1 FROM traders t
+			WHERE t.id=copy_guard_reentry_candidates.trader_id
+			  AND t.lifecycle_status='RUNNING' AND t.is_running=1)
 		AND (failure_backoff_until IS NULL OR failure_backoff_until<=CURRENT_TIMESTAMP)
-		AND (budget_blocked_until IS NULL OR budget_blocked_until<=CURRENT_TIMESTAMP)
 		ORDER BY next_review_at,id LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
@@ -332,8 +382,12 @@ func (s *ReentryAIStore) CountReentryCandidateCalls24h(candidateID int64) (int, 
 	return count, err
 }
 
-// ClaimReentryCandidateReview 原子领取一次 AI 调用额度。
+// ClaimReentryCandidateReview atomically leases a review. The legacy daily and
+// lifecycle values are accepted for one compatibility version but are soft
+// cost-warning lines only and never affect eligibility.
 func (s *ReentryAIStore) ClaimReentryCandidateReview(id int64, minInterval time.Duration, dailyLimit, lifecycleLimit int) (*CopyGuardReentryCandidate, bool, error) {
+	_ = dailyLimit
+	_ = lifecycleLimit
 	tx, err := s.db.Begin()
 	if err != nil {
 		return nil, false, err
@@ -342,44 +396,19 @@ func (s *ReentryAIStore) ClaimReentryCandidateReview(id int64, minInterval time.
 	var status string
 	var count int
 	var last sql.NullString
-	if err = tx.QueryRow(`SELECT status,review_count,last_review_at FROM copy_guard_reentry_candidates WHERE id=?`, id).Scan(&status, &count, &last); err != nil {
+	var lifecycleStatus string
+	var lifecycleGeneration int64
+	if err = tx.QueryRow(`SELECT c.status,c.review_count,c.last_review_at,
+		COALESCE(t.lifecycle_status,''),COALESCE(t.lifecycle_generation,0)
+		FROM copy_guard_reentry_candidates c
+		LEFT JOIN traders t ON t.id=c.trader_id WHERE c.id=?`, id).
+		Scan(&status, &count, &last, &lifecycleStatus, &lifecycleGeneration); err != nil {
 		return nil, false, err
 	}
 	if status != ReentryCandidateWatching && status != ReentryCandidateWaiting {
 		return nil, false, nil
 	}
-	if count >= lifecycleLimit {
-		_, err = tx.Exec(`UPDATE copy_guard_reentry_candidates SET status=?,last_error='AI lifecycle budget exhausted',closed_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?`, ReentryCandidateBudgetSuspended, id)
-		if err != nil {
-			return nil, false, err
-		}
-		if err = tx.Commit(); err != nil {
-			return nil, false, err
-		}
-		c, _ := s.GetReentryCandidate(id)
-		return c, false, nil
-	}
-	var daily int
-	if err = tx.QueryRow(`SELECT COUNT(*) FROM reentry_ai_analyses WHERE candidate_id=? AND call_status IN ('RUNNING','COMPLETED','INVALID','FAILED') AND created_at>=datetime('now','-24 hours')`, id).Scan(&daily); err != nil {
-		return nil, false, err
-	}
-	if daily >= dailyLimit {
-		var oldest string
-		if err = tx.QueryRow(`SELECT MIN(created_at) FROM reentry_ai_analyses WHERE candidate_id=? AND call_status IN ('RUNNING','COMPLETED','INVALID','FAILED') AND created_at>=datetime('now','-24 hours')`, id).Scan(&oldest); err != nil {
-			return nil, false, err
-		}
-		oldestAt, parseErr := parseDBTime(oldest)
-		if parseErr != nil {
-			return nil, false, parseErr
-		}
-		unblock := oldestAt.Add(24 * time.Hour).UTC()
-		_, err = tx.Exec(`UPDATE copy_guard_reentry_candidates SET next_review_at=?,budget_blocked_until=?,pending_trigger='DAILY_BUDGET',updated_at=CURRENT_TIMESTAMP WHERE id=?`, unblock, unblock, id)
-		if err != nil {
-			return nil, false, err
-		}
-		if err = tx.Commit(); err != nil {
-			return nil, false, err
-		}
+	if lifecycleStatus != TraderLifecycleRunning {
 		return nil, false, nil
 	}
 	if last.Valid {
@@ -399,7 +428,21 @@ func (s *ReentryAIStore) ClaimReentryCandidateReview(id int64, minInterval time.
 		return nil, false, err
 	}
 	c, err := s.GetReentryCandidate(id)
+	if c != nil {
+		c.TraderLifecycleGeneration = lifecycleGeneration
+	}
 	return c, true, err
+}
+
+func (s *ReentryAIStore) GetFirstCandidateModelCallAt(candidateID int64) (*time.Time, error) {
+	var raw sql.NullString
+	err := s.db.QueryRow(`SELECT MIN(created_at) FROM reentry_ai_analyses
+		WHERE candidate_id=? AND call_status IN ('RUNNING','COMPLETED','INVALID','FAILED')`,
+		candidateID).Scan(&raw)
+	if err != nil {
+		return nil, err
+	}
+	return parseNullableDBTime(raw)
 }
 
 type ReentryCandidateDecision struct {
@@ -447,7 +490,11 @@ func (s *ReentryAIStore) FinishReentryCandidateReview(id int64, d ReentryCandida
 		}
 		decisionExpires = expiresAt.UTC()
 	}
-	res, err := s.db.Exec(`UPDATE copy_guard_reentry_candidates SET status=?,last_decision=?,regime=?,confidence=?,size_factor=?,entry_price_low=?,entry_price_high=?,attention_price_low=?,attention_price_high=?,next_review_at=?,regular_review_at=?,event_review_at=NULL,last_analysis_id=?,decision_ttl_seconds=?,decision_expires_at=?,failure_count=0,last_error='',failure_backoff_until=NULL,consecutive_abandons=CASE WHEN ? AND last_abandon_candle<>? THEN consecutive_abandons+1 WHEN ? THEN consecutive_abandons ELSE 0 END,last_abandon_candle=CASE WHEN ? THEN ? ELSE '' END,updated_at=CURRENT_TIMESTAMP WHERE id=? AND status=?`, status, d.Decision, d.Regime, d.Confidence, d.SizeFactor, d.EntryPriceLow, d.EntryPriceHigh, d.AttentionPriceLow, d.AttentionPriceHigh, d.NextReview.UTC(), d.NextReview.UTC(), d.AnalysisID, d.TTLSeconds, decisionExpires, d.ConfirmAbandon, d.CandleKey, d.ConfirmAbandon, d.ConfirmAbandon, d.CandleKey, id, ReentryCandidateReviewing)
+	res, err := s.db.Exec(`UPDATE copy_guard_reentry_candidates SET status=?,last_decision=?,regime=?,confidence=?,size_factor=?,entry_price_low=?,entry_price_high=?,attention_price_low=?,attention_price_high=?,next_review_at=?,regular_review_at=?,event_review_at=NULL,last_analysis_id=?,decision_ttl_seconds=?,decision_expires_at=?,failure_count=0,last_error='',failure_backoff_until=NULL,consecutive_abandons=CASE WHEN ? AND last_abandon_candle<>? THEN consecutive_abandons+1 WHEN ? THEN consecutive_abandons ELSE 0 END,last_abandon_candle=CASE WHEN ? THEN ? ELSE '' END,updated_at=CURRENT_TIMESTAMP
+		WHERE id=? AND status=? AND EXISTS(
+			SELECT 1 FROM traders t WHERE t.id=copy_guard_reentry_candidates.trader_id
+			  AND t.lifecycle_status='RUNNING' AND t.is_running=1
+		)`, status, d.Decision, d.Regime, d.Confidence, d.SizeFactor, d.EntryPriceLow, d.EntryPriceHigh, d.AttentionPriceLow, d.AttentionPriceHigh, d.NextReview.UTC(), d.NextReview.UTC(), d.AnalysisID, d.TTLSeconds, decisionExpires, d.ConfirmAbandon, d.CandleKey, d.ConfirmAbandon, d.ConfirmAbandon, d.CandleKey, id, ReentryCandidateReviewing)
 	if err != nil {
 		return err
 	}
@@ -578,7 +625,11 @@ func (s *ReentryAIStore) SkipDuplicateCandidateReview(candidateID, analysisID in
 	if n, _ := res.RowsAffected(); n != 1 {
 		return fmt.Errorf("candidate analysis is no longer pending")
 	}
-	res, err = tx.Exec(`UPDATE copy_guard_reentry_candidates SET status=?,review_count=max(review_count-1,0),last_analysis_id=?,last_error='',pending_trigger='SAME_DATA_SKIPPED',next_review_at=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND status=?`, ReentryCandidateWaiting, analysisID, next.UTC(), candidateID, ReentryCandidateReviewing)
+	res, err = tx.Exec(`UPDATE copy_guard_reentry_candidates SET status=?,review_count=max(review_count-1,0),last_analysis_id=?,last_error='',pending_trigger='SAME_DATA_SKIPPED',
+		next_review_at=CASE WHEN regular_review_at IS NOT NULL AND regular_review_at>CURRENT_TIMESTAMP THEN regular_review_at ELSE ? END,
+		regular_review_at=CASE WHEN regular_review_at IS NOT NULL AND regular_review_at>CURRENT_TIMESTAMP THEN regular_review_at ELSE ? END,
+		updated_at=CURRENT_TIMESTAMP WHERE id=? AND status=?`,
+		ReentryCandidateWaiting, analysisID, next.UTC(), next.UTC(), candidateID, ReentryCandidateReviewing)
 	if err != nil {
 		return err
 	}
@@ -731,18 +782,65 @@ func (s *ReentryAIStore) ResumeReentryCandidate(id int64) error {
 	return nil
 }
 
+func (s *ReentryAIStore) PauseReentryCandidateForTraderStop(id int64) error {
+	_, err := s.db.Exec(`UPDATE copy_guard_reentry_candidates
+		SET status=?,last_error='discarded because trader lifecycle stopped',
+		    pending_trigger='TRADER_STOPPED',updated_at=CURRENT_TIMESTAMP
+		WHERE id=? AND status IN ('REVIEWING','WATCHING','WAITING','ENTRY_PENDING')`,
+		ReentryCandidatePausedByTrader, id)
+	return err
+}
+
+// ResumeTraderCandidatesForStart revives only observations whose cycle and
+// ownership mapping are still authoritative. Stale paused rows become explicit
+// invalidations instead of silently surviving an archive/reversal.
+func (s *ReentryAIStore) ResumeTraderCandidatesForStart(traderID string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	valid := `EXISTS(
+		SELECT 1 FROM copy_guard_cycles c
+		JOIN copy_trade_position_mappings m
+		  ON m.trader_id=c.trader_id AND m.leader_pos_id=c.leader_pos_id
+		WHERE c.id=copy_guard_reentry_candidates.cycle_id
+		  AND c.trader_id=copy_guard_reentry_candidates.trader_id
+		  AND c.closed_at IS NULL
+		  AND c.status IN ('STOPPED_WATCHING','AI_WATCHING','AI_REVIEWING','AI_WAITING','ATTEMPTS_EXHAUSTED')
+		  AND m.status='stopped_by_risk'
+	)`
+	if _, err = tx.Exec(`UPDATE copy_guard_reentry_candidates
+		SET status=?,last_error='',pending_trigger='TRADER_RESTARTED',
+		    next_review_at=CURRENT_TIMESTAMP,regular_review_at=CURRENT_TIMESTAMP,
+		    closed_at=NULL,updated_at=CURRENT_TIMESTAMP
+		WHERE trader_id=? AND status=? AND `+valid,
+		ReentryCandidateWaiting, traderID, ReentryCandidatePausedByTrader); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`UPDATE copy_guard_reentry_candidates
+		SET status=?,last_error='paused candidate no longer has an active leader cycle',
+		    pending_trigger='TRADER_RESTART_INVALIDATED',
+		    closed_at=COALESCE(closed_at,CURRENT_TIMESTAMP),updated_at=CURRENT_TIMESTAMP
+		WHERE trader_id=? AND status=? AND NOT (`+valid+`)`,
+		ReentryCandidateInvalidated, traderID, ReentryCandidatePausedByTrader); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // RequestImmediateReentryCandidateReview schedules a production review at the
-// earliest time permitted by the trader's minimum interval. It never claims a
-// quota, calls a model, or changes execution state; the normal scheduler still
-// owns feature-hash dedupe, daily/lifecycle budgets, leases and preflight.
+// earliest time permitted by the trader's minimum interval. It never calls a
+// model or changes execution state; the normal scheduler still owns
+// feature-hash dedupe, soft cost warnings, leases and preflight.
 func (s *ReentryAIStore) RequestImmediateReentryCandidateReview(id int64, minInterval time.Duration) (*CopyGuardReentryCandidate, error) {
 	return s.ScheduleReentryCandidateEventReview(id, "OPERATOR_REVIEW_REQUEST", minInterval)
 }
 
 // ScheduleReentryCandidateEventReview is the only event-review scheduler.
-// Event signals may pull a regular review forward, while failure backoff and
-// daily-budget blocks remain hard lower bounds that feature changes cannot
-// bypass.
+// Event signals may pull a regular review forward, while failure backoff
+// remains a hard lower bound that feature changes cannot bypass. Legacy budget
+// fields are cost warnings and never participate in eligibility.
 func (s *ReentryAIStore) ScheduleReentryCandidateEventReview(id int64, trigger string, minInterval time.Duration) (*CopyGuardReentryCandidate, error) {
 	if minInterval < 5*time.Minute {
 		minInterval = 5 * time.Minute
@@ -753,10 +851,10 @@ func (s *ReentryAIStore) ScheduleReentryCandidateEventReview(id int64, trigger s
 	}
 	defer tx.Rollback()
 	var status string
-	var last, regular, failureBackoff, budgetBlocked sql.NullString
-	if err = tx.QueryRow(`SELECT status,last_review_at,regular_review_at,failure_backoff_until,budget_blocked_until
+	var last, regular, failureBackoff sql.NullString
+	if err = tx.QueryRow(`SELECT status,last_review_at,regular_review_at,failure_backoff_until
 		FROM copy_guard_reentry_candidates WHERE id=?`, id).
-		Scan(&status, &last, &regular, &failureBackoff, &budgetBlocked); err != nil {
+		Scan(&status, &last, &regular, &failureBackoff); err != nil {
 		return nil, err
 	}
 	if status != ReentryCandidateWatching && status != ReentryCandidateWaiting {
@@ -780,7 +878,7 @@ func (s *ReentryAIStore) ScheduleReentryCandidateEventReview(id int64, trigger s
 			next = regularAt
 		}
 	}
-	for _, blocked := range []sql.NullString{failureBackoff, budgetBlocked} {
+	for _, blocked := range []sql.NullString{failureBackoff} {
 		if !blocked.Valid {
 			continue
 		}

@@ -195,6 +195,7 @@ export class HttpClient {
         const errorData = error.response.data as any
         return {
           success: false,
+          data: errorData as T,
           message: errorData?.error || errorData?.message || 'Operation failed',
         }
       }

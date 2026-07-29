@@ -550,7 +550,7 @@ func (tm *TraderManager) LoadUserTradersFromStore(st *store.Store, userID string
 
 		// Use existing method to load trader
 		logger.Infof("📦 Loading trader %s (AI Model: %s, Exchange: %s/%s, Strategy ID: %s)", traderCfg.Name, aiModelCfg.Provider, exchangeCfg.ExchangeType, exchangeCfg.AccountName, traderCfg.StrategyID)
-		err = tm.addTraderFromStore(traderCfg, aiModelCfg, exchangeCfg, st)
+		err = tm.addTraderFromStore(traderCfg, aiModelCfg, exchangeCfg, st, false)
 		if err != nil {
 			logger.Infof("❌ Failed to load trader %s: %v", traderCfg.Name, err)
 			// Save error for later retrieval
@@ -655,7 +655,7 @@ func (tm *TraderManager) LoadTradersFromStore(st *store.Store) error {
 		}
 
 		// Add to TraderManager (coinPoolURL/oiTopURL already obtained from strategy config)
-		err = tm.addTraderFromStore(traderCfg, aiModelCfg, exchangeCfg, st)
+		err = tm.addTraderFromStore(traderCfg, aiModelCfg, exchangeCfg, st, true)
 		if err != nil {
 			logger.Infof("❌ Failed to add trader %s: %v", traderCfg.Name, err)
 			continue
@@ -667,7 +667,7 @@ func (tm *TraderManager) LoadTradersFromStore(st *store.Store) error {
 }
 
 // addTraderFromStore internal method: adds trader from store configuration
-func (tm *TraderManager) addTraderFromStore(traderCfg *store.Trader, aiModelCfg *store.AIModel, exchangeCfg *store.Exchange, st *store.Store) error {
+func (tm *TraderManager) addTraderFromStore(traderCfg *store.Trader, aiModelCfg *store.AIModel, exchangeCfg *store.Exchange, st *store.Store, restoreRuntime bool) error {
 	if _, exists := tm.traders[traderCfg.ID]; exists {
 		return fmt.Errorf("trader ID '%s' already exists", traderCfg.ID)
 	}
@@ -772,10 +772,13 @@ func (tm *TraderManager) addTraderFromStore(traderCfg *store.Trader, aiModelCfg 
 	}
 
 	tm.traders[traderCfg.ID] = at
+	at.SetLifecycleGeneration(traderCfg.LifecycleGeneration)
 	logger.Infof("✓ Trader '%s' (%s + %s/%s) loaded to memory", traderCfg.Name, aiModelCfg.Provider, exchangeCfg.ExchangeType, exchangeCfg.AccountName)
 
-	// Auto-start if trader was running before shutdown
-	if traderCfg.IsRunning {
+	// Only the process-start loader restores RUNNING runtimes. User-scoped
+	// refreshes are configuration loads and must never start a second engine or
+	// mark the authoritative lifecycle stopped because a runtime already exists.
+	if restoreRuntime && traderCfg.IsRunning {
 		logger.Infof("🔄 Auto-starting trader '%s' (was running before shutdown)...", traderCfg.Name)
 
 		// Check decision mode to determine startup type
@@ -784,14 +787,17 @@ func (tm *TraderManager) addTraderFromStore(traderCfg *store.Trader, aiModelCfg 
 		if decisionMode == "copy_trade" {
 			// Start in copy trade mode
 			logger.Infof("🎯 [%s] Copy trade mode detected, starting copy trading engine...", traderCfg.Name)
-			go func(autoTrader *trader.AutoTrader, traderName, traderID, userID string) {
-				if err := copytrade.StartCopyTradingForTrader(traderID, autoTrader, st); err != nil {
-					logger.Warnf("⚠️ Trader '%s' copy trade stopped with error: %v", traderName, err)
-					if st != nil {
-						_ = st.Trader().UpdateStatus(userID, traderID, false)
-					}
+			// Process startup must finish deterministic order/ownership recovery
+			// before the global reentry advisor is started by main. Running this
+			// synchronously closes the former window in which a WAITING candidate
+			// could be claimed while its exchange intent was still recovering.
+			if err := copytrade.StartCopyTradingForTrader(traderCfg.ID, at, st); err != nil {
+				logger.Warnf("⚠️ Trader '%s' copy trade stopped with error: %v", traderCfg.Name, err)
+				if st != nil {
+					_ = st.Trader().UpdateStatus(traderCfg.UserID, traderCfg.ID, false)
 				}
-			}(at, traderCfg.Name, traderCfg.ID, traderCfg.UserID)
+				return fmt.Errorf("restore copy trader %s: %w", traderCfg.Name, err)
+			}
 			logger.Infof("✅ Trader '%s' started in copy trade mode", traderCfg.Name)
 		} else {
 			// Start in AI mode (default)

@@ -327,6 +327,14 @@ func (a *Advisor) runAnalysis(analysisID int64, autoTriggered bool) {
 		return
 	}
 	candidateID = analysis.CandidateID
+	lifecycle, lifecycleErr := a.st.Trader().GetLifecycle(analysis.TraderID)
+	if lifecycleErr != nil || lifecycle.Status != store.TraderLifecycleRunning || !lifecycle.IsRunning {
+		if candidateID > 0 {
+			_ = a.st.ReentryAI().PauseReentryCandidateForTraderStop(candidateID)
+		}
+		return
+	}
+	lifecycleGeneration := lifecycle.Generation
 	cfg, err := a.st.ReentryAI().GetReentryAIConfig()
 	if err != nil {
 		logger.Warnf("[ReentryAdvisor] AI 分析读取配置失败: %v", err)
@@ -366,6 +374,13 @@ func (a *Advisor) runAnalysis(analysisID int64, autoTriggered bool) {
 	}
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		raw, err = client.CallWithMessages(analysis.SystemPrompt, analysis.UserPrompt)
+		if !a.st.Trader().IsGenerationRunning(analysis.TraderID, lifecycleGeneration) {
+			_ = a.st.ReentryAI().MarkReentryAnalysisFailed(analysis.ID, "TRADER_STOPPED_RESULT_DISCARDED")
+			if candidateID > 0 {
+				_ = a.st.ReentryAI().PauseReentryCandidateForTraderStop(candidateID)
+			}
+			return
+		}
 		if err != nil {
 			logger.Warnf("[ReentryAdvisor] AI 调用失败 (analysis=%d, 第 %d 次): %v", analysisID, attempt, err)
 			continue
@@ -389,7 +404,7 @@ func (a *Advisor) runAnalysis(analysisID int64, autoTriggered bool) {
 				a.updateCandidateCycleStatus(c, store.CopyGuardAIWaiting)
 				a.recordCandidateEvent(c, "AI_REVIEW_FAILED", 0, 0, map[string]interface{}{"reason": "ai_call_failed"})
 				if c.FailureCount+1 == 3 {
-					a.notifyCandidateImportant(c, "AI_REVIEW_FAILED", "AI 连续调用失败", "模型连续失败，候选将按 60 分钟退避继续观察。")
+					a.notifyCandidateImportant(c, "AI_REVIEW_FAILED", "AI 连续调用失败", "模型连续失败，候选将按最长 6 小时的指数退避继续观察，恢复后自动续跑。")
 				}
 			}
 		}
@@ -448,21 +463,19 @@ func (a *Advisor) finishCandidateAnalysis(analysis *store.ReentryAIAnalysis, cfg
 	if err != nil {
 		return fmt.Errorf("trader risk policy unavailable after analysis: %w", err)
 	}
+	lifecycle, err := a.st.Trader().GetLifecycle(c.TraderID)
+	if err != nil || lifecycle.Status != store.TraderLifecycleRunning || !lifecycle.IsRunning {
+		_ = a.st.ReentryAI().PauseReentryCandidateForTraderStop(c.ID)
+		return fmt.Errorf("trader lifecycle stopped before AI result commit")
+	}
 	abandonThreshold := math.Max(0.80, traderCfg.RiskAIConfidenceThreshold)
 	nextSeconds := pv.NextReviewSeconds
 	if pv.Verdict == store.ReentryVerdictWait || pv.Verdict == store.ReentryVerdictAbandon {
-		// Paid heartbeat is owned by deterministic code: 15m → 30m → 60m →
-		// 2h. Market/leader/attention-zone events may still pull the review
-		// forward, subject to the 5m minimum interval and feature-hash dedupe.
-		switch {
-		case c.ReviewCount <= 1:
-			nextSeconds = 15 * 60
-		case c.ReviewCount == 2:
-			nextSeconds = 30 * 60
-		case c.ReviewCount == 3:
-			nextSeconds = 60 * 60
-		default:
-			nextSeconds = 2 * 60 * 60
+		// Deterministic tiered heartbeat survives any number of early event
+		// reviews: +15m, +45m, hourly through 6h, then every two hours.
+		nextSeconds = int(time.Until(a.nextCandidateReviewAt(c.ID, time.Now().UTC())).Seconds())
+		if nextSeconds < 1 {
+			nextSeconds = 1
 		}
 	}
 	next := time.Now().Add(time.Duration(nextSeconds) * time.Second)
@@ -510,6 +523,10 @@ func (a *Advisor) finishCandidateAnalysis(analysis *store.ReentryAIAnalysis, cfg
 		a.recordCandidateEvent(c, "ENTER_APPROVED_EXECUTION_DISABLED", c.TriggerPrice, 0, map[string]interface{}{"analysis_id": analysis.ID, "reason_code": "EXECUTION_DISABLED", "reason": "global AI execution disabled"})
 		return nil
 	}
+	if !a.st.Trader().IsGenerationRunning(c.TraderID, lifecycle.Generation) {
+		_ = a.st.ReentryAI().PauseReentryCandidateForTraderStop(c.ID)
+		return fmt.Errorf("trader lifecycle stopped before AI entry")
+	}
 	if err := copytrade.ExecuteAIReentryForTrader(c.TraderID, c.ID, analysis.ID); err != nil {
 		logger.Warnf("[ReentryAdvisor] AI 重入预检拒绝 candidate=%d: %v", c.ID, err)
 		if copytrade.ReasonCodeOf(err) == "PRICE_OUT_OF_RANGE" {
@@ -526,6 +543,32 @@ func (a *Advisor) finishCandidateAnalysis(analysis *store.ReentryAIAnalysis, cfg
 		a.recordCandidateEvent(c, "REENTRY_PREFLIGHT_REJECTED", c.TriggerPrice, 0, map[string]interface{}{"analysis_id": analysis.ID, "reason_code": classifyAIReentryPreflightError(err), "error": err.Error()})
 	}
 	return nil
+}
+
+func (a *Advisor) nextCandidateReviewAt(candidateID int64, now time.Time) time.Time {
+	now = now.UTC()
+	first, err := a.st.ReentryAI().GetFirstCandidateModelCallAt(candidateID)
+	if err != nil || first == nil {
+		return now.Add(15 * time.Minute)
+	}
+	elapsed := now.Sub(first.UTC())
+	if elapsed < 15*time.Minute {
+		return first.Add(15 * time.Minute).UTC()
+	}
+	if elapsed < 45*time.Minute {
+		return first.Add(45 * time.Minute).UTC()
+	}
+	if elapsed < 6*time.Hour {
+		steps := int((elapsed - 45*time.Minute) / time.Hour)
+		target := first.Add(45*time.Minute + time.Duration(steps+1)*time.Hour)
+		limit := first.Add(6 * time.Hour)
+		if target.After(limit) {
+			target = limit
+		}
+		return target.UTC()
+	}
+	steps := int((elapsed - 6*time.Hour) / (2 * time.Hour))
+	return first.Add(6*time.Hour + time.Duration(steps+1)*2*time.Hour).UTC()
 }
 
 func classifyAIReentryPreflightError(err error) string {
@@ -631,7 +674,7 @@ func (a *Advisor) failCandidateBeforeModel(candidateID, analysisID int64, messag
 }
 
 func (a *Advisor) notifyCandidateImportant(c *store.CopyGuardReentryCandidate, eventType, title, body string) {
-	if c == nil {
+	if c == nil || !a.traderLifecycleRunning(c.TraderID) {
 		return
 	}
 	traderCfg, err := a.st.CopyTrade().GetByTraderID(c.TraderID)
@@ -653,7 +696,7 @@ func (a *Advisor) notifyCandidateImportant(c *store.CopyGuardReentryCandidate, e
 // recordAIAnalysisEvent 把一次内置 AI 二次入场分析结论落成统一跟单事件（best-effort）。
 // provider 从交易员跟单配置解析，避免非 OKX 账户在统一日志中被错误归类。
 func (a *Advisor) recordAIAnalysisEvent(analysis *store.ReentryAIAnalysis, pv *parsedVerdict, autoTriggered bool) {
-	if a.st == nil || analysis == nil || pv == nil {
+	if a.st == nil || analysis == nil || pv == nil || !a.traderLifecycleRunning(analysis.TraderID) {
 		return
 	}
 	trigger := "manual"
@@ -785,6 +828,9 @@ func AnalyzeAnalysis(analysisID int64) error {
 	}
 	if analysis.CandidateID > 0 {
 		return fmt.Errorf("AI 候选分析由持久化调度器管理，禁止手动触发")
+	}
+	if !a.traderLifecycleRunning(analysis.TraderID) {
+		return fmt.Errorf("交易员未处于 RUNNING，禁止模型调用")
 	}
 	if _, err := resolveAIModel(a.st, cfg); err != nil {
 		return err

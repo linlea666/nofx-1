@@ -780,6 +780,102 @@ func TestSettleOrdinaryCatchupPreservesPartialFill(t *testing.T) {
 	}
 }
 
+func TestSettleOrdinaryCatchupDoesNotReopenClosedMapping(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "settle-closed-mapping.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cs := st.CopyTrade()
+	if err = cs.SavePositionMapping(&CopyTradePositionMapping{
+		TraderID: "trader-1", LeaderID: "leader-1", LeaderPosID: "closed-pos",
+		Symbol: "SNDKUSDT", Side: "long", MarginMode: "cross",
+		Status: MappingStatusActive, SourceRevision: 4, LastKnownSize: 20,
+		OpenedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	intent, claimed, err := cs.ReserveExecutionIntent(&CopyTradeExecutionIntent{
+		TraderID: "trader-1", LeaderPosID: "closed-pos", SourceRevision: 5,
+		CanonicalKey: "leader|trader-1|closed-pos|5", Action: "open_long",
+		Symbol: "SNDKUSDT", Side: "long", LeaderTargetSize: 25,
+		ClientOrderID: "closed-mapping-catchup",
+	})
+	if err != nil || !claimed {
+		t.Fatalf("reserve claimed=%v err=%v", claimed, err)
+	}
+	if _, err = cs.PrepareExecutionOrderAttempt(intent.ID, "closed-mapping-catchup", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err = cs.CompleteExecutionOrderAttempt(intent.ID, "closed-mapping-catchup",
+		ExecutionOrderAttemptTerminalNoFill, "", "CANCELED", "", 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = st.DB().Exec(`UPDATE copy_trade_execution_intents SET status='FAILED',reason_code='CATCHUP_SUPERSEDED' WHERE id=?`, intent.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = st.DB().Exec(`UPDATE copy_trade_position_mappings SET status='closed',source_revision=6,closed_at=CURRENT_TIMESTAMP WHERE trader_id='trader-1' AND leader_pos_id='closed-pos'`); err != nil {
+		t.Fatal(err)
+	}
+	status, err := cs.SettleOrdinaryCatchupTransition(OrdinaryCatchupSettlement{
+		IntentID: intent.ID, TraderID: "trader-1", LeaderID: "leader-1",
+		ReasonCode: "CATCHUP_SKIPPED_NO_FILL", Detail: "mapping already closed by later source transition",
+	})
+	if err != nil || status != ExecutionIntentSkipped {
+		t.Fatalf("settle closed mapping status=%s err=%v", status, err)
+	}
+	var mappingStatus string
+	var sourceRevision int64
+	err = st.DB().QueryRow(`SELECT status,source_revision FROM copy_trade_position_mappings WHERE trader_id=? AND leader_pos_id=?`,
+		"trader-1", "closed-pos").Scan(&mappingStatus, &sourceRevision)
+	if err != nil || mappingStatus != MappingStatusClosed || sourceRevision != 6 {
+		t.Fatalf("closed mapping was mutated: status=%s revision=%d err=%v", mappingStatus, sourceRevision, err)
+	}
+}
+
+func TestReclaimUnsubmittedExecutionIntentRequiresNoExchangeEvidence(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "reclaim-unsubmitted.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cs := st.CopyTrade()
+	intent, claimed, err := cs.ReserveExecutionIntent(&CopyTradeExecutionIntent{
+		TraderID: "trader-1", LeaderPosID: "p1", SourceRevision: 1,
+		CanonicalKey: "leader|trader-1|p1|1", Action: "close_long",
+		LeaderTargetSize: 0, ClientOrderID: "close-unsubmitted",
+	})
+	if err != nil || !claimed {
+		t.Fatalf("reserve claimed=%v err=%v", claimed, err)
+	}
+	if _, err = st.DB().Exec(`UPDATE copy_trade_execution_intents
+		SET status='FAILED',reason_code='MANUAL_REVIEW_REQUIRED',terminal_at=CURRENT_TIMESTAMP
+		WHERE id=?`, intent.ID); err != nil {
+		t.Fatal(err)
+	}
+	reclaimed, err := cs.ReclaimUnsubmittedExecutionIntent(intent.ID, "trader-1", "close_long", 0)
+	if err != nil || !reclaimed {
+		t.Fatalf("safe reclaim=%v err=%v", reclaimed, err)
+	}
+	stored, err := cs.GetExecutionIntentByID(intent.ID)
+	if err != nil || stored.Status != ExecutionIntentReserved || stored.ReasonCode != "" {
+		t.Fatalf("unexpected reclaimed intent: %+v err=%v", stored, err)
+	}
+
+	if _, err = cs.PrepareExecutionOrderAttempt(intent.ID, "close-unsubmitted", 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = st.DB().Exec(`UPDATE copy_trade_execution_intents
+		SET status='FAILED',reason_code='MANUAL_REVIEW_REQUIRED',terminal_at=CURRENT_TIMESTAMP
+		WHERE id=?`, intent.ID); err != nil {
+		t.Fatal(err)
+	}
+	reclaimed, err = cs.ReclaimUnsubmittedExecutionIntent(intent.ID, "trader-1", "close_long", 0)
+	if err != nil || reclaimed {
+		t.Fatalf("attempt evidence must block reclaim: reclaimed=%v err=%v", reclaimed, err)
+	}
+}
+
 func TestClosedMappingReopenUsesNextRevisionAndReactivatesMapping(t *testing.T) {
 	st, err := New(filepath.Join(t.TempDir(), "reopen-fill.db"))
 	if err != nil {

@@ -10,8 +10,26 @@ import (
 	"time"
 )
 
+func newReentryCandidateTestStore(t *testing.T, path string) (*Store, error) {
+	t.Helper()
+	st, err := New(path)
+	if err != nil {
+		return nil, err
+	}
+	for _, id := range []string{"trader-a", "trader-b"} {
+		if _, err = st.db.Exec(`INSERT OR IGNORE INTO traders
+			(id,user_id,name,ai_model_id,exchange_id,initial_balance,is_running,lifecycle_status,lifecycle_generation)
+			VALUES(?,?,?,?,?,1000,1,?,1)`,
+			id, "test-user", id, "test-model", "test-exchange", TraderLifecycleRunning); err != nil {
+			_ = st.Close()
+			return nil, err
+		}
+	}
+	return st, nil
+}
+
 func TestReentryCandidateLifecycleAndRiskReservation(t *testing.T) {
-	st, err := New(filepath.Join(t.TempDir(), "candidate.db"))
+	st, err := newReentryCandidateTestStore(t, filepath.Join(t.TempDir(), "candidate.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,7 +118,7 @@ func TestReentryCandidateLifecycleAndRiskReservation(t *testing.T) {
 }
 
 func TestLowConfidenceEnterRemainsWaitingWithoutFailure(t *testing.T) {
-	st, err := New(filepath.Join(t.TempDir(), "candidate-low-confidence.db"))
+	st, err := newReentryCandidateTestStore(t, filepath.Join(t.TempDir(), "candidate-low-confidence.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,7 +142,7 @@ func TestLowConfidenceEnterRemainsWaitingWithoutFailure(t *testing.T) {
 }
 
 func TestFeatureHashChangeDoesNotPullForwardRegularReviewOrEntryLease(t *testing.T) {
-	st, err := New(filepath.Join(t.TempDir(), "candidate-schedule.db"))
+	st, err := newReentryCandidateTestStore(t, filepath.Join(t.TempDir(), "candidate-schedule.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +198,7 @@ func TestFeatureHashChangeDoesNotPullForwardRegularReviewOrEntryLease(t *testing
 }
 
 func TestEventReviewSchedulerHonorsRegularCadenceAndHardBlocks(t *testing.T) {
-	st, err := New(filepath.Join(t.TempDir(), "candidate-event-schedule.db"))
+	st, err := newReentryCandidateTestStore(t, filepath.Join(t.TempDir(), "candidate-event-schedule.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -233,7 +251,7 @@ func TestEventReviewSchedulerHonorsRegularCadenceAndHardBlocks(t *testing.T) {
 }
 
 func TestDisableReentryCandidatesKeepsSubmittedIntentOwnedByReconciler(t *testing.T) {
-	st, err := New(filepath.Join(t.TempDir(), "candidate-disable.db"))
+	st, err := newReentryCandidateTestStore(t, filepath.Join(t.TempDir(), "candidate-disable.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -283,7 +301,7 @@ func TestDisableReentryCandidatesKeepsSubmittedIntentOwnedByReconciler(t *testin
 }
 
 func TestCandidateOperatorTransitionsRejectInFlightEntry(t *testing.T) {
-	st, err := New(filepath.Join(t.TempDir(), "candidate-operator-transition.db"))
+	st, err := newReentryCandidateTestStore(t, filepath.Join(t.TempDir(), "candidate-operator-transition.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -309,7 +327,7 @@ func TestCandidateOperatorTransitionsRejectInFlightEntry(t *testing.T) {
 }
 
 func TestOperatorReviewRequestUsesSchedulerAndMinimumInterval(t *testing.T) {
-	st, err := New(filepath.Join(t.TempDir(), "candidate-request-review.db"))
+	st, err := newReentryCandidateTestStore(t, filepath.Join(t.TempDir(), "candidate-request-review.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -343,7 +361,7 @@ func TestOperatorReviewRequestUsesSchedulerAndMinimumInterval(t *testing.T) {
 }
 
 func TestPreflightRejectionReturnsToWaitingWithoutAIFailure(t *testing.T) {
-	st, err := New(filepath.Join(t.TempDir(), "candidate-preflight.db"))
+	st, err := newReentryCandidateTestStore(t, filepath.Join(t.TempDir(), "candidate-preflight.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -366,7 +384,7 @@ func TestPreflightRejectionReturnsToWaitingWithoutAIFailure(t *testing.T) {
 }
 
 func TestCandidateStaleLeaseRecovery(t *testing.T) {
-	st, err := New(filepath.Join(t.TempDir(), "candidate-lease.db"))
+	st, err := newReentryCandidateTestStore(t, filepath.Join(t.TempDir(), "candidate-lease.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -447,7 +465,7 @@ func TestCandidateStaleLeaseRecovery(t *testing.T) {
 }
 
 func TestCandidateDataHashDedupeDoesNotConsumeQuota(t *testing.T) {
-	st, err := New(filepath.Join(t.TempDir(), "candidate-hash.db"))
+	st, err := newReentryCandidateTestStore(t, filepath.Join(t.TempDir(), "candidate-hash.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -489,7 +507,7 @@ func TestCandidateDataHashDedupeDoesNotConsumeQuota(t *testing.T) {
 }
 
 func TestCandidatePreparationFailureDoesNotConsumeCallQuota(t *testing.T) {
-	st, err := New(filepath.Join(t.TempDir(), "candidate-prepare-failure.db"))
+	st, err := newReentryCandidateTestStore(t, filepath.Join(t.TempDir(), "candidate-prepare-failure.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -524,9 +542,103 @@ func TestCandidatePreparationFailureDoesNotConsumeCallQuota(t *testing.T) {
 	}
 }
 
+func TestCandidateSoftCostWarningsNeverSuspendLaterReviews(t *testing.T) {
+	st, err := newReentryCandidateTestStore(t, filepath.Join(t.TempDir(), "candidate-soft-cost-warning.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	rs := st.ReentryAI()
+	candidate, err := rs.EnsureReentryCandidate(&CopyGuardReentryCandidate{
+		CycleID: 79, TraderID: "trader-a", LeaderPosID: "p",
+		Symbol: "HYPEUSDT", Side: "long", FeatureHash: "soft-warning",
+	}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for review := 1; review <= 20; review++ {
+		claimed, ok, claimErr := rs.ClaimReentryCandidateReview(candidate.ID, 0, 1, 1)
+		if claimErr != nil || !ok || claimed == nil {
+			t.Fatalf("review %d was blocked by retired hard limits: candidate=%+v ok=%v err=%v",
+				review, claimed, ok, claimErr)
+		}
+		if finishErr := rs.FinishReentryCandidateReview(candidate.ID, ReentryCandidateDecision{
+			Decision: ReentryVerdictWait, NextReview: time.Now().Add(-time.Second),
+		}); finishErr != nil {
+			t.Fatalf("finish review %d: %v", review, finishErr)
+		}
+	}
+	candidate, err = rs.GetReentryCandidate(candidate.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if candidate.Status == ReentryCandidateBudgetSuspended || candidate.ReviewCount != 20 ||
+		candidate.BudgetBlockedUntil != nil {
+		t.Fatalf("soft warning changed review eligibility: %+v", candidate)
+	}
+}
+
+func TestLegacyBudgetSuspensionMigratesByTraderLifecycle(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "candidate-budget-migration.db")
+	st, err := newReentryCandidateTestStore(t, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = st.DB().Exec(`UPDATE traders SET lifecycle_status=?,is_running=0 WHERE id='trader-b'`,
+		TraderLifecycleStopped); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range []struct {
+		cycleID int64
+		trader  string
+		hash    string
+	}{
+		{801, "trader-a", "running-budget"},
+		{802, "trader-b", "stopped-budget"},
+		{803, "deleted-trader", "orphan-budget"},
+	} {
+		if _, err = st.DB().Exec(`INSERT INTO copy_guard_reentry_candidates
+			(cycle_id,trader_id,leader_pos_id,symbol,side,status,feature_hash,
+			 pending_trigger,budget_blocked_until,next_review_at,closed_at)
+			VALUES(?,?,?,?,?,?,?,'DAILY_BUDGET',datetime('now','+1 day'),
+			       datetime('now','+1 day'),CURRENT_TIMESTAMP)`,
+			row.cycleID, row.trader, "leader-pos", "HYPEUSDT", "long",
+			ReentryCandidateBudgetSuspended, row.hash); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err = st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	st, err = New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	want := map[int64]string{
+		801: ReentryCandidateWaiting,
+		802: ReentryCandidatePausedByTrader,
+		803: ReentryCandidateInvalidatedTraderArchived,
+	}
+	for cycleID, wantStatus := range want {
+		var status string
+		var blocked sql.NullString
+		if err = st.DB().QueryRow(`SELECT status,budget_blocked_until
+			FROM copy_guard_reentry_candidates WHERE cycle_id=?`, cycleID).
+			Scan(&status, &blocked); err != nil {
+			t.Fatal(err)
+		}
+		if status != wantStatus || blocked.Valid {
+			t.Fatalf("cycle %d legacy budget state=%s blocked=%v want=%s",
+				cycleID, status, blocked.Valid, wantStatus)
+		}
+	}
+}
+
 func TestPendingManualSignalMigratesToAICandidate(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "migration.db")
-	st, err := New(path)
+	st, err := newReentryCandidateTestStore(t, path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -536,7 +648,7 @@ func TestPendingManualSignalMigratesToAICandidate(t *testing.T) {
 	}
 	_ = st.Close()
 
-	st, err = New(path)
+	st, err = newReentryCandidateTestStore(t, path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -552,7 +664,7 @@ func TestPendingManualSignalMigratesToAICandidate(t *testing.T) {
 }
 
 func TestListReentryCandidatesFiltersByTraderAndStatus(t *testing.T) {
-	st, err := New(filepath.Join(t.TempDir(), "candidate-list.db"))
+	st, err := newReentryCandidateTestStore(t, filepath.Join(t.TempDir(), "candidate-list.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -580,7 +692,7 @@ func TestListReentryCandidatesFiltersByTraderAndStatus(t *testing.T) {
 }
 
 func TestAbandonRequiresTwoHighConfidenceDistinctClosedCandles(t *testing.T) {
-	st, err := New(filepath.Join(t.TempDir(), "abandon.db"))
+	st, err := newReentryCandidateTestStore(t, filepath.Join(t.TempDir(), "abandon.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -619,7 +731,7 @@ func TestAbandonRequiresTwoHighConfidenceDistinctClosedCandles(t *testing.T) {
 }
 
 func TestLateAIResultCannotReviveTerminatedCandidate(t *testing.T) {
-	st, err := New(filepath.Join(t.TempDir(), "late-result.db"))
+	st, err := newReentryCandidateTestStore(t, filepath.Join(t.TempDir(), "late-result.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -649,7 +761,7 @@ func TestLateAIResultCannotReviveTerminatedCandidate(t *testing.T) {
 }
 
 func TestPortfolioReservationIsAtomicAndScopedToExchangeAccount(t *testing.T) {
-	st, err := New(filepath.Join(t.TempDir(), "portfolio.db"))
+	st, err := newReentryCandidateTestStore(t, filepath.Join(t.TempDir(), "portfolio.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -676,7 +788,7 @@ func TestPortfolioReservationIsAtomicAndScopedToExchangeAccount(t *testing.T) {
 }
 
 func TestConcurrentPortfolioReservationCannotPierceBudget(t *testing.T) {
-	st, err := New(filepath.Join(t.TempDir(), "portfolio-concurrent.db"))
+	st, err := newReentryCandidateTestStore(t, filepath.Join(t.TempDir(), "portfolio-concurrent.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -711,7 +823,7 @@ func TestConcurrentPortfolioReservationCannotPierceBudget(t *testing.T) {
 }
 
 func TestExecutionIntentRiskReservationPromotesWithoutDoubleCounting(t *testing.T) {
-	st, err := New(filepath.Join(t.TempDir(), "intent-risk.db"))
+	st, err := newReentryCandidateTestStore(t, filepath.Join(t.TempDir(), "intent-risk.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -763,7 +875,7 @@ func TestRiskReservationAdditiveMigrationIsIdempotent(t *testing.T) {
 	}
 	_ = raw.Close()
 	for pass := 0; pass < 2; pass++ {
-		st, openErr := New(dbPath)
+		st, openErr := newReentryCandidateTestStore(t, dbPath)
 		if openErr != nil {
 			t.Fatalf("migration pass %d: %v", pass, openErr)
 		}
@@ -779,7 +891,7 @@ func TestRiskReservationAdditiveMigrationIsIdempotent(t *testing.T) {
 }
 
 func TestReduceCopyGuardRiskToFillUsesImmutableReservationBase(t *testing.T) {
-	st, err := New(filepath.Join(t.TempDir(), "partial-risk-idempotency.db"))
+	st, err := newReentryCandidateTestStore(t, filepath.Join(t.TempDir(), "partial-risk-idempotency.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -806,7 +918,7 @@ func TestReduceCopyGuardRiskToFillUsesImmutableReservationBase(t *testing.T) {
 }
 
 func TestOutcomeCleanupRequiresPositiveCrossAnalysisEvidence(t *testing.T) {
-	st, err := New(filepath.Join(t.TempDir(), "outcome-cleanup.db"))
+	st, err := newReentryCandidateTestStore(t, filepath.Join(t.TempDir(), "outcome-cleanup.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -853,7 +965,7 @@ func TestOutcomeCleanupRequiresPositiveCrossAnalysisEvidence(t *testing.T) {
 }
 
 func TestExecutionIntentAddReservationHoldsOnlyRiskDelta(t *testing.T) {
-	st, err := New(filepath.Join(t.TempDir(), "intent-add-risk.db"))
+	st, err := newReentryCandidateTestStore(t, filepath.Join(t.TempDir(), "intent-add-risk.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -891,7 +1003,7 @@ func TestExecutionIntentAddReservationHoldsOnlyRiskDelta(t *testing.T) {
 }
 
 func TestCycleCloseReleasesRiskReservation(t *testing.T) {
-	st, err := New(filepath.Join(t.TempDir(), "reservation-close.db"))
+	st, err := newReentryCandidateTestStore(t, filepath.Join(t.TempDir(), "reservation-close.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -916,7 +1028,7 @@ func TestCycleCloseReleasesRiskReservation(t *testing.T) {
 }
 
 func TestCandidateFeatureRefreshCannotShortenFailureBackoff(t *testing.T) {
-	st, err := New(filepath.Join(t.TempDir(), "candidate-backoff.db"))
+	st, err := newReentryCandidateTestStore(t, filepath.Join(t.TempDir(), "candidate-backoff.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -960,7 +1072,7 @@ func TestCandidateFeatureRefreshCannotShortenFailureBackoff(t *testing.T) {
 }
 
 func TestUnactionableEventDedupeKeepsReasonChangesAndHeartbeat(t *testing.T) {
-	st, err := New(filepath.Join(t.TempDir(), "candidate-event-dedupe.db"))
+	st, err := newReentryCandidateTestStore(t, filepath.Join(t.TempDir(), "candidate-event-dedupe.db"))
 	if err != nil {
 		t.Fatal(err)
 	}

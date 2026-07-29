@@ -2,7 +2,8 @@
 //
 // AI 只判断趋势反转与建议缩放比例；仓位、风险预算、止损可保护性和
 // 订单幂等由 copytrade 确定性执行层最终裁决。插件每 5 秒领取到期候选，
-// 使用数据哈希、最小间隔、退避与日/生命周期额度控制调用。历史人工信号只保留
+// 使用数据哈希、最小间隔、事件合并与故障退避控制调用。原日/生命周期额度只保留
+// 费用软预警，不再中断分析。历史人工信号只保留
 // 查询兼容，不再由后台产生分析或执行。
 package reentryadvisor
 
@@ -11,12 +12,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"sort"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"nofx/copyguardmetrics"
 	"nofx/copytrade"
 	"nofx/logger"
+	"nofx/market"
 	"nofx/store"
 )
 
@@ -31,6 +37,10 @@ const (
 	maxAutoAnalysisRetries = 2
 	// manualAnalyzeCooldown 手动"内置 AI 分析"按钮冷却，防误触连击烧 token
 	manualAnalyzeCooldown = 30 * time.Second
+	// marketEventScanInterval bounds public-market polling. The scan only
+	// schedules a review; feature-hash dedupe still decides whether a model
+	// call is needed.
+	marketEventScanInterval = 5 * time.Minute
 )
 
 // Advisor 插件实例（进程内单例）
@@ -45,12 +55,18 @@ type Advisor struct {
 	started bool
 
 	// Phase 2：内置 AI 分析进行中标记（防止同一记录并发分析）
-	inflightMu sync.Mutex
-	inflight   map[int64]bool
+	inflightMu     sync.Mutex
+	inflight       map[int64]bool
+	inflightTrader map[string]bool
 	// aiRetries 自动分析失败补跑计数（analysis ID → 已补跑次数，内存态，
 	// 重启清零重新给额度）；analyzeLast 手动 analyze 冷却（analysis ID → 上次触发）
 	aiRetries   map[int64]int
 	analyzeLast map[int64]time.Time
+
+	marketEventMu       sync.Mutex
+	marketEventLastScan map[int64]time.Time
+	marketEventState    map[int64]marketEventSnapshot
+	marketEventScanning atomic.Bool
 
 	// Phase 2：结局回填节流计数（每 backfillEvery 轮跑一次）
 	pollCount int
@@ -64,12 +80,15 @@ var (
 // Start 创建并启动插件（main.go 调用一次）。返回实例供 Stop。
 func Start(st *store.Store) *Advisor {
 	a := &Advisor{
-		st:          st,
-		bn:          newBinanceClient(),
-		stopCh:      make(chan struct{}),
-		inflight:    map[int64]bool{},
-		aiRetries:   map[int64]int{},
-		analyzeLast: map[int64]time.Time{},
+		st:                  st,
+		bn:                  newBinanceClient(),
+		stopCh:              make(chan struct{}),
+		inflight:            map[int64]bool{},
+		inflightTrader:      map[string]bool{},
+		aiRetries:           map[int64]int{},
+		analyzeLast:         map[int64]time.Time{},
+		marketEventLastScan: map[int64]time.Time{},
+		marketEventState:    map[int64]marketEventSnapshot{},
 	}
 	defaultAdvisorMu.Lock()
 	defaultAdvisor = a
@@ -134,6 +153,14 @@ func (a *Advisor) pollOnce() {
 	if a.pollCount%backfillEvery == 0 {
 		a.backfillOutcomes()
 		a.backfillDecisionEvaluations()
+		if cfg.AIEnabled && a.marketEventScanning.CompareAndSwap(false, true) {
+			a.wg.Add(1)
+			go func() {
+				defer a.wg.Done()
+				defer a.marketEventScanning.Store(false)
+				a.pollMarketEventReviews()
+			}()
+		}
 	}
 	if !cfg.Enabled {
 		return
@@ -142,6 +169,192 @@ func (a *Advisor) pollOnce() {
 		a.pollAICandidates(cfg)
 	}
 
+}
+
+type marketEventSnapshot struct {
+	FundingState string
+	OIState      string
+	CVDState     string
+	ATRState     string
+}
+
+func changedMarketEventTriggers(before, after marketEventSnapshot) []string {
+	var changed []string
+	for _, field := range []struct {
+		name          string
+		before, after string
+	}{
+		{"FUNDING_STATE_FLIP", before.FundingState, after.FundingState},
+		{"OI_STATE_FLIP", before.OIState, after.OIState},
+		{"CONTRACT_CVD_STATE_FLIP", before.CVDState, after.CVDState},
+		{"ATR_REGIME_CHANGE", before.ATRState, after.ATRState},
+	} {
+		// Missing data becoming available is evidence-quality recovery, not a
+		// market reversal by itself.
+		if field.before != "" && field.after != "" && field.before != field.after {
+			changed = append(changed, field.name)
+		}
+	}
+	sort.Strings(changed)
+	return changed
+}
+
+func atrFromClosedKlines(klines []market.Kline, period int) float64 {
+	if period <= 0 || len(klines) < period+1 {
+		return 0
+	}
+	start := len(klines) - period
+	var total float64
+	for i := start; i < len(klines); i++ {
+		prevClose := klines[i-1].Close
+		tr := math.Max(klines[i].High-klines[i].Low,
+			math.Max(math.Abs(klines[i].High-prevClose), math.Abs(klines[i].Low-prevClose)))
+		total += tr
+	}
+	return total / float64(period)
+}
+
+func oiState(points []oiPoint) string {
+	if len(points) < 2 {
+		return ""
+	}
+	change := pctChange(points[0].Value, points[len(points)-1].Value)
+	switch {
+	case change >= 1:
+		return "RISING"
+	case change <= -1:
+		return "FALLING"
+	default:
+		return "STABLE"
+	}
+}
+
+func atrRegime(current, baseline float64) string {
+	if current <= 0 || baseline <= 0 {
+		return ""
+	}
+	ratio := current / baseline
+	switch {
+	case ratio >= 1.5:
+		return "EXPANDED"
+	case ratio <= 0.67:
+		return "CONTRACTED"
+	default:
+		return "NORMAL"
+	}
+}
+
+func (a *Advisor) loadMarketEventSnapshot(c *store.CopyGuardReentryCandidate) marketEventSnapshot {
+	var snapshot marketEventSnapshot
+	if a == nil || a.bn == nil || c == nil {
+		return snapshot
+	}
+	var wg sync.WaitGroup
+	wg.Add(4)
+	go func() {
+		defer wg.Done()
+		if premium, err := a.bn.premiumIndex(c.Symbol); err == nil {
+			snapshot.FundingState = fundingState(premium.LastFundingRate)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if points, err := a.bn.openInterestHist(c.Symbol, "5m", 13); err == nil {
+			snapshot.OIState = oiState(points)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if klines, err := a.bn.futuresKlines(c.Symbol, "5m", 60); err == nil {
+			if cvd := summarizeCVD(closedKlinesAt(klines, time.Now())); cvd != nil {
+				snapshot.CVDState = cvd.SlopeSign + "|" + cvd.Divergence
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if klines, err := a.bn.futuresKlines(c.Symbol, "1h", 30); err == nil {
+			snapshot.ATRState = atrRegime(atrFromClosedKlines(closedKlinesAt(klines, time.Now()), 14), c.ATR)
+		}
+	}()
+	wg.Wait()
+	return snapshot
+}
+
+// pollMarketEventReviews turns material derivative-market state flips into
+// coalesced candidate reviews. It never calls the model or mutates execution
+// state directly.
+func (a *Advisor) pollMarketEventReviews() {
+	traders, err := a.st.Trader().ListAll()
+	if err != nil {
+		logger.Warnf("[ReentryAdvisor] 读取市场事件交易员失败: %v", err)
+		return
+	}
+	var runningIDs []string
+	for _, trader := range traders {
+		if trader != nil && trader.LifecycleStatus == store.TraderLifecycleRunning && trader.IsRunning {
+			runningIDs = append(runningIDs, trader.ID)
+		}
+	}
+	candidates, err := a.st.ReentryAI().ListReentryCandidatesByTraders(runningIDs,
+		[]string{store.ReentryCandidateWatching, store.ReentryCandidateWaiting}, 25)
+	if err != nil {
+		logger.Warnf("[ReentryAdvisor] 读取市场事件候选失败: %v", err)
+		return
+	}
+	now := time.Now().UTC()
+	active := make(map[int64]struct{}, len(candidates))
+	symbolSnapshots := make(map[string]marketEventSnapshot)
+	for _, candidate := range candidates {
+		if candidate == nil {
+			continue
+		}
+		active[candidate.ID] = struct{}{}
+		a.marketEventMu.Lock()
+		lastScan := a.marketEventLastScan[candidate.ID]
+		a.marketEventMu.Unlock()
+		if !lastScan.IsZero() && now.Sub(lastScan) < marketEventScanInterval {
+			continue
+		}
+		snapshotKey := fmt.Sprintf("%s|%.8f", strings.ToUpper(candidate.Symbol), candidate.ATR)
+		snapshot, cached := symbolSnapshots[snapshotKey]
+		if !cached {
+			snapshot = a.loadMarketEventSnapshot(candidate)
+			symbolSnapshots[snapshotKey] = snapshot
+		}
+		a.marketEventMu.Lock()
+		before, hadBefore := a.marketEventState[candidate.ID]
+		a.marketEventState[candidate.ID] = snapshot
+		a.marketEventLastScan[candidate.ID] = now
+		a.marketEventMu.Unlock()
+		if !hadBefore {
+			continue
+		}
+		triggers := changedMarketEventTriggers(before, snapshot)
+		if len(triggers) == 0 {
+			continue
+		}
+		traderCfg, cfgErr := a.st.CopyTrade().GetByTraderID(candidate.TraderID)
+		if cfgErr != nil || traderCfg.RiskReentryDecisionMode != "ai_guarded" ||
+			!traderCfg.RiskReentryEnabled {
+			continue
+		}
+		minInterval := time.Duration(traderCfg.RiskAIMinReviewSeconds) * time.Second
+		trigger := strings.Join(triggers, "+")
+		if _, scheduleErr := a.st.ReentryAI().ScheduleReentryCandidateEventReview(
+			candidate.ID, trigger, minInterval); scheduleErr != nil {
+			logger.Warnf("[ReentryAdvisor] 市场状态事件复审调度失败 candidate=%d trigger=%s: %v",
+				candidate.ID, trigger, scheduleErr)
+		}
+	}
+	a.marketEventMu.Lock()
+	for id := range a.marketEventState {
+		if _, exists := active[id]; !exists {
+			delete(a.marketEventState, id)
+			delete(a.marketEventLastScan, id)
+		}
+	}
+	a.marketEventMu.Unlock()
 }
 
 func (a *Advisor) backfillDecisionEvaluations() {
@@ -169,6 +382,16 @@ func (a *Advisor) pollAICandidates(cfg *store.ReentryAIConfig) {
 		return
 	}
 	for _, candidate := range candidates {
+		lifecycle, lifecycleErr := a.st.Trader().GetLifecycle(candidate.TraderID)
+		if lifecycleErr != nil || lifecycle.Status != store.TraderLifecycleRunning || !lifecycle.IsRunning {
+			continue
+		}
+		a.inflightMu.Lock()
+		traderBusy := a.inflightTrader[candidate.TraderID]
+		a.inflightMu.Unlock()
+		if traderBusy {
+			continue
+		}
 		traderCfg, err := a.st.CopyTrade().GetByTraderID(candidate.TraderID)
 		if err != nil || !traderCfg.RiskStopLossEnabled || traderCfg.RiskReentryDecisionMode != "ai_guarded" || !traderCfg.RiskReentryEnabled {
 			continue
@@ -220,11 +443,6 @@ func (a *Advisor) pollAICandidates(cfg *store.ReentryAIConfig) {
 			continue
 		}
 		if !ok {
-			if claimed != nil && claimed.Status == store.ReentryCandidateBudgetSuspended {
-				a.updateCandidateCycleStatus(claimed, store.CopyGuardBudgetSuspended)
-				a.recordCandidateEvent(claimed, "AI_BUDGET_SUSPENDED", claimed.TriggerPrice, 0, map[string]interface{}{"review_count": claimed.ReviewCount, "lifecycle_limit": traderCfg.RiskAILifecycleCallLimit})
-				a.notifyCandidateImportant(claimed, "AI_BUDGET_SUSPENDED", "AI 重入观察额度已耗尽", "候选已暂停，不再继续消耗模型额度。")
-			}
 			continue
 		}
 		if claimed == nil {
@@ -270,14 +488,15 @@ func (a *Advisor) pollAICandidates(cfg *store.ReentryAIConfig) {
 			continue
 		}
 		if duplicate {
-			if err := a.st.ReentryAI().SkipDuplicateCandidateReview(claimed.ID, analysis.ID, time.Now().Add(2*time.Hour)); err != nil {
+			next := a.nextCandidateReviewAt(claimed.ID, time.Now().UTC())
+			if err := a.st.ReentryAI().SkipDuplicateCandidateReview(claimed.ID, analysis.ID, next); err != nil {
 				logger.Warnf("[ReentryAdvisor] 候选 %d 跳过重复数据失败: %v", claimed.ID, err)
 			} else {
 				a.updateCandidateCycleStatus(claimed, store.CopyGuardAIWaiting)
 			}
 			continue
 		}
-		if !a.spawnAnalysis(analysis.ID, true) {
+		if !a.spawnAnalysis(analysis.ID, true, claimed.TraderID) {
 			_ = a.st.ReentryAI().FailReentryCandidateBeforeModel(claimed.ID, analysis.ID, "advisor stopped before model call", candidateFailureBackoff(claimed.FailureCount+1))
 			a.updateCandidateCycleStatus(claimed, store.CopyGuardAIWaiting)
 		}
@@ -287,10 +506,18 @@ func (a *Advisor) pollAICandidates(cfg *store.ReentryAIConfig) {
 var errCandidateUnactionable = errors.New("AI candidate is deterministically unactionable")
 
 func (a *Advisor) updateCandidateCycleStatus(c *store.CopyGuardReentryCandidate, status string) {
-	if a == nil || a.st == nil || c == nil {
+	if a == nil || a.st == nil || c == nil || !a.traderLifecycleRunning(c.TraderID) {
 		return
 	}
 	_ = a.st.CopyTrade().UpdateCopyGuardObservation(c.CycleID, status, c.LeaderEntryPrice, c.TriggerPrice, c.ATR)
+}
+
+func (a *Advisor) traderLifecycleRunning(traderID string) bool {
+	if a == nil || a.st == nil {
+		return false
+	}
+	state, err := a.st.Trader().GetLifecycle(traderID)
+	return err == nil && state.Status == store.TraderLifecycleRunning && state.IsRunning
 }
 
 func candidateFailureBackoff(n int) time.Duration {
@@ -300,7 +527,14 @@ func candidateFailureBackoff(n int) time.Duration {
 	if n == 2 {
 		return 15 * time.Minute
 	}
-	return time.Hour
+	backoff := time.Hour
+	for attempt := 3; attempt < n && backoff < 6*time.Hour; attempt++ {
+		backoff *= 2
+	}
+	if backoff > 6*time.Hour {
+		backoff = 6 * time.Hour
+	}
+	return backoff
 }
 
 func (a *Advisor) generateForCandidate(c *store.CopyGuardReentryCandidate, cfg *store.ReentryAIConfig) (*store.ReentryAIAnalysis, error) {
@@ -339,7 +573,7 @@ func (a *Advisor) generateForCandidate(c *store.CopyGuardReentryCandidate, cfg *
 }
 
 func (a *Advisor) recordCandidateEvent(c *store.CopyGuardReentryCandidate, event string, price, notional float64, detail map[string]interface{}) {
-	if c == nil {
+	if c == nil || !a.traderLifecycleRunning(c.TraderID) {
 		return
 	}
 	if detail == nil {
@@ -379,7 +613,7 @@ func (a *Advisor) maybeRetryAnalysis(signalID int64) {
 
 // spawnAnalysis 以受管 goroutine 启动内置 AI 分析：纳入 wg（Stop 会等待
 // 收尾，避免对已关闭资源写入），插件已停止时不再启动。
-func (a *Advisor) spawnAnalysis(analysisID int64, autoTriggered bool) bool {
+func (a *Advisor) spawnAnalysis(analysisID int64, autoTriggered bool, traderIDs ...string) bool {
 	a.mu.Lock()
 	if !a.started {
 		a.mu.Unlock()
@@ -387,8 +621,34 @@ func (a *Advisor) spawnAnalysis(analysisID int64, autoTriggered bool) bool {
 	}
 	a.wg.Add(1)
 	a.mu.Unlock()
+	traderID := ""
+	if len(traderIDs) > 0 {
+		traderID = traderIDs[0]
+	} else if analysis, err := a.st.ReentryAI().GetReentryAnalysis(analysisID); err == nil {
+		traderID = analysis.TraderID
+	}
+	if traderID != "" {
+		a.inflightMu.Lock()
+		if a.inflightTrader == nil {
+			a.inflightTrader = map[string]bool{}
+		}
+		if a.inflightTrader[traderID] {
+			a.inflightMu.Unlock()
+			a.wg.Done()
+			return false
+		}
+		a.inflightTrader[traderID] = true
+		a.inflightMu.Unlock()
+	}
 	go func() {
 		defer a.wg.Done()
+		if traderID != "" {
+			defer func() {
+				a.inflightMu.Lock()
+				delete(a.inflightTrader, traderID)
+				a.inflightMu.Unlock()
+			}()
+		}
 		select {
 		case <-a.stopCh:
 			return

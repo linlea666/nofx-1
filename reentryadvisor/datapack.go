@@ -193,6 +193,9 @@ type LeaderInfo struct {
 	UnrealizedPnLPct             float64 `json:"unrealized_pnl_pct_est"`
 	SizeVsCycleBaseline          float64 `json:"size_vs_cycle_baseline_ratio"` // 当前仓位/周期基线仓位（>1=加过仓）
 	SizeVsCycleBaselineAvailable bool    `json:"size_vs_cycle_baseline_available"`
+	BehaviorClass                string  `json:"behavior_class"`
+	AddingWhileLosing            bool    `json:"adding_while_losing"`
+	ConcentrationSpike           bool    `json:"concentration_spike"`
 }
 
 type AttemptEntry struct {
@@ -408,6 +411,21 @@ func buildDataPack(st *store.Store, bn *binanceClient, sig *store.CopyGuardManua
 	if cycle.BaselineAvailable && cycle.BaselineLeaderSize > 0 {
 		guard.Leader.SizeVsCycleBaseline = round(sig.LeaderSize/cycle.BaselineLeaderSize, 3)
 		guard.Leader.SizeVsCycleBaselineAvailable = true
+		ratio := guard.Leader.SizeVsCycleBaseline
+		switch {
+		case ratio < 0.8:
+			guard.Leader.BehaviorClass = "REDUCING"
+		case ratio >= 1.2 && guard.Leader.UnrealizedPnLPct < 0:
+			guard.Leader.BehaviorClass = "AVERAGING_DOWN"
+			guard.Leader.AddingWhileLosing = true
+		case ratio >= 1.2:
+			guard.Leader.BehaviorClass = "TREND_ADDING"
+		default:
+			guard.Leader.BehaviorClass = "HOLDING"
+		}
+		guard.Leader.ConcentrationSpike = ratio >= 5
+	} else {
+		guard.Leader.BehaviorClass = "UNKNOWN"
 	}
 	guard.ReentryBoundaryAvailable = guard.ReentryBoundary > 0
 	guard.ChaseLimitAvailable = guard.ChaseLimit > 0

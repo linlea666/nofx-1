@@ -125,6 +125,23 @@ export interface TraderInfo {
   ai_model: string
   exchange_id?: string
   is_running?: boolean
+  lifecycle_status?:
+    | 'STARTING'
+    | 'RUNNING'
+    | 'STOPPING'
+    | 'STOPPING_RECONCILE_REQUIRED'
+    | 'STOPPED'
+    | 'ARCHIVING'
+    | 'ARCHIVED'
+  lifecycle_generation?: number
+  pending_blockers?: Array<{
+    code: string
+    resource_id: string
+    symbol?: string
+    status: string
+  }>
+  stopped_at?: string
+  archived_at?: string
   show_in_competition?: boolean
   strategy_id?: string
   strategy_name?: string
@@ -400,6 +417,9 @@ export interface TraderConfigData {
   scan_interval_minutes: number
   initial_balance: number
   is_running: boolean
+  lifecycle_status?: TraderInfo['lifecycle_status']
+  lifecycle_generation?: number
+  pending_blockers?: TraderInfo['pending_blockers']
   decision_mode?: DecisionMode // "ai" or "copy_trade"
   // 以下为旧版字段（向后兼容）
   btc_eth_leverage?: number
@@ -918,6 +938,49 @@ export interface CopyGuardSummary {
     baseline: number
     net_effect: number
   }>
+  shadow_promotion?: CopyGuardShadowPromotionReport
+}
+
+export interface CopyGuardShadowEvaluation {
+  id: number
+  cycle_id: number
+  trader_id: string
+  policy:
+    | 'CURRENT_STOP'
+    | 'WIDE_STOP_EQUAL_RISK'
+    | 'STAGED_REDUCTION'
+    | 'PROBE_REENTRY_25_PCT'
+  evaluation_version: number
+  status: 'SCORABLE' | 'NO_SIGNAL' | 'UNSCORABLE'
+  data_quality: 'VERIFIED' | 'ESTIMATED_SHADOW' | 'UNSCORABLE'
+  gross_pnl: number
+  estimated_cost: number
+  net_pnl: number
+  size_factor: number
+  entry_price: number
+  exit_price: number
+  reason: string
+}
+
+export interface CopyGuardShadowPromotionReport {
+  status: 'INSUFFICIENT_DATA' | 'MANUAL_ENABLE_ELIGIBLE'
+  minimum_independent_cycles: number
+  minimum_enter_samples: number
+  requires_positive_median: boolean
+  requires_non_negative_ci95: boolean
+  requires_zero_unprotected: boolean
+  policies: Array<{
+    policy: string
+    independent_cycles: number
+    enter_samples: number
+    mean_net_pnl: number
+    median_net_pnl: number
+    bootstrap_ci95_low: number
+    bootstrap_ci95_high: number
+    unprotected_filled_count: number
+    eligible_for_manual_enable: boolean
+    blocking_reasons: string[]
+  }>
 }
 export interface RateEstimate {
   numerator: number
@@ -1116,6 +1179,8 @@ export interface CopyGuardAICandidate {
     | 'BUDGET_SUSPENDED'
     | 'INVALIDATED'
     | 'PAUSED'
+    | 'PAUSED_BY_TRADER'
+    | 'INVALIDATED_TRADER_ARCHIVED'
   trigger_price: number
   atr: number
   max_notional: number
@@ -1150,6 +1215,8 @@ export interface CopyGuardAICandidate {
   ai_daily_call_limit: number
   ai_daily_calls_used: number
   ai_lifecycle_call_limit: number
+  ai_call_limits_deprecated: boolean
+  ai_cost_warning_exceeded: boolean
   snapshot_at: string
   last_review_at?: string
   next_review_at: string
@@ -1260,6 +1327,7 @@ export interface CopyGuardAIEffectSummary {
   decision_outcome_counts: Record<string, number>
   market_outcome_counts: Record<string, number>
   missed_reversals: number
+  missed_reversal_decisions: number
   correct_abandons: number
   risk_gate_saved_losses: number
   enter_decisions: number

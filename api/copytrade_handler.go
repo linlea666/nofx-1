@@ -263,8 +263,16 @@ func (h *CopyTradeHandler) ListAICandidates(c *gin.Context) {
 		if calls, callsErr := h.store.ReentryAI().CountReentryCandidateCalls24h(candidate.ID); callsErr == nil {
 			candidate.AIDailyCallsUsed = calls
 		}
+		candidate.AICallLimitsDeprecated = true
+		candidate.AICostWarningExceeded =
+			(candidate.AIDailyCallLimit > 0 && candidate.AIDailyCallsUsed >= candidate.AIDailyCallLimit) ||
+				(candidate.AILifecycleCallLimit > 0 && candidate.ReviewCount >= candidate.AILifecycleCallLimit)
 	}
-	c.JSON(http.StatusOK, gin.H{"candidates": candidates, "trader_names": names, "count": len(candidates)})
+	c.JSON(http.StatusOK, gin.H{
+		"candidates": candidates, "trader_names": names, "count": len(candidates),
+		"call_limits_deprecated": true,
+		"call_limit_semantics":   "soft_cost_warning_only",
+	})
 }
 
 func (h *CopyTradeHandler) getOwnedAICandidate(c *gin.Context) *store.CopyGuardReentryCandidate {
@@ -308,6 +316,11 @@ func (h *CopyTradeHandler) ResumeAICandidate(c *gin.Context) {
 	if candidate == nil {
 		return
 	}
+	lifecycle, err := h.store.Trader().GetLifecycle(candidate.TraderID)
+	if err != nil || lifecycle.Status != store.TraderLifecycleRunning || !lifecycle.IsRunning {
+		c.JSON(http.StatusConflict, gin.H{"error": "candidate can only be resumed while trader is RUNNING"})
+		return
+	}
 	if err := h.store.ReentryAI().ResumeReentryCandidate(candidate.ID); err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 		return
@@ -319,6 +332,11 @@ func (h *CopyTradeHandler) ResumeAICandidate(c *gin.Context) {
 func (h *CopyTradeHandler) RequestAICandidateReview(c *gin.Context) {
 	candidate := h.getOwnedAICandidate(c)
 	if candidate == nil {
+		return
+	}
+	lifecycle, lifecycleErr := h.store.Trader().GetLifecycle(candidate.TraderID)
+	if lifecycleErr != nil || lifecycle.Status != store.TraderLifecycleRunning || !lifecycle.IsRunning {
+		c.JSON(http.StatusConflict, gin.H{"error": "AI review requires a RUNNING trader"})
 		return
 	}
 	policy, err := h.store.CopyTrade().GetByTraderID(candidate.TraderID)
@@ -365,7 +383,10 @@ func (h *CopyTradeHandler) TerminateAICandidate(c *gin.Context) {
 		return
 	}
 	_ = h.store.CopyTrade().UpdateCopyGuardObservation(candidate.CycleID, store.CopyGuardAIAbandoned, candidate.LeaderEntryPrice, candidate.TriggerPrice, candidate.ATR)
-	_ = h.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: candidate.CycleID, TraderID: candidate.TraderID, Type: "AI_CANDIDATE_TERMINATED", Metadata: map[string]interface{}{"candidate_id": candidate.ID, "operator": c.GetString("user_id")}})
+	if lifecycle, lifecycleErr := h.store.Trader().GetLifecycle(candidate.TraderID); lifecycleErr == nil &&
+		lifecycle.Status == store.TraderLifecycleRunning && lifecycle.IsRunning {
+		_ = h.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: candidate.CycleID, TraderID: candidate.TraderID, Type: "AI_CANDIDATE_TERMINATED", Metadata: map[string]interface{}{"candidate_id": candidate.ID, "operator": c.GetString("user_id")}})
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "AI candidate terminated"})
 }
 
@@ -431,14 +452,15 @@ func riskFilter(c *gin.Context) store.CopyGuardFilter {
 }
 
 type copyGuardCycleArtifacts struct {
-	Attempts      []*store.CopyGuardAttempt            `json:"attempts"`
-	Events        []*store.CopyGuardEvent              `json:"events"`
-	Intents       []*store.CopyTradeExecutionIntent    `json:"execution_intents"`
-	Protection    *store.CopyGuardProtectiveOrder      `json:"protection,omitempty"`
-	WatchSamples  []*store.CopyGuardWatchSample        `json:"watch_samples"`
-	Candidates    []*store.CopyGuardReentryCandidate   `json:"ai_candidates"`
-	AIAnalyses    []*store.ReentryAIAnalysis           `json:"ai_analyses"`
-	AIEvaluations []*store.ReentryAIDecisionEvaluation `json:"ai_decision_evaluations"`
+	Attempts          []*store.CopyGuardAttempt            `json:"attempts"`
+	Events            []*store.CopyGuardEvent              `json:"events"`
+	Intents           []*store.CopyTradeExecutionIntent    `json:"execution_intents"`
+	Protection        *store.CopyGuardProtectiveOrder      `json:"protection,omitempty"`
+	WatchSamples      []*store.CopyGuardWatchSample        `json:"watch_samples"`
+	Candidates        []*store.CopyGuardReentryCandidate   `json:"ai_candidates"`
+	AIAnalyses        []*store.ReentryAIAnalysis           `json:"ai_analyses"`
+	AIEvaluations     []*store.ReentryAIDecisionEvaluation `json:"ai_decision_evaluations"`
+	ShadowEvaluations []*store.CopyGuardShadowEvaluation   `json:"shadow_evaluations"`
 }
 
 type copyGuardAttemptAttribution struct {
@@ -619,12 +641,15 @@ func (h *CopyTradeHandler) loadCopyGuardCycleArtifacts(cycleID int64) (*copyGuar
 	if artifacts.AIEvaluations, err = h.store.ReentryAI().ListReentryDecisionEvaluationsByCycle(cycleID); err != nil {
 		return nil, err
 	}
+	if artifacts.ShadowEvaluations, err = h.store.CopyTrade().ListCopyGuardShadowEvaluations(cycleID); err != nil {
+		return nil, err
+	}
 	return artifacts, nil
 }
 
 func copyGuardCycleDocument(cycle *store.CopyGuardCycle, artifacts *copyGuardCycleArtifacts) gin.H {
 	return gin.H{
-		"schema_version":          6,
+		"schema_version":          7,
 		"defaults_version":        store.CopyGuardDefaultsVersion(),
 		"cycle":                   cycle,
 		"attempts":                artifacts.Attempts,
@@ -636,6 +661,7 @@ func copyGuardCycleDocument(cycle *store.CopyGuardCycle, artifacts *copyGuardCyc
 		"ai_analyses":             artifacts.AIAnalyses,
 		"ai_decision_evaluations": artifacts.AIEvaluations,
 		"ai_effect_summary":       copyguardmetrics.SummarizeCycleAIEffects(cycle, artifacts.Attempts, artifacts.AIEvaluations),
+		"shadow_evaluations":      artifacts.ShadowEvaluations,
 		"attribution":             buildCopyGuardAttribution(cycle, artifacts.Attempts, artifacts.Events),
 	}
 }
@@ -652,7 +678,12 @@ func (h *CopyTradeHandler) GetRiskSummary(c *gin.Context) {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(200, gin.H{"summary": x, "from": from, "to": to})
+	shadowPromotion, shadowErr := copyguardmetrics.BuildShadowPromotionReport(h.store, ids, from, to)
+	if shadowErr != nil {
+		c.JSON(500, gin.H{"error": shadowErr.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"summary": x, "shadow_promotion": shadowPromotion, "from": from, "to": to})
 }
 func (h *CopyTradeHandler) GetRiskCycles(c *gin.Context) {
 	ids, _, names, err := h.ownedTraderIDs(c)
@@ -1136,10 +1167,12 @@ func (h *CopyTradeHandler) GetConfig(c *gin.Context) {
 		effectiveStopPolicy = policy
 	}
 	c.JSON(http.StatusOK, gin.H{
-		"config":                maskedCopyTradeConfig(config),
-		"status":                copytrade.IsCopyTradingRunning(traderID),
-		"source_health":         sourceHealth,
-		"effective_stop_policy": effectiveStopPolicy,
+		"config":                 maskedCopyTradeConfig(config),
+		"status":                 copytrade.IsCopyTradingRunning(traderID),
+		"source_health":          sourceHealth,
+		"effective_stop_policy":  effectiveStopPolicy,
+		"call_limits_deprecated": true,
+		"call_limit_semantics":   "soft_cost_warning_only",
 	})
 }
 
@@ -1489,8 +1522,10 @@ func (h *CopyTradeHandler) SaveConfig(c *gin.Context) {
 		traderID, req.ProviderType, req.LeaderID, req.CopyRatio*100)
 
 	response := gin.H{
-		"message": "config saved",
-		"config":  maskedCopyTradeConfig(config),
+		"message":                "config saved",
+		"config":                 maskedCopyTradeConfig(config),
+		"call_limits_deprecated": true,
+		"call_limit_semantics":   "soft_cost_warning_only",
 	}
 	if manualDeprecated {
 		response["deprecated"] = manualReentryDeprecatedMessage
@@ -1662,6 +1697,19 @@ func applyCopyGuardV4Request(c, old *store.CopyTradeConfig, r *CopyTradeConfigRe
 // @Router /api/copytrade/config/{trader_id} [delete]
 func (h *CopyTradeHandler) DeleteConfig(c *gin.Context) {
 	traderID := c.Param("trader_id")
+	userID := c.GetString("user_id")
+	lifecycle, err := h.store.Trader().GetLifecycleForUser(userID, traderID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "trader not found or access denied"})
+		return
+	}
+	if lifecycle.Status != store.TraderLifecycleStopped {
+		c.JSON(http.StatusConflict, gin.H{
+			"error":            "copy-trade config can only be removed while trader is STOPPED",
+			"lifecycle_status": lifecycle.Status,
+		})
+		return
+	}
 	live, err := h.store.CopyTrade().HasLiveSourceState(traderID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to verify active copy-trade state"})
@@ -1670,11 +1718,6 @@ func (h *CopyTradeHandler) DeleteConfig(c *gin.Context) {
 	if live {
 		c.JSON(http.StatusConflict, gin.H{"error": "当前仍有活动跟单映射、持仓保护或 Copy Guard 周期，不能删除配置；请先安全清理旧来源"})
 		return
-	}
-
-	// 先停止跟单
-	if copytrade.IsCopyTradingRunning(traderID) {
-		copytrade.StopCopyTradingForTrader(traderID)
 	}
 
 	// 删除配置
@@ -1697,10 +1740,9 @@ func (h *CopyTradeHandler) DeleteConfig(c *gin.Context) {
 // @Router /api/copytrade/start/{trader_id} [post]
 func (h *CopyTradeHandler) Start(c *gin.Context) {
 	traderID := c.Param("trader_id")
-
-	// 检查是否已在运行
-	if copytrade.IsCopyTradingRunning(traderID) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "copy trading already running"})
+	userID := c.GetString("user_id")
+	if _, err := h.store.Trader().GetFullConfig(userID, traderID); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "trader not found or access denied"})
 		return
 	}
 
@@ -1710,21 +1752,67 @@ func (h *CopyTradeHandler) Start(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "trader not found"})
 		return
 	}
+	lifecycle, err := h.store.Trader().BeginStart(userID, traderID)
+	if err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		return
+	}
+	if lifecycle.Status == store.TraderLifecycleRunning {
+		if copytrade.IsCopyTradingRunning(traderID) {
+			c.JSON(http.StatusOK, gin.H{
+				"message": "copy trading already running", "status": store.TraderLifecycleRunning,
+				"lifecycle_generation": lifecycle.Generation,
+			})
+			return
+		}
+		c.JSON(http.StatusConflict, gin.H{
+			"error": "trader is RUNNING without a copy-trade runtime; stop it through the unified lifecycle before switching modes",
+		})
+		return
+	}
+	autoTrader.SetLifecycleGeneration(lifecycle.Generation)
+	if err = h.store.CopyTrade().SetEnabled(traderID, true); err != nil {
+		_ = h.store.Trader().FailStart(userID, traderID, lifecycle.Generation, err.Error())
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if err = h.store.CopyTrade().UpdateDecisionMode(traderID, "copy_trade"); err != nil {
+		_ = h.store.CopyTrade().SetEnabled(traderID, false)
+		_ = h.store.Trader().FailStart(userID, traderID, lifecycle.Generation, err.Error())
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if err = h.store.Trader().CompleteStart(userID, traderID, lifecycle.Generation); err != nil {
+		_ = h.store.CopyTrade().SetEnabled(traderID, false)
+		_ = h.store.Trader().FailStart(userID, traderID, lifecycle.Generation, err.Error())
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		return
+	}
 
 	// 启动跟单
-	if err := copytrade.StartCopyTradingForTrader(traderID, autoTrader, h.store); err != nil {
+	if err = copytrade.StartCopyTradingForTraderWithGeneration(
+		traderID, lifecycle.Generation, autoTrader, h.store); err != nil {
 		logger.Errorf("Failed to start copy trading: %v", err)
+		_ = h.store.CopyTrade().SetEnabled(traderID, false)
+		if stopping, stopErr := h.store.Trader().BeginStop(userID, traderID); stopErr == nil {
+			_ = h.store.Trader().CompleteStop(userID, traderID, stopping.Generation)
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if err = h.store.ReentryAI().ResumeTraderCandidatesForStart(traderID); err != nil {
+		_ = copytrade.StopCopyTradingForTrader(traderID)
+		_ = h.store.CopyTrade().SetEnabled(traderID, false)
+		if stopping, stopErr := h.store.Trader().BeginStop(userID, traderID); stopErr == nil {
+			_ = h.store.Trader().CompleteStop(userID, traderID, stopping.Generation)
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
-	// 更新配置状态
-	h.store.CopyTrade().SetEnabled(traderID, true)
-	h.store.CopyTrade().UpdateDecisionMode(traderID, "copy_trade")
-
 	c.JSON(http.StatusOK, gin.H{
-		"message": "copy trading started",
-		"status":  "running",
+		"message": "copy trading started", "status": store.TraderLifecycleRunning,
+		"lifecycle_generation": lifecycle.Generation,
 	})
 }
 
@@ -1736,26 +1824,65 @@ func (h *CopyTradeHandler) Start(c *gin.Context) {
 // @Router /api/copytrade/stop/{trader_id} [post]
 func (h *CopyTradeHandler) Stop(c *gin.Context) {
 	traderID := c.Param("trader_id")
-
-	// 检查是否在运行
-	if !copytrade.IsCopyTradingRunning(traderID) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "copy trading not running"})
+	userID := c.GetString("user_id")
+	if _, err := h.store.Trader().GetLifecycleForUser(userID, traderID); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "trader not found or access denied"})
 		return
 	}
+	lifecycle, err := h.store.Trader().BeginStop(userID, traderID)
+	if err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		return
+	}
+	if lifecycle.Status == store.TraderLifecycleStopped {
+		c.JSON(http.StatusOK, gin.H{
+			"message": "copy trading already stopped", "status": store.TraderLifecycleStopped,
+			"lifecycle_generation": lifecycle.Generation,
+			"pending_blockers":     []store.TraderLifecycleBlocker{},
+		})
+		return
+	}
+	autoTrader, _ := h.traderManager.GetTrader(traderID)
+	// The integration itself may still exist even when the manager has already
+	// lost its AutoTrader instance. Always let the stop reconciler use the live
+	// integration first; the executor is only a fallback.
+	_ = copytrade.PrepareCopyTradingStopWithExecutor(traderID, autoTrader, h.store)
 
 	// 停止跟单
-	if err := copytrade.StopCopyTradingForTrader(traderID); err != nil {
+	if err = copytrade.StopCopyTradingForTrader(traderID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	if autoTrader != nil {
+		autoTrader.Stop()
+	}
 
-	// 更新配置状态
-	h.store.CopyTrade().SetEnabled(traderID, false)
-	h.store.CopyTrade().UpdateDecisionMode(traderID, "ai")
+	_ = h.store.CopyTrade().SetEnabled(traderID, false)
+	blockers, blockerErr := h.store.Trader().GetStopBlockers(traderID)
+	if blockerErr != nil {
+		blockers = []store.TraderLifecycleBlocker{{
+			Code: "STOP_BLOCKER_QUERY_FAILED", ResourceID: traderID, Status: blockerErr.Error(),
+		}}
+	}
+	if len(blockers) > 0 {
+		_ = h.store.Trader().MarkStopReconcileRequired(
+			userID, traderID, lifecycle.Generation, store.FormatLifecycleBlockers(blockers))
+		c.JSON(http.StatusAccepted, gin.H{
+			"message":              "copy trading runtime stopped; exchange reconciliation required",
+			"status":               store.TraderLifecycleStoppingReconcileRequired,
+			"lifecycle_generation": lifecycle.Generation, "pending_blockers": blockers,
+		})
+		return
+	}
+	if err = h.store.Trader().CompleteStop(userID, traderID, lifecycle.Generation); err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"message": "copy trading stopped",
-		"status":  "stopped",
+		"message": "copy trading stopped", "status": store.TraderLifecycleStopped,
+		"lifecycle_generation": lifecycle.Generation,
+		"pending_blockers":     []store.TraderLifecycleBlocker{},
 	})
 }
 

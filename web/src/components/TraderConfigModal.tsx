@@ -2215,15 +2215,15 @@ export function TraderConfigModal({
                                 ],
                                 [
                                   'risk_ai_daily_call_limit',
-                                  '24 小时调用上限',
+                                  '24 小时费用软预警线',
                                   1,
-                                  12,
+                                  null,
                                 ],
                                 [
                                   'risk_ai_lifecycle_call_limit',
-                                  '生命周期调用上限',
+                                  '单候选费用软预警线',
                                   1,
-                                  30,
+                                  null,
                                 ],
                               ].map(([field, label, min, max]) => (
                                 <label
@@ -2234,7 +2234,7 @@ export function TraderConfigModal({
                                   <input
                                     type="number"
                                     min={Number(min)}
-                                    max={Number(max)}
+                                    max={max == null ? undefined : Number(max)}
                                     value={
                                       formData[
                                         field as keyof FormState
@@ -2250,6 +2250,10 @@ export function TraderConfigModal({
                                   />
                                 </label>
                               ))}
+                              <div className="col-span-2 text-[11px] text-[#F0B90B]">
+                                兼容字段已改为费用软预警：达到数值只告警和展示成本，不会暂停候选、跳过后续反转复审或产生
+                                BUDGET_SUSPENDED。
+                              </div>
                               <p className="col-span-2 text-xs text-[#848E9C]">
                                 WAIT
                                 不发邮件；事件、心跳退避和关注区间会持续触发复查，AI

@@ -132,15 +132,18 @@ func main() {
 		logger.Warnf("⚠️ Failed to restore backtest history: %v", err)
 	}
 
-	// Start position sync manager (detects manual closures, TP/SL triggers)
-	positionSyncManager := trader.NewPositionSyncManager(st, 0) // 0 = use default 10s interval
-	positionSyncManager.Start()
-	defer positionSyncManager.Stop()
-
-	// Load all traders from database to memory (may auto-start traders with IsRunning=true)
+	// Load all traders and synchronously restore RUNNING copy-trading engines.
+	// Their execution intents and ownership mappings must reconcile before the
+	// position synchronizer is allowed to inspect or claim exchange positions.
 	if err := traderManager.LoadTradersFromStore(st); err != nil {
 		logger.Fatalf("❌ Failed to load traders: %v", err)
 	}
+
+	// Start position sync only after copy-trading recovery has established the
+	// authoritative ownership view (detects manual closures, TP/SL triggers).
+	positionSyncManager := trader.NewPositionSyncManager(st, 0) // 0 = use default 10s interval
+	positionSyncManager.Start()
+	defer positionSyncManager.Stop()
 
 	// 重入 AI 助手插件（DB 轮询发现人工重入信号 → 生成决策数据包，零侵入跟单引擎；
 	// 可在配置 reentry_ai_config.enabled 中关闭，关闭/异常均不影响跟单）

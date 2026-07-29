@@ -201,22 +201,24 @@ func TestValidateRiskPolicyV4(t *testing.T) {
 	}
 }
 
-func TestValidateRiskPolicyAIReviewLimitsAreIndependent(t *testing.T) {
+func TestValidateRiskPolicyAICostWarningsHaveNoHardUpperBound(t *testing.T) {
 	c := &CopyConfig{ProviderType: ProviderOKX, RiskPolicyVersion: 7}
 	c.FillRiskDefaults()
 	c.RiskAIDailyCallLimit = 12
 	c.RiskAILifecycleCallLimit = 5
 	if err := ValidateRiskPolicyV4(c); err != nil {
-		t.Fatalf("lifecycle limit may be lower than the rolling daily ceiling: %v", err)
+		t.Fatalf("independent soft warning thresholds must remain compatible: %v", err)
 	}
-	c.RiskAIDailyCallLimit = 13
-	if err := ValidateRiskPolicyV4(c); err == nil {
-		t.Fatal("daily limit above 12 must be rejected")
+	c.RiskAIDailyCallLimit = 100000
+	c.RiskAILifecycleCallLimit = 200000
+	if err := ValidateRiskPolicyV4(c); err != nil {
+		t.Fatalf("soft warning thresholds must not retain a hard upper bound: %v", err)
 	}
-	c.RiskAIDailyCallLimit = 12
-	c.RiskAILifecycleCallLimit = 31
+	// Zero keeps the long-standing "use default" compatibility semantics.
+	// A negative value is the explicit invalid case.
+	c.RiskAIDailyCallLimit = -1
 	if err := ValidateRiskPolicyV4(c); err == nil {
-		t.Fatal("lifecycle limit above 30 must be rejected")
+		t.Fatal("non-positive compatibility warning threshold must be rejected")
 	}
 }
 

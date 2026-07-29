@@ -358,35 +358,52 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
 
   const handleDeleteTrader = async (traderId: string) => {
     {
-      const ok = await confirmToast(t('confirmDeleteTrader', language))
+      const ok = await confirmToast(
+        '归档后将从列表隐藏，但会永久保留盈亏、订单意图、映射、周期与事件审计。存在真实仓位、未决订单或未核实保护单时系统会拒绝归档。确认继续？',
+        { title: '安全归档交易员', okText: '确认归档' }
+      )
       if (!ok) return
     }
 
     try {
-      await toast.promise(api.deleteTrader(traderId), {
-        loading: '正在删除…',
-        success: '删除成功',
-        error: '删除失败',
-      })
+      const archivePromise = api.deleteTrader(traderId)
+      toast.loading('正在归档…', { id: `archive-${traderId}` })
+      await archivePromise
+      toast.success('归档成功', { id: `archive-${traderId}` })
 
       // Immediately refresh traders list for better UX
       await mutateTraders()
     } catch (error) {
       console.error('Failed to delete trader:', error)
-      toast.error(t('deleteTraderFailed', language))
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : t('deleteTraderFailed', language),
+        { id: `archive-${traderId}` }
+      )
     }
   }
 
-  const handleToggleTrader = async (traderId: string, running: boolean) => {
+  const handleToggleTrader = async (trader: TraderInfo) => {
     try {
-      if (running) {
-        await toast.promise(api.stopTrader(traderId), {
-          loading: '正在停止…',
-          success: '已停止',
-          error: '停止失败',
-        })
+      const status =
+        trader.lifecycle_status || (trader.is_running ? 'RUNNING' : 'STOPPED')
+      if (
+        status === 'RUNNING' ||
+        status === 'STARTING' ||
+        status === 'STOPPING' ||
+        status === 'STOPPING_RECONCILE_REQUIRED'
+      ) {
+        const result = await api.stopTrader(trader.trader_id)
+        if (result.status === 'STOPPED') {
+          toast.success('已安全停止')
+        } else {
+          toast.warning(
+            `运行时已停止，仍有 ${result.pending_blockers?.length || 0} 项交易所状态待核实`
+          )
+        }
       } else {
-        await toast.promise(api.startTrader(traderId), {
+        await toast.promise(api.startTrader(trader.trader_id), {
           loading: '正在启动…',
           success: '已启动',
           error: '启动失败',
@@ -1129,12 +1146,16 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
                     </div> */}
                     <div
                       className={`px-2 md:px-3 py-1 rounded text-xs font-bold ${
-                        trader.is_running
+                        (trader.lifecycle_status ||
+                          (trader.is_running ? 'RUNNING' : 'STOPPED')) ===
+                        'RUNNING'
                           ? 'bg-green-100 text-green-800'
                           : 'bg-red-100 text-red-800'
                       }`}
                       style={
-                        trader.is_running
+                        (trader.lifecycle_status ||
+                          (trader.is_running ? 'RUNNING' : 'STOPPED')) ===
+                        'RUNNING'
                           ? {
                               background: 'rgba(14, 203, 129, 0.1)',
                               color: '#0ECB81',
@@ -1145,10 +1166,25 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
                             }
                       }
                     >
-                      {trader.is_running
-                        ? t('running', language)
-                        : t('stopped', language)}
+                      {trader.lifecycle_status ||
+                        (trader.is_running
+                          ? t('running', language)
+                          : t('stopped', language))}
                     </div>
+                    {!!trader.pending_blockers?.length && (
+                      <div
+                        className="mt-1 text-[10px] font-semibold"
+                        style={{ color: '#F0B90B' }}
+                        title={trader.pending_blockers
+                          .map(
+                            (blocker) =>
+                              `${blocker.code}: ${blocker.symbol || blocker.resource_id} (${blocker.status})`
+                          )
+                          .join('\n')}
+                      >
+                        阻塞 {trader.pending_blockers.length}
+                      </div>
+                    )}
                   </div>
 
                   {/* Actions: 禁止换行，超出横向滚动 */}
@@ -1173,7 +1209,11 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
 
                     <button
                       onClick={() => handleEditTrader(trader.trader_id)}
-                      disabled={trader.is_running}
+                      disabled={
+                        (trader.lifecycle_status ||
+                          (trader.is_running ? 'RUNNING' : 'STOPPED')) !==
+                        'STOPPED'
+                      }
                       className="px-2 md:px-3 py-1.5 md:py-2 rounded text-xs md:text-sm font-semibold transition-all hover:scale-105 disabled:opacity-50 disabled:cursor-not-allowed whitespace-nowrap flex items-center gap-1"
                       style={{
                         background: trader.is_running
@@ -1187,15 +1227,12 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
                     </button>
 
                     <button
-                      onClick={() =>
-                        handleToggleTrader(
-                          trader.trader_id,
-                          trader.is_running || false
-                        )
-                      }
+                      onClick={() => handleToggleTrader(trader)}
                       className="px-2 md:px-3 py-1.5 md:py-2 rounded text-xs md:text-sm font-semibold transition-all hover:scale-105 whitespace-nowrap"
                       style={
-                        trader.is_running
+                        (trader.lifecycle_status ||
+                          (trader.is_running ? 'RUNNING' : 'STOPPED')) !==
+                        'STOPPED'
                           ? {
                               background: 'rgba(246, 70, 93, 0.1)',
                               color: '#F6465D',
@@ -1206,9 +1243,17 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
                             }
                       }
                     >
-                      {trader.is_running
-                        ? t('stop', language)
-                        : t('start', language)}
+                      {(trader.lifecycle_status ||
+                        (trader.is_running ? 'RUNNING' : 'STOPPED')) ===
+                      'STOPPED'
+                        ? t('start', language)
+                        : (trader.lifecycle_status ||
+                              (trader.is_running ? 'RUNNING' : 'STOPPED')) ===
+                              'STOPPING' ||
+                            trader.lifecycle_status ===
+                              'STOPPING_RECONCILE_REQUIRED'
+                          ? '继续对账'
+                          : t('stop', language)}
                     </button>
 
                     <button
@@ -1245,7 +1290,17 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
 
                     <button
                       onClick={() => handleDeleteTrader(trader.trader_id)}
-                      className="px-2 md:px-3 py-1.5 md:py-2 rounded text-xs md:text-sm font-semibold transition-all hover:scale-105"
+                      disabled={
+                        (trader.lifecycle_status ||
+                          (trader.is_running ? 'RUNNING' : 'STOPPED')) !==
+                          'STOPPED' || !!trader.pending_blockers?.length
+                      }
+                      className="px-2 md:px-3 py-1.5 md:py-2 rounded text-xs md:text-sm font-semibold transition-all hover:scale-105 disabled:opacity-40 disabled:cursor-not-allowed"
+                      title={
+                        trader.pending_blockers?.length
+                          ? `存在 ${trader.pending_blockers.length} 项阻塞，不能归档`
+                          : '仅 STOPPED 且无仓位、未决订单、未核实保护单时可归档'
+                      }
                       style={{
                         background: 'rgba(246, 70, 93, 0.1)',
                         color: '#F6465D',

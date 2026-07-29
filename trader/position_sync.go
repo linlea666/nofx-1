@@ -130,14 +130,19 @@ func (m *PositionSyncManager) syncPositions() {
 
 // syncTraderPositions Synchronize positions for a single trader
 func (m *PositionSyncManager) syncTraderPositions(traderID string, localPositions []*store.TraderPosition) {
+	lifecycle, lifecycleErr := m.store.Trader().GetLifecycle(traderID)
+	if lifecycleErr != nil {
+		// Legacy physically deleted traders are represented by tombstones.
+		// Their OPEN rows remain audit evidence and must never be fabricated as
+		// exchange-closed merely because configuration is absent.
+		return
+	}
+	if lifecycle.Status != store.TraderLifecycleRunning || !lifecycle.IsRunning {
+		return
+	}
 	// Get or create trader instance
 	trader, err := m.getOrCreateTrader(traderID)
 	if err != nil {
-		// If trader not found (deleted), close all orphan positions automatically
-		if strings.Contains(err.Error(), "trader not found") {
-			m.closeOrphanPositions(traderID, localPositions)
-			return
-		}
 		logger.Infof("⚠️ Failed to get trader instance (ID: %s): %v", traderID, err)
 		return
 	}
@@ -644,31 +649,6 @@ func (m *PositionSyncManager) InvalidateCache(traderID string) {
 	delete(m.configCache, traderID)
 }
 
-// closeOrphanPositions closes orphan positions when trader is deleted
-// This is a self-healing mechanism to clean up positions that belong to deleted traders
-func (m *PositionSyncManager) closeOrphanPositions(traderID string, positions []*store.TraderPosition) {
-	if len(positions) == 0 {
-		return
-	}
-
-	closedCount := 0
-	for _, pos := range positions {
-		err := m.store.Position().ClosePosition(pos.ID, 0, "", 0, 0, "trader_deleted")
-		if err != nil {
-			logger.Warnf("⚠️ Failed to close orphan position (ID: %d, TraderID: %s): %v", pos.ID, traderID, err)
-			continue
-		}
-		closedCount++
-	}
-
-	if closedCount > 0 {
-		logger.Infof("🧹 Closed %d orphan positions for deleted trader: %s", closedCount, traderID)
-	}
-
-	// Clean up cache for this trader
-	m.InvalidateCache(traderID)
-}
-
 // getFloatFromMap Get float64 value from map
 func getFloatFromMap(m map[string]interface{}, key string) float64 {
 	if v, ok := m[key]; ok {
@@ -706,6 +686,9 @@ func (m *PositionSyncManager) startupSync() {
 	}
 
 	for _, traderInfo := range traders {
+		if traderInfo.LifecycleStatus != store.TraderLifecycleRunning || !traderInfo.IsRunning {
+			continue
+		}
 		traderID := traderInfo.ID
 
 		// Get trader instance
@@ -863,7 +846,7 @@ func (m *PositionSyncManager) canClaimExternalPositions(traderID, exchangeID str
 	if err != nil {
 		return false, 0, "POSITION_SYNC_TRADER_UNAVAILABLE"
 	}
-	if !traderInfo.IsRunning {
+	if !traderInfo.IsRunning || traderInfo.LifecycleStatus != store.TraderLifecycleRunning {
 		return false, 0, "POSITION_SYNC_TRADER_STOPPED"
 	}
 	if traderInfo.ExchangeID != exchangeID {
@@ -1062,6 +1045,13 @@ func (m *PositionSyncManager) syncDueClosedAccounting() {
 		return
 	}
 	for _, traderInfo := range traders {
+		if traderInfo == nil || traderInfo.LifecycleStatus != store.TraderLifecycleRunning ||
+			!traderInfo.IsRunning {
+			// A stopped trader deliberately retains exchange protection and
+			// audit state. Periodic reconciliation must remain silent until an
+			// explicit restart (or a future operator-driven one-shot sync).
+			continue
+		}
 		traderID := traderInfo.ID
 		trader, traderErr := m.getOrCreateTrader(traderID)
 		if traderErr != nil {

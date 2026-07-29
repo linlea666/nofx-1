@@ -2082,17 +2082,14 @@ func (e *Engine) reserveExecutionIntent(dec *decision.Decision) bool {
 		return false
 	}
 	if !claimed {
-		if intent.Status == store.ExecutionIntentFailed && intent.ReasonCode == "MANUAL_REVIEW_REQUIRED" {
-			logger.Errorf("🚨 [%s] 源过渡被人工复核意图阻塞，不自动重放或重复下单 | intent=%d posId=%s rev=%d target=%.8f",
-				e.traderID, intent.ID, dec.LeaderPosID, revision, dec.LeaderPosSize)
-			return false
-		}
 		transitionChanged := intent.Action != dec.Action || intent.LeaderTargetSize != dec.LeaderPosSize
 		catchupBlocker := intent.SourceKind == "LEADER_TRANSITION" &&
 			(intent.Action == "open_long" || intent.Action == "open_short") &&
 			(intent.Status == store.ExecutionIntentPartiallyFilled ||
 				intent.Status == store.ExecutionIntentReconciling ||
-				(intent.Status == store.ExecutionIntentFailed && strings.HasPrefix(intent.ReasonCode, "CATCHUP_")))
+				(intent.Status == store.ExecutionIntentFailed &&
+					(strings.HasPrefix(intent.ReasonCode, "CATCHUP_") ||
+						intent.ReasonCode == "MANUAL_REVIEW_REQUIRED")))
 		if transitionChanged && catchupBlocker {
 			reasonCode := "CATCHUP_SKIPPED_NO_FILL"
 			if intent.FilledQuantity > 0 {
@@ -2120,6 +2117,31 @@ func (e *Engine) reserveExecutionIntent(dec *decision.Decision) bool {
 			e.UnmarkDecisionSources(dec)
 			logger.Warnf("⏳ [%s] 后续领航员动作等待旧补仓订单完成对账 | intent=%d rev=%d next=%s error=%v",
 				e.traderID, intent.ID, intent.SourceRevision, dec.Action, settleErr)
+			return false
+		}
+		if !transitionChanged &&
+			(intent.Status == store.ExecutionIntentReconciling ||
+				(intent.Status == store.ExecutionIntentFailed && intent.ReasonCode == "MANUAL_REVIEW_REQUIRED")) {
+			reclaimed, reclaimErr := e.store.CopyTrade().ReclaimUnsubmittedExecutionIntent(
+				intent.ID, e.traderID, dec.Action, dec.LeaderPosSize)
+			if reclaimErr != nil {
+				logger.Errorf("❌ [%s] 回收未提交执行意图失败 | intent=%d posId=%s rev=%d: %v",
+					e.traderID, intent.ID, dec.LeaderPosID, revision, reclaimErr)
+			} else if reclaimed {
+				dec.ExecutionIntentID = intent.ID
+				dec.SourceRevision = revision
+				dec.ExecutionStatus = store.ExecutionIntentReserved
+				if intent.ClientOrderID != "" {
+					dec.ClientOrderID = intent.ClientOrderID
+				}
+				logger.Warnf("🟡 [%s] 权威源确认过渡仍有效，已回收从未提交的意图 | intent=%d posId=%s rev=%d action=%s",
+					e.traderID, intent.ID, dec.LeaderPosID, revision, dec.Action)
+				return true
+			}
+		}
+		if intent.Status == store.ExecutionIntentFailed && intent.ReasonCode == "MANUAL_REVIEW_REQUIRED" {
+			logger.Errorf("🚨 [%s] 源过渡仍被人工复核意图阻塞（存在不可安全回收的执行证据） | intent=%d posId=%s rev=%d target=%.8f",
+				e.traderID, intent.ID, dec.LeaderPosID, revision, dec.LeaderPosSize)
 			return false
 		}
 		replayRequired := intent.Action != dec.Action || intent.LeaderTargetSize != dec.LeaderPosSize ||

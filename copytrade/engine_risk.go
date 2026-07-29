@@ -971,7 +971,7 @@ func (e *Engine) checkReentryConditions() {
 }
 
 // handleAIGuardedReentry 把已完全止损的周期转换为 AI 候选。这里不调用模型、
-// 不下单，只负责确定性数据快照、额度上限和可保护性预检。
+// 不下单，只负责确定性数据快照、费用软预警和可保护性预检。
 func (e *Engine) handleAIGuardedReentry(mapping *store.CopyTradePositionMapping, leaderPos *Position, cycle *store.CopyGuardCycle, stoppedAttempt *store.CopyGuardAttempt, followerEquity float64, coolingDown bool, terminalStatus string) {
 	if mapping == nil || leaderPos == nil || cycle == nil || e.store == nil {
 		return
@@ -1086,6 +1086,9 @@ func (e *Engine) handleAIGuardedReentry(mapping *store.CopyTradePositionMapping,
 		prevLeaderBucket := math.Floor(before.LeaderSize / leaderStep)
 		candleTrigger, candleHash := e.aiClosedCandleFeature(cycle.ID, mapping.Symbol, mapping.Side, before)
 		switch {
+		case inRange(mark, before.EntryPriceLow, before.EntryPriceHigh) && !inRange(before.TriggerPrice, before.EntryPriceLow, before.EntryPriceHigh):
+			pendingTrigger = "AI_ENTRY_ZONE"
+			highSignalEvent = true
 		case inRange(mark, before.AttentionPriceLow, before.AttentionPriceHigh) && !inRange(before.TriggerPrice, before.AttentionPriceLow, before.AttentionPriceHigh):
 			pendingTrigger = "AI_ATTENTION_ZONE"
 			highSignalEvent = true

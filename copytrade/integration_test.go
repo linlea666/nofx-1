@@ -337,6 +337,9 @@ func TestLeaderCloseUnblocksTerminalNoFillCatchupRevision(t *testing.T) {
 
 type cancelPendingCatchupExecutor struct {
 	canceled bool
+	// requestedQuantity emulates venue payloads where "quantity" is the
+	// original order size even after a zero-fill cancellation.
+	requestedQuantity float64
 }
 
 func (f *cancelPendingCatchupExecutor) ExecuteDecision(*decision.Decision) error {
@@ -354,7 +357,8 @@ func (f *cancelPendingCatchupExecutor) GetOrderStatusByClientID(_, clientOrderID
 		status = "CANCELED"
 	}
 	return map[string]interface{}{
-		"clOrdId": clientOrderID, "ordId": "venue-order", "status": status, "executedQty": 0.0,
+		"clOrdId": clientOrderID, "ordId": "venue-order", "status": status,
+		"executedQty": 0.0, "quantity": f.requestedQuantity,
 	}, nil
 }
 func (f *cancelPendingCatchupExecutor) CancelOrderByClientID(_, _ string) error {
@@ -414,6 +418,91 @@ func TestLeaderCloseReconciliationCancelsPendingCatchupBeforeSettlement(t *testi
 	mapping, err := cs.GetMapping("trader-1", "pros-pos")
 	if err != nil || mapping.SourceRevision != 5 {
 		t.Fatalf("source revision did not advance after cancel confirmation: mapping=%+v err=%v", mapping, err)
+	}
+}
+
+func TestPrepareStopDoesNotTreatRequestedQuantityAsFill(t *testing.T) {
+	st, err := store.New(filepath.Join(t.TempDir(), "stop-zero-fill.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if _, err = st.DB().Exec(`INSERT INTO traders
+		(id,user_id,name,ai_model_id,exchange_id,initial_balance,is_running,lifecycle_status,lifecycle_generation)
+		VALUES('trader-1','user-1','trader','model','exchange',1000,0,?,2)`,
+		store.TraderLifecycleStopping); err != nil {
+		t.Fatal(err)
+	}
+	intent, claimed, err := st.CopyTrade().ReserveExecutionIntent(&store.CopyTradeExecutionIntent{
+		TraderID: "trader-1", LeaderPosID: "leader-pos", SourceRevision: 1,
+		CanonicalKey: "stop|zero-fill", Action: "open_long",
+		Symbol: "ETHUSDT", Side: "long", ClientOrderID: "stop-client-id",
+	})
+	if err != nil || !claimed {
+		t.Fatalf("reserve claimed=%v err=%v", claimed, err)
+	}
+	if _, err = st.CopyTrade().PrepareExecutionOrderAttempt(intent.ID, intent.ClientOrderID, 0.25); err != nil {
+		t.Fatal(err)
+	}
+	fake := &cancelPendingCatchupExecutor{requestedQuantity: 0.25}
+	integration := NewTraderIntegrationWithGeneration("trader-1", 2, fake, st)
+	blockers := integration.PrepareStop()
+	if len(blockers) != 0 {
+		t.Fatalf("confirmed zero-fill cancel remained blocked: %+v", blockers)
+	}
+	intent, err = st.CopyTrade().GetExecutionIntentByID(intent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if intent.Status != store.ExecutionIntentFailed ||
+		intent.ReasonCode != "TRADER_STOPPED_TERMINAL_NO_FILL" ||
+		intent.FilledQuantity != 0 {
+		t.Fatalf("requested quantity was misclassified as fill: %+v", intent)
+	}
+}
+
+func TestLeaderCloseReclaimsMatchingManualReviewWithoutSubmission(t *testing.T) {
+	st, err := store.New(filepath.Join(t.TempDir(), "leader-close-manual-reclaim.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cs := st.CopyTrade()
+	if err = cs.SavePositionMapping(&store.CopyTradePositionMapping{
+		TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "leader-pos",
+		Symbol: "BTCUSDT", Side: "long", MarginMode: "cross",
+		Status: store.MappingStatusActive, SourceRevision: 1, LastKnownSize: 2,
+		OpenedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	intent, claimed, err := cs.ReserveExecutionIntent(&store.CopyTradeExecutionIntent{
+		TraderID: "trader-1", LeaderPosID: "leader-pos", SourceRevision: 2,
+		CanonicalKey: "leader|trader-1|leader-pos|2", Action: "close_long",
+		Symbol: "BTCUSDT", Side: "long", LeaderTargetSize: 0,
+		ClientOrderID: "leader-close-reclaim",
+	})
+	if err != nil || !claimed {
+		t.Fatalf("reserve claimed=%v err=%v", claimed, err)
+	}
+	if _, err = st.DB().Exec(`UPDATE copy_trade_execution_intents
+		SET status='FAILED',reason_code='MANUAL_REVIEW_REQUIRED',terminal_at=CURRENT_TIMESTAMP
+		WHERE id=?`, intent.ID); err != nil {
+		t.Fatal(err)
+	}
+	engine := &Engine{
+		traderID: "trader-1", store: st,
+		config: &CopyConfig{ProviderType: ProviderOKX, LeaderID: "leader"},
+	}
+	dec := &decision.Decision{
+		Action: "close_long", Symbol: "BTCUSDT", LeaderPosID: "leader-pos",
+		LeaderPosSize: 0, MarginMode: "cross", SourceFillID: "leader-close",
+	}
+	if !engine.reserveExecutionIntent(dec) {
+		t.Fatal("authoritative leader close was blocked by a pre-submit manual-review intent")
+	}
+	if dec.ExecutionIntentID != intent.ID || dec.SourceRevision != 2 {
+		t.Fatalf("manual-review close did not reclaim exact intent: %+v", dec)
 	}
 }
 
@@ -903,6 +992,13 @@ func TestBenignCloseStatusDistinctFromHardFailure(t *testing.T) {
 	const traderID = "test-trader"
 	const posID = "test-pos"
 
+	if _, err = st.DB().Exec(`INSERT INTO traders
+		(id,user_id,name,ai_model_id,exchange_id,initial_balance,is_running,lifecycle_status,lifecycle_generation)
+		VALUES(?,?,?,?,?,?,1,?,0)`,
+		traderID, "test-user", "test trader", "test-model", "test-exchange", 1000,
+		store.TraderLifecycleRunning); err != nil {
+		t.Fatalf("seed trader: %v", err)
+	}
 	if err := st.CopyTrade().SavePositionMapping(&store.CopyTradePositionMapping{
 		TraderID:      traderID,
 		LeaderPosID:   posID,

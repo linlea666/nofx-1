@@ -1613,6 +1613,31 @@ func (t *FuturesTrader) GetOrderStatusByClientID(symbol, clientOrderID string) (
 	return binanceOrderResult(order), nil
 }
 
+// CancelOrderByClientID cancels one exact Binance USD-M order without touching
+// protective or unrelated orders on the same symbol. A successful cancel
+// response is only an acknowledgement; Copy Guard performs the authoritative
+// read-after-write state check before releasing a leader-close barrier.
+func (t *FuturesTrader) CancelOrderByClientID(symbol, clientOrderID string) error {
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	clientOrderID = strings.TrimSpace(clientOrderID)
+	if symbol == "" || clientOrderID == "" {
+		return fmt.Errorf("symbol and client order id are required")
+	}
+	_, err := t.client.NewCancelOrderService().
+		Symbol(symbol).
+		OrigClientOrderID(clientOrderID).
+		Do(context.Background())
+	if err != nil {
+		if isBinanceOrderNotFound(err) {
+			// The caller must still query and classify the final order state.
+			return nil
+		}
+		return fmt.Errorf("failed to cancel Binance order by client id: %w", err)
+	}
+	t.invalidatePositionsCache()
+	return nil
+}
+
 // GetClosedPnL retrieves recent closing trades from Binance Futures
 // Note: Binance does NOT have a position history API, only trade history.
 // This returns individual closing trades (realizedPnl != 0) for real-time position closure detection.

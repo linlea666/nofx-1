@@ -759,6 +759,11 @@ func (s *CopyTradeStore) SettleOrdinaryCatchupTransition(c OrdinaryCatchupSettle
 			mappingStatus == MappingStatusStoppedByRisk || mappingStatus == MappingStatusDetached):
 		// A confirmed partial fill already advanced the mapping. Only the
 		// residual catch-up lifecycle remains to be terminalized.
+	case mappingErr == nil && mappingStatus == MappingStatusClosed && currentRevision >= sourceRevision:
+		// A later authoritative close already advanced and retired the mapping.
+		// The old risk-increasing intent may still carry a terminal no-fill or
+		// confirmed partial-fill residual. Terminate only that residual; never
+		// reopen or rewind a closed mapping.
 	case mappingErr != nil:
 		return "", mappingErr
 	default:
@@ -803,6 +808,56 @@ func (s *CopyTradeStore) SettleOrdinaryCatchupTransition(c OrdinaryCatchupSettle
 	return terminalStatus, nil
 }
 
+// ReclaimUnsubmittedExecutionIntent returns an exact source transition to the
+// executable RESERVED state after a fresh authoritative signal proves the
+// transition is still current. It is intentionally limited to intents with no
+// order attempt, submitted timestamp, exchange identity, or fill evidence.
+// This closes the restart/manual-review deadlock without replaying uncertain
+// exchange work.
+func (s *CopyTradeStore) ReclaimUnsubmittedExecutionIntent(id int64, traderID, action string, leaderTargetSize float64) (bool, error) {
+	if id <= 0 || strings.TrimSpace(traderID) == "" || strings.TrimSpace(action) == "" || leaderTargetSize < 0 {
+		return false, fmt.Errorf("invalid execution intent reclaim")
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`UPDATE copy_trade_execution_intents SET
+		status='RESERVED',reason_code='',last_error='',terminal_at=NULL,
+		reconciliation_attempts=0,first_reconciling_at=NULL,updated_at=CURRENT_TIMESTAMP
+		WHERE id=? AND trader_id=? AND action=?
+		  AND ABS(COALESCE(leader_target_size,0)-?)<=MAX(1e-12,ABS(?) * 1e-9)
+		  AND status IN ('RECONCILING','FAILED')
+		  AND reason_code IN (
+			'SOURCE_REVALIDATION_REQUIRED','SOURCE_DATA_UNAVAILABLE',
+			'SOURCE_VALUE_UNAVAILABLE','MANUAL_REVIEW_REQUIRED',
+			'ORDER_LOOKUP_FAILED','ORDER_LOOKUP_UNAVAILABLE'
+		  )
+		  AND submitted_at IS NULL AND COALESCE(exchange_order_id,'')=''
+		  AND COALESCE(filled_quantity,0)=0
+		  AND NOT EXISTS (
+			SELECT 1 FROM copy_trade_execution_order_attempts a
+			WHERE a.intent_id=copy_trade_execution_intents.id
+		  )`,
+		id, traderID, action, leaderTargetSize, leaderTargetSize)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil || n != 1 {
+		return false, err
+	}
+	if _, err = tx.Exec(`UPDATE copy_trade_source_transitions
+		SET status='RESERVED',updated_at=CURRENT_TIMESTAMP WHERE intent_id=?`, id); err != nil {
+		return false, err
+	}
+	if err = tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (s *CopyTradeStore) MarkOrdinaryCatchupReconciliationPending(intentID int64, traderID, reasonCode, detail string) error {
 	if intentID <= 0 || strings.TrimSpace(traderID) == "" {
 		return fmt.Errorf("invalid ordinary catch-up reconciliation")
@@ -835,6 +890,7 @@ func (s *CopyTradeStore) MarkOrdinaryCatchupReconciliationPending(intentID int64
 
 type ExecutionReconciliationReport struct {
 	UnfinishedIntents          int `json:"unfinished_intents"`
+	ManualReviewIntents        int `json:"manual_review_intents"`
 	OpenCyclesWithoutMapping   int `json:"open_cycles_without_mapping"`
 	RecoverableOwnershipGaps   int `json:"recoverable_ownership_gaps"`
 	AmbiguousOwnershipGaps     int `json:"ambiguous_ownership_gaps"`
@@ -853,6 +909,7 @@ func (s *CopyTradeStore) GetExecutionReconciliationReport(traderID string) (*Exe
 		sql    string
 	}{
 		{&report.UnfinishedIntents, `SELECT COUNT(*) FROM copy_trade_execution_intents WHERE trader_id=? AND status IN ('RESERVED','SUBMITTED','RECONCILING','PARTIALLY_FILLED')`},
+		{&report.ManualReviewIntents, `SELECT COUNT(*) FROM copy_trade_execution_intents WHERE trader_id=? AND status='FAILED' AND reason_code='MANUAL_REVIEW_REQUIRED'`},
 		{&report.OpenCyclesWithoutMapping, `SELECT COUNT(*) FROM copy_guard_cycles c WHERE c.trader_id=? AND c.closed_at IS NULL AND NOT EXISTS (SELECT 1 FROM copy_trade_position_mappings m WHERE m.trader_id=c.trader_id AND m.leader_pos_id=c.leader_pos_id AND m.status IN ('active','stopped_by_risk','detached'))`},
 		{&report.ActiveMappingsWithoutCycle, `SELECT COUNT(*) FROM copy_trade_position_mappings m WHERE m.trader_id=? AND m.status='active' AND NOT EXISTS (SELECT 1 FROM copy_guard_cycles c WHERE c.trader_id=m.trader_id AND c.leader_pos_id=m.leader_pos_id AND c.closed_at IS NULL)`},
 		{&report.UnprotectedOpenCycles, `SELECT COUNT(*) FROM copy_guard_cycles WHERE trader_id=? AND closed_at IS NULL AND status IN ('FOLLOWING','FOLLOWING_REENTRY') AND (protection_status NOT IN ('VERIFIED','CLAMPED') OR protection_coverage<0.999)`},

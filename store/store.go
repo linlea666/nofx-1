@@ -256,6 +256,9 @@ func (s *Store) initTables() error {
 	if err := s.ReentryAI().initTables(); err != nil {
 		return fmt.Errorf("failed to initialize reentry ai tables: %w", err)
 	}
+	if err := s.Trader().ReconcileOrphanTombstones(); err != nil {
+		return fmt.Errorf("failed to reconcile legacy trader tombstones: %w", err)
+	}
 	return nil
 }
 

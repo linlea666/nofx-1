@@ -19,9 +19,16 @@ func (f *positionSyncFakeTrader) GetPositions() ([]map[string]interface{}, error
 
 func insertPositionSyncTrader(t *testing.T, st *store.Store, id, name, exchangeID string, running bool) {
 	t.Helper()
+	status := store.TraderLifecycleStopped
+	generation := int64(0)
+	if running {
+		status = store.TraderLifecycleRunning
+		generation = 1
+	}
 	if _, err := st.DB().Exec(`INSERT INTO traders
-		(id,user_id,name,ai_model_id,exchange_id,initial_balance,is_running)
-		VALUES(?,?,?,?,?,?,?)`, id, "user-1", name, "model-1", exchangeID, 100, running); err != nil {
+		(id,user_id,name,ai_model_id,exchange_id,initial_balance,is_running,lifecycle_status,lifecycle_generation)
+		VALUES(?,?,?,?,?,?,?,?,?)`,
+		id, "user-1", name, "model-1", exchangeID, 100, running, status, generation); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -83,6 +90,23 @@ func TestExternalPositionSyncDoesNotLetStoppedSharedTraderClaim(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("idempotent sync created duplicate rows: %d", count)
+	}
+}
+
+func TestPeriodicAccountingSyncSkipsStoppedTrader(t *testing.T) {
+	st, err := store.New(filepath.Join(t.TempDir(), "stopped-accounting-sync.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	insertPositionSyncTrader(t, st, "stopped-trader", "stopped", "exchange-1", false)
+	manager := NewPositionSyncManager(st, time.Second)
+	manager.syncDueClosedAccounting()
+	manager.lastHistorySyncMutex.RLock()
+	_, synced := manager.lastHistorySync["stopped-trader"]
+	manager.lastHistorySyncMutex.RUnlock()
+	if synced {
+		t.Fatal("stopped trader continued periodic exchange accounting reconciliation")
 	}
 }
 

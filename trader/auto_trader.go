@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -123,6 +124,7 @@ type AutoTrader struct {
 	peakPnLCacheMutex     sync.RWMutex       // Cache read-write lock
 	lastBalanceSyncTime   time.Time          // Last balance sync time
 	userID                string             // User ID
+	lifecycleGeneration   atomic.Int64       // Database lifecycle lease held by this runtime
 }
 
 // NewAutoTrader creates an automatic trader
@@ -343,6 +345,9 @@ func NewAutoTrader(config AutoTraderConfig, st *store.Store, userID string) (*Au
 
 // Run runs the automatic trading main loop
 func (at *AutoTrader) Run() error {
+	if !at.lifecycleRunning() {
+		return fmt.Errorf("trader lifecycle does not permit runtime start")
+	}
 	at.isRunning = true
 	at.stopMonitorCh = make(chan struct{})
 	at.startTime = time.Now()
@@ -368,6 +373,9 @@ func (at *AutoTrader) Run() error {
 	for at.isRunning {
 		select {
 		case <-ticker.C:
+			if !at.lifecycleRunning() {
+				return nil
+			}
 			if err := at.runCycle(); err != nil {
 				logger.Infof("❌ Execution failed: %v", err)
 			}
@@ -393,6 +401,9 @@ func (at *AutoTrader) Stop() {
 
 // runCycle runs one trading cycle (using AI full decision-making)
 func (at *AutoTrader) runCycle() error {
+	if !at.lifecycleRunning() {
+		return nil
+	}
 	at.callCount++
 
 	logger.Info("\n" + strings.Repeat("=", 70) + "\n")
@@ -445,6 +456,12 @@ func (at *AutoTrader) runCycle() error {
 	// 5. Use strategy engine to call AI for decision
 	logger.Infof("🤖 Requesting AI analysis and decision... [Strategy Engine]")
 	aiDecision, err := decision.GetFullDecisionWithStrategy(ctx, at.mcpClient, at.strategyEngine, "balanced")
+	if !at.lifecycleRunning() {
+		// An in-flight model call may finish after an operator stop. Its output
+		// is intentionally discarded: no order, business log, or notification
+		// is allowed to cross the lifecycle generation barrier.
+		return nil
+	}
 
 	if aiDecision != nil && aiDecision.AIRequestDurationMs > 0 {
 		record.AIRequestDurationMs = aiDecision.AIRequestDurationMs
@@ -529,6 +546,9 @@ func (at *AutoTrader) runCycle() error {
 
 	// Execute decisions and record results
 	for _, d := range sortedDecisions {
+		if !at.lifecycleRunning() {
+			return nil
+		}
 		actionRecord := store.DecisionAction{
 			Action:     d.Action,
 			Symbol:     d.Symbol,
@@ -2164,6 +2184,15 @@ func (at *AutoTrader) SetOverrideBasePrompt(override bool) {
 	at.overrideBasePrompt = override
 }
 
+func (at *AutoTrader) SetLifecycleGeneration(generation int64) {
+	at.lifecycleGeneration.Store(generation)
+}
+
+func (at *AutoTrader) lifecycleRunning() bool {
+	return at != nil && at.store != nil &&
+		at.store.Trader().IsGenerationRunning(at.id, at.lifecycleGeneration.Load())
+}
+
 // GetSystemPromptTemplate gets current system prompt template name (from strategy config)
 func (at *AutoTrader) GetSystemPromptTemplate() string {
 	if at.strategyEngine != nil {
@@ -2177,7 +2206,7 @@ func (at *AutoTrader) GetSystemPromptTemplate() string {
 
 // saveEquitySnapshot saves equity snapshot independently (for drawing profit curve, decoupled from AI decision)
 func (at *AutoTrader) saveEquitySnapshot(ctx *decision.Context) {
-	if at.store == nil || ctx == nil {
+	if at.store == nil || ctx == nil || !at.lifecycleRunning() {
 		return
 	}
 
@@ -2198,7 +2227,7 @@ func (at *AutoTrader) saveEquitySnapshot(ctx *decision.Context) {
 
 // saveDecision saves AI decision log to database (only records AI input/output, for debugging)
 func (at *AutoTrader) saveDecision(record *store.DecisionRecord) error {
-	if at.store == nil {
+	if at.store == nil || !at.lifecycleRunning() {
 		return nil
 	}
 
@@ -2446,6 +2475,9 @@ func (at *AutoTrader) startDrawdownMonitor() {
 		for {
 			select {
 			case <-ticker.C:
+				if !at.lifecycleRunning() {
+					return
+				}
 				at.checkPositionDrawdown()
 			case <-at.stopMonitorCh:
 				logger.Info("⏹ Stopped position drawdown monitoring")

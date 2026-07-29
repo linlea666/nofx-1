@@ -35,6 +35,13 @@ func TestAIEnterPriceLeaseReusesExactUnsubmittedIntentUntilAuthoritativeExpiry(t
 		t.Fatal(err)
 	}
 	defer st.Close()
+	if _, err = st.DB().Exec(`INSERT INTO traders
+		(id,user_id,name,ai_model_id,exchange_id,initial_balance,is_running,lifecycle_status,lifecycle_generation)
+		VALUES(?,?,?,?,?,?,1,?,1)`,
+		"trader-1", "test-user", "test trader", "test-model", "test-exchange", 1000,
+		store.TraderLifecycleRunning); err != nil {
+		t.Fatal(err)
+	}
 	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{
 		TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "leader-pos",
 		Symbol: "ETHUSDT", Side: "short", MarginMode: "cross",

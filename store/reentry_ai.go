@@ -550,19 +550,22 @@ type ReentryAIStats struct {
 	// Candidate calls are never deduplicated away: WAIT, ABANDON, invalid
 	// schema and transport/model failures all remain visible. Accuracy is only
 	// computed where an ENTER analysis maps to a reconciled attempt.
-	CandidateAnalyses           int            `json:"candidate_analyses"`
-	CandidateDecisions          map[string]int `json:"candidate_decisions"`
-	CandidateCallStatuses       map[string]int `json:"candidate_call_statuses"`
-	CandidateScored             int            `json:"candidate_scored"`
-	CandidateProfitable         int            `json:"candidate_profitable"`
-	CandidateEvaluated          int            `json:"candidate_evaluated"`
-	CandidateUnscorable         int            `json:"candidate_unscorable"`
-	CandidateExecutionRequested int            `json:"candidate_execution_requested"`
-	CandidateExecutionSubmitted int            `json:"candidate_execution_submitted"`
-	CandidateExecutionFilled    int            `json:"candidate_execution_filled"`
-	CandidateExecutionProtected int            `json:"candidate_execution_protected"`
-	CandidateEvaluationOutcomes map[string]int `json:"candidate_evaluation_outcomes"`
-	CandidateMarketOutcomes     map[string]int `json:"candidate_market_outcomes"`
+	CandidateAnalyses                int            `json:"candidate_analyses"`
+	CandidateDecisions               map[string]int `json:"candidate_decisions"`
+	CandidateCallStatuses            map[string]int `json:"candidate_call_statuses"`
+	CandidateScored                  int            `json:"candidate_scored"`
+	CandidateProfitable              int            `json:"candidate_profitable"`
+	CandidateEvaluated               int            `json:"candidate_evaluated"`
+	CandidateUnscorable              int            `json:"candidate_unscorable"`
+	CandidateExecutionRequested      int            `json:"candidate_execution_requested"`
+	CandidateExecutionSubmitted      int            `json:"candidate_execution_submitted"`
+	CandidateExecutionFilled         int            `json:"candidate_execution_filled"`
+	CandidateExecutionProtected      int            `json:"candidate_execution_protected"`
+	CandidateEvaluationOutcomes      map[string]int `json:"candidate_evaluation_outcomes"`
+	CandidateMarketOutcomes          map[string]int `json:"candidate_market_outcomes"`
+	CandidateCycles                  int            `json:"candidate_cycles"`
+	CandidateMissedReversalCycles    int            `json:"candidate_missed_reversal_cycles"`
+	CandidateMissedReversalDecisions int            `json:"candidate_missed_reversal_decisions"`
 }
 
 // sqlMarks 生成 "?,?,...,?" 占位符
@@ -667,6 +670,15 @@ func (s *ReentryAIStore) GetReentryAIStats(traderIDs []string) (*ReentryAIStats,
 		}
 	}
 	if err := evalRows.Err(); err != nil {
+		return nil, err
+	}
+	if err := s.db.QueryRow(`SELECT
+		COUNT(DISTINCT cycle_id),
+		COUNT(DISTINCT CASE WHEN decision_outcome IN ('ABANDON_MISSED_REVERSAL','WAIT_DELAYED_REVERSAL','RISK_GATE_MISSED_REVERSAL','ENTER_NOT_EXECUTED_MISSED') THEN cycle_id END),
+		COALESCE(SUM(CASE WHEN decision_outcome IN ('ABANDON_MISSED_REVERSAL','WAIT_DELAYED_REVERSAL','RISK_GATE_MISSED_REVERSAL','ENTER_NOT_EXECUTED_MISSED') THEN 1 ELSE 0 END),0)
+		FROM reentry_ai_decision_evaluations
+		WHERE trader_id IN (`+marks+`) AND evaluation_version=? AND horizon='LEADER_FINAL'`,
+		evalArgs...).Scan(&st.CandidateCycles, &st.CandidateMissedReversalCycles, &st.CandidateMissedReversalDecisions); err != nil {
 		return nil, err
 	}
 	if err := s.db.QueryRow(`SELECT

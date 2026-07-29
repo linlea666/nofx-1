@@ -443,8 +443,11 @@ func ValidateRiskPolicyV4(c *CopyConfig) error {
 	if c.RiskAIMinReviewSeconds < 300 || c.RiskAIMinReviewSeconds > 21600 {
 		return fmt.Errorf("risk_ai_min_review_seconds must be 300..21600")
 	}
-	if c.RiskAIDailyCallLimit < 1 || c.RiskAIDailyCallLimit > 12 || c.RiskAILifecycleCallLimit < 1 || c.RiskAILifecycleCallLimit > 30 {
-		return fmt.Errorf("AI review limits must be 1..12 per 24h and 1..30 per lifecycle")
+	// Legacy call-limit fields are cost-warning thresholds only. They remain
+	// positive for backwards-compatible UI/reporting but never cap eligibility,
+	// and deliberately have no upper bound.
+	if c.RiskAIDailyCallLimit < 1 || c.RiskAILifecycleCallLimit < 1 {
+		return fmt.Errorf("AI cost warning thresholds must be positive")
 	}
 	if c.RiskNotificationLevel != "critical" && c.RiskNotificationLevel != "important" && c.RiskNotificationLevel != "verbose" {
 		return fmt.Errorf("risk_notification_level must be critical, important or verbose")

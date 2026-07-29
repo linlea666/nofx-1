@@ -18,25 +18,26 @@ const (
 )
 
 type AIEffectSummary struct {
-	CycleID               int64          `json:"cycle_id"`
-	EvaluationVersion     int            `json:"evaluation_version"`
-	TotalDecisions        int            `json:"total_decisions"`
-	ScorableDecisions     int            `json:"scorable_decisions"`
-	UnscorableDecisions   int            `json:"unscorable_decisions"`
-	DecisionCounts        map[string]int `json:"decision_counts"`
-	DecisionOutcomeCounts map[string]int `json:"decision_outcome_counts"`
-	MarketOutcomeCounts   map[string]int `json:"market_outcome_counts"`
-	MissedReversals       int            `json:"missed_reversals"`
-	CorrectAbandons       int            `json:"correct_abandons"`
-	RiskGateSavedLosses   int            `json:"risk_gate_saved_losses"`
-	EnterDecisions        int            `json:"enter_decisions"`
-	ExecutionRequested    int            `json:"execution_requested"`
-	ExecutionSubmitted    int            `json:"execution_submitted"`
-	ExecutionFilled       int            `json:"execution_filled"`
-	ExecutionProtected    int            `json:"execution_protected"`
-	ActualReentryPnL      float64        `json:"actual_reentry_pnl"`
-	FinalDecision         string         `json:"final_decision"`
-	FinalDecisionOutcome  string         `json:"final_decision_outcome"`
+	CycleID                 int64          `json:"cycle_id"`
+	EvaluationVersion       int            `json:"evaluation_version"`
+	TotalDecisions          int            `json:"total_decisions"`
+	ScorableDecisions       int            `json:"scorable_decisions"`
+	UnscorableDecisions     int            `json:"unscorable_decisions"`
+	DecisionCounts          map[string]int `json:"decision_counts"`
+	DecisionOutcomeCounts   map[string]int `json:"decision_outcome_counts"`
+	MarketOutcomeCounts     map[string]int `json:"market_outcome_counts"`
+	MissedReversals         int            `json:"missed_reversals"`
+	MissedReversalDecisions int            `json:"missed_reversal_decisions"`
+	CorrectAbandons         int            `json:"correct_abandons"`
+	RiskGateSavedLosses     int            `json:"risk_gate_saved_losses"`
+	EnterDecisions          int            `json:"enter_decisions"`
+	ExecutionRequested      int            `json:"execution_requested"`
+	ExecutionSubmitted      int            `json:"execution_submitted"`
+	ExecutionFilled         int            `json:"execution_filled"`
+	ExecutionProtected      int            `json:"execution_protected"`
+	ActualReentryPnL        float64        `json:"actual_reentry_pnl"`
+	FinalDecision           string         `json:"final_decision"`
+	FinalDecisionOutcome    string         `json:"final_decision_outcome"`
 }
 
 type evaluationDatapack struct {
@@ -266,6 +267,9 @@ func EvaluateCycleAIDecisions(st *store.Store, cycleID int64) (*AIEffectSummary,
 				"trader_name_snapshot": traderName,
 			},
 		})
+	}
+	if _, err = EvaluateCycleShadowPolicies(st, cycleID); err != nil {
+		return nil, fmt.Errorf("evaluate Copy Guard shadow policies: %w", err)
 	}
 	return summary, nil
 }
@@ -623,7 +627,7 @@ func summarizeCycle(cycle *store.CopyGuardCycle, attempts []*store.CopyGuardAtte
 		}
 		switch evaluation.DecisionOutcome {
 		case "ABANDON_MISSED_REVERSAL", "WAIT_DELAYED_REVERSAL", "RISK_GATE_MISSED_REVERSAL", "ENTER_NOT_EXECUTED_MISSED":
-			summary.MissedReversals++
+			summary.MissedReversalDecisions++
 		case "ABANDON_CORRECT":
 			summary.CorrectAbandons++
 		case "RISK_GATE_SAVED_LOSS":
@@ -631,6 +635,11 @@ func summarizeCycle(cycle *store.CopyGuardCycle, attempts []*store.CopyGuardAtte
 		}
 		summary.FinalDecision = evaluation.Decision
 		summary.FinalDecisionOutcome = evaluation.DecisionOutcome
+	}
+	if summary.MissedReversalDecisions > 0 {
+		// Opportunity-level metric: multiple WAIT decisions in one leader
+		// cycle describe one missed reversal, not independent failures.
+		summary.MissedReversals = 1
 	}
 	return summary
 }

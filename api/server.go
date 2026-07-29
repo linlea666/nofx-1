@@ -2,7 +2,9 @@ package api
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -26,23 +28,61 @@ import (
 // isTraderRunning checks if a trader is running (unified for both AI and copy trade modes)
 // This is the single source of truth for trader running status
 func (s *Server) isTraderRunning(traderID string) bool {
-	// Check decision mode
-	decisionMode, _ := s.store.CopyTrade().GetDecisionMode(traderID)
+	state, err := s.store.Trader().GetLifecycle(traderID)
+	return err == nil && state.Status == store.TraderLifecycleRunning && state.IsRunning
+}
 
-	if decisionMode == "copy_trade" {
-		// For copy trade mode, check copy trading engine status
-		return copytrade.IsCopyTradingRunning(traderID)
+func (s *Server) getExchangeArchiveBlockers(traderID string) []store.TraderLifecycleBlocker {
+	traderConfig, err := s.store.Trader().GetByID(traderID)
+	if err != nil {
+		return []store.TraderLifecycleBlocker{{
+			Code: "EXCHANGE_POSITION_VERIFICATION_UNAVAILABLE", ResourceID: traderID,
+			Status: err.Error(),
+		}}
 	}
-
-	// For AI mode, check AutoTrader status
-	if at, err := s.traderManager.GetTrader(traderID); err == nil {
-		status := at.GetStatus()
-		if running, ok := status["is_running"].(bool); ok {
-			return running
-		}
+	runtimeTrader, err := s.traderManager.GetTrader(traderID)
+	if err != nil {
+		return []store.TraderLifecycleBlocker{{
+			Code: "EXCHANGE_POSITION_VERIFICATION_UNAVAILABLE", ResourceID: traderConfig.ExchangeID,
+			Status: "trader runtime unavailable for authoritative position read",
+		}}
 	}
-
-	return false
+	positions, err := runtimeTrader.GetPositionsFresh()
+	if err != nil {
+		return []store.TraderLifecycleBlocker{{
+			Code: "EXCHANGE_POSITION_VERIFICATION_FAILED", ResourceID: traderConfig.ExchangeID,
+			Status: err.Error(),
+		}}
+	}
+	if len(positions) == 0 {
+		return nil
+	}
+	accountUsers, err := s.store.Trader().CountNonArchivedByExchange(traderConfig.ExchangeID)
+	if err != nil {
+		return []store.TraderLifecycleBlocker{{
+			Code: "EXCHANGE_ACCOUNT_OWNERSHIP_UNAVAILABLE", ResourceID: traderConfig.ExchangeID,
+			Status: err.Error(),
+		}}
+	}
+	if accountUsers > 1 {
+		// A live position on a shared account cannot be assigned to the trader
+		// being archived merely from symbol/side. Fail closed and require an
+		// explicit ownership reconciliation instead of risking orphaned funds.
+		return []store.TraderLifecycleBlocker{{
+			Code:       "SHARED_ACCOUNT_POSITION_OWNERSHIP_AMBIGUOUS",
+			ResourceID: traderConfig.ExchangeID,
+			Status:     fmt.Sprintf("%d open exchange positions across %d non-archived traders", len(positions), accountUsers),
+		}}
+	}
+	blockers := make([]store.TraderLifecycleBlocker, 0, len(positions))
+	for index, position := range positions {
+		symbol, _ := position["symbol"].(string)
+		blockers = append(blockers, store.TraderLifecycleBlocker{
+			Code: "EXCHANGE_POSITION_PRESENT", ResourceID: fmt.Sprintf("%s:%d", traderConfig.ExchangeID, index),
+			Symbol: symbol, Status: "OPEN",
+		})
+	}
+	return blockers
 }
 
 // Server HTTP API server
@@ -1399,32 +1439,55 @@ func (s *Server) handleDeleteTrader(c *gin.Context) {
 	userID := c.GetString("user_id")
 	traderID := c.Param("id")
 
-	// Delete from database
-	err := s.store.Trader().Delete(userID, traderID)
+	state, err := s.store.Trader().GetLifecycleForUser(userID, traderID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to delete trader: %v", err)})
+		c.JSON(http.StatusNotFound, gin.H{"error": "Trader does not exist or no access permission"})
 		return
 	}
-
-	// If trader is running, stop it first (unified check)
-	if s.isTraderRunning(traderID) {
-		// Check decision mode to determine stop type
-		decisionMode, _ := s.store.CopyTrade().GetDecisionMode(traderID)
-		if decisionMode == "copy_trade" {
-			copytrade.StopCopyTradingForTrader(traderID)
-			s.store.CopyTrade().SetEnabled(traderID, false)
-		}
-		if trader, err := s.traderManager.GetTrader(traderID); err == nil {
-			trader.Stop()
-		}
-		logger.Infof("⏹  Stopped running trader: %s", traderID)
+	if state.Status == store.TraderLifecycleArchived {
+		c.JSON(http.StatusOK, gin.H{"status": store.TraderLifecycleArchived, "message": "Trader already archived"})
+		return
 	}
-
-	// Remove trader from memory
+	if state.Status != store.TraderLifecycleStopped {
+		c.JSON(http.StatusConflict, gin.H{
+			"error":            "Trader must be fully stopped before archive",
+			"lifecycle_status": state.Status,
+			"pending_blockers": []store.TraderLifecycleBlocker{{
+				Code: "TRADER_NOT_STOPPED", ResourceID: traderID, Status: state.Status,
+			}},
+		})
+		return
+	}
+	archiveBlockers, err := s.store.Trader().GetArchiveBlockers(traderID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to verify archive safety: %v", err)})
+		return
+	}
+	archiveBlockers = append(archiveBlockers, s.getExchangeArchiveBlockers(traderID)...)
+	if len(archiveBlockers) > 0 {
+		c.JSON(http.StatusConflict, gin.H{
+			"error":            "Trader has unresolved exchange risk and cannot be archived",
+			"lifecycle_status": state.Status,
+			"pending_blockers": archiveBlockers,
+		})
+		return
+	}
+	blockers, err := s.store.Trader().Archive(userID, traderID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to archive trader: %v", err)})
+		return
+	}
+	if len(blockers) > 0 {
+		c.JSON(http.StatusConflict, gin.H{
+			"error":            "Trader has unresolved exchange risk and cannot be archived",
+			"lifecycle_status": state.Status,
+			"pending_blockers": blockers,
+		})
+		return
+	}
 	s.traderManager.RemoveTrader(traderID)
-
-	logger.Infof("✓ Trader deleted: %s", traderID)
-	c.JSON(http.StatusOK, gin.H{"message": "Trader deleted"})
+	logger.Infof("✓ Trader archived with audit history retained: %s", traderID)
+	c.JSON(http.StatusOK, gin.H{"status": store.TraderLifecycleArchived, "message": "Trader archived"})
 }
 
 // handleStartTrader Start trader
@@ -1433,16 +1496,34 @@ func (s *Server) handleStartTrader(c *gin.Context) {
 	traderID := c.Param("id")
 
 	// Verify trader belongs to current user
-	_, err := s.store.Trader().GetFullConfig(userID, traderID)
+	fullConfig, err := s.store.Trader().GetFullConfig(userID, traderID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Trader does not exist or no access permission"})
 		return
 	}
 
-	// Check if trader is already running (unified check for both AI and copy trade modes)
-	if s.isTraderRunning(traderID) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Trader is already running"})
+	if fullConfig.Trader.LifecycleStatus == store.TraderLifecycleArchived {
+		c.JSON(http.StatusConflict, gin.H{"error": "Archived trader cannot be started"})
 		return
+	}
+	lifecycle, err := s.store.Trader().BeginStart(userID, traderID)
+	if err != nil {
+		status := http.StatusConflict
+		if errors.Is(err, sql.ErrNoRows) {
+			status = http.StatusNotFound
+		}
+		c.JSON(status, gin.H{"error": err.Error(), "lifecycle_status": fullConfig.Trader.LifecycleStatus})
+		return
+	}
+	if lifecycle.Status == store.TraderLifecycleRunning {
+		c.JSON(http.StatusOK, gin.H{
+			"status": store.TraderLifecycleRunning, "lifecycle_generation": lifecycle.Generation,
+			"message": "Trader already running",
+		})
+		return
+	}
+	failStart := func(cause error) {
+		_ = s.store.Trader().FailStart(userID, traderID, lifecycle.Generation, cause.Error())
 	}
 
 	// Remove from memory to reload fresh config
@@ -1454,6 +1535,7 @@ func (s *Server) handleStartTrader(c *gin.Context) {
 	// Load trader from database (always reload to get latest config)
 	logger.Infof("🔄 Loading trader %s from database...", traderID)
 	if loadErr := s.traderManager.LoadUserTradersFromStore(s.store, userID); loadErr != nil {
+		failStart(loadErr)
 		logger.Infof("❌ Failed to load user traders: %v", loadErr)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load trader: " + loadErr.Error()})
 		return
@@ -1461,6 +1543,7 @@ func (s *Server) handleStartTrader(c *gin.Context) {
 
 	trader, err := s.traderManager.GetTrader(traderID)
 	if err != nil {
+		failStart(fmt.Errorf("trader runtime configuration could not be loaded: %w", err))
 		// Check detailed reason
 		fullCfg, _ := s.store.Trader().GetFullConfig(userID, traderID)
 		if fullCfg != nil && fullCfg.Trader != nil {
@@ -1496,9 +1579,24 @@ func (s *Server) handleStartTrader(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Failed to load trader, please check AI model, exchange and strategy configuration"})
 		return
 	}
+	trader.SetLifecycleGeneration(lifecycle.Generation)
 
 	// Check decision mode to determine startup type
 	decisionMode, _ := s.store.CopyTrade().GetDecisionMode(traderID)
+
+	if err = s.store.Trader().CompleteStart(userID, traderID, lifecycle.Generation); err != nil {
+		trader.Stop()
+		failStart(err)
+		c.JSON(http.StatusConflict, gin.H{"error": "Failed to commit trader start: " + err.Error()})
+		return
+	}
+	rollbackCommittedStart := func(cause error) {
+		if stopped, stopErr := s.store.Trader().BeginStop(userID, traderID); stopErr == nil {
+			_ = s.store.Trader().CompleteStop(userID, traderID, stopped.Generation)
+		}
+		trader.Stop()
+		logger.Errorf("❌ Trader %s startup rolled back after RUNNING commit: %v", traderID, cause)
+	}
 
 	if decisionMode == "copy_trade" {
 		// Start in copy trade mode
@@ -1509,31 +1607,46 @@ func (s *Server) handleStartTrader(c *gin.Context) {
 			logger.Warnf("⚠️ Failed to enable copy trade config: %v", err)
 		}
 
-		go func() {
-			if err := copytrade.StartCopyTradingForTrader(traderID, trader, s.store); err != nil {
-				logger.Errorf("❌ Trader %s copy trade runtime error: %v", trader.GetName(), err)
-				// Disable copy trade on error
-				s.store.CopyTrade().SetEnabled(traderID, false)
-			}
-		}()
+		if err := copytrade.StartCopyTradingForTraderWithGeneration(traderID, lifecycle.Generation, trader, s.store); err != nil {
+			_ = s.store.CopyTrade().SetEnabled(traderID, false)
+			rollbackCommittedStart(err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start copy trader: " + err.Error()})
+			return
+		}
 	} else {
 		// Start in AI mode (default)
 		logger.Infof("🤖 [%s] Starting in AI mode...", trader.GetName())
-		go func() {
-			if err := trader.Run(); err != nil {
-				logger.Infof("❌ Trader %s runtime error: %v", trader.GetName(), err)
-			}
-		}()
 	}
-
-	// Update running status in database
-	err = s.store.Trader().UpdateStatus(userID, traderID, true)
-	if err != nil {
-		logger.Infof("⚠️  Failed to update trader status: %v", err)
+	// A stopped Copy Guard candidate becomes eligible only after unfinished
+	// exchange work and authoritative leader/follower state have been restored.
+	// Keeping it PAUSED_BY_TRADER until this point prevents the global advisor
+	// scheduler from racing the copy-trading startup reconciliation.
+	if err = s.store.ReentryAI().ResumeTraderCandidatesForStart(traderID); err != nil {
+		if decisionMode == "copy_trade" {
+			_ = copytrade.StopCopyTradingForTrader(traderID)
+			_ = s.store.CopyTrade().SetEnabled(traderID, false)
+		}
+		rollbackCommittedStart(err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to restore paused AI candidates: " + err.Error()})
+		return
+	}
+	if decisionMode != "copy_trade" {
+		go func(generation int64) {
+			if runErr := trader.Run(); runErr != nil {
+				logger.Infof("❌ Trader %s runtime error: %v", trader.GetName(), runErr)
+				state, stateErr := s.store.Trader().GetLifecycle(traderID)
+				if stateErr == nil && state.Generation == generation && state.Status == store.TraderLifecycleRunning {
+					_ = s.store.Trader().UpdateStatus(userID, traderID, false)
+				}
+			}
+		}(lifecycle.Generation)
 	}
 
 	logger.Infof("✓ Trader %s started", trader.GetName())
-	c.JSON(http.StatusOK, gin.H{"message": "Trader started"})
+	c.JSON(http.StatusOK, gin.H{
+		"status": store.TraderLifecycleRunning, "lifecycle_generation": lifecycle.Generation,
+		"message": "Trader started",
+	})
 }
 
 // handleStopTrader Stop trader
@@ -1541,43 +1654,70 @@ func (s *Server) handleStopTrader(c *gin.Context) {
 	userID := c.GetString("user_id")
 	traderID := c.Param("id")
 
-	// Verify trader belongs to current user
-	_, err := s.store.Trader().GetFullConfig(userID, traderID)
+	// Stop and reconciliation remain available even if runtime dependencies
+	// were removed; only ownership and the durable lifecycle are required.
+	_, err := s.store.Trader().GetLifecycleForUser(userID, traderID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Trader does not exist or no access permission"})
 		return
 	}
 
-	// Check if trader is running (unified check for both AI and copy trade modes)
-	if !s.isTraderRunning(traderID) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Trader is already stopped"})
+	lifecycle, err := s.store.Trader().BeginStop(userID, traderID)
+	if err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		return
+	}
+	if lifecycle.Status == store.TraderLifecycleStopped {
+		c.JSON(http.StatusOK, gin.H{
+			"status": store.TraderLifecycleStopped, "lifecycle_generation": lifecycle.Generation,
+			"pending_blockers": []store.TraderLifecycleBlocker{}, "message": "Trader already stopped",
+		})
 		return
 	}
 
-	// Check decision mode to determine stop type
-	decisionMode, _ := s.store.CopyTrade().GetDecisionMode(traderID)
-
-	if decisionMode == "copy_trade" {
-		// Stop copy trade engine
-		if err := copytrade.StopCopyTradingForTrader(traderID); err != nil {
-			logger.Warnf("⚠️ Failed to stop copy trade engine: %v", err)
-		}
-		// Disable copy trade config
-		s.store.CopyTrade().SetEnabled(traderID, false)
+	// Stop every possible runtime path. Decision-mode configuration is not an
+	// authority: it may be missing or stale, while a copy-trading integration
+	// and submitted exchange work still exist.
+	var executor copytrade.DecisionExecutor
+	if runtimeTrader, getErr := s.traderManager.GetTrader(traderID); getErr == nil {
+		executor = runtimeTrader
 	}
+	_ = copytrade.PrepareCopyTradingStopWithExecutor(traderID, executor, s.store)
+	if err := copytrade.StopCopyTradingForTrader(traderID); err != nil {
+		logger.Warnf("⚠️ Failed to stop copy trade engine: %v", err)
+	}
+	_ = s.store.CopyTrade().SetEnabled(traderID, false)
 
 	// Stop AutoTrader (also stop for copy trade mode in case it was partially started)
 	if trader, err := s.traderManager.GetTrader(traderID); err == nil {
 		trader.Stop()
 	}
 
-	// Update running status in database
-	if err := s.store.Trader().UpdateStatus(userID, traderID, false); err != nil {
-		logger.Infof("⚠️  Failed to update trader status: %v", err)
+	blockers, blockerErr := s.store.Trader().GetStopBlockers(traderID)
+	if blockerErr != nil {
+		blockers = []store.TraderLifecycleBlocker{{
+			Code: "STOP_BLOCKER_QUERY_FAILED", ResourceID: traderID, Status: blockerErr.Error(),
+		}}
+	}
+	if len(blockers) > 0 {
+		detail := store.FormatLifecycleBlockers(blockers)
+		_ = s.store.Trader().MarkStopReconcileRequired(userID, traderID, lifecycle.Generation, detail)
+		c.JSON(http.StatusAccepted, gin.H{
+			"status": store.TraderLifecycleStoppingReconcileRequired, "lifecycle_generation": lifecycle.Generation,
+			"pending_blockers": blockers, "message": "Trader runtime stopped; exchange reconciliation is still required",
+		})
+		return
+	}
+	if err := s.store.Trader().CompleteStop(userID, traderID, lifecycle.Generation); err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		return
 	}
 
 	logger.Infof("⏹  Trader %s stopped", traderID)
-	c.JSON(http.StatusOK, gin.H{"message": "Trader stopped"})
+	c.JSON(http.StatusOK, gin.H{
+		"status": store.TraderLifecycleStopped, "lifecycle_generation": lifecycle.Generation,
+		"pending_blockers": []store.TraderLifecycleBlocker{}, "message": "Trader stopped",
+	})
 }
 
 // handleUpdateTraderPrompt Update trader custom prompt
@@ -2316,6 +2456,17 @@ func (s *Server) handleTraderList(c *gin.Context) {
 
 		// Get real-time running status (unified check)
 		isRunning := s.isTraderRunning(trader.ID)
+		pendingBlockers := []store.TraderLifecycleBlocker{}
+		if trader.LifecycleStatus == store.TraderLifecycleStopping ||
+			trader.LifecycleStatus == store.TraderLifecycleStoppingReconcileRequired {
+			if found, blockerErr := s.store.Trader().GetStopBlockers(trader.ID); blockerErr == nil {
+				pendingBlockers = found
+			}
+		} else if trader.LifecycleStatus == store.TraderLifecycleStopped {
+			if found, blockerErr := s.store.Trader().GetArchiveBlockers(trader.ID); blockerErr == nil {
+				pendingBlockers = found
+			}
+		}
 
 		// Get strategy name if strategy_id is set
 		var strategyName string
@@ -2328,16 +2479,21 @@ func (s *Server) handleTraderList(c *gin.Context) {
 		// Return complete AIModelID (e.g. "admin_deepseek"), don't truncate
 		// Frontend needs complete ID to verify model exists (consistent with handleGetTraderConfig)
 		result = append(result, map[string]interface{}{
-			"trader_id":           trader.ID,
-			"trader_name":         trader.Name,
-			"ai_model":            trader.AIModelID, // Use complete ID
-			"exchange_id":         trader.ExchangeID,
-			"is_running":          isRunning,
-			"show_in_competition": trader.ShowInCompetition,
-			"initial_balance":     trader.InitialBalance,
-			"strategy_id":         trader.StrategyID,
-			"strategy_name":       strategyName,
-			"decision_mode":       decisionMode,
+			"trader_id":            trader.ID,
+			"trader_name":          trader.Name,
+			"ai_model":             trader.AIModelID, // Use complete ID
+			"exchange_id":          trader.ExchangeID,
+			"is_running":           isRunning,
+			"lifecycle_status":     trader.LifecycleStatus,
+			"lifecycle_generation": trader.LifecycleGeneration,
+			"pending_blockers":     pendingBlockers,
+			"stopped_at":           trader.StoppedAt,
+			"archived_at":          trader.ArchivedAt,
+			"show_in_competition":  trader.ShowInCompetition,
+			"initial_balance":      trader.InitialBalance,
+			"strategy_id":          trader.StrategyID,
+			"strategy_name":        strategyName,
+			"decision_mode":        decisionMode,
 		})
 	}
 
@@ -2369,6 +2525,13 @@ func (s *Server) handleGetTraderConfig(c *gin.Context) {
 
 	// Get real-time running status (unified check)
 	isRunning := s.isTraderRunning(traderID)
+	pendingBlockers := []store.TraderLifecycleBlocker{}
+	if traderConfig.LifecycleStatus == store.TraderLifecycleStopping ||
+		traderConfig.LifecycleStatus == store.TraderLifecycleStoppingReconcileRequired {
+		pendingBlockers, _ = s.store.Trader().GetStopBlockers(traderID)
+	} else if traderConfig.LifecycleStatus == store.TraderLifecycleStopped {
+		pendingBlockers, _ = s.store.Trader().GetArchiveBlockers(traderID)
+	}
 
 	// Return complete model ID without conversion, consistent with frontend model list
 	aiModelID := traderConfig.AIModelID
@@ -2423,6 +2586,11 @@ func (s *Server) handleGetTraderConfig(c *gin.Context) {
 		"use_coin_pool":         traderConfig.UseCoinPool,
 		"use_oi_top":            traderConfig.UseOITop,
 		"is_running":            isRunning,
+		"lifecycle_status":      traderConfig.LifecycleStatus,
+		"lifecycle_generation":  traderConfig.LifecycleGeneration,
+		"pending_blockers":      pendingBlockers,
+		"stopped_at":            traderConfig.StoppedAt,
+		"archived_at":           traderConfig.ArchivedAt,
 		"decision_mode":         decisionMode,
 		"copy_config":           copyConfig,
 	}

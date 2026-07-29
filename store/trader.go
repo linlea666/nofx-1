@@ -15,19 +15,23 @@ type TraderStore struct {
 
 // Trader trader configuration
 type Trader struct {
-	ID                  string    `json:"id"`
-	UserID              string    `json:"user_id"`
-	Name                string    `json:"name"`
-	AIModelID           string    `json:"ai_model_id"`
-	ExchangeID          string    `json:"exchange_id"`
-	StrategyID          string    `json:"strategy_id"` // Associated strategy ID
-	InitialBalance      float64   `json:"initial_balance"`
-	ScanIntervalMinutes int       `json:"scan_interval_minutes"`
-	IsRunning           bool      `json:"is_running"`
-	IsCrossMargin       bool      `json:"is_cross_margin"`
-	ShowInCompetition   bool      `json:"show_in_competition"` // Whether to show in competition page
-	CreatedAt           time.Time `json:"created_at"`
-	UpdatedAt           time.Time `json:"updated_at"`
+	ID                  string     `json:"id"`
+	UserID              string     `json:"user_id"`
+	Name                string     `json:"name"`
+	AIModelID           string     `json:"ai_model_id"`
+	ExchangeID          string     `json:"exchange_id"`
+	StrategyID          string     `json:"strategy_id"` // Associated strategy ID
+	InitialBalance      float64    `json:"initial_balance"`
+	ScanIntervalMinutes int        `json:"scan_interval_minutes"`
+	IsRunning           bool       `json:"is_running"`
+	LifecycleStatus     string     `json:"lifecycle_status"`
+	LifecycleGeneration int64      `json:"lifecycle_generation"`
+	StoppedAt           *time.Time `json:"stopped_at,omitempty"`
+	ArchivedAt          *time.Time `json:"archived_at,omitempty"`
+	IsCrossMargin       bool       `json:"is_cross_margin"`
+	ShowInCompetition   bool       `json:"show_in_competition"` // Whether to show in competition page
+	CreatedAt           time.Time  `json:"created_at"`
+	UpdatedAt           time.Time  `json:"updated_at"`
 
 	// Following fields are deprecated, kept for backward compatibility, new traders should use StrategyID
 	BTCETHLeverage       int    `json:"btc_eth_leverage,omitempty"`
@@ -59,6 +63,10 @@ func (s *TraderStore) initTables() error {
 			initial_balance REAL NOT NULL,
 			scan_interval_minutes INTEGER DEFAULT 3,
 			is_running BOOLEAN DEFAULT 0,
+			lifecycle_status TEXT NOT NULL DEFAULT 'STOPPED',
+			lifecycle_generation INTEGER NOT NULL DEFAULT 0,
+			stopped_at DATETIME,
+			archived_at DATETIME,
 			btc_eth_leverage INTEGER DEFAULT 5,
 			altcoin_leverage INTEGER DEFAULT 5,
 			trading_symbols TEXT DEFAULT '',
@@ -100,10 +108,29 @@ func (s *TraderStore) initTables() error {
 		`ALTER TABLE traders ADD COLUMN use_oi_top BOOLEAN DEFAULT 0`,
 		`ALTER TABLE traders ADD COLUMN system_prompt_template TEXT DEFAULT 'default'`,
 		`ALTER TABLE traders ADD COLUMN strategy_id TEXT DEFAULT ''`,
-		`ALTER TABLE traders ADD COLUMN show_in_competition BOOLEAN DEFAULT 1`,
 	}
 	for _, q := range alterQueries {
 		s.db.Exec(q)
+	}
+	for _, migration := range []struct{ name, definition string }{
+		{"lifecycle_status", "TEXT NOT NULL DEFAULT 'STOPPED'"},
+		{"lifecycle_generation", "INTEGER NOT NULL DEFAULT 0"},
+		{"stopped_at", "DATETIME"},
+		{"archived_at", "DATETIME"},
+		{"show_in_competition", "BOOLEAN DEFAULT 1"},
+	} {
+		if err = ensureSQLiteColumn(s.db, "traders", migration.name, migration.definition); err != nil {
+			return fmt.Errorf("migrate traders.%s: %w", migration.name, err)
+		}
+	}
+	if _, err = s.db.Exec(`UPDATE traders
+		SET lifecycle_status=CASE WHEN is_running=1 THEN 'RUNNING' ELSE 'STOPPED' END
+		WHERE COALESCE(lifecycle_generation,0)=0
+		  AND COALESCE(lifecycle_status,'STOPPED')='STOPPED'`); err != nil {
+		return err
+	}
+	if err = s.initLifecycleTables(); err != nil {
+		return err
 	}
 
 	// Migration: Remove FOREIGN KEY constraint from existing traders table
@@ -111,6 +138,11 @@ func (s *TraderStore) initTables() error {
 	if err := s.migrateTradersRemoveFK(); err != nil {
 		// Log but don't fail - this is a best-effort migration
 		// The constraint may not exist in older databases
+	}
+	// The legacy foreign-key migration can recreate the traders table and
+	// thereby drop its indexes, so create this index only after that migration.
+	if _, err = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_traders_lifecycle ON traders(lifecycle_status,lifecycle_generation)`); err != nil {
+		return err
 	}
 
 	return nil
@@ -142,6 +174,10 @@ func (s *TraderStore) migrateTradersRemoveFK() error {
 			initial_balance REAL NOT NULL,
 			scan_interval_minutes INTEGER DEFAULT 3,
 			is_running BOOLEAN DEFAULT 0,
+			lifecycle_status TEXT NOT NULL DEFAULT 'STOPPED',
+			lifecycle_generation INTEGER NOT NULL DEFAULT 0,
+			stopped_at DATETIME,
+			archived_at DATETIME,
 			btc_eth_leverage INTEGER DEFAULT 5,
 			altcoin_leverage INTEGER DEFAULT 5,
 			trading_symbols TEXT DEFAULT '',
@@ -152,17 +188,26 @@ func (s *TraderStore) migrateTradersRemoveFK() error {
 			system_prompt_template TEXT DEFAULT 'default',
 			is_cross_margin BOOLEAN DEFAULT 1,
 			strategy_id TEXT DEFAULT '',
+			show_in_competition BOOLEAN DEFAULT 1,
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		);
 
 		-- Copy data from old table
-		INSERT OR IGNORE INTO traders_new
+		INSERT OR IGNORE INTO traders_new(
+			id,user_id,name,ai_model_id,exchange_id,initial_balance,
+			scan_interval_minutes,is_running,btc_eth_leverage,altcoin_leverage,
+			trading_symbols,use_coin_pool,use_oi_top,custom_prompt,
+			override_base_prompt,system_prompt_template,is_cross_margin,strategy_id,
+			lifecycle_status,lifecycle_generation,stopped_at,archived_at,
+			show_in_competition,created_at,updated_at
+		)
 		SELECT id, user_id, name, ai_model_id, exchange_id, initial_balance,
 		       scan_interval_minutes, is_running, btc_eth_leverage, altcoin_leverage,
 		       trading_symbols, use_coin_pool, use_oi_top, custom_prompt,
 		       override_base_prompt, system_prompt_template, is_cross_margin,
-		       COALESCE(strategy_id, ''), created_at, updated_at
+		       COALESCE(strategy_id, ''), lifecycle_status, lifecycle_generation,
+		       stopped_at, archived_at, COALESCE(show_in_competition,1), created_at, updated_at
 		FROM traders;
 
 		-- Drop old table
@@ -197,14 +242,23 @@ func (s *TraderStore) decrypt(encrypted string) string {
 
 // Create creates trader
 func (s *TraderStore) Create(trader *Trader) error {
+	if trader.LifecycleStatus == "" {
+		if trader.IsRunning {
+			trader.LifecycleStatus = TraderLifecycleRunning
+		} else {
+			trader.LifecycleStatus = TraderLifecycleStopped
+		}
+	}
 	_, err := s.db.Exec(`
 		INSERT INTO traders (id, user_id, name, ai_model_id, exchange_id, strategy_id, initial_balance,
-		                     scan_interval_minutes, is_running, is_cross_margin, show_in_competition,
+		                     scan_interval_minutes, is_running, lifecycle_status, lifecycle_generation,
+		                     stopped_at, archived_at, is_cross_margin, show_in_competition,
 		                     btc_eth_leverage, altcoin_leverage, trading_symbols, use_coin_pool,
 		                     use_oi_top, custom_prompt, override_base_prompt, system_prompt_template)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, trader.ID, trader.UserID, trader.Name, trader.AIModelID, trader.ExchangeID, trader.StrategyID,
-		trader.InitialBalance, trader.ScanIntervalMinutes, trader.IsRunning, trader.IsCrossMargin, trader.ShowInCompetition,
+		trader.InitialBalance, trader.ScanIntervalMinutes, trader.IsRunning, trader.LifecycleStatus, trader.LifecycleGeneration,
+		trader.StoppedAt, trader.ArchivedAt, trader.IsCrossMargin, trader.ShowInCompetition,
 		trader.BTCETHLeverage, trader.AltcoinLeverage, trader.TradingSymbols, trader.UseCoinPool,
 		trader.UseOITop, trader.CustomPrompt, trader.OverrideBasePrompt, trader.SystemPromptTemplate)
 	return err
@@ -214,13 +268,15 @@ func (s *TraderStore) Create(trader *Trader) error {
 func (s *TraderStore) List(userID string) ([]*Trader, error) {
 	rows, err := s.db.Query(`
 		SELECT id, user_id, name, ai_model_id, exchange_id, COALESCE(strategy_id, ''),
-		       initial_balance, scan_interval_minutes, is_running, COALESCE(is_cross_margin, 1),
+		       initial_balance, scan_interval_minutes, is_running,
+		       COALESCE(lifecycle_status,CASE WHEN is_running=1 THEN 'RUNNING' ELSE 'STOPPED' END),
+		       COALESCE(lifecycle_generation,0),stopped_at,archived_at,COALESCE(is_cross_margin, 1),
 		       COALESCE(show_in_competition, 1),
 		       COALESCE(btc_eth_leverage, 5), COALESCE(altcoin_leverage, 5), COALESCE(trading_symbols, ''),
 		       COALESCE(use_coin_pool, 0), COALESCE(use_oi_top, 0), COALESCE(custom_prompt, ''),
 		       COALESCE(override_base_prompt, 0), COALESCE(system_prompt_template, 'default'),
 		       created_at, updated_at
-		FROM traders WHERE user_id = ? ORDER BY created_at DESC
+		FROM traders WHERE user_id = ? AND COALESCE(lifecycle_status,'STOPPED')<>'ARCHIVED' ORDER BY created_at DESC
 	`, userID)
 	if err != nil {
 		return nil, err
@@ -231,9 +287,11 @@ func (s *TraderStore) List(userID string) ([]*Trader, error) {
 	for rows.Next() {
 		var t Trader
 		var createdAt, updatedAt string
+		var stoppedAt, archivedAt sql.NullString
 		err := rows.Scan(
 			&t.ID, &t.UserID, &t.Name, &t.AIModelID, &t.ExchangeID, &t.StrategyID,
-			&t.InitialBalance, &t.ScanIntervalMinutes, &t.IsRunning, &t.IsCrossMargin,
+			&t.InitialBalance, &t.ScanIntervalMinutes, &t.IsRunning, &t.LifecycleStatus,
+			&t.LifecycleGeneration, &stoppedAt, &archivedAt, &t.IsCrossMargin,
 			&t.ShowInCompetition,
 			&t.BTCETHLeverage, &t.AltcoinLeverage, &t.TradingSymbols,
 			&t.UseCoinPool, &t.UseOITop, &t.CustomPrompt, &t.OverrideBasePrompt,
@@ -244,6 +302,7 @@ func (s *TraderStore) List(userID string) ([]*Trader, error) {
 		}
 		t.CreatedAt, _ = time.Parse("2006-01-02 15:04:05", createdAt)
 		t.UpdatedAt, _ = time.Parse("2006-01-02 15:04:05", updatedAt)
+		assignTraderLifecycleTimes(&t, stoppedAt, archivedAt)
 		traders = append(traders, &t)
 	}
 	return traders, nil
@@ -251,8 +310,31 @@ func (s *TraderStore) List(userID string) ([]*Trader, error) {
 
 // UpdateStatus updates trader running status
 func (s *TraderStore) UpdateStatus(userID, id string, isRunning bool) error {
-	_, err := s.db.Exec(`UPDATE traders SET is_running = ? WHERE id = ? AND user_id = ?`, isRunning, id, userID)
-	return err
+	if isRunning {
+		state, err := s.BeginStart(userID, id)
+		if err != nil {
+			return err
+		}
+		if state.Status == TraderLifecycleRunning {
+			return nil
+		}
+		return s.CompleteStart(userID, id, state.Generation)
+	}
+	state, err := s.BeginStop(userID, id)
+	if err != nil {
+		return err
+	}
+	if state.Status == TraderLifecycleStopped {
+		return nil
+	}
+	blockers, err := s.GetStopBlockers(id)
+	if err != nil {
+		return err
+	}
+	if len(blockers) > 0 {
+		return s.MarkStopReconcileRequired(userID, id, state.Generation, FormatLifecycleBlockers(blockers))
+	}
+	return s.CompleteStop(userID, id, state.Generation)
 }
 
 // UpdateShowInCompetition updates trader competition visibility
@@ -298,24 +380,13 @@ func (s *TraderStore) UpdateCustomPrompt(userID, id string, customPrompt string,
 	return err
 }
 
-// Delete deletes trader and associated data
+// Delete is retained as a compatibility alias for safe archival. It never
+// fabricates exchange closure or physically removes audit history.
 func (s *TraderStore) Delete(userID, id string) error {
-	// 1. Close all OPEN positions (mark as CLOSED with reason 'trader_deleted')
-	// This prevents PositionSyncManager from repeatedly trying to sync these orphan positions
-	now := time.Now().Format(time.RFC3339)
-	_, _ = s.db.Exec(`UPDATE trader_positions SET status = 'CLOSED', close_reason = 'trader_deleted', updated_at = ? WHERE trader_id = ? AND status = 'OPEN'`, now, id)
-
-	// 2. Delete copy trade config
-	_, _ = s.db.Exec(`DELETE FROM copy_trade_configs WHERE trader_id = ?`, id)
-
-	// 3. Delete copy trade position mappings
-	_, _ = s.db.Exec(`DELETE FROM copy_trade_position_mappings WHERE trader_id = ?`, id)
-
-	// 4. Delete associated equity snapshots
-	_, _ = s.db.Exec(`DELETE FROM trader_equity_snapshots WHERE trader_id = ?`, id)
-
-	// 5. Delete the trader
-	_, err := s.db.Exec(`DELETE FROM traders WHERE id = ? AND user_id = ?`, id, userID)
+	blockers, err := s.Archive(userID, id)
+	if err == nil && len(blockers) > 0 {
+		return fmt.Errorf("%w: archive blocked by %s", ErrTraderLifecycleConflict, FormatLifecycleBlockers(blockers))
+	}
 	return err
 }
 
@@ -327,11 +398,15 @@ func (s *TraderStore) GetFullConfig(userID, traderID string) (*TraderFullConfig,
 	var traderCreatedAt, traderUpdatedAt string
 	var aiModelCreatedAt, aiModelUpdatedAt string
 	var exchangeCreatedAt, exchangeUpdatedAt string
+	var stoppedAt, archivedAt sql.NullString
 
 	err := s.db.QueryRow(`
 		SELECT
 			t.id, t.user_id, t.name, t.ai_model_id, t.exchange_id, COALESCE(t.strategy_id, ''),
-			t.initial_balance, t.scan_interval_minutes, t.is_running, COALESCE(t.is_cross_margin, 1),
+			t.initial_balance, t.scan_interval_minutes, t.is_running,
+			COALESCE(t.lifecycle_status,CASE WHEN t.is_running=1 THEN 'RUNNING' ELSE 'STOPPED' END),
+			COALESCE(t.lifecycle_generation,0),t.stopped_at,t.archived_at,COALESCE(t.is_cross_margin, 1),
+			COALESCE(t.show_in_competition, 1),
 			COALESCE(t.btc_eth_leverage, 5), COALESCE(t.altcoin_leverage, 5), COALESCE(t.trading_symbols, ''),
 			COALESCE(t.use_coin_pool, 0), COALESCE(t.use_oi_top, 0), COALESCE(t.custom_prompt, ''),
 			COALESCE(t.override_base_prompt, 0), COALESCE(t.system_prompt_template, 'default'),
@@ -349,7 +424,9 @@ func (s *TraderStore) GetFullConfig(userID, traderID string) (*TraderFullConfig,
 		WHERE t.id = ? AND t.user_id = ?
 	`, traderID, userID).Scan(
 		&trader.ID, &trader.UserID, &trader.Name, &trader.AIModelID, &trader.ExchangeID, &trader.StrategyID,
-		&trader.InitialBalance, &trader.ScanIntervalMinutes, &trader.IsRunning, &trader.IsCrossMargin,
+		&trader.InitialBalance, &trader.ScanIntervalMinutes, &trader.IsRunning, &trader.LifecycleStatus,
+		&trader.LifecycleGeneration, &stoppedAt, &archivedAt, &trader.IsCrossMargin,
+		&trader.ShowInCompetition,
 		&trader.BTCETHLeverage, &trader.AltcoinLeverage, &trader.TradingSymbols,
 		&trader.UseCoinPool, &trader.UseOITop, &trader.CustomPrompt, &trader.OverrideBasePrompt,
 		&trader.SystemPromptTemplate, &traderCreatedAt, &traderUpdatedAt,
@@ -365,6 +442,7 @@ func (s *TraderStore) GetFullConfig(userID, traderID string) (*TraderFullConfig,
 	if err != nil {
 		return nil, err
 	}
+	assignTraderLifecycleTimes(&trader, stoppedAt, archivedAt)
 
 	trader.CreatedAt, _ = time.Parse("2006-01-02 15:04:05", traderCreatedAt)
 	trader.UpdatedAt, _ = time.Parse("2006-01-02 15:04:05", traderUpdatedAt)
@@ -459,9 +537,13 @@ func (s *TraderStore) getActiveOrDefaultStrategy(userID string) (*Strategy, erro
 func (s *TraderStore) GetByID(traderID string) (*Trader, error) {
 	var t Trader
 	var createdAt, updatedAt string
+	var stoppedAt, archivedAt sql.NullString
 	err := s.db.QueryRow(`
 		SELECT id, user_id, name, ai_model_id, exchange_id, COALESCE(strategy_id, ''),
-		       initial_balance, scan_interval_minutes, is_running, COALESCE(is_cross_margin, 1),
+		       initial_balance, scan_interval_minutes, is_running,
+		       COALESCE(lifecycle_status,CASE WHEN is_running=1 THEN 'RUNNING' ELSE 'STOPPED' END),
+		       COALESCE(lifecycle_generation,0),stopped_at,archived_at,COALESCE(is_cross_margin, 1),
+		       COALESCE(show_in_competition, 1),
 		       COALESCE(btc_eth_leverage, 5), COALESCE(altcoin_leverage, 5), COALESCE(trading_symbols, ''),
 		       COALESCE(use_coin_pool, 0), COALESCE(use_oi_top, 0), COALESCE(custom_prompt, ''),
 		       COALESCE(override_base_prompt, 0), COALESCE(system_prompt_template, 'default'),
@@ -469,7 +551,9 @@ func (s *TraderStore) GetByID(traderID string) (*Trader, error) {
 		FROM traders WHERE id = ?
 	`, traderID).Scan(
 		&t.ID, &t.UserID, &t.Name, &t.AIModelID, &t.ExchangeID, &t.StrategyID,
-		&t.InitialBalance, &t.ScanIntervalMinutes, &t.IsRunning, &t.IsCrossMargin,
+		&t.InitialBalance, &t.ScanIntervalMinutes, &t.IsRunning, &t.LifecycleStatus,
+		&t.LifecycleGeneration, &stoppedAt, &archivedAt, &t.IsCrossMargin,
+		&t.ShowInCompetition,
 		&t.BTCETHLeverage, &t.AltcoinLeverage, &t.TradingSymbols,
 		&t.UseCoinPool, &t.UseOITop, &t.CustomPrompt, &t.OverrideBasePrompt,
 		&t.SystemPromptTemplate, &createdAt, &updatedAt,
@@ -479,6 +563,7 @@ func (s *TraderStore) GetByID(traderID string) (*Trader, error) {
 	}
 	t.CreatedAt, _ = time.Parse("2006-01-02 15:04:05", createdAt)
 	t.UpdatedAt, _ = time.Parse("2006-01-02 15:04:05", updatedAt)
+	assignTraderLifecycleTimes(&t, stoppedAt, archivedAt)
 	return &t, nil
 }
 
@@ -487,7 +572,18 @@ func (s *TraderStore) CountRunningByExchange(exchangeID string) (int, error) {
 		return 0, nil
 	}
 	var count int
-	err := s.db.QueryRow(`SELECT COUNT(*) FROM traders WHERE exchange_id=? AND is_running=1`, exchangeID).Scan(&count)
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM traders WHERE exchange_id=? AND lifecycle_status='RUNNING' AND is_running=1`, exchangeID).Scan(&count)
+	return count, err
+}
+
+func (s *TraderStore) CountNonArchivedByExchange(exchangeID string) (int, error) {
+	if strings.TrimSpace(exchangeID) == "" {
+		return 0, nil
+	}
+	var count int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM traders
+		WHERE exchange_id=? AND COALESCE(lifecycle_status,'STOPPED')<>'ARCHIVED'`,
+		exchangeID).Scan(&count)
 	return count, err
 }
 
@@ -501,14 +597,14 @@ func (s *TraderStore) ResolveExclusivePositionOwner(exchangeID, symbol, side str
 			SELECT DISTINCT m.trader_id AS owner_id
 			FROM copy_trade_position_mappings m
 			JOIN traders t ON t.id=m.trader_id
-			WHERE t.exchange_id=? AND t.is_running=1
+			WHERE t.exchange_id=? AND t.is_running=1 AND t.lifecycle_status='RUNNING'
 			  AND UPPER(m.symbol)=UPPER(?) AND LOWER(m.side)=LOWER(?)
 			  AND m.status='active'
 			UNION
 			SELECT DISTINCT i.trader_id AS owner_id
 			FROM copy_trade_execution_intents i
 			JOIN traders t ON t.id=i.trader_id
-			WHERE t.exchange_id=? AND t.is_running=1
+			WHERE t.exchange_id=? AND t.is_running=1 AND t.lifecycle_status='RUNNING'
 			  AND UPPER(i.symbol)=UPPER(?) AND LOWER(i.side)=LOWER(?)
 			  AND (
 				(COALESCE(i.exchange_order_id,'')<>'' AND i.terminal_at IS NULL
@@ -566,13 +662,15 @@ func (s *TraderStore) ResolveDisplayName(traderID string) string {
 func (s *TraderStore) ListAll() ([]*Trader, error) {
 	rows, err := s.db.Query(`
 		SELECT id, user_id, name, ai_model_id, exchange_id, COALESCE(strategy_id, ''),
-		       initial_balance, scan_interval_minutes, is_running, COALESCE(is_cross_margin, 1),
+		       initial_balance, scan_interval_minutes, is_running,
+		       COALESCE(lifecycle_status,CASE WHEN is_running=1 THEN 'RUNNING' ELSE 'STOPPED' END),
+		       COALESCE(lifecycle_generation,0),stopped_at,archived_at,COALESCE(is_cross_margin, 1),
 		       COALESCE(show_in_competition, 1),
 		       COALESCE(btc_eth_leverage, 5), COALESCE(altcoin_leverage, 5), COALESCE(trading_symbols, ''),
 		       COALESCE(use_coin_pool, 0), COALESCE(use_oi_top, 0), COALESCE(custom_prompt, ''),
 		       COALESCE(override_base_prompt, 0), COALESCE(system_prompt_template, 'default'),
 		       created_at, updated_at
-		FROM traders ORDER BY created_at DESC
+		FROM traders WHERE COALESCE(lifecycle_status,'STOPPED')<>'ARCHIVED' ORDER BY created_at DESC
 	`)
 	if err != nil {
 		return nil, err
@@ -583,9 +681,11 @@ func (s *TraderStore) ListAll() ([]*Trader, error) {
 	for rows.Next() {
 		var t Trader
 		var createdAt, updatedAt string
+		var stoppedAt, archivedAt sql.NullString
 		err := rows.Scan(
 			&t.ID, &t.UserID, &t.Name, &t.AIModelID, &t.ExchangeID, &t.StrategyID,
-			&t.InitialBalance, &t.ScanIntervalMinutes, &t.IsRunning, &t.IsCrossMargin,
+			&t.InitialBalance, &t.ScanIntervalMinutes, &t.IsRunning, &t.LifecycleStatus,
+			&t.LifecycleGeneration, &stoppedAt, &archivedAt, &t.IsCrossMargin,
 			&t.ShowInCompetition,
 			&t.BTCETHLeverage, &t.AltcoinLeverage, &t.TradingSymbols,
 			&t.UseCoinPool, &t.UseOITop, &t.CustomPrompt, &t.OverrideBasePrompt,
@@ -596,6 +696,7 @@ func (s *TraderStore) ListAll() ([]*Trader, error) {
 		}
 		t.CreatedAt, _ = time.Parse("2006-01-02 15:04:05", createdAt)
 		t.UpdatedAt, _ = time.Parse("2006-01-02 15:04:05", updatedAt)
+		assignTraderLifecycleTimes(&t, stoppedAt, archivedAt)
 		traders = append(traders, &t)
 	}
 	return traders, nil

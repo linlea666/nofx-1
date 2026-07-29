@@ -125,12 +125,14 @@ const mappingFailureCircuitThreshold = 5
 // TraderIntegration 跟单与交易执行的集成
 type TraderIntegration struct {
 	traderID             string
+	lifecycleGeneration  int64
 	executor             DecisionExecutor
 	engine               *Engine
 	store                *store.Store
 	ctx                  context.Context
 	cancel               context.CancelFunc
 	running              atomic.Bool
+	wg                   sync.WaitGroup
 	lastAttemptReconcile map[int64]time.Time
 	// executionMu serializes foreground leader transitions with ordinary
 	// catch-up orders so an old gap cannot be submitted while a reduce, close,
@@ -162,9 +164,25 @@ func NewTraderIntegration(
 	executor DecisionExecutor,
 	st *store.Store,
 ) *TraderIntegration {
+	generation := int64(0)
+	if st != nil {
+		if lifecycle, err := st.Trader().GetLifecycle(traderID); err == nil {
+			generation = lifecycle.Generation
+		}
+	}
+	return NewTraderIntegrationWithGeneration(traderID, generation, executor, st)
+}
+
+func NewTraderIntegrationWithGeneration(
+	traderID string,
+	generation int64,
+	executor DecisionExecutor,
+	st *store.Store,
+) *TraderIntegration {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &TraderIntegration{
 		traderID:                traderID,
+		lifecycleGeneration:     generation,
 		executor:                executor,
 		store:                   st,
 		ctx:                     ctx,
@@ -177,10 +195,34 @@ func NewTraderIntegration(
 	}
 }
 
+func (ti *TraderIntegration) lifecycleRunning() bool {
+	return ti != nil && ti.store != nil &&
+		ti.store.Trader().IsGenerationRunning(ti.traderID, ti.lifecycleGeneration)
+}
+
+func (ti *TraderIntegration) launch(fn func()) {
+	ti.wg.Add(1)
+	go func() {
+		defer ti.wg.Done()
+		fn()
+	}()
+}
+
 // StartCopyTrading 启动跟单
 func (ti *TraderIntegration) StartCopyTrading() error {
 	if ti.running.Load() {
 		return fmt.Errorf("copy trading already running for trader %s", ti.traderID)
+	}
+	if ti.store == nil {
+		return fmt.Errorf("copy trading store is unavailable")
+	}
+	lifecycle, err := ti.store.Trader().GetLifecycle(ti.traderID)
+	if err != nil {
+		return fmt.Errorf("load trader lifecycle: %w", err)
+	}
+	if lifecycle.Generation != ti.lifecycleGeneration ||
+		lifecycle.Status != store.TraderLifecycleRunning {
+		return fmt.Errorf("trader lifecycle does not permit copy-trading start: status=%s generation=%d", lifecycle.Status, lifecycle.Generation)
 	}
 
 	// 从数据库加载跟单配置
@@ -362,10 +404,10 @@ func (ti *TraderIntegration) StartCopyTrading() error {
 	ti.reconcileMappingOwnershipGaps(true)
 
 	// 启动决策消费协程
-	go ti.consumeDecisions()
+	ti.launch(ti.consumeDecisions)
 	// 启动风控事件消费协程（v3 风控：SL 触发 / 二次进场告警邮件）
-	go ti.consumeRiskEvents()
-	go ti.monitorExecutionIntents()
+	ti.launch(ti.consumeRiskEvents)
+	ti.launch(ti.monitorExecutionIntents)
 	if SupportsCopyGuard(engineConfig.ProviderType) && engineConfig.RiskPolicyVersion >= 4 {
 		if !engineConfig.RiskStopLossEnabled {
 			// 用户关闭了「账户保护止损」开关：撤销交易所上仍存活的保护单。
@@ -375,7 +417,7 @@ func (ti *TraderIntegration) StartCopyTrading() error {
 			ti.cancelProtectionsOnDisable()
 		}
 		ti.recoverV4PendingStates()
-		go ti.monitorV4ProtectiveStops()
+		ti.launch(ti.monitorV4ProtectiveStops)
 	}
 
 	ti.running.Store(true)
@@ -456,13 +498,13 @@ func (ti *TraderIntegration) logExecutionReconciliationReport() {
 		logger.Warnf("⚠️ [%s] 启动执行生命周期对账报告生成失败: %v", ti.traderID, err)
 		return
 	}
-	total := report.UnfinishedIntents + report.OpenCyclesWithoutMapping + report.ActiveMappingsWithoutCycle + report.UnprotectedOpenCycles + report.PendingIntentRisk
+	total := report.UnfinishedIntents + report.ManualReviewIntents + report.OpenCyclesWithoutMapping + report.ActiveMappingsWithoutCycle + report.UnprotectedOpenCycles + report.PendingIntentRisk
 	if total == 0 {
 		logger.Infof("✅ [%s] 启动执行生命周期对账无异常（只读，未自动补单）", ti.traderID)
 		return
 	}
-	logger.Warnf("⚠️ [%s] 启动执行生命周期对账待处理 | unfinished_intents=%d open_cycles_without_mapping=%d recoverable_ownership_gaps=%d ambiguous_ownership_gaps=%d active_mappings_without_cycle=%d unprotected_open_cycles=%d pending_intent_risk=%d",
-		ti.traderID, report.UnfinishedIntents, report.OpenCyclesWithoutMapping, report.RecoverableOwnershipGaps, report.AmbiguousOwnershipGaps, report.ActiveMappingsWithoutCycle, report.UnprotectedOpenCycles, report.PendingIntentRisk)
+	logger.Warnf("⚠️ [%s] 启动执行生命周期对账待处理 | unfinished_intents=%d manual_review_intents=%d open_cycles_without_mapping=%d recoverable_ownership_gaps=%d ambiguous_ownership_gaps=%d active_mappings_without_cycle=%d unprotected_open_cycles=%d pending_intent_risk=%d",
+		ti.traderID, report.UnfinishedIntents, report.ManualReviewIntents, report.OpenCyclesWithoutMapping, report.RecoverableOwnershipGaps, report.AmbiguousOwnershipGaps, report.ActiveMappingsWithoutCycle, report.UnprotectedOpenCycles, report.PendingIntentRisk)
 }
 
 func (ti *TraderIntegration) reconcileExecutionIntents(startup bool) {
@@ -666,7 +708,11 @@ func (ti *TraderIntegration) reconcileExecutionIntents(startup bool) {
 				continue
 			}
 		}
-		filled := getFloatField(order, "executedQty", "filled_quantity", "quantity")
+		// Never fall back to the original order quantity here. Several venue
+		// responses expose "quantity" as requested size, not executed size;
+		// treating it as a fill would strand a confirmed zero-fill cancellation
+		// in STOPPING_RECONCILE_REQUIRED forever.
+		filled := getFloatField(order, "executedQty", "filled_quantity", "filledQty", "accFillSz")
 		orderID := getStringField(order, "orderId", "ordId", "exchange_order_id")
 		terminal := isTerminalExchangeOrderState(state)
 		if filled <= 0 {
@@ -2692,10 +2738,6 @@ func (ti *TraderIntegration) recoverFilledReentry(cycle *store.CopyGuardCycle, o
 
 // Stop 停止跟单
 func (ti *TraderIntegration) Stop() {
-	if !ti.running.Load() {
-		return
-	}
-
 	ti.cancel()
 
 	if ti.engine != nil {
@@ -2703,12 +2745,13 @@ func (ti *TraderIntegration) Stop() {
 	}
 
 	ti.running.Store(false)
+	ti.wg.Wait()
 	logger.Infof("🛑 [%s] 跟单集成已停止", ti.traderID)
 }
 
 // IsRunning 检查是否运行中
 func (ti *TraderIntegration) IsRunning() bool {
-	return ti.running.Load()
+	return ti.running.Load() && ti.lifecycleRunning()
 }
 
 // GetStats 获取统计信息
@@ -2731,6 +2774,9 @@ func (ti *TraderIntegration) consumeDecisions() {
 			if !ok {
 				return
 			}
+			if !ti.lifecycleRunning() {
+				return
+			}
 			ti.executeFullDecision(fullDec)
 		}
 	}
@@ -2738,6 +2784,9 @@ func (ti *TraderIntegration) consumeDecisions() {
 
 // executeFullDecision 执行完整决策
 func (ti *TraderIntegration) executeFullDecision(fullDec *decision.FullDecision) {
+	if !ti.lifecycleRunning() {
+		return
+	}
 	ti.executionMu.Lock()
 	defer ti.executionMu.Unlock()
 
@@ -4629,6 +4678,9 @@ func (ti *TraderIntegration) traderDisplayName() string {
 
 // saveSignalLog 保存信号日志到数据库
 func (ti *TraderIntegration) saveSignalLog(dec *decision.Decision, status, errorMsg string) {
+	if !ti.lifecycleRunning() {
+		return
+	}
 	log := &store.CopyTradeSignalLog{
 		TraderID:     ti.traderID,
 		LeaderID:     ti.engine.config.LeaderID,
@@ -4656,7 +4708,7 @@ func (ti *TraderIntegration) saveSignalLog(dec *decision.Decision, status, error
 // recordCopyEvent 统一跟单事件写入器（best-effort）。
 // 写入失败仅告警、绝不上抛，保证交易主链路零影响。
 func (ti *TraderIntegration) recordCopyEvent(e *store.CopyTradeEvent) {
-	if ti.store == nil || e == nil {
+	if ti.store == nil || e == nil || !ti.lifecycleRunning() {
 		return
 	}
 	if e.TraderID == "" {
@@ -6641,6 +6693,9 @@ func (ti *TraderIntegration) consumeRiskEvents() {
 			if event == nil {
 				continue
 			}
+			if !ti.lifecycleRunning() {
+				return
+			}
 			switch event.Type {
 			case RiskEventStopLossTriggered:
 				ti.sendStopLossTriggerAlert(event)
@@ -7256,6 +7311,21 @@ func StartCopyTradingForTrader(
 	executor DecisionExecutor,
 	st *store.Store,
 ) error {
+	generation := int64(0)
+	if st != nil {
+		if lifecycle, err := st.Trader().GetLifecycle(traderID); err == nil {
+			generation = lifecycle.Generation
+		}
+	}
+	return StartCopyTradingForTraderWithGeneration(traderID, generation, executor, st)
+}
+
+func StartCopyTradingForTraderWithGeneration(
+	traderID string,
+	generation int64,
+	executor DecisionExecutor,
+	st *store.Store,
+) error {
 	integrationsMu.Lock()
 	if existing, exists := integrations[traderID]; exists && existing != nil && existing.IsRunning() {
 		integrationsMu.Unlock()
@@ -7269,7 +7339,7 @@ func StartCopyTradingForTrader(
 	startEpoch := integrationsEpoch
 	integrationsMu.Unlock()
 
-	integration := NewTraderIntegration(traderID, executor, st)
+	integration := NewTraderIntegrationWithGeneration(traderID, generation, executor, st)
 	if err := integration.StartCopyTrading(); err != nil {
 		integrationsMu.Lock()
 		delete(integrationsStarting, traderID)
@@ -7299,7 +7369,7 @@ func StopCopyTradingForTrader(traderID string) error {
 	integration, exists := integrations[traderID]
 	if !exists {
 		integrationsMu.Unlock()
-		return fmt.Errorf("no copy trading integration found for trader %s", traderID)
+		return nil
 	}
 	delete(integrations, traderID)
 	integrationsStarting[traderID] = struct{}{}
@@ -7309,6 +7379,119 @@ func StopCopyTradingForTrader(traderID string) error {
 	delete(integrationsStarting, traderID)
 	integrationsMu.Unlock()
 	return nil
+}
+
+// PrepareStop cancels only risk-increasing orders with durable client-order
+// identity. A cancel ACK is never treated as terminal: readback must prove a
+// terminal zero-fill state. Any fill or uncertain state remains a structured
+// STOPPING blocker and is not disguised as locally completed work.
+func (ti *TraderIntegration) PrepareStop() []store.TraderLifecycleBlocker {
+	if ti == nil || ti.store == nil {
+		return nil
+	}
+	intents, err := ti.store.CopyTrade().ListUnfinishedExecutionIntents(ti.traderID)
+	if err != nil {
+		return []store.TraderLifecycleBlocker{{
+			Code: "INTENT_LIST_FAILED", ResourceID: ti.traderID, Status: err.Error(),
+		}}
+	}
+	provider, canQuery := ti.executor.(ClientOrderStatusProvider)
+	canceler, canCancel := ti.executor.(ClientOrderCanceler)
+	for _, intent := range intents {
+		if intent.Action != "open_long" && intent.Action != "open_short" {
+			continue
+		}
+		if intent.SubmittedAt == nil && strings.TrimSpace(intent.ExchangeOrderID) == "" &&
+			intent.FilledQuantity <= 0 {
+			continue
+		}
+		if !canQuery {
+			_ = ti.store.CopyTrade().UpdateExecutionIntent(intent.ID,
+				store.ExecutionIntentReconciling, "TRADER_STOP_ORDER_LOOKUP_UNAVAILABLE",
+				"cannot prove submitted risk-increasing order terminal", "", 0, 0, intent.FilledQuantity)
+			continue
+		}
+		order, actualClientID, lookupErr := ti.lookupExecutionIntentOrder(provider, intent)
+		if lookupErr != nil {
+			_ = ti.store.CopyTrade().UpdateExecutionIntent(intent.ID,
+				store.ExecutionIntentReconciling, "TRADER_STOP_ORDER_LOOKUP_FAILED",
+				lookupErr.Error(), "", 0, 0, intent.FilledQuantity)
+			continue
+		}
+		state := strings.ToUpper(getStringField(order, "status", "state"))
+		if !isTerminalExchangeOrderState(state) {
+			if !canCancel {
+				_ = ti.store.CopyTrade().UpdateExecutionIntent(intent.ID,
+					store.ExecutionIntentReconciling, "TRADER_STOP_ORDER_CANCEL_UNAVAILABLE",
+					"venue cannot cancel by client order id", "", 0, 0, intent.FilledQuantity)
+				continue
+			}
+			if cancelErr := canceler.CancelOrderByClientID(intent.Symbol, actualClientID); cancelErr != nil {
+				_ = ti.store.CopyTrade().UpdateExecutionIntent(intent.ID,
+					store.ExecutionIntentReconciling, "TRADER_STOP_ORDER_CANCEL_FAILED",
+					cancelErr.Error(), "", 0, 0, intent.FilledQuantity)
+				continue
+			}
+			order, actualClientID, lookupErr = ti.lookupExecutionIntentOrder(provider, intent)
+			if lookupErr != nil {
+				_ = ti.store.CopyTrade().UpdateExecutionIntent(intent.ID,
+					store.ExecutionIntentReconciling, "TRADER_STOP_CANCEL_CONFIRMATION_FAILED",
+					lookupErr.Error(), "", 0, 0, intent.FilledQuantity)
+				continue
+			}
+			state = strings.ToUpper(getStringField(order, "status", "state"))
+		}
+		// The generic quantity field is requested size on some venues. Stop
+		// reconciliation must rely only on explicit cumulative-fill fields.
+		filled := getFloatField(order, "executedQty", "filled_quantity", "filledQty", "accFillSz")
+		orderID := getStringField(order, "orderId", "ordId", "exchange_order_id")
+		if isTerminalExchangeOrderState(state) && filled <= 0 && intent.FilledQuantity <= 0 {
+			_ = ti.store.CopyTrade().CompleteExecutionOrderAttempt(intent.ID, actualClientID,
+				store.ExecutionOrderAttemptTerminalNoFill, orderID, state, "", 0)
+			_ = ti.store.CopyTrade().UpdateExecutionIntent(intent.ID,
+				store.ExecutionIntentFailed, "TRADER_STOPPED_TERMINAL_NO_FILL",
+				"risk-increasing order canceled and confirmed without fill", orderID, 0, 0, 0)
+			_ = ti.store.CopyTrade().UpdateExecutionIntentExchangeState(intent.ID, state)
+			_ = ti.store.ReentryAI().ReleaseCopyGuardIntentRisk(intent.ID)
+			if intent.CandidateID > 0 {
+				_ = ti.store.ReentryAI().PauseReentryCandidateForTraderStop(intent.CandidateID)
+			}
+			continue
+		}
+		_ = ti.store.CopyTrade().UpdateExecutionIntent(intent.ID,
+			store.ExecutionIntentReconciling, "TRADER_STOP_FILL_RECONCILE_REQUIRED",
+			"submitted risk-increasing order has a fill or non-terminal state", orderID, 0, 0, filled)
+	}
+	blockers, err := ti.store.Trader().GetStopBlockers(ti.traderID)
+	if err != nil {
+		return []store.TraderLifecycleBlocker{{
+			Code: "STOP_BLOCKER_QUERY_FAILED", ResourceID: ti.traderID, Status: err.Error(),
+		}}
+	}
+	return blockers
+}
+
+func PrepareCopyTradingStop(traderID string) []store.TraderLifecycleBlocker {
+	integrationsMu.RLock()
+	integration := integrations[traderID]
+	integrationsMu.RUnlock()
+	if integration == nil {
+		return nil
+	}
+	return integration.PrepareStop()
+}
+
+func PrepareCopyTradingStopWithExecutor(traderID string, executor DecisionExecutor, st *store.Store) []store.TraderLifecycleBlocker {
+	integrationsMu.RLock()
+	integration := integrations[traderID]
+	integrationsMu.RUnlock()
+	if integration != nil {
+		return integration.PrepareStop()
+	}
+	if executor == nil || st == nil {
+		return nil
+	}
+	return NewTraderIntegration(traderID, executor, st).PrepareStop()
 }
 
 // ReloadCopyTradingForTrader is the runtime configuration commit barrier.

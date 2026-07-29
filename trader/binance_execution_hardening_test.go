@@ -112,6 +112,36 @@ func TestBinanceCopyOrderDoesNotAdoptExistingTerminalZeroFill(t *testing.T) {
 	}
 }
 
+func TestBinanceCancelOrderByClientIDUsesExactIdentity(t *testing.T) {
+	var method, symbol, clientID string
+	client := futures.NewClient("", "")
+	client.BaseURL = "https://binance.cancel-client-id.test"
+	client.HTTPClient = &http.Client{Transport: binanceHardeningRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		method = req.Method
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			t.Fatalf("read Binance cancel body: %v", err)
+		}
+		form, err := url.ParseQuery(string(body))
+		if err != nil {
+			t.Fatalf("parse Binance cancel body: %v", err)
+		}
+		symbol = form.Get("symbol")
+		clientID = form.Get("origClientOrderId")
+		return binanceHardeningJSONResponse(t, http.StatusOK, map[string]interface{}{
+			"symbol": symbol, "orderId": 123, "clientOrderId": clientID,
+			"status": "CANCELED", "executedQty": "0", "origQty": "1",
+		}), nil
+	})}
+	bt := &FuturesTrader{client: client}
+	if err := bt.CancelOrderByClientID("btcusdt", "copy-open-123"); err != nil {
+		t.Fatal(err)
+	}
+	if method != http.MethodDelete || symbol != "BTCUSDT" || clientID != "copy-open-123" {
+		t.Fatalf("unexpected cancel request: method=%s symbol=%s client=%s", method, symbol, clientID)
+	}
+}
+
 func TestBinanceMarketLotSizeControlsMarketQuantity(t *testing.T) {
 	symbol := binanceCatalogSymbol("BTCUSDT", "BTC", "USDT", "USDT", "TRADING", "PERPETUAL")
 	symbol["filters"] = []map[string]interface{}{

@@ -98,21 +98,61 @@ export const api = {
     return result.data!
   },
 
-  async deleteTrader(traderId: string): Promise<void> {
-    const result = await httpClient.delete(`${API_BASE}/traders/${traderId}`)
-    if (!result.success) throw new Error('删除交易员失败')
+  async deleteTrader(traderId: string): Promise<{
+    status: string
+    message: string
+    pending_blockers?: TraderInfo['pending_blockers']
+  }> {
+    const result = await httpClient.delete<{
+      status: string
+      message: string
+      pending_blockers?: TraderInfo['pending_blockers']
+    }>(`${API_BASE}/traders/${traderId}`)
+    if (!result.success) {
+      const blockers = result.data?.pending_blockers || []
+      const details = blockers
+        .map(
+          (blocker) =>
+            `${blocker.code}:${blocker.symbol || blocker.resource_id}(${blocker.status})`
+        )
+        .join('；')
+      throw new Error(
+        details
+          ? `${result.message || '归档交易员失败'}：${details}`
+          : result.message || '归档交易员失败'
+      )
+    }
+    return result.data!
   },
 
-  async startTrader(traderId: string): Promise<void> {
-    const result = await httpClient.post(
-      `${API_BASE}/traders/${traderId}/start`
-    )
-    if (!result.success) throw new Error('启动交易员失败')
+  async startTrader(traderId: string): Promise<{
+    status: string
+    lifecycle_generation: number
+    message: string
+  }> {
+    const result = await httpClient.post<{
+      status: string
+      lifecycle_generation: number
+      message: string
+    }>(`${API_BASE}/traders/${traderId}/start`)
+    if (!result.success) throw new Error(result.message || '启动交易员失败')
+    return result.data!
   },
 
-  async stopTrader(traderId: string): Promise<void> {
-    const result = await httpClient.post(`${API_BASE}/traders/${traderId}/stop`)
-    if (!result.success) throw new Error('停止交易员失败')
+  async stopTrader(traderId: string): Promise<{
+    status: string
+    lifecycle_generation: number
+    pending_blockers: TraderInfo['pending_blockers']
+    message: string
+  }> {
+    const result = await httpClient.post<{
+      status: string
+      lifecycle_generation: number
+      pending_blockers: TraderInfo['pending_blockers']
+      message: string
+    }>(`${API_BASE}/traders/${traderId}/stop`)
+    if (!result.success) throw new Error(result.message || '停止交易员失败')
+    return result.data!
   },
 
   async toggleCompetition(
@@ -914,10 +954,14 @@ export const api = {
   async getCopyGuardSummary(params = '') {
     const result = await httpClient.get<{
       summary: import('../types').CopyGuardSummary
+      shadow_promotion: import('../types').CopyGuardShadowPromotionReport
     }>(`${API_BASE}/copytrade/risk/summary${params}`)
     if (!result.success)
       throw new Error(result.message || '获取 Copy Guard 统计失败')
-    return result.data!.summary
+    return {
+      ...result.data!.summary,
+      shadow_promotion: result.data!.shadow_promotion,
+    }
   },
 
   async getCopyGuardCycles(params = '') {
@@ -985,6 +1029,7 @@ export const api = {
       ai_analyses: import('../types').ReentryAIAnalysis[]
       ai_decision_evaluations: import('../types').ReentryAIDecisionEvaluation[]
       ai_effect_summary: import('../types').CopyGuardAIEffectSummary
+      shadow_evaluations: import('../types').CopyGuardShadowEvaluation[]
       attribution: {
         final: boolean
         leader_direction_return: number

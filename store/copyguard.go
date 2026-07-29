@@ -346,6 +346,27 @@ func (s *CopyTradeStore) initCopyGuardTables() error {
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		);
 		CREATE INDEX IF NOT EXISTS idx_copy_guard_watch_samples_cycle ON copy_guard_watch_samples(cycle_id, created_at);
+		CREATE TABLE IF NOT EXISTS copy_guard_shadow_evaluations (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			cycle_id INTEGER NOT NULL,
+			trader_id TEXT NOT NULL,
+			policy TEXT NOT NULL,
+			evaluation_version INTEGER NOT NULL DEFAULT 1,
+			status TEXT NOT NULL,
+			data_quality TEXT NOT NULL,
+			gross_pnl REAL NOT NULL DEFAULT 0,
+			estimated_cost REAL NOT NULL DEFAULT 0,
+			net_pnl REAL NOT NULL DEFAULT 0,
+			size_factor REAL NOT NULL DEFAULT 0,
+			entry_price REAL NOT NULL DEFAULT 0,
+			exit_price REAL NOT NULL DEFAULT 0,
+			reason TEXT NOT NULL DEFAULT '',
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(cycle_id,policy,evaluation_version)
+		);
+		CREATE INDEX IF NOT EXISTS idx_copy_guard_shadow_policy
+			ON copy_guard_shadow_evaluations(trader_id,policy,status,cycle_id);
 	`)
 	if err == nil {
 		migrations := []struct {

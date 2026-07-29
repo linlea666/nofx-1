@@ -9,7 +9,7 @@ import (
 
 // promptVersion 记入每条分析记录，用于后续准确率统计时区分模板代次
 const promptVersion = "v1-legacy-history"
-const candidatePromptVersion = "v4-ai-guarded"
+const candidatePromptVersion = "v5-ai-guarded-lifecycle"
 
 // buildSystemPrompt is the read-only compatibility path for historical manual
 // signals. Production ai_guarded candidates never call it and therefore can
@@ -61,12 +61,16 @@ func candidateSystemPrompt(analysisFocus string) string {
 二次入场的常态是"接回领航员仍在持有的原方向"，因此趋势延续（CONTINUATION）与假突破/反转（FALSE_BREAK / REVERSAL）都可以成为 ENTER_NOW 的理由——只要证据强度足够、风险可控，不要因为"这只是延续而非反转"就默认观望。不要因为价格回到领航员成本附近就直接批准，也不要因为当前价高于领航员成本就机械拒绝。判断必须综合 copy_guard 的止损/尝试/领航员状态与 market 的多周期结构、CVD、OI、Funding、多空比、基差、成交量和支撑阻力，并在 reasons 里逐条引用字段与数值。所有带 *_available=false 的数值都是未知值，绝不能把占位数值 0 当成真实的价格、仓位比例或边界；必须结合 meta.missing_fields 明确降级。
 
 ## 何时 ENTER_NOW（证据越齐全，confidence 越高）
-- 领航员仍持有原方向且未在减仓（copy_guard.leader.still_holding_same_side、size_vs_cycle_baseline_ratio）；
+- 领航员仍持有原方向且未在减仓（copy_guard.leader.still_holding_same_side、size_vs_cycle_baseline_ratio、behavior_class）；
 - 价格已沿原方向站稳或重新收复上次止损簇，且未追价过远（last_stop.current_price_distance_atr、chase_limit_price、reentry_boundary_price）；
 - 上次止损更像噪声扫损而非结构破坏（last_stop_distance_atr_ratio 偏小、last_stop.stop_cluster_spread_atr 小）；
 - CVD 支持原方向（优先看现货 spot_cvd，与 contract_cvd 斜率一致、无反向背离）；
 - OI / Funding / 多空比未对原方向明显反向或极端拥挤（open_interest 四象限、funding.state 与百分位、long_short_ratio、basis_pct）；
 - 新止损能放到合理 ATR 距离（new_stop_protectable_precheck=true、gate_atr_okx、附近支撑阻力无挤压）。
+
+## 证据解释约束
+- Binance 现货不存在导致 spot_cvd 缺失时，这是币种能力缺失，只能降低证据质量，不能单独作为 WAIT 或 ABANDON 的强制理由；应改看 contract_cvd、open_interest、funding、成交量和价格结构。
+- 领航员加仓不等于看多/看空信心。behavior_class=AVERAGING_DOWN、adding_while_losing=true 或 concentration_spike=true 表示逆势摊平/集中度风险，必须降低其作为 ENTER_NOW 依据的权重。仓位相对基线达到数倍尤其不能机械解释为信心增强。
 
 ## 何时 WAIT
 - 关键证据不足或相互冲突，或数据缺失（missing_fields）；

@@ -42,7 +42,7 @@ const statusLabels: Record<string, string> = {
   LEADER_REVERSED: '领航员已反手',
   ATTEMPTS_EXHAUSTED: '重入次数用尽',
   AI_ABANDONED: 'AI 已确认放弃',
-  BUDGET_SUSPENDED: 'AI 调用额度耗尽',
+  BUDGET_SUSPENDED: '历史额度暂停·启动后自动迁移',
   WATCH_TIMEOUT: '观察超时·等待领航员平仓',
   PROTECTION_EXITED: '无法保护·已按配置市价离场',
   DETACHED: '跟随仓位已脱离·仅跟踪领航员',
@@ -821,7 +821,7 @@ function AdvisorSettingsCard() {
                 <span>
                   启用候选调度
                   <span className="ml-1 text-xs text-[#848E9C]">
-                    （持久化观察、事件触发与额度控制）
+                    （持久化观察、事件触发与费用软预警）
                   </span>
                 </span>
               </label>
@@ -842,7 +842,7 @@ function AdvisorSettingsCard() {
                 <span>
                   允许内置 AI 分析
                   <span className="ml-1 text-xs text-[#848E9C]">
-                    （WAIT 不发邮件，调用受候选额度与退避限制）
+                    （WAIT 不发邮件；持续分段复审，故障按退避恢复）
                   </span>
                 </span>
               </label>
@@ -1682,7 +1682,7 @@ function AICandidatesPanel() {
     'copy-guard-ai-candidates',
     () =>
       api.getCopyGuardAICandidates(
-        '?status=WATCHING,REVIEWING,WAITING,ENTRY_PENDING,PAUSED,BUDGET_SUSPENDED&limit=100'
+        '?status=WATCHING,REVIEWING,WAITING,ENTRY_PENDING,PAUSED,PAUSED_BY_TRADER,BUDGET_SUSPENDED&limit=100'
       ),
     { refreshInterval: 15000 }
   )
@@ -1724,7 +1724,7 @@ function AICandidatesPanel() {
   const requestReview = async (candidate: CopyGuardAICandidate) => {
     if (
       !window.confirm(
-        `请求立即复查 ${candidate.symbol}？\n\n这不是模拟分析：系统仍会遵守最短间隔、额度、数据去重和全部确定性风控，但若 AI 返回高置信度 ENTER 且预检通过，可能直接使用真实资金重入。`
+        `请求立即复查 ${candidate.symbol}？\n\n这不是模拟分析：系统仍会遵守最短间隔、故障退避、数据去重和全部确定性风控；费用预警线不会阻断分析。若 AI 返回高置信度 ENTER 且预检通过，可能直接使用真实资金重入。`
       )
     )
       return
@@ -1784,10 +1784,10 @@ function AICandidatesPanel() {
                     : ''}
                 </span>
                 <span>
-                  复查：{candidate.review_count}/
-                  {candidate.ai_lifecycle_call_limit || 30} · 24h{' '}
-                  {candidate.ai_daily_calls_used || 0}/
-                  {candidate.ai_daily_call_limit || 12} · 下次{' '}
+                  已复查：{candidate.review_count} · 单候选费用预警线{' '}
+                  {candidate.ai_lifecycle_call_limit || 30} · 24h 调用{' '}
+                  {candidate.ai_daily_calls_used || 0} / 费用预警线{' '}
+                  {candidate.ai_daily_call_limit || 12}（均不阻断） · 下次{' '}
                   {new Date(candidate.next_review_at).toLocaleString()}
                 </span>
                 <span>
@@ -1828,10 +1828,10 @@ function AICandidatesPanel() {
                   {candidate.decision_expires_at
                     ? new Date(candidate.decision_expires_at).toLocaleString()
                     : '—'}
-                  {' · '}预算封锁：
-                  {candidate.budget_blocked_until
-                    ? new Date(candidate.budget_blocked_until).toLocaleString()
-                    : '—'}
+                  {' · '}费用预警：
+                  {candidate.ai_cost_warning_exceeded
+                    ? '已达到（继续分析）'
+                    : '未达到'}
                 </span>
               </div>
               {(candidate.pending_trigger || candidate.last_error) && (
@@ -2222,6 +2222,53 @@ export function CopyGuardPage() {
           区间 [{money(summary.mean_net_guard_effect_estimate.ci95_low)},{' '}
           {money(summary.mean_net_guard_effect_estimate.ci95_high)}]（
           {summary.mean_net_guard_effect_estimate.sample_count} 个已验证周期）
+        </div>
+      )}
+      {!!summary?.shadow_promotion?.policies?.length && (
+        <div className="border border-[#2B3139] bg-[#181A20] rounded-lg p-4">
+          <div className="font-semibold mb-1">影子策略人工启用门槛</div>
+          <div className="text-xs text-[#848E9C] mb-3">
+            仅做离线评测，不会改变当前止损或自动下单。需至少 30
+            个独立关闭周期、10 个可进场样本、成本后均值与中位数为正、95%
+            Bootstrap 下界不为负，且没有未保护成交。
+          </div>
+          <div className="grid md:grid-cols-3 gap-3">
+            {summary.shadow_promotion.policies.map((policy) => (
+              <div
+                key={policy.policy}
+                className="border border-[#2B3139] rounded p-3 text-xs"
+              >
+                <div className="font-semibold text-sm mb-2">
+                  {policy.policy}
+                </div>
+                <div>
+                  周期 / 进场样本：{policy.independent_cycles} /{' '}
+                  {policy.enter_samples}
+                </div>
+                <div>
+                  成本后均值 / 中位数：{money(policy.mean_net_pnl)} /{' '}
+                  {money(policy.median_net_pnl)}
+                </div>
+                <div>
+                  95% CI：[{money(policy.bootstrap_ci95_low)},{' '}
+                  {money(policy.bootstrap_ci95_high)}]
+                </div>
+                <div
+                  className="mt-2 font-semibold"
+                  style={{
+                    color: policy.eligible_for_manual_enable
+                      ? '#0ECB81'
+                      : '#F0B90B',
+                  }}
+                  title={policy.blocking_reasons.join('\n')}
+                >
+                  {policy.eligible_for_manual_enable
+                    ? '可人工评审开启'
+                    : `证据不足（${policy.blocking_reasons.length} 项门槛未满足）`}
+                </div>
+              </div>
+            ))}
+          </div>
         </div>
       )}
       {(summary?.unscorable_baseline_cycles ?? 0) > 0 && (
@@ -2804,8 +2851,8 @@ export function CopyGuardPage() {
                   value={`${detail.ai_effect_summary.enter_decisions} → ${detail.ai_effect_summary.execution_requested} → ${detail.ai_effect_summary.execution_submitted} → ${detail.ai_effect_summary.execution_filled} → ${detail.ai_effect_summary.execution_protected}`}
                 />
                 <Metric
-                  label="错过反转 / 正确放弃"
-                  value={`${detail.ai_effect_summary.missed_reversals} / ${detail.ai_effect_summary.correct_abandons}`}
+                  label="周期级错失 / 重复决策 / 正确放弃"
+                  value={`${detail.ai_effect_summary.missed_reversals} / ${detail.ai_effect_summary.missed_reversal_decisions} / ${detail.ai_effect_summary.correct_abandons}`}
                 />
                 <Metric
                   label="风控避免继续亏损"
@@ -2827,6 +2874,31 @@ export function CopyGuardPage() {
               <div className="mt-3 text-xs text-[#848E9C]">
                 评价只基于已保存的观察行情、执行事件和交易所对账；INSUFFICIENT_DATA
                 会明确记为不可评分，不用估算盈亏冒充真实结果。
+              </div>
+            </div>
+          )}
+          {!!detail.shadow_evaluations?.length && (
+            <div className="border border-[#2B3139] rounded p-3">
+              <div className="font-semibold mb-2">
+                本周期影子策略（不影响实盘）
+              </div>
+              <div className="grid md:grid-cols-2 gap-2">
+                {detail.shadow_evaluations.map((evaluation) => (
+                  <div
+                    key={`${evaluation.policy}-${evaluation.evaluation_version}`}
+                    className="bg-[#0B0E11] rounded p-2 text-xs"
+                    title={evaluation.reason}
+                  >
+                    <div className="font-semibold">{evaluation.policy}</div>
+                    <div>
+                      {evaluation.status} / {evaluation.data_quality}
+                    </div>
+                    <div>
+                      成本后：{money(evaluation.net_pnl)}（成本{' '}
+                      {money(evaluation.estimated_cost)}）
+                    </div>
+                  </div>
+                ))}
               </div>
             </div>
           )}
