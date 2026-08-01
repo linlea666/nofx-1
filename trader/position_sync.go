@@ -518,8 +518,13 @@ func (m *PositionSyncManager) ReconcileStoppedTrader(traderID string) ([]store.T
 	if len(blockers) > 0 {
 		return blockers, nil
 	}
-
 	if len(localPositions) == 0 {
+		_, err = m.store.CopyTrade().RetireStoppedTraderCopyGuardState(
+			traderID, "fresh exchange positions=0; regular/algo pending orders=0; local open positions=0",
+		)
+		if err != nil {
+			return nil, fmt.Errorf("retire stopped Copy Guard state: %w", err)
+		}
 		return nil, nil
 	}
 	oldestByMarket := make(map[string]*store.TraderPosition)
@@ -590,6 +595,9 @@ func (m *PositionSyncManager) ReconcileStoppedTrader(traderID string) ([]store.T
 		); err != nil {
 			return nil, err
 		}
+	}
+	if _, err = m.store.CopyTrade().RetireStoppedTraderCopyGuardState(traderID, evidence); err != nil {
+		return nil, fmt.Errorf("retire stopped Copy Guard state: %w", err)
 	}
 	return nil, nil
 }

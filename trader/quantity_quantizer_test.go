@@ -70,8 +70,8 @@ func TestQuantizeOrderIntentAtPriceUsesVenueMinimumByAction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if open.Quantized != 0.10 || !open.UsedMinimum {
-		t.Fatalf("initial open must promote exactly to exchange minimum: %+v", open)
+	if open.Quantized != 0.11 || !open.UsedMinimum {
+		t.Fatalf("initial market open must include the minimum-notional price cushion: %+v", open)
 	}
 	if _, err := QuantizeOrderIntentAtPrice(inst, 0.06, 100, QuantityAdd); !errors.Is(err, ErrQuantityBelowMinimum) {
 		t.Fatalf("small add must remain unsubmitted for later reconciliation, got %v", err)

@@ -1496,6 +1496,28 @@ func (s *Server) handleDeleteTrader(c *gin.Context) {
 		})
 		return
 	}
+	// Archive is one operator action: first refresh authoritative exchange
+	// positions, regular/algo orders and local Copy Guard retirement, then repeat
+	// both local and exchange checks before the irreversible archive transition.
+	if s.positionSyncManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Position reconciliation service unavailable"})
+		return
+	}
+	s.positionSyncManager.InvalidateCache(traderID)
+	if exchangeBlockers, reconcileErr := s.positionSyncManager.ReconcileStoppedTrader(traderID); reconcileErr != nil {
+		c.JSON(http.StatusBadGateway, gin.H{
+			"error":            "Authoritative exchange reconciliation failed: " + reconcileErr.Error(),
+			"lifecycle_status": state.Status,
+		})
+		return
+	} else if len(exchangeBlockers) > 0 {
+		c.JSON(http.StatusConflict, gin.H{
+			"error":            "Trader has unresolved exchange risk and cannot be archived",
+			"lifecycle_status": state.Status,
+			"pending_blockers": exchangeBlockers,
+		})
+		return
+	}
 	archiveBlockers, err := s.store.Trader().GetArchiveBlockers(traderID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to verify archive safety: %v", err)})

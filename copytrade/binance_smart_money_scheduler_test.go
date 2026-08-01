@@ -4,6 +4,8 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -84,5 +86,40 @@ func TestClassicBinanceSourceRequestsUseCredentialScoped429Gate(t *testing.T) {
 	var backoffErr *SmartMoneyBackoffError
 	if !errors.As(secondErr, &backoffErr) || calls != 1 {
 		t.Fatalf("backoff must suppress another classic source request: calls=%d err=%v", calls, secondErr)
+	}
+}
+
+// A credential lease covers the complete paginated snapshot, not one HTTP
+// page. Otherwise two leaders sharing the global credential can interleave
+// dozens of pages and recreate the production 429 storm even though each page
+// individually passes through requestMu.
+func TestSmartMoneyCredentialGateSerializesCompleteSnapshots(t *testing.T) {
+	gate := &smartMoneyCredentialGate{}
+	var active int32
+	var maxActive int32
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			gate.doSnapshot(func() {
+				current := atomic.AddInt32(&active, 1)
+				for {
+					previous := atomic.LoadInt32(&maxActive)
+					if current <= previous || atomic.CompareAndSwapInt32(&maxActive, previous, current) {
+						break
+					}
+				}
+				time.Sleep(20 * time.Millisecond)
+				atomic.AddInt32(&active, -1)
+			})
+		}()
+	}
+	close(start)
+	wg.Wait()
+	if maxActive != 1 {
+		t.Fatalf("complete snapshots overlapped under one credential: max=%d", maxActive)
 	}
 }

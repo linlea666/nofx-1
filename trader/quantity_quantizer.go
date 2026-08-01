@@ -56,6 +56,27 @@ func MinimumExecutableQuantity(inst *ExecutionInstrument, price float64) (float6
 	return math.Round(minimum/step) * step, nil
 }
 
+// MinimumExecutableOpenQuantity adds a small market-order price cushion to a
+// venue's exact minimum notional. It is only for risk-increasing market opens:
+// reduce-only orders keep their venue exemptions, and adds/catch-ups are never
+// promoted. The final result remains on the exchange quantity grid.
+func MinimumExecutableOpenQuantity(inst *ExecutionInstrument, price float64) (float64, error) {
+	minimum, err := MinimumExecutableQuantity(inst, price)
+	if err != nil || inst.MinNotional <= 0 {
+		return minimum, err
+	}
+	const marketPriceSafetyFactor = 1.01
+	if minimum*price >= inst.MinNotional*marketPriceSafetyFactor-1e-12 {
+		return minimum, nil
+	}
+	step := inst.BaseQuantityStep
+	minimum = math.Ceil((inst.MinNotional*marketPriceSafetyFactor/price)/step-1e-12) * step
+	if minimum < inst.MinBaseQuantity {
+		minimum = inst.MinBaseQuantity
+	}
+	return math.Round(minimum/step) * step, nil
+}
+
 // QuantizeOrderIntent is the only business-level quantity rounding boundary.
 // Adapters serialize its result; they do not choose a different rounding mode.
 func QuantizeOrderIntent(inst *ExecutionInstrument, requested float64, kind QuantityIntentKind) (QuantityQuantization, error) {
@@ -130,6 +151,11 @@ func QuantizeOrderIntentAtPrice(inst *ExecutionInstrument, requested, price floa
 	const epsilon = 1e-12
 	switch kind {
 	case QuantityInitialOpen, QuantityRiskIncrease:
+		minimum, err = MinimumExecutableOpenQuantity(inst, price)
+		if err != nil {
+			return QuantityQuantization{}, err
+		}
+		q.Minimum = minimum
 		if q.Quantized < minimum-epsilon {
 			q.Quantized = minimum
 			q.UsedMinimum = true

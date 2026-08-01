@@ -170,6 +170,10 @@ type TradeSignal struct {
 	LeaderEquity   float64   // 领航员总权益
 	LeaderPosition *Position // 该币种的持仓（如有）
 	LeaderPosID    string    // 领航员仓位键（OKX 原生 posId / Binance 合成稳定生命周期键），用于精确匹配
+	// AuthoritativeSnapshot means the signal was derived from the immutable
+	// complete snapshot already installed by the current poll. Processing it
+	// must not fetch the same multi-page source state again.
+	AuthoritativeSnapshot bool
 }
 
 // CopyConfig 跟单配置

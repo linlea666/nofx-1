@@ -2,6 +2,7 @@ package trader
 
 import (
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -168,6 +169,45 @@ type CopyTradeIdempotentOrderExecutor interface {
 	OpenShortPreservingOrdersWithClientID(symbol string, quantity float64, leverage int, clientOrderID string) (map[string]interface{}, error)
 	CloseLongPreservingOrdersWithClientID(symbol string, quantity float64, clientOrderID string) (map[string]interface{}, error)
 	CloseShortPreservingOrdersWithClientID(symbol string, quantity float64, clientOrderID string) (map[string]interface{}, error)
+}
+
+// CopyTradeMarketOrderRequest carries the persistence callback to the exact
+// transport boundary. Implementations must invoke BeforeSubmit after all
+// deterministic local validation and immediately before the exchange request;
+// when adopting an existing idempotent order they invoke it before returning
+// the adopted result.
+type CopyTradeMarketOrderRequest struct {
+	Action        string
+	Symbol        string
+	Quantity      float64
+	Leverage      int
+	ClientOrderID string
+	BeforeSubmit  func() error
+}
+
+type CopyTradeSubmissionBoundaryExecutor interface {
+	ExecuteCopyTradeMarketOrder(request CopyTradeMarketOrderRequest) (map[string]interface{}, error)
+}
+
+// CopyTradePreSubmitError proves the adapter rejected a request before its
+// BeforeSubmit callback succeeded. The copy-trade layer uses ReasonCode rather
+// than string matching so the source revision stays safely replayable.
+type CopyTradePreSubmitError struct{ Cause error }
+
+func (e *CopyTradePreSubmitError) Error() string {
+	if e == nil || e.Cause == nil {
+		return "copy trade rejected before exchange submission"
+	}
+	return fmt.Sprintf("copy trade rejected before exchange submission: %v", e.Cause)
+}
+func (e *CopyTradePreSubmitError) Unwrap() error      { return e.Cause }
+func (e *CopyTradePreSubmitError) ReasonCode() string { return "PRE_SUBMIT" }
+
+// CopyTradeOpenPreparer moves venue-specific leverage cooldowns before the
+// final price/minimum calculation without imposing those semantics on other
+// exchanges.
+type CopyTradeOpenPreparer interface {
+	PrepareCopyTradeOpen(symbol string, leverage int) error
 }
 
 type ClientOrderStatusProvider interface {

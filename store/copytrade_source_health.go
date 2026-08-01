@@ -58,6 +58,8 @@ type SourceHealthObservation struct {
 	NextPollAt         time.Time
 	BackoffUntil       time.Time
 	RateLimit429Count  int
+	DirectRateLimit    bool
+	ScheduledBackoff   bool
 }
 
 func (s *CopyTradeStore) initSourceHealthTable() error {
@@ -237,7 +239,14 @@ func (s *CopyTradeStore) RecordSourceHealthObservation(traderID, leaderID, sourc
 	if status == "" {
 		status = "ERROR"
 	}
-	if obs.CompleteSnapshot && status == SourceHealthHealthy {
+	if obs.ScheduledBackoff {
+		// The credential-scoped scheduler already recorded the one upstream 429.
+		// Other traders merely observing that shared backoff must not each add a
+		// failure or manufacture independent DEGRADED -> HEALTHY transitions.
+		if obs.Error != "" {
+			current.LastError = obs.Error
+		}
+	} else if obs.CompleteSnapshot && status == SourceHealthHealthy {
 		current.ConsecutiveFailures = 0
 		current.LastCompleteSnapshotAt = &obs.CheckedAt
 		current.LastError = ""

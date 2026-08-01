@@ -1159,24 +1159,44 @@ func (t *OKXTrader) setLeverageForSide(symbol string, leverage int, posSide stri
 
 // OpenLong opens long position
 func (t *OKXTrader) OpenLong(symbol string, quantity float64, leverage int) (map[string]interface{}, error) {
-	return t.openLong(symbol, quantity, leverage, true, "")
+	return t.openLong(symbol, quantity, leverage, true, "", nil)
 }
 
 func (t *OKXTrader) OpenLongPreservingOrders(symbol string, quantity float64, leverage int) (map[string]interface{}, error) {
-	return t.openLong(symbol, quantity, leverage, false, "")
+	return t.openLong(symbol, quantity, leverage, false, "", nil)
 }
 
 func (t *OKXTrader) OpenLongPreservingOrdersWithClientID(symbol string, quantity float64, leverage int, clientOrderID string) (map[string]interface{}, error) {
-	return t.openLong(symbol, quantity, leverage, false, clientOrderID)
+	return t.openLong(symbol, quantity, leverage, false, clientOrderID, nil)
 }
 
-func (t *OKXTrader) openLong(symbol string, quantity float64, leverage int, cancelExisting bool, clientOrderID string) (map[string]interface{}, error) {
+func (t *OKXTrader) ExecuteCopyTradeMarketOrder(request CopyTradeMarketOrderRequest) (map[string]interface{}, error) {
+	switch request.Action {
+	case "open_long":
+		return t.openLong(request.Symbol, request.Quantity, request.Leverage, false, request.ClientOrderID, request.BeforeSubmit)
+	case "open_short":
+		return t.openShort(request.Symbol, request.Quantity, request.Leverage, false, request.ClientOrderID, request.BeforeSubmit)
+	case "close_long", "reduce_long":
+		return t.closeLong(request.Symbol, request.Quantity, false, request.ClientOrderID, request.BeforeSubmit)
+	case "close_short", "reduce_short":
+		return t.closeShort(request.Symbol, request.Quantity, false, request.ClientOrderID, request.BeforeSubmit)
+	default:
+		return nil, fmt.Errorf("unsupported OKX copy market action %q", request.Action)
+	}
+}
+
+func (t *OKXTrader) openLong(symbol string, quantity float64, leverage int, cancelExisting bool, clientOrderID string, beforeSubmit func() error) (map[string]interface{}, error) {
 	idempotent := clientOrderID != ""
 	if clientOrderID == "" {
 		clientOrderID = genOkxClOrdID()
 	}
 	if idempotent {
 		if existing, found, err := t.lookupIdempotentOKXOrder(symbol, clientOrderID); err != nil || found {
+			if found && err == nil && beforeSubmit != nil {
+				if err = beforeSubmit(); err != nil {
+					return nil, err
+				}
+			}
 			return existing, err
 		}
 	}
@@ -1242,6 +1262,11 @@ func (t *OKXTrader) openLong(symbol string, quantity float64, leverage int, canc
 		"tag":     okxTag,
 	}
 
+	if beforeSubmit != nil {
+		if err = beforeSubmit(); err != nil {
+			return nil, err
+		}
+	}
 	data, err := t.doRequest("POST", okxOrderPath, body)
 	if err != nil {
 		if idempotent {
@@ -1294,24 +1319,29 @@ func (t *OKXTrader) openLong(symbol string, quantity float64, leverage int, canc
 
 // OpenShort opens short position
 func (t *OKXTrader) OpenShort(symbol string, quantity float64, leverage int) (map[string]interface{}, error) {
-	return t.openShort(symbol, quantity, leverage, true, "")
+	return t.openShort(symbol, quantity, leverage, true, "", nil)
 }
 
 func (t *OKXTrader) OpenShortPreservingOrders(symbol string, quantity float64, leverage int) (map[string]interface{}, error) {
-	return t.openShort(symbol, quantity, leverage, false, "")
+	return t.openShort(symbol, quantity, leverage, false, "", nil)
 }
 
 func (t *OKXTrader) OpenShortPreservingOrdersWithClientID(symbol string, quantity float64, leverage int, clientOrderID string) (map[string]interface{}, error) {
-	return t.openShort(symbol, quantity, leverage, false, clientOrderID)
+	return t.openShort(symbol, quantity, leverage, false, clientOrderID, nil)
 }
 
-func (t *OKXTrader) openShort(symbol string, quantity float64, leverage int, cancelExisting bool, clientOrderID string) (map[string]interface{}, error) {
+func (t *OKXTrader) openShort(symbol string, quantity float64, leverage int, cancelExisting bool, clientOrderID string, beforeSubmit func() error) (map[string]interface{}, error) {
 	idempotent := clientOrderID != ""
 	if clientOrderID == "" {
 		clientOrderID = genOkxClOrdID()
 	}
 	if idempotent {
 		if existing, found, err := t.lookupIdempotentOKXOrder(symbol, clientOrderID); err != nil || found {
+			if found && err == nil && beforeSubmit != nil {
+				if err = beforeSubmit(); err != nil {
+					return nil, err
+				}
+			}
 			return existing, err
 		}
 	}
@@ -1374,6 +1404,11 @@ func (t *OKXTrader) openShort(symbol string, quantity float64, leverage int, can
 		"tag":     okxTag,
 	}
 
+	if beforeSubmit != nil {
+		if err = beforeSubmit(); err != nil {
+			return nil, err
+		}
+	}
 	data, err := t.doRequest("POST", okxOrderPath, body)
 	if err != nil {
 		if idempotent {
@@ -1426,24 +1461,29 @@ func (t *OKXTrader) openShort(symbol string, quantity float64, leverage int, can
 
 // CloseLong closes long position
 func (t *OKXTrader) CloseLong(symbol string, quantity float64) (map[string]interface{}, error) {
-	return t.closeLong(symbol, quantity, true, "")
+	return t.closeLong(symbol, quantity, true, "", nil)
 }
 
 func (t *OKXTrader) CloseLongPreservingOrders(symbol string, quantity float64) (map[string]interface{}, error) {
-	return t.closeLong(symbol, quantity, false, "")
+	return t.closeLong(symbol, quantity, false, "", nil)
 }
 
 func (t *OKXTrader) CloseLongPreservingOrdersWithClientID(symbol string, quantity float64, clientOrderID string) (map[string]interface{}, error) {
-	return t.closeLong(symbol, quantity, false, clientOrderID)
+	return t.closeLong(symbol, quantity, false, clientOrderID, nil)
 }
 
-func (t *OKXTrader) closeLong(symbol string, quantity float64, cancelExisting bool, clientOrderID string) (map[string]interface{}, error) {
+func (t *OKXTrader) closeLong(symbol string, quantity float64, cancelExisting bool, clientOrderID string, beforeSubmit func() error) (map[string]interface{}, error) {
 	idempotent := clientOrderID != ""
 	if clientOrderID == "" {
 		clientOrderID = genOkxClOrdID()
 	}
 	if idempotent {
 		if existing, found, err := t.lookupIdempotentOKXOrder(symbol, clientOrderID); err != nil || found {
+			if found && err == nil && beforeSubmit != nil {
+				if err = beforeSubmit(); err != nil {
+					return nil, err
+				}
+			}
 			return existing, err
 		}
 	}
@@ -1511,6 +1551,11 @@ func (t *OKXTrader) closeLong(symbol string, quantity float64, cancelExisting bo
 		"tag":     okxTag,
 	}
 
+	if beforeSubmit != nil {
+		if err = beforeSubmit(); err != nil {
+			return nil, err
+		}
+	}
 	data, err := t.doRequest("POST", okxOrderPath, body)
 	if err != nil {
 		if idempotent {
@@ -1565,24 +1610,29 @@ func (t *OKXTrader) closeLong(symbol string, quantity float64, cancelExisting bo
 
 // CloseShort closes short position
 func (t *OKXTrader) CloseShort(symbol string, quantity float64) (map[string]interface{}, error) {
-	return t.closeShort(symbol, quantity, true, "")
+	return t.closeShort(symbol, quantity, true, "", nil)
 }
 
 func (t *OKXTrader) CloseShortPreservingOrders(symbol string, quantity float64) (map[string]interface{}, error) {
-	return t.closeShort(symbol, quantity, false, "")
+	return t.closeShort(symbol, quantity, false, "", nil)
 }
 
 func (t *OKXTrader) CloseShortPreservingOrdersWithClientID(symbol string, quantity float64, clientOrderID string) (map[string]interface{}, error) {
-	return t.closeShort(symbol, quantity, false, clientOrderID)
+	return t.closeShort(symbol, quantity, false, clientOrderID, nil)
 }
 
-func (t *OKXTrader) closeShort(symbol string, quantity float64, cancelExisting bool, clientOrderID string) (map[string]interface{}, error) {
+func (t *OKXTrader) closeShort(symbol string, quantity float64, cancelExisting bool, clientOrderID string, beforeSubmit func() error) (map[string]interface{}, error) {
 	idempotent := clientOrderID != ""
 	if clientOrderID == "" {
 		clientOrderID = genOkxClOrdID()
 	}
 	if idempotent {
 		if existing, found, err := t.lookupIdempotentOKXOrder(symbol, clientOrderID); err != nil || found {
+			if found && err == nil && beforeSubmit != nil {
+				if err = beforeSubmit(); err != nil {
+					return nil, err
+				}
+			}
 			return existing, err
 		}
 	}
@@ -1655,6 +1705,11 @@ func (t *OKXTrader) closeShort(symbol string, quantity float64, cancelExisting b
 
 	logger.Infof("🔻 OKX close short request body: %+v", body)
 
+	if beforeSubmit != nil {
+		if err = beforeSubmit(); err != nil {
+			return nil, err
+		}
+	}
 	data, err := t.doRequest("POST", okxOrderPath, body)
 	if err != nil {
 		if idempotent {

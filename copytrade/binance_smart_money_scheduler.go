@@ -31,12 +31,29 @@ func (e *SmartMoneyBackoffError) Error() string {
 
 type smartMoneyCredentialGate struct {
 	requestMu sync.Mutex
-	mu        sync.Mutex
+	// snapshotMu covers one complete, all-pages Smart Money snapshot. requestMu
+	// alone only serialized individual pages and allowed two leaders sharing one
+	// credential to interleave dozens of requests until Binance returned 429.
+	snapshotMu sync.Mutex
+	mu         sync.Mutex
 
 	backoffUntil    time.Time
 	consecutive429  int
 	healthyAfter429 int
 	total429        int
+}
+
+func (g *smartMoneyCredentialGate) doSnapshot(run func()) {
+	if run == nil {
+		return
+	}
+	if g == nil {
+		run()
+		return
+	}
+	g.snapshotMu.Lock()
+	defer g.snapshotMu.Unlock()
+	run()
 }
 
 var smartMoneyCredentialGates sync.Map

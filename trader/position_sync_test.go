@@ -221,6 +221,99 @@ func TestStoppedReconciliationDoesNotMutateWhileExchangeRiskExists(t *testing.T)
 	}
 }
 
+func TestStoppedReconciliationRetiresFlatCopyGuardLifecycleIdempotently(t *testing.T) {
+	st, err := store.New(filepath.Join(t.TempDir(), "stopped-copyguard-retirement.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	insertPositionSyncTrader(t, st, "stopped-trader", "stopped", "exchange-1", false)
+	if err = st.CopyTrade().SavePositionMapping(&store.CopyTradePositionMapping{
+		TraderID: "stopped-trader", LeaderID: "leader", LeaderPosID: "leader-pos",
+		Symbol: "SNDKUSDT", Side: "short", MarginMode: "cross",
+		Status: store.MappingStatusStoppedByRisk, LastKnownSize: 10,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{
+		TraderID: "stopped-trader", LeaderID: "leader", LeaderPosID: "leader-pos",
+		Symbol: "SNDKUSDT", Side: "short", MarginMode: "cross",
+		Status: store.CopyGuardAIAbandoned, ProtectionStatus: store.CopyGuardProtectionTriggered,
+		FollowerEntryPrice: 1, FollowerNotional: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = st.CopyTrade().OpenCopyGuardAttempt(cycle.ID, 0, 1, 10, 10, .1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = st.DB().Exec(`UPDATE copy_guard_attempts SET status='STOPPED',closed_at=CURRENT_TIMESTAMP WHERE cycle_id=?`, cycle.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err = st.CopyTrade().UpsertCopyGuardProtectiveOrder(&store.CopyGuardProtectiveOrder{
+		CycleID: cycle.ID, TraderID: "stopped-trader", AlgoID: "old-algo", AlgoClientID: "old-client",
+		Symbol: "SNDKUSDT", Side: "short", MarginMode: "cross", Quantity: 10,
+		TriggerPrice: 1.2, TriggerType: "mark", Status: "live",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	intent, claimed, err := st.CopyTrade().ReserveExecutionIntent(&store.CopyTradeExecutionIntent{
+		TraderID: "stopped-trader", LeaderPosID: "leader-pos", SourceRevision: 2,
+		CanonicalKey: "leader|stopped-trader|leader-pos|2", Action: "open_short",
+		Symbol: "SNDKUSDT", Side: "short", LeaderTargetSize: 10,
+		RequestedNotional: 10, RequestedQuantity: 10, QuantizedQuantity: 10,
+		ClientOrderID: "stopped-local-prepared",
+	})
+	if err != nil || !claimed {
+		t.Fatalf("reserve local prepared intent: claimed=%v err=%v", claimed, err)
+	}
+	if _, err = st.CopyTrade().PrepareExecutionOrderAttemptRecordWithKind(
+		intent.ID, intent.ClientOrderID, "INITIAL_OPEN", 10, 10,
+	); err != nil {
+		t.Fatal(err)
+	}
+	manager := NewPositionSyncManager(st, time.Second)
+	manager.traderCache["stopped-trader"] = &positionSyncFakeTrader{}
+	for run := 0; run < 2; run++ {
+		blockers, reconcileErr := manager.ReconcileStoppedTrader("stopped-trader")
+		if reconcileErr != nil || len(blockers) != 0 {
+			t.Fatalf("run %d blockers=%+v err=%v", run, blockers, reconcileErr)
+		}
+	}
+	blockers, err := st.Trader().GetArchiveBlockers("stopped-trader")
+	if err != nil || len(blockers) != 0 {
+		t.Fatalf("flat stopped trader still blocked: %+v err=%v", blockers, err)
+	}
+	cycle, err = st.CopyTrade().GetCopyGuardCycle(cycle.ID)
+	if err != nil || cycle.ClosedAt == nil || cycle.Status != store.CopyGuardDetached ||
+		cycle.AccountingStatus != store.CopyGuardAccountingUnscorable || cycle.ProtectionStatus != store.CopyGuardProtectionCanceled {
+		t.Fatalf("cycle was not safely retired: %+v err=%v", cycle, err)
+	}
+	mapping, err := st.CopyTrade().GetMapping("stopped-trader", "leader-pos")
+	if err != nil || mapping.Status != store.MappingStatusDetached {
+		t.Fatalf("mapping retirement mismatch: %+v err=%v", mapping, err)
+	}
+	protective, err := st.CopyTrade().GetCopyGuardProtectiveOrder(cycle.ID)
+	if err != nil || protective.Status != "canceled" || protective.ReplacementPending {
+		t.Fatalf("local protective order was not retired: %+v err=%v", protective, err)
+	}
+	var events int
+	if err = st.DB().QueryRow(`SELECT COUNT(*) FROM copy_guard_events WHERE cycle_id=? AND type=?`, cycle.ID, store.StoppedTraderFlatRetirementReason).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if events != 1 {
+		t.Fatalf("retirement event count=%d want=1", events)
+	}
+	intent, err = st.CopyTrade().GetExecutionIntentByID(intent.ID)
+	if err != nil || intent.Status != store.ExecutionIntentFailed || intent.ReasonCode != store.ExecutionIntentCycleTerminatedBeforeSubmit || intent.TerminalAt == nil {
+		t.Fatalf("local PREPARED intent was not safely retired: %+v err=%v", intent, err)
+	}
+	attempts, err := st.CopyTrade().ListExecutionOrderAttempts(intent.ID)
+	if err != nil || len(attempts) != 1 || attempts[0].Status != store.ExecutionOrderAttemptTerminalNoFill || attempts[0].SubmittedAt != nil {
+		t.Fatalf("local PREPARED attempt retirement mismatch: %+v err=%v", attempts, err)
+	}
+}
+
 func TestStoppedReconciliationDoesNotTreatFillQueryFailureAsNoFills(t *testing.T) {
 	st, err := store.New(filepath.Join(t.TempDir(), "stopped-reconcile-history-error.db"))
 	if err != nil {

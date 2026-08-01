@@ -557,6 +557,10 @@ func (t *FuturesTrader) OpenLongPreservingOrders(symbol string, quantity float64
 	return t.OpenLongPreservingOrdersWithClientID(symbol, quantity, leverage, getBrOrderID())
 }
 
+func (t *FuturesTrader) PrepareCopyTradeOpen(symbol string, leverage int) error {
+	return t.SetLeverage(symbol, leverage)
+}
+
 func (t *FuturesTrader) OpenShortPreservingOrders(symbol string, quantity float64, leverage int) (map[string]interface{}, error) {
 	return t.OpenShortPreservingOrdersWithClientID(symbol, quantity, leverage, getBrOrderID())
 }
@@ -570,22 +574,37 @@ func (t *FuturesTrader) CloseShortPreservingOrders(symbol string, quantity float
 }
 
 func (t *FuturesTrader) OpenLongPreservingOrdersWithClientID(symbol string, quantity float64, leverage int, clientOrderID string) (map[string]interface{}, error) {
-	return t.createCopyMarketOrder(symbol, quantity, leverage, futures.SideTypeBuy, futures.PositionSideTypeLong, clientOrderID, false)
+	return t.createCopyMarketOrder(symbol, quantity, leverage, futures.SideTypeBuy, futures.PositionSideTypeLong, clientOrderID, false, nil)
 }
 
 func (t *FuturesTrader) OpenShortPreservingOrdersWithClientID(symbol string, quantity float64, leverage int, clientOrderID string) (map[string]interface{}, error) {
-	return t.createCopyMarketOrder(symbol, quantity, leverage, futures.SideTypeSell, futures.PositionSideTypeShort, clientOrderID, false)
+	return t.createCopyMarketOrder(symbol, quantity, leverage, futures.SideTypeSell, futures.PositionSideTypeShort, clientOrderID, false, nil)
 }
 
 func (t *FuturesTrader) CloseLongPreservingOrdersWithClientID(symbol string, quantity float64, clientOrderID string) (map[string]interface{}, error) {
-	return t.createCopyMarketOrder(symbol, quantity, 0, futures.SideTypeSell, futures.PositionSideTypeLong, clientOrderID, true)
+	return t.createCopyMarketOrder(symbol, quantity, 0, futures.SideTypeSell, futures.PositionSideTypeLong, clientOrderID, true, nil)
 }
 
 func (t *FuturesTrader) CloseShortPreservingOrdersWithClientID(symbol string, quantity float64, clientOrderID string) (map[string]interface{}, error) {
-	return t.createCopyMarketOrder(symbol, quantity, 0, futures.SideTypeBuy, futures.PositionSideTypeShort, clientOrderID, true)
+	return t.createCopyMarketOrder(symbol, quantity, 0, futures.SideTypeBuy, futures.PositionSideTypeShort, clientOrderID, true, nil)
 }
 
-func (t *FuturesTrader) createCopyMarketOrder(symbol string, quantity float64, leverage int, side futures.SideType, positionSide futures.PositionSideType, clientOrderID string, closing bool) (map[string]interface{}, error) {
+func (t *FuturesTrader) ExecuteCopyTradeMarketOrder(request CopyTradeMarketOrderRequest) (map[string]interface{}, error) {
+	switch request.Action {
+	case "open_long":
+		return t.createCopyMarketOrder(request.Symbol, request.Quantity, request.Leverage, futures.SideTypeBuy, futures.PositionSideTypeLong, request.ClientOrderID, false, request.BeforeSubmit)
+	case "open_short":
+		return t.createCopyMarketOrder(request.Symbol, request.Quantity, request.Leverage, futures.SideTypeSell, futures.PositionSideTypeShort, request.ClientOrderID, false, request.BeforeSubmit)
+	case "close_long", "reduce_long":
+		return t.createCopyMarketOrder(request.Symbol, request.Quantity, 0, futures.SideTypeSell, futures.PositionSideTypeLong, request.ClientOrderID, true, request.BeforeSubmit)
+	case "close_short", "reduce_short":
+		return t.createCopyMarketOrder(request.Symbol, request.Quantity, 0, futures.SideTypeBuy, futures.PositionSideTypeShort, request.ClientOrderID, true, request.BeforeSubmit)
+	default:
+		return nil, fmt.Errorf("unsupported Binance copy market action %q", request.Action)
+	}
+}
+
+func (t *FuturesTrader) createCopyMarketOrder(symbol string, quantity float64, leverage int, side futures.SideType, positionSide futures.PositionSideType, clientOrderID string, closing bool, beforeSubmit func() error) (map[string]interface{}, error) {
 	symbol = strings.ToUpper(strings.TrimSpace(symbol))
 	var instrument *binanceExecutionInstrument
 	var err error
@@ -610,6 +629,11 @@ func (t *FuturesTrader) createCopyMarketOrder(symbol string, quantity float64, l
 	if existing, found, err := t.findOrderByClientID(symbol, clientOrderID); err != nil {
 		return nil, fmt.Errorf("query idempotent Binance order: %w", err)
 	} else if found {
+		if beforeSubmit != nil {
+			if err = beforeSubmit(); err != nil {
+				return nil, err
+			}
+		}
 		return adoptBinanceCopyOrder(existing)
 	}
 	if closing && quantity == 0 {
@@ -640,6 +664,11 @@ func (t *FuturesTrader) createCopyMarketOrder(symbol string, quantity float64, l
 	if !closing {
 		quantityFloat, _ := strconv.ParseFloat(quantityStr, 64)
 		if err := t.CheckMinNotional(symbol, quantityFloat); err != nil {
+			return nil, err
+		}
+	}
+	if beforeSubmit != nil {
+		if err := beforeSubmit(); err != nil {
 			return nil, err
 		}
 	}

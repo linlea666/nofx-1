@@ -518,6 +518,8 @@ func (e *Engine) recordSmartMoneySourceHealth() bool {
 			NextPollAt:         obs.NextPollAt,
 			BackoffUntil:       obs.BackoffUntil,
 			RateLimit429Count:  obs.RateLimit429Count,
+			DirectRateLimit:    obs.DirectRateLimit,
+			ScheduledBackoff:   obs.ScheduledBackoff,
 		},
 	)
 	if err != nil {
@@ -526,112 +528,128 @@ func (e *Engine) recordSmartMoneySourceHealth() bool {
 	}
 
 	recovered := transitioned && health.Status == store.SourceHealthHealthy && health.PreviousStatus != ""
-	now := time.Now()
-	shouldNotify := recovered || health.Status != store.SourceHealthHealthy &&
-		(transitioned || health.LastNotifiedAt == nil || now.Sub(*health.LastNotifiedAt) >= time.Hour)
-	// AUTH_FAILED already uses the global Binance credential notification, which
-	// lists every affected trader. Persist it here but avoid sending a duplicate.
-	if shouldNotify && health.Status != store.SourceHealthAuthFailed {
-		e.notifySmartMoneySourceHealth(health, recovered, now)
-		if err := e.store.CopyTrade().MarkSourceHealthNotified(e.traderID, now); err != nil {
-			logger.Warnf("⚠️ [%s] 更新 Smart Money 健康状态通知时间失败: %v", e.traderID, err)
-		}
-	}
+	e.recordSmartMoneySourceIncident(obs, health)
 	return recovered
 }
 
-func (e *Engine) notifySmartMoneySourceHealth(health *store.CopyTradeSourceHealth, recovered bool, now time.Time) {
-	if health == nil {
+const smartMoneyCredentialIncidentScope = "binance:web-credential:" + DefaultBinanceCredentialsLabel
+
+// recordSmartMoneySourceIncident deliberately separates the hot-path health
+// row from the human-notification lifecycle. A complete snapshot restores the
+// data plane immediately, while a recovery email is emitted only after the
+// persisted incident has remained stable for the store's recovery window.
+func (e *Engine) recordSmartMoneySourceIncident(obs SourceHealthObservation, health *store.CopyTradeSourceHealth) {
+	if health == nil || e.store == nil || obs.ScheduledBackoff {
 		return
 	}
-	traderName := e.traderID
-	executionExchange := "unknown"
-	activeMappings := "none"
-	protectionSummary := "none"
-	if e.store != nil {
-		traderName = e.store.Trader().ResolveDisplayName(e.traderID)
-		if configuredTrader, err := e.store.Trader().GetByID(e.traderID); err == nil && configuredTrader.ExchangeID != "" {
-			executionExchange = configuredTrader.ExchangeID
-		}
-		if mappings, err := e.store.CopyTrade().ListActiveMappings(e.traderID); err == nil && len(mappings) > 0 {
-			parts := make([]string, 0, len(mappings))
-			for _, mapping := range mappings {
-				if mapping == nil {
-					continue
-				}
-				sourceSymbol := mapping.SourceSymbol
-				if sourceSymbol == "" {
-					sourceSymbol = mapping.Symbol
-				}
-				executionSymbol := mapping.ExecutionSymbol
-				if executionSymbol == "" {
-					executionSymbol = mapping.Symbol
-				}
-				parts = append(parts, fmt.Sprintf("%s/%s->%s", sourceSymbol, mapping.Side, executionSymbol))
-			}
-			if len(parts) > 0 {
-				activeMappings = strings.Join(parts, ", ")
-			}
-		}
-		if orders, err := e.store.CopyTrade().ListActiveCopyGuardProtectiveOrders(e.traderID); err == nil && len(orders) > 0 {
-			pending := 0
-			for _, order := range orders {
-				if order.ReplacementPending {
-					pending++
-				}
-			}
-			protectionSummary = fmt.Sprintf("%d active, %d replacement pending", len(orders), pending)
+	now := obs.CheckedAt
+	if now.IsZero() {
+		now = time.Now()
+	}
+	generation := health.SourceGeneration
+	if generation <= 0 {
+		generation = 1
+	}
+	leaderScope := fmt.Sprintf("binance:leader:%s:g%d", health.LeaderID, generation)
+	observations := make([]store.SourceIncidentObservation, 0, 2)
+	if obs.DirectRateLimit {
+		observations = append(observations, store.SourceIncidentObservation{
+			ScopeKey: smartMoneyCredentialIncidentScope, ScopeKind: store.SourceIncidentScopeCredential,
+			TraderID: e.traderID, LeaderID: health.LeaderID, Cause: "HTTP_429", Error: health.LastError,
+			Failed: true, ObservedAt: now,
+		})
+	} else if obs.CompleteSnapshot && health.Status == store.SourceHealthHealthy {
+		observations = append(observations,
+			store.SourceIncidentObservation{ScopeKey: smartMoneyCredentialIncidentScope, ScopeKind: store.SourceIncidentScopeCredential, TraderID: e.traderID, LeaderID: health.LeaderID, Healthy: true, ObservedAt: now},
+			store.SourceIncidentObservation{ScopeKey: leaderScope, ScopeKind: store.SourceIncidentScopeLeader, TraderID: e.traderID, LeaderID: health.LeaderID, Healthy: true, ObservedAt: now},
+		)
+	} else if health.Status != store.SourceHealthHealthy {
+		// Authentication errors already have the global credential-expiry alert.
+		// All other source-local failures share this durable incident lifecycle.
+		if health.Status != store.SourceHealthAuthFailed {
+			observations = append(observations, store.SourceIncidentObservation{
+				ScopeKey: leaderScope, ScopeKind: store.SourceIncidentScopeLeader,
+				TraderID: e.traderID, LeaderID: health.LeaderID, Cause: health.Status, Error: health.LastError,
+				Failed: true, ObservedAt: now,
+			})
 		}
 	}
-	title := fmt.Sprintf("Binance 公开领航员数据源已冻结（%s）", health.Status)
+	for _, incidentObs := range observations {
+		incident, action, err := e.store.CopyTrade().RecordSourceIncidentObservation(incidentObs)
+		if err != nil {
+			logger.Warnf("⚠️ [%s] 保存 Smart Money 数据源事故失败: %v", e.traderID, err)
+			continue
+		}
+		if action != "" {
+			e.notifySmartMoneySourceIncident(incident, action, health, now)
+		}
+	}
+}
+
+func (e *Engine) notifySmartMoneySourceIncident(incident *store.CopyTradeSourceIncident, kind string, health *store.CopyTradeSourceHealth, now time.Time) {
+	if incident == nil || health == nil || e.store == nil {
+		return
+	}
+	members, _ := e.store.CopyTrade().ListSourceIncidentMembers(incident.ID)
+	if incident.ScopeKind == store.SourceIncidentScopeCredential {
+		if configs, err := e.store.CopyTrade().ListEnabled(); err == nil {
+			members = members[:0]
+			for _, config := range configs {
+				if config != nil && strings.EqualFold(config.ProviderType, string(ProviderBinance)) && strings.EqualFold(config.BinanceSourceMode, string(BinanceSourceSmartMoney)) {
+					members = append(members, config.TraderID)
+				}
+			}
+		}
+	}
+	if len(members) == 0 {
+		members = []string{e.traderID}
+	}
+	displayNames := make([]string, 0, len(members))
+	for _, member := range members {
+		displayNames = append(displayNames, fmt.Sprintf("%s (%s)", e.store.Trader().ResolveDisplayName(member), member))
+	}
+	recovered := kind == store.SourceIncidentMailRecovered
+	title := "Binance 公开领航员数据源事故已冻结"
+	body := fmt.Sprintf("事故 #%d\n范围: %s\n原因: %s\n最后错误: %s\n受影响交易员: %s\n处理: 只冻结依赖新数据源快照的开仓/加仓；已有仓位止损、保护、下单查询和成交对账继续独立运行。",
+		incident.ID, incident.ScopeKind, incident.Cause, incident.LastError, strings.Join(displayNames, ", "))
 	severity := store.CopyEventSeverityError
 	status := "failed"
 	if recovered {
-		title = "Binance 公开领航员数据源已恢复"
+		title = "Binance 公开领航员数据源已稳定恢复"
+		body = fmt.Sprintf("事故 #%d\n范围: %s\n受影响交易员: %s\n稳定性: 已连续取得完整快照，且距最后一次失败不少于15分钟。\n处理: 风险减少信号立即处理；新开仓/加仓仍只接受新的完整快照。",
+			incident.ID, incident.ScopeKind, strings.Join(displayNames, ", "))
 		severity = store.CopyEventSeverityInfo
 		status = "success"
 	}
-	lastComplete := "从未完整同步"
-	if health.LastCompleteSnapshotAt != nil {
-		lastComplete = health.LastCompleteSnapshotAt.Format(time.RFC3339)
-	}
-	body := fmt.Sprintf("领航员: %s (%s)\n交易员: %s\n执行交易所: %s\n状态: %s\n最后完整快照: %s\n活动映射: %s\n保护状态: %s\n连续失败: %d\n原因: %s\n处理: 冻结依赖新源快照的开仓/加仓；已有仓位 Copy Guard、执行和对账继续运行，不会把数据不可见视为全平。",
-		health.TraderName, health.LeaderID, traderName, executionExchange, health.Status, lastComplete, activeMappings, protectionSummary, health.ConsecutiveFailures, health.LastError)
-	if recovered {
-		body = fmt.Sprintf("领航员: %s (%s)\n交易员: %s\n执行交易所: %s\n状态: HEALTHY\n完整快照: %s\n活动映射: %s\n保护状态: %s\n处理: 私密期间的减仓/平仓会立即同步；新仓/加仓只重建基线，不追单。",
-			health.TraderName, health.LeaderID, traderName, executionExchange, lastComplete, activeMappings, protectionSummary)
-	}
-	bucket := now.Unix() / 3600
-	dedup := fmt.Sprintf("source_health|%s|%s|%d", e.traderID, health.Status, bucket)
-	if recovered {
-		transition := int64(0)
-		if health.LastTransitionAt != nil {
-			transition = health.LastTransitionAt.UTC().UnixNano()
-		}
-		dedup = fmt.Sprintf("source_health|%s|recovered|%d|%d", e.traderID, health.SourceGeneration, transition)
-	}
+	dedup := fmt.Sprintf("source_incident|%d|%s", incident.ID, strings.ToLower(kind))
+	traderName := e.store.Trader().ResolveDisplayName(e.traderID)
 	notifier.Notify(notifier.Alert{
 		Time: now, Category: "copy_trade", TraderID: e.traderID, TraderName: traderName,
 		Title: title, Body: body, RateKey: dedup, DedupKey: dedup,
-		Fields: map[string]string{"LeaderID": health.LeaderID, "ExecutionExchange": executionExchange, "SourceStatus": health.Status, "LastCompleteSnapshot": lastComplete, "ActiveMappings": activeMappings, "Protection": protectionSummary},
+		Fields: map[string]string{"IncidentID": fmt.Sprint(incident.ID), "Scope": incident.ScopeKind, "LeaderID": health.LeaderID},
 		StatusHook: func(delivery notifier.DeliveryStatus, deliveryErr error) {
 			message := ""
 			if deliveryErr != nil {
 				message = deliveryErr.Error()
 			}
-			if err := e.store.CopyTrade().MarkSourceHealthMailDelivery(e.traderID, string(delivery), message, time.Now()); err != nil {
-				logger.Warnf("⚠️ [%s] 保存 Smart Money 邮件投递状态失败: %v", e.traderID, err)
+			if err := e.store.CopyTrade().MarkSourceIncidentMailDelivery(incident.ID, kind, string(delivery), message, time.Now()); err != nil {
+				logger.Warnf("⚠️ [%s] 保存 Smart Money 事故邮件投递状态失败: %v", e.traderID, err)
+			}
+			for _, member := range members {
+				if err := e.store.CopyTrade().MarkSourceHealthMailDelivery(member, string(delivery), message, time.Now()); err != nil {
+					logger.Warnf("⚠️ [%s] 保存 Smart Money 交易员邮件投递状态失败: %v", member, err)
+				}
 			}
 		},
 	})
 	if err := e.store.CopyTrade().LogCopyEvent(&store.CopyTradeEvent{
 		TraderID: e.traderID, LeaderID: health.LeaderID, ProviderType: string(ProviderBinance),
-		Category: map[bool]string{true: store.CopyEventCategoryReconcile, false: store.CopyEventCategoryError}[recovered], EventType: "SOURCE_HEALTH_" + health.Status,
+		Category: map[bool]string{true: store.CopyEventCategoryReconcile, false: store.CopyEventCategoryError}[recovered], EventType: "SOURCE_INCIDENT_" + kind,
 		Severity: severity, Status: status, Summary: title,
-		Detail:   map[string]interface{}{"source_mode": health.SourceMode, "last_complete_snapshot": lastComplete, "consecutive_failures": health.ConsecutiveFailures, "error": health.LastError},
+		Detail:   map[string]interface{}{"incident_id": incident.ID, "scope": incident.ScopeKind, "cause": incident.Cause, "affected_traders": members},
 		DedupKey: dedup, CreatedAt: now,
 	}); err != nil {
-		logger.Warnf("⚠️ [%s] 保存 Smart Money 健康状态事件失败: %v", e.traderID, err)
+		logger.Warnf("⚠️ [%s] 保存 Smart Money 数据源事故事件失败: %v", e.traderID, err)
 	}
 }
 
@@ -862,6 +880,7 @@ func (e *Engine) poll() {
 		useSnapshotHotPath = provider.UseAuthoritativeSnapshotHotPath()
 	}
 	var fills []Fill
+	authoritativeStateInstalled := false
 	if !useSnapshotHotPath {
 		var err error
 		fills, err = e.provider.GetFills(e.config.LeaderID, since)
@@ -900,6 +919,7 @@ func (e *Engine) poll() {
 			logger.Warnf("⚠️ [%s] Binance 实时持仓同步失败，本轮跳过信号处理: %v", e.traderID, err)
 			return
 		}
+		authoritativeStateInstalled = true
 		snapshotFills := e.detectBinancePositionSnapshotFills()
 		// 🔑 关键去重：snapshot fill.ID 形如
 		//   "binance_snapshot|<posId>|<action>|<previousSize>|<currentSize>"
@@ -941,6 +961,7 @@ func (e *Engine) poll() {
 			}
 			logger.Warnf("⚠️ [%s] 处理信号前同步状态失败: %v（使用缓存）", e.traderID, err)
 		} else {
+			authoritativeStateInstalled = true
 			logger.Debugf("📡 [%s] 收到 %d 条新成交，已同步领航员持仓", e.traderID, len(newFills))
 		}
 	} else {
@@ -951,6 +972,8 @@ func (e *Engine) poll() {
 				if e.config.ProviderType == ProviderOKX {
 					return
 				}
+			} else {
+				authoritativeStateInstalled = true
 			}
 		}
 	}
@@ -996,6 +1019,11 @@ func (e *Engine) poll() {
 		e.normalizeNetModeFill(fill)
 
 		signal := e.buildSignal(fill)
+		// Only Binance/OKX position-snapshot paths have the complete authoritative
+		// state needed to skip processSignal's historical second read. Preserve the
+		// existing revalidation behavior for every other provider.
+		signal.AuthoritativeSnapshot = authoritativeStateInstalled &&
+			(e.config.ProviderType == ProviderBinance || e.config.ProviderType == ProviderOKX)
 
 		logger.Infof("📡 [%s] 收到信号 | %s %s %s | 价格=%.4f 数量=%.4f 价值=%.2f",
 			e.traderID, fill.Symbol, fill.Action, fill.PositionSide,
@@ -1946,16 +1974,18 @@ func (e *Engine) processSignal(signal *TradeSignal) {
 	// ========================================
 	// Step 1: 统一数据准备（只拉取一次）
 	// ========================================
-	if err := e.syncLeaderState(); err != nil {
-		logger.Warnf("⚠️ [%s] 领航员状态同步失败: %v", e.traderID, err)
-		if e.isSmartMoneyMode() {
-			// The snapshot may have been generated immediately before the leader
-			// hid positions or the credential expired. Never process it against
-			// cached state; release the dedup key so a complete healthy snapshot
-			// can replay the risk-reducing change after recovery.
-			e.unmarkFillSources(fill)
-			e.stats.SignalsSkipped++
-			return
+	if !signal.AuthoritativeSnapshot {
+		if err := e.syncLeaderState(); err != nil {
+			logger.Warnf("⚠️ [%s] 领航员状态同步失败: %v", e.traderID, err)
+			if e.isSmartMoneyMode() {
+				// The snapshot may have been generated immediately before the leader
+				// hid positions or the credential expired. Never process it against
+				// cached state; release the dedup key so a complete healthy snapshot
+				// can replay the risk-reducing change after recovery.
+				e.unmarkFillSources(fill)
+				e.stats.SignalsSkipped++
+				return
+			}
 		}
 	}
 

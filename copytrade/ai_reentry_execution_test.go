@@ -20,7 +20,7 @@ func TestPlanAIReentryNotionalPromotionAndCeiling(t *testing.T) {
 	}
 
 	plan, err = PlanAIReentryNotional(100, 0.5, 0.1, 0, 100, inst)
-	if err != nil || !plan.Promoted || plan.ExecutionNotional != 10 {
+	if err != nil || !plan.Promoted || plan.ExecutionNotional != 11 {
 		t.Fatalf("zero config must use exchange floor: plan=%+v err=%v", plan, err)
 	}
 

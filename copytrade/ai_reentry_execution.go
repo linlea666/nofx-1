@@ -61,9 +61,13 @@ func PlanAIReentryNotional(stoppedNotional, reentryRatio, sizeFactor, configured
 	if stoppedNotional <= 0 || reentryRatio <= 0 || sizeFactor <= 0 || sizeFactor > 1 || configuredMinimum < 0 || price <= 0 || inst == nil || inst.BaseQuantityStep <= 0 {
 		return nil, fmt.Errorf("invalid AI reentry sizing input")
 	}
-	venueMinQty, err := trader.MinimumExecutableQuantity(inst, price)
+	exchangeMinQty, err := trader.MinimumExecutableQuantity(inst, price)
 	if err != nil {
 		return nil, fmt.Errorf("resolve exchange minimum: %w", err)
+	}
+	venueMinQty, err := trader.MinimumExecutableOpenQuantity(inst, price)
+	if err != nil {
+		return nil, fmt.Errorf("resolve safe exchange minimum: %w", err)
 	}
 	step := inst.BaseQuantityStep
 	configuredMinQty := 0.0
@@ -71,7 +75,7 @@ func PlanAIReentryNotional(stoppedNotional, reentryRatio, sizeFactor, configured
 		configuredMinQty = math.Ceil(configuredMinimum/price/step-1e-12) * step
 	}
 	effectiveMinQty := math.Max(venueMinQty, configuredMinQty)
-	exchangeMinimum := venueMinQty * price
+	exchangeMinimum := exchangeMinQty * price
 	effectiveMinimum := effectiveMinQty * price
 	if effectiveMinimum > stoppedNotional+math.Max(0.01, stoppedNotional*1e-9) {
 		return nil, reasonError("INELIGIBLE_PROMOTION_CEILING", "有效最低金额 %.8f 超过原止损仓位 %.8f", effectiveMinimum, stoppedNotional)

@@ -66,6 +66,16 @@ func TestExecutionAttemptRecorderAcceptsCloseAllSentinel(t *testing.T) {
 	if err = dec.BeforeOrderSubmit(dec.ClientOrderID, 0); err != nil {
 		t.Fatalf("close-all sentinel was rejected before adapter submission: %v", err)
 	}
+	var preparedStatus string
+	if err = st.DB().QueryRow(`SELECT status FROM copy_trade_execution_order_attempts WHERE intent_id=?`, intent.ID).Scan(&preparedStatus); err != nil {
+		t.Fatal(err)
+	}
+	if preparedStatus != store.ExecutionOrderAttemptPrepared || dec.ExecutionStatus != store.ExecutionIntentReserved {
+		t.Fatalf("local validation crossed submission boundary: attempt=%s decision=%s", preparedStatus, dec.ExecutionStatus)
+	}
+	if err = dec.BeforeExchangeSubmit(dec.ClientOrderID); err != nil {
+		t.Fatalf("exchange boundary was rejected: %v", err)
+	}
 	var status string
 	var attemptCount int
 	if err = st.DB().QueryRow(`SELECT status FROM copy_trade_execution_intents WHERE id=?`, intent.ID).Scan(&status); err != nil {
@@ -76,6 +86,28 @@ func TestExecutionAttemptRecorderAcceptsCloseAllSentinel(t *testing.T) {
 	}
 	if status != store.ExecutionIntentSubmitted || attemptCount != 1 || dec.ExecutionStatus != store.ExecutionIntentSubmitted {
 		t.Fatalf("close-all submission boundary incomplete: db_status=%s attempts=%d decision_status=%s", status, attemptCount, dec.ExecutionStatus)
+	}
+}
+
+func TestExecutionAttemptsProvenPreSubmitFailsClosedOnAnyExchangeEvidence(t *testing.T) {
+	now := time.Now()
+	safe := []*store.CopyTradeExecutionOrderAttempt{
+		{Status: store.ExecutionOrderAttemptPrepared, ClientOrderID: "local-only"},
+		{Status: store.ExecutionOrderAttemptTerminalNoFill, ClientOrderID: "local-rejected"},
+	}
+	if !executionAttemptsProvenPreSubmit(safe) {
+		t.Fatal("purely local attempts must be replayable after restart")
+	}
+	unsafe := [][]*store.CopyTradeExecutionOrderAttempt{
+		{{Status: store.ExecutionOrderAttemptSubmitted, SubmittedAt: &now}},
+		{{Status: store.ExecutionOrderAttemptPrepared, ExchangeOrderID: "exchange-order"}},
+		{{Status: store.ExecutionOrderAttemptPrepared, FilledQuantity: 1}},
+		{{Status: store.ExecutionOrderAttemptUnknown}},
+	}
+	for index, attempts := range unsafe {
+		if executionAttemptsProvenPreSubmit(attempts) {
+			t.Fatalf("unsafe attempt case %d was treated as pre-submit: %+v", index, attempts)
+		}
 	}
 }
 

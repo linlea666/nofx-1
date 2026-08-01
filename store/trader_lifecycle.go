@@ -349,9 +349,10 @@ func (s *TraderStore) GetStopBlockers(traderID string) ([]TraderLifecycleBlocker
 							OR EXISTS (
 								SELECT 1 FROM copy_trade_execution_order_attempts a
 								WHERE a.intent_id=i.id AND (
-									a.terminal_at IS NULL
+									a.submitted_at IS NOT NULL
+									OR COALESCE(a.exchange_order_id,'')<>''
 									OR COALESCE(a.filled_quantity,0)>0
-									OR a.status IN ('SUBMITTED','PARTIALLY_FILLED','FILLED')
+									OR a.status IN ('SUBMITTED','PARTIALLY_FILLED','FILLED','UNKNOWN')
 								)
 							)
 						)

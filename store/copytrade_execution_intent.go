@@ -33,6 +33,19 @@ const (
 	ExecutionOrderAttemptTerminalNoFill  = "TERMINAL_NO_FILL"
 )
 
+// noUnsafeExecutionAttemptSQL is the single proof used by replay/reclaim
+// paths. PREPARED and a local TERMINAL_NO_FILL are safe only when the adapter
+// never crossed the durable submission boundary and no exchange/fill identity
+// exists. Every other attempt remains fail-closed.
+const noUnsafeExecutionAttemptSQL = `NOT EXISTS (
+	SELECT 1 FROM copy_trade_execution_order_attempts a
+	WHERE a.intent_id=copy_trade_execution_intents.id AND (
+		a.submitted_at IS NOT NULL OR COALESCE(a.exchange_order_id,'')<>''
+		OR COALESCE(a.filled_quantity,0)>0
+		OR a.status NOT IN ('PREPARED','TERMINAL_NO_FILL')
+	)
+)`
+
 func (s *CopyTradeStore) CountMigrationMarginStopIntents(cycleID int64) (int, error) {
 	if cycleID <= 0 {
 		return 0, nil
@@ -843,7 +856,8 @@ func (s *CopyTradeStore) SettleOrdinaryCatchupTransition(c OrdinaryCatchupSettle
 // ReclaimUnsubmittedExecutionIntent returns an exact source transition to the
 // executable RESERVED state after a fresh authoritative signal proves the
 // transition is still current. It is intentionally limited to intents with no
-// order attempt, submitted timestamp, exchange identity, or fill evidence.
+// submitted attempt, exchange identity, or fill evidence; a purely local
+// PREPARED/TERMINAL_NO_FILL attempt remains safely replayable.
 // This closes the restart/manual-review deadlock without replaying uncertain
 // exchange work.
 func (s *CopyTradeStore) ReclaimUnsubmittedExecutionIntent(id int64, traderID, action string, leaderTargetSize float64) (bool, error) {
@@ -868,10 +882,7 @@ func (s *CopyTradeStore) ReclaimUnsubmittedExecutionIntent(id int64, traderID, a
 		  )
 		  AND submitted_at IS NULL AND COALESCE(exchange_order_id,'')=''
 		  AND COALESCE(filled_quantity,0)=0
-		  AND NOT EXISTS (
-			SELECT 1 FROM copy_trade_execution_order_attempts a
-			WHERE a.intent_id=copy_trade_execution_intents.id
-		  )`,
+		  AND `+noUnsafeExecutionAttemptSQL,
 		id, traderID, action, leaderTargetSize, leaderTargetSize)
 	if err != nil {
 		return false, err
@@ -1397,7 +1408,7 @@ func (s *CopyTradeStore) ReserveExecutionIntent(intent *CopyTradeExecutionIntent
 	if !claimed {
 		// A crash can leave a pre-submit source transition reserved while the
 		// leader changes direction/target before the first healthy snapshot
-		// after restart. With no order attempt there is no exchange side effect,
+		// after restart. With no submitted attempt there is no exchange side effect,
 		// so the same canonical revision may be safely rebound to the current
 		// authoritative transition instead of being blocked forever by its old
 		// action identity.
@@ -1412,7 +1423,7 @@ func (s *CopyTradeStore) ReserveExecutionIntent(intent *CopyTradeExecutionIntent
 			WHERE canonical_key=? AND canonical_key<>''
 			  AND status='RECONCILING' AND reason_code IN ('SOURCE_REVALIDATION_REQUIRED','SOURCE_DATA_UNAVAILABLE','SOURCE_VALUE_UNAVAILABLE','MIGRATION_RECONCILING')
 			  AND submitted_at IS NULL AND COALESCE(exchange_order_id,'')=''
-			  AND NOT EXISTS (SELECT 1 FROM copy_trade_execution_order_attempts a WHERE a.intent_id=copy_trade_execution_intents.id)
+			  AND `+noUnsafeExecutionAttemptSQL+`
 		`, intent.SourceFillID, intent.Action, intent.CycleID, intent.CandidateID, intent.AnalysisID,
 			intent.AttemptNo, intent.DecisionGeneration, intent.Symbol, intent.Side, intent.MarginMode,
 			intent.LeaderTargetSize, intent.RequestedNotional, intent.TargetQuantity, intent.RequestedQuantity,
@@ -1436,7 +1447,7 @@ func (s *CopyTradeStore) ReserveExecutionIntent(intent *CopyTradeExecutionIntent
 				submitted_at=NULL,filled_at=NULL,protected_at=NULL,terminal_at=NULL,updated_at=CURRENT_TIMESTAMP
 			WHERE trader_id=? AND leader_pos_id=? AND source_revision=? AND action=?
 			  AND COALESCE(exchange_order_id,'')=''
-			  AND NOT EXISTS (SELECT 1 FROM copy_trade_execution_order_attempts a WHERE a.intent_id=copy_trade_execution_intents.id)
+			  AND `+noUnsafeExecutionAttemptSQL+`
 			  AND (
 			    (submitted_at IS NULL AND (
 			      (status='FAILED' AND (reason_code IN ('PRE_SUBMIT','DECISION_CHANNEL_BUSY','STARTUP_REPLAY_REQUIRED') OR reason_code LIKE 'PRECHECK_%'))
@@ -1544,6 +1555,22 @@ func (s *CopyTradeStore) PrepareExecutionOrderAttemptWithQuantities(intentID int
 }
 
 func (s *CopyTradeStore) PrepareExecutionOrderAttemptWithKind(intentID int64, clientOrderID, quantityKind string, requestedQuantity, quantizedQuantity float64) (*CopyTradeExecutionOrderAttempt, error) {
+	attempt, err := s.PrepareExecutionOrderAttemptRecordWithKind(intentID, clientOrderID, quantityKind, requestedQuantity, quantizedQuantity)
+	if err != nil {
+		return nil, err
+	}
+	if _, err = s.MarkExecutionOrderAttemptSubmitted(intentID, attempt.ClientOrderID); err != nil {
+		return nil, err
+	}
+	// Preserve the legacy return contract: callers historically received the
+	// PREPARED row even though this compatibility wrapper also advanced parent.
+	return attempt, nil
+}
+
+// PrepareExecutionOrderAttemptRecordWithKind persists a concrete, validated
+// local plan but deliberately leaves both it and the parent before the exchange
+// submission boundary. This is the production path used by copy trading.
+func (s *CopyTradeStore) PrepareExecutionOrderAttemptRecordWithKind(intentID int64, clientOrderID, quantityKind string, requestedQuantity, quantizedQuantity float64) (*CopyTradeExecutionOrderAttempt, error) {
 	clientOrderID = strings.TrimSpace(clientOrderID)
 	if intentID <= 0 || clientOrderID == "" ||
 		requestedQuantity < 0 || math.IsNaN(requestedQuantity) || math.IsInf(requestedQuantity, 0) ||
@@ -1580,7 +1607,12 @@ func (s *CopyTradeStore) PrepareExecutionOrderAttemptWithKind(intentID int64, cl
 		return nil, fmt.Errorf("execution intent %d cannot prepare order attempt from %s", intentID, intentStatus)
 	}
 	var attemptNo int
-	err = tx.QueryRow(`SELECT attempt_no FROM copy_trade_execution_order_attempts WHERE intent_id=? AND client_order_id=?`, intentID, clientOrderID).Scan(&attemptNo)
+	var existingStatus, existingExchangeOrderID string
+	var existingSubmitted sql.NullString
+	var existingFilled float64
+	err = tx.QueryRow(`SELECT attempt_no,status,COALESCE(exchange_order_id,''),submitted_at,COALESCE(filled_quantity,0)
+		FROM copy_trade_execution_order_attempts WHERE intent_id=? AND client_order_id=?`, intentID, clientOrderID).
+		Scan(&attemptNo, &existingStatus, &existingExchangeOrderID, &existingSubmitted, &existingFilled)
 	if err == sql.ErrNoRows {
 		if err = tx.QueryRow(`SELECT COALESCE(MAX(attempt_no),0)+1 FROM copy_trade_execution_order_attempts WHERE intent_id=?`, intentID).Scan(&attemptNo); err != nil {
 			return nil, err
@@ -1591,12 +1623,24 @@ func (s *CopyTradeStore) PrepareExecutionOrderAttemptWithKind(intentID int64, cl
 		}
 	} else if err != nil {
 		return nil, err
+	} else {
+		safePreSubmit := !existingSubmitted.Valid && existingExchangeOrderID == "" && existingFilled == 0 &&
+			(existingStatus == ExecutionOrderAttemptPrepared || existingStatus == ExecutionOrderAttemptTerminalNoFill)
+		if !safePreSubmit && existingStatus != ExecutionOrderAttemptSubmitted {
+			return nil, fmt.Errorf("execution order attempt %s cannot be reused from %s", clientOrderID, existingStatus)
+		}
+		if safePreSubmit && existingStatus != ExecutionOrderAttemptPrepared {
+			if _, err = tx.Exec(`UPDATE copy_trade_execution_order_attempts SET status='PREPARED',last_error='',
+				exchange_state='',terminal_at=NULL,updated_at=CURRENT_TIMESTAMP WHERE intent_id=? AND client_order_id=?`,
+				intentID, clientOrderID); err != nil {
+				return nil, err
+			}
+		}
 	}
 	res, err := tx.Exec(`UPDATE copy_trade_execution_intents SET
-		status='SUBMITTED',
 		requested_quantity=CASE WHEN requested_quantity<=0 AND ?>0 THEN ? ELSE requested_quantity END,
 		quantized_quantity=CASE WHEN quantized_quantity<=0 AND ?>0 THEN ? ELSE quantized_quantity END,
-		submitted_at=COALESCE(submitted_at,CURRENT_TIMESTAMP),updated_at=CURRENT_TIMESTAMP
+		updated_at=CURRENT_TIMESTAMP
 		WHERE id=? AND status IN ('RESERVED','SUBMITTED','PARTIALLY_FILLED')`,
 		requestedQuantity, requestedQuantity, quantizedQuantity, quantizedQuantity, intentID)
 	if err != nil {
@@ -1607,11 +1651,57 @@ func (s *CopyTradeStore) PrepareExecutionOrderAttemptWithKind(intentID int64, cl
 	} else if updated != 1 {
 		return nil, fmt.Errorf("execution intent %d changed before order attempt preparation", intentID)
 	}
+	row := tx.QueryRow(`SELECT id,intent_id,attempt_no,client_order_id,COALESCE(quantity_kind,''),requested_quantity,quantized_quantity,filled_quantity,exchange_order_id,exchange_state,status,last_error,created_at,updated_at,submitted_at,filled_at,terminal_at FROM copy_trade_execution_order_attempts WHERE intent_id=? AND client_order_id=?`, intentID, clientOrderID)
+	attempt, err := scanExecutionOrderAttempt(row)
+	if err != nil {
+		return nil, err
+	}
+	if err = tx.Commit(); err != nil {
+		return nil, err
+	}
+	return attempt, nil
+}
+
+// MarkExecutionOrderAttemptSubmitted is the durable HTTP boundary. Calling it
+// twice for the same already-submitted attempt is idempotent; a locally failed
+// PREPARED attempt cannot later be smuggled across this boundary.
+func (s *CopyTradeStore) MarkExecutionOrderAttemptSubmitted(intentID int64, clientOrderID string) (*CopyTradeExecutionOrderAttempt, error) {
+	clientOrderID = strings.TrimSpace(clientOrderID)
+	if intentID <= 0 || clientOrderID == "" {
+		return nil, fmt.Errorf("invalid execution submission boundary")
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	var attemptStatus string
+	if err = tx.QueryRow(`SELECT status FROM copy_trade_execution_order_attempts WHERE intent_id=? AND client_order_id=?`, intentID, clientOrderID).Scan(&attemptStatus); err != nil {
+		return nil, err
+	}
+	if attemptStatus != ExecutionOrderAttemptPrepared && attemptStatus != ExecutionOrderAttemptSubmitted {
+		return nil, fmt.Errorf("execution order attempt cannot submit from %s", attemptStatus)
+	}
+	res, err := tx.Exec(`UPDATE copy_trade_execution_intents SET status='SUBMITTED',
+		submitted_at=COALESCE(submitted_at,CURRENT_TIMESTAMP),updated_at=CURRENT_TIMESTAMP
+		WHERE id=? AND status IN ('RESERVED','SUBMITTED','PARTIALLY_FILLED')`, intentID)
+	if err != nil {
+		return nil, err
+	}
+	if updated, rowsErr := res.RowsAffected(); rowsErr != nil {
+		return nil, rowsErr
+	} else if updated != 1 {
+		return nil, fmt.Errorf("execution intent %d changed before exchange submission", intentID)
+	}
+	if _, err = tx.Exec(`UPDATE copy_trade_execution_order_attempts SET status='SUBMITTED',
+		submitted_at=COALESCE(submitted_at,CURRENT_TIMESTAMP),updated_at=CURRENT_TIMESTAMP
+		WHERE intent_id=? AND client_order_id=? AND status IN ('PREPARED','SUBMITTED')`, intentID, clientOrderID); err != nil {
+		return nil, err
+	}
 	if _, err = tx.Exec(`UPDATE copy_trade_source_transitions SET status='SUBMITTED',updated_at=CURRENT_TIMESTAMP WHERE intent_id=?`, intentID); err != nil {
 		return nil, err
 	}
-	row := tx.QueryRow(`SELECT id,intent_id,attempt_no,client_order_id,COALESCE(quantity_kind,''),requested_quantity,quantized_quantity,filled_quantity,exchange_order_id,exchange_state,status,last_error,created_at,updated_at,submitted_at,filled_at,terminal_at FROM copy_trade_execution_order_attempts WHERE intent_id=? AND client_order_id=?`, intentID, clientOrderID)
-	attempt, err := scanExecutionOrderAttempt(row)
+	attempt, err := scanExecutionOrderAttempt(tx.QueryRow(`SELECT id,intent_id,attempt_no,client_order_id,COALESCE(quantity_kind,''),requested_quantity,quantized_quantity,filled_quantity,exchange_order_id,exchange_state,status,last_error,created_at,updated_at,submitted_at,filled_at,terminal_at FROM copy_trade_execution_order_attempts WHERE intent_id=? AND client_order_id=?`, intentID, clientOrderID))
 	if err != nil {
 		return nil, err
 	}

@@ -1232,8 +1232,47 @@ func (at *AutoTrader) fillCopyTradeMarginMode(isCopyTrade bool, d *decision.Deci
 	logger.Infof("  📊 跟单开仓使用交易员自身保证金模式: %s（未同步领航员模式）", d.MarginMode)
 }
 
-func (at *AutoTrader) openLongOrder(copyTrade bool, symbol string, quantity float64, leverage int, clientOrderID string) (map[string]interface{}, error) {
+func copyTradeSubmissionHook(d *decision.Decision, copyTrade bool, clientOrderID string) func() error {
+	if !copyTrade || d == nil || d.BeforeExchangeSubmit == nil {
+		return nil
+	}
+	return func() error { return d.BeforeExchangeSubmit(clientOrderID) }
+}
+
+func runCopyTradeSubmissionHook(hook func() error) error {
+	if hook == nil {
+		return nil
+	}
+	return hook()
+}
+
+func executeCopyTradeMarketOrderAtBoundary(executor CopyTradeSubmissionBoundaryExecutor, request CopyTradeMarketOrderRequest, hook func() error) (map[string]interface{}, error) {
+	boundaryCrossed := hook == nil
+	if hook != nil {
+		request.BeforeSubmit = func() error {
+			if err := hook(); err != nil {
+				return err
+			}
+			boundaryCrossed = true
+			return nil
+		}
+	}
+	result, err := executor.ExecuteCopyTradeMarketOrder(request)
+	if err != nil && !boundaryCrossed {
+		return nil, &CopyTradePreSubmitError{Cause: err}
+	}
+	return result, err
+}
+
+func (at *AutoTrader) openLongOrder(d *decision.Decision, copyTrade bool, symbol string, quantity float64, leverage int, clientOrderID string) (map[string]interface{}, error) {
 	if copyTrade {
+		hook := copyTradeSubmissionHook(d, copyTrade, clientOrderID)
+		if executor, ok := at.trader.(CopyTradeSubmissionBoundaryExecutor); ok {
+			return executeCopyTradeMarketOrderAtBoundary(executor, CopyTradeMarketOrderRequest{Action: "open_long", Symbol: symbol, Quantity: quantity, Leverage: leverage, ClientOrderID: clientOrderID}, hook)
+		}
+		if err := runCopyTradeSubmissionHook(hook); err != nil {
+			return nil, err
+		}
 		if clientOrderID != "" {
 			if executor, ok := at.trader.(CopyTradeIdempotentOrderExecutor); ok {
 				return executor.OpenLongPreservingOrdersWithClientID(symbol, quantity, leverage, clientOrderID)
@@ -1246,8 +1285,15 @@ func (at *AutoTrader) openLongOrder(copyTrade bool, symbol string, quantity floa
 	return at.trader.OpenLong(symbol, quantity, leverage)
 }
 
-func (at *AutoTrader) openShortOrder(copyTrade bool, symbol string, quantity float64, leverage int, clientOrderID string) (map[string]interface{}, error) {
+func (at *AutoTrader) openShortOrder(d *decision.Decision, copyTrade bool, symbol string, quantity float64, leverage int, clientOrderID string) (map[string]interface{}, error) {
 	if copyTrade {
+		hook := copyTradeSubmissionHook(d, copyTrade, clientOrderID)
+		if executor, ok := at.trader.(CopyTradeSubmissionBoundaryExecutor); ok {
+			return executeCopyTradeMarketOrderAtBoundary(executor, CopyTradeMarketOrderRequest{Action: "open_short", Symbol: symbol, Quantity: quantity, Leverage: leverage, ClientOrderID: clientOrderID}, hook)
+		}
+		if err := runCopyTradeSubmissionHook(hook); err != nil {
+			return nil, err
+		}
 		if clientOrderID != "" {
 			if executor, ok := at.trader.(CopyTradeIdempotentOrderExecutor); ok {
 				return executor.OpenShortPreservingOrdersWithClientID(symbol, quantity, leverage, clientOrderID)
@@ -1260,8 +1306,15 @@ func (at *AutoTrader) openShortOrder(copyTrade bool, symbol string, quantity flo
 	return at.trader.OpenShort(symbol, quantity, leverage)
 }
 
-func (at *AutoTrader) closeLongOrder(copyTrade bool, symbol string, quantity float64, clientOrderID string) (map[string]interface{}, error) {
+func (at *AutoTrader) closeLongOrder(d *decision.Decision, copyTrade bool, symbol string, quantity float64, clientOrderID string) (map[string]interface{}, error) {
 	if copyTrade {
+		hook := copyTradeSubmissionHook(d, copyTrade, clientOrderID)
+		if executor, ok := at.trader.(CopyTradeSubmissionBoundaryExecutor); ok {
+			return executeCopyTradeMarketOrderAtBoundary(executor, CopyTradeMarketOrderRequest{Action: "close_long", Symbol: symbol, Quantity: quantity, ClientOrderID: clientOrderID}, hook)
+		}
+		if err := runCopyTradeSubmissionHook(hook); err != nil {
+			return nil, err
+		}
 		if clientOrderID != "" {
 			if executor, ok := at.trader.(CopyTradeIdempotentOrderExecutor); ok {
 				return executor.CloseLongPreservingOrdersWithClientID(symbol, quantity, clientOrderID)
@@ -1274,8 +1327,15 @@ func (at *AutoTrader) closeLongOrder(copyTrade bool, symbol string, quantity flo
 	return at.trader.CloseLong(symbol, quantity)
 }
 
-func (at *AutoTrader) closeShortOrder(copyTrade bool, symbol string, quantity float64, clientOrderID string) (map[string]interface{}, error) {
+func (at *AutoTrader) closeShortOrder(d *decision.Decision, copyTrade bool, symbol string, quantity float64, clientOrderID string) (map[string]interface{}, error) {
 	if copyTrade {
+		hook := copyTradeSubmissionHook(d, copyTrade, clientOrderID)
+		if executor, ok := at.trader.(CopyTradeSubmissionBoundaryExecutor); ok {
+			return executeCopyTradeMarketOrderAtBoundary(executor, CopyTradeMarketOrderRequest{Action: "close_short", Symbol: symbol, Quantity: quantity, ClientOrderID: clientOrderID}, hook)
+		}
+		if err := runCopyTradeSubmissionHook(hook); err != nil {
+			return nil, err
+		}
 		if clientOrderID != "" {
 			if executor, ok := at.trader.(CopyTradeIdempotentOrderExecutor); ok {
 				return executor.CloseShortPreservingOrdersWithClientID(symbol, quantity, clientOrderID)
@@ -1472,15 +1532,6 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 	// Calculate quantity with adjusted position size. Copy trading resolves the
 	// exact execution contract and quantizes once before the adapter sees it.
 	quantity := actualPositionSize / currentPrice
-	if isCopyTrade {
-		quantity, err = at.quantizeCopyOpenQuantity(decision, currentPrice, quantity, true)
-		if err != nil {
-			return fmt.Errorf("copy open quantity preflight: %w", err)
-		}
-		actualPositionSize = decision.PositionSizeUSD
-	}
-	actionRecord.Quantity = quantity
-	actionRecord.Price = currentPrice
 
 	// Set margin mode: 跟单模式下使用 decision 中的模式，否则使用配置
 	isCrossMargin := at.config.IsCrossMargin
@@ -1492,12 +1543,35 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 		logger.Infof("  ⚠️ Failed to set margin mode: %v", err)
 		// Continue execution, doesn't affect trading
 	}
+	if isCopyTrade {
+		if preparer, ok := at.trader.(CopyTradeOpenPreparer); ok {
+			if err = preparer.PrepareCopyTradeOpen(decision.Symbol, decision.Leverage); err != nil {
+				return fmt.Errorf("prepare copy open leverage: %w", err)
+			}
+		}
+		freshPrice, priceErr := at.trader.GetMarketPrice(decision.Symbol)
+		if priceErr != nil {
+			return fmt.Errorf("refresh copy open price after venue preparation: %w", priceErr)
+		}
+		if freshPrice <= 0 {
+			return fmt.Errorf("refresh copy open price after venue preparation: invalid price %.8f", freshPrice)
+		}
+		currentPrice = freshPrice
+		quantity = actualPositionSize / currentPrice
+		quantity, err = at.quantizeCopyOpenQuantity(decision, currentPrice, quantity, true)
+		if err != nil {
+			return fmt.Errorf("copy open quantity preflight: %w", err)
+		}
+		actualPositionSize = decision.PositionSizeUSD
+	}
+	actionRecord.Quantity = quantity
+	actionRecord.Price = currentPrice
 
 	// Open position
 	if err := prepareCopyOrderAttempt(decision, isCopyTrade, decision.ClientOrderID, quantity); err != nil {
 		return fmt.Errorf("persist open long attempt: %w", err)
 	}
-	order, err := at.openLongOrder(isCopyTrade, decision.Symbol, quantity, decision.Leverage, decision.ClientOrderID)
+	order, err := at.openLongOrder(decision, isCopyTrade, decision.Symbol, quantity, decision.Leverage, decision.ClientOrderID)
 	finishCopyOrderAttempt(decision, isCopyTrade, decision.ClientOrderID, order, err)
 	if err != nil {
 		// AI 二次入场遇到保证金不足时允许按独立风险预算减半重试一次。
@@ -1532,7 +1606,7 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 			if prepareErr := prepareCopyOrderAttempt(decision, isCopyTrade, retryClientID, retryQty); prepareErr != nil {
 				return fmt.Errorf("persist open long retry attempt: %w", prepareErr)
 			}
-			order2, err2 := at.openLongOrder(isCopyTrade, decision.Symbol, retryQty, decision.Leverage, retryClientID)
+			order2, err2 := at.openLongOrder(decision, isCopyTrade, decision.Symbol, retryQty, decision.Leverage, retryClientID)
 			finishCopyOrderAttempt(decision, isCopyTrade, retryClientID, order2, err2)
 			if err2 != nil {
 				return fmt.Errorf("open long retry-halved failed: initial=%v retry=%v", err, err2)
@@ -1738,15 +1812,6 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 	// Calculate quantity with adjusted position size. Copy trading resolves the
 	// exact execution contract and quantizes once before the adapter sees it.
 	quantity := actualPositionSize / currentPrice
-	if isCopyTrade {
-		quantity, err = at.quantizeCopyOpenQuantity(decision, currentPrice, quantity, true)
-		if err != nil {
-			return fmt.Errorf("copy open quantity preflight: %w", err)
-		}
-		actualPositionSize = decision.PositionSizeUSD
-	}
-	actionRecord.Quantity = quantity
-	actionRecord.Price = currentPrice
 
 	// Set margin mode: 跟单模式下使用 decision 中的模式，否则使用配置
 	isCrossMargin := at.config.IsCrossMargin
@@ -1758,12 +1823,35 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 		logger.Infof("  ⚠️ Failed to set margin mode: %v", err)
 		// Continue execution, doesn't affect trading
 	}
+	if isCopyTrade {
+		if preparer, ok := at.trader.(CopyTradeOpenPreparer); ok {
+			if err = preparer.PrepareCopyTradeOpen(decision.Symbol, decision.Leverage); err != nil {
+				return fmt.Errorf("prepare copy open leverage: %w", err)
+			}
+		}
+		freshPrice, priceErr := at.trader.GetMarketPrice(decision.Symbol)
+		if priceErr != nil {
+			return fmt.Errorf("refresh copy open price after venue preparation: %w", priceErr)
+		}
+		if freshPrice <= 0 {
+			return fmt.Errorf("refresh copy open price after venue preparation: invalid price %.8f", freshPrice)
+		}
+		currentPrice = freshPrice
+		quantity = actualPositionSize / currentPrice
+		quantity, err = at.quantizeCopyOpenQuantity(decision, currentPrice, quantity, true)
+		if err != nil {
+			return fmt.Errorf("copy open quantity preflight: %w", err)
+		}
+		actualPositionSize = decision.PositionSizeUSD
+	}
+	actionRecord.Quantity = quantity
+	actionRecord.Price = currentPrice
 
 	// Open position
 	if err := prepareCopyOrderAttempt(decision, isCopyTrade, decision.ClientOrderID, quantity); err != nil {
 		return fmt.Errorf("persist open short attempt: %w", err)
 	}
-	order, err := at.openShortOrder(isCopyTrade, decision.Symbol, quantity, decision.Leverage, decision.ClientOrderID)
+	order, err := at.openShortOrder(decision, isCopyTrade, decision.Symbol, quantity, decision.Leverage, decision.ClientOrderID)
 	finishCopyOrderAttempt(decision, isCopyTrade, decision.ClientOrderID, order, err)
 	if err != nil {
 		// AI 二次入场开空保证金不足减半重试；普通领航员跟单不缩量。
@@ -1785,7 +1873,7 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 			if prepareErr := prepareCopyOrderAttempt(decision, isCopyTrade, retryClientID, retryQty); prepareErr != nil {
 				return fmt.Errorf("persist open short retry attempt: %w", prepareErr)
 			}
-			order2, err2 := at.openShortOrder(isCopyTrade, decision.Symbol, retryQty, decision.Leverage, retryClientID)
+			order2, err2 := at.openShortOrder(decision, isCopyTrade, decision.Symbol, retryQty, decision.Leverage, retryClientID)
 			finishCopyOrderAttempt(decision, isCopyTrade, retryClientID, order2, err2)
 			if err2 != nil {
 				return fmt.Errorf("open short retry-halved failed: initial=%v retry=%v", err, err2)
@@ -1953,7 +2041,7 @@ func (at *AutoTrader) executeCloseLongWithRecord(decision *decision.Decision, ac
 	if err := prepareCopyOrderAttempt(decision, isCopyTrade, decision.ClientOrderID, closeQuantity); err != nil {
 		return fmt.Errorf("persist close long attempt: %w", err)
 	}
-	order, err := at.closeLongOrder(isCopyTrade, decision.Symbol, closeQuantity, decision.ClientOrderID)
+	order, err := at.closeLongOrder(decision, isCopyTrade, decision.Symbol, closeQuantity, decision.ClientOrderID)
 	finishCopyOrderAttempt(decision, isCopyTrade, decision.ClientOrderID, order, err)
 	if err != nil {
 		return err
@@ -2104,7 +2192,7 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *decision.Decision, a
 	if err := prepareCopyOrderAttempt(decision, isCopyTrade, decision.ClientOrderID, closeQuantity); err != nil {
 		return fmt.Errorf("persist close short attempt: %w", err)
 	}
-	order, err := at.closeShortOrder(isCopyTrade, decision.Symbol, closeQuantity, decision.ClientOrderID)
+	order, err := at.closeShortOrder(decision, isCopyTrade, decision.Symbol, closeQuantity, decision.ClientOrderID)
 	finishCopyOrderAttempt(decision, isCopyTrade, decision.ClientOrderID, order, err)
 	if err != nil {
 		return err

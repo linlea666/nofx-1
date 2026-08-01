@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -200,6 +201,39 @@ func TestStopBlockersDistinguishHistoricalTerminalWorkFromActiveRisk(t *testing.
 	}
 	if len(blockers) != 1 || blockers[0].Symbol != "ETHUSDT" || blockers[0].Status != ExecutionIntentFilled {
 		t.Fatalf("historical terminal work polluted stop blockers: %+v", blockers)
+	}
+}
+
+func TestStopBlockersIgnorePreparedAttemptUntilSubmissionBoundary(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "stop-prepared-boundary.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	createLifecycleTestTrader(t, st, "trader-1", TraderLifecycleStoppingReconcileRequired, 2)
+	intent, claimed, err := st.CopyTrade().ReserveExecutionIntent(&CopyTradeExecutionIntent{
+		TraderID: "trader-1", LeaderPosID: "leader-pos", SourceRevision: 1,
+		CanonicalKey: "stop|prepared", Action: "open_long", Symbol: "SYNUSDT", Side: "long",
+		RequestedQuantity: 56, QuantizedQuantity: 56, ClientOrderID: "prepared-only",
+	})
+	if err != nil || !claimed {
+		t.Fatalf("reserve intent: claimed=%v err=%v", claimed, err)
+	}
+	if _, err = st.CopyTrade().PrepareExecutionOrderAttemptRecordWithKind(
+		intent.ID, intent.ClientOrderID, "INITIAL_OPEN", 56, 56,
+	); err != nil {
+		t.Fatal(err)
+	}
+	blockers, err := st.Trader().GetStopBlockers("trader-1")
+	if err != nil || len(blockers) != 0 {
+		t.Fatalf("local PREPARED attempt became exchange-risk blocker: %+v err=%v", blockers, err)
+	}
+	if _, err = st.CopyTrade().MarkExecutionOrderAttemptSubmitted(intent.ID, intent.ClientOrderID); err != nil {
+		t.Fatal(err)
+	}
+	blockers, err = st.Trader().GetStopBlockers("trader-1")
+	if err != nil || len(blockers) != 1 || blockers[0].ResourceID != fmt.Sprint(intent.ID) {
+		t.Fatalf("submitted attempt was not reported as blocker: %+v err=%v", blockers, err)
 	}
 }
 

@@ -939,6 +939,55 @@ func TestReclaimUnsubmittedExecutionIntentRequiresNoExchangeEvidence(t *testing.
 	}
 }
 
+func TestPreSubmitTerminalAttemptCanReplaySameSourceRevision(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "pre-submit-attempt-replay.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cs := st.CopyTrade()
+	request := &CopyTradeExecutionIntent{
+		TraderID: "trader-1", LeaderPosID: "p1", SourceRevision: 1,
+		SourceFillID: "fill-1", CanonicalKey: "leader|trader-1|p1|1",
+		Action: "open_long", Symbol: "SYNUSDT", Side: "long", LeaderTargetSize: 56,
+		RequestedNotional: 5, RequestedQuantity: 56, QuantizedQuantity: 56,
+		ClientOrderID: "copy-syn-open",
+	}
+	intent, claimed, err := cs.ReserveExecutionIntent(request)
+	if err != nil || !claimed {
+		t.Fatalf("initial reserve claimed=%v err=%v", claimed, err)
+	}
+	attempt, err := cs.PrepareExecutionOrderAttemptRecordWithKind(intent.ID, request.ClientOrderID, "INITIAL_OPEN", 56, 56)
+	if err != nil || attempt.Status != ExecutionOrderAttemptPrepared {
+		t.Fatalf("prepare local attempt=%+v err=%v", attempt, err)
+	}
+	if err = cs.CompleteExecutionOrderAttempt(intent.ID, request.ClientOrderID,
+		ExecutionOrderAttemptTerminalNoFill, "", "", "minimum notional changed before submit", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err = cs.UpdateExecutionIntent(intent.ID, ExecutionIntentFailed, "PRE_SUBMIT", "minimum notional changed before submit", "", 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	replayed, claimed, err := cs.ReserveExecutionIntent(request)
+	if err != nil || !claimed || replayed.ID != intent.ID || replayed.Status != ExecutionIntentReserved {
+		t.Fatalf("safe pre-submit replay intent=%+v claimed=%v err=%v", replayed, claimed, err)
+	}
+	attempt, err = cs.PrepareExecutionOrderAttemptRecordWithKind(intent.ID, request.ClientOrderID, "INITIAL_OPEN", 57, 57)
+	if err != nil || attempt.Status != ExecutionOrderAttemptPrepared || attempt.TerminalAt != nil || attempt.SubmittedAt != nil {
+		t.Fatalf("safe attempt was not reopened locally: %+v err=%v", attempt, err)
+	}
+	if _, err = cs.MarkExecutionOrderAttemptSubmitted(intent.ID, request.ClientOrderID); err != nil {
+		t.Fatal(err)
+	}
+	if err = cs.UpdateExecutionIntent(intent.ID, ExecutionIntentFailed, "PRE_SUBMIT", "should remain blocked", "", 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if replayed, claimed, err = cs.ReserveExecutionIntent(request); err != nil || claimed {
+		t.Fatalf("submitted attempt was replayed: intent=%+v claimed=%v err=%v", replayed, claimed, err)
+	}
+}
+
 func TestClosedMappingReopenUsesNextRevisionAndReactivatesMapping(t *testing.T) {
 	st, err := New(filepath.Join(t.TempDir(), "reopen-fill.db"))
 	if err != nil {

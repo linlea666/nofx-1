@@ -1279,3 +1279,19 @@ func TestBinanceSnapshotDifferentSizeStillTriggers(t *testing.T) {
 		t.Fatalf("size 变化后 fill.ID 应该不同，期望新决策但未收到")
 	}
 }
+
+func TestBinanceSnapshotSignalReusesJustInstalledAuthoritativeState(t *testing.T) {
+	const posID = "snapshot-reuse_ETHUSDT_LONG"
+	e, st := newTestCopyTradeEngine(t, ProviderBinance)
+	saveActiveMapping(t, st, posID, 0.02)
+	provider := &binancePollTestProvider{state: &AccountState{
+		TotalEquity: 1000,
+		Positions:   map[string]*Position{posID: binanceTestPosition(posID, 0.01)},
+		Timestamp:   time.Now(),
+	}}
+	e.provider = provider
+	e.poll()
+	if provider.stateCalls != 1 {
+		t.Fatalf("one authoritative poll re-fetched the complete snapshot while processing its own signal: calls=%d", provider.stateCalls)
+	}
+}

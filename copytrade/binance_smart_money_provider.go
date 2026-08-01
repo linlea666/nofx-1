@@ -54,6 +54,8 @@ type SourceHealthObservation struct {
 	BackoffUntil         time.Time
 	RateLimit429Count    int
 	ActiveLeaderPosition bool
+	DirectRateLimit      bool
+	ScheduledBackoff     bool
 }
 
 type SourceHealthObservationProvider interface {
@@ -338,6 +340,23 @@ func (p *BinanceSmartMoneyProvider) GetAccountState(leaderID string) (*AccountSt
 	if err != nil {
 		return nil, fmt.Errorf("binance smart money: %w", err)
 	}
+	p20t, _, credentialErr := p.auth.credentials()
+	if credentialErr != nil {
+		p.setObservation(SourceHealthObservation{Status: "AUTH_FAILED", Error: credentialErr.Error(), CheckedAt: time.Now()})
+		return nil, credentialErr
+	}
+	gate := smartMoneyGateForCredential(p20t)
+	p.mu.Lock()
+	p.credentialGate = gate
+	p.mu.Unlock()
+	var state *AccountState
+	gate.doSnapshot(func() {
+		state, err = p.getAccountStateSnapshot(topTraderID)
+	})
+	return state, err
+}
+
+func (p *BinanceSmartMoneyProvider) getAccountStateSnapshot(topTraderID string) (*AccountState, error) {
 	checkedAt := time.Now()
 	// Profile/visibility metadata changes much less frequently than positions.
 	// Keep it off the 3-second authoritative position path; an empty snapshot or
@@ -407,12 +426,16 @@ func (p *BinanceSmartMoneyProvider) GetAccountState(leaderID string) (*AccountSt
 		} else if errors.Is(err, ErrBinanceSmartMoneyPrivate) {
 			status = "PRIVATE"
 		}
-		p.setObservation(SourceHealthObservation{Status: status, TraderName: profile.TraderName, Error: err.Error(), CheckedAt: checkedAt})
+		p.setObservation(SourceHealthObservation{
+			Status: status, TraderName: profile.TraderName, Error: err.Error(), CheckedAt: checkedAt,
+			DirectRateLimit:  errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusTooManyRequests,
+			ScheduledBackoff: errors.As(err, &backoffErr),
+		})
 		return nil, err
 	}
 	emptySnapshotConfirmed := false
 	if countSmartOpenPositions(positions) == 0 {
-		// Bypass the 15-second cache: a just-hidden profile can otherwise make an
+		// Bypass the 30-minute profile cache: a just-hidden profile can otherwise make an
 		// empty positions response look like a genuine full close.
 		freshProfile, profileErr := p.getProfile(topTraderID, time.Now(), true)
 		if profileErr != nil {

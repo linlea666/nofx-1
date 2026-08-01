@@ -83,6 +83,29 @@ func TestCopyTradeSourceHealthSlowHealthyPollDoesNotSynthesizeRecovery(t *testin
 	}
 }
 
+func TestCopyTradeSourceHealthScheduledBackoffIsNotAnotherUpstreamFailure(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "health-scheduled-backoff.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	base := time.Now().UTC().Truncate(time.Second)
+	if _, _, err = st.CopyTrade().RecordSourceHealthObservation("trader", "leader", "smart_money", 1, SourceHealthObservation{
+		Status: SourceHealthHealthy, CompleteSnapshot: true, CheckedAt: base,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	health, transitioned, err := st.CopyTrade().RecordSourceHealthObservation("trader", "leader", "smart_money", 1, SourceHealthObservation{
+		Status: "ERROR", Error: "credential scheduler backoff", CheckedAt: base.Add(time.Second), ScheduledBackoff: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if transitioned || health.Status != SourceHealthHealthy || health.ConsecutiveFailures != 0 {
+		t.Fatalf("local scheduler backoff became a second upstream failure: transitioned=%v health=%+v", transitioned, health)
+	}
+}
+
 func TestCopyTradeSourceHealthPersistsSchedulerAndDeliveryMetrics(t *testing.T) {
 	st, err := New(filepath.Join(t.TempDir(), "health-metrics.db"))
 	if err != nil {

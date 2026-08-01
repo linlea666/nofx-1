@@ -695,6 +695,20 @@ func (ti *TraderIntegration) reconcileExecutionIntents(startup bool) {
 				_ = ti.store.CopyTrade().UpdateExecutionIntent(intent.ID, store.ExecutionIntentReconciling, "SOURCE_REVALIDATION_REQUIRED", "reserved before restart; waiting for healthy source snapshot", "", 0, 0, 0)
 				continue
 			}
+			if executionAttemptsProvenPreSubmit(attempts) {
+				// PREPARED is local evidence, not an exchange submission. A crash in
+				// this narrow window must never turn the client id into uncertain
+				// exchange work or block the next authoritative source revision.
+				for _, attempt := range attempts {
+					if attempt.Status == store.ExecutionOrderAttemptPrepared {
+						_ = ti.store.CopyTrade().CompleteExecutionOrderAttempt(intent.ID, attempt.ClientOrderID,
+							store.ExecutionOrderAttemptTerminalNoFill, "", "", "restart before exchange submission", 0)
+					}
+				}
+				_ = ti.store.CopyTrade().UpdateExecutionIntent(intent.ID, store.ExecutionIntentReconciling,
+					"SOURCE_REVALIDATION_REQUIRED", "prepared locally before restart; exchange boundary was never crossed", "", 0, 0, 0)
+				continue
+			}
 		}
 		if !supportsLookup {
 			ti.recordExecutionReconciliationFailure(intent, "ORDER_LOOKUP_UNAVAILABLE", "execution venue does not support client-order lookup")
@@ -811,6 +825,19 @@ func (ti *TraderIntegration) reconcileExecutionIntents(startup bool) {
 		}
 		logger.Warnf("🟡 [%s] 已恢复重启前成交的跟单意图 | intent=%d order=%s %s", ti.traderID, intent.ID, orderID, intent.Symbol)
 	}
+}
+
+func executionAttemptsProvenPreSubmit(attempts []*store.CopyTradeExecutionOrderAttempt) bool {
+	if len(attempts) == 0 {
+		return false
+	}
+	for _, attempt := range attempts {
+		if attempt == nil || attempt.SubmittedAt != nil || attempt.ExchangeOrderID != "" || attempt.FilledQuantity > 0 ||
+			(attempt.Status != store.ExecutionOrderAttemptPrepared && attempt.Status != store.ExecutionOrderAttemptTerminalNoFill) {
+			return false
+		}
+	}
+	return true
 }
 
 func (ti *TraderIntegration) executeOrdinaryCatchup(intent *store.CopyTradeExecutionIntent) {
@@ -3666,6 +3693,9 @@ func (ti *TraderIntegration) bindExecutionAttemptRecorder(dec *decision.Decision
 		return
 	}
 	intentID := dec.ExecutionIntentID
+	if dec.ExecutionStatus == "" {
+		dec.ExecutionStatus = store.ExecutionIntentReserved
+	}
 	quantityKind := executionAttemptQuantityKind(dec)
 	var reentrySubmittedOnce sync.Once
 	dec.BeforeOrderSubmit = func(clientOrderID string, quantity float64) error {
@@ -3674,15 +3704,21 @@ func (ti *TraderIntegration) bindExecutionAttemptRecorder(dec *decision.Decision
 			!validOKXClientOrderID(clientOrderID) {
 			return reasonError("PRE_SUBMIT", "invalid OKX client order id")
 		}
-		if _, err := ti.store.CopyTrade().PrepareExecutionOrderAttemptWithKind(
+		if _, err := ti.store.CopyTrade().PrepareExecutionOrderAttemptRecordWithKind(
 			intentID, clientOrderID, quantityKind, dec.RequestedQuantity, quantity,
 		); err != nil {
 			return reasonError("PRE_SUBMIT", "prepare durable execution order attempt: %w", err)
 		}
-		dec.ExecutionStatus = store.ExecutionIntentSubmitted
 		if quantity > 0 {
 			dec.QuantizedQuantity = quantity
 		}
+		return nil
+	}
+	dec.BeforeExchangeSubmit = func(clientOrderID string) error {
+		if _, err := ti.store.CopyTrade().MarkExecutionOrderAttemptSubmitted(intentID, clientOrderID); err != nil {
+			return reasonError("PRE_SUBMIT", "persist exchange submission boundary: %w", err)
+		}
+		dec.ExecutionStatus = store.ExecutionIntentSubmitted
 		reentrySubmittedOnce.Do(func() {
 			ti.recordAIReentrySubmitted(dec)
 		})

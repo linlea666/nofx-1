@@ -20,6 +20,12 @@ func (fn binanceHardeningRoundTripFunc) RoundTrip(req *http.Request) (*http.Resp
 	return fn(req)
 }
 
+type copyBoundaryExecutorFunc func(CopyTradeMarketOrderRequest) (map[string]interface{}, error)
+
+func (fn copyBoundaryExecutorFunc) ExecuteCopyTradeMarketOrder(req CopyTradeMarketOrderRequest) (map[string]interface{}, error) {
+	return fn(req)
+}
+
 func binanceHardeningJSONResponse(t *testing.T, status int, body interface{}) *http.Response {
 	t.Helper()
 	payload, err := json.Marshal(body)
@@ -322,5 +328,109 @@ func TestBinanceOpenFailsClosedWhenCatalogUnavailable(t *testing.T) {
 	}
 	if postCount != 0 {
 		t.Fatalf("open submitted %d POST requests after catalog failure", postCount)
+	}
+}
+
+func TestBinanceCopyOpenMarksSubmittedOnlyAtExchangeBoundary(t *testing.T) {
+	postCount := 0
+	client := futures.NewClient("", "")
+	client.BaseURL = "https://binance.copy-boundary.test"
+	client.HTTPClient = &http.Client{Transport: binanceHardeningRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch {
+		case req.URL.Path == "/fapi/v1/order" && req.Method == http.MethodGet:
+			return binanceHardeningJSONResponse(t, http.StatusBadRequest, map[string]interface{}{"code": -2013, "msg": "Order does not exist."}), nil
+		case req.URL.Path == "/fapi/v2/ticker/price" && req.Method == http.MethodGet:
+			return binanceHardeningJSONResponse(t, http.StatusOK, []map[string]interface{}{{
+				"symbol": "SYNUSDT", "price": "0.0885", "time": time.Now().UnixMilli(),
+			}}), nil
+		case req.URL.Path == "/fapi/v1/order" && req.Method == http.MethodPost:
+			postCount++
+			if err := req.ParseForm(); err != nil {
+				t.Fatalf("parse Binance copy-open form: %v", err)
+			}
+			return binanceHardeningJSONResponse(t, http.StatusOK, map[string]interface{}{
+				"orderId": 201, "clientOrderId": req.Form.Get("newClientOrderId"),
+				"symbol": req.Form.Get("symbol"), "status": "FILLED",
+				"executedQty": req.Form.Get("quantity"), "origQty": req.Form.Get("quantity"),
+				"side": req.Form.Get("side"), "positionSide": req.Form.Get("positionSide"), "type": "MARKET",
+			}), nil
+		default:
+			t.Fatalf("unexpected Binance copy-boundary request: %s %s", req.Method, req.URL.String())
+			return nil, errors.New("unexpected request")
+		}
+	})}
+	bt := &FuturesTrader{
+		client:        client,
+		cacheDuration: 15 * time.Second,
+		cachedPositions: []map[string]interface{}{{
+			"symbol": "SYNUSDT", "leverage": float64(5),
+		}},
+		positionsCacheTime: time.Now(),
+		instrumentsCache: map[string]*binanceExecutionInstrument{
+			"SYNUSDT": {
+				ExecutionInstrument: ExecutionInstrument{
+					SourceSymbol: "SYNUSDT", NativeSymbol: "SYNUSDT", BaseAsset: "SYN",
+					QuoteAsset: "USDT", SettleAsset: "USDT", MarketType: "UM",
+					ContractType: "PERPETUAL", Status: "TRADING", BaseQuantityStep: 1,
+				},
+				StepSize: 1, MinQuantity: 1, MaxQuantity: 1_000_000, TickSize: 0.0001, MinNotional: 5,
+			},
+		},
+		instrumentsCacheTime: time.Now(),
+	}
+
+	boundaryCalls := 0
+	_, err := bt.ExecuteCopyTradeMarketOrder(CopyTradeMarketOrderRequest{
+		Action: "open_long", Symbol: "SYNUSDT", Quantity: 56, Leverage: 5, ClientOrderID: "copy-syn-below-min",
+		BeforeSubmit: func() error {
+			boundaryCalls++
+			return nil
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "below minimum requirement") {
+		t.Fatalf("56 SYN at the refreshed price must fail minimum notional locally, got %v", err)
+	}
+	if boundaryCalls != 0 || postCount != 0 {
+		t.Fatalf("local rejection crossed submission boundary: callbacks=%d posts=%d", boundaryCalls, postCount)
+	}
+
+	result, err := bt.ExecuteCopyTradeMarketOrder(CopyTradeMarketOrderRequest{
+		Action: "open_long", Symbol: "SYNUSDT", Quantity: 57, Leverage: 5, ClientOrderID: "copy-syn-valid-min",
+		BeforeSubmit: func() error {
+			if postCount != 0 {
+				t.Fatalf("submission callback must run before the HTTP POST, posts=%d", postCount)
+			}
+			boundaryCalls++
+			return nil
+		},
+	})
+	if err != nil || result == nil {
+		t.Fatalf("57 SYN must cross the boundary and submit: result=%v err=%v", result, err)
+	}
+	if boundaryCalls != 1 || postCount != 1 {
+		t.Fatalf("valid order must cross exactly one boundary: callbacks=%d posts=%d", boundaryCalls, postCount)
+	}
+}
+
+func TestCopyTradeBoundaryClassifiesOnlyPreSubmitAdapterFailure(t *testing.T) {
+	hook := func() error { return nil }
+	preSubmit := copyBoundaryExecutorFunc(func(CopyTradeMarketOrderRequest) (map[string]interface{}, error) {
+		return nil, errors.New("local minimum rejected")
+	})
+	_, err := executeCopyTradeMarketOrderAtBoundary(preSubmit, CopyTradeMarketOrderRequest{Action: "open_long"}, hook)
+	var coded interface{ ReasonCode() string }
+	if !errors.As(err, &coded) || coded.ReasonCode() != "PRE_SUBMIT" {
+		t.Fatalf("local adapter rejection was not classified PRE_SUBMIT: %v", err)
+	}
+
+	postSubmit := copyBoundaryExecutorFunc(func(req CopyTradeMarketOrderRequest) (map[string]interface{}, error) {
+		if err := req.BeforeSubmit(); err != nil {
+			return nil, err
+		}
+		return nil, errors.New("exchange rejected")
+	})
+	_, err = executeCopyTradeMarketOrderAtBoundary(postSubmit, CopyTradeMarketOrderRequest{Action: "open_long"}, hook)
+	if errors.As(err, &coded) {
+		t.Fatalf("post-boundary exchange rejection was mislabeled PRE_SUBMIT: %v", err)
 	}
 }

@@ -250,6 +250,9 @@ func (s *Store) initTables() error {
 	if err := s.CopyTrade().initSourceHealthTable(); err != nil {
 		return fmt.Errorf("failed to initialize copy trade source health table: %w", err)
 	}
+	if err := s.CopyTrade().initSourceIncidentTable(); err != nil {
+		return fmt.Errorf("failed to initialize copy trade source incident table: %w", err)
+	}
 	if err := s.CopyTrade().initSourceBaselineTable(); err != nil {
 		return fmt.Errorf("failed to initialize copy trade source baseline table: %w", err)
 	}
