@@ -649,7 +649,7 @@ func (h *CopyTradeHandler) loadCopyGuardCycleArtifacts(cycleID int64) (*copyGuar
 
 func copyGuardCycleDocument(cycle *store.CopyGuardCycle, artifacts *copyGuardCycleArtifacts) gin.H {
 	return gin.H{
-		"schema_version":          7,
+		"schema_version":          8,
 		"defaults_version":        store.CopyGuardDefaultsVersion(),
 		"cycle":                   cycle,
 		"attempts":                artifacts.Attempts,
@@ -1328,22 +1328,21 @@ func (h *CopyTradeHandler) SaveConfig(c *gin.Context) {
 	}
 
 	// 构造配置
-	config := &store.CopyTradeConfig{
-		TraderID:       traderID,
-		ProviderType:   req.ProviderType,
-		LeaderID:       req.LeaderID,
-		CopyRatio:      req.CopyRatio,
-		SyncLeverage:   req.SyncLeverage,
-		SyncMarginMode: req.SyncMarginMode,
-		MinTradeWarn:   req.MinTradeWarn,
-		MaxTradeWarn:   req.MaxTradeWarn,
-		Enabled:        req.Enabled,
-		// GET 接口已脱敏返回凭证；编辑回传的掩码值/空值不覆盖已存明文
-		BinanceP20T:        resolveCredentialUpdate(req.BinanceP20T, existingP20T),
-		BinanceCSRFToken:   resolveCredentialUpdate(req.BinanceCSRFToken, existingCSRF),
-		BinanceSourceMode:  req.BinanceSourceMode,
-		BinanceTopTraderID: req.BinanceTopTraderID,
-	}
+	config := store.NewCopyGuardDefaults()
+	config.TraderID = traderID
+	config.ProviderType = req.ProviderType
+	config.LeaderID = req.LeaderID
+	config.CopyRatio = req.CopyRatio
+	config.SyncLeverage = req.SyncLeverage
+	config.SyncMarginMode = req.SyncMarginMode
+	config.MinTradeWarn = req.MinTradeWarn
+	config.MaxTradeWarn = req.MaxTradeWarn
+	config.Enabled = req.Enabled
+	// GET 接口已脱敏返回凭证；编辑回传的掩码值/空值不覆盖已存明文
+	config.BinanceP20T = resolveCredentialUpdate(req.BinanceP20T, existingP20T)
+	config.BinanceCSRFToken = resolveCredentialUpdate(req.BinanceCSRFToken, existingCSRF)
+	config.BinanceSourceMode = req.BinanceSourceMode
+	config.BinanceTopTraderID = req.BinanceTopTraderID
 	if req.CopyCatchupWindowSeconds != nil {
 		config.CopyCatchupWindowSeconds = *req.CopyCatchupWindowSeconds
 	} else if existing != nil {
@@ -1388,9 +1387,7 @@ func (h *CopyTradeHandler) SaveConfig(c *gin.Context) {
 	} else if existing != nil {
 		config.RiskLeverageFallback = existing.RiskLeverageFallback
 	} else {
-		// v5.2 默认 off（抗噪默认态，与 api/server.go、store 层 FillRiskDefaults
-		// 保持一致）：margin_cap 在高杠杆下会把止损压进噪音区
-		config.RiskLeverageFallback = false
+		config.RiskLeverageFallback = true
 	}
 	if req.RiskLeverageMaxLoss != nil {
 		config.RiskLeverageMaxLoss = *req.RiskLeverageMaxLoss

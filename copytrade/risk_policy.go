@@ -40,6 +40,89 @@ type ProtectionPlan struct {
 	PlannedNotional       float64 `json:"planned_notional"`
 	ExpectedLossUSD       float64 `json:"expected_loss_usd"`
 	ExpectedLossPct       float64 `json:"expected_loss_pct"`
+	ExpectedMarginLossPct float64 `json:"expected_margin_loss_pct"`
+	GovernedBy            string  `json:"governed_by"`
+}
+
+type AIProtectionPlanInput struct {
+	Side             SideType
+	EntryPrice       float64
+	CurrentPrice     float64
+	AIStopPrice      float64
+	ATR              float64
+	Equity           float64
+	AvailableRiskUSD float64
+	PlannedNotional  float64
+	PriceTickSize    float64
+	LiquidationPrice float64
+	Leverage         int
+}
+
+// BuildAIProtectionPlanFromStop validates the model's absolute stop as an
+// immutable trading thesis. Deterministic risk management may align it only in
+// the safer direction or reject the entry; it must never replace it with an
+// ATR/structure-derived stop.
+func BuildAIProtectionPlanFromStop(c *CopyConfig, in AIProtectionPlanInput) (*ProtectionPlan, error) {
+	if c == nil || in.EntryPrice <= 0 || in.CurrentPrice <= 0 || in.AIStopPrice <= 0 || in.ATR <= 0 || in.Equity <= 0 || in.AvailableRiskUSD <= 0 || in.PlannedNotional <= 0 || in.PriceTickSize <= 0 {
+		return nil, fmt.Errorf("invalid AI protection input")
+	}
+	if in.Side != SideLong && in.Side != SideShort {
+		return nil, fmt.Errorf("invalid AI protection side %s", in.Side)
+	}
+	stop := alignToTickSize(in.AIStopPrice, in.PriceTickSize, in.Side == SideShort)
+	if in.Side == SideLong {
+		if stop >= in.EntryPrice {
+			return nil, fmt.Errorf("long AI stop %.8f must be below entry %.8f", stop, in.EntryPrice)
+		}
+		if in.CurrentPrice <= stop {
+			return nil, fmt.Errorf("long AI stop %.8f is already crossed by current price %.8f", stop, in.CurrentPrice)
+		}
+	} else {
+		if stop <= in.EntryPrice {
+			return nil, fmt.Errorf("short AI stop %.8f must be above entry %.8f", stop, in.EntryPrice)
+		}
+		if in.CurrentPrice >= stop {
+			return nil, fmt.Errorf("short AI stop %.8f is already crossed by current price %.8f", stop, in.CurrentPrice)
+		}
+	}
+	distance := math.Abs(in.EntryPrice - stop)
+	atrRatio := distance / in.ATR
+	if atrRatio < 0.5-1e-9 || atrRatio > 4+1e-9 {
+		return nil, fmt.Errorf("AI stop distance %.4f ATR is outside [0.5,4]", atrRatio)
+	}
+	if in.LiquidationPrice > 0 && isLiquidationPriceDirectionValid(in.Side, in.EntryPrice, in.LiquidationPrice) {
+		buffer := liquidationSafetyBuffer(in.PriceTickSize, in.ATR, in.EntryPrice, c.RiskLiquidationBufferATR)
+		unsafe := (in.Side == SideLong && stop <= in.LiquidationPrice+buffer) ||
+			(in.Side == SideShort && stop >= in.LiquidationPrice-buffer)
+		if unsafe {
+			return nil, fmt.Errorf("AI stop %.8f conflicts with liquidation safety boundary", stop)
+		}
+	}
+	frictionRate := (c.RiskSlippageBufferBPS + c.RiskRoundTripFeeBPS) / 10000
+	if frictionRate < 0 {
+		frictionRate = 0
+	}
+	expected := in.PlannedNotional * (distance/in.EntryPrice + frictionRate)
+	if expected > in.AvailableRiskUSD+1e-9 {
+		return nil, fmt.Errorf("AI stop expected loss %.8f exceeds available risk %.8f", expected, in.AvailableRiskUSD)
+	}
+	marginLossPct := 0.0
+	if in.Leverage <= 0 {
+		in.Leverage = 1
+	}
+	if initialMargin := in.PlannedNotional / float64(in.Leverage); initialMargin > 0 {
+		marginLossPct = expected / initialMargin
+	}
+	if c.RiskLeverageFallback && c.RiskLeverageMaxLoss > 0 && marginLossPct > c.RiskLeverageMaxLoss+1e-9 {
+		return nil, fmt.Errorf("AI stop margin loss %.6f exceeds position cap %.6f", marginLossPct, c.RiskLeverageMaxLoss)
+	}
+	return &ProtectionPlan{
+		EntryPrice: in.EntryPrice, StopPrice: stop, StopDistance: distance, ATR: in.ATR,
+		SlippageBPS: c.RiskSlippageBufferBPS, RoundTripFeeBPS: c.RiskRoundTripFeeBPS,
+		MaxRiskUSD: in.AvailableRiskUSD, MaxNotional: in.PlannedNotional, PlannedNotional: in.PlannedNotional,
+		ExpectedLossUSD: expected, ExpectedLossPct: expected / in.Equity, ExpectedMarginLossPct: marginLossPct,
+		GovernedBy: "ai_stop",
+	}, nil
 }
 
 // ComputeAccountProtectionDistance protects the real ordinary-copy position
@@ -47,7 +130,7 @@ type ProtectionPlan struct {
 // volatility_first treats the account percentage as an observability threshold,
 // while the backward-compatible account_cap mode may tighten that distance.
 // Liquidation safety is applied later by finalizeStopLossPrice.
-func ComputeAccountProtectionDistance(c *CopyConfig, side SideType, entryPrice, positionNotional, accountEquity, atr, atrDistance, structureInvalidation, maxAccountLossPct float64) (RiskDistanceResult, error) {
+func ComputeAccountProtectionDistance(c *CopyConfig, side SideType, entryPrice, positionNotional, accountEquity, atr, atrDistance, structureInvalidation, maxAccountLossPct float64, leverage int) (RiskDistanceResult, error) {
 	if c == nil || entryPrice <= 0 || positionNotional <= 0 || accountEquity <= 0 || atrDistance <= 0 {
 		return RiskDistanceResult{}, fmt.Errorf("invalid account protection input")
 	}
@@ -56,6 +139,9 @@ func ComputeAccountProtectionDistance(c *CopyConfig, side SideType, entryPrice, 
 	}
 	if maxAccountLossPct < 0.001 || maxAccountLossPct > 0.30 {
 		return RiskDistanceResult{}, fmt.Errorf("max account loss pct %.6f must be between 0.001 and 0.30", maxAccountLossPct)
+	}
+	if leverage <= 0 {
+		leverage = 1
 	}
 
 	distance := atrDistance
@@ -82,6 +168,19 @@ func ComputeAccountProtectionDistance(c *CopyConfig, side SideType, entryPrice, 
 		frictionRate = 0
 	}
 	noiseConflict := false
+	if c.RiskLeverageFallback && c.RiskLeverageMaxLoss > 0 {
+		initialMargin := positionNotional / float64(leverage)
+		priceRiskBudget := initialMargin*c.RiskLeverageMaxLoss - positionNotional*frictionRate
+		if priceRiskBudget <= 0 {
+			return RiskDistanceResult{}, fmt.Errorf("trading friction exhausts position margin loss cap")
+		}
+		marginCapDistance := priceRiskBudget / positionNotional * entryPrice
+		if marginCapDistance < distance {
+			distance = marginCapDistance
+			governedBy = "margin_cap"
+			noiseConflict = true
+		}
+	}
 	if c.RiskStopPriority == "account_cap" {
 		priceRiskBudget := accountEquity*maxAccountLossPct - positionNotional*frictionRate
 		if priceRiskBudget <= 0 {
@@ -106,6 +205,9 @@ func ComputeAccountProtectionDistance(c *CopyConfig, side SideType, entryPrice, 
 		GovernedBy:                   governedBy,
 		NoiseConflict:                noiseConflict,
 		AccountRiskThresholdExceeded: expected/accountEquity > maxAccountLossPct+1e-12,
+	}
+	if initialMargin := positionNotional / float64(leverage); initialMargin > 0 {
+		result.ExpectedMarginLossPct = expected / initialMargin
 	}
 	if atr > 0 {
 		result.DistanceATRRatio = distance / atr
@@ -183,13 +285,12 @@ func BuildProtectionPlan(c *CopyConfig, side SideType, entryPrice, atr, structur
 // Copy Guard v5.2 止损：各项纯取严（min），任何机制不得放宽——
 //
 //	distance = min( ATR 基线      = atrDistance（默认 2.0×ATR，抗噪主力线）,
-//	                [可选] 保证金 = entry × RiskLeverageMaxLoss / leverage（RiskLeverageFallback 默认关）,
+//	                [可选] 保证金 = entry × RiskLeverageMaxLoss / leverage,
 //	                单次风险预算 = equity × RiskAccountPct / notional × entry（v7 默认 2%） )
 //
-// v5.2 抗噪：仓位保证金止损（margin_cap）默认关闭（RiskLeverageFallback=false）。
-// 高杠杆下 entry×maxLoss/lev 会坍缩进市场噪音区（100x×20%≈0.2% 即止损），是频繁
-// 扫损的直接根因；改由 ATR 基线 + 账户线主导，账户线始终参与 min 作单笔硬兜底。
-// 用户可显式开启 RiskLeverageFallback 恢复更严的保证金封顶（低杠杆场景仍有意义）。
+// 仓位保证金止损由配置显式控制；新配置和已迁移的全局止损配置默认开启 50%。
+// 高杠杆下该上限可能比 ATR 基线更早生效，这是用户选择的仓位亏损硬上限；
+// AI 重入遇到止损结构与硬上限冲突时拒绝成交，不会暗中替换 AI 止损。
 //
 // v4.1 的噪音下限（noise_floor）放宽机制已删除：它在高杠杆下覆盖保证金 cap，
 // 是实盘 -40% 止损（周期 64）的直接根因。ATR 不再放宽硬止损，但保留基线、
@@ -417,6 +518,9 @@ func ValidateRiskPolicyV4(c *CopyConfig) error {
 	if invalidRange(c.RiskSlippageBufferBPS, 0, 1000) {
 		return fmt.Errorf("risk_slippage_buffer_bps must be 0..1000")
 	}
+	if c.RiskLeverageFallback && invalidRange(c.RiskLeverageMaxLoss, 0.01, 1) {
+		return fmt.Errorf("risk_leverage_max_loss must be 1%%..100%% when position stop is enabled")
+	}
 	if invalidRange(c.RiskLiquidationBufferATR, 0, 5) {
 		return fmt.Errorf("risk_liquidation_buffer_atr must be 0..5")
 	}
@@ -509,5 +613,5 @@ func ValidateStoredRiskPolicy(c *store.CopyTradeConfig) error {
 	if c.RiskPolicyVersion < 4 {
 		return nil
 	}
-	return ValidateRiskPolicyV4(&CopyConfig{ProviderType: ProviderType(c.ProviderType), RiskPolicyVersion: c.RiskPolicyVersion, RiskStopMode: c.RiskStopMode, RiskStopPriority: c.RiskStopPriority, RiskATRPeriod: c.RiskATRPeriod, RiskATRCacheMaxAgeMinutes: c.RiskATRCacheMaxAgeMinutes, RiskATRMultiplier: c.RiskATRMultiplier, RiskATRFallbackPct: c.RiskATRFallbackPct, RiskTriggerPriceType: c.RiskTriggerPriceType, RiskAccountPct: c.RiskAccountPct, RiskCycleLossBudgetPct: c.RiskCycleLossBudgetPct, RiskPortfolioLossBudgetPct: c.RiskPortfolioLossBudgetPct, RiskRoundTripFeeBPS: c.RiskRoundTripFeeBPS, RiskSlippageBufferBPS: c.RiskSlippageBufferBPS, RiskLiquidationBufferATR: c.RiskLiquidationBufferATR, RiskMaxReentries: c.RiskMaxReentries, RiskReentryRatio: c.RiskReentryRatio, RiskReentryDecisionMode: c.RiskReentryDecisionMode, RiskReentryMinNotional: c.RiskReentryMinNotional, RiskAIConfidenceThreshold: c.RiskAIConfidenceThreshold, RiskAIMinReviewSeconds: c.RiskAIMinReviewSeconds, RiskAIDailyCallLimit: c.RiskAIDailyCallLimit, RiskAILifecycleCallLimit: c.RiskAILifecycleCallLimit, RiskNotificationLevel: c.RiskNotificationLevel, RiskReentryBandATR: c.RiskReentryBandATR, RiskReentryCooldownSeconds: c.RiskReentryCooldownSeconds, RiskReentryMaxChaseATR: c.RiskReentryMaxChaseATR, RiskReentryMaxATRExpansion: c.RiskReentryMaxATRExpansion, RiskWatchTimeoutMinutes: c.RiskWatchTimeoutMinutes, RiskAddonBudgetPct: c.RiskAddonBudgetPct, RiskReentryMinRecoveryATR: c.RiskReentryMinRecoveryATR, RiskReentryCooldownEscalation: c.RiskReentryCooldownEscalation, RiskReentryRecoveryEscalation: c.RiskReentryRecoveryEscalation, RiskUnprotectableDisposition: c.RiskUnprotectableDisposition, RiskUnprotectableAction: c.RiskUnprotectableAction})
+	return ValidateRiskPolicyV4(&CopyConfig{ProviderType: ProviderType(c.ProviderType), RiskPolicyVersion: c.RiskPolicyVersion, RiskStopMode: c.RiskStopMode, RiskStopPriority: c.RiskStopPriority, RiskATRPeriod: c.RiskATRPeriod, RiskATRCacheMaxAgeMinutes: c.RiskATRCacheMaxAgeMinutes, RiskATRMultiplier: c.RiskATRMultiplier, RiskATRFallbackPct: c.RiskATRFallbackPct, RiskTriggerPriceType: c.RiskTriggerPriceType, RiskAccountPct: c.RiskAccountPct, RiskLeverageFallback: c.RiskLeverageFallback, RiskLeverageMaxLoss: c.RiskLeverageMaxLoss, RiskCycleLossBudgetPct: c.RiskCycleLossBudgetPct, RiskPortfolioLossBudgetPct: c.RiskPortfolioLossBudgetPct, RiskRoundTripFeeBPS: c.RiskRoundTripFeeBPS, RiskSlippageBufferBPS: c.RiskSlippageBufferBPS, RiskLiquidationBufferATR: c.RiskLiquidationBufferATR, RiskMaxReentries: c.RiskMaxReentries, RiskReentryRatio: c.RiskReentryRatio, RiskReentryDecisionMode: c.RiskReentryDecisionMode, RiskReentryMinNotional: c.RiskReentryMinNotional, RiskAIConfidenceThreshold: c.RiskAIConfidenceThreshold, RiskAIMinReviewSeconds: c.RiskAIMinReviewSeconds, RiskAIDailyCallLimit: c.RiskAIDailyCallLimit, RiskAILifecycleCallLimit: c.RiskAILifecycleCallLimit, RiskNotificationLevel: c.RiskNotificationLevel, RiskReentryBandATR: c.RiskReentryBandATR, RiskReentryCooldownSeconds: c.RiskReentryCooldownSeconds, RiskReentryMaxChaseATR: c.RiskReentryMaxChaseATR, RiskReentryMaxATRExpansion: c.RiskReentryMaxATRExpansion, RiskWatchTimeoutMinutes: c.RiskWatchTimeoutMinutes, RiskAddonBudgetPct: c.RiskAddonBudgetPct, RiskReentryMinRecoveryATR: c.RiskReentryMinRecoveryATR, RiskReentryCooldownEscalation: c.RiskReentryCooldownEscalation, RiskReentryRecoveryEscalation: c.RiskReentryRecoveryEscalation, RiskUnprotectableDisposition: c.RiskUnprotectableDisposition, RiskUnprotectableAction: c.RiskUnprotectableAction})
 }

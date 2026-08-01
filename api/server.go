@@ -616,9 +616,8 @@ func applyCopyConfigRiskFields(copyConfig *store.CopyTradeConfig, req *CopyConfi
 	if req.RiskStopMaxAccountLossPct != nil {
 		copyConfig.RiskStopMaxAccountLossPct = *req.RiskStopMaxAccountLossPct
 	}
-	// v5.2：margin_cap（仓位保证金止损上限）默认关。高杠杆下 entry×maxLoss/lev
-	// 会把止损压进市场噪音区（100x×20% = 0.2% 即止损）导致频繁扫损；默认改由
-	// ATR 基线 + 账户线决定，用户可显式开启恢复严格保证金封顶。
+	// 仓位初始保证金亏损上限由统一默认工厂初始化为开启 50%；指针仍允许
+	// 用户显式关闭，历史配置则由带版本的数据库迁移保持原有选择。
 	copyConfig.RiskLeverageFallback = derefBoolDefault(req.RiskLeverageFallback, copyConfig.RiskLeverageFallback)
 	copyConfig.RiskReentryEnabled = derefBoolDefault(req.RiskReentryEnabled, copyConfig.RiskReentryEnabled)
 	copyConfig.RiskReentryNoiseOverride = derefBoolDefault(req.RiskReentryNoiseOverride, copyConfig.RiskReentryNoiseOverride)

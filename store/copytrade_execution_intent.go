@@ -10,6 +10,8 @@ import (
 )
 
 const (
+	ExecutionIntentSourceMigrationMarginStop = "MIGRATION_MARGIN_STOP"
+
 	ExecutionIntentReserved         = "RESERVED"
 	ExecutionIntentSubmitted        = "SUBMITTED"
 	ExecutionIntentFilled           = "FILLED"
@@ -30,6 +32,26 @@ const (
 	ExecutionOrderAttemptUnknown         = "UNKNOWN"
 	ExecutionOrderAttemptTerminalNoFill  = "TERMINAL_NO_FILL"
 )
+
+func (s *CopyTradeStore) CountMigrationMarginStopIntents(cycleID int64) (int, error) {
+	if cycleID <= 0 {
+		return 0, nil
+	}
+	var count int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM copy_trade_execution_intents WHERE cycle_id=? AND source_kind=?`,
+		cycleID, ExecutionIntentSourceMigrationMarginStop).Scan(&count)
+	return count, err
+}
+
+func (s *CopyTradeStore) HasUnfinishedMigrationMarginStopIntents(traderID string) (bool, error) {
+	var count int
+	err := s.db.QueryRow(`
+		SELECT COUNT(*) FROM copy_trade_execution_intents
+		WHERE trader_id=? AND source_kind=?
+		  AND status IN ('RESERVED','SUBMITTED','RECONCILING','PARTIALLY_FILLED')
+	`, traderID, ExecutionIntentSourceMigrationMarginStop).Scan(&count)
+	return count > 0, err
+}
 
 var ErrOrdinaryCatchupUnsettled = errors.New("ordinary catch-up has unresolved exchange side effects")
 
@@ -840,7 +862,7 @@ func (s *CopyTradeStore) ReclaimUnsubmittedExecutionIntent(id int64, traderID, a
 		  AND ABS(COALESCE(leader_target_size,0)-?)<=MAX(1e-12,ABS(?) * 1e-9)
 		  AND status IN ('RECONCILING','FAILED')
 		  AND reason_code IN (
-			'SOURCE_REVALIDATION_REQUIRED','SOURCE_DATA_UNAVAILABLE',
+			'SOURCE_REVALIDATION_REQUIRED','SOURCE_DATA_UNAVAILABLE','MIGRATION_RECONCILING',
 			'SOURCE_VALUE_UNAVAILABLE','MANUAL_REVIEW_REQUIRED',
 			'ORDER_LOOKUP_FAILED','ORDER_LOOKUP_UNAVAILABLE'
 		  )
@@ -1388,7 +1410,7 @@ func (s *CopyTradeStore) ReserveExecutionIntent(intent *CopyTradeExecutionIntent
 				status='RESERVED',reason_code='',last_error='',failure_counted=0,
 				reconciliation_attempts=0,first_reconciling_at=NULL,terminal_at=NULL,updated_at=CURRENT_TIMESTAMP
 			WHERE canonical_key=? AND canonical_key<>''
-			  AND status='RECONCILING' AND reason_code IN ('SOURCE_REVALIDATION_REQUIRED','SOURCE_DATA_UNAVAILABLE','SOURCE_VALUE_UNAVAILABLE')
+			  AND status='RECONCILING' AND reason_code IN ('SOURCE_REVALIDATION_REQUIRED','SOURCE_DATA_UNAVAILABLE','SOURCE_VALUE_UNAVAILABLE','MIGRATION_RECONCILING')
 			  AND submitted_at IS NULL AND COALESCE(exchange_order_id,'')=''
 			  AND NOT EXISTS (SELECT 1 FROM copy_trade_execution_order_attempts a WHERE a.intent_id=copy_trade_execution_intents.id)
 		`, intent.SourceFillID, intent.Action, intent.CycleID, intent.CandidateID, intent.AnalysisID,
@@ -1419,7 +1441,7 @@ func (s *CopyTradeStore) ReserveExecutionIntent(intent *CopyTradeExecutionIntent
 			    (submitted_at IS NULL AND (
 			      (status='FAILED' AND (reason_code IN ('PRE_SUBMIT','DECISION_CHANNEL_BUSY','STARTUP_REPLAY_REQUIRED') OR reason_code LIKE 'PRECHECK_%'))
 			      OR (status='SKIPPED' AND reason_code IN ('RISK_CAP','MIN_NOTIONAL','SOURCE_SUPERSEDED') AND ?<>'' AND COALESCE(source_fill_id,'')<>?)
-			      OR (status='RECONCILING' AND reason_code IN ('SOURCE_REVALIDATION_REQUIRED','SOURCE_DATA_UNAVAILABLE','SOURCE_VALUE_UNAVAILABLE'))
+			      OR (status='RECONCILING' AND reason_code IN ('SOURCE_REVALIDATION_REQUIRED','SOURCE_DATA_UNAVAILABLE','SOURCE_VALUE_UNAVAILABLE','MIGRATION_RECONCILING'))
 			    ))
 			    OR (
 			      status='FAILED' AND reason_code='EXECUTION_FAILED'
@@ -1945,7 +1967,7 @@ func (s *CopyTradeStore) SupersedeUnsubmittedExecutionIntent(id int64, traderID,
 		terminal_at=COALESCE(terminal_at,CURRENT_TIMESTAMP),updated_at=CURRENT_TIMESTAMP
 		WHERE id=? AND trader_id=? AND leader_pos_id=?
 		  AND status='RECONCILING'
-		  AND reason_code IN ('SOURCE_REVALIDATION_REQUIRED','SOURCE_DATA_UNAVAILABLE','SOURCE_VALUE_UNAVAILABLE')
+		  AND reason_code IN ('SOURCE_REVALIDATION_REQUIRED','SOURCE_DATA_UNAVAILABLE','SOURCE_VALUE_UNAVAILABLE','MIGRATION_RECONCILING')
 		  AND submitted_at IS NULL AND COALESCE(exchange_order_id,'')=''
 		  AND NOT EXISTS (SELECT 1 FROM copy_trade_execution_order_attempts a WHERE a.intent_id=copy_trade_execution_intents.id)`,
 		id, traderID, leaderPosID)

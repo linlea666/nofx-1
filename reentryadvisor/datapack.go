@@ -27,12 +27,12 @@ var timeframeSpec = []struct {
 	fetch   int
 	include int
 }{
-	{"5m", 60, 24},
-	{"15m", 60, 24},
-	{"30m", 48, 16},
-	{"1h", 120, 24},
-	{"4h", 120, 24},
-	{"1d", 30, 14},
+	{"5m", 240, 24},
+	{"15m", 240, 24},
+	{"30m", 240, 16},
+	{"1h", 240, 24},
+	{"4h", 240, 24},
+	{"1d", 240, 30},
 }
 
 // cvdTimeframes 计算现货/合约 CVD 的周期子集
@@ -55,6 +55,7 @@ type MetaSection struct {
 	MissingFields    []string          `json:"missing_fields,omitempty"`
 	Note             string            `json:"note,omitempty"`
 	SourceTimestamps map[string]string `json:"source_timestamps,omitempty"`
+	UnavailableData  map[string]string `json:"unavailable_data"`
 }
 
 type GuardSection struct {
@@ -239,9 +240,31 @@ type MarketSection struct {
 
 type KlineSummary struct {
 	// bars: [open_time_ms, open, high, low, close, volume]，旧→新
-	Bars           [][]float64 `json:"bars"`
-	PctChange      float64     `json:"pct_change_window"` // 入包窗口首尾涨跌幅 %
-	VolumeRatio520 float64     `json:"volume_ratio_5_20"` // 近5根均量/前20根均量（>1 放量）
+	Bars           [][]float64                `json:"bars"`
+	PctChange      float64                    `json:"pct_change_window"` // 入包窗口首尾涨跌幅 %
+	VolumeRatio520 float64                    `json:"volume_ratio_5_20"` // 近5根均量/前20根均量（>1 放量）
+	ATR14          float64                    `json:"atr_14"`
+	MovingAverages map[string]*IndicatorValue `json:"moving_averages"`
+	VWAP           *IndicatorValue            `json:"vwap"`
+	SwingAnchors   *SwingAnchorSummary        `json:"swing_anchors"`
+	Fibonacci      map[string]*IndicatorValue `json:"fibonacci_retracement"`
+	Structure      string                     `json:"high_low_structure"`
+	BreakoutState  string                     `json:"breakout_retest_false_break"`
+	RecentHigh     float64                    `json:"recent_high"`
+	RecentLow      float64                    `json:"recent_low"`
+}
+
+type IndicatorValue struct {
+	Available bool    `json:"available"`
+	Value     float64 `json:"value,omitempty"`
+}
+
+type SwingAnchorSummary struct {
+	Available bool    `json:"available"`
+	Low       float64 `json:"low,omitempty"`
+	High      float64 `json:"high,omitempty"`
+	LowAt     string  `json:"low_at,omitempty"`
+	HighAt    string  `json:"high_at,omitempty"`
 }
 
 type CVDSummary struct {
@@ -280,12 +303,24 @@ type BasisSummary struct {
 }
 
 type SRSummary struct {
-	NearestSupport        float64 `json:"nearest_support"`
-	SupportTouches        int     `json:"support_touches"`
-	SupportDistanceATR    float64 `json:"support_distance_atr"`
-	NearestResistance     float64 `json:"nearest_resistance"`
-	ResistanceTouches     int     `json:"resistance_touches"`
-	ResistanceDistanceATR float64 `json:"resistance_distance_atr"`
+	NearestSupport         float64 `json:"nearest_support"`
+	SupportTouches         int     `json:"support_touches"`
+	SupportDistanceATR     float64 `json:"support_distance_atr"`
+	NearestResistance      float64 `json:"nearest_resistance"`
+	ResistanceTouches      int     `json:"resistance_touches"`
+	ResistanceDistanceATR  float64 `json:"resistance_distance_atr"`
+	SupportZoneLow         float64 `json:"support_zone_low"`
+	SupportZoneHigh        float64 `json:"support_zone_high"`
+	SupportStrength        int     `json:"support_strength"`
+	SupportLastTouchAt     string  `json:"support_last_touch_at"`
+	SupportRoleReversal    bool    `json:"support_role_reversal"`
+	SupportExhaustion      string  `json:"support_exhaustion"`
+	ResistanceZoneLow      float64 `json:"resistance_zone_low"`
+	ResistanceZoneHigh     float64 `json:"resistance_zone_high"`
+	ResistanceStrength     int     `json:"resistance_strength"`
+	ResistanceLastTouchAt  string  `json:"resistance_last_touch_at"`
+	ResistanceRoleReversal bool    `json:"resistance_role_reversal"`
+	ResistanceExhaustion   string  `json:"resistance_exhaustion"`
 }
 
 // buildDataPack 为一条人工重入信号组装完整数据包。
@@ -308,6 +343,10 @@ func buildDataPack(st *store.Store, bn *binanceClient, sig *store.CopyGuardManua
 			Side:             sig.Side,
 			DataSources:      "binance_futures(fapi) + binance_spot + okx_mark_price_atr(与门控同源)",
 			SourceTimestamps: map[string]string{"public_market_snapshot": time.Now().UTC().Format(time.RFC3339)},
+			UnavailableData: map[string]string{
+				"onchain": "UNAVAILABLE", "etf_flows": "UNAVAILABLE", "macro": "UNAVAILABLE",
+				"options": "UNAVAILABLE", "cost_basis_chips": "UNAVAILABLE",
+			},
 		},
 	}
 
@@ -498,7 +537,7 @@ func buildLastStopInfo(attempts []*store.CopyGuardAttempt, side string, currentP
 // buildMarketSection Binance 市场层；合约不可用返回 nil
 func buildMarketSection(bn *binanceClient, symbol string, atr float64, meta *MetaSection) *MarketSection {
 	// 先探测主周期：失败即视为 Binance 无此币种合约
-	primaryKlines, err := bn.futuresKlines(symbol, "1h", 120)
+	primaryKlines, err := bn.futuresKlines(symbol, "1h", 240)
 	if err != nil || len(primaryKlines) == 0 {
 		meta.FuturesAvailable = false
 		meta.SpotAvailable = false
@@ -535,6 +574,9 @@ func buildMarketSection(bn *binanceClient, symbol string, atr float64, meta *Met
 			futuresByTF[spec.tf] = klines
 		}
 		m.Klines[spec.tf] = summarizeKlines(klines, spec.include)
+		if latest := klines[len(klines)-1]; latest.CloseTime > 0 {
+			meta.SourceTimestamps["binance_futures_closed_kline_"+spec.tf] = time.UnixMilli(latest.CloseTime).UTC().Format(time.RFC3339)
+		}
 	}
 	for _, tf := range cvdTimeframes {
 		if klines := futuresByTF[tf]; len(klines) > 0 {
@@ -691,6 +733,7 @@ func buildMarketSection(bn *binanceClient, symbol string, atr float64, meta *Met
 			NearestSupport: sup, SupportTouches: supT,
 			NearestResistance: res, ResistanceTouches: resT,
 		}
+		populateSRZoneEvidence(sr, klines, m.CurrentPrice, atr)
 		if atr > 0 {
 			if sup > 0 {
 				sr.SupportDistanceATR = round((m.CurrentPrice-sup)/atr, 3)
@@ -722,7 +765,7 @@ func closedKlinesAt(klines []market.Kline, now time.Time) []market.Kline {
 
 // summarizeKlines 截取入包窗口并计算窗口涨跌幅 + 量比
 func summarizeKlines(klines []market.Kline, include int) *KlineSummary {
-	s := &KlineSummary{VolumeRatio520: round(volumeRatio(klines, 5, 20), 3)}
+	s := &KlineSummary{VolumeRatio520: round(volumeRatio(klines, 5, 20), 3), MovingAverages: map[string]*IndicatorValue{}, Fibonacci: map[string]*IndicatorValue{}}
 	tail := klines
 	if len(tail) > include {
 		tail = tail[len(tail)-include:]
@@ -737,7 +780,192 @@ func summarizeKlines(klines []market.Kline, include int) *KlineSummary {
 	if len(tail) > 1 {
 		s.PctChange = round(pctChange(tail[0].Open, tail[len(tail)-1].Close), 3)
 	}
+	s.ATR14 = roundSig(klineATR(klines, 14))
+	for _, period := range []int{20, 50, 100, 200} {
+		key := fmt.Sprintf("ma%d", period)
+		if len(klines) >= period {
+			var sum float64
+			for _, k := range klines[len(klines)-period:] {
+				sum += k.Close
+			}
+			s.MovingAverages[key] = &IndicatorValue{Available: true, Value: roundSig(sum / float64(period))}
+		} else {
+			s.MovingAverages[key] = &IndicatorValue{Available: false}
+		}
+	}
+	s.Structure, s.RecentHigh, s.RecentLow = highLowStructure(klines)
+	s.BreakoutState = breakoutState(klines)
+	s.VWAP = closedKlineVWAP(tail)
+	s.SwingAnchors, s.Fibonacci = closedKlineSwingFibonacci(klines, 120)
 	return s
+}
+
+func closedKlineVWAP(klines []market.Kline) *IndicatorValue {
+	var weighted, volume float64
+	for _, k := range klines {
+		if k.Volume <= 0 {
+			continue
+		}
+		price := (k.High + k.Low + k.Close) / 3
+		if k.QuoteVolume > 0 {
+			weighted += k.QuoteVolume
+		} else {
+			weighted += price * k.Volume
+		}
+		volume += k.Volume
+	}
+	if volume <= 0 {
+		return &IndicatorValue{Available: false}
+	}
+	return &IndicatorValue{Available: true, Value: roundSig(weighted / volume)}
+}
+
+func closedKlineSwingFibonacci(klines []market.Kline, window int) (*SwingAnchorSummary, map[string]*IndicatorValue) {
+	levels := map[string]*IndicatorValue{}
+	if window <= 0 || len(klines) < 2 {
+		return &SwingAnchorSummary{Available: false}, levels
+	}
+	if len(klines) > window {
+		klines = klines[len(klines)-window:]
+	}
+	lowIndex, highIndex := 0, 0
+	for i := 1; i < len(klines); i++ {
+		if klines[i].Low < klines[lowIndex].Low {
+			lowIndex = i
+		}
+		if klines[i].High > klines[highIndex].High {
+			highIndex = i
+		}
+	}
+	low, high := klines[lowIndex].Low, klines[highIndex].High
+	if low <= 0 || high <= low {
+		return &SwingAnchorSummary{Available: false}, levels
+	}
+	anchors := &SwingAnchorSummary{
+		Available: true, Low: roundSig(low), High: roundSig(high),
+		LowAt:  time.UnixMilli(klines[lowIndex].CloseTime).UTC().Format(time.RFC3339),
+		HighAt: time.UnixMilli(klines[highIndex].CloseTime).UTC().Format(time.RFC3339),
+	}
+	rangeSize := high - low
+	for label, ratio := range map[string]float64{"23.6%": .236, "38.2%": .382, "50.0%": .5, "61.8%": .618, "78.6%": .786} {
+		levels[label] = &IndicatorValue{Available: true, Value: roundSig(high - rangeSize*ratio)}
+	}
+	return anchors, levels
+}
+
+func klineATR(klines []market.Kline, period int) float64 {
+	if period <= 0 || len(klines) < period+1 {
+		return 0
+	}
+	var total float64
+	start := len(klines) - period
+	for i := start; i < len(klines); i++ {
+		prevClose := klines[i-1].Close
+		tr := math.Max(klines[i].High-klines[i].Low, math.Max(math.Abs(klines[i].High-prevClose), math.Abs(klines[i].Low-prevClose)))
+		total += tr
+	}
+	return total / float64(period)
+}
+
+func highLowStructure(klines []market.Kline) (string, float64, float64) {
+	highs, lows := findSwingPoints(klines, 2)
+	if len(highs) < 2 || len(lows) < 2 {
+		return "INSUFFICIENT", 0, 0
+	}
+	lastHigh, prevHigh := highs[len(highs)-1], highs[len(highs)-2]
+	lastLow, prevLow := lows[len(lows)-1], lows[len(lows)-2]
+	switch {
+	case lastHigh > prevHigh && lastLow > prevLow:
+		return "HH_HL_UPTREND", lastHigh, lastLow
+	case lastHigh < prevHigh && lastLow < prevLow:
+		return "LH_LL_DOWNTREND", lastHigh, lastLow
+	default:
+		return "MIXED_RANGE", lastHigh, lastLow
+	}
+}
+
+func breakoutState(klines []market.Kline) string {
+	if len(klines) < 22 {
+		return "INSUFFICIENT"
+	}
+	latest := klines[len(klines)-1]
+	window := klines[len(klines)-21 : len(klines)-1]
+	high, low := window[0].High, window[0].Low
+	for _, k := range window[1:] {
+		if k.High > high {
+			high = k.High
+		}
+		if k.Low < low {
+			low = k.Low
+		}
+	}
+	switch {
+	case latest.High > high && latest.Close <= high:
+		return "FALSE_BREAK_ABOVE"
+	case latest.Low < low && latest.Close >= low:
+		return "FALSE_BREAK_BELOW"
+	case latest.Close > high:
+		return "CLOSED_BREAKOUT_ABOVE"
+	case latest.Close < low:
+		return "CLOSED_BREAKOUT_BELOW"
+	default:
+		return "INSIDE_20_BAR_RANGE"
+	}
+}
+
+func populateSRZoneEvidence(sr *SRSummary, klines []market.Kline, currentPrice, atr float64) {
+	if sr == nil || len(klines) == 0 {
+		return
+	}
+	tolerance := 0.25 * atr
+	if tolerance <= 0 {
+		tolerance = currentPrice * 0.002
+	}
+	exhaustion := func(touches int) string {
+		if touches <= 1 {
+			return "FRESH"
+		}
+		if touches <= 3 {
+			return "TESTED"
+		}
+		return "WEAKENED"
+	}
+	lastTouch := func(level float64, support bool) string {
+		if level <= 0 {
+			return "UNAVAILABLE"
+		}
+		for i := len(klines) - 1; i >= 0; i-- {
+			touched := math.Abs(klines[i].Low-level) <= tolerance
+			if !support {
+				touched = math.Abs(klines[i].High-level) <= tolerance
+			}
+			if touched {
+				return time.UnixMilli(klines[i].CloseTime).UTC().Format(time.RFC3339)
+			}
+		}
+		return "UNAVAILABLE"
+	}
+	roleReversal := func(level float64) bool {
+		if level <= 0 || len(klines) < 3 {
+			return false
+		}
+		above, below := false, false
+		for _, k := range klines {
+			above = above || k.Close > level+tolerance
+			below = below || k.Close < level-tolerance
+		}
+		return above && below
+	}
+	if sr.NearestSupport > 0 {
+		sr.SupportZoneLow, sr.SupportZoneHigh = roundSig(sr.NearestSupport-tolerance), roundSig(sr.NearestSupport+tolerance)
+		sr.SupportStrength = int(math.Min(100, 45+float64(sr.SupportTouches)*12))
+		sr.SupportLastTouchAt, sr.SupportRoleReversal, sr.SupportExhaustion = lastTouch(sr.NearestSupport, true), roleReversal(sr.NearestSupport), exhaustion(sr.SupportTouches)
+	}
+	if sr.NearestResistance > 0 {
+		sr.ResistanceZoneLow, sr.ResistanceZoneHigh = roundSig(sr.NearestResistance-tolerance), roundSig(sr.NearestResistance+tolerance)
+		sr.ResistanceStrength = int(math.Min(100, 45+float64(sr.ResistanceTouches)*12))
+		sr.ResistanceLastTouchAt, sr.ResistanceRoleReversal, sr.ResistanceExhaustion = lastTouch(sr.NearestResistance, false), roleReversal(sr.NearestResistance), exhaustion(sr.ResistanceTouches)
+	}
 }
 
 // summarizeCVD CVD 摘要：窗口末 20 值（以窗口起点归零）+ 斜率 + 价量背离

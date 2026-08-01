@@ -58,9 +58,63 @@ func TestCopyTradeSourceHealthStateMachine(t *testing.T) {
 	if h.Status != SourceHealthHealthy || h.ConsecutiveFailures != 0 || h.LastError != "" {
 		t.Fatalf("complete recovery: %+v", h)
 	}
-	h = record(SourceHealthObservation{Status: "ERROR", Error: "old snapshot", CheckedAt: base.Add(71 * time.Second)})
+	h = record(SourceHealthObservation{Status: "ERROR", Error: "old snapshot", CheckedAt: base.Add(131 * time.Second)})
 	if h.Status != SourceHealthStale || !h.Frozen() {
 		t.Fatalf("stale must freeze: %+v", h)
+	}
+}
+
+func TestCopyTradeSourceHealthSlowHealthyPollDoesNotSynthesizeRecovery(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "health-slow-success.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	base := time.Now().UTC().Truncate(time.Second)
+	if _, transitioned, err := st.CopyTrade().RecordSourceHealthObservation("trader", "leader", "smart_money", 1, SourceHealthObservation{Status: SourceHealthHealthy, CompleteSnapshot: true, CheckedAt: base}); err != nil || transitioned {
+		t.Fatalf("initial healthy observation: transitioned=%v err=%v", transitioned, err)
+	}
+	h, transitioned, err := st.CopyTrade().RecordSourceHealthObservation("trader", "leader", "smart_money", 1, SourceHealthObservation{Status: SourceHealthHealthy, CompleteSnapshot: true, CheckedAt: base.Add(95 * time.Second)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if transitioned || h.Status != SourceHealthHealthy || h.PreviousStatus != "" {
+		t.Fatalf("slow healthy completion must stay steady healthy: transitioned=%v health=%+v", transitioned, h)
+	}
+}
+
+func TestCopyTradeSourceHealthPersistsSchedulerAndDeliveryMetrics(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "health-metrics.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	started := time.Now().UTC().Truncate(time.Millisecond)
+	completed := started.Add(875 * time.Millisecond)
+	next := completed.Add(15 * time.Second)
+	backoff := completed.Add(30 * time.Second)
+	_, _, err = st.CopyTrade().RecordSourceHealthObservation("trader", "leader", "smart_money", 1, SourceHealthObservation{
+		Status: SourceHealthDegraded, Error: "429", CheckedAt: started,
+		RequestStartedAt: started, RequestCompletedAt: completed, RequestDurationMS: 875,
+		NextPollAt: next, BackoffUntil: backoff, RateLimit429Count: 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = st.CopyTrade().MarkSourceHealthProcessingDelay("trader", 42*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if err = st.CopyTrade().MarkSourceHealthMailDelivery("trader", "failed", "smtp 554", completed); err != nil {
+		t.Fatal(err)
+	}
+	health, err := st.CopyTrade().GetSourceHealth("trader")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if health.LastRequestStartedAt == nil || health.LastRequestCompletedAt == nil || health.BackoffUntil == nil || health.NextPollAt == nil ||
+		health.LastRequestDurationMS != 875 || health.RateLimit429Count != 3 || health.LastProcessingDelayMS != 42 ||
+		health.LastMailStatus != "failed" || health.LastMailError != "smtp 554" || health.LastMailAt == nil {
+		t.Fatalf("scheduler/delivery metrics did not round-trip: %+v", health)
 	}
 }
 

@@ -754,6 +754,41 @@ func TestAbandonRequiresTwoHighConfidenceDistinctClosedCandles(t *testing.T) {
 	}
 }
 
+func TestThesisInvalidSleepsUntilStructuralRearmCreatesNewGeneration(t *testing.T) {
+	st, err := newReentryCandidateTestStore(t, filepath.Join(t.TempDir(), "dormant-rearm.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ensureReviewableReentryCycle(t, st, 880, "trader-a", "p-rearm", "BTCUSDT", "long")
+	rs := st.ReentryAI()
+	candidate, err := rs.EnsureReentryCandidate(&CopyGuardReentryCandidate{CycleID: 880, TraderID: "trader-a", LeaderPosID: "p-rearm", Symbol: "BTCUSDT", Side: "long", FeatureHash: "before"}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = st.db.Exec(`UPDATE copy_guard_reentry_candidates SET status=? WHERE id=?`, ReentryCandidateReviewing, candidate.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err = rs.FinishReentryCandidateReview(candidate.ID, ReentryCandidateDecision{Decision: ReentryVerdictThesisInvalid, NextReview: time.Now().Add(time.Hour), TTLSeconds: 30, RearmConditionsJSON: `["15m close reclaims support"]`}); err != nil {
+		t.Fatal(err)
+	}
+	dormant, err := rs.GetReentryCandidate(candidate.ID)
+	if err != nil || dormant.Status != ReentryCandidateDormantRearm || dormant.ClosedAt != nil {
+		t.Fatalf("thesis invalid must remain non-terminal dormant: candidate=%+v err=%v", dormant, err)
+	}
+	rearmed, err := rs.ScheduleReentryCandidateEventReview(candidate.ID, "STRUCTURE_RECLAIMED", 5*time.Minute)
+	if err != nil || rearmed.Status != ReentryCandidateWaiting || rearmed.PendingTrigger != "STRUCTURE_RECLAIMED" {
+		t.Fatalf("structural event did not rearm candidate: candidate=%+v err=%v", rearmed, err)
+	}
+	if _, err = st.db.Exec(`UPDATE copy_guard_reentry_candidates SET next_review_at=CURRENT_TIMESTAMP,last_review_at=NULL WHERE id=?`, candidate.ID); err != nil {
+		t.Fatal(err)
+	}
+	claimed, ok, err := rs.ClaimReentryCandidateReview(candidate.ID, 5*time.Minute, 0, 0)
+	if err != nil || !ok || claimed.Status != ReentryCandidateReviewing || claimed.DecisionGeneration != dormant.DecisionGeneration+1 {
+		t.Fatalf("rearmed review did not create a new generation: ok=%v candidate=%+v err=%v", ok, claimed, err)
+	}
+}
+
 func TestLateAIResultCannotReviveTerminatedCandidate(t *testing.T) {
 	st, err := newReentryCandidateTestStore(t, filepath.Join(t.TempDir(), "late-result.db"))
 	if err != nil {

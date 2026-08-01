@@ -23,7 +23,7 @@ const (
 
 	smartMoneyRows       = 9
 	smartMoneyMaxPages   = 100
-	smartMoneyProfileTTL = 15 * time.Second
+	smartMoneyProfileTTL = 30 * time.Minute
 	smartMoneyCatalogTTL = 5 * time.Minute
 	smartMoneyFXTTL      = 2 * time.Minute
 	// A sudden all-empty response is held long enough for two normal polling
@@ -42,11 +42,18 @@ var (
 )
 
 type SourceHealthObservation struct {
-	Status           string
-	TraderName       string
-	Error            string
-	CompleteSnapshot bool
-	CheckedAt        time.Time
+	Status               string
+	TraderName           string
+	Error                string
+	CompleteSnapshot     bool
+	CheckedAt            time.Time
+	RequestStartedAt     time.Time
+	RequestCompletedAt   time.Time
+	RequestDurationMS    int64
+	NextPollAt           time.Time
+	BackoffUntil         time.Time
+	RateLimit429Count    int
+	ActiveLeaderPosition bool
 }
 
 type SourceHealthObservationProvider interface {
@@ -67,6 +74,9 @@ type BinanceSmartMoneyProvider struct {
 	fxRates                   map[string]cachedSmartFXRate
 	lastCompletePositionCount int
 	emptySnapshotCandidateAt  time.Time
+	credentialGate            *smartMoneyCredentialGate
+	credentialFingerprint     [32]byte
+	credentialFingerprintSet  bool
 }
 
 type cachedSmartFXRate struct {
@@ -93,6 +103,39 @@ func NewBinanceSmartMoneyProviderWithLoader(loader BinanceCredentialsLoader, lab
 }
 
 func (p *BinanceSmartMoneyProvider) Type() ProviderType { return ProviderBinance }
+
+func (p *BinanceSmartMoneyProvider) UseAuthoritativeSnapshotHotPath() bool { return true }
+
+func (p *BinanceSmartMoneyProvider) SuggestedSourcePollDelay(activeLeaderPosition bool) time.Duration {
+	delay := smartMoneyIdlePollInterval
+	if activeLeaderPosition {
+		delay = smartMoneyActivePollInterval
+	}
+	p.mu.Lock()
+	gate := p.credentialGate
+	p.mu.Unlock()
+	if gate != nil {
+		if remaining := gate.remaining(time.Now()); remaining > delay {
+			return remaining
+		}
+		return gate.suggestedPollDelay(activeLeaderPosition)
+	}
+	return delay
+}
+
+func (p *BinanceSmartMoneyProvider) smartMoneyRequest(method, endpoint string, body interface{}) ([]byte, int, error) {
+	p20t, csrf, err := p.auth.credentials()
+	if err != nil {
+		return nil, 0, err
+	}
+	gate := smartMoneyGateForCredential(p20t)
+	p.mu.Lock()
+	p.credentialGate = gate
+	p.mu.Unlock()
+	return gate.do(func() ([]byte, int, error) {
+		return binanceWebRequest(p.client, p20t, csrf, method, endpoint, body)
+	})
+}
 
 // GetFills deliberately returns no order-history events. Smart Money's latest
 // operation feed is delayed; Engine's existing Binance snapshot reconciler is
@@ -215,6 +258,38 @@ func (p *BinanceSmartMoneyProvider) setObservation(obs SourceHealthObservation) 
 	if obs.CheckedAt.IsZero() {
 		obs.CheckedAt = time.Now()
 	}
+	if obs.RequestStartedAt.IsZero() {
+		obs.RequestStartedAt = obs.CheckedAt
+	}
+	if obs.RequestCompletedAt.IsZero() {
+		obs.RequestCompletedAt = time.Now()
+	}
+	if duration := obs.RequestCompletedAt.Sub(obs.RequestStartedAt); duration > 0 {
+		obs.RequestDurationMS = duration.Milliseconds()
+	}
+	p.mu.Lock()
+	gate := p.credentialGate
+	lastCompletePositionCount := p.lastCompletePositionCount
+	p.mu.Unlock()
+	if gate != nil {
+		obs.BackoffUntil, obs.RateLimit429Count = gate.snapshot()
+	}
+	// Failed/incomplete requests inherit the last complete activity state so the
+	// UI next-poll timestamp matches the engine's 3-second recovery target. A
+	// confirmed healthy empty snapshot still switches to the 15-second idle path.
+	if !obs.CompleteSnapshot && lastCompletePositionCount > 0 {
+		obs.ActiveLeaderPosition = true
+	}
+	delay := smartMoneyIdlePollInterval
+	if gate != nil {
+		delay = gate.suggestedPollDelay(obs.ActiveLeaderPosition)
+	} else if obs.ActiveLeaderPosition {
+		delay = smartMoneyActivePollInterval
+	}
+	obs.NextPollAt = obs.RequestCompletedAt.Add(delay)
+	if obs.BackoffUntil.After(obs.NextPollAt) {
+		obs.NextPollAt = obs.BackoffUntil
+	}
 	p.mu.Lock()
 	p.lastObservation = obs
 	p.mu.Unlock()
@@ -264,11 +339,11 @@ func (p *BinanceSmartMoneyProvider) GetAccountState(leaderID string) (*AccountSt
 		return nil, fmt.Errorf("binance smart money: %w", err)
 	}
 	checkedAt := time.Now()
-	// Visibility flags authorize trading and must be refreshed for every
-	// authoritative snapshot. Equity may fall back to a zeroed stale profile
-	// below, but sharingPosition must never remain trusted for the full cache
-	// TTL after the leader turns private.
-	profile, err := p.getProfile(topTraderID, checkedAt, true)
+	// Profile/visibility metadata changes much less frequently than positions.
+	// Keep it off the 3-second authoritative position path; an empty snapshot or
+	// a non-rate-limit access error below forces an immediate refresh before any
+	// close can be inferred.
+	profile, err := p.getProfile(topTraderID, checkedAt, false)
 	if err != nil {
 		if !errors.Is(err, ErrBinanceCredentialsExpired) {
 			// A stale profile is sufficient to retain the last confirmed
@@ -309,9 +384,28 @@ func (p *BinanceSmartMoneyProvider) GetAccountState(leaderID string) (*AccountSt
 	}
 	positions, err := p.fetchAllPositions(topTraderID)
 	if err != nil {
+		var httpErr *BinanceHTTPError
+		var backoffErr *SmartMoneyBackoffError
+		if !errors.As(err, &httpErr) && !errors.As(err, &backoffErr) && !errors.Is(err, ErrBinanceCredentialsExpired) {
+			// Access/relationship failures invalidate the long-lived profile cache.
+			// Re-read visibility once so PRIVATE/DISABLED is classified explicitly;
+			// never add another request during a 429/backoff window.
+			if refreshed, refreshErr := p.getProfile(topTraderID, time.Now(), true); refreshErr == nil {
+				profile = refreshed
+				if profile.Enable != nil && !*profile.Enable {
+					err = ErrBinanceSmartMoneyDisabled
+				} else if profile.SharingPosition != nil && !*profile.SharingPosition {
+					err = ErrBinanceSmartMoneyPrivate
+				}
+			}
+		}
 		status := "ERROR"
 		if errors.Is(err, ErrBinanceCredentialsExpired) {
 			status = "AUTH_FAILED"
+		} else if errors.Is(err, ErrBinanceSmartMoneyDisabled) {
+			status = "DISABLED"
+		} else if errors.Is(err, ErrBinanceSmartMoneyPrivate) {
+			status = "PRIVATE"
 		}
 		p.setObservation(SourceHealthObservation{Status: status, TraderName: profile.TraderName, Error: err.Error(), CheckedAt: checkedAt})
 		return nil, err
@@ -440,7 +534,11 @@ func (p *BinanceSmartMoneyProvider) GetAccountState(leaderID string) (*AccountSt
 			state.Positions[posID].Instrument = &instCopy
 		}
 	}
-	p.setObservation(SourceHealthObservation{Status: "HEALTHY", TraderName: profile.TraderName, CompleteSnapshot: true, CheckedAt: checkedAt})
+	p.mu.Lock()
+	gate := p.credentialGate
+	p.mu.Unlock()
+	gate.recordHealthySnapshot()
+	p.setObservation(SourceHealthObservation{Status: "HEALTHY", TraderName: profile.TraderName, CompleteSnapshot: true, CheckedAt: checkedAt, ActiveLeaderPosition: len(state.Positions) > 0})
 	// M5：只在快照非空时更新基线。空快照确认后若立即把基线归零并清空
 	// candidate，下一轮空快照将不再携带 EmptySnapshotConfirmed 标记；
 	// 引擎层（confirmSmartMoneyEmptySnapshot）会因此再跑一轮完整确认
@@ -534,19 +632,28 @@ type binanceSmartProfile struct {
 }
 
 func (p *BinanceSmartMoneyProvider) getProfile(topTraderID string, now time.Time, force bool) (*binanceSmartProfile, error) {
+	p20t, csrf, credentialErr := p.auth.credentials()
+	if credentialErr != nil {
+		return nil, credentialErr
+	}
+	fingerprint := smartMoneyCredentialKey(p20t + "\x00" + csrf)
 	p.mu.Lock()
+	if !p.credentialFingerprintSet || p.credentialFingerprint != fingerprint {
+		p.profile = nil
+		p.profileTopTraderID = ""
+		p.profileFetchedAt = time.Time{}
+		p.credentialFingerprint = fingerprint
+		p.credentialFingerprintSet = true
+		p.credentialGate = smartMoneyGateForCredential(p20t)
+	}
 	if !force && p.profile != nil && p.profileTopTraderID == topTraderID && now.Sub(p.profileFetchedAt) < smartMoneyProfileTTL {
 		copy := *p.profile
 		p.mu.Unlock()
 		return &copy, nil
 	}
 	p.mu.Unlock()
-	p20t, csrf, err := p.auth.credentials()
-	if err != nil {
-		return nil, err
-	}
 	endpoint := BinanceSmartMoneyProfileAPI + "?topTraderId=" + url.QueryEscape(topTraderID)
-	raw, _, err := binanceWebRequest(p.client, p20t, csrf, http.MethodGet, endpoint, nil)
+	raw, _, err := p.smartMoneyRequest(http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -614,10 +721,6 @@ func (p *BinanceSmartMoneyProvider) requireSmartDiagnosticSharing(topTraderID st
 }
 
 func (p *BinanceSmartMoneyProvider) fetchAllSmartDiagnosticRows(topTraderID, endpoint string, startTime, endTime time.Time, rowsPerPage int, includeMarketType bool) ([]json.RawMessage, error) {
-	p20t, csrf, err := p.auth.credentials()
-	if err != nil {
-		return nil, err
-	}
 	var all []json.RawMessage
 	expectedTotal := -1
 	seenPages := make(map[string]bool)
@@ -632,7 +735,7 @@ func (p *BinanceSmartMoneyProvider) fetchAllSmartDiagnosticRows(topTraderID, end
 		if includeMarketType {
 			q.Set("marketType", "UM")
 		}
-		raw, _, requestErr := binanceWebRequest(p.client, p20t, csrf, http.MethodGet, endpoint+"?"+q.Encode(), nil)
+		raw, _, requestErr := p.smartMoneyRequest(http.MethodGet, endpoint+"?"+q.Encode(), nil)
 		if requestErr != nil {
 			return nil, fmt.Errorf("query page %d: %w", page, requestErr)
 		}
@@ -869,17 +972,13 @@ type binanceSmartPositionRaw struct {
 }
 
 func (p *BinanceSmartMoneyProvider) fetchAllPositions(topTraderID string) ([]binanceSmartPositionRaw, error) {
-	p20t, csrf, err := p.auth.credentials()
-	if err != nil {
-		return nil, err
-	}
 	var all []binanceSmartPositionRaw
 	expectedTotal := -1
 	seenPages := make(map[string]bool)
 	seenPositions := make(map[string]bool)
 	for page := 1; page <= smartMoneyMaxPages; page++ {
 		q := url.Values{"topTraderId": {topTraderID}, "marketType": {"UM"}, "page": {strconv.Itoa(page)}, "rows": {strconv.Itoa(smartMoneyRows)}}
-		raw, _, reqErr := binanceWebRequest(p.client, p20t, csrf, http.MethodGet, BinanceSmartMoneyPositionsAPI+"?"+q.Encode(), nil)
+		raw, _, reqErr := p.smartMoneyRequest(http.MethodGet, BinanceSmartMoneyPositionsAPI+"?"+q.Encode(), nil)
 		if reqErr != nil {
 			return nil, fmt.Errorf("query Smart Money positions page %d: %w", page, reqErr)
 		}

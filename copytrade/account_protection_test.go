@@ -9,7 +9,7 @@ func TestAccountProtectionUsesStructureThenHardLossCap(t *testing.T) {
 	cfg := &CopyConfig{RiskSlippageBufferBPS: 0, RiskRoundTripFeeBPS: 0, RiskStopPriority: "account_cap"}
 	got, err := ComputeAccountProtectionDistance(
 		cfg, SideLong, 100, 1000, 100,
-		2, 4, 90, 0.10,
+		2, 4, 90, 0.10, 1,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -26,7 +26,7 @@ func TestAccountProtectionKeepsDistantStructureWithinCap(t *testing.T) {
 	cfg := &CopyConfig{RiskSlippageBufferBPS: 0, RiskRoundTripFeeBPS: 0}
 	got, err := ComputeAccountProtectionDistance(
 		cfg, SideShort, 100, 100, 100,
-		2, 4, 110, 0.30,
+		2, 4, 110, 0.30, 1,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -43,7 +43,7 @@ func TestAccountProtectionVolatilityFirstWarnsWithoutCompressingATR(t *testing.T
 	}
 	got, err := ComputeAccountProtectionDistance(
 		cfg, SideShort, 1974.41, 2918, 100,
-		11, 22, 0, 0.10,
+		11, 22, 0, 0.10, 100,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -56,6 +56,39 @@ func TestAccountProtectionVolatilityFirstWarnsWithoutCompressingATR(t *testing.T
 	}
 	if got.DistanceATRRatio < 1.99 {
 		t.Fatalf("expected roughly 2 ATR, got %.4f", got.DistanceATRRatio)
+	}
+}
+
+func TestAccountProtectionIncludesFeesInPositionMarginCap(t *testing.T) {
+	cfg := &CopyConfig{
+		RiskStopPriority:      "volatility_first",
+		RiskLeverageFallback:  true,
+		RiskLeverageMaxLoss:   0.50,
+		RiskSlippageBufferBPS: 10,
+		RiskRoundTripFeeBPS:   10,
+	}
+	got, err := ComputeAccountProtectionDistance(
+		cfg, SideLong, 100, 1000, 1000,
+		2, 4, 0, 0.30, 10,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Initial margin=100, total cap=50. Friction=2, so price loss budget=48
+	// and the trigger distance is 4.8. ATR=4 remains tighter in this case.
+	if got.GovernedBy != "atr" || math.Abs(got.ExpectedMarginLossPct-0.42) > 1e-9 {
+		t.Fatalf("unexpected wider margin cap result: %+v", got)
+	}
+
+	got, err = ComputeAccountProtectionDistance(
+		cfg, SideLong, 100, 1000, 1000,
+		2, 8, 0, 0.30, 10,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GovernedBy != "margin_cap" || math.Abs(got.Distance-4.8) > 1e-9 || math.Abs(got.ExpectedMarginLossPct-0.50) > 1e-9 {
+		t.Fatalf("position margin cap must include friction exactly: %+v", got)
 	}
 }
 

@@ -244,6 +244,9 @@ func (s *Store) initTables() error {
 	if err := s.CopyTrade().initCopyEventTable(); err != nil {
 		return fmt.Errorf("failed to initialize copy trade event table: %w", err)
 	}
+	if err := s.CopyTrade().migratePositionMarginStops(); err != nil {
+		return fmt.Errorf("failed to migrate position margin stops: %w", err)
+	}
 	if err := s.CopyTrade().initSourceHealthTable(); err != nil {
 		return fmt.Errorf("failed to initialize copy trade source health table: %w", err)
 	}

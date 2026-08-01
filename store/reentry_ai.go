@@ -29,6 +29,10 @@ const (
 	ReentryVerdictWait    = "WAIT"
 	ReentryVerdictSkip    = "SKIP"
 	ReentryVerdictAbandon = "ABANDON"
+	// ReentryVerdictThesisInvalid is the v6 non-terminal invalidation verdict.
+	// It moves the candidate to DORMANT_REARM until a new structural event
+	// creates another decision generation.
+	ReentryVerdictThesisInvalid = "THESIS_INVALID_NOW"
 )
 
 // ReentryAIAnalysis 一次数据包快照 + 双 AI 结果载体
@@ -56,10 +60,17 @@ type ReentryAIAnalysis struct {
 	MissingFields       string `json:"missing_fields"` // 逗号分隔的降级字段列表
 
 	// 内部 AI（Phase 2 起填充）
-	RawResponse string  `json:"raw_response"`
-	Verdict     string  `json:"verdict"`
-	Confidence  float64 `json:"confidence"`
-	Reasons     string  `json:"reasons"`
+	RawResponse         string  `json:"raw_response"`
+	Verdict             string  `json:"verdict"`
+	Confidence          float64 `json:"confidence"`
+	Reasons             string  `json:"reasons"`
+	AIStopPrice         float64 `json:"ai_stop_price"`
+	StopBasis           string  `json:"stop_basis"`
+	CloseInvalidation   string  `json:"close_invalidation"`
+	SupportZonesJSON    string  `json:"support_zones_json"`
+	ResistanceZonesJSON string  `json:"resistance_zones_json"`
+	TargetZonesJSON     string  `json:"target_zones_json"`
+	RearmConditionsJSON string  `json:"rearm_conditions_json"`
 
 	// 外部 AI（用户粘贴，永久可编辑）
 	ExternalResponse string `json:"external_response"`
@@ -118,6 +129,13 @@ func (s *ReentryAIStore) initTables() error {
 			verdict TEXT DEFAULT '',
 			confidence REAL DEFAULT 0,
 			reasons TEXT DEFAULT '',
+			ai_stop_price REAL DEFAULT 0,
+			stop_basis TEXT DEFAULT '',
+			close_invalidation TEXT DEFAULT '',
+			support_zones_json TEXT DEFAULT '[]',
+			resistance_zones_json TEXT DEFAULT '[]',
+			target_zones_json TEXT DEFAULT '[]',
+			rearm_conditions_json TEXT DEFAULT '[]',
 			external_response TEXT DEFAULT '',
 			external_verdict TEXT DEFAULT '',
 			prompt_version TEXT DEFAULT '',
@@ -162,6 +180,13 @@ func (s *ReentryAIStore) initTables() error {
 		{"reentry_ai_analyses", "model_started_at", "DATETIME"},
 		{"reentry_ai_analyses", "model_completed_at", "DATETIME"},
 		{"reentry_ai_analyses", "decision_expires_at", "DATETIME"},
+		{"reentry_ai_analyses", "ai_stop_price", "REAL DEFAULT 0"},
+		{"reentry_ai_analyses", "stop_basis", "TEXT DEFAULT ''"},
+		{"reentry_ai_analyses", "close_invalidation", "TEXT DEFAULT ''"},
+		{"reentry_ai_analyses", "support_zones_json", "TEXT DEFAULT '[]'"},
+		{"reentry_ai_analyses", "resistance_zones_json", "TEXT DEFAULT '[]'"},
+		{"reentry_ai_analyses", "target_zones_json", "TEXT DEFAULT '[]'"},
+		{"reentry_ai_analyses", "rearm_conditions_json", "TEXT DEFAULT '[]'"},
 		{"reentry_ai_config", "ai_enabled", "BOOLEAN DEFAULT 0"},
 		{"reentry_ai_config", "auto_entry_enabled", "BOOLEAN DEFAULT 0"},
 		{"reentry_ai_config", "analysis_focus", "TEXT DEFAULT ''"},
@@ -209,6 +234,7 @@ func (s *ReentryAIStore) initTables() error {
 const reentryAnalysisColumns = `id, signal_id, candidate_id, trader_id, cycle_id, symbol, side, attempt_no, decision_generation, call_status, call_error, data_hash,
 	system_prompt, user_prompt, datapack_json, market_data_available, missing_fields,
 	raw_response, verdict, confidence, reasons, external_response, external_verdict,
+	ai_stop_price,stop_basis,close_invalidation,support_zones_json,resistance_zones_json,target_zones_json,rearm_conditions_json,
 	prompt_version, snapshot_price, snapshot_at, model_started_at, model_completed_at, decision_expires_at, outcome_pnl, created_at, updated_at`
 
 func scanReentryAnalysis(row rowScanner) (*ReentryAIAnalysis, error) {
@@ -220,6 +246,7 @@ func scanReentryAnalysis(row rowScanner) (*ReentryAIAnalysis, error) {
 		&a.AttemptNo, &a.DecisionGeneration, &a.CallStatus, &a.CallError, &a.DataHash,
 		&a.SystemPrompt, &a.UserPrompt, &a.DatapackJSON, &a.MarketDataAvailable, &a.MissingFields,
 		&a.RawResponse, &a.Verdict, &a.Confidence, &a.Reasons, &a.ExternalResponse, &a.ExternalVerdict,
+		&a.AIStopPrice, &a.StopBasis, &a.CloseInvalidation, &a.SupportZonesJSON, &a.ResistanceZonesJSON, &a.TargetZonesJSON, &a.RearmConditionsJSON,
 		&a.PromptVersion, &a.SnapshotPrice, &snapshot, &modelStarted, &modelCompleted, &decisionExpires, &outcome, &created, &updated); err != nil {
 		return nil, err
 	}
@@ -403,8 +430,12 @@ func (s *ReentryAIStore) UpdateReentryInternalResult(id int64, rawResponse, verd
 // CompleteReentryInternalResult completes a model call and starts the decision
 // TTL at model completion, rather than consuming it while the model is running.
 func (s *ReentryAIStore) CompleteReentryInternalResult(id int64, rawResponse, verdict string, confidence float64, reasons string, ttlSeconds int) error {
+	return s.CompleteReentryInternalResultV6(id, rawResponse, verdict, confidence, reasons, ttlSeconds, 0, "", "", "[]", "[]", "[]", "[]")
+}
+
+func (s *ReentryAIStore) CompleteReentryInternalResultV6(id int64, rawResponse, verdict string, confidence float64, reasons string, ttlSeconds int, aiStopPrice float64, stopBasis, closeInvalidation, supportZones, resistanceZones, targetZones, rearmConditions string) error {
 	switch verdict {
-	case "", ReentryVerdictEnter, ReentryVerdictWait, ReentryVerdictSkip, ReentryVerdictAbandon:
+	case "", ReentryVerdictEnter, ReentryVerdictWait, ReentryVerdictSkip, ReentryVerdictAbandon, ReentryVerdictThesisInvalid:
 	default:
 		return fmt.Errorf("无效的内部结论标签: %s", verdict)
 	}
@@ -417,9 +448,9 @@ func (s *ReentryAIStore) CompleteReentryInternalResult(id int64, rawResponse, ve
 	if ttlSeconds < 15 || ttlSeconds > 60 {
 		ttlSeconds = 30
 	}
-	res, err := s.db.Exec(`UPDATE reentry_ai_analyses SET raw_response=?, verdict=?, confidence=?, reasons=?,call_status=?,call_error=?,
+	res, err := s.db.Exec(`UPDATE reentry_ai_analyses SET raw_response=?, verdict=?, confidence=?, reasons=?,ai_stop_price=?,stop_basis=?,close_invalidation=?,support_zones_json=?,resistance_zones_json=?,target_zones_json=?,rearm_conditions_json=?,call_status=?,call_error=?,
 		model_completed_at=CURRENT_TIMESTAMP, decision_expires_at=datetime(CURRENT_TIMESTAMP, ?), updated_at=CURRENT_TIMESTAMP WHERE id=?`,
-		rawResponse, verdict, confidence, reasons, callStatus, callError, fmt.Sprintf("+%d seconds", ttlSeconds), id)
+		rawResponse, verdict, confidence, reasons, aiStopPrice, stopBasis, closeInvalidation, supportZones, resistanceZones, targetZones, rearmConditions, callStatus, callError, fmt.Sprintf("+%d seconds", ttlSeconds), id)
 	if err != nil {
 		return err
 	}
@@ -455,12 +486,16 @@ func (s *ReentryAIStore) MarkReentryAnalysisRunning(id int64) error {
 	return nil
 }
 
-func (s *ReentryAIStore) HasCompletedCandidateDataHash(candidateID, beforeID int64, dataHash string) (bool, error) {
+func (s *ReentryAIStore) HasCompletedCandidateDataHash(candidateID, beforeID int64, dataHash string, promptVersions ...string) (bool, error) {
 	if candidateID <= 0 || beforeID <= 0 || dataHash == "" {
 		return false, nil
 	}
+	promptVersion := ""
+	if len(promptVersions) > 0 {
+		promptVersion = promptVersions[0]
+	}
 	var exists int
-	err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM reentry_ai_analyses WHERE candidate_id=? AND id<? AND data_hash=? AND call_status='COMPLETED')`, candidateID, beforeID, dataHash).Scan(&exists)
+	err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM reentry_ai_analyses WHERE candidate_id=? AND id<? AND data_hash=? AND prompt_version=? AND call_status='COMPLETED')`, candidateID, beforeID, dataHash, promptVersion).Scan(&exists)
 	return exists == 1, err
 }
 

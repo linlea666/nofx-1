@@ -147,3 +147,26 @@ func TestClosedKlinesExcludeFormingCandle(t *testing.T) {
 		t.Fatalf("forming candle leaked into technical inputs: %+v", got)
 	}
 }
+
+func TestSummarizeKlinesProvidesClosedVWAPAndSwingFibonacci(t *testing.T) {
+	base := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+	klines := make([]market.Kline, 0, 30)
+	for i := 0; i < 30; i++ {
+		closePrice := 100 + float64(i)
+		klines = append(klines, market.Kline{
+			OpenTime: base.Add(time.Duration(i) * time.Hour).UnixMilli(), CloseTime: base.Add(time.Duration(i+1) * time.Hour).UnixMilli(),
+			Open: closePrice - 1, High: closePrice + 2, Low: closePrice - 2, Close: closePrice,
+			Volume: 10, QuoteVolume: closePrice * 10,
+		})
+	}
+	summary := summarizeKlines(klines, 30)
+	if summary.VWAP == nil || !summary.VWAP.Available || summary.VWAP.Value <= 0 {
+		t.Fatalf("closed-candle VWAP unavailable: %+v", summary.VWAP)
+	}
+	if summary.SwingAnchors == nil || !summary.SwingAnchors.Available || summary.SwingAnchors.High <= summary.SwingAnchors.Low {
+		t.Fatalf("swing anchors unavailable: %+v", summary.SwingAnchors)
+	}
+	if len(summary.Fibonacci) != 5 || summary.Fibonacci["61.8%"] == nil || !summary.Fibonacci["61.8%"].Available {
+		t.Fatalf("fibonacci evidence unavailable: %+v", summary.Fibonacci)
+	}
+}

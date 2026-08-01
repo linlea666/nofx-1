@@ -11,8 +11,11 @@ import (
 	"nofx/store"
 )
 
-const connectionSelfTestPrompt = `这是一次零交易的连接与 JSON Schema 自检，不包含真实候选，也绝不应建议入场。请忽略市场判断，严格只返回以下 JSON 对象且不要输出其他文本：
+const connectionSelfTestPromptV5 = `这是一次零交易的连接与 JSON Schema 自检，不包含真实候选，也绝不应建议入场。请忽略市场判断，严格只返回以下 JSON 对象且不要输出其他文本：
 {"decision":"WAIT","regime":"CHOP","confidence":0.0,"size_factor":0.0,"entry_price_low":0.0,"entry_price_high":0.0,"attention_price_low":0.0,"attention_price_high":0.0,"ttl_seconds":30,"next_review_seconds":900,"reasons":["connection and schema self-test"],"risk_notes":["no trade candidate was evaluated"]}`
+
+const connectionSelfTestPromptV6 = `这是一次零交易的连接与 JSON Schema 自检，不包含真实候选，也绝不应建议入场。请忽略市场判断，严格只返回以下 JSON 对象且不要输出其他文本：
+{"decision":"WAIT","regime":"CHOP","multi_timeframe_trend":{"5m":"RANGE","15m":"RANGE","1h":"RANGE","4h":"RANGE","1d":"RANGE"},"market_phase":"RANGE","confidence":0.0,"size_factor":0.0,"entry_price_low":0.0,"entry_price_high":0.0,"ai_stop_price":0.0,"stop_basis":"self-test","close_invalidation":"self-test","support_zones":[],"resistance_zones":[],"target_zones":[],"attention_price_low":0.0,"attention_price_high":0.0,"ttl_seconds":30,"next_review_seconds":900,"rearm_conditions":[],"reasons":["connection and schema self-test"],"risk_notes":["no trade candidate was evaluated"]}`
 
 // runCandidateSchemaSelfTest is deliberately shared by the production client
 // factory and unit tests. Passing the same strict parser here catches provider,
@@ -22,11 +25,16 @@ func runCandidateSchemaSelfTest(client mcp.AIClient, systemPrompt string) (strin
 	if client == nil {
 		return "", nil, fmt.Errorf("AI client is nil")
 	}
-	raw, err := client.CallWithMessages(systemPrompt, connectionSelfTestPrompt)
+	version := activeCandidatePromptVersion()
+	userPrompt := connectionSelfTestPromptV6
+	if version == candidatePromptVersionV5 {
+		userPrompt = connectionSelfTestPromptV5
+	}
+	raw, err := client.CallWithMessages(systemPrompt, userPrompt)
 	if err != nil {
 		return "", nil, err
 	}
-	pv, err := parseAICandidateVerdict(raw)
+	pv, err := parseAICandidateVerdictForVersion(raw, version)
 	if err != nil {
 		return raw, nil, err
 	}
@@ -43,7 +51,7 @@ func RunConnectionSelfTest(st *store.Store, userID string) (*store.ReentryAIDiag
 	if st == nil || strings.TrimSpace(userID) == "" {
 		return nil, fmt.Errorf("invalid self-test context")
 	}
-	diagnostic := &store.ReentryAIDiagnostic{UserID: userID, PromptVersion: candidatePromptVersion}
+	diagnostic := &store.ReentryAIDiagnostic{UserID: userID, PromptVersion: activeCandidatePromptVersion()}
 	started := time.Now()
 	cfg, err := st.ReentryAI().GetReentryAIConfig()
 	if err == nil {

@@ -131,8 +131,43 @@ func TestSmartMoneyProviderFullPaginationAndExactSettlementAssets(t *testing.T) 
 			t.Fatalf("%s USD value=%f want=%f", pos.Symbol, pos.PositionValue, want.usd)
 		}
 	}
-	if obs := p.LastSourceHealthObservation(); obs.Status != "HEALTHY" || !obs.CompleteSnapshot {
+	if obs := p.LastSourceHealthObservation(); obs.Status != "HEALTHY" || !obs.CompleteSnapshot || obs.RequestStartedAt.IsZero() || obs.RequestCompletedAt.IsZero() || obs.NextPollAt.IsZero() {
 		t.Fatalf("unexpected health observation: %+v", obs)
+	}
+}
+
+func TestSmartMoneyProfileCacheInvalidatesWhenCredentialsChange(t *testing.T) {
+	loader := &fakeCredsLoader{p20t: "credential-a", csrf: "csrf-a"}
+	p := NewBinanceSmartMoneyProviderWithLoader(loader, "default", "", "")
+	t.Cleanup(func() {
+		smartMoneyCredentialGates.Delete(smartMoneyCredentialKey("credential-a"))
+		smartMoneyCredentialGates.Delete(smartMoneyCredentialKey("credential-b"))
+	})
+	profileCalls := 0
+	p.client.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch {
+		case strings.Contains(req.URL.Path, "query-positions"):
+			return smartHTTPResponse(200, `{"code":"000000","data":{"total":1,"list":[{"symbol":"BTCUSDT","amount":"1","markPrice":"100","entryPrice":"99","leverage":"2"}]}}`), nil
+		case strings.Contains(req.URL.Path, "/smart-money/profile"):
+			profileCalls++
+			return smartHTTPResponse(200, fmt.Sprintf(`{"code":"000000","data":{"traderName":%q,"enable":true,"sharingPosition":true,"umMarginBalance":"1000"}}`, req.Header.Get("Cookie"))), nil
+		case req.URL.Path == "/fapi/v1/exchangeInfo":
+			return smartHTTPResponse(200, `{"symbols":[{"symbol":"BTCUSDT","baseAsset":"BTC","quoteAsset":"USDT","marginAsset":"USDT","contractType":"PERPETUAL","status":"TRADING"}]}`), nil
+		default:
+			return smartHTTPResponse(404, `{}`), nil
+		}
+	})
+	first, err := p.GetAccountState("5082050984257986817")
+	if err != nil || first == nil {
+		t.Fatalf("first state failed: state=%+v err=%v", first, err)
+	}
+	loader.p20t, loader.csrf = "credential-b", "csrf-b"
+	second, err := p.GetAccountState("5082050984257986817")
+	if err != nil || second == nil || profileCalls != 2 {
+		t.Fatalf("credential change did not invalidate profile cache: calls=%d state=%+v err=%v", profileCalls, second, err)
+	}
+	if obs := p.LastSourceHealthObservation(); !strings.Contains(obs.TraderName, "credential-b") {
+		t.Fatalf("stale profile survived credential change: %+v", obs)
 	}
 }
 
@@ -205,7 +240,29 @@ func TestSmartMoneyProviderPrivateAndSecondPageFailureFailClosed(t *testing.T) {
 		}
 	})
 
+	t.Run("positions relationship error refreshes profile classification", func(t *testing.T) {
+		p := NewBinanceSmartMoneyProvider("relationship-refresh", "c")
+		t.Cleanup(func() { smartMoneyCredentialGates.Delete(smartMoneyCredentialKey("relationship-refresh")) })
+		profileCalls := 0
+		p.client.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if strings.Contains(req.URL.Path, "query-positions") {
+				return smartHTTPResponse(200, `{"code":"999999","message":"not following leader"}`), nil
+			}
+			if strings.Contains(req.URL.Path, "/smart-money/profile") {
+				profileCalls++
+				sharing := profileCalls == 1
+				return smartHTTPResponse(200, fmt.Sprintf(`{"code":"000000","data":{"enable":true,"sharingPosition":%t,"umMarginBalance":"1"}}`, sharing)), nil
+			}
+			return smartHTTPResponse(404, `{}`), nil
+		})
+		_, err := p.GetAccountState("5082050984257986817")
+		if !errors.Is(err, ErrBinanceSmartMoneyPrivate) || p.LastSourceHealthObservation().Status != "PRIVATE" || profileCalls != 2 {
+			t.Fatalf("refreshed classification failed: calls=%d err=%v obs=%+v", profileCalls, err, p.LastSourceHealthObservation())
+		}
+	})
+
 	t.Run("auth and transient HTTP errors remain distinct", func(t *testing.T) {
+		t.Cleanup(func() { smartMoneyCredentialGates.Delete(smartMoneyCredentialKey("p")) })
 		auth := NewBinanceSmartMoneyProvider("p", "c")
 		auth.client.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
 			return smartHTTPResponse(200, `{"code":"100001005","message":"Please log in first"}`), nil
@@ -395,7 +452,7 @@ func TestSmartMoneyProviderSuddenEmptyBypassesCachedProfileAndCannotMasqueradeAs
 	}
 }
 
-func TestSmartMoneyProviderRefreshesPrivacyBeforeAcceptingNonEmptySnapshot(t *testing.T) {
+func TestSmartMoneyProviderCachesProfileButRefreshesAfterTTL(t *testing.T) {
 	profileCalls := 0
 	positionCalls := 0
 	p := NewBinanceSmartMoneyProvider("p", "c")
@@ -418,12 +475,21 @@ func TestSmartMoneyProviderRefreshesPrivacyBeforeAcceptingNonEmptySnapshot(t *te
 	if state, err := p.GetAccountState("5082050984257986817"); err != nil || len(state.Positions) != 1 {
 		t.Fatalf("initial public snapshot failed: state=%+v err=%v", state, err)
 	}
+	if state, err := p.GetAccountState("5082050984257986817"); err != nil || len(state.Positions) != 1 {
+		t.Fatalf("hot position path must reuse the profile cache: state=%+v err=%v", state, err)
+	}
+	if profileCalls != 1 || positionCalls != 2 {
+		t.Fatalf("profile cache did not remove the duplicate request: profiles=%d positions=%d", profileCalls, positionCalls)
+	}
+	p.mu.Lock()
+	p.profileFetchedAt = time.Now().Add(-smartMoneyProfileTTL - time.Second)
+	p.mu.Unlock()
 	state, err := p.GetAccountState("5082050984257986817")
 	if !errors.Is(err, ErrBinanceSmartMoneyPrivate) || state != nil {
-		t.Fatalf("non-empty cached positions must not bypass a fresh privacy check: state=%+v err=%v", state, err)
+		t.Fatalf("expired profile must refresh privacy before positions: state=%+v err=%v", state, err)
 	}
-	if profileCalls != 2 || positionCalls != 1 {
-		t.Fatalf("privacy must be refreshed before the second positions request: profiles=%d positions=%d", profileCalls, positionCalls)
+	if profileCalls != 2 || positionCalls != 2 {
+		t.Fatalf("expired privacy profile request counts: profiles=%d positions=%d", profileCalls, positionCalls)
 	}
 }
 

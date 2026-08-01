@@ -31,6 +31,14 @@ type binancePositionHistoryProvider interface {
 	GetPositionHistory(leadPortfolioID string) ([]BinancePositionHistoryRecord, error)
 }
 
+// AuthoritativeSnapshotHotPathProvider declares that polling must use the
+// current position snapshot as its only Binance hot-path request. Historical
+// trades remain available for explicit diagnostics/accounting but may not
+// delay a newly acquired reduce/close/reversal snapshot.
+type AuthoritativeSnapshotHotPathProvider interface {
+	UseAuthoritativeSnapshotHotPath() bool
+}
+
 // Engine 跟单引擎
 type Engine struct {
 	traderID string
@@ -108,6 +116,11 @@ type Engine struct {
 	// AI 模式只需按已收盘 5m K 线检查结构事件；该内存限频不承担正确性，
 	// 重启后持久化的 last_review_at/feature_hash 仍可防重复模型调用。
 	lastAICandleFeatureCheck map[int64]time.Time
+	// riskIncreaseBlockReason freezes only open/add decisions during startup
+	// reconciliation. Reductions, closes, protection and exchange accounting do
+	// not use this lock or this gate.
+	riskIncreaseBlockMu     sync.RWMutex
+	riskIncreaseBlockReason string
 }
 
 // EngineOption 引擎配置选项
@@ -494,11 +507,17 @@ func (e *Engine) recordSmartMoneySourceHealth() bool {
 		string(e.config.BinanceSourceMode),
 		generation,
 		store.SourceHealthObservation{
-			Status:           obs.Status,
-			TraderName:       obs.TraderName,
-			Error:            obs.Error,
-			CompleteSnapshot: obs.CompleteSnapshot,
-			CheckedAt:        obs.CheckedAt,
+			Status:             obs.Status,
+			TraderName:         obs.TraderName,
+			Error:              obs.Error,
+			CompleteSnapshot:   obs.CompleteSnapshot,
+			CheckedAt:          obs.CheckedAt,
+			RequestStartedAt:   obs.RequestStartedAt,
+			RequestCompletedAt: obs.RequestCompletedAt,
+			RequestDurationMS:  obs.RequestDurationMS,
+			NextPollAt:         obs.NextPollAt,
+			BackoffUntil:       obs.BackoffUntil,
+			RateLimit429Count:  obs.RateLimit429Count,
 		},
 	)
 	if err != nil {
@@ -576,7 +595,7 @@ func (e *Engine) notifySmartMoneySourceHealth(health *store.CopyTradeSourceHealt
 	if health.LastCompleteSnapshotAt != nil {
 		lastComplete = health.LastCompleteSnapshotAt.Format(time.RFC3339)
 	}
-	body := fmt.Sprintf("领航员: %s (%s)\n交易员: %s\n执行交易所: %s\n状态: %s\n最后完整快照: %s\n活动映射: %s\n保护状态: %s\n连续失败: %d\n原因: %s\n处理: 冻结新开/加仓/减仓/平仓同步，已有仓位 Copy Guard 继续运行，不会把数据不可见视为全平。",
+	body := fmt.Sprintf("领航员: %s (%s)\n交易员: %s\n执行交易所: %s\n状态: %s\n最后完整快照: %s\n活动映射: %s\n保护状态: %s\n连续失败: %d\n原因: %s\n处理: 冻结依赖新源快照的开仓/加仓；已有仓位 Copy Guard、执行和对账继续运行，不会把数据不可见视为全平。",
 		health.TraderName, health.LeaderID, traderName, executionExchange, health.Status, lastComplete, activeMappings, protectionSummary, health.ConsecutiveFailures, health.LastError)
 	if recovered {
 		body = fmt.Sprintf("领航员: %s (%s)\n交易员: %s\n执行交易所: %s\n状态: HEALTHY\n完整快照: %s\n活动映射: %s\n保护状态: %s\n处理: 私密期间的减仓/平仓会立即同步；新仓/加仓只重建基线，不追单。",
@@ -585,16 +604,29 @@ func (e *Engine) notifySmartMoneySourceHealth(health *store.CopyTradeSourceHealt
 	bucket := now.Unix() / 3600
 	dedup := fmt.Sprintf("source_health|%s|%s|%d", e.traderID, health.Status, bucket)
 	if recovered {
-		dedup = fmt.Sprintf("source_health|%s|recovered|%d", e.traderID, now.Unix())
+		transition := int64(0)
+		if health.LastTransitionAt != nil {
+			transition = health.LastTransitionAt.UTC().UnixNano()
+		}
+		dedup = fmt.Sprintf("source_health|%s|recovered|%d|%d", e.traderID, health.SourceGeneration, transition)
 	}
 	notifier.Notify(notifier.Alert{
 		Time: now, Category: "copy_trade", TraderID: e.traderID, TraderName: traderName,
 		Title: title, Body: body, RateKey: dedup, DedupKey: dedup,
 		Fields: map[string]string{"LeaderID": health.LeaderID, "ExecutionExchange": executionExchange, "SourceStatus": health.Status, "LastCompleteSnapshot": lastComplete, "ActiveMappings": activeMappings, "Protection": protectionSummary},
+		StatusHook: func(delivery notifier.DeliveryStatus, deliveryErr error) {
+			message := ""
+			if deliveryErr != nil {
+				message = deliveryErr.Error()
+			}
+			if err := e.store.CopyTrade().MarkSourceHealthMailDelivery(e.traderID, string(delivery), message, time.Now()); err != nil {
+				logger.Warnf("⚠️ [%s] 保存 Smart Money 邮件投递状态失败: %v", e.traderID, err)
+			}
+		},
 	})
 	if err := e.store.CopyTrade().LogCopyEvent(&store.CopyTradeEvent{
 		TraderID: e.traderID, LeaderID: health.LeaderID, ProviderType: string(ProviderBinance),
-		Category: store.CopyEventCategoryError, EventType: "SOURCE_HEALTH_" + health.Status,
+		Category: map[bool]string{true: store.CopyEventCategoryReconcile, false: store.CopyEventCategoryError}[recovered], EventType: "SOURCE_HEALTH_" + health.Status,
 		Severity: severity, Status: status, Summary: title,
 		Detail:   map[string]interface{}{"source_mode": health.SourceMode, "last_complete_snapshot": lastComplete, "consecutive_failures": health.ConsecutiveFailures, "error": health.LastError},
 		DedupKey: dedup, CreatedAt: now,
@@ -628,10 +660,7 @@ func (e *Engine) smartMoneyRecoveryRequired(checkedAt time.Time) (bool, error) {
 	if health == nil {
 		return false, nil
 	}
-	if health.Status != store.SourceHealthHealthy || health.LastCompleteSnapshotAt == nil {
-		return true, nil
-	}
-	return checkedAt.Sub(*health.LastCompleteSnapshotAt) > time.Minute, nil
+	return health.Status != store.SourceHealthHealthy, nil
 }
 
 func (e *Engine) confirmSmartMoneyEmptySnapshot(state *AccountState, now time.Time) error {
@@ -781,8 +810,8 @@ func (e *Engine) Stop() {
 const pollLookbackWindow = 5 * time.Minute
 
 func (e *Engine) pollLoop(ctx context.Context) {
-	ticker := time.NewTicker(3 * time.Second)
-	defer ticker.Stop()
+	timer := time.NewTimer(e.nextPollDelay())
+	defer timer.Stop()
 
 	for {
 		select {
@@ -790,12 +819,36 @@ func (e *Engine) pollLoop(ctx context.Context) {
 			return
 		case <-e.stopCh:
 			return
-		case <-ticker.C:
+		case <-timer.C:
 			e.poll()
+			timer.Reset(e.nextPollDelay())
 		case <-e.pollNowCh:
 			e.poll()
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(e.nextPollDelay())
 		}
 	}
+}
+
+func (e *Engine) nextPollDelay() time.Duration {
+	const defaultDelay = 3 * time.Second
+	scheduler, ok := e.provider.(SourcePollScheduleProvider)
+	if !ok {
+		return defaultDelay
+	}
+	e.leaderStateMu.RLock()
+	active := e.leaderState != nil && len(e.leaderState.Positions) > 0
+	e.leaderStateMu.RUnlock()
+	delay := scheduler.SuggestedSourcePollDelay(active)
+	if delay <= 0 {
+		return defaultDelay
+	}
+	return delay
 }
 
 func (e *Engine) poll() {
@@ -804,14 +857,22 @@ func (e *Engine) poll() {
 	// 且 UnmarkSeen 重放机制依赖 fill 在后续 poll 中仍可拉到。
 	// 扩大窗口的重复处理风险由 seenFills 去重 + 状态化匹配（持仓 size 对比）双重兜底。
 	since := time.Now().Add(-pollLookbackWindow)
-	fills, err := e.provider.GetFills(e.config.LeaderID, since)
-	if err != nil {
-		e.reportBinanceCredentialsExpired(err, "poll/GetFills")
-		logger.Warnf("⚠️ [%s] 获取成交记录失败: %v", e.traderID, err)
-		if e.config.ProviderType != ProviderBinance && e.config.ProviderType != ProviderOKX {
-			return
+	useSnapshotHotPath := false
+	if provider, ok := e.provider.(AuthoritativeSnapshotHotPathProvider); ok {
+		useSnapshotHotPath = provider.UseAuthoritativeSnapshotHotPath()
+	}
+	var fills []Fill
+	if !useSnapshotHotPath {
+		var err error
+		fills, err = e.provider.GetFills(e.config.LeaderID, since)
+		if err != nil {
+			e.reportBinanceCredentialsExpired(err, "poll/GetFills")
+			logger.Warnf("⚠️ [%s] 获取成交记录失败: %v", e.traderID, err)
+			if e.config.ProviderType != ProviderBinance && e.config.ProviderType != ProviderOKX {
+				return
+			}
+			fills = nil
 		}
-		fills = nil
 	}
 
 	// 按时间排序（确保反向开仓按顺序处理）
@@ -829,8 +890,9 @@ func (e *Engine) poll() {
 
 	// 🔑 第二步：同步领航员持仓（确保用最新数据判断）
 	if e.config.ProviderType == ProviderBinance {
-		// Binance 成交历史会延迟数分钟；实时持仓快照才是开仓/加仓/减仓/平仓的主信号。
-		// 成交历史仍保留为兜底，但只在快照没有检测到变化时处理，避免迟到成交重复触发。
+		// Binance Web sources use the current position snapshot as the sole hot
+		// path. Delayed history remains diagnostic/accounting evidence and cannot
+		// hold a newly acquired close/reduce snapshot behind another web request.
 		if err := e.syncLeaderState(); err != nil {
 			// fail-closed：同步失败时快照对账无法进行，本轮不得继续消费
 			// trade-history 兜底成交——否则会在过期 leaderState 上做决策，
@@ -1251,6 +1313,9 @@ func (e *Engine) binanceCloseSignalPrice(mapping *store.CopyTradePositionMapping
 	if mapping == nil {
 		return 0
 	}
+	if provider, ok := e.provider.(AuthoritativeSnapshotHotPathProvider); ok && provider.UseAuthoritativeSnapshotHotPath() {
+		return mapping.ClosePrice
+	}
 	if price := e.latestBinanceClosedPositionPrice(mapping.Symbol, SideType(mapping.Side)); price > 0 {
 		return price
 	}
@@ -1441,6 +1506,24 @@ func (e *Engine) requestAuthoritativePoll() {
 	case e.pollNowCh <- struct{}{}:
 	default:
 	}
+}
+
+func (e *Engine) setRiskIncreaseBlock(reason string) {
+	if e == nil {
+		return
+	}
+	e.riskIncreaseBlockMu.Lock()
+	e.riskIncreaseBlockReason = strings.TrimSpace(reason)
+	e.riskIncreaseBlockMu.Unlock()
+}
+
+func (e *Engine) riskIncreaseBlock() string {
+	if e == nil {
+		return ""
+	}
+	e.riskIncreaseBlockMu.RLock()
+	defer e.riskIncreaseBlockMu.RUnlock()
+	return e.riskIncreaseBlockReason
 }
 
 // matchOpenAddSignal 匹配开仓/加仓信号
@@ -1895,7 +1978,11 @@ func (e *Engine) processSignal(signal *TradeSignal) {
 	// 回填匹配结果到 signal（供后续逻辑使用）
 	signal.LeaderPosID = matchResult.PosID
 	signal.LeaderPosition = matchResult.LeaderPosition
-	invalidSourceRiskIncrease := e.blockInvalidSourceRiskIncrease(signal, matchResult)
+	migrationRiskBlock := ""
+	if (matchResult.Action == ActionOpen || matchResult.Action == ActionAdd) && e.riskIncreaseBlock() != "" {
+		migrationRiskBlock = e.riskIncreaseBlock()
+	}
+	invalidSourceRiskIncrease := migrationRiskBlock != "" || e.blockInvalidSourceRiskIncrease(signal, matchResult)
 
 	// ========================================
 	// Step 3: 计算跟单仓位（基于持仓变化量）
@@ -1920,10 +2007,17 @@ func (e *Engine) processSignal(signal *TradeSignal) {
 	if !e.reserveExecutionIntent(&dec) {
 		return
 	}
+	e.recordSmartMoneyProcessingDelay()
 
 	if invalidSourceRiskIncrease {
-		e.deferReservedIntentForSourceData(&dec, "SOURCE_VALUE_UNAVAILABLE")
-		logger.Infof("🎯 [%s] ⏳ %s暂停 | %s | USD 价值换算不可用，等待权威数据恢复", e.traderID, matchResult.Action, fill.Symbol)
+		reasonCode := "SOURCE_VALUE_UNAVAILABLE"
+		reason := "USD 价值换算不可用，等待权威数据恢复"
+		if migrationRiskBlock != "" {
+			reasonCode = "MIGRATION_RECONCILING"
+			reason = migrationRiskBlock
+		}
+		e.deferReservedIntentForSourceData(&dec, reasonCode)
+		logger.Infof("🎯 [%s] ⏳ %s暂停 | %s | %s", e.traderID, matchResult.Action, fill.Symbol, reason)
 		e.stats.SignalsSkipped++
 		return
 	}
@@ -1988,6 +2082,23 @@ func (e *Engine) processSignal(signal *TradeSignal) {
 		}
 		logger.Errorf("❌ [%s] 决策通道已满，丢弃决策并释放去重标记等待重放 | %s %s fillID=%s",
 			e.traderID, dec.Action, dec.Symbol, fill.ID)
+	}
+}
+
+func (e *Engine) recordSmartMoneyProcessingDelay() {
+	if !e.isSmartMoneyMode() || e.store == nil {
+		return
+	}
+	provider, ok := e.provider.(SourceHealthObservationProvider)
+	if !ok {
+		return
+	}
+	completed := provider.LastSourceHealthObservation().RequestCompletedAt
+	if completed.IsZero() {
+		return
+	}
+	if err := e.store.CopyTrade().MarkSourceHealthProcessingDelay(e.traderID, time.Since(completed)); err != nil {
+		logger.Debugf("[%s] 保存 Smart Money 跟单处理延迟失败: %v", e.traderID, err)
 	}
 }
 
@@ -2868,7 +2979,7 @@ func (e *Engine) syncLeaderState() error {
 
 	// 🔍 调试日志：打印 API 返回的所有持仓详情（方便排查 posId 问题）
 	for key, pos := range state.Positions {
-		logger.Infof("🔍 [%s] 领航员持仓 | key=%s posId=%s | %s %s %s | size=%.4f",
+		logger.Debugf("🔍 [%s] 领航员持仓 | key=%s posId=%s | %s %s %s | size=%.4f",
 			e.traderID, key, pos.PosID, pos.Symbol, pos.Side, pos.MarginMode, pos.Size)
 	}
 

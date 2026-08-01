@@ -39,6 +39,9 @@ func TestCopyGuardCycleAndEventLedger(t *testing.T) {
 	if err := cs.ReconcileCopyGuardAttempt(cycle.ID, 0, -25, 2, -1, 0); err != nil {
 		t.Fatal(err)
 	}
+	if err := cs.UpdateCopyGuardAttemptAIAudit(cycle.ID, 0, 10, 100, 1000, 1000, "", 0, 0, 0, "margin_stop"); err != nil {
+		t.Fatal(err)
+	}
 	cycle, _ = cs.GetCopyGuardCycle(cycle.ID)
 	if cycle.ActualPnL != -25 || cycle.Fees != 2 || cycle.FundingFee != -1 {
 		t.Fatalf("attempt reconciliation not reflected in cycle: %+v", cycle)
@@ -59,6 +62,12 @@ func TestCopyGuardCycleAndEventLedger(t *testing.T) {
 	if err := cs.UpdateCopyGuardAttemptIdentity(cycle.ID, 1, "follower-pos-1", "entry-1", ""); err != nil {
 		t.Fatal(err)
 	}
+	if err := cs.UpdateCopyGuardAttemptAIAudit(cycle.ID, 1, 5, 100, 40, 500, "AI_REENTRY_PROMOTED_TO_MINIMUM", 96, 96.1, .25, "ai_absolute_stop"); err != nil {
+		t.Fatal(err)
+	}
+	if err := cs.UpdateCopyGuardAttemptProtection(cycle.ID, 1, 96.1, "algo-ai", CopyGuardProtectionVerified, 1); err != nil {
+		t.Fatal(err)
+	}
 	got, err := cs.GetCopyGuardCycle(cycle.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -73,6 +82,15 @@ func TestCopyGuardCycleAndEventLedger(t *testing.T) {
 	attempts, err := cs.ListCopyGuardAttempts(cycle.ID)
 	if err != nil || len(attempts) != 2 || attempts[0].FollowerPosID != "follower-pos-0" || attempts[1].FollowerPosID != "follower-pos-1" || attempts[1].EntryOrderID != "entry-1" {
 		t.Fatalf("attempt identities were overwritten: %+v, %v", attempts, err)
+	}
+	if attempts[1].ActualLeverage != 5 || attempts[1].InitialMarginBasis != 100 || attempts[1].PlannedNotional != 40 || attempts[1].PromotedNotional != 500 || attempts[1].AIStopPrice != 96 || attempts[1].FinalStopPrice != 96.1 || attempts[1].ExpectedPositionLossPct != .25 || attempts[1].StopValidationResult != "PROTECTION_VERIFIED" {
+		t.Fatalf("AI attempt audit did not round-trip: %+v", attempts[1])
+	}
+	if attempts[0].ActualPositionLossPct != .25 {
+		t.Fatalf("reconciled actual position loss = %v, want .25", attempts[0].ActualPositionLossPct)
+	}
+	if attempts[1].ActualPositionLossPct != 0 {
+		t.Fatalf("unreconciled attempt must not expose actual position loss: %+v", attempts[1])
 	}
 	events, err := cs.ListCopyGuardEvents(cycle.ID)
 	if err != nil {

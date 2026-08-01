@@ -90,6 +90,11 @@ const SOURCE_HEALTH_META: Record<
     textClass: 'text-[#F6465D]',
     backgroundClass: 'bg-[#F6465D1A] border-[#F6465D44]',
   },
+  NOT_FOLLOWING_LEADER: {
+    label: '当前未跟随该领航员',
+    textClass: 'text-[#F0B90B]',
+    backgroundClass: 'bg-[#F0B90B14] border-[#F0B90B44]',
+  },
   DEGRADED: {
     label: '数据源连续失败',
     textClass: 'text-[#F0B90B]',
@@ -110,7 +115,19 @@ function formatSourceHealthTime(value?: string): string {
 }
 
 function sourceHealthFrozen(status: CopyTradeSourceHealthStatus): boolean {
-  return ['PRIVATE', 'DISABLED', 'AUTH_FAILED', 'STALE'].includes(status)
+  return [
+    'PRIVATE',
+    'DISABLED',
+    'AUTH_FAILED',
+    'NOT_FOLLOWING_LEADER',
+    'STALE',
+  ].includes(status)
+}
+
+function formatDuration(milliseconds?: number): string {
+  if (!milliseconds || milliseconds < 1) return '—'
+  if (milliseconds < 1000) return `${milliseconds} ms`
+  return `${(milliseconds / 1000).toFixed(2)} s`
 }
 
 function SmartMoneySourceHealthCard({
@@ -150,7 +167,23 @@ function SmartMoneySourceHealthCard({
           最后完整快照：
           {formatSourceHealthTime(health.last_complete_snapshot_at)}
         </span>
+        <span>请求耗时：{formatDuration(health.last_request_duration_ms)}</span>
+        <span>
+          跟单处理延迟：{formatDuration(health.last_processing_delay_ms)}
+        </span>
+        <span>累计 429：{health.rate_limit_429_count ?? 0}</span>
+        <span>下次调度：{formatSourceHealthTime(health.next_poll_at)}</span>
+        <span>退避截止：{formatSourceHealthTime(health.backoff_until)}</span>
+        <span>
+          邮件投递：{health.last_mail_status || '尚无'} ·{' '}
+          {formatSourceHealthTime(health.last_mail_at)}
+        </span>
       </div>
+      {health.last_mail_error && (
+        <p className="break-words text-[11px] text-[#F0B90B]">
+          邮件错误：{health.last_mail_error}
+        </p>
+      )}
       {health.last_error && (
         <p className="break-words text-[11px] text-[#F6465D]">
           原因：{health.last_error}
@@ -249,8 +282,8 @@ interface FormState {
   risk_round_trip_fee_bps: number
   risk_atr_multiplier: number // 默认 2.0
   risk_atr_timeframe: string // 默认 "1h"
-  risk_leverage_fallback: boolean // 默认 false（margin_cap 默认关）
-  risk_leverage_max_loss: number // 默认 20%（前端用百分比展示，提交时转 0.2）：保证金硬 cap
+  risk_leverage_fallback: boolean // 默认 true：开启仓位初始保证金亏损硬上限
+  risk_leverage_max_loss: number // 默认 50%（前端用百分比展示，提交时转 0.5）
   risk_reentry_enabled: boolean // 默认 true：AI guarded 持续观察重入
   risk_reentry_ratio: number // 默认 50%（前端用百分比，提交时转 0.5）
   risk_reentry_decision_mode: 'ai_guarded' | 'legacy_rule' | 'disabled'
@@ -339,8 +372,8 @@ export function TraderConfigModal({
     risk_round_trip_fee_bps: 12,
     risk_atr_multiplier: 2.0, // v5.2 抗噪：默认 2.0×ATR
     risk_atr_timeframe: '1h',
-    risk_leverage_fallback: false, // v5.2：margin_cap 默认关
-    risk_leverage_max_loss: 20, // %（提交时 /100 转 0.2）—— v5 默认 20% 硬 cap
+    risk_leverage_fallback: true,
+    risk_leverage_max_loss: 50, // %（提交时 /100 转 0.5）
     risk_reentry_enabled: true,
     risk_reentry_ratio: 50, // %（提交时 /100 转 0.5）
     risk_reentry_decision_mode: 'ai_guarded',
@@ -496,11 +529,11 @@ export function TraderConfigModal({
             risk_round_trip_fee_bps: cfg.risk_round_trip_fee_bps ?? 12,
             risk_atr_multiplier: cfg.risk_atr_multiplier ?? 2.0,
             risk_atr_timeframe: cfg.risk_atr_timeframe ?? '1h',
-            risk_leverage_fallback: cfg.risk_leverage_fallback ?? false,
+            risk_leverage_fallback: cfg.risk_leverage_fallback ?? true,
             risk_leverage_max_loss:
               cfg.risk_leverage_max_loss != null
                 ? cfg.risk_leverage_max_loss * 100
-                : 20,
+                : 50,
             risk_reentry_enabled: cfg.risk_reentry_enabled ?? true,
             risk_reentry_ratio:
               cfg.risk_reentry_ratio != null
@@ -681,8 +714,8 @@ export function TraderConfigModal({
         risk_round_trip_fee_bps: 12,
         risk_atr_multiplier: 2.0,
         risk_atr_timeframe: '1h',
-        risk_leverage_fallback: false,
-        risk_leverage_max_loss: 20,
+        risk_leverage_fallback: true,
+        risk_leverage_max_loss: 50,
         risk_reentry_enabled: true,
         risk_reentry_ratio: 50,
         risk_reentry_decision_mode: 'ai_guarded',
@@ -1935,8 +1968,8 @@ export function TraderConfigModal({
                                       risk_cycle_loss_budget_pct: 5,
                                       risk_portfolio_loss_budget_pct: 8,
                                       risk_round_trip_fee_bps: 12,
-                                      risk_leverage_fallback: false,
-                                      risk_leverage_max_loss: 20,
+                                      risk_leverage_fallback: true,
+                                      risk_leverage_max_loss: 50,
                                       risk_slippage_buffer_bps: 10,
                                       risk_liquidation_buffer_atr: 0.5,
                                       risk_reentry_enabled: true,
@@ -2326,14 +2359,12 @@ export function TraderConfigModal({
                               <div className="flex items-center justify-between mb-2">
                                 <div>
                                   <label className="text-sm text-[#EAECEF]">
-                                    {formData.risk_policy_version >= 4
-                                      ? 'AI 重入保证金止损上限'
-                                      : '杠杆兜底封顶'}
+                                    仓位保证金止损上限
                                   </label>
                                   <p className="text-xs text-[#848E9C]">
-                                    {formData.risk_policy_version >= 4
-                                      ? '仅作用于 AI/旧规则二次入场的风险距离，不改变普通领航员开仓、加仓或账户远止损。默认关闭'
-                                      : '保证金亏损达此比例时强制平仓（高杠杆兜底）'}
+                                    普通跟单与 AI
+                                    重入共用：预计总损失（含手续费和滑点）达到初始保证金比例时，执行
+                                    reduce-only 离场。默认开启 50%
                                   </p>
                                 </div>
                                 <button
@@ -2379,10 +2410,11 @@ export function TraderConfigModal({
                                   {formData.risk_policy_version >= 4 && (
                                     <p className="text-xs text-[#848E9C] mt-1">
                                       默认
-                                      20%（硬上限，任何情况不放宽）。示例：20x
-                                      杠杆、上限 20% → 价格反向 1% 即止损（OKX
-                                      收益率约
-                                      -20%）。高杠杆下止损距离小于市场噪音时不再放宽止损，而是禁止该档重入（可在下方覆盖）
+                                      50%（硬上限，任何情况不放宽）。示例：20x
+                                      杠杆、上限 50% → 含费用后的允许反向波动约
+                                      2.5%。若 AI
+                                      给出的结构止损会超过该风险上限，本次重入进入等待，不会偷偷缩窄
+                                      AI 止损
                                     </p>
                                   )}
                                 </div>
@@ -2480,7 +2512,7 @@ export function TraderConfigModal({
                                     />
                                   </div>
                                   <label className="text-xs text-[#848E9C]">
-                                    AI 重入最小名义（USDT）
+                                    AI 重入固定最低金额（USDT）
                                     <input
                                       type="number"
                                       min="0"
@@ -2495,8 +2527,8 @@ export function TraderConfigModal({
                                       className="mt-1 w-full px-2 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF]"
                                     />
                                     <span className="mt-1 block text-[10px] text-[#5E6673]">
-                                      0
-                                      表示采用交易所合约最小值，不使用跟单预警阈值
+                                      0=仅交易所实时最低额；大于 0
+                                      时取本值与交易所最低额的较大者，且永不超过原止损仓位
                                     </span>
                                   </label>
                                 </div>

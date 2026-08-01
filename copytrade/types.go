@@ -199,25 +199,26 @@ type CopyConfig struct {
 	// 字段含义见 store/copytrade.go CopyTradeConfig
 	// v3 旧策略与噪音下限/周期熔断/反加仓铁律等参数已于 v5 下线
 	// ============================================================
-	RiskStopLossEnabled        bool    `json:"risk_stop_loss_enabled"`
-	RiskStopMaxAccountLossPct  float64 `json:"risk_stop_max_account_loss_pct,omitempty"`
-	RiskAccountPct             float64 `json:"risk_account_pct"`    // v7：单次尝试风险预算，默认 0.02
-	RiskATRMultiplier          float64 `json:"risk_atr_multiplier"` // v5.2：止损距离基线 k×ATR，默认 2.0
-	RiskATRTimeframe           string  `json:"risk_atr_timeframe"`
-	RiskLeverageFallback       bool    `json:"risk_leverage_fallback"` // v5.2：margin_cap 开关，默认 false（关）
-	RiskLeverageMaxLoss        float64 `json:"risk_leverage_max_loss"` // 仅 RiskLeverageFallback 开启时生效，默认 0.20
-	RiskReentryEnabled         bool    `json:"risk_reentry_enabled"`
-	RiskReentryRatio           float64 `json:"risk_reentry_ratio"` // × 被止损仓位名义
-	RiskReentryDecisionMode    string  `json:"risk_reentry_decision_mode"`
-	RiskReentryMinNotional     float64 `json:"risk_reentry_min_notional"`
-	RiskCycleLossBudgetPct     float64 `json:"risk_cycle_loss_budget_pct"`
-	RiskPortfolioLossBudgetPct float64 `json:"risk_portfolio_loss_budget_pct"`
-	RiskRoundTripFeeBPS        float64 `json:"risk_round_trip_fee_bps"`
-	RiskAIConfidenceThreshold  float64 `json:"risk_ai_confidence_threshold"`
-	RiskAIMinReviewSeconds     int     `json:"risk_ai_min_review_seconds"`
-	RiskAIDailyCallLimit       int     `json:"risk_ai_daily_call_limit"`
-	RiskAILifecycleCallLimit   int     `json:"risk_ai_lifecycle_call_limit"`
-	RiskNotificationLevel      string  `json:"risk_notification_level"`
+	RiskStopLossEnabled            bool    `json:"risk_stop_loss_enabled"`
+	RiskStopMaxAccountLossPct      float64 `json:"risk_stop_max_account_loss_pct,omitempty"`
+	RiskAccountPct                 float64 `json:"risk_account_pct"`    // v7：单次尝试风险预算，默认 0.02
+	RiskATRMultiplier              float64 `json:"risk_atr_multiplier"` // v5.2：止损距离基线 k×ATR，默认 2.0
+	RiskATRTimeframe               string  `json:"risk_atr_timeframe"`
+	RiskLeverageFallback           bool    `json:"risk_leverage_fallback"`
+	RiskLeverageMaxLoss            float64 `json:"risk_leverage_max_loss"`
+	RiskMarginStopMigrationVersion int     `json:"risk_margin_stop_migration_version"`
+	RiskReentryEnabled             bool    `json:"risk_reentry_enabled"`
+	RiskReentryRatio               float64 `json:"risk_reentry_ratio"` // × 被止损仓位名义
+	RiskReentryDecisionMode        string  `json:"risk_reentry_decision_mode"`
+	RiskReentryMinNotional         float64 `json:"risk_reentry_min_notional"`
+	RiskCycleLossBudgetPct         float64 `json:"risk_cycle_loss_budget_pct"`
+	RiskPortfolioLossBudgetPct     float64 `json:"risk_portfolio_loss_budget_pct"`
+	RiskRoundTripFeeBPS            float64 `json:"risk_round_trip_fee_bps"`
+	RiskAIConfidenceThreshold      float64 `json:"risk_ai_confidence_threshold"`
+	RiskAIMinReviewSeconds         int     `json:"risk_ai_min_review_seconds"`
+	RiskAIDailyCallLimit           int     `json:"risk_ai_daily_call_limit"`
+	RiskAILifecycleCallLimit       int     `json:"risk_ai_lifecycle_call_limit"`
+	RiskNotificationLevel          string  `json:"risk_notification_level"`
 
 	// 历史人工重入字段仅保留存储兼容；v7 不再执行。
 	RiskManualReentryEnabled bool `json:"risk_manual_reentry_enabled"`
@@ -263,7 +264,7 @@ type CopyConfig struct {
 // v5.2 默认值选型（与 store.CopyTradeConfig.FillRiskDefaults 保持一致）：
 //   - RiskATRMultiplier 2.0：止损距离基线（k×ATR），抗噪主力线
 //   - RiskAccountPct 0.02：v7 单次尝试风险预算（含费用与滑点）
-//   - RiskLeverageMaxLoss 0.20：仅当 RiskLeverageFallback 开启时的保证金封顶（默认关）
+//   - RiskLeverageMaxLoss 0.50：仓位初始保证金预计总损失硬上限（默认开启）
 func (c *CopyConfig) FillRiskDefaults() {
 	if c.CopyCatchupWindowSeconds <= 0 {
 		c.CopyCatchupWindowSeconds = 60
@@ -282,7 +283,7 @@ func (c *CopyConfig) FillRiskDefaults() {
 		c.RiskATRTimeframe = "1h"
 	}
 	if c.RiskLeverageMaxLoss == 0 {
-		c.RiskLeverageMaxLoss = 0.2
+		c.RiskLeverageMaxLoss = 0.5
 	}
 	if c.RiskReentryRatio == 0 {
 		c.RiskReentryRatio = 0.5

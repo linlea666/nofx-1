@@ -297,7 +297,7 @@ func (a *Advisor) pollMarketEventReviews() {
 		}
 	}
 	candidates, err := a.st.ReentryAI().ListReentryCandidatesByTraders(runningIDs,
-		[]string{store.ReentryCandidateWatching, store.ReentryCandidateWaiting}, 25)
+		[]string{store.ReentryCandidateWatching, store.ReentryCandidateWaiting, store.ReentryCandidateDormantRearm}, 25)
 	if err != nil {
 		logger.Warnf("[ReentryAdvisor] 读取市场事件候选失败: %v", err)
 		return
@@ -396,18 +396,16 @@ func (a *Advisor) pollAICandidates(cfg *store.ReentryAIConfig) {
 		if err != nil || !traderCfg.RiskStopLossEnabled || traderCfg.RiskReentryDecisionMode != "ai_guarded" || !traderCfg.RiskReentryEnabled {
 			continue
 		}
-		minNotional := traderCfg.RiskReentryMinNotional
-		maxExecutableNotional := candidate.MaxNotional
+		effectiveMinimum := traderCfg.RiskReentryMinNotional
+		stoppedNotionalCeiling := 0.0
 		unactionableCode := ""
 		unactionableMessage := ""
 		riskSnapshot, snapshotErr := copytrade.GetExecutionRiskSnapshotForTrader(candidate.TraderID, candidate.CycleID)
 		if snapshotErr == nil && riskSnapshot != nil {
-			if minNotional <= 0 {
-				minNotional = riskSnapshot.MinExecutableNotional
+			if riskSnapshot.EffectiveMinNotional > effectiveMinimum {
+				effectiveMinimum = riskSnapshot.EffectiveMinNotional
 			}
-			if riskSnapshot.MaxExecutableNotional > 0 && (maxExecutableNotional <= 0 || riskSnapshot.MaxExecutableNotional < maxExecutableNotional) {
-				maxExecutableNotional = riskSnapshot.MaxExecutableNotional
-			}
+			stoppedNotionalCeiling = riskSnapshot.StoppedPositionNotional
 		}
 		switch {
 		case !candidate.Protectable:
@@ -420,10 +418,16 @@ func (a *Advisor) pollAICandidates(cfg *store.ReentryAIConfig) {
 				reason = riskSnapshot.ExecutionConstraintReason
 			}
 			unactionableCode, unactionableMessage = "EXECUTION_CONSTRAINTS_UNAVAILABLE", reason
-		case minNotional > 0 && maxExecutableNotional < minNotional:
-			unactionableCode, unactionableMessage = "MIN_NOTIONAL", fmt.Sprintf("maximum executable notional %.2f is below exchange minimum %.2f", maxExecutableNotional, minNotional)
+		case effectiveMinimum > 0 && stoppedNotionalCeiling > 0 && effectiveMinimum > stoppedNotionalCeiling+0.01:
+			unactionableCode, unactionableMessage = "INELIGIBLE_PROMOTION_CEILING", fmt.Sprintf("effective minimum %.2f exceeds stopped position ceiling %.2f", effectiveMinimum, stoppedNotionalCeiling)
 		}
 		if unactionableCode != "" {
+			if unactionableCode == "INELIGIBLE_PROMOTION_CEILING" {
+				_ = a.st.ReentryAI().MarkReentryCandidateStatus(candidate.ID, store.ReentryCandidateInvalidated, unactionableMessage)
+				a.updateCandidateCycleStatus(candidate, store.CopyGuardAIAbandoned)
+				a.recordCandidateEvent(candidate, "INELIGIBLE_PROMOTION_CEILING", candidate.TriggerPrice, stoppedNotionalCeiling, map[string]interface{}{"reason_code": unactionableCode, "reason": unactionableMessage, "configured_minimum": traderCfg.RiskReentryMinNotional, "exchange_minimum": riskSnapshot.MinExecutableNotional, "effective_minimum": effectiveMinimum, "stopped_notional": stoppedNotionalCeiling})
+				continue
+			}
 			retry := time.Duration(traderCfg.RiskAIMinReviewSeconds) * time.Second
 			if retry < 5*time.Minute {
 				retry = 5 * time.Minute
@@ -451,7 +455,7 @@ func (a *Advisor) pollAICandidates(cfg *store.ReentryAIConfig) {
 		a.updateCandidateCycleStatus(claimed, store.CopyGuardAIReviewing)
 		analysis, err := a.generateForCandidate(claimed, cfg)
 		if err != nil {
-			failed, _ := a.st.ReentryAI().SaveReentryAnalysis(&store.ReentryAIAnalysis{CandidateID: claimed.ID, TraderID: claimed.TraderID, CycleID: claimed.CycleID, Symbol: claimed.Symbol, Side: claimed.Side, AttemptNo: claimed.ReentryCount + 1, DecisionGeneration: claimed.DecisionGeneration, CallStatus: "PENDING", PromptVersion: candidatePromptVersion, SnapshotPrice: claimed.TriggerPrice})
+			failed, _ := a.st.ReentryAI().SaveReentryAnalysis(&store.ReentryAIAnalysis{CandidateID: claimed.ID, TraderID: claimed.TraderID, CycleID: claimed.CycleID, Symbol: claimed.Symbol, Side: claimed.Side, AttemptNo: claimed.ReentryCount + 1, DecisionGeneration: claimed.DecisionGeneration, CallStatus: "PENDING", PromptVersion: activeCandidatePromptVersion(), SnapshotPrice: claimed.TriggerPrice})
 			analysisID := int64(0)
 			if failed != nil {
 				analysisID = failed.ID
@@ -481,7 +485,7 @@ func (a *Advisor) pollAICandidates(cfg *store.ReentryAIConfig) {
 			}
 			continue
 		}
-		duplicate, hashErr := a.st.ReentryAI().HasCompletedCandidateDataHash(claimed.ID, analysis.ID, analysis.DataHash)
+		duplicate, hashErr := a.st.ReentryAI().HasCompletedCandidateDataHash(claimed.ID, analysis.ID, analysis.DataHash, analysis.PromptVersion)
 		if hashErr != nil {
 			_ = a.st.ReentryAI().FailReentryCandidateBeforeModel(claimed.ID, analysis.ID, "data hash dedupe failed: "+hashErr.Error(), candidateFailureBackoff(claimed.FailureCount+1))
 			a.updateCandidateCycleStatus(claimed, store.CopyGuardAIWaiting)
@@ -568,7 +572,7 @@ func (a *Advisor) generateForCandidate(c *store.CopyGuardReentryCandidate, cfg *
 		return nil, err
 	}
 	dataHash := fmt.Sprintf("%x", sha256.Sum256(hashInput))
-	analysis := &store.ReentryAIAnalysis{CandidateID: c.ID, TraderID: c.TraderID, CycleID: c.CycleID, Symbol: c.Symbol, Side: c.Side, AttemptNo: c.ReentryCount + 1, DecisionGeneration: c.DecisionGeneration, DataHash: dataHash, SystemPrompt: candidateSystemPrompt(cfg.AnalysisFocus), UserPrompt: buildCandidateUserPrompt(&promptCandidate, string(b)), DatapackJSON: string(b), MarketDataAvailable: pack.Meta.FuturesAvailable, MissingFields: joinMissing(pack.Meta.MissingFields), PromptVersion: candidatePromptVersion, SnapshotPrice: snapshotPrice}
+	analysis := &store.ReentryAIAnalysis{CandidateID: c.ID, TraderID: c.TraderID, CycleID: c.CycleID, Symbol: c.Symbol, Side: c.Side, AttemptNo: c.ReentryCount + 1, DecisionGeneration: c.DecisionGeneration, DataHash: dataHash, SystemPrompt: candidateSystemPrompt(cfg.AnalysisFocus), UserPrompt: buildCandidateUserPrompt(&promptCandidate, string(b)), DatapackJSON: string(b), MarketDataAvailable: pack.Meta.FuturesAvailable, MissingFields: joinMissing(pack.Meta.MissingFields), PromptVersion: activeCandidatePromptVersion(), SnapshotPrice: snapshotPrice}
 	return a.st.ReentryAI().SaveReentryAnalysis(analysis)
 }
 

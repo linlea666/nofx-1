@@ -246,7 +246,7 @@ func pauseTraderRiskIncreaseTx(tx *sql.Tx, traderID string) error {
 	if _, err := tx.Exec(`UPDATE copy_guard_reentry_candidates
 		SET status=?,pending_trigger='TRADER_STOPPED',last_error='paused by trader stop',
 		    next_review_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP
-		WHERE trader_id=? AND status IN ('WATCHING','WAITING','REVIEWING')`,
+		WHERE trader_id=? AND status IN ('WATCHING','WAITING','DORMANT_REARM','REVIEWING')`,
 		ReentryCandidatePausedByTrader, traderID); err != nil {
 		return err
 	}
@@ -503,7 +503,7 @@ func (s *TraderStore) Archive(userID, traderID string) ([]TraderLifecycleBlocker
 	if _, err = tx.Exec(`UPDATE copy_guard_reentry_candidates SET status=?,
 		last_error='trader archived',pending_trigger='TRADER_ARCHIVED',
 		closed_at=COALESCE(closed_at,CURRENT_TIMESTAMP),updated_at=CURRENT_TIMESTAMP
-		WHERE trader_id=? AND status IN ('WATCHING','WAITING','REVIEWING','PAUSED','PAUSED_BY_TRADER')`,
+		WHERE trader_id=? AND status IN ('WATCHING','WAITING','DORMANT_REARM','REVIEWING','PAUSED','PAUSED_BY_TRADER')`,
 		ReentryCandidateInvalidatedTraderArchived, traderID); err != nil {
 		return nil, err
 	}
@@ -564,7 +564,7 @@ func (s *TraderStore) ReconcileOrphanTombstones() error {
 		SET status=?,last_error='legacy trader archived',pending_trigger='TRADER_ARCHIVED',
 		    closed_at=COALESCE(closed_at,CURRENT_TIMESTAMP),updated_at=CURRENT_TIMESTAMP
 		WHERE trader_id IN (SELECT trader_id FROM trader_tombstones)
-		  AND status IN ('WATCHING','WAITING','REVIEWING','PAUSED','PAUSED_BY_TRADER')`,
+		  AND status IN ('WATCHING','WAITING','DORMANT_REARM','REVIEWING','PAUSED','PAUSED_BY_TRADER')`,
 		ReentryCandidateInvalidatedTraderArchived); err != nil {
 		return err
 	}

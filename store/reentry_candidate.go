@@ -11,6 +11,7 @@ const (
 	ReentryCandidateWatching        = "WATCHING"
 	ReentryCandidateReviewing       = "REVIEWING"
 	ReentryCandidateWaiting         = "WAITING"
+	ReentryCandidateDormantRearm    = "DORMANT_REARM"
 	ReentryCandidateEntryPending    = "ENTRY_PENDING"
 	ReentryCandidateReentered       = "REENTERED"
 	ReentryCandidateAbandoned       = "ABANDONED"
@@ -53,6 +54,13 @@ type CopyGuardReentryCandidate struct {
 	EntryPriceHigh          float64    `json:"entry_price_high"`
 	AttentionPriceLow       float64    `json:"attention_price_low"`
 	AttentionPriceHigh      float64    `json:"attention_price_high"`
+	AIStopPrice             float64    `json:"ai_stop_price"`
+	StopBasis               string     `json:"stop_basis"`
+	CloseInvalidation       string     `json:"close_invalidation"`
+	SupportZonesJSON        string     `json:"support_zones_json"`
+	ResistanceZonesJSON     string     `json:"resistance_zones_json"`
+	TargetZonesJSON         string     `json:"target_zones_json"`
+	RearmConditionsJSON     string     `json:"rearm_conditions_json"`
 	ConsecutiveAbandons     int        `json:"consecutive_abandons"`
 	LastAbandonCandle       string     `json:"last_abandon_candle"`
 	LastAnalysisID          int64      `json:"last_analysis_id"`
@@ -106,6 +114,9 @@ func (s *ReentryAIStore) initReentryCandidateTables() error {
 			last_decision TEXT DEFAULT '', regime TEXT DEFAULT '', confidence REAL DEFAULT 0, size_factor REAL DEFAULT 0,
 			entry_price_low REAL DEFAULT 0, entry_price_high REAL DEFAULT 0,
 			attention_price_low REAL DEFAULT 0, attention_price_high REAL DEFAULT 0,
+			ai_stop_price REAL DEFAULT 0, stop_basis TEXT DEFAULT '', close_invalidation TEXT DEFAULT '',
+			support_zones_json TEXT DEFAULT '[]', resistance_zones_json TEXT DEFAULT '[]',
+			target_zones_json TEXT DEFAULT '[]', rearm_conditions_json TEXT DEFAULT '[]',
 			consecutive_abandons INTEGER DEFAULT 0, last_abandon_candle TEXT DEFAULT '',
 			last_analysis_id INTEGER DEFAULT 0, decision_ttl_seconds INTEGER DEFAULT 30, last_error TEXT DEFAULT '',
 			failure_backoff_until DATETIME, last_unactionable_code TEXT DEFAULT '', last_unactionable_event_at DATETIME,
@@ -139,6 +150,13 @@ func (s *ReentryAIStore) initReentryCandidateTables() error {
 		{"copy_guard_reentry_candidates", "regular_review_at", "DATETIME"},
 		{"copy_guard_reentry_candidates", "event_review_at", "DATETIME"},
 		{"copy_guard_reentry_candidates", "budget_blocked_until", "DATETIME"},
+		{"copy_guard_reentry_candidates", "ai_stop_price", "REAL DEFAULT 0"},
+		{"copy_guard_reentry_candidates", "stop_basis", "TEXT DEFAULT ''"},
+		{"copy_guard_reentry_candidates", "close_invalidation", "TEXT DEFAULT ''"},
+		{"copy_guard_reentry_candidates", "support_zones_json", "TEXT DEFAULT '[]'"},
+		{"copy_guard_reentry_candidates", "resistance_zones_json", "TEXT DEFAULT '[]'"},
+		{"copy_guard_reentry_candidates", "target_zones_json", "TEXT DEFAULT '[]'"},
+		{"copy_guard_reentry_candidates", "rearm_conditions_json", "TEXT DEFAULT '[]'"},
 		{"copy_guard_risk_reservations", "account_key", "TEXT NOT NULL DEFAULT ''"},
 		{"copy_guard_risk_reservations", "intent_id", "INTEGER NOT NULL DEFAULT 0"},
 		{"copy_guard_risk_reservations", "replace_cycle_id", "INTEGER NOT NULL DEFAULT 0"},
@@ -228,7 +246,7 @@ func (s *ReentryAIStore) reconcileReentryCandidateLifecycleState() error {
 	rows, err := s.db.Query(`SELECT DISTINCT c.cycle_id,g.status
 		FROM copy_guard_reentry_candidates c
 		JOIN copy_guard_cycles g ON g.id=c.cycle_id
-		WHERE c.status IN ('WATCHING','WAITING','REVIEWING','ENTRY_PENDING','PAUSED','PAUSED_BY_TRADER')
+		WHERE c.status IN ('WATCHING','WAITING','DORMANT_REARM','REVIEWING','ENTRY_PENDING','PAUSED','PAUSED_BY_TRADER')
 		  AND (
 			g.closed_at IS NOT NULL
 			OR g.status NOT IN (
@@ -274,7 +292,7 @@ func (s *ReentryAIStore) reconcileReentryCandidateLifecycleState() error {
 		SET status=?,pending_trigger='TRADER_ARCHIVED',
 		    last_error='candidate invalidated because trader is archived',
 		    closed_at=COALESCE(closed_at,CURRENT_TIMESTAMP),updated_at=CURRENT_TIMESTAMP
-		WHERE status IN ('WATCHING','WAITING','REVIEWING','ENTRY_PENDING','PAUSED_BY_TRADER')
+		WHERE status IN ('WATCHING','WAITING','DORMANT_REARM','REVIEWING','ENTRY_PENDING','PAUSED_BY_TRADER')
 		  AND EXISTS (
 			SELECT 1 FROM traders t
 			WHERE t.id=copy_guard_reentry_candidates.trader_id
@@ -287,7 +305,7 @@ func (s *ReentryAIStore) reconcileReentryCandidateLifecycleState() error {
 		FROM traders t
 		JOIN copy_guard_reentry_candidates c ON c.trader_id=t.id
 		WHERE t.lifecycle_status NOT IN ('RUNNING','ARCHIVED')
-		  AND c.status IN ('WATCHING','WAITING','REVIEWING','ENTRY_PENDING')
+		  AND c.status IN ('WATCHING','WAITING','DORMANT_REARM','REVIEWING','ENTRY_PENDING')
 		ORDER BY t.id`)
 	if err != nil {
 		return err
@@ -324,6 +342,7 @@ const reentryCandidateColumns = `id,cycle_id,trader_id,leader_pos_id,symbol,side
 	trigger_price,atr,max_notional,stop_count,reentry_count,leader_size,leader_entry_price,last_stop_price,
 	distance_atr_ratio,protectable,feature_hash,pending_trigger,decision_generation,review_count,failure_count,
 	last_decision,regime,confidence,size_factor,entry_price_low,entry_price_high,attention_price_low,attention_price_high,
+	ai_stop_price,stop_basis,close_invalidation,support_zones_json,resistance_zones_json,target_zones_json,rearm_conditions_json,
 	consecutive_abandons,last_abandon_candle,last_analysis_id,decision_ttl_seconds,last_error,
 	failure_backoff_until,COALESCE(last_unactionable_code,''),last_unactionable_event_at,
 	decision_expires_at,regular_review_at,event_review_at,budget_blocked_until,
@@ -338,6 +357,7 @@ func scanReentryCandidate(row rowScanner) (*CopyGuardReentryCandidate, error) {
 		&c.TriggerPrice, &c.ATR, &c.MaxNotional, &c.StopCount, &c.ReentryCount, &c.LeaderSize, &c.LeaderEntryPrice, &c.LastStopPrice,
 		&c.DistanceATRRatio, &c.Protectable, &c.FeatureHash, &c.PendingTrigger, &c.DecisionGeneration, &c.ReviewCount, &c.FailureCount,
 		&c.LastDecision, &c.Regime, &c.Confidence, &c.SizeFactor, &c.EntryPriceLow, &c.EntryPriceHigh, &c.AttentionPriceLow, &c.AttentionPriceHigh,
+		&c.AIStopPrice, &c.StopBasis, &c.CloseInvalidation, &c.SupportZonesJSON, &c.ResistanceZonesJSON, &c.TargetZonesJSON, &c.RearmConditionsJSON,
 		&c.ConsecutiveAbandons, &c.LastAbandonCandle, &c.LastAnalysisID, &c.DecisionTTLSeconds, &c.LastError,
 		&failureBackoff, &c.LastUnactionableCode, &unactionableEvent, &decisionExpires, &regularReview, &eventReview, &budgetBlocked,
 		&snapshot, &last, &next, &created, &updated, &closed); err != nil {
@@ -444,7 +464,7 @@ func (s *ReentryAIStore) EnsureReentryCandidate(c *CopyGuardReentryCandidate, fi
 		feature_hash=excluded.feature_hash,
 		closed_at=CASE WHEN copy_guard_reentry_candidates.reentry_count<>excluded.reentry_count THEN NULL ELSE copy_guard_reentry_candidates.closed_at END,
 		snapshot_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP
-		WHERE copy_guard_reentry_candidates.status IN ('WATCHING','WAITING') OR copy_guard_reentry_candidates.reentry_count<>excluded.reentry_count`,
+		WHERE copy_guard_reentry_candidates.status IN ('WATCHING','WAITING','DORMANT_REARM') OR copy_guard_reentry_candidates.reentry_count<>excluded.reentry_count`,
 		c.CycleID, c.TraderID, c.LeaderPosID, c.Symbol, c.Side, c.MarginMode, ReentryCandidateWatching, c.TriggerPrice, c.ATR, c.MaxNotional, c.StopCount, c.ReentryCount, c.LeaderSize, c.LeaderEntryPrice, c.LastStopPrice, c.DistanceATRRatio, c.Protectable, c.FeatureHash, c.PendingTrigger, firstReview.UTC(), firstReview.UTC())
 	if err != nil {
 		return nil, err
@@ -572,6 +592,10 @@ type ReentryCandidateDecision struct {
 	CandleKey                             string
 	ConfirmAbandon                        bool
 	EnterApproved                         bool
+	AIStopPrice                           float64
+	StopBasis, CloseInvalidation          string
+	SupportZonesJSON, ResistanceZonesJSON string
+	TargetZonesJSON, RearmConditionsJSON  string
 }
 
 func (s *ReentryAIStore) FinishReentryCandidateReview(id int64, d ReentryCandidateDecision) error {
@@ -581,6 +605,9 @@ func (s *ReentryAIStore) FinishReentryCandidateReview(id int64, d ReentryCandida
 	}
 	if d.Decision == ReentryVerdictAbandon {
 		status = ReentryCandidateWaiting
+	}
+	if d.Decision == ReentryVerdictThesisInvalid {
+		status = ReentryCandidateDormantRearm
 	}
 	var decisionExpires interface{}
 	if status == ReentryCandidateEntryPending {
@@ -606,11 +633,11 @@ func (s *ReentryAIStore) FinishReentryCandidateReview(id int64, d ReentryCandida
 		}
 		decisionExpires = expiresAt.UTC()
 	}
-	res, err := s.db.Exec(`UPDATE copy_guard_reentry_candidates SET status=?,last_decision=?,regime=?,confidence=?,size_factor=?,entry_price_low=?,entry_price_high=?,attention_price_low=?,attention_price_high=?,next_review_at=?,regular_review_at=?,event_review_at=NULL,last_analysis_id=?,decision_ttl_seconds=?,decision_expires_at=?,failure_count=0,last_error='',failure_backoff_until=NULL,consecutive_abandons=CASE WHEN ? AND last_abandon_candle<>? THEN consecutive_abandons+1 WHEN ? THEN consecutive_abandons ELSE 0 END,last_abandon_candle=CASE WHEN ? THEN ? ELSE '' END,updated_at=CURRENT_TIMESTAMP
+	res, err := s.db.Exec(`UPDATE copy_guard_reentry_candidates SET status=?,last_decision=?,regime=?,confidence=?,size_factor=?,entry_price_low=?,entry_price_high=?,attention_price_low=?,attention_price_high=?,ai_stop_price=?,stop_basis=?,close_invalidation=?,support_zones_json=?,resistance_zones_json=?,target_zones_json=?,rearm_conditions_json=?,next_review_at=?,regular_review_at=?,event_review_at=NULL,last_analysis_id=?,decision_ttl_seconds=?,decision_expires_at=?,failure_count=0,last_error='',failure_backoff_until=NULL,consecutive_abandons=CASE WHEN ? AND last_abandon_candle<>? THEN consecutive_abandons+1 WHEN ? THEN consecutive_abandons ELSE 0 END,last_abandon_candle=CASE WHEN ? THEN ? ELSE '' END,updated_at=CURRENT_TIMESTAMP
 		WHERE id=? AND status=? AND EXISTS(
 			SELECT 1 FROM traders t WHERE t.id=copy_guard_reentry_candidates.trader_id
 			  AND t.lifecycle_status='RUNNING' AND t.is_running=1
-		)`, status, d.Decision, d.Regime, d.Confidence, d.SizeFactor, d.EntryPriceLow, d.EntryPriceHigh, d.AttentionPriceLow, d.AttentionPriceHigh, d.NextReview.UTC(), d.NextReview.UTC(), d.AnalysisID, d.TTLSeconds, decisionExpires, d.ConfirmAbandon, d.CandleKey, d.ConfirmAbandon, d.ConfirmAbandon, d.CandleKey, id, ReentryCandidateReviewing)
+		)`, status, d.Decision, d.Regime, d.Confidence, d.SizeFactor, d.EntryPriceLow, d.EntryPriceHigh, d.AttentionPriceLow, d.AttentionPriceHigh, d.AIStopPrice, d.StopBasis, d.CloseInvalidation, d.SupportZonesJSON, d.ResistanceZonesJSON, d.TargetZonesJSON, d.RearmConditionsJSON, d.NextReview.UTC(), d.NextReview.UTC(), d.AnalysisID, d.TTLSeconds, decisionExpires, d.ConfirmAbandon, d.CandleKey, d.ConfirmAbandon, d.ConfirmAbandon, d.CandleKey, id, ReentryCandidateReviewing)
 	if err != nil {
 		return err
 	}
@@ -982,7 +1009,7 @@ func (s *ReentryAIStore) ScheduleReentryCandidateEventReview(id int64, trigger s
 		Scan(&status, &last, &regular, &failureBackoff, &reviewAllowed); err != nil {
 		return nil, err
 	}
-	if status != ReentryCandidateWatching && status != ReentryCandidateWaiting {
+	if status != ReentryCandidateWatching && status != ReentryCandidateWaiting && status != ReentryCandidateDormantRearm {
 		return nil, fmt.Errorf("candidate status %s cannot be manually reviewed", status)
 	}
 	if !reviewAllowed {
@@ -1019,9 +1046,9 @@ func (s *ReentryAIStore) ScheduleReentryCandidateEventReview(id int64, trigger s
 		}
 	}
 	res, err := tx.Exec(`UPDATE copy_guard_reentry_candidates SET
-		event_review_at=?,next_review_at=?,pending_trigger=?,last_error='',updated_at=CURRENT_TIMESTAMP
-		WHERE id=? AND status IN (?,?)`,
-		eligible, next.UTC(), trigger, id, ReentryCandidateWatching, ReentryCandidateWaiting)
+		status=CASE WHEN status=? THEN ? ELSE status END,event_review_at=?,next_review_at=?,pending_trigger=?,last_error='',updated_at=CURRENT_TIMESTAMP
+		WHERE id=? AND status IN (?,?,?)`,
+		ReentryCandidateDormantRearm, ReentryCandidateWaiting, eligible, next.UTC(), trigger, id, ReentryCandidateWatching, ReentryCandidateWaiting, ReentryCandidateDormantRearm)
 	if err != nil {
 		return nil, err
 	}

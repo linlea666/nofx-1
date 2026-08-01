@@ -260,25 +260,26 @@ func (ti *TraderIntegration) StartCopyTrading() error {
 		SourceGeneration:         copyConfig.SourceGeneration,
 
 		// Copy Guard 风控字段透传（v5：两层硬止损 + 可保护性状态机 + 确认式重入）
-		RiskStopLossEnabled:        copyConfig.RiskStopLossEnabled,
-		RiskStopMaxAccountLossPct:  copyConfig.RiskStopMaxAccountLossPct,
-		RiskAccountPct:             copyConfig.RiskAccountPct,
-		RiskATRMultiplier:          copyConfig.RiskATRMultiplier,
-		RiskATRTimeframe:           copyConfig.RiskATRTimeframe,
-		RiskLeverageFallback:       copyConfig.RiskLeverageFallback,
-		RiskLeverageMaxLoss:        copyConfig.RiskLeverageMaxLoss,
-		RiskReentryEnabled:         copyConfig.RiskReentryEnabled,
-		RiskReentryRatio:           copyConfig.RiskReentryRatio,
-		RiskReentryDecisionMode:    copyConfig.RiskReentryDecisionMode,
-		RiskReentryMinNotional:     copyConfig.RiskReentryMinNotional,
-		RiskCycleLossBudgetPct:     copyConfig.RiskCycleLossBudgetPct,
-		RiskPortfolioLossBudgetPct: copyConfig.RiskPortfolioLossBudgetPct,
-		RiskRoundTripFeeBPS:        copyConfig.RiskRoundTripFeeBPS,
-		RiskAIConfidenceThreshold:  copyConfig.RiskAIConfidenceThreshold,
-		RiskAIMinReviewSeconds:     copyConfig.RiskAIMinReviewSeconds,
-		RiskAIDailyCallLimit:       copyConfig.RiskAIDailyCallLimit,
-		RiskAILifecycleCallLimit:   copyConfig.RiskAILifecycleCallLimit,
-		RiskNotificationLevel:      copyConfig.RiskNotificationLevel,
+		RiskStopLossEnabled:            copyConfig.RiskStopLossEnabled,
+		RiskStopMaxAccountLossPct:      copyConfig.RiskStopMaxAccountLossPct,
+		RiskAccountPct:                 copyConfig.RiskAccountPct,
+		RiskATRMultiplier:              copyConfig.RiskATRMultiplier,
+		RiskATRTimeframe:               copyConfig.RiskATRTimeframe,
+		RiskLeverageFallback:           copyConfig.RiskLeverageFallback,
+		RiskLeverageMaxLoss:            copyConfig.RiskLeverageMaxLoss,
+		RiskMarginStopMigrationVersion: copyConfig.RiskMarginStopMigrationVersion,
+		RiskReentryEnabled:             copyConfig.RiskReentryEnabled,
+		RiskReentryRatio:               copyConfig.RiskReentryRatio,
+		RiskReentryDecisionMode:        copyConfig.RiskReentryDecisionMode,
+		RiskReentryMinNotional:         copyConfig.RiskReentryMinNotional,
+		RiskCycleLossBudgetPct:         copyConfig.RiskCycleLossBudgetPct,
+		RiskPortfolioLossBudgetPct:     copyConfig.RiskPortfolioLossBudgetPct,
+		RiskRoundTripFeeBPS:            copyConfig.RiskRoundTripFeeBPS,
+		RiskAIConfidenceThreshold:      copyConfig.RiskAIConfidenceThreshold,
+		RiskAIMinReviewSeconds:         copyConfig.RiskAIMinReviewSeconds,
+		RiskAIDailyCallLimit:           copyConfig.RiskAIDailyCallLimit,
+		RiskAILifecycleCallLimit:       copyConfig.RiskAILifecycleCallLimit,
+		RiskNotificationLevel:          copyConfig.RiskNotificationLevel,
 
 		RiskManualReentryEnabled: copyConfig.RiskManualReentryEnabled,
 
@@ -344,6 +345,23 @@ func (ti *TraderIntegration) StartCopyTrading() error {
 	// 修订号后掩盖一个尚未对账的真实交易所订单。
 	ti.recoverExecutionIntents()
 	ti.logExecutionReconciliationReport()
+	// Before applying the newly migrated position-margin cap, reconcile durable
+	// reentry orders and persisted Algo protection against the exchange. This
+	// closes the crash window where a protective stop has already flattened the
+	// follower but its local lifecycle still looks open. These routines are
+	// idempotent and remain in the normal post-start monitor as well.
+	if SupportsCopyGuard(engineConfig.ProviderType) && engineConfig.RiskPolicyVersion >= 4 && engineConfig.RiskStopLossEnabled {
+		ti.recoverV4PendingStates()
+		ti.pollV4ProtectiveStops()
+	}
+	migrationPending, migrationErr := ti.reconcileStartupPositionMarginStops()
+	if migrationErr != nil {
+		migrationPending = true
+		logger.Errorf("❌ [%s] 历史仓位止损迁移启动对账失败，冻结风险增加: %v", ti.traderID, migrationErr)
+	}
+	if migrationPending {
+		engine.setRiskIncreaseBlock("历史仓位止损迁移仍在对账；仅开仓和加仓暂停，减仓、平仓、保护与成交对账继续")
+	}
 
 	// 🔑 初始化历史仓位：将领航员当前持仓标记为 ignored
 	// 这样后续这些仓位的操作都不会跟随，只跟新开仓
@@ -408,6 +426,9 @@ func (ti *TraderIntegration) StartCopyTrading() error {
 	// 启动风控事件消费协程（v3 风控：SL 触发 / 二次进场告警邮件）
 	ti.launch(ti.consumeRiskEvents)
 	ti.launch(ti.monitorExecutionIntents)
+	if migrationPending {
+		ti.launch(ti.monitorMigrationMarginStopReconciliation)
+	}
 	if SupportsCopyGuard(engineConfig.ProviderType) && engineConfig.RiskPolicyVersion >= 4 {
 		if !engineConfig.RiskStopLossEnabled {
 			// 用户关闭了「账户保护止损」开关：撤销交易所上仍存活的保护单。
@@ -539,6 +560,10 @@ func (ti *TraderIntegration) reconcileExecutionIntents(startup bool) {
 		leaderID = ti.engine.config.LeaderID
 	}
 	for _, intent := range intents {
+		if intent.SourceKind == store.ExecutionIntentSourceMigrationMarginStop {
+			ti.reconcileMigrationMarginStopIntent(intent)
+			continue
+		}
 		if intent.Status == store.ExecutionIntentFailed &&
 			intent.SourceKind == "LEADER_TRANSITION" &&
 			(intent.Action == "open_long" || intent.Action == "open_short") &&
@@ -1131,6 +1156,22 @@ func (ti *TraderIntegration) reconcileAIReentryIntent(intent *store.CopyTradeExe
 		ExchangeOrderID: orderID, ExchangeOrderState: state, ExchangeFillConfirmed: true,
 		RequestedQuantity: intent.RequestedQuantity, QuantizedQuantity: intent.QuantizedQuantity, FilledQuantity: filled,
 		EntryPrice: entry, PositionSizeUSD: entry * filled, Reasoning: "Copy trading: reentry recovered from durable AI execution intent",
+	}
+	if intent.CandidateID > 0 {
+		if candidate, candidateErr := rs.GetReentryCandidate(intent.CandidateID); candidateErr == nil {
+			dec.StopLoss = candidate.AIStopPrice
+			dec.AIExecutionNotional = intent.RequestedNotional
+			if cycle, cycleErr := ti.store.CopyTrade().GetCopyGuardCycle(intent.CycleID); cycleErr == nil {
+				if attempts, attemptsErr := ti.store.CopyTrade().ListCopyGuardAttempts(cycle.ID); attemptsErr == nil {
+					stopped := stoppedAttemptNotional(attempts, intent.AttemptNo-1, cycle.FollowerNotional)
+					dec.AIPlannedNotional = stopped * ti.engine.config.RiskReentryRatio * candidate.SizeFactor
+					dec.AIConfiguredMinimum = ti.engine.config.RiskReentryMinNotional
+					if dec.AIExecutionNotional > dec.AIPlannedNotional+math.Max(0.01, dec.AIPlannedNotional*1e-9) {
+						dec.AIPromotionReason = "AI_REENTRY_PROMOTED_TO_MINIMUM"
+					}
+				}
+			}
+		}
 	}
 	if err = ti.commitCopyGuardReentryFill(dec); err != nil {
 		_ = ti.store.CopyTrade().UpdateExecutionIntent(intent.ID, store.ExecutionIntentReconciling, "LOCAL_COMMIT_PENDING", err.Error(), orderID, 0, 0, filled)
@@ -1815,6 +1856,11 @@ func (ti *TraderIntegration) notifyCycleClosedSummary(cycle *store.CopyGuardCycl
 }
 
 func (ti *TraderIntegration) saveCycleSummaryEmailStatus(cycle *store.CopyGuardCycle, status notifier.DeliveryStatus, key, detail string) error {
+	// DEDUPED is an in-process transport detail. Persisting it on every scan
+	// created an unbounded event storm while adding no durable delivery state.
+	if status == notifier.DeliveryDeduped {
+		return nil
+	}
 	eventType := "CYCLE_SUMMARY_EMAIL_" + strings.ToUpper(string(status))
 	return ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: eventType, Metadata: map[string]interface{}{"attempt_no": cycle.ReentryCount, "decision_generation": 0, "dedup_key": key, "delivery_status": status, "detail": detail}})
 }
@@ -4358,6 +4404,8 @@ func classifyAIReentryExecutionError(err error) string {
 		{"SNAPSHOT_STALE", []string{"expired", "过期", "stale"}},
 		{"PRICE_OUT_OF_RANGE", []string{"approved range", "入场区间", "0.25 atr", "漂移"}},
 		{"MIN_NOTIONAL", []string{"minimum", "最小下单额", "名义"}},
+		{"INELIGIBLE_PROMOTION_CEILING", []string{"promotion ceiling", "超过原止损仓位", "无法容纳最低可执行"}},
+		{"WAITING_RISK_CAP", []string{"exceeds available risk", "exceeds position cap"}},
 		{"RISK_CAP", []string{"risk", "风险预算", "risk cap"}},
 		{"POSITION_EXISTS", []string{"already has", "已有同向仓位"}},
 		{"PROTECTION_UNAVAILABLE", []string{"protection", "保护", "stop loss"}},
@@ -4459,8 +4507,21 @@ func (ti *TraderIntegration) validateAIReentryImmediatelyBeforeOrder(dec *decisi
 	if cycle.ReentryCount >= ti.engine.config.RiskMaxReentries {
 		return aiReentryPreflightError("RISK_CAP", "maximum reentry attempts reached")
 	}
-	if dec.PositionSizeUSD <= 0 || dec.PositionSizeUSD > candidate.MaxNotional*candidate.SizeFactor+math.Max(0.01, dec.PositionSizeUSD*1e-9) {
-		return aiReentryPreflightError("RISK_CAP", "queued notional exceeds AI deterministic cap")
+	intent, err := ti.store.CopyTrade().GetExecutionIntentByID(dec.ExecutionIntentID)
+	if err != nil || intent.SourceKind != "AI_REENTRY" || intent.CandidateID != candidate.ID || intent.CycleID != cycle.ID || intent.RequestedNotional <= 0 {
+		return aiReentryPreflightError("SNAPSHOT_STALE", "authoritative AI execution intent unavailable")
+	}
+	tolerance := math.Max(0.01, intent.RequestedNotional*1e-9)
+	if dec.PositionSizeUSD <= 0 || dec.PositionSizeUSD > intent.RequestedNotional+tolerance {
+		return aiReentryPreflightError("RISK_CAP", "queued notional exceeds the durable AI execution intent")
+	}
+	attempts, err := ti.store.CopyTrade().ListCopyGuardAttempts(cycle.ID)
+	if err != nil {
+		return aiReentryPreflightError("EXECUTION_CONTEXT_UNAVAILABLE", "stopped attempt ceiling unavailable: %v", err)
+	}
+	stoppedNotional := stoppedAttemptNotional(attempts, intent.AttemptNo-1, cycle.FollowerNotional)
+	if stoppedNotional <= 0 || intent.RequestedNotional > stoppedNotional+math.Max(0.01, stoppedNotional*1e-9) {
+		return aiReentryPreflightError("INELIGIBLE_PROMOTION_CEILING", "durable AI execution intent exceeds stopped position ceiling")
 	}
 	analysis, err := ti.store.ReentryAI().GetReentryAnalysis(candidate.LastAnalysisID)
 	if err != nil || analysis.CandidateID != candidate.ID {
@@ -4482,6 +4543,16 @@ func (ti *TraderIntegration) validateAIReentryImmediatelyBeforeOrder(dec *decisi
 	}
 	if price <= 0 || price < candidate.EntryPriceLow || price > candidate.EntryPriceHigh || candidate.ATR <= 0 || math.Abs(price-analysis.SnapshotPrice) > 0.25*candidate.ATR {
 		return aiReentryPreflightError("PRICE_OUT_OF_RANGE", "price left the approved range or drift limit")
+	}
+	side := SideLong
+	if candidate.Side == string(SideShort) {
+		side = SideShort
+	}
+	if err := ValidateAIStopAgainstEntryZone(side, candidate.AIStopPrice, candidate.EntryPriceLow, candidate.EntryPriceHigh); err != nil {
+		return aiReentryPreflightError("AI_STOP_ENTRY_ZONE_CONFLICT", "%v", err)
+	}
+	if (side == SideLong && price <= candidate.AIStopPrice) || (side == SideShort && price >= candidate.AIStopPrice) {
+		return aiReentryPreflightError("AI_STOP_ALREADY_CROSSED", "current price already crossed the model stop")
 	}
 	positions, err := ti.getFreshPositions()
 	if err != nil {
@@ -5715,7 +5786,59 @@ func (ti *TraderIntegration) refreshStopLossAfterExecute(dec *decision.Decision)
 		slInput.BaseQuantityStep = inst.BaseQuantityStep
 	}
 
-	slResult, err := calcStopLossPrice(ti.engine.config, slInput)
+	var slResult *StopLossCalcResult
+	if isAIReentryDecision(dec) {
+		if dec.StopLoss <= 0 {
+			ti.handleUnprotectableForDecision(dec, expectedSide, quantity, entryPrice, fmt.Errorf("AI absolute stop is missing"))
+			return
+		}
+		cycle, cycleErr := ti.store.CopyTrade().GetOpenCopyGuardCycle(ti.traderID, dec.LeaderPosID)
+		if cycleErr != nil {
+			ti.handleUnprotectableForDecision(dec, expectedSide, quantity, entryPrice, fmt.Errorf("AI protection cycle unavailable: %w", cycleErr))
+			return
+		}
+		atr := cycle.ATRAtStop
+		if candidate, candidateErr := ti.store.ReentryAI().GetReentryCandidateByCycle(cycle.ID); candidateErr == nil && candidate.ATR > 0 {
+			atr = candidate.ATR
+		}
+		if atr <= 0 {
+			atr = ti.copyGuardEntryATR(dec.Symbol, entryPrice)
+		}
+		usage, usageErr := ti.store.ReentryAI().GetCopyGuardRiskUsageExcludingAttempt(ti.traderID, cycle.ID, cycle.ReentryCount)
+		availableRisk, capacityErr := AvailableCopyGuardRiskUSD(ti.engine.config, followerEquity, usage)
+		currentPrice := entryPrice
+		if mgr, ok := ti.executor.(StopLossManager); ok {
+			if current, currentErr := mgr.GetMarketPrice(dec.Symbol); currentErr == nil && current > 0 {
+				currentPrice = current
+			}
+		}
+		if usageErr != nil || capacityErr != nil {
+			if usageErr != nil {
+				capacityErr = usageErr
+			}
+			ti.handleUnprotectableForDecision(dec, expectedSide, quantity, entryPrice, fmt.Errorf("AI risk capacity unavailable: %w", capacityErr))
+			return
+		}
+		aiPlan, planErr := BuildAIProtectionPlanFromStop(ti.engine.config, AIProtectionPlanInput{
+			Side: side, EntryPrice: entryPrice, CurrentPrice: currentPrice, AIStopPrice: dec.StopLoss,
+			ATR: atr, Equity: followerEquity, AvailableRiskUSD: availableRisk,
+			PlannedNotional: slInput.PositionValue, PriceTickSize: slInput.PriceTickSize,
+			LiquidationPrice: liquidationPrice, Leverage: leverage,
+		})
+		if planErr != nil {
+			ti.handleUnprotectableForDecision(dec, expectedSide, quantity, entryPrice, fmt.Errorf("AI stop post-fill validation failed: %w", planErr))
+			return
+		}
+		slResult = &StopLossCalcResult{
+			SLPrice: aiPlan.StopPrice, SLDistance: aiPlan.StopDistance, ATRDistance: aiPlan.StopDistance,
+			ATRValue: aiPlan.ATR, GovernedBy: aiPlan.GovernedBy, TickSize: slInput.PriceTickSize,
+			QuantityStep: slInput.BaseQuantityStep, ExpectedLossUSD: aiPlan.ExpectedLossUSD,
+			ExpectedLossPct: aiPlan.ExpectedLossPct, ExpectedMarginLossPct: aiPlan.ExpectedMarginLossPct,
+			DistanceATRRatio: aiPlan.StopDistance / aiPlan.ATR,
+		}
+	} else {
+		slResult, err = calcStopLossPrice(ti.engine.config, slInput)
+	}
 	if err != nil {
 		logger.Warnf("⚠️ [%s] 重挂 SL：算法失败: %v | %s", ti.traderID, err, dec.Symbol)
 		if usesV4CopyGuardRisk(ti.engine.config) {
@@ -5812,6 +5935,7 @@ func (ti *TraderIntegration) refreshStopLossAfterExecute(dec *decision.Decision)
 			_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "LIQ_PRICE_IGNORED", Price: entryPrice, Metadata: map[string]interface{}{"liquidation_price": liquidationPrice, "side": expectedSide, "reason": "direction implausible"}})
 		}
 	}
+	dec.Leverage = leverage
 	ti.upsertV4Protection(dec, expectedSide, quantity, entryPrice, slResult)
 }
 
@@ -5977,6 +6101,26 @@ func (ti *TraderIntegration) upsertV4Protection(dec *decision.Decision, side str
 	_ = ti.store.CopyTrade().UpdateCopyGuardFollowerPosition(cycle.ID, followerPosID, entryPrice, entryPrice*quantity)
 	_ = ti.store.CopyTrade().UpdateCopyGuardAttemptPosition(cycle.ID, cycle.ReentryCount, entryPrice, entryPrice*quantity, quantity, result.ATRValue)
 	_ = ti.store.CopyTrade().UpdateCopyGuardAttemptIdentity(cycle.ID, cycle.ReentryCount, followerPosID, cycle.EntryOrderID, "")
+	if isAIReentryDecision(dec) {
+		actualNotional := entryPrice * quantity
+		plannedNotional := dec.AIPlannedNotional
+		if plannedNotional <= 0 {
+			plannedNotional = actualNotional
+		}
+		executionNotional := dec.AIExecutionNotional
+		if executionNotional <= 0 {
+			executionNotional = actualNotional
+		}
+		initialMargin := 0.0
+		if dec.Leverage > 0 {
+			initialMargin = actualNotional / float64(dec.Leverage)
+		}
+		if err := ti.store.CopyTrade().UpdateCopyGuardAttemptAIAudit(cycle.ID, cycle.ReentryCount,
+			float64(dec.Leverage), initialMargin, plannedNotional, executionNotional, dec.AIPromotionReason,
+			dec.StopLoss, result.SLPrice, result.ExpectedMarginLossPct, result.GovernedBy); err != nil {
+			logger.Warnf("⚠️ [%s] 保存 AI 重入尝试风控审计失败: %v", ti.traderID, err)
+		}
+	}
 	// M9：upsert 每个 poll 周期都会经过这里；持续故障期间无去重会把事件表
 	// 刷爆（同 cycle 27 PROTECTION_COVERAGE_LOW 前科）。复用统一去重：
 	// 同 attempt + 同参数 60 秒内只落一条，参数变化（数量/止损价）立即记录。
@@ -6969,8 +7113,10 @@ func (ti *TraderIntegration) ConfirmManualReentry(_ int64, _ string, _ float64) 
 	return ErrManualReentryRetired
 }
 
-// ExecuteAIReentry 执行 ai_guarded 候选。AI 只能缩小 max_notional；本函数
-// 在提交决策前重新检查行情、仓位、领航员、保护可行性和三层风险预算。
+// ExecuteAIReentry executes an ai_guarded candidate. The model owns the entry
+// zone, size factor and absolute stop; deterministic code may promote an amount
+// to the configured/venue minimum or veto unsafe execution, but never replaces
+// the model stop. All authoritative state is rechecked before submission.
 func (ti *TraderIntegration) ExecuteAIReentry(candidateID, analysisID int64) error {
 	if ti.engine == nil || ti.engine.config == nil {
 		return fmt.Errorf("跟单引擎未运行")
@@ -7059,8 +7205,35 @@ func (ti *TraderIntegration) ExecuteAIReentry(candidateID, analysisID int64) err
 	if candidate.ATR <= 0 || math.Abs(price-snapshotPrice) > 0.25*candidate.ATR {
 		return reasonError("PRICE_OUT_OF_RANGE", "价格相对 AI 快照漂移超过 0.25 ATR")
 	}
-	nominalCap := candidate.MaxNotional * candidate.SizeFactor
-	minNotional := cfg.RiskReentryMinNotional
+	side := SideLong
+	if candidate.Side == string(SideShort) {
+		side = SideShort
+	}
+	if err := ValidateAIStopAgainstEntryZone(side, candidate.AIStopPrice, candidate.EntryPriceLow, candidate.EntryPriceHigh); err != nil {
+		return reasonError("AI_STOP_ENTRY_ZONE_CONFLICT", "AI 止损与入场区间冲突: %v", err)
+	}
+	resolver, ok := ti.executor.(trader.ExecutionInstrumentResolver)
+	if !ok {
+		return reasonError("PROTECTION_UNAVAILABLE", "执行交易所未提供合约精度")
+	}
+	inst, err := resolver.ResolveExecutionInstrument(candidate.Symbol)
+	if err != nil || inst == nil || inst.PriceTickSize <= 0 || inst.BaseQuantityStep <= 0 {
+		return reasonError("PROTECTION_UNAVAILABLE", "执行合约规格不可用: %v", err)
+	}
+	attempts, err := ti.store.CopyTrade().ListCopyGuardAttempts(cycle.ID)
+	if err != nil {
+		return fmt.Errorf("读取原止损仓位失败: %w", err)
+	}
+	stoppedNotional := stoppedAttemptNotional(attempts, cycle.ReentryCount, cycle.FollowerNotional)
+	sizing, err := PlanAIReentryNotional(stoppedNotional, cfg.RiskReentryRatio, candidate.SizeFactor, cfg.RiskReentryMinNotional, price, inst)
+	if err != nil {
+		if ReasonCodeOf(err) == "INELIGIBLE_PROMOTION_CEILING" {
+			_ = rs.MarkReentryCandidateStatus(candidate.ID, store.ReentryCandidateInvalidated, err.Error())
+			_ = ti.store.CopyTrade().UpdateCopyGuardObservation(cycle.ID, store.CopyGuardAIAbandoned, leader.EntryPrice, price, candidate.ATR)
+			_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "INELIGIBLE_PROMOTION_CEILING", Price: price, Notional: stoppedNotional, Metadata: map[string]interface{}{"candidate_id": candidate.ID, "analysis_id": analysis.ID, "configured_minimum": cfg.RiskReentryMinNotional, "exchange_minimum": inst.MinNotional, "stopped_notional": stoppedNotional}})
+		}
+		return err
+	}
 	equity := ti.getEquityFunc()()
 	if equity <= 0 {
 		equity = cycle.AccountEquity
@@ -7068,30 +7241,31 @@ func (ti *TraderIntegration) ExecuteAIReentry(candidateID, analysisID int64) err
 	if equity <= 0 {
 		return fmt.Errorf("账户权益不可用")
 	}
-	side := SideLong
-	if candidate.Side == string(SideShort) {
-		side = SideShort
-	}
-	structure := structuralInvalidationPrice(candidate.Symbol, side, price)
 	usage, err := rs.GetCopyGuardRiskUsageExcludingAttempt(ti.traderID, cycle.ID, cycle.ReentryCount+1)
 	if err != nil {
 		return fmt.Errorf("风险占用查询失败: %w", err)
 	}
 	availableRisk, err := AvailableCopyGuardRiskUSD(cfg, equity, usage)
 	if err != nil {
-		return reasonError("RISK_CAP", "风险预算不足: %v", err)
+		return reasonError("WAITING_RISK_CAP", "风险预算不足，等待预算释放: %v", err)
 	}
-	plan, err := BuildProtectionPlan(cfg, side, price, candidate.ATR, structure, equity, availableRisk/equity, nominalCap)
+	plan, err := BuildAIProtectionPlanFromStop(cfg, AIProtectionPlanInput{
+		Side: side, EntryPrice: price, CurrentPrice: price, AIStopPrice: candidate.AIStopPrice,
+		ATR: candidate.ATR, Equity: equity, AvailableRiskUSD: availableRisk,
+		PlannedNotional: sizing.ExecutionNotional, PriceTickSize: inst.PriceTickSize,
+		Leverage: plannedAIReentryLeverage(cfg, leader),
+	})
 	if err != nil {
-		return reasonError("PROTECTION_UNAVAILABLE", "保护计划失败: %v", err)
+		code := "PROTECTION_UNAVAILABLE"
+		if strings.Contains(err.Error(), "exceeds available risk") || strings.Contains(err.Error(), "exceeds position cap") {
+			code = "WAITING_RISK_CAP"
+		}
+		return reasonError(code, "AI 止损安全校验失败: %v", err)
 	}
-	notional := plan.MaxNotional
-	if minNotional > 0 && notional < minNotional {
-		return reasonError("MIN_NOTIONAL", "风险缩量后名义 %.2f 低于最小下单额 %.2f", notional, minNotional)
-	}
+	notional := sizing.ExecutionNotional
 	attemptNo := cycle.ReentryCount + 1
 	if err := rs.ReserveCopyGuardRisk(ti.traderID, cycle.ID, attemptNo, plan.ExpectedLossUSD, equity, cfg.RiskAccountPct, cfg.RiskCycleLossBudgetPct, cfg.RiskPortfolioLossBudgetPct); err != nil {
-		return reasonError("RISK_CAP", "风险预算拒绝: %v", err)
+		return reasonError("WAITING_RISK_CAP", "风险预算并发校验拒绝，等待预算释放: %v", err)
 	}
 	mapping, err := ti.store.CopyTrade().GetMapping(ti.traderID, candidate.LeaderPosID)
 	if err != nil || mapping == nil || mapping.Status != "stopped_by_risk" {
@@ -7127,8 +7301,12 @@ func (ti *TraderIntegration) ExecuteAIReentry(candidateID, analysisID int64) err
 		}
 	}
 	_ = ti.store.CopyTrade().UpdateCopyGuardObservation(cycle.ID, store.CopyGuardReentryPending, leader.EntryPrice, price, candidate.ATR)
-	_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "REENTRY_REQUESTED", Price: price, Notional: notional, Metadata: map[string]interface{}{"intent_id": intent.ID, "client_order_id": intent.ClientOrderID, "candidate_id": candidate.ID, "analysis_id": analysis.ID, "attempt_no": attemptNo, "decision_generation": candidate.DecisionGeneration, "size_factor": candidate.SizeFactor, "risk_budget": plan.ExpectedLossUSD, "max_risk_usd": plan.MaxRiskUSD, "stop_price": plan.StopPrice, "stop_distance": plan.StopDistance, "structure_invalidation": plan.StructureInvalidation}})
-	if !ti.engine.emitReentryDecision(mapping, leader, notional, price, intent) {
+	metadata := map[string]interface{}{"intent_id": intent.ID, "client_order_id": intent.ClientOrderID, "candidate_id": candidate.ID, "analysis_id": analysis.ID, "attempt_no": attemptNo, "decision_generation": candidate.DecisionGeneration, "size_factor": candidate.SizeFactor, "base_target_notional": sizing.BaseTargetNotional, "configured_minimum": sizing.ConfiguredMinimum, "exchange_minimum": sizing.ExchangeMinimum, "effective_minimum": sizing.EffectiveMinimum, "execution_notional": sizing.ExecutionNotional, "stopped_notional": sizing.StoppedNotional, "promotion_multiplier": sizing.PromotionMultiplier, "promotion_reason": sizing.PromotionReason, "risk_budget": plan.ExpectedLossUSD, "max_risk_usd": plan.MaxRiskUSD, "ai_stop_price": candidate.AIStopPrice, "final_stop_price": plan.StopPrice, "stop_distance": plan.StopDistance, "expected_loss_usd": plan.ExpectedLossUSD, "expected_loss_pct": plan.ExpectedLossPct, "expected_margin_loss_pct": plan.ExpectedMarginLossPct, "governed_by": plan.GovernedBy}
+	_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "REENTRY_REQUESTED", Price: price, Notional: notional, Metadata: metadata})
+	if sizing.Promoted {
+		_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "AI_REENTRY_PROMOTED_TO_MINIMUM", Price: price, Notional: notional, Metadata: metadata})
+	}
+	if !ti.engine.emitReentryDecision(mapping, leader, notional, price, intent, sizing) {
 		if replayingLease {
 			_ = ti.store.CopyTrade().UpdateExecutionIntent(intent.ID, store.ExecutionIntentReconciling, "AI_ENTRY_LEASE_WAITING_PRICE", "execution channel busy while replaying AI ENTER lease", "", 0, 0, 0)
 		} else {
@@ -7197,6 +7375,15 @@ type ExecutionRiskSnapshot struct {
 	MinExecutableNotional         float64                 `json:"min_executable_notional"`
 	MaxExecutableQuantity         float64                 `json:"max_executable_quantity"`
 	MaxExecutableNotional         float64                 `json:"max_executable_notional"`
+	ConfiguredMinNotional         float64                 `json:"configured_min_notional"`
+	EffectiveMinNotional          float64                 `json:"effective_min_notional"`
+	StoppedPositionNotional       float64                 `json:"stopped_position_notional"`
+	ReentryRatio                  float64                 `json:"reentry_ratio"`
+	BaseTargetNotional            float64                 `json:"base_target_notional_at_size_factor_1"`
+	PromotionCandidateNotional    float64                 `json:"promotion_candidate_notional_at_size_factor_1"`
+	MaxSafeStopDistancePct        float64                 `json:"max_safe_stop_distance_pct"`
+	MaxSafeStopDistancePrice      float64                 `json:"max_safe_stop_distance_price"`
+	PlannedLeverage               int                     `json:"planned_leverage"`
 }
 
 // GetExecutionRiskSnapshotForTrader returns a credential-free private account
@@ -7222,6 +7409,8 @@ func GetExecutionRiskSnapshotForTrader(traderID string, cycleID int64) (*Executi
 		Positions:             []ExecutionRiskPosition{},
 	}
 	if cycle, cycleErr := ti.store.CopyTrade().GetCopyGuardCycle(cycleID); cycleErr == nil {
+		leader := ti.engine.buildLeaderPosMap()[cycle.LeaderPosID]
+		snapshot.PlannedLeverage = plannedAIReentryLeverage(cfg, leader)
 		price := cycle.LastObservedPrice
 		if mgr, ok := ti.executor.(StopLossManager); ok {
 			if livePrice, priceErr := mgr.GetMarketPrice(cycle.Symbol); priceErr == nil && livePrice > 0 {
@@ -7237,11 +7426,30 @@ func GetExecutionRiskSnapshotForTrader(traderID string, cycleID int64) (*Executi
 				if price > 0 {
 					snapshot.MinExecutableNotional = math.Max(inst.MinNotional, inst.MinBaseQuantity*price)
 					cycleMax := cycle.FollowerNotional
+					if attempts, attemptsErr := ti.store.CopyTrade().ListCopyGuardAttempts(cycle.ID); attemptsErr == nil {
+						cycleMax = stoppedAttemptNotional(attempts, cycle.ReentryCount, cycleMax)
+					}
 					if cycleMax <= 0 {
 						cycleMax = snapshot.MinExecutableNotional
 					}
 					snapshot.MaxExecutableNotional = cycleMax
 					snapshot.MaxExecutableQuantity = cycleMax / price
+					snapshot.StoppedPositionNotional = cycleMax
+					snapshot.ConfiguredMinNotional = cfg.RiskReentryMinNotional
+					snapshot.EffectiveMinNotional = math.Max(snapshot.ConfiguredMinNotional, snapshot.MinExecutableNotional)
+					snapshot.ReentryRatio = cfg.RiskReentryRatio
+					snapshot.BaseTargetNotional = cycleMax * cfg.RiskReentryRatio
+					snapshot.PromotionCandidateNotional = math.Max(snapshot.BaseTargetNotional, snapshot.EffectiveMinNotional)
+					availableRisk := math.Min(snapshot.AttemptBudgetUSD, math.Min(snapshot.CycleRemainingUSD, snapshot.PortfolioRemainingUSD))
+					if cfg.RiskLeverageFallback && cfg.RiskLeverageMaxLoss > 0 && snapshot.PlannedLeverage > 0 {
+						positionRisk := snapshot.PromotionCandidateNotional / float64(snapshot.PlannedLeverage) * cfg.RiskLeverageMaxLoss
+						availableRisk = math.Min(availableRisk, positionRisk)
+					}
+					friction := math.Max((cfg.RiskRoundTripFeeBPS+cfg.RiskSlippageBufferBPS)/10000, 0)
+					if snapshot.PromotionCandidateNotional > 0 && availableRisk > 0 {
+						snapshot.MaxSafeStopDistancePct = math.Max(availableRisk/snapshot.PromotionCandidateNotional-friction, 0)
+						snapshot.MaxSafeStopDistancePrice = price * snapshot.MaxSafeStopDistancePct
+					}
 				}
 			} else if resolveErr != nil {
 				snapshot.ExecutionConstraintReason = resolveErr.Error()

@@ -1,11 +1,16 @@
 package notifier
 
 import (
+	"errors"
 	"os"
 	"strings"
 	"testing"
 	"time"
 )
+
+type failingMailSender struct{ err error }
+
+func (s failingMailSender) Send([]string, string, string) error { return s.err }
 
 func TestBuildBodyIncludesTraderNameAndStableID(t *testing.T) {
 	body := buildBody(Alert{Category: "copy_trade", TraderID: "trader-id", TraderName: "主账户-A", Title: "AI 决策", Time: time.Now()})
@@ -181,6 +186,27 @@ func TestEmailNotifierDedupKeyReleasedWhenQueueIsFull(t *testing.T) {
 	n.Notify(Alert{Category: "copy_trade", Title: "retry", DedupKey: "retryable"})
 	if got := len(n.queue); got != 1 {
 		t.Fatalf("queue len=%d want 1 after retrying dropped dedup alert", got)
+	}
+}
+
+func TestEmailNotifierSMTPFailureReleasesDedupAndRateReservations(t *testing.T) {
+	n := &emailNotifier{
+		cfg: Config{MinInterval: time.Hour, QueueSize: 2}, client: failingMailSender{err: errors.New("smtp 554")},
+		queue: make(chan Alert, 2), stopCh: make(chan struct{}),
+	}
+	alert := Alert{Category: "copy_trade", TraderID: "t", Title: "summary", RateKey: "summary-rate", DedupKey: "summary-dedup"}
+	n.Notify(alert)
+	queued := <-n.queue
+	n.send(queued)
+	if _, exists := n.deduped.Load(alert.DedupKey); exists {
+		t.Fatal("SMTP failure must release the dedup reservation")
+	}
+	if _, exists := n.lastSent.Load(alert.RateKey); exists {
+		t.Fatal("SMTP failure must release the rate reservation")
+	}
+	n.Notify(alert)
+	if got := len(n.queue); got != 1 {
+		t.Fatalf("retry after SMTP failure was not queued: len=%d", got)
 	}
 }
 

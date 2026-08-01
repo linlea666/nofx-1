@@ -29,7 +29,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"math"
 	"net/http"
 	"strings"
@@ -80,8 +79,12 @@ const (
 	// 成功码
 	BinanceCodeSuccess = "000000"
 
-	// marginBalance 缓存 TTL：60s 足以覆盖 3 次 engine poll 周期（默认 20s），
-	// 同时领航员盈亏波动后 1 分钟内能刷新到，权衡精度与副接口压力
+	// Identity/profile metadata is deliberately outside the 3-second position
+	// hot path. It is invalidated immediately on credential or relationship
+	// identity errors.
+	binanceIdentityDetailTTL = 30 * time.Minute
+
+	// Dynamic balance metadata retains its shorter cache.
 	binanceMarginBalanceTTL = 60 * time.Second
 
 	// 跟随者跟单关系详情缓存 TTL：与 marginBalance 一致；
@@ -140,16 +143,14 @@ type BinanceProvider struct {
 	mu           sync.Mutex
 	leaderUserID string // 从持仓接口 id 字段（如 "1239518824_ETHUSDT_LONG"）首次解析获得
 
-	// detail 接口缓存：marginBalance + copyPortfolioId（同一次调用同时拿到，绑定缓存）
-	//   - marginBalance: 60s TTL，作为领航员权益（state.TotalEquity）
-	//   - copyPortfolioID: 与 marginBalance 同一 60s TTL（用户解除/重建跟单关系后
-	//     copyPortfolioId 会变化，永不过期的缓存会让持仓/成交接口打到旧关系上）；
-	//     TTL 过期后刷新失败时沿用旧值降级（与 marginBalance stale 模式一致）
+	// detail identity cache: copyPortfolioId/profile metadata is refreshed every
+	// 30 minutes, on credential changes and after identity errors. Dynamic
+	// margin balance remains a shorter-lived best-effort value.
 	mbValue         float64   // 最近一次成功拉到的 marginBalance
 	mbFetchedAt     time.Time // 拉取时间，距今 < TTL 视为有效
 	mbValid         bool      // 是否曾成功拉到过 marginBalance
 	copyPortfolioID string    // 用户对该领航员的跟单关系 ID（用于 user-position / trade-history）
-	cpidFetchedAt   time.Time // copyPortfolioID 拉取时间，距今 < binanceCopyDetailTTL 视为新鲜
+	cpidFetchedAt   time.Time // copyPortfolioID 拉取时间，距今 < binanceIdentityDetailTTL 视为新鲜
 
 	// copy-portfolio/detail-list 接口缓存（按 leadPortfolioId 索引）
 	//   - 用于解决"镜像价值/领航员权益"量纲错配 → 改用"镜像价值/跟随者权益"严格对齐
@@ -161,6 +162,15 @@ type BinanceProvider struct {
 
 	// 最近一次 ValidateCredentials 成功获取的 binance userID（用于 API 展示绑定账号）
 	binanceUserID string
+
+	// A missing copy relationship is a permanent configuration condition, not
+	// a 3-second transient. Keep it local to this source provider so follower
+	// execution/protection remains completely independent.
+	notFollowingUntil         time.Time
+	notFollowingCredentialKey [32]byte
+	credentialGate            *smartMoneyCredentialGate
+	identityCredentialKey     [32]byte
+	identityCredentialKeySet  bool
 }
 
 // NewBinanceProvider 创建 Binance 数据源（旧版构造，向后兼容）
@@ -242,6 +252,8 @@ func (p *BinanceProvider) Type() ProviderType {
 	return ProviderBinance
 }
 
+func (p *BinanceProvider) UseAuthoritativeSnapshotHotPath() bool { return true }
+
 // ============================================================================
 // LeaderProvider 接口实现
 // ============================================================================
@@ -281,6 +293,9 @@ func (p *BinanceProvider) GetAccountState(leadPortfolioID string) (*AccountState
 	}
 
 	if resp.Code != BinanceCodeSuccess {
+		if resp.Code == BinanceErrPortfolioClosed {
+			p.invalidateCopyPortfolioIdentity(copyPID)
+		}
 		return nil, fmt.Errorf("binance position api error: code=%s msg=%s", resp.Code, resp.Message)
 	}
 
@@ -367,7 +382,34 @@ func (p *BinanceProvider) GetAccountState(leadPortfolioID string) (*AccountState
 	logger.Debugf("📊 Binance leader equity | leadPortfolioId=%s copyPortfolioId=%s equity=%.4f source=%s totalNotional=%.4f positions=%d",
 		leadPortfolioID, copyPID, leaderEquity, source, totalNotional, len(state.Positions))
 
+	p.mu.Lock()
+	gate := p.credentialGate
+	p.mu.Unlock()
+	gate.recordHealthySnapshot()
 	return state, nil
+}
+
+func (p *BinanceProvider) SuggestedSourcePollDelay(activeLeaderPosition bool) time.Duration {
+	delay := smartMoneyIdlePollInterval
+	if activeLeaderPosition {
+		delay = smartMoneyActivePollInterval
+	}
+	p.mu.Lock()
+	until := p.notFollowingUntil
+	gate := p.credentialGate
+	p.mu.Unlock()
+	if remaining := time.Until(until); remaining > delay {
+		delay = remaining
+	}
+	if gate != nil {
+		if remaining := gate.remaining(time.Now()); remaining > delay {
+			delay = remaining
+		}
+		if recoveryDelay := gate.suggestedPollDelay(activeLeaderPosition); recoveryDelay > delay {
+			delay = recoveryDelay
+		}
+	}
+	return delay
 }
 
 // ValidateCredentials 使用 Binance 账号状态接口校验 p20t/csrftoken 是否仍有效。
@@ -453,6 +495,9 @@ func (p *BinanceProvider) GetFills(leadPortfolioID string, since time.Time) ([]F
 	}
 
 	if resp.Code != BinanceCodeSuccess {
+		if resp.Code == BinanceErrPortfolioClosed {
+			p.invalidateCopyPortfolioIdentity(copyPID)
+		}
 		return nil, fmt.Errorf("binance trade-history api error: code=%s msg=%s", resp.Code, resp.Message)
 	}
 
@@ -553,6 +598,9 @@ func (p *BinanceProvider) GetPositionHistory(leadPortfolioID string) ([]BinanceP
 		return nil, ErrBinanceCredentialsExpired
 	}
 	if resp.Code != BinanceCodeSuccess {
+		if resp.Code == BinanceErrPortfolioClosed {
+			p.invalidateCopyPortfolioIdentity(copyPID)
+		}
 		return nil, fmt.Errorf("binance position-history api error: code=%s msg=%s", resp.Code, resp.Message)
 	}
 
@@ -573,27 +621,45 @@ func (p *BinanceProvider) GetPositionHistory(leadPortfolioID string) ([]BinanceP
 // 必需 cookie：
 //   - p20t: <p20t value>
 func (p *BinanceProvider) postCopyTrade(url string, body interface{}) ([]byte, error) {
-	p20t, csrf, err := p.credentials()
-	if err != nil {
-		return nil, err
-	}
-	raw, _, err := binanceWebRequest(p.client, p20t, csrf, http.MethodPost, url, body)
+	raw, _, err := p.sourceWebRequest(http.MethodPost, url, body)
 	return raw, err
 }
 
 func (p *BinanceProvider) getAccountBaseInfo() ([]byte, int, error) {
+	return p.sourceWebRequest(http.MethodGet, BinanceAccountBaseInfoAPI, nil)
+}
+
+// sourceWebRequest is scoped to leader-data collection. Its credential gate
+// is never used by the follower exchange executor, stop manager or accounting
+// clients, so a Binance web 429 cannot take a trading lock away from them.
+func (p *BinanceProvider) sourceWebRequest(method, endpoint string, body interface{}) ([]byte, int, error) {
 	p20t, csrf, err := p.credentials()
 	if err != nil {
 		return nil, 0, err
 	}
+	gate := smartMoneyGateForCredential(p20t)
+	p.mu.Lock()
+	p.credentialGate = gate
+	p.mu.Unlock()
+	return gate.do(func() ([]byte, int, error) {
+		return binanceWebRequest(p.client, p20t, csrf, method, endpoint, body)
+	})
+}
 
-	return binanceWebRequest(p.client, p20t, csrf, http.MethodGet, BinanceAccountBaseInfoAPI, nil)
+func (p *BinanceProvider) invalidateCopyPortfolioIdentity(expectedCopyPortfolioID string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if expectedCopyPortfolioID != "" && p.copyPortfolioID != "" && p.copyPortfolioID != expectedCopyPortfolioID {
+		return
+	}
+	p.copyPortfolioID = ""
+	p.cpidFetchedAt = time.Time{}
 }
 
 // resolveCopyPortfolioID 解析 leadPortfolioId → copyPortfolioId
 //
 // 流程：
-//   - 缓存新鲜（< binanceCopyDetailTTL）→ 直接返回；用户解除/重建跟单关系后
+//   - 缓存新鲜（< binanceIdentityDetailTTL）→ 直接返回；用户解除/重建跟单关系后
 //     copyPortfolioId 会变化，永不过期的缓存会让持仓/成交接口打到旧关系上
 //   - 缓存过期或为空时调 detail 刷新（同时填充 marginBalance 缓存）
 //   - 刷新失败但有旧缓存 → 沿用旧值降级（与 marginBalance stale 模式一致）
@@ -601,13 +667,35 @@ func (p *BinanceProvider) getAccountBaseInfo() ([]byte, int, error) {
 //
 // 返回错误时上层不能降级，因为没有 copyPortfolioId 持仓/成交接口根本无法调用
 func (p *BinanceProvider) resolveCopyPortfolioID(leadPortfolioID string) (string, error) {
-	if _, _, err := p.credentials(); err != nil {
+	p20t, _, err := p.credentials()
+	if err != nil {
 		return "", err
 	}
+	credentialKey := smartMoneyCredentialKey(p20t)
 
 	p.mu.Lock()
+	if !p.identityCredentialKeySet || p.identityCredentialKey != credentialKey {
+		p.copyPortfolioID = ""
+		p.cpidFetchedAt = time.Time{}
+		p.copyDetails = nil
+		p.copyDetailsAt = time.Time{}
+		p.copyDetailsValid = false
+		p.mbValue = 0
+		p.mbFetchedAt = time.Time{}
+		p.mbValid = false
+		p.leaderUserID = ""
+		p.identityCredentialKey = credentialKey
+		p.identityCredentialKeySet = true
+	}
+	if p.notFollowingUntil.After(time.Now()) && p.notFollowingCredentialKey == credentialKey {
+		p.mu.Unlock()
+		return "", fmt.Errorf("%w (leadPortfolioId=%s; retryAfter=%s)", ErrBinanceNotCopying, leadPortfolioID, p.notFollowingUntil.UTC().Format(time.RFC3339))
+	}
+	if p.notFollowingCredentialKey != credentialKey {
+		p.notFollowingUntil = time.Time{}
+	}
 	cached := p.copyPortfolioID
-	fresh := cached != "" && time.Since(p.cpidFetchedAt) < binanceCopyDetailTTL
+	fresh := cached != "" && time.Since(p.cpidFetchedAt) < binanceIdentityDetailTTL
 	p.mu.Unlock()
 	if fresh {
 		return cached, nil
@@ -625,12 +713,17 @@ func (p *BinanceProvider) resolveCopyPortfolioID(leadPortfolioID string) (string
 		if err := p.ValidateCredentials(); err != nil {
 			return "", err
 		}
+		p.mu.Lock()
+		p.notFollowingUntil = time.Now().Add(time.Hour)
+		p.notFollowingCredentialKey = credentialKey
+		p.mu.Unlock()
 		return "", fmt.Errorf("%w (leadPortfolioId=%s)", ErrBinanceNotCopying, leadPortfolioID)
 	}
 
 	p.mu.Lock()
 	p.copyPortfolioID = cpid
 	p.cpidFetchedAt = time.Now()
+	p.notFollowingUntil = time.Time{}
 	if mb > 0 {
 		p.mbValue = mb
 		p.mbFetchedAt = time.Now()
@@ -705,39 +798,9 @@ func (p *BinanceProvider) resolveLeaderEquity(leadPortfolioID string, totalNotio
 //
 // 注意：aumAmount 是"跟单池总规模"（领航员本金 + 所有跟随者本金），不能用作权益
 func (p *BinanceProvider) fetchLeaderDetail(leadPortfolioID string) (float64, string, error) {
-	p20t, csrf, err := p.credentials()
-	if err != nil {
-		return 0, "", err
-	}
-
-	url := BinanceLeadPortfolioDetailAPI + "?portfolioId=" + leadPortfolioID
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		return 0, "", err
-	}
-	req.Header.Set("accept", "*/*")
-	req.Header.Set("clienttype", "web")
-	req.Header.Set("user-agent", "Mozilla/5.0 (compatible; NOFX/1.0)")
-	// p20t 是关键：没有它 copyPortfolioId 会是 null 导致后续无法调用持仓/成交接口
-	req.AddCookie(&http.Cookie{Name: "p20t", Value: p20t})
-	req.Header.Set("csrftoken", csrf)
-
-	resp, err := p.client.Do(req)
+	rawBody, _, err := p.sourceWebRequest(http.MethodGet, BinanceLeadPortfolioDetailAPI+"?portfolioId="+leadPortfolioID, nil)
 	if err != nil {
 		return 0, "", fmt.Errorf("lead-portfolio/detail request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return 0, "", ErrBinanceCredentialsExpired
-	}
-	if resp.StatusCode != http.StatusOK {
-		return 0, "", fmt.Errorf("lead-portfolio/detail http %d", resp.StatusCode)
-	}
-
-	rawBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return 0, "", fmt.Errorf("lead-portfolio/detail read body failed: %w", err)
 	}
 
 	var dr BinanceLeadPortfolioDetailResp
@@ -872,38 +935,9 @@ func (p *BinanceProvider) GetCopyPortfolioDetail(leadPortfolioID string) (*Binan
 //   - 返回当前账户进行中的所有跟单关系（list）
 //   - 错误码 100001005/100002002 → 凭证过期
 func (p *BinanceProvider) fetchCopyPortfolioDetailList() ([]BinanceCopyPortfolioDetailRawItem, error) {
-	p20t, csrf, err := p.credentials()
-	if err != nil {
-		return nil, err
-	}
-
-	url := BinanceCopyPortfolioDetailListAPI + "?ongoing=true"
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("accept", "*/*")
-	req.Header.Set("clienttype", "web")
-	req.Header.Set("csrftoken", csrf)
-	req.Header.Set("user-agent", "Mozilla/5.0 (compatible; NOFX/1.0)")
-	req.AddCookie(&http.Cookie{Name: "p20t", Value: p20t})
-
-	resp, err := p.client.Do(req)
+	rawBody, _, err := p.sourceWebRequest(http.MethodGet, BinanceCopyPortfolioDetailListAPI+"?ongoing=true", nil)
 	if err != nil {
 		return nil, fmt.Errorf("copy-portfolio/detail-list request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	rawBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("copy-portfolio/detail-list read body failed: %w", err)
-	}
-
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return nil, ErrBinanceCredentialsExpired
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("copy-portfolio/detail-list http %d: %s", resp.StatusCode, truncate(string(rawBody), 200))
 	}
 
 	var dr BinanceCopyPortfolioDetailListResp

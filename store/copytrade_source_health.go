@@ -8,13 +8,16 @@ import (
 )
 
 const (
-	SourceHealthHealthy    = "HEALTHY"
-	SourceHealthPrivate    = "PRIVATE"
-	SourceHealthDisabled   = "DISABLED"
-	SourceHealthAuthFailed = "AUTH_FAILED"
-	SourceHealthDegraded   = "DEGRADED"
-	SourceHealthStale      = "STALE"
+	SourceHealthHealthy      = "HEALTHY"
+	SourceHealthPrivate      = "PRIVATE"
+	SourceHealthDisabled     = "DISABLED"
+	SourceHealthAuthFailed   = "AUTH_FAILED"
+	SourceHealthNotFollowing = "NOT_FOLLOWING_LEADER"
+	SourceHealthDegraded     = "DEGRADED"
+	SourceHealthStale        = "STALE"
 )
+
+const sourceHealthStaleAfter = 2 * time.Minute
 
 type CopyTradeSourceHealth struct {
 	TraderID               string                           `json:"trader_id"`
@@ -28,17 +31,33 @@ type CopyTradeSourceHealth struct {
 	LastCompleteSnapshotAt *time.Time                       `json:"last_complete_snapshot_at,omitempty"`
 	LastTransitionAt       *time.Time                       `json:"last_transition_at,omitempty"`
 	LastNotifiedAt         *time.Time                       `json:"last_notified_at,omitempty"`
+	LastRequestStartedAt   *time.Time                       `json:"last_request_started_at,omitempty"`
+	LastRequestCompletedAt *time.Time                       `json:"last_request_completed_at,omitempty"`
+	LastRequestDurationMS  int64                            `json:"last_request_duration_ms"`
+	NextPollAt             *time.Time                       `json:"next_poll_at,omitempty"`
+	BackoffUntil           *time.Time                       `json:"backoff_until,omitempty"`
+	RateLimit429Count      int                              `json:"rate_limit_429_count"`
+	LastProcessingDelayMS  int64                            `json:"last_processing_delay_ms"`
+	LastMailStatus         string                           `json:"last_mail_status,omitempty"`
+	LastMailError          string                           `json:"last_mail_error,omitempty"`
+	LastMailAt             *time.Time                       `json:"last_mail_at,omitempty"`
 	ConsecutiveFailures    int                              `json:"consecutive_failures"`
 	LastError              string                           `json:"last_error,omitempty"`
 	UnsupportedContracts   []UnsupportedExecutionInstrument `json:"unsupported_contracts,omitempty"`
 }
 
 type SourceHealthObservation struct {
-	Status           string
-	TraderName       string
-	Error            string
-	CompleteSnapshot bool
-	CheckedAt        time.Time
+	Status             string
+	TraderName         string
+	Error              string
+	CompleteSnapshot   bool
+	CheckedAt          time.Time
+	RequestStartedAt   time.Time
+	RequestCompletedAt time.Time
+	RequestDurationMS  int64
+	NextPollAt         time.Time
+	BackoffUntil       time.Time
+	RateLimit429Count  int
 }
 
 func (s *CopyTradeStore) initSourceHealthTable() error {
@@ -55,16 +74,45 @@ func (s *CopyTradeStore) initSourceHealthTable() error {
 			last_complete_snapshot_at DATETIME,
 			last_transition_at DATETIME,
 			last_notified_at DATETIME,
+			last_request_started_at DATETIME,
+			last_request_completed_at DATETIME,
+			last_request_duration_ms INTEGER NOT NULL DEFAULT 0,
+			next_poll_at DATETIME,
+			backoff_until DATETIME,
+			rate_limit_429_count INTEGER NOT NULL DEFAULT 0,
+			last_processing_delay_ms INTEGER NOT NULL DEFAULT 0,
+			last_mail_status TEXT DEFAULT '',
+			last_mail_error TEXT DEFAULT '',
+			last_mail_at DATETIME,
 			consecutive_failures INTEGER NOT NULL DEFAULT 0,
 			last_error TEXT DEFAULT ''
 		)
 	`)
-	return err
+	if err != nil {
+		return err
+	}
+	for _, column := range []struct{ name, definition string }{
+		{"last_request_started_at", "DATETIME"},
+		{"last_request_completed_at", "DATETIME"},
+		{"last_request_duration_ms", "INTEGER NOT NULL DEFAULT 0"},
+		{"next_poll_at", "DATETIME"},
+		{"backoff_until", "DATETIME"},
+		{"rate_limit_429_count", "INTEGER NOT NULL DEFAULT 0"},
+		{"last_processing_delay_ms", "INTEGER NOT NULL DEFAULT 0"},
+		{"last_mail_status", "TEXT DEFAULT ''"},
+		{"last_mail_error", "TEXT DEFAULT ''"},
+		{"last_mail_at", "DATETIME"},
+	} {
+		if err = ensureSQLiteColumn(s.db, "copy_trade_source_health", column.name, column.definition); err != nil {
+			return fmt.Errorf("migrate copy_trade_source_health.%s: %w", column.name, err)
+		}
+	}
+	return nil
 }
 
 func sourceHealthFrozen(status string) bool {
 	switch status {
-	case SourceHealthPrivate, SourceHealthDisabled, SourceHealthAuthFailed, SourceHealthStale:
+	case SourceHealthPrivate, SourceHealthDisabled, SourceHealthAuthFailed, SourceHealthNotFollowing, SourceHealthStale:
 		return true
 	default:
 		return false
@@ -77,11 +125,14 @@ func (h *CopyTradeSourceHealth) Frozen() bool {
 
 func scanSourceHealth(scanner interface{ Scan(...interface{}) error }) (*CopyTradeSourceHealth, error) {
 	var h CopyTradeSourceHealth
-	var checked, complete, transitioned, notified sql.NullString
+	var checked, complete, transitioned, notified, requestStarted, requestCompleted, nextPoll, backoff, mailAt sql.NullString
 	err := scanner.Scan(
 		&h.TraderID, &h.LeaderID, &h.SourceMode, &h.SourceGeneration,
 		&h.Status, &h.PreviousStatus, &h.TraderName,
 		&checked, &complete, &transitioned, &notified,
+		&requestStarted, &requestCompleted, &h.LastRequestDurationMS,
+		&nextPoll, &backoff, &h.RateLimit429Count, &h.LastProcessingDelayMS,
+		&h.LastMailStatus, &h.LastMailError, &mailAt,
 		&h.ConsecutiveFailures, &h.LastError,
 	)
 	if err != nil {
@@ -91,6 +142,11 @@ func scanSourceHealth(scanner interface{ Scan(...interface{}) error }) (*CopyTra
 	h.LastCompleteSnapshotAt = parseOptionalSQLiteTime(complete)
 	h.LastTransitionAt = parseOptionalSQLiteTime(transitioned)
 	h.LastNotifiedAt = parseOptionalSQLiteTime(notified)
+	h.LastRequestStartedAt = parseOptionalSQLiteTime(requestStarted)
+	h.LastRequestCompletedAt = parseOptionalSQLiteTime(requestCompleted)
+	h.NextPollAt = parseOptionalSQLiteTime(nextPoll)
+	h.BackoffUntil = parseOptionalSQLiteTime(backoff)
+	h.LastMailAt = parseOptionalSQLiteTime(mailAt)
 	return &h, nil
 }
 
@@ -143,6 +199,10 @@ const sourceHealthColumns = `trader_id, leader_id, source_mode, source_generatio
 	status, COALESCE(previous_status,''), COALESCE(trader_name,''),
 	CAST(last_checked_at AS TEXT), CAST(last_complete_snapshot_at AS TEXT),
 	CAST(last_transition_at AS TEXT), CAST(last_notified_at AS TEXT),
+	CAST(last_request_started_at AS TEXT), CAST(last_request_completed_at AS TEXT),
+	last_request_duration_ms, CAST(next_poll_at AS TEXT), CAST(backoff_until AS TEXT),
+	rate_limit_429_count, last_processing_delay_ms,
+	COALESCE(last_mail_status,''), COALESCE(last_mail_error,''), CAST(last_mail_at AS TEXT),
 	consecutive_failures, COALESCE(last_error,'')`
 
 func (s *CopyTradeStore) GetSourceHealth(traderID string) (*CopyTradeSourceHealth, error) {
@@ -173,15 +233,6 @@ func (s *CopyTradeStore) RecordSourceHealthObservation(traderID, leaderID, sourc
 	}
 
 	previous := current.Status
-	// A process can be offline long enough for its last healthy snapshot to
-	// become stale without recording an intermediate poll failure. Treat the
-	// first complete post-gap observation as STALE -> HEALTHY so callers apply
-	// recovery/no-chase semantics and emit one recovery notification.
-	if !isNew && previous == SourceHealthHealthy && current.LastCompleteSnapshotAt != nil &&
-		obs.CompleteSnapshot && strings.EqualFold(obs.Status, SourceHealthHealthy) &&
-		obs.CheckedAt.Sub(*current.LastCompleteSnapshotAt) > time.Minute {
-		previous = SourceHealthStale
-	}
 	status := strings.ToUpper(strings.TrimSpace(obs.Status))
 	if status == "" {
 		status = "ERROR"
@@ -191,7 +242,7 @@ func (s *CopyTradeStore) RecordSourceHealthObservation(traderID, leaderID, sourc
 		current.LastCompleteSnapshotAt = &obs.CheckedAt
 		current.LastError = ""
 		current.Status = SourceHealthHealthy
-	} else if status == SourceHealthPrivate || status == SourceHealthDisabled || status == SourceHealthAuthFailed {
+	} else if status == SourceHealthPrivate || status == SourceHealthDisabled || status == SourceHealthAuthFailed || status == SourceHealthNotFollowing {
 		current.ConsecutiveFailures++
 		current.Status = status
 		current.LastError = obs.Error
@@ -204,13 +255,19 @@ func (s *CopyTradeStore) RecordSourceHealthObservation(traderID, leaderID, sourc
 		// non-frozen DEGRADED state. Only a complete HEALTHY snapshot recovers it.
 		if sourceHealthFrozen(current.Status) {
 			// keep the confirmed frozen status
-		} else if current.LastCompleteSnapshotAt != nil && obs.CheckedAt.Sub(*current.LastCompleteSnapshotAt) > time.Minute {
+		} else if current.LastCompleteSnapshotAt != nil && obs.CheckedAt.Sub(*current.LastCompleteSnapshotAt) > sourceHealthStaleAfter {
 			current.Status = SourceHealthStale
 		} else if current.ConsecutiveFailures >= 3 {
 			current.Status = SourceHealthDegraded
 		}
 	}
 	current.LastCheckedAt = &obs.CheckedAt
+	current.LastRequestStartedAt = optionalSourceHealthTime(obs.RequestStartedAt)
+	current.LastRequestCompletedAt = optionalSourceHealthTime(obs.RequestCompletedAt)
+	current.LastRequestDurationMS = obs.RequestDurationMS
+	current.NextPollAt = optionalSourceHealthTime(obs.NextPollAt)
+	current.BackoffUntil = optionalSourceHealthTime(obs.BackoffUntil)
+	current.RateLimit429Count = obs.RateLimit429Count
 	if obs.TraderName != "" {
 		current.TraderName = obs.TraderName
 	}
@@ -227,8 +284,11 @@ func (s *CopyTradeStore) RecordSourceHealthObservation(traderID, leaderID, sourc
 		INSERT INTO copy_trade_source_health
 			(trader_id, leader_id, source_mode, source_generation, status, previous_status,
 			 trader_name, last_checked_at, last_complete_snapshot_at, last_transition_at,
-			 last_notified_at, consecutive_failures, last_error)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			 last_notified_at, last_request_started_at, last_request_completed_at,
+			 last_request_duration_ms, next_poll_at, backoff_until, rate_limit_429_count,
+			 last_processing_delay_ms, last_mail_status, last_mail_error, last_mail_at,
+			 consecutive_failures, last_error)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(trader_id) DO UPDATE SET
 			leader_id=excluded.leader_id, source_mode=excluded.source_mode,
 			source_generation=excluded.source_generation, status=excluded.status,
@@ -237,10 +297,21 @@ func (s *CopyTradeStore) RecordSourceHealthObservation(traderID, leaderID, sourc
 			last_complete_snapshot_at=excluded.last_complete_snapshot_at,
 			last_transition_at=excluded.last_transition_at,
 			last_notified_at=excluded.last_notified_at,
+			last_request_started_at=excluded.last_request_started_at,
+			last_request_completed_at=excluded.last_request_completed_at,
+			last_request_duration_ms=excluded.last_request_duration_ms,
+			next_poll_at=excluded.next_poll_at, backoff_until=excluded.backoff_until,
+			rate_limit_429_count=excluded.rate_limit_429_count,
+			last_processing_delay_ms=excluded.last_processing_delay_ms,
+			last_mail_status=excluded.last_mail_status,last_mail_error=excluded.last_mail_error,
+			last_mail_at=excluded.last_mail_at,
 			consecutive_failures=excluded.consecutive_failures, last_error=excluded.last_error
 	`, current.TraderID, current.LeaderID, current.SourceMode, current.SourceGeneration,
 		current.Status, current.PreviousStatus, current.TraderName, formatSourceHealthTime(current.LastCheckedAt),
 		formatSourceHealthTime(current.LastCompleteSnapshotAt), formatSourceHealthTime(current.LastTransitionAt), formatSourceHealthTime(current.LastNotifiedAt),
+		formatSourceHealthTime(current.LastRequestStartedAt), formatSourceHealthTime(current.LastRequestCompletedAt), current.LastRequestDurationMS,
+		formatSourceHealthTime(current.NextPollAt), formatSourceHealthTime(current.BackoffUntil), current.RateLimit429Count,
+		current.LastProcessingDelayMS, current.LastMailStatus, current.LastMailError, formatSourceHealthTime(current.LastMailAt),
 		current.ConsecutiveFailures, current.LastError)
 	if err != nil {
 		return nil, false, fmt.Errorf("save source health: %w", err)
@@ -248,7 +319,28 @@ func (s *CopyTradeStore) RecordSourceHealthObservation(traderID, leaderID, sourc
 	return current, transitioned, nil
 }
 
+func optionalSourceHealthTime(value time.Time) *time.Time {
+	if value.IsZero() {
+		return nil
+	}
+	value = value.UTC()
+	return &value
+}
+
 func (s *CopyTradeStore) MarkSourceHealthNotified(traderID string, at time.Time) error {
 	_, err := s.db.Exec(`UPDATE copy_trade_source_health SET last_notified_at=? WHERE trader_id=?`, formatSourceHealthTime(&at), traderID)
+	return err
+}
+
+func (s *CopyTradeStore) MarkSourceHealthMailDelivery(traderID, status, message string, at time.Time) error {
+	_, err := s.db.Exec(`UPDATE copy_trade_source_health SET last_mail_status=?,last_mail_error=?,last_mail_at=? WHERE trader_id=?`, status, message, formatSourceHealthTime(&at), traderID)
+	return err
+}
+
+func (s *CopyTradeStore) MarkSourceHealthProcessingDelay(traderID string, delay time.Duration) error {
+	if delay < 0 {
+		delay = 0
+	}
+	_, err := s.db.Exec(`UPDATE copy_trade_source_health SET last_processing_delay_ms=? WHERE trader_id=?`, delay.Milliseconds(), traderID)
 	return err
 }

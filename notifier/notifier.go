@@ -296,7 +296,7 @@ func CopyTradeActionEnabled() bool {
 
 type emailNotifier struct {
 	cfg      Config
-	client   *emailClient
+	client   mailSender
 	queue    chan Alert
 	wg       sync.WaitGroup
 	stopOnce sync.Once
@@ -307,6 +307,10 @@ type emailNotifier struct {
 
 	// 一次性去重：dedupKey -> 首次入队时间
 	deduped sync.Map
+}
+
+type mailSender interface {
+	Send(to []string, subject, body string) error
 }
 
 func newEmailNotifier(cfg Config) *emailNotifier {
@@ -334,10 +338,7 @@ func (n *emailNotifier) Notify(a Alert) {
 	}
 
 	// 1. 限流键
-	key := a.RateKey
-	if key == "" {
-		key = a.Category + "|" + a.TraderID + "|" + a.Title
-	}
+	key := alertRateKey(a)
 
 	// 2. 限流判断（在入队前过滤，节省队列容量）
 	if n.cfg.MinInterval > 0 {
@@ -407,11 +408,25 @@ func (n *emailNotifier) send(a Alert) {
 
 	if err := n.client.Send(n.cfg.To, subject, body); err != nil {
 		logger.Warnf("⚠️ 邮件发送失败: %v | subject=%s", err, subject)
+		// Queue acceptance is not delivery. A failed SMTP attempt must release
+		// both reservations so the durable caller can retry after its own
+		// persisted backoff instead of being deduped forever in this process.
+		if a.DedupKey != "" {
+			n.deduped.Delete(a.DedupKey)
+		}
+		n.lastSent.Delete(alertRateKey(a))
 		reportDelivery(a, DeliveryFailed, err)
 		return
 	}
 	logger.Infof("📧 邮件已发送 | %s → %s", subject, strings.Join(n.cfg.To, ","))
 	reportDelivery(a, DeliverySent, nil)
+}
+
+func alertRateKey(a Alert) string {
+	if a.RateKey != "" {
+		return a.RateKey
+	}
+	return a.Category + "|" + a.TraderID + "|" + a.Title
 }
 
 // Shutdown 等待队列消费完毕（最多 5 秒）

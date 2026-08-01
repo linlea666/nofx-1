@@ -128,6 +128,102 @@ func (s *CopyTradeStore) initCopyEventTable() error {
 	return nil
 }
 
+// migratePositionMarginStops v1 turns on the 50% initial-margin loss cap only
+// for legacy configurations that already enabled the global stop-loss switch
+// but had never enabled the position cap. Every row is then version-bookmarked
+// in the same transaction so explicit 20%/50% settings and globally-disabled
+// settings cannot be reconsidered on a later restart.
+func (s *CopyTradeStore) migratePositionMarginStops() error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	type migrationTarget struct {
+		traderID, leaderID, providerType string
+		previousMaxLoss                  float64
+	}
+	rows, err := tx.Query(`
+		SELECT trader_id, leader_id, provider_type, COALESCE(risk_leverage_max_loss, 0)
+		FROM copy_trade_configs
+		WHERE COALESCE(risk_margin_stop_migration_version, 0) < ?
+		  AND risk_stop_loss_enabled = 1
+		  AND risk_leverage_fallback = 0
+	`, positionMarginStopMigrationVersion)
+	if err != nil {
+		return err
+	}
+	var targets []migrationTarget
+	for rows.Next() {
+		var target migrationTarget
+		if err = rows.Scan(&target.traderID, &target.leaderID, &target.providerType, &target.previousMaxLoss); err != nil {
+			rows.Close()
+			return err
+		}
+		targets = append(targets, target)
+	}
+	if err = rows.Close(); err != nil {
+		return err
+	}
+
+	for _, target := range targets {
+		result, updateErr := tx.Exec(`
+			UPDATE copy_trade_configs
+			SET risk_leverage_fallback = 1,
+			    risk_leverage_max_loss = 0.50,
+			    risk_margin_stop_migration_version = ?
+			WHERE trader_id = ?
+			  AND COALESCE(risk_margin_stop_migration_version, 0) < ?
+			  AND risk_stop_loss_enabled = 1
+			  AND risk_leverage_fallback = 0
+		`, positionMarginStopMigrationVersion, target.traderID, positionMarginStopMigrationVersion)
+		if updateErr != nil {
+			return updateErr
+		}
+		affected, affectedErr := result.RowsAffected()
+		if affectedErr != nil {
+			return affectedErr
+		}
+		if affected != 1 {
+			return fmt.Errorf("position margin stop migration changed %d rows for trader %s", affected, target.traderID)
+		}
+		detailJSON, marshalErr := json.Marshal(map[string]interface{}{
+			"migration_version":       positionMarginStopMigrationVersion,
+			"previous_enabled":        false,
+			"previous_max_loss_ratio": target.previousMaxLoss,
+			"new_enabled":             true,
+			"new_max_loss_ratio":      0.50,
+		})
+		if marshalErr != nil {
+			return marshalErr
+		}
+		if _, insertErr := tx.Exec(`
+			INSERT OR IGNORE INTO copy_trade_events
+				(trader_id, leader_id, provider_type, category, event_type, severity,
+				 status, operator, summary, detail_json, dedup_key)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, target.traderID, target.leaderID, target.providerType,
+			CopyEventCategoryReconcile, "POSITION_MARGIN_STOP_MIGRATED", CopyEventSeverityInfo,
+			"success", "system:migration", "历史仓位止损已迁移为初始保证金亏损 50%", string(detailJSON),
+			fmt.Sprintf("position_margin_stop_migration|%s|v%d", target.traderID, positionMarginStopMigrationVersion)); insertErr != nil {
+			return insertErr
+		}
+	}
+
+	// Rows that were already explicitly configured, or whose global stop-loss
+	// is disabled, keep every business value unchanged and only receive the
+	// audit bookmark.
+	if _, err = tx.Exec(`
+		UPDATE copy_trade_configs
+		SET risk_margin_stop_migration_version = ?
+		WHERE COALESCE(risk_margin_stop_migration_version, 0) < ?
+	`, positionMarginStopMigrationVersion, positionMarginStopMigrationVersion); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // LogCopyEvent 写入一条事件（INSERT OR IGNORE 保证 dedup_key 幂等）。
 func (s *CopyTradeStore) LogCopyEvent(e *CopyTradeEvent) error {
 	if e == nil {
@@ -291,6 +387,7 @@ var copyGuardEventSpecs = map[string]CopyGuardEventSpec{
 	"AI_REVIEW_REQUESTED":              {CopyEventCategoryTakeover, CopyEventSeverityInfo, "verbose", true},
 	"AI_REVIEW_ENTER":                  {CopyEventCategoryTakeover, CopyEventSeverityInfo, "verbose", true},
 	"AI_REVIEW_ABANDON":                {CopyEventCategoryTakeover, CopyEventSeverityWarn, "important", true},
+	"AI_REVIEW_THESIS_INVALID":         {CopyEventCategoryTakeover, CopyEventSeverityInfo, "verbose", true},
 	"AI_REVIEW_FAILED":                 {CopyEventCategoryTakeover, CopyEventSeverityWarn, "important", true},
 	"AI_BUDGET_SUSPENDED":              {CopyEventCategoryTakeover, CopyEventSeverityWarn, "important", true},
 	"AI_RESULT_STALE":                  {CopyEventCategoryTakeover, CopyEventSeverityWarn, "verbose", true},
@@ -453,6 +550,8 @@ func guardEventSummary(eventType, symbol, side, operator string) string {
 		return fmt.Sprintf("AI 建议重入，进入确定性预检 | %s", pair)
 	case "AI_REVIEW_ABANDON":
 		return fmt.Sprintf("AI 建议放弃候选 | %s", pair)
+	case "AI_REVIEW_THESIS_INVALID":
+		return fmt.Sprintf("AI 判断当前论点失效，候选休眠等待结构恢复 | %s", pair)
 	case "AI_REVIEW_FAILED", "AI_BUDGET_SUSPENDED", "AI_RESULT_STALE":
 		return fmt.Sprintf("AI 重入审查异常（%s）| %s", eventType, pair)
 	case "AI_CANDIDATE_TERMINATED":

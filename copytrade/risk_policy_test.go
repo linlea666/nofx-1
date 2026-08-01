@@ -119,11 +119,11 @@ func TestComputeRiskDistanceV4AccountHardBackstopCapsEveryMode(t *testing.T) {
 	}
 }
 
-// TestComputeRiskDistanceV4DefaultMarginCapOffResistsNoise 复现截图 ETH 场景：
-// v5.2 默认关闭 margin_cap（RiskLeverageFallback=false）后，高杠杆止损不再被
+// TestComputeRiskDistanceV4ExplicitMarginCapOffResistsNoise 复现截图 ETH 场景：
+// 用户显式关闭 margin_cap（RiskLeverageFallback=false）后，高杠杆止损不再被
 // entry×maxLoss/lev 压进噪音区，改由 min(k×ATR, account_cap) 决定；account_cap
 // 始终参与 min 作单笔硬兜底。
-func TestComputeRiskDistanceV4DefaultMarginCapOffResistsNoise(t *testing.T) {
+func TestComputeRiskDistanceV4ExplicitMarginCapOffResistsNoise(t *testing.T) {
 	// entry=1766, 100x, notional=859, equity=90, ATR raw≈10.6, k=2.0
 	// atrDistance = 10.6×2.0 = 21.2；account_cap = 90×0.10/859×1766 ≈ 18.51
 	// margin_cap（若开启）= 1766×0.2/100 = 3.532（噪音区）
@@ -137,7 +137,7 @@ func TestComputeRiskDistanceV4DefaultMarginCapOffResistsNoise(t *testing.T) {
 	}
 	accountCap := equity * 0.10 / notional * entry // ≈ 18.51
 	if math.Abs(r.Distance-accountCap) > 1e-6 || r.GovernedBy != "account_cap" {
-		t.Fatalf("默认关 margin_cap 时应由 account_cap(≈%.2f) 主导，got %+v", accountCap, r)
+		t.Fatalf("显式关闭 margin_cap 时应由 account_cap(≈%.2f) 主导，got %+v", accountCap, r)
 	}
 	// 抗噪目标：止损距离远大于坍缩的 margin_cap 3.53 点
 	if r.Distance <= 3.532 {
@@ -275,5 +275,41 @@ func TestAvailableCopyGuardRiskUsesSmallestRemainingBudget(t *testing.T) {
 	}
 	if _, err := AvailableCopyGuardRiskUSD(c, 1000, store.CopyGuardRiskUsage{PortfolioUsedUSD: 80}); err == nil {
 		t.Fatal("exhausted portfolio budget must reject sizing")
+	}
+}
+
+func TestBuildAIProtectionPlanFromStopContract(t *testing.T) {
+	cfg := &CopyConfig{RiskSlippageBufferBPS: 5, RiskRoundTripFeeBPS: 10, RiskLeverageFallback: true, RiskLeverageMaxLoss: 0.50, RiskLiquidationBufferATR: 0.5}
+	base := AIProtectionPlanInput{Side: SideLong, EntryPrice: 100, CurrentPrice: 100, AIStopPrice: 98.03, ATR: 2, Equity: 1000, AvailableRiskUSD: 50, PlannedNotional: 100, PriceTickSize: 0.1, Leverage: 5}
+	plan, err := BuildAIProtectionPlanFromStop(cfg, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if math.Abs(plan.StopPrice-98.1) > 1e-9 || plan.GovernedBy != "ai_stop" || plan.ExpectedLossUSD <= 0 {
+		t.Fatalf("unexpected AI plan: %+v", plan)
+	}
+
+	for name, mutate := range map[string]func(*AIProtectionPlanInput){
+		"wrong side":           func(in *AIProtectionPlanInput) { in.AIStopPrice = 101 },
+		"already crossed":      func(in *AIProtectionPlanInput) { in.CurrentPrice = 98 },
+		"too narrow":           func(in *AIProtectionPlanInput) { in.AIStopPrice = 99.5 },
+		"too wide":             func(in *AIProtectionPlanInput) { in.AIStopPrice = 90 },
+		"risk cap":             func(in *AIProtectionPlanInput) { in.AvailableRiskUSD = 1 },
+		"liquidation conflict": func(in *AIProtectionPlanInput) { in.LiquidationPrice = 98 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			in := base
+			mutate(&in)
+			if _, err := BuildAIProtectionPlanFromStop(cfg, in); err == nil {
+				t.Fatal("unsafe AI stop must be rejected")
+			}
+		})
+	}
+
+	short := base
+	short.Side, short.AIStopPrice = SideShort, 101.97
+	plan, err = BuildAIProtectionPlanFromStop(cfg, short)
+	if err != nil || math.Abs(plan.StopPrice-101.9) > 1e-9 {
+		t.Fatalf("short stop must floor toward safety: plan=%+v err=%v", plan, err)
 	}
 }

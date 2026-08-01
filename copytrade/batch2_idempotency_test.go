@@ -155,7 +155,7 @@ func TestResolveCopyPortfolioIDRefreshesAfterTTLAndFallsBackToStale(t *testing.T
 
 	// TTL 过期后必须刷新拿到新关系 ID
 	p.mu.Lock()
-	p.cpidFetchedAt = time.Now().Add(-2 * binanceCopyDetailTTL)
+	p.cpidFetchedAt = time.Now().Add(-2 * binanceIdentityDetailTTL)
 	p.mu.Unlock()
 	if got, err = p.resolveCopyPortfolioID("lead-1"); err != nil || got != "cpid-b" {
 		t.Fatalf("expired TTL must refresh: got=%q err=%v", got, err)
@@ -163,7 +163,7 @@ func TestResolveCopyPortfolioIDRefreshesAfterTTLAndFallsBackToStale(t *testing.T
 
 	// 刷新失败沿用旧值降级（stale 模式），不得整体失败
 	p.mu.Lock()
-	p.cpidFetchedAt = time.Now().Add(-2 * binanceCopyDetailTTL)
+	p.cpidFetchedAt = time.Now().Add(-2 * binanceIdentityDetailTTL)
 	p.mu.Unlock()
 	rt.detailFail = true
 	if got, err = p.resolveCopyPortfolioID("lead-1"); err != nil || got != "cpid-b" {

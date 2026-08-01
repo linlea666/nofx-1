@@ -6,7 +6,40 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
+	"strings"
+	"time"
 )
+
+// BinanceHTTPError preserves response metadata required by the Smart Money
+// source scheduler. Callers must not parse error strings to implement 429
+// backoff or source-health classification.
+type BinanceHTTPError struct {
+	StatusCode int
+	Body       string
+	RetryAfter time.Duration
+}
+
+func (e *BinanceHTTPError) Error() string {
+	if e == nil {
+		return "binance http error"
+	}
+	return fmt.Sprintf("binance http %d: %s", e.StatusCode, e.Body)
+}
+
+func parseRetryAfter(value string, now time.Time) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	if seconds, err := strconv.Atoi(value); err == nil && seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	if at, err := http.ParseTime(value); err == nil && at.After(now) {
+		return at.Sub(now)
+	}
+	return 0
+}
 
 // binanceWebRequest centralizes the authenticated Binance web request
 // contract shared by copy-management and Smart Money providers. It never logs
@@ -46,7 +79,11 @@ func binanceWebRequest(client *http.Client, p20t, csrf, method, url string, body
 		return raw, resp.StatusCode, ErrBinanceCredentialsExpired
 	}
 	if resp.StatusCode != http.StatusOK {
-		return raw, resp.StatusCode, fmt.Errorf("binance http %d: %s", resp.StatusCode, truncate(string(raw), 200))
+		return raw, resp.StatusCode, &BinanceHTTPError{
+			StatusCode: resp.StatusCode,
+			Body:       truncate(string(raw), 200),
+			RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()),
+		}
 	}
 	return raw, resp.StatusCode, nil
 }

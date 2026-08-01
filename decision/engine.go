@@ -175,6 +175,11 @@ type Decision struct {
 	ExecutionStatus       string  `json:"execution_status,omitempty"`
 	ExecutionReasonCode   string  `json:"execution_reason_code,omitempty"`
 	QuantityStepOverride  bool    `json:"quantity_step_override,omitempty"`
+	AIPlannedNotional     float64 `json:"ai_planned_notional,omitempty"`
+	AIExecutionNotional   float64 `json:"ai_execution_notional,omitempty"`
+	AIPromotionReason     string  `json:"ai_promotion_reason,omitempty"`
+	AIConfiguredMinimum   float64 `json:"ai_configured_minimum,omitempty"`
+	AIExchangeMinimum     float64 `json:"ai_exchange_minimum,omitempty"`
 	SourceSymbol          string  `json:"source_symbol,omitempty"`
 	ExecutionSymbol       string  `json:"execution_symbol,omitempty"`
 	ValueCurrency         string  `json:"value_currency,omitempty"`

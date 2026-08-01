@@ -21,8 +21,8 @@ import (
 //
 // 算法（calcStopLossPrice → ComputeRiskDistanceV4）：各项纯取严（min）
 //   - ATR 基线：噪音参考线（默认 RiskATRMultiplier=2.0 × ATR_1h_14），不再放宽硬 cap
-//   - 仓位保证金止损（margin cap）：仅 RiskLeverageFallback 开启时参与（默认关，
-//     开启时默认 20% 保证金）
+//   - 仓位保证金止损（margin cap）：仅 RiskLeverageFallback 开启时参与；
+//     新配置和已迁移的全局止损配置默认开启 50%
 //   - 风险预算：单次尝试默认最多亏账户的 RiskAccountPct（v7 默认 2%）
 //
 // 由 SupportsCopyGuard 的数据源（OKX / Binance 领航员）在 v4+ 配置下调用；
@@ -134,7 +134,7 @@ func calcStopLossPrice(cfg *CopyConfig, input *StopLossCalcInput) (*StopLossCalc
 		computed, err := ComputeAccountProtectionDistance(
 			cfg, input.Side, input.EntryPrice, input.PositionValue,
 			input.FollowerEquity, result.ATRValue, result.ATRDistance,
-			input.StructureInvalidation, input.MaxAccountLossPct,
+			input.StructureInvalidation, input.MaxAccountLossPct, input.Leverage,
 		)
 		if err != nil {
 			return nil, err
@@ -145,9 +145,7 @@ func calcStopLossPrice(cfg *CopyConfig, input *StopLossCalcInput) (*StopLossCalc
 		result.AccountRiskThresholdExceeded = computed.AccountRiskThresholdExceeded
 		result.ExpectedLossUSD = computed.ExpectedLossUSD
 		result.ExpectedLossPct = computed.ExpectedLossPct
-		if margin := input.PositionValue / float64(input.Leverage); margin > 0 {
-			result.ExpectedMarginLossPct = computed.ExpectedLossUSD / margin
-		}
+		result.ExpectedMarginLossPct = computed.ExpectedMarginLossPct
 		result.DistanceATRRatio = computed.DistanceATRRatio
 		return finalizeStopLossPrice(input, result, cfg.RiskLiquidationBufferATR)
 	}
@@ -964,7 +962,7 @@ func (e *Engine) checkReentryConditions() {
 		delete(e.stopRiskSuspectCount, mapping.LeaderPosID)
 
 		// 推一个 Open 决策出去
-		if !e.emitReentryDecision(mapping, leaderPos, reentrySize, markPrice, nil) {
+		if !e.emitReentryDecision(mapping, leaderPos, reentrySize, markPrice, nil, nil) {
 			_ = e.store.CopyTrade().UpdateCopyGuardObservation(v4Cycle.ID, store.CopyGuardStoppedWatching, entryRef, markPrice, currentATR)
 		}
 	}
@@ -1192,7 +1190,7 @@ func copyGuardCycleStatusForCandidate(candidateStatus string) string {
 	switch candidateStatus {
 	case store.ReentryCandidateReviewing:
 		return store.CopyGuardAIReviewing
-	case store.ReentryCandidateWaiting, store.ReentryCandidatePaused:
+	case store.ReentryCandidateWaiting, store.ReentryCandidateDormantRearm, store.ReentryCandidatePaused:
 		return store.CopyGuardAIWaiting
 	case store.ReentryCandidateEntryPending:
 		return store.CopyGuardReentryPending
@@ -1566,7 +1564,7 @@ func emitWatchSummary(cs *store.CopyTradeStore, traderID string, cycle *store.Co
 }
 
 // emitReentryDecision 构造并推送一个二次进场的 Open 决策
-func (e *Engine) emitReentryDecision(mapping *store.CopyTradePositionMapping, leaderPos *Position, copySize, entryPrice float64, intent *store.CopyTradeExecutionIntent) bool {
+func (e *Engine) emitReentryDecision(mapping *store.CopyTradePositionMapping, leaderPos *Position, copySize, entryPrice float64, intent *store.CopyTradeExecutionIntent, sizing *AIReentryNotionalPlan) bool {
 	if leaderPos == nil {
 		return false
 	}
@@ -1636,6 +1634,18 @@ func (e *Engine) emitReentryDecision(mapping *store.CopyTradePositionMapping, le
 		dec.SourceFillID = intent.SourceFillID
 		dec.ClientOrderID = intent.ClientOrderID
 		dec.ExecutionStatus = intent.Status
+		if intent.SourceKind == "AI_REENTRY" && intent.CandidateID > 0 {
+			if candidate, err := e.store.ReentryAI().GetReentryCandidate(intent.CandidateID); err == nil {
+				dec.StopLoss = candidate.AIStopPrice
+			}
+		}
+	}
+	if sizing != nil {
+		dec.AIPlannedNotional = sizing.BaseTargetNotional
+		dec.AIExecutionNotional = sizing.ExecutionNotional
+		dec.AIPromotionReason = sizing.PromotionReason
+		dec.AIConfiguredMinimum = sizing.ConfiguredMinimum
+		dec.AIExchangeMinimum = sizing.ExchangeMinimum
 	}
 
 	fullDec := &decision.FullDecision{

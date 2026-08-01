@@ -28,19 +28,65 @@ import (
 
 // aiVerdict 模型输出的严格 JSON 结论（schema 见 buildSystemPrompt 输出格式段）
 type aiVerdict struct {
-	Decision           string   `json:"decision"`
-	Regime             string   `json:"regime"`
-	Confidence         float64  `json:"confidence"`
-	SuggestedNotional  float64  `json:"suggested_notional"`
-	SizeFactor         float64  `json:"size_factor"`
-	EntryPriceLow      float64  `json:"entry_price_low"`
-	EntryPriceHigh     float64  `json:"entry_price_high"`
-	AttentionPriceLow  float64  `json:"attention_price_low"`
-	AttentionPriceHigh float64  `json:"attention_price_high"`
-	TTLSeconds         int      `json:"ttl_seconds"`
-	NextReviewSeconds  int      `json:"next_review_seconds"`
-	Reasons            []string `json:"reasons"`
-	RiskNotes          []string `json:"risk_notes"`
+	Decision            string            `json:"decision"`
+	Regime              string            `json:"regime"`
+	MultiTimeframeTrend map[string]string `json:"multi_timeframe_trend"`
+	MarketPhase         string            `json:"market_phase"`
+	Confidence          float64           `json:"confidence"`
+	SuggestedNotional   float64           `json:"suggested_notional"`
+	SizeFactor          float64           `json:"size_factor"`
+	EntryPriceLow       float64           `json:"entry_price_low"`
+	EntryPriceHigh      float64           `json:"entry_price_high"`
+	AIStopPrice         float64           `json:"ai_stop_price"`
+	StopBasis           string            `json:"stop_basis"`
+	CloseInvalidation   string            `json:"close_invalidation"`
+	SupportZones        []aiStructureZone `json:"support_zones"`
+	ResistanceZones     []aiStructureZone `json:"resistance_zones"`
+	TargetZones         []aiTargetZone    `json:"target_zones"`
+	AttentionPriceLow   float64           `json:"attention_price_low"`
+	AttentionPriceHigh  float64           `json:"attention_price_high"`
+	TTLSeconds          int               `json:"ttl_seconds"`
+	NextReviewSeconds   int               `json:"next_review_seconds"`
+	RearmConditions     []string          `json:"rearm_conditions"`
+	Reasons             []string          `json:"reasons"`
+	RiskNotes           []string          `json:"risk_notes"`
+}
+
+type aiStructureZone struct {
+	Low          float64  `json:"low"`
+	High         float64  `json:"high"`
+	Strength     int      `json:"strength"`
+	Timeframes   []string `json:"timeframes"`
+	Touches      int      `json:"touches"`
+	LastTouchAt  string   `json:"last_touch_at"`
+	RoleReversal bool     `json:"role_reversal"`
+	Exhaustion   string   `json:"exhaustion"`
+}
+
+type aiTargetZone struct {
+	Low, High float64
+	Basis     string
+}
+
+func (z *aiTargetZone) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Low   float64 `json:"low"`
+		High  float64 `json:"high"`
+		Basis string  `json:"basis"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	z.Low, z.High, z.Basis = raw.Low, raw.High, raw.Basis
+	return nil
+}
+
+func (z aiTargetZone) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		Low   float64 `json:"low"`
+		High  float64 `json:"high"`
+		Basis string  `json:"basis"`
+	}{z.Low, z.High, z.Basis})
 }
 
 // parsedVerdict 解析归一化后的结论
@@ -54,9 +100,17 @@ type parsedVerdict struct {
 	EntryPriceLow, EntryPriceHigh         float64
 	AttentionPriceLow, AttentionPriceHigh float64
 	TTLSeconds, NextReviewSeconds         int
+	AIStopPrice                           float64
+	StopBasis, CloseInvalidation          string
+	SupportZonesJSON, ResistanceZonesJSON string
+	TargetZonesJSON, RearmConditionsJSON  string
 }
 
 func parseAICandidateVerdict(raw string) (*parsedVerdict, error) {
+	return parseAICandidateVerdictForVersion(raw, activeCandidatePromptVersion())
+}
+
+func parseAICandidateVerdictForVersion(raw, version string) (*parsedVerdict, error) {
 	obj, ok := extractJSONObject(raw)
 	if !ok {
 		return nil, fmt.Errorf("回复中未找到 JSON 对象")
@@ -68,8 +122,13 @@ func parseAICandidateVerdict(raw string) (*parsedVerdict, error) {
 	if err := json.Unmarshal([]byte(obj), &keys); err != nil {
 		return nil, fmt.Errorf("JSON 解析失败: %w", err)
 	}
+	v6 := version != candidatePromptVersionV5
 	allowedKeys := map[string]struct{}{}
-	for _, key := range []string{"decision", "regime", "confidence", "size_factor", "entry_price_low", "entry_price_high", "attention_price_low", "attention_price_high", "ttl_seconds", "next_review_seconds", "reasons", "risk_notes"} {
+	required := []string{"decision", "regime", "confidence", "size_factor", "entry_price_low", "entry_price_high", "attention_price_low", "attention_price_high", "ttl_seconds", "next_review_seconds", "reasons", "risk_notes"}
+	if v6 {
+		required = append(required, "multi_timeframe_trend", "market_phase", "ai_stop_price", "stop_basis", "close_invalidation", "support_zones", "resistance_zones", "target_zones", "rearm_conditions")
+	}
+	for _, key := range required {
 		allowedKeys[key] = struct{}{}
 		if _, exists := keys[key]; !exists {
 			return nil, fmt.Errorf("缺少必填字段 %s", key)
@@ -90,7 +149,11 @@ func parseAICandidateVerdict(raw string) (*parsedVerdict, error) {
 		return nil, fmt.Errorf("JSON 对象后存在额外内容")
 	}
 	decision := strings.ToUpper(strings.TrimSpace(v.Decision))
-	if decision != "ENTER_NOW" && decision != store.ReentryVerdictWait && decision != store.ReentryVerdictAbandon {
+	validInvalid := store.ReentryVerdictThesisInvalid
+	if !v6 {
+		validInvalid = store.ReentryVerdictAbandon
+	}
+	if decision != "ENTER_NOW" && decision != store.ReentryVerdictWait && decision != validInvalid && !(v6 && decision == store.ReentryVerdictAbandon) {
 		return nil, fmt.Errorf("decision 字段无效: %q", v.Decision)
 	}
 	regime := strings.ToUpper(strings.TrimSpace(v.Regime))
@@ -109,6 +172,24 @@ func parseAICandidateVerdict(raw string) (*parsedVerdict, error) {
 		if v.EntryPriceLow <= 0 || v.EntryPriceHigh < v.EntryPriceLow {
 			return nil, fmt.Errorf("入场价格区间无效")
 		}
+		if v6 {
+			if v.AIStopPrice <= 0 || strings.TrimSpace(v.StopBasis) == "" || strings.TrimSpace(v.CloseInvalidation) == "" {
+				return nil, fmt.Errorf("ENTER_NOW 必须给出 AI 止损及失效依据")
+			}
+			if len(v.SupportZones) == 0 || len(v.ResistanceZones) == 0 || len(v.TargetZones) == 0 || len(v.RearmConditions) == 0 || len(v.Reasons) == 0 {
+				return nil, fmt.Errorf("ENTER_NOW 必须给出支撑、阻力、目标和重新唤醒条件")
+			}
+			for _, condition := range v.RearmConditions {
+				if strings.TrimSpace(condition) == "" {
+					return nil, fmt.Errorf("rearm_conditions 不得包含空条件")
+				}
+			}
+			for _, reason := range v.Reasons {
+				if strings.TrimSpace(reason) == "" {
+					return nil, fmt.Errorf("reasons 必须引用非空证据")
+				}
+			}
+		}
 	} else if v.SizeFactor != 0 {
 		return nil, fmt.Errorf("非入场决策 size_factor 必须为 0")
 	}
@@ -121,12 +202,77 @@ func parseAICandidateVerdict(raw string) (*parsedVerdict, error) {
 	if v.NextReviewSeconds < 300 || v.NextReviewSeconds > 21600 {
 		return nil, fmt.Errorf("next_review_seconds 必须为 300..21600")
 	}
-	payload, _ := json.Marshal(map[string]interface{}{"reasons": v.Reasons, "risk_notes": v.RiskNotes, "regime": regime, "size_factor": v.SizeFactor, "entry_price_low": v.EntryPriceLow, "entry_price_high": v.EntryPriceHigh, "attention_price_low": v.AttentionPriceLow, "attention_price_high": v.AttentionPriceHigh, "ttl_seconds": v.TTLSeconds, "next_review_seconds": v.NextReviewSeconds})
+	if v6 {
+		for _, tf := range []string{"5m", "15m", "1h", "4h", "1d"} {
+			trend := strings.ToUpper(strings.TrimSpace(v.MultiTimeframeTrend[tf]))
+			if trend != "UP" && trend != "DOWN" && trend != "RANGE" {
+				return nil, fmt.Errorf("multi_timeframe_trend.%s 无效", tf)
+			}
+		}
+		phase := strings.ToUpper(strings.TrimSpace(v.MarketPhase))
+		switch phase {
+		case "ACCUMULATION", "MARKUP", "DISTRIBUTION", "MARKDOWN", "RANGE", "TRANSITION":
+		default:
+			return nil, fmt.Errorf("market_phase 无效")
+		}
+		if err := validateAIStructureZones(v.SupportZones); err != nil {
+			return nil, fmt.Errorf("support_zones: %w", err)
+		}
+		if err := validateAIStructureZones(v.ResistanceZones); err != nil {
+			return nil, fmt.Errorf("resistance_zones: %w", err)
+		}
+		if err := validateAITargetZones(v.TargetZones); err != nil {
+			return nil, fmt.Errorf("target_zones: %w", err)
+		}
+	}
+	supportJSON, _ := json.Marshal(v.SupportZones)
+	resistanceJSON, _ := json.Marshal(v.ResistanceZones)
+	targetJSON, _ := json.Marshal(v.TargetZones)
+	rearmJSON, _ := json.Marshal(v.RearmConditions)
+	payload, _ := json.Marshal(map[string]interface{}{"reasons": v.Reasons, "risk_notes": v.RiskNotes, "regime": regime, "multi_timeframe_trend": v.MultiTimeframeTrend, "market_phase": v.MarketPhase, "size_factor": v.SizeFactor, "entry_price_low": v.EntryPriceLow, "entry_price_high": v.EntryPriceHigh, "ai_stop_price": v.AIStopPrice, "stop_basis": v.StopBasis, "close_invalidation": v.CloseInvalidation, "support_zones": v.SupportZones, "resistance_zones": v.ResistanceZones, "target_zones": v.TargetZones, "attention_price_low": v.AttentionPriceLow, "attention_price_high": v.AttentionPriceHigh, "ttl_seconds": v.TTLSeconds, "next_review_seconds": v.NextReviewSeconds, "rearm_conditions": v.RearmConditions})
 	normalized := decision
 	if decision == "ENTER_NOW" {
 		normalized = store.ReentryVerdictEnter
+	} else if v6 && decision == store.ReentryVerdictAbandon {
+		normalized = store.ReentryVerdictThesisInvalid
 	}
-	return &parsedVerdict{Verdict: normalized, Confidence: v.Confidence, ReasonsJSON: string(payload), Regime: regime, SizeFactor: v.SizeFactor, EntryPriceLow: v.EntryPriceLow, EntryPriceHigh: v.EntryPriceHigh, AttentionPriceLow: v.AttentionPriceLow, AttentionPriceHigh: v.AttentionPriceHigh, TTLSeconds: v.TTLSeconds, NextReviewSeconds: v.NextReviewSeconds}, nil
+	return &parsedVerdict{Verdict: normalized, Confidence: v.Confidence, ReasonsJSON: string(payload), Regime: regime, SizeFactor: v.SizeFactor, EntryPriceLow: v.EntryPriceLow, EntryPriceHigh: v.EntryPriceHigh, AttentionPriceLow: v.AttentionPriceLow, AttentionPriceHigh: v.AttentionPriceHigh, TTLSeconds: v.TTLSeconds, NextReviewSeconds: v.NextReviewSeconds, AIStopPrice: v.AIStopPrice, StopBasis: v.StopBasis, CloseInvalidation: v.CloseInvalidation, SupportZonesJSON: string(supportJSON), ResistanceZonesJSON: string(resistanceJSON), TargetZonesJSON: string(targetJSON), RearmConditionsJSON: string(rearmJSON)}, nil
+}
+
+func validateAIStructureZones(zones []aiStructureZone) error {
+	for _, z := range zones {
+		if z.Low <= 0 || z.High < z.Low || z.Strength < 0 || z.Strength > 100 || z.Touches < 0 || len(z.Timeframes) == 0 {
+			return fmt.Errorf("区域数值无效")
+		}
+		switch strings.ToUpper(strings.TrimSpace(z.Exhaustion)) {
+		case "FRESH", "TESTED", "WEAKENED":
+		default:
+			return fmt.Errorf("exhaustion 无效")
+		}
+		for _, timeframe := range z.Timeframes {
+			switch strings.ToLower(strings.TrimSpace(timeframe)) {
+			case "5m", "15m", "1h", "4h", "1d":
+			default:
+				return fmt.Errorf("timeframe %q 无效", timeframe)
+			}
+		}
+		lastTouch := strings.TrimSpace(z.LastTouchAt)
+		if !strings.EqualFold(lastTouch, "UNAVAILABLE") {
+			if _, err := time.Parse(time.RFC3339, lastTouch); err != nil {
+				return fmt.Errorf("last_touch_at 必须是 RFC3339 或 UNAVAILABLE")
+			}
+		}
+	}
+	return nil
+}
+
+func validateAITargetZones(zones []aiTargetZone) error {
+	for _, zone := range zones {
+		if zone.Low <= 0 || zone.High < zone.Low || strings.TrimSpace(zone.Basis) == "" {
+			return fmt.Errorf("目标区域数值或依据无效")
+		}
+	}
+	return nil
 }
 
 // resolveAIModel 解析配置指向的 ai_models 行：
@@ -386,7 +532,7 @@ func (a *Advisor) runAnalysis(analysisID int64, autoTriggered bool) {
 			continue
 		}
 		if analysis.CandidateID > 0 {
-			pv, err = parseAICandidateVerdict(raw)
+			pv, err = parseAICandidateVerdictForVersion(raw, analysis.PromptVersion)
 		} else {
 			pv, err = parseAIVerdict(raw)
 		}
@@ -413,7 +559,7 @@ func (a *Advisor) runAnalysis(analysisID int64, autoTriggered bool) {
 	if pv == nil {
 		pv = &parsedVerdict{} // 解析失败：verdict 留空，仅存 raw
 	}
-	if saveErr := a.st.ReentryAI().CompleteReentryInternalResult(analysis.ID, raw, pv.Verdict, pv.Confidence, pv.ReasonsJSON, pv.TTLSeconds); saveErr != nil {
+	if saveErr := a.st.ReentryAI().CompleteReentryInternalResultV6(analysis.ID, raw, pv.Verdict, pv.Confidence, pv.ReasonsJSON, pv.TTLSeconds, pv.AIStopPrice, pv.StopBasis, pv.CloseInvalidation, pv.SupportZonesJSON, pv.ResistanceZonesJSON, pv.TargetZonesJSON, pv.RearmConditionsJSON); saveErr != nil {
 		logger.Warnf("[ReentryAdvisor] AI 结果落库失败 (analysis=%d): %v", analysisID, saveErr)
 		a.failCandidateAnalysis(candidateID, analysisID, "AI result persistence failed: "+saveErr.Error(), 0)
 		return
@@ -470,7 +616,7 @@ func (a *Advisor) finishCandidateAnalysis(analysis *store.ReentryAIAnalysis, cfg
 	}
 	abandonThreshold := math.Max(0.80, traderCfg.RiskAIConfidenceThreshold)
 	nextSeconds := pv.NextReviewSeconds
-	if pv.Verdict == store.ReentryVerdictWait || pv.Verdict == store.ReentryVerdictAbandon {
+	if pv.Verdict == store.ReentryVerdictWait || pv.Verdict == store.ReentryVerdictAbandon || pv.Verdict == store.ReentryVerdictThesisInvalid {
 		// Deterministic tiered heartbeat survives any number of early event
 		// reviews: +15m, +45m, hourly through 6h, then every two hours.
 		nextSeconds = int(time.Until(a.nextCandidateReviewAt(c.ID, time.Now().UTC())).Seconds())
@@ -481,7 +627,7 @@ func (a *Advisor) finishCandidateAnalysis(analysis *store.ReentryAIAnalysis, cfg
 	next := time.Now().Add(time.Duration(nextSeconds) * time.Second)
 	candle := candidateClosed5mCandleKey(analysis)
 	enterApproved := pv.Verdict == store.ReentryVerdictEnter && pv.Confidence >= traderCfg.RiskAIConfidenceThreshold
-	d := store.ReentryCandidateDecision{Decision: pv.Verdict, Regime: pv.Regime, Confidence: pv.Confidence, SizeFactor: pv.SizeFactor, EntryPriceLow: pv.EntryPriceLow, EntryPriceHigh: pv.EntryPriceHigh, AttentionPriceLow: pv.AttentionPriceLow, AttentionPriceHigh: pv.AttentionPriceHigh, NextReview: next, AnalysisID: analysis.ID, TTLSeconds: pv.TTLSeconds, CandleKey: candle, ConfirmAbandon: pv.Verdict == store.ReentryVerdictAbandon && pv.Confidence >= abandonThreshold && candle != "", EnterApproved: enterApproved}
+	d := store.ReentryCandidateDecision{Decision: pv.Verdict, Regime: pv.Regime, Confidence: pv.Confidence, SizeFactor: pv.SizeFactor, EntryPriceLow: pv.EntryPriceLow, EntryPriceHigh: pv.EntryPriceHigh, AttentionPriceLow: pv.AttentionPriceLow, AttentionPriceHigh: pv.AttentionPriceHigh, NextReview: next, AnalysisID: analysis.ID, TTLSeconds: pv.TTLSeconds, CandleKey: candle, ConfirmAbandon: pv.Verdict == store.ReentryVerdictAbandon && pv.Confidence >= abandonThreshold && candle != "", EnterApproved: enterApproved, AIStopPrice: pv.AIStopPrice, StopBasis: pv.StopBasis, CloseInvalidation: pv.CloseInvalidation, SupportZonesJSON: pv.SupportZonesJSON, ResistanceZonesJSON: pv.ResistanceZonesJSON, TargetZonesJSON: pv.TargetZonesJSON, RearmConditionsJSON: pv.RearmConditionsJSON}
 	if err := a.st.ReentryAI().FinishReentryCandidateReview(c.ID, d); err != nil {
 		return err
 	}
@@ -492,8 +638,15 @@ func (a *Advisor) finishCandidateAnalysis(analysis *store.ReentryAIAnalysis, cfg
 	if pv.Verdict == store.ReentryVerdictAbandon {
 		event = "AI_REVIEW_ABANDON"
 	}
+	if pv.Verdict == store.ReentryVerdictThesisInvalid {
+		event = "AI_REVIEW_THESIS_INVALID"
+	}
 	a.recordCandidateEvent(c, event, c.TriggerPrice, c.MaxNotional*pv.SizeFactor, map[string]interface{}{"analysis_id": analysis.ID, "data_hash": analysis.DataHash, "model": cfg.Model, "prompt_version": analysis.PromptVersion, "confidence": pv.Confidence, "regime": pv.Regime, "size_factor": pv.SizeFactor, "entry_price_low": pv.EntryPriceLow, "entry_price_high": pv.EntryPriceHigh, "next_review_at": next, "ai_next_review_seconds": pv.NextReviewSeconds, "scheduled_next_review_seconds": nextSeconds})
 	if pv.Verdict == store.ReentryVerdictWait {
+		_ = a.st.CopyTrade().UpdateCopyGuardObservation(c.CycleID, store.CopyGuardAIWaiting, c.LeaderEntryPrice, c.TriggerPrice, c.ATR)
+		return nil
+	}
+	if pv.Verdict == store.ReentryVerdictThesisInvalid {
 		_ = a.st.CopyTrade().UpdateCopyGuardObservation(c.CycleID, store.CopyGuardAIWaiting, c.LeaderEntryPrice, c.TriggerPrice, c.ATR)
 		return nil
 	}

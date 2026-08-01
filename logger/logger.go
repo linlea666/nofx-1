@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"time"
 
 	"github.com/sirupsen/logrus"
 )
@@ -15,8 +14,8 @@ import (
 var (
 	// Log is the global logger instance
 	Log *logrus.Logger
-	// logFile holds the current log file handle
-	logFile *os.File
+	// logWriter owns daily/size rotation for the file sink.
+	logWriter *rotatingFileWriter
 )
 
 // compactFormatter is a custom formatter for cleaner log output
@@ -64,6 +63,10 @@ func init() {
 // Init initializes the global logger
 // If config is nil, uses default configuration (console output, info level)
 func Init(cfg *Config) error {
+	if logWriter != nil {
+		_ = logWriter.Close()
+		logWriter = nil
+	}
 	Log = logrus.New()
 
 	// Use default values if no config provided
@@ -85,14 +88,13 @@ func Init(cfg *Config) error {
 	Log.SetFormatter(&compactFormatter{})
 
 	// Setup log file output (write to both stdout and file)
-	logDir := "data"
+	logDir := cfg.LogDir
 	if err := os.MkdirAll(logDir, 0755); err == nil {
-		logFileName := filepath.Join(logDir, fmt.Sprintf("nofx_%s.log", time.Now().Format("2006-01-02")))
-		f, err := os.OpenFile(logFileName, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		writer, err := newRotatingFileWriter(logDir, cfg.MaxSizeMB*1024*1024)
 		if err == nil {
-			logFile = f
+			logWriter = writer
 			// Write to both stdout and file
-			Log.SetOutput(io.MultiWriter(os.Stdout, f))
+			Log.SetOutput(io.MultiWriter(os.Stdout, writer))
 		} else {
 			Log.SetOutput(os.Stdout)
 		}
@@ -113,9 +115,9 @@ func InitWithSimpleConfig(level string) error {
 
 // Shutdown gracefully shuts down the logger
 func Shutdown() {
-	if logFile != nil {
-		logFile.Close()
-		logFile = nil
+	if logWriter != nil {
+		_ = logWriter.Close()
+		logWriter = nil
 	}
 }
 

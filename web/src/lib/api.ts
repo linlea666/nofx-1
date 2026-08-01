@@ -1015,6 +1015,17 @@ export const api = {
         pnl: number
         fee: number
         funding_fee: number
+        actual_leverage: number
+        initial_margin_basis: number
+        planned_notional: number
+        promoted_notional: number
+        promotion_reason?: string
+        ai_stop_price: number
+        final_stop_price: number
+        stop_validation_result?: string
+        expected_position_loss_pct: number
+        actual_position_loss_pct: number
+        governed_by?: string
         follower_pos_id: string
         entry_order_id: string
         exit_order_id: string

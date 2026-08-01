@@ -137,6 +137,7 @@ const eventLabels: Record<string, string> = {
   REENTRY_RECOVERED_AFTER_RESTART: '重启后重入状态已恢复',
   REENTRY_RECOVERY_PENDING: '重启后重入状态待确认',
   AI_REVIEW_REQUESTED: '操作员请求 AI 尽快复查',
+  AI_REVIEW_THESIS_INVALID: 'AI 当前论点失效，休眠等待结构恢复',
   AI_DECISION_OUTCOME_FINALIZED: 'AI 单次决策后验评价完成',
   AI_CANDIDATE_OUTCOME_FINALIZED: 'AI 候选周期评价完成',
   ADDON_RISK_WARNING: '加仓风险告警（仍跟随）',
@@ -243,12 +244,14 @@ const verdictStyles: Record<string, string> = {
   WAIT: 'bg-[#F0B90B]/15 text-[#F0B90B] border-[#F0B90B]',
   SKIP: 'bg-[#F6465D]/15 text-[#F6465D] border-[#F6465D]',
   ABANDON: 'bg-[#F6465D]/15 text-[#F6465D] border-[#F6465D]',
+  THESIS_INVALID_NOW: 'bg-[#848E9C]/15 text-[#B7BDC6] border-[#848E9C]',
 }
 const verdictLabels: Record<string, string> = {
   ENTER: 'ENTER · 建议重入',
   WAIT: 'WAIT · 继续观察',
   SKIP: 'SKIP · 建议忽略',
   ABANDON: 'ABANDON · 建议放弃候选',
+  THESIS_INVALID_NOW: 'THESIS_INVALID_NOW · 当前论点失效，等待结构恢复',
 }
 
 // 内置 AI 结论卡片：verdict 徽标 + 置信度 + 依据/风险列表（reasons JSON）
@@ -267,6 +270,29 @@ function InternalVerdictCard({ analysis }: { analysis: ReentryAIAnalysis }) {
         attention_price_high?: number
         ttl_seconds?: number
         next_review_seconds?: number
+        multi_timeframe_trend?: Record<string, string>
+        market_phase?: string
+        ai_stop_price?: number
+        stop_basis?: string
+        close_invalidation?: string
+        support_zones?: Array<{
+          low: number
+          high: number
+          strength: number
+          timeframes: string[]
+          touches: number
+          exhaustion: string
+        }>
+        resistance_zones?: Array<{
+          low: number
+          high: number
+          strength: number
+          timeframes: string[]
+          touches: number
+          exhaustion: string
+        }>
+        target_zones?: Array<{ low: number; high: number; basis: string }>
+        rearm_conditions?: string[]
       }
     } catch {
       return {}
@@ -316,9 +342,59 @@ function InternalVerdictCard({ analysis }: { analysis: ReentryAIAnalysis }) {
             {parsed.attention_price_low ?? '—'} –{' '}
             {parsed.attention_price_high ?? '—'}
           </div>
+          <div className="text-[#EAECEF]">
+            AI 止损：{parsed.ai_stop_price || analysis.ai_stop_price || '—'}
+            ；失效条件：
+            {parsed.close_invalidation || analysis.close_invalidation || '—'}
+          </div>
+          {(parsed.stop_basis || analysis.stop_basis) && (
+            <div>止损依据：{parsed.stop_basis || analysis.stop_basis}</div>
+          )}
+          {parsed.multi_timeframe_trend && (
+            <div>
+              多周期趋势：
+              {Object.entries(parsed.multi_timeframe_trend)
+                .map(([tf, trend]) => `${tf} ${trend}`)
+                .join(' · ')}
+              ；阶段 {parsed.market_phase || '—'}
+            </div>
+          )}
+          {(parsed.support_zones?.length ?? 0) > 0 && (
+            <div>
+              支撑区：
+              {parsed
+                .support_zones!.map(
+                  (z) =>
+                    `${z.low}-${z.high}(${z.strength}/100, ${z.timeframes.join('/')}, ${z.touches}次, ${z.exhaustion})`
+                )
+                .join('；')}
+            </div>
+          )}
+          {(parsed.resistance_zones?.length ?? 0) > 0 && (
+            <div>
+              阻力区：
+              {parsed
+                .resistance_zones!.map(
+                  (z) =>
+                    `${z.low}-${z.high}(${z.strength}/100, ${z.timeframes.join('/')}, ${z.touches}次, ${z.exhaustion})`
+                )
+                .join('；')}
+            </div>
+          )}
+          {(parsed.target_zones?.length ?? 0) > 0 && (
+            <div>
+              目标区：
+              {parsed
+                .target_zones!.map((z) => `${z.low}-${z.high}（${z.basis}）`)
+                .join('；')}
+            </div>
+          )}
+          {(parsed.rearm_conditions?.length ?? 0) > 0 && (
+            <div>重新唤醒条件：{parsed.rearm_conditions!.join('；')}</div>
+          )}
           <div>
-            这是生产候选结论；只有
-            ENTER、置信度达标且仓位、价格漂移、预算和保护预检全部通过时才可能真实下单。
+            AI 建议与确定性安全校验分离展示；只有 ENTER、置信度达标且同一 AI
+            止损通过价格、ATR、清算、tick、仓位与组合预算校验后才可能真实下单。
           </div>
         </div>
       ) : (
@@ -1056,7 +1132,7 @@ function AdvisorSettingsCard() {
                 </div>
                 <div>
                   决策：
-                  {['ENTER', 'WAIT', 'ABANDON']
+                  {['ENTER', 'WAIT', 'THESIS_INVALID_NOW', 'ABANDON']
                     .map((v) => `${v} ${stats.candidate_decisions?.[v] || 0}`)
                     .join(' · ')}
                 </div>
@@ -1078,8 +1154,9 @@ function AdvisorSettingsCard() {
                     .join(' · ')}
                 </div>
                 <div className="text-[#848E9C]">
-                  WAIT、ABANDON、非法输出与失败调用全部保留；仅实际 ENTER 且
-                  attempt 已对账的 {stats.candidate_scored}
+                  WAIT、THESIS_INVALID_NOW、v5
+                  ABANDON、非法输出与失败调用全部保留；仅实际 ENTER 且 attempt
+                  已对账的 {stats.candidate_scored}
                   条可回填真实盈亏，其中盈利 {stats.candidate_profitable}
                   条。不会把未执行决策伪装成反事实盈亏。
                 </div>
@@ -2929,15 +3006,47 @@ export function CopyGuardPage() {
           {detail.attempts.length > 0 && (
             <div className="space-y-2 mb-4">
               {detail.attempts.map((a) => (
-                <div
-                  key={a.id}
-                  className="grid grid-cols-5 gap-3 text-sm bg-[#181A20] rounded p-3"
-                >
-                  <span>尝试 #{a.attempt_no}</span>
-                  <span>{localized(attemptLabels, a.status)}</span>
-                  <span>入场 {a.entry_price || '-'}</span>
-                  <span>离场 {a.exit_price || '-'}</span>
-                  <span>净盈亏 {a.pnl.toFixed(2)}</span>
+                <div key={a.id} className="space-y-2 bg-[#181A20] rounded p-3">
+                  <div className="grid grid-cols-5 gap-3 text-sm">
+                    <span>尝试 #{a.attempt_no}</span>
+                    <span>{localized(attemptLabels, a.status)}</span>
+                    <span>入场 {a.entry_price || '-'}</span>
+                    <span>离场 {a.exit_price || '-'}</span>
+                    <span>净盈亏 {a.pnl.toFixed(2)}</span>
+                  </div>
+                  {a.ai_stop_price > 0 && (
+                    <div className="grid gap-1 text-xs text-[#848E9C] sm:grid-cols-3">
+                      <span>
+                        金额：计划 {a.planned_notional.toFixed(2)} → 执行{' '}
+                        {a.promoted_notional.toFixed(2)} USDT
+                      </span>
+                      <span>
+                        杠杆 {a.actual_leverage || '-'}× · 初始保证金{' '}
+                        {a.initial_margin_basis.toFixed(2)} USDT
+                      </span>
+                      <span>
+                        AI 止损 {a.ai_stop_price} · 最终止损{' '}
+                        {a.final_stop_price || '-'}
+                      </span>
+                      <span>
+                        预计仓位亏损{' '}
+                        {(a.expected_position_loss_pct * 100).toFixed(2)}%
+                      </span>
+                      <span>
+                        实际仓位亏损{' '}
+                        {(a.actual_position_loss_pct * 100).toFixed(2)}%
+                      </span>
+                      <span>
+                        安全校验 {a.stop_validation_result || '待验证'}
+                        {a.governed_by ? ` · ${a.governed_by}` : ''}
+                      </span>
+                      {a.promotion_reason && (
+                        <span className="text-[#F0B90B] sm:col-span-3">
+                          提升原因：{a.promotion_reason}
+                        </span>
+                      )}
+                    </div>
+                  )}
                 </div>
               ))}
             </div>

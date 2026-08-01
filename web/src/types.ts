@@ -249,6 +249,7 @@ export type CopyTradeSourceHealthStatus =
   | 'PRIVATE'
   | 'DISABLED'
   | 'AUTH_FAILED'
+  | 'NOT_FOLLOWING_LEADER'
   | 'DEGRADED'
   | 'STALE'
 
@@ -263,6 +264,17 @@ export interface CopyTradeSourceHealth {
   last_checked_at?: string
   last_complete_snapshot_at?: string
   last_transition_at?: string
+  last_notified_at?: string
+  last_request_started_at?: string
+  last_request_completed_at?: string
+  last_request_duration_ms: number
+  next_poll_at?: string
+  backoff_until?: string
+  rate_limit_429_count: number
+  last_processing_delay_ms: number
+  last_mail_status?: string
+  last_mail_error?: string
+  last_mail_at?: string
   consecutive_failures: number
   last_error?: string
   unsupported_contracts?: Array<{
@@ -305,8 +317,8 @@ export interface CopyConfigRequest {
   risk_round_trip_fee_bps?: number
   risk_atr_multiplier?: number // 默认 2.0：SL 距离基线 = k×ATR（1.0-3.0，抗噪主力线）
   risk_atr_timeframe?: string // 默认 "1h"：ATR 时间周期（"15m" / "1h" / "4h"）
-  risk_leverage_fallback?: boolean // 默认 false：margin_cap 默认关（高杠杆下会压进噪音区）
-  risk_leverage_max_loss?: number // 默认 0.2：仅 risk_leverage_fallback 开启时的保证金封顶
+  risk_leverage_fallback?: boolean // 默认 true：开启仓位初始保证金亏损硬上限
+  risk_leverage_max_loss?: number // 默认 0.5：普通跟单与 AI 重入共用
   risk_reentry_enabled?: boolean // 默认 true：止损完全平仓后进入 AI 持续观察
   risk_reentry_ratio?: number // 默认 0.5：重入仓位系数（× 被止损仓位名义）
   risk_reentry_decision_mode?: 'ai_guarded' | 'legacy_rule' | 'disabled'
@@ -1172,6 +1184,7 @@ export interface CopyGuardAICandidate {
     | 'WATCHING'
     | 'REVIEWING'
     | 'WAITING'
+    | 'DORMANT_REARM'
     | 'ENTRY_PENDING'
     | 'REENTERED'
     | 'ABANDONED'
@@ -1204,6 +1217,13 @@ export interface CopyGuardAICandidate {
   entry_price_high: number
   attention_price_low: number
   attention_price_high: number
+  ai_stop_price: number
+  stop_basis: string
+  close_invalidation: string
+  support_zones_json: string
+  resistance_zones_json: string
+  target_zones_json: string
+  rearm_conditions_json: string
   last_analysis_id: number
   last_error: string
   decision_expires_at?: string
@@ -1255,6 +1275,13 @@ export interface ReentryAIAnalysis {
   verdict: string
   confidence: number
   reasons: string
+  ai_stop_price: number
+  stop_basis: string
+  close_invalidation: string
+  support_zones_json: string
+  resistance_zones_json: string
+  target_zones_json: string
+  rearm_conditions_json: string
   external_response: string // 用户粘贴的外部 AI 结论（永久可编辑）
   external_verdict: '' | 'ENTER' | 'WAIT' | 'SKIP'
   prompt_version: string
