@@ -1732,16 +1732,20 @@ func (s *CopyTradeStore) ListCopyGuardCyclesPendingSummaryEmail(traderID string,
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	var ids []int64
 	for rows.Next() {
 		var id int64
 		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
 			return nil, err
 		}
 		ids = append(ids, id)
 	}
 	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
 		return nil, err
 	}
 	out := make([]*CopyGuardCycle, 0, len(ids))
@@ -1812,16 +1816,20 @@ func (s *CopyTradeStore) ListCopyGuardCyclesWithUnreconciledStops(traderID strin
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	var ids []int64
 	for rows.Next() {
 		var id int64
 		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
 			return nil, err
 		}
 		ids = append(ids, id)
 	}
 	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
 		return nil, err
 	}
 	out := make([]*CopyGuardCycle, 0, len(ids))

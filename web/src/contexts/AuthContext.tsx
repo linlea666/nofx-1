@@ -1,6 +1,7 @@
 import React, { createContext, useContext, useState, useEffect } from 'react'
 import { getSystemConfig } from '../lib/config'
 import { reset401Flag, httpClient } from '../lib/httpClient'
+import { requestLogin } from '../lib/loginRequest'
 
 interface User {
   id: string
@@ -107,34 +108,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, [])
 
   const login = async (email: string, password: string) => {
-    try {
-      const response = await fetch('/api/login', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ email, password }),
-      })
-
-      const data = await response.json()
-
-      if (response.ok) {
-        if (data.requires_otp) {
-          return {
-            success: true,
-            userID: data.user_id,
-            requiresOTP: true,
-            message: data.message,
-          }
-        }
-      } else {
-        return { success: false, message: data.error }
-      }
-    } catch (error) {
-      return { success: false, message: '登录失败，请重试' }
-    }
-
-    return { success: false, message: '未知错误' }
+    return requestLogin(email, password)
   }
 
   const loginAdmin = async (password: string) => {

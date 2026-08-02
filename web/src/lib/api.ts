@@ -520,12 +520,21 @@ export const api = {
 
   // 批量获取多个交易员的历史数据（无需认证）
   async getEquityHistoryBatch(traderIds: string[]): Promise<any> {
-    const result = await httpClient.post<any>(
+    const result = await httpClient.request<any>(
       `${API_BASE}/equity-history-batch`,
-      { trader_ids: traderIds }
+      { method: 'POST', data: { trader_ids: traderIds }, timeout: 15000 }
     )
     if (!result.success) throw new Error('获取批量历史数据失败')
-    return result.data!
+    const data = result.data!
+    const histories = data?.histories || {}
+    const errors = data?.errors || {}
+    if (
+      traderIds.length > 0 &&
+      traderIds.every((traderId) => errors[traderId] && !histories[traderId])
+    ) {
+      throw new Error('历史数据服务暂时不可用')
+    }
+    return data
   },
 
   // 获取前5名交易员数据（无需认证）

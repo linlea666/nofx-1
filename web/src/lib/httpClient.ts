@@ -87,6 +87,12 @@ export class HttpClient {
   private async handleError(error: AxiosError): Promise<any> {
     // Network error (no response from server)
     if (!error.response) {
+      if (error.code === 'ECONNABORTED') {
+        toast.error('Request timed out', {
+          description: 'The server did not respond in time',
+        })
+        throw new Error('Request timeout')
+      }
       toast.error('Network error - Please check your connection', {
         description: 'Unable to reach the server',
       })
@@ -171,6 +177,7 @@ export class HttpClient {
       data?: any
       params?: any
       headers?: Record<string, string>
+      timeout?: number
     } = {}
   ): Promise<ApiResponse<T>> {
     try {
@@ -180,6 +187,7 @@ export class HttpClient {
         data: options.data,
         params: options.params,
         headers: options.headers,
+        timeout: options.timeout,
       })
 
       // Success

@@ -657,6 +657,23 @@ func scanCopyTradeConfig(scanner interface {
 	return &config, nil
 }
 
+// hydrateCopyTradeConfig loads the policy stored outside copy_trade_configs and
+// applies all compatibility/default rules. Callers must not invoke this while a
+// query result set is still open: Store intentionally uses one SQLite
+// connection, so a nested query would wait forever for the connection held by
+// the outer rows iterator.
+func (s *CopyTradeStore) hydrateCopyTradeConfig(config *CopyTradeConfig) error {
+	if config == nil {
+		return nil
+	}
+	if err := s.loadCopyGuardPolicy(config); err != nil && err != sql.ErrNoRows {
+		return err
+	}
+	upgradeLegacyRiskPolicy(config)
+	config.FillRiskDefaults()
+	return nil
+}
+
 // GetByTraderID 根据 trader_id 获取跟单配置
 func (s *CopyTradeStore) GetByTraderID(traderID string) (*CopyTradeConfig, error) {
 	row := s.db.QueryRow(`SELECT `+copyTradeConfigSelectColumns+` FROM copy_trade_configs WHERE trader_id = ?`, traderID)
@@ -664,11 +681,9 @@ func (s *CopyTradeStore) GetByTraderID(traderID string) (*CopyTradeConfig, error
 	if err != nil {
 		return nil, err
 	}
-	if err := s.loadCopyGuardPolicy(config); err != nil && err != sql.ErrNoRows {
+	if err := s.hydrateCopyTradeConfig(config); err != nil {
 		return nil, err
 	}
-	upgradeLegacyRiskPolicy(config)
-	config.FillRiskDefaults()
 	return config, nil
 }
 
@@ -678,22 +693,64 @@ func (s *CopyTradeStore) ListEnabled() ([]*CopyTradeConfig, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 
 	var configs []*CopyTradeConfig
 	for rows.Next() {
 		config, err := scanCopyTradeConfig(rows)
 		if err != nil {
+			_ = rows.Close()
 			return nil, err
 		}
-		if err := s.loadCopyGuardPolicy(config); err != nil && err != sql.ErrNoRows {
-			return nil, err
-		}
-		upgradeLegacyRiskPolicy(config)
-		config.FillRiskDefaults()
 		configs = append(configs, config)
 	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	// Release the only SQLite connection before loading per-trader policy rows.
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	for _, config := range configs {
+		if err := s.hydrateCopyTradeConfig(config); err != nil {
+			return nil, err
+		}
+	}
 	return configs, nil
+}
+
+// ListEnabledTraderIDsBySource returns only incident membership identifiers.
+// Notification code must use this instead of ListEnabled so it never loads
+// credentials or Copy Guard risk policies on the source-signal hot path.
+func (s *CopyTradeStore) ListEnabledTraderIDsBySource(providerType, sourceMode string) ([]string, error) {
+	rows, err := s.db.Query(`
+		SELECT trader_id
+		FROM copy_trade_configs
+		WHERE enabled = 1
+		  AND LOWER(provider_type) = LOWER(?)
+		  AND LOWER(COALESCE(binance_source_mode, 'copy_management')) = LOWER(?)
+		ORDER BY trader_id`, providerType, sourceMode)
+	if err != nil {
+		return nil, err
+	}
+
+	ids := make([]string, 0)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	return ids, nil
 }
 
 // SetEnabled 设置跟单配置启用状态

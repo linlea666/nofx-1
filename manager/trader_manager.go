@@ -42,6 +42,27 @@ type CompetitionCache struct {
 	mu        sync.RWMutex
 }
 
+func cloneCompetitionData(data map[string]interface{}) map[string]interface{} {
+	cloned := make(map[string]interface{}, len(data))
+	for key, value := range data {
+		switch typed := value.(type) {
+		case []map[string]interface{}:
+			traders := make([]map[string]interface{}, len(typed))
+			for i, traderData := range typed {
+				copyData := make(map[string]interface{}, len(traderData))
+				for field, fieldValue := range traderData {
+					copyData[field] = fieldValue
+				}
+				traders[i] = copyData
+			}
+			cloned[key] = traders
+		default:
+			cloned[key] = value
+		}
+	}
+	return cloned
+}
+
 // TraderManager manages multiple trader instances
 type TraderManager struct {
 	traders          map[string]*trader.AutoTrader // key: trader ID
@@ -262,18 +283,10 @@ func (tm *TraderManager) GetComparisonData() (map[string]interface{}, error) {
 // GetCompetitionData retrieves competition data (all traders across platform)
 func (tm *TraderManager) GetCompetitionData() (map[string]interface{}, error) {
 	// Check if cache is valid (within 30 seconds)
-	tm.competitionCache.mu.RLock()
-	if time.Since(tm.competitionCache.timestamp) < 30*time.Second && len(tm.competitionCache.data) > 0 {
-		// Return cached data
-		cachedData := make(map[string]interface{})
-		for k, v := range tm.competitionCache.data {
-			cachedData[k] = v
-		}
-		tm.competitionCache.mu.RUnlock()
-		logger.Infof("📋 Returning competition data cache (cache age: %.1fs)", time.Since(tm.competitionCache.timestamp).Seconds())
+	if cachedData, ok := tm.GetCachedCompetitionData(30 * time.Second); ok {
+		logger.Infof("📋 Returning competition data cache")
 		return cachedData, nil
 	}
-	tm.competitionCache.mu.RUnlock()
 
 	tm.mu.RLock()
 
@@ -326,6 +339,22 @@ func (tm *TraderManager) GetCompetitionData() (map[string]interface{}, error) {
 	tm.competitionCache.mu.Unlock()
 
 	return comparison, nil
+}
+
+// GetCachedCompetitionData returns a read-only snapshot without refreshing any
+// trader account. Consumers such as historical charts must never turn a cache
+// miss into exchange API traffic.
+func (tm *TraderManager) GetCachedCompetitionData(maxAge time.Duration) (map[string]interface{}, bool) {
+	if tm == nil || tm.competitionCache == nil || maxAge <= 0 {
+		return nil, false
+	}
+	tm.competitionCache.mu.RLock()
+	defer tm.competitionCache.mu.RUnlock()
+	age := time.Since(tm.competitionCache.timestamp)
+	if tm.competitionCache.timestamp.IsZero() || age < 0 || age > maxAge || len(tm.competitionCache.data) == 0 {
+		return nil, false
+	}
+	return cloneCompetitionData(tm.competitionCache.data), true
 }
 
 // getConcurrentTraderData concurrently fetches data for multiple traders

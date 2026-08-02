@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"time"
@@ -85,7 +86,13 @@ func (s *EquityStore) Save(snapshot *EquitySnapshot) error {
 
 // GetLatest gets the latest N equity records for specified trader (sorted in ascending chronological order: old to new)
 func (s *EquityStore) GetLatest(traderID string, limit int) ([]*EquitySnapshot, error) {
-	rows, err := s.db.Query(`
+	return s.GetLatestContext(context.Background(), traderID, limit)
+}
+
+// GetLatestContext returns history without contacting an exchange and observes
+// the caller's request deadline while waiting for SQLite.
+func (s *EquityStore) GetLatestContext(ctx context.Context, traderID string, limit int) ([]*EquitySnapshot, error) {
+	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, trader_id, timestamp, total_equity, balance,
 		       unrealized_pnl, position_count, margin_used_pct
 		FROM trader_equity_snapshots

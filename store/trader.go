@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"strings"
@@ -565,6 +566,44 @@ func (s *TraderStore) GetByID(traderID string) (*Trader, error) {
 	t.UpdatedAt, _ = time.Parse("2006-01-02 15:04:05", updatedAt)
 	assignTraderLifecycleTimes(&t, stoppedAt, archivedAt)
 	return &t, nil
+}
+
+// GetInitialBalancesByIDs reads only the public chart baseline fields in one
+// query. It avoids loading full trader configuration N times for the batch
+// equity endpoint.
+func (s *TraderStore) GetInitialBalancesByIDs(ctx context.Context, traderIDs []string) (map[string]float64, error) {
+	out := make(map[string]float64)
+	if len(traderIDs) == 0 {
+		return out, nil
+	}
+	placeholders := strings.TrimRight(strings.Repeat("?,", len(traderIDs)), ",")
+	args := make([]interface{}, 0, len(traderIDs))
+	for _, id := range traderIDs {
+		args = append(args, id)
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT id,initial_balance FROM traders WHERE id IN (`+placeholders+`)`, args...)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var id string
+		var initialBalance float64
+		if err := rows.Scan(&id, &initialBalance); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		if initialBalance > 0 {
+			out[id] = initialBalance
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (s *TraderStore) CountRunningByExchange(exchangeID string) (int, error) {

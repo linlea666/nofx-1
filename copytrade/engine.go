@@ -581,7 +581,7 @@ func (e *Engine) recordSmartMoneySourceIncident(obs SourceHealthObservation, hea
 			continue
 		}
 		if action != "" {
-			e.notifySmartMoneySourceIncident(incident, action, health, now)
+			e.enqueueSmartMoneySourceIncidentNotification(incident, action, health, now)
 		}
 	}
 }
@@ -592,13 +592,10 @@ func (e *Engine) notifySmartMoneySourceIncident(incident *store.CopyTradeSourceI
 	}
 	members, _ := e.store.CopyTrade().ListSourceIncidentMembers(incident.ID)
 	if incident.ScopeKind == store.SourceIncidentScopeCredential {
-		if configs, err := e.store.CopyTrade().ListEnabled(); err == nil {
-			members = members[:0]
-			for _, config := range configs {
-				if config != nil && strings.EqualFold(config.ProviderType, string(ProviderBinance)) && strings.EqualFold(config.BinanceSourceMode, string(BinanceSourceSmartMoney)) {
-					members = append(members, config.TraderID)
-				}
-			}
+		if ids, err := e.store.CopyTrade().ListEnabledTraderIDsBySource(string(ProviderBinance), string(BinanceSourceSmartMoney)); err == nil {
+			members = ids
+		} else {
+			logger.Warnf("⚠️ [%s] 查询 Smart Money 事故成员失败，回退到已记录成员: %v", e.traderID, err)
 		}
 	}
 	if len(members) == 0 {

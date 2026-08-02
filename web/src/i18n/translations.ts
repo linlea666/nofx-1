@@ -88,6 +88,10 @@ export const translations = {
     dataPoints: 'Data Points',
     currentGap: 'Current Gap',
     count: '{count} pts',
+    loadingChartData: 'Loading chart data...',
+    chartLoadFailed: 'Failed to load chart',
+    chartLoadFailedHint: 'Historical data is temporarily unavailable',
+    retry: 'Retry',
 
     // TradingView Chart
     marketChart: 'Market Chart',
@@ -1249,6 +1253,10 @@ export const translations = {
     dataPoints: '数据点数',
     currentGap: '当前差距',
     count: '{count} 个',
+    loadingChartData: '正在加载图表数据…',
+    chartLoadFailed: '图表加载失败',
+    chartLoadFailedHint: '历史数据暂时不可用，请稍后重试',
+    retry: '重试',
 
     // TradingView Chart
     marketChart: '行情图表',

@@ -60,25 +60,31 @@ export function LoginPage() {
     setError('')
     setLoading(true)
 
-    const result = await login(email, password)
+    try {
+      const result = await login(email, password)
 
-    if (result.success) {
-      if (result.requiresOTP && result.userID) {
-        setUserID(result.userID)
-        setStep('otp')
-      } else {
-        // Dismiss the "login expired" toast on successful login (no OTP required)
-        if (expiredToastId) {
-          toast.dismiss(expiredToastId)
+      if (result.success) {
+        if (result.requiresOTP && result.userID) {
+          setUserID(result.userID)
+          setStep('otp')
+        } else {
+          // Dismiss the "login expired" toast on successful login (no OTP required)
+          if (expiredToastId) {
+            toast.dismiss(expiredToastId)
+          }
         }
+      } else {
+        const msg = result.message || t('loginFailed', language)
+        setError(msg)
+        toast.error(msg)
       }
-    } else {
-      const msg = result.message || t('loginFailed', language)
+    } catch {
+      const msg = t('loginFailed', language)
       setError(msg)
       toast.error(msg)
+    } finally {
+      setLoading(false)
     }
-
-    setLoading(false)
   }
 
   const handleOTPVerify = async (e: React.FormEvent) => {

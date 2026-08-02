@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/base32"
@@ -75,9 +76,15 @@ func (s *UserStore) Create(user *User) error {
 
 // GetByEmail gets user by email
 func (s *UserStore) GetByEmail(email string) (*User, error) {
+	return s.GetByEmailContext(context.Background(), email)
+}
+
+// GetByEmailContext allows latency-sensitive callers such as login to fail
+// closed when the single SQLite connection is unavailable.
+func (s *UserStore) GetByEmailContext(ctx context.Context, email string) (*User, error) {
 	var user User
 	var createdAt, updatedAt string
-	err := s.db.QueryRow(`
+	err := s.db.QueryRowContext(ctx, `
 		SELECT id, email, password_hash, otp_secret, otp_verified, created_at, updated_at
 		FROM users WHERE email = ?
 	`, email).Scan(

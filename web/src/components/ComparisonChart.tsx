@@ -17,7 +17,13 @@ import type { CompetitionTraderData } from '../types'
 import { getTraderColor } from '../utils/traderColors'
 import { useLanguage } from '../contexts/LanguageContext'
 import { t } from '../i18n/translations'
-import { BarChart3, TrendingUp, TrendingDown, Zap } from 'lucide-react'
+import {
+  AlertCircle,
+  BarChart3,
+  TrendingUp,
+  TrendingDown,
+  Zap,
+} from 'lucide-react'
 
 interface ComparisonChartProps {
   traders: CompetitionTraderData[]
@@ -32,7 +38,13 @@ export function ComparisonChart({ traders }: ComparisonChartProps) {
     .sort()
     .join(',')
 
-  const { data: allTraderHistories, isLoading } = useSWR(
+  const {
+    data: allTraderHistories,
+    error,
+    isLoading,
+    isValidating,
+    mutate,
+  } = useSWR(
     traders.length > 0 ? `all-equity-histories-${tradersKey}` : null,
     async () => {
       const traderIds = traders.map((trader) => trader.trader_id)
@@ -58,6 +70,7 @@ export function ComparisonChart({ traders }: ComparisonChartProps) {
       refreshInterval: 30000,
       revalidateOnFocus: false,
       dedupingInterval: 20000,
+      shouldRetryOnError: false,
     }
   )
 
@@ -188,6 +201,29 @@ export function ComparisonChart({ traders }: ComparisonChartProps) {
         <div className="text-sm mt-4 font-medium" style={{ color: '#848E9C' }}>
           {t('loadingChartData', language) || 'Loading chart data...'}
         </div>
+      </div>
+    )
+  }
+
+  if (error) {
+    return (
+      <div className="flex flex-col items-center justify-center py-20">
+        <AlertCircle className="w-12 h-12 mb-4" style={{ color: '#F6465D' }} />
+        <div className="text-lg font-bold mb-2" style={{ color: '#EAECEF' }}>
+          {t('chartLoadFailed', language)}
+        </div>
+        <div className="text-sm mb-5" style={{ color: '#848E9C' }}>
+          {t('chartLoadFailedHint', language)}
+        </div>
+        <button
+          type="button"
+          disabled={isValidating}
+          onClick={() => void mutate()}
+          className="px-4 py-2 rounded text-sm font-semibold disabled:opacity-50"
+          style={{ background: '#F0B90B', color: '#0B0E11' }}
+        >
+          {isValidating ? t('loading', language) : t('retry', language)}
+        </button>
       </div>
     )
   }

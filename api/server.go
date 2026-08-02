@@ -192,6 +192,7 @@ func (s *Server) setupRoutes() {
 	{
 		// Health check
 		api.Any("/health", s.handleHealth)
+		api.Any("/ready", s.handleReady)
 
 		// Admin login (used in admin mode, public)
 
@@ -312,6 +313,29 @@ func (s *Server) handleHealth(c *gin.Context) {
 		"status": "ok",
 		"time":   c.Request.Context().Value("time"),
 	})
+}
+
+const (
+	databaseReadyTimeout         = 2 * time.Second
+	loginDatabaseTimeout         = 5 * time.Second
+	equityHistoryDatabaseTimeout = 5 * time.Second
+)
+
+// handleReady verifies that the process can acquire and query its single
+// SQLite connection. It intentionally does not expose driver or schema errors.
+func (s *Server) handleReady(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), databaseReadyTimeout)
+	defer cancel()
+	var one int
+	if err := s.store.DB().QueryRowContext(ctx, `SELECT 1`).Scan(&one); err != nil || one != 1 {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"status": "not_ready",
+			"code":   "DATABASE_UNAVAILABLE",
+			"error":  "Service temporarily unavailable",
+		})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ready"})
 }
 
 // handleGetSystemConfig Get system configuration (configuration that client needs to know)
@@ -3203,9 +3227,19 @@ func (s *Server) handleLogin(c *gin.Context) {
 		return
 	}
 
-	// Get user information
-	user, err := s.store.User().GetByEmail(req.Email)
+	// Bound the SQLite wait independently of the reverse proxy timeout so a
+	// database stall is reported as service unavailability, not bad credentials.
+	ctx, cancel := context.WithTimeout(c.Request.Context(), loginDatabaseTimeout)
+	defer cancel()
+	user, err := s.store.User().GetByEmailContext(ctx, req.Email)
 	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"code":  "DATABASE_UNAVAILABLE",
+				"error": "Service temporarily unavailable",
+			})
+			return
+		}
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Email or password incorrect"})
 		return
 	}
@@ -3365,6 +3399,7 @@ func (s *Server) Start() error {
 	logger.Infof("🌐 API server starting at http://localhost%s", addr)
 	logger.Infof("📊 API Documentation:")
 	logger.Infof("  • GET  /api/health           - Health check")
+	logger.Infof("  • GET  /api/ready            - Database readiness check")
 	logger.Infof("  • GET  /api/traders          - Public AI trader leaderboard top 50 (no auth required)")
 	logger.Infof("  • GET  /api/competition      - Public competition data (no auth required)")
 	logger.Infof("  • GET  /api/top-traders      - Top 5 trader data (no auth required, for performance comparison)")
@@ -3488,30 +3523,25 @@ func (s *Server) handleEquityHistoryBatch(c *gin.Context) {
 		// If JSON parse fails, try to get from query parameters (compatible with GET request)
 		traderIDsParam := c.Query("trader_ids")
 		if traderIDsParam == "" {
-			// If no trader_ids specified, return historical data for top 5
-			topTraders, err := s.traderManager.GetTopTradersData()
-			if err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{
-					"error": fmt.Sprintf("Failed to get top 5 traders: %v", err),
-				})
-				return
-			}
-
-			traders, ok := topTraders["traders"].([]map[string]interface{})
-			if !ok {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Trader data format error"})
-				return
-			}
-
-			// Extract trader IDs
-			traderIDs := make([]string, 0, len(traders))
-			for _, trader := range traders {
-				if traderID, ok := trader["trader_id"].(string); ok {
-					traderIDs = append(traderIDs, traderID)
+			// Compatibility fallback may use only the existing leaderboard cache;
+			// a cache miss must not trigger exchange account requests.
+			traderIDs := make([]string, 0, 5)
+			if cached, ok := s.traderManager.GetCachedCompetitionData(60 * time.Second); ok {
+				if traders, valid := cached["traders"].([]map[string]interface{}); valid {
+					for _, trader := range traders {
+						if traderID, valid := trader["trader_id"].(string); valid {
+							traderIDs = append(traderIDs, traderID)
+							if len(traderIDs) == 5 {
+								break
+							}
+						}
+					}
 				}
 			}
 
-			result := s.getEquityHistoryForTraders(traderIDs)
+			ctx, cancel := context.WithTimeout(c.Request.Context(), equityHistoryDatabaseTimeout)
+			defer cancel()
+			result := s.getEquityHistoryForTraders(ctx, traderIDs)
 			c.JSON(http.StatusOK, result)
 			return
 		}
@@ -3528,14 +3558,16 @@ func (s *Server) handleEquityHistoryBatch(c *gin.Context) {
 		requestBody.TraderIDs = requestBody.TraderIDs[:20]
 	}
 
-	result := s.getEquityHistoryForTraders(requestBody.TraderIDs)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), equityHistoryDatabaseTimeout)
+	defer cancel()
+	result := s.getEquityHistoryForTraders(ctx, requestBody.TraderIDs)
 	c.JSON(http.StatusOK, result)
 }
 
 // getEquityHistoryForTraders Get historical data for multiple traders
 // Query directly from database, not dependent on trader in memory (so historical data can be retrieved after restart)
 // Also appends current real-time data point to ensure chart matches leaderboard
-func (s *Server) getEquityHistoryForTraders(traderIDs []string) map[string]interface{} {
+func (s *Server) getEquityHistoryForTraders(ctx context.Context, traderIDs []string) map[string]interface{} {
 	result := make(map[string]interface{})
 	histories := make(map[string]interface{})
 	errors := make(map[string]string)
@@ -3543,28 +3575,45 @@ func (s *Server) getEquityHistoryForTraders(traderIDs []string) map[string]inter
 	// Use a single consistent timestamp for all real-time data points
 	now := time.Now()
 
-	// Pre-fetch initial balances for all traders
-	initialBalances := make(map[string]float64)
+	// Pre-fetch chart baselines in one database query.
+	filteredIDs := make([]string, 0, len(traderIDs))
+	seen := make(map[string]struct{}, len(traderIDs))
 	for _, traderID := range traderIDs {
+		traderID = strings.TrimSpace(traderID)
 		if traderID == "" {
 			continue
 		}
-		// Get trader's initial balance from database (use GetByID which doesn't require userID)
-		trader, err := s.store.Trader().GetByID(traderID)
-		if err == nil && trader != nil && trader.InitialBalance > 0 {
-			initialBalances[traderID] = trader.InitialBalance
+		if _, exists := seen[traderID]; exists {
+			continue
+		}
+		seen[traderID] = struct{}{}
+		filteredIDs = append(filteredIDs, traderID)
+	}
+	initialBalances, err := s.store.Trader().GetInitialBalancesByIDs(ctx, filteredIDs)
+	if err != nil {
+		for _, traderID := range filteredIDs {
+			errors[traderID] = "Historical data is temporarily unavailable"
 		}
 	}
 
-	for _, traderID := range traderIDs {
-		if traderID == "" {
-			continue
+	// Reuse only a fresh leaderboard snapshot. A miss deliberately remains a
+	// miss: this endpoint must never fetch trader accounts or exchanges.
+	cachedTraders := make(map[string]map[string]interface{})
+	if cached, ok := s.traderManager.GetCachedCompetitionData(60 * time.Second); ok {
+		if traders, valid := cached["traders"].([]map[string]interface{}); valid {
+			for _, traderData := range traders {
+				if traderID, valid := traderData["trader_id"].(string); valid {
+					cachedTraders[traderID] = traderData
+				}
+			}
 		}
+	}
 
+	for _, traderID := range filteredIDs {
 		// Get equity historical data from new equity table
-		snapshots, err := s.store.Equity().GetLatest(traderID, 500)
+		snapshots, err := s.store.Equity().GetLatestContext(ctx, traderID, 500)
 		if err != nil {
-			errors[traderID] = fmt.Sprintf("Failed to get historical data: %v", err)
+			errors[traderID] = "Historical data is temporarily unavailable"
 			continue
 		}
 
@@ -3597,37 +3646,24 @@ func (s *Server) getEquityHistoryForTraders(traderIDs []string) map[string]inter
 			}
 		}
 
-		// Append current real-time data point to ensure chart matches leaderboard
-		// This ensures the latest point is always current, not from a potentially stale snapshot
-		if trader, err := s.traderManager.GetTrader(traderID); err == nil {
-			if accountInfo, err := trader.GetAccountInfo(); err == nil {
-				// Only append if it's been more than 30 seconds since last snapshot
-				if now.Sub(lastSnapshotTime) > 30*time.Second {
-					totalEquity := 0.0
-					if v, ok := accountInfo["total_equity"].(float64); ok {
-						totalEquity = v
-					}
-					totalPnL := 0.0
-					if v, ok := accountInfo["total_pnl"].(float64); ok {
-						totalPnL = v
-					}
-					walletBalance := 0.0
-					if v, ok := accountInfo["wallet_balance"].(float64); ok {
-						walletBalance = v
-					}
-					pnlPct := 0.0
-					if initialBalance > 0 {
-						pnlPct = (totalEquity - initialBalance) / initialBalance * 100
-					}
-
-					history = append(history, map[string]interface{}{
-						"timestamp":     now,
-						"total_equity":  totalEquity,
-						"total_pnl":     totalPnL,
-						"total_pnl_pct": pnlPct,
-						"balance":       walletBalance,
-					})
+		// Append the current leaderboard point only when it came from a fresh
+		// cache and the database series is older than 30 seconds.
+		if accountInfo, ok := cachedTraders[traderID]; ok && now.Sub(lastSnapshotTime) > 30*time.Second {
+			totalEquity, valid := accountInfo["total_equity"].(float64)
+			if valid {
+				totalPnL, _ := accountInfo["total_pnl"].(float64)
+				walletBalance := initialBalance
+				if len(snapshots) > 0 {
+					walletBalance = snapshots[len(snapshots)-1].Balance
 				}
+				pnlPct := 0.0
+				if initialBalance > 0 {
+					pnlPct = (totalEquity - initialBalance) / initialBalance * 100
+				}
+				history = append(history, map[string]interface{}{
+					"timestamp": now, "total_equity": totalEquity, "total_pnl": totalPnL,
+					"total_pnl_pct": pnlPct, "balance": walletBalance,
+				})
 			}
 		}
 
