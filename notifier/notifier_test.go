@@ -1,6 +1,7 @@
 package notifier
 
 import (
+	"context"
 	"errors"
 	"os"
 	"strings"
@@ -10,7 +11,15 @@ import (
 
 type failingMailSender struct{ err error }
 
-func (s failingMailSender) Send([]string, string, string) error { return s.err }
+func (s failingMailSender) Send(context.Context, []string, string, string) error { return s.err }
+
+type blockingContextMailSender struct{ entered chan struct{} }
+
+func (s blockingContextMailSender) Send(ctx context.Context, _ []string, _, _ string) error {
+	close(s.entered)
+	<-ctx.Done()
+	return ctx.Err()
+}
 
 func TestBuildBodyIncludesTraderNameAndStableID(t *testing.T) {
 	body := buildBody(Alert{Category: "copy_trade", TraderID: "trader-id", TraderName: "主账户-A", Title: "AI 决策", Time: time.Now()})
@@ -150,7 +159,7 @@ func TestCopyTradeActionEnabledReflectsGlobalConfig(t *testing.T) {
 func TestLoadFromEnvKeepsExistingDefaultsWhenCopyActionEnvIsSet(t *testing.T) {
 	// 清空其他 env 避免本机环境干扰
 	keys := []string{"NOTIFY_EMAIL_ENABLED", "SMTP_HOST", "SMTP_USER", "SMTP_PASS",
-		"NOTIFY_TO", "NOTIFY_MIN_INTERVAL", "NOTIFY_QUEUE_SIZE", "NOTIFY_SEND_ON_STARTUP"}
+		"NOTIFY_TO", "NOTIFY_MIN_INTERVAL", "NOTIFY_QUEUE_SIZE", "NOTIFY_SEND_TIMEOUT_SECONDS", "NOTIFY_SEND_ON_STARTUP"}
 	for _, k := range keys {
 		t.Setenv(k, "")
 		_ = os.Unsetenv(k) // 防止 Setenv 设为空串而不是 unset
@@ -169,6 +178,9 @@ func TestLoadFromEnvKeepsExistingDefaultsWhenCopyActionEnvIsSet(t *testing.T) {
 	}
 	if cfg.QueueSize != 100 {
 		t.Fatalf("默认 QueueSize 应为 100，实际 %d", cfg.QueueSize)
+	}
+	if cfg.SendTimeout != 15*time.Second {
+		t.Fatalf("默认 SendTimeout 应为 15s，实际 %v", cfg.SendTimeout)
 	}
 }
 
@@ -228,5 +240,32 @@ func TestNoopNotifierReportsDisabled(t *testing.T) {
 	noopNotifier{}.Notify(Alert{StatusHook: func(got DeliveryStatus, _ error) { status = got }})
 	if status != DeliveryDisabled {
 		t.Fatalf("noop delivery status=%s want disabled", status)
+	}
+}
+
+func TestEmailNotifierShutdownCancelsInFlightSMTP(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	n := &emailNotifier{
+		cfg:    Config{MinInterval: 0, QueueSize: 1, SendTimeout: time.Hour},
+		client: blockingContextMailSender{entered: make(chan struct{})},
+		queue:  make(chan Alert, 1), stopCh: make(chan struct{}), ctx: ctx, cancel: cancel,
+	}
+	n.wg.Add(1)
+	go n.worker()
+	n.Notify(Alert{Category: "system", Title: "blocking smtp"})
+	select {
+	case <-n.client.(blockingContextMailSender).entered:
+	case <-time.After(time.Second):
+		t.Fatal("SMTP sender did not start")
+	}
+	done := make(chan struct{})
+	go func() {
+		n.Shutdown()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not cancel in-flight SMTP")
 	}
 }

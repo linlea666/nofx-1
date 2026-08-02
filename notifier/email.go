@@ -8,6 +8,7 @@
 package notifier
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/base64"
 	"fmt"
@@ -51,12 +52,15 @@ func newEmailClient(cfg Config) *emailClient {
 
 // Send 发送一封邮件
 // to: 收件人地址（多个）；subject: UTF-8 主题；body: UTF-8 正文（纯文本）
-func (c *emailClient) Send(to []string, subject, body string) error {
+func (c *emailClient) Send(ctx context.Context, to []string, subject, body string) error {
 	if len(to) == 0 {
 		return fmt.Errorf("notifier: empty recipient list")
 	}
 	if c.host == "" || c.user == "" || c.pass == "" {
 		return fmt.Errorf("notifier: incomplete smtp config")
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 
 	msg := buildMIMEMessage(c.fromName, c.from, to, subject, body)
@@ -64,30 +68,81 @@ func (c *emailClient) Send(to []string, subject, body string) error {
 
 	// 优先使用隐式 TLS（端口 465 - 163/QQ 等国内邮箱推荐方式）
 	if c.port == 465 || c.port == 994 {
-		return c.sendViaImplicitTLS(auth, to, msg)
+		return c.sendViaImplicitTLS(ctx, auth, to, msg)
 	}
 	// 端口 25/587 → STARTTLS（显式协商）
-	return c.sendViaSTARTTLS(auth, to, msg)
+	return c.sendViaSTARTTLS(ctx, auth, to, msg)
 }
 
 // sendViaImplicitTLS 用 SSL/TLS 直连发送（适配 163 端口 465）
-func (c *emailClient) sendViaImplicitTLS(auth smtp.Auth, to []string, msg []byte) error {
+func (c *emailClient) sendViaImplicitTLS(ctx context.Context, auth smtp.Auth, to []string, msg []byte) error {
 	addr := fmt.Sprintf("%s:%d", c.host, c.port)
 	dialer := &net.Dialer{Timeout: c.timeout}
 	tlsCfg := &tls.Config{ServerName: c.host, MinVersion: tls.VersionTLS12}
 
-	conn, err := tls.DialWithDialer(dialer, "tcp", addr, tlsCfg)
+	rawConn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return fmt.Errorf("tls dial %s failed: %w", addr, err)
 	}
-	defer conn.Close()
+	defer rawConn.Close()
+	stopCancel := context.AfterFunc(ctx, func() { _ = rawConn.SetDeadline(time.Now()) })
+	defer stopCancel()
+	if err = setSMTPConnectionDeadline(ctx, rawConn, c.timeout); err != nil {
+		return err
+	}
+	tlsConn := tls.Client(rawConn, tlsCfg)
+	if err = tlsConn.HandshakeContext(ctx); err != nil {
+		return fmt.Errorf("tls handshake %s failed: %w", addr, err)
+	}
 
+	client, err := smtp.NewClient(tlsConn, c.host)
+	if err != nil {
+		return fmt.Errorf("smtp client init failed: %w", err)
+	}
+	defer client.Close()
+	return c.sendSMTPTransaction(client, auth, to, msg)
+}
+
+// sendViaSTARTTLS 用 STARTTLS 显式升级发送（适配端口 25/587）
+func (c *emailClient) sendViaSTARTTLS(ctx context.Context, auth smtp.Auth, to []string, msg []byte) error {
+	addr := fmt.Sprintf("%s:%d", c.host, c.port)
+	dialer := &net.Dialer{Timeout: c.timeout}
+	conn, err := dialer.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return fmt.Errorf("smtp dial %s failed: %w", addr, err)
+	}
+	defer conn.Close()
+	stopCancel := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
+	defer stopCancel()
+	if err = setSMTPConnectionDeadline(ctx, conn, c.timeout); err != nil {
+		return err
+	}
 	client, err := smtp.NewClient(conn, c.host)
 	if err != nil {
 		return fmt.Errorf("smtp client init failed: %w", err)
 	}
-	defer client.Quit()
+	defer client.Close()
+	if ok, _ := client.Extension("STARTTLS"); !ok {
+		return fmt.Errorf("smtp server %s does not support STARTTLS", addr)
+	}
+	if err = client.StartTLS(&tls.Config{ServerName: c.host, MinVersion: tls.VersionTLS12}); err != nil {
+		return fmt.Errorf("smtp STARTTLS failed: %w", err)
+	}
+	return c.sendSMTPTransaction(client, auth, to, msg)
+}
 
+func setSMTPConnectionDeadline(ctx context.Context, conn net.Conn, fallback time.Duration) error {
+	deadline := time.Now().Add(fallback)
+	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
+		deadline = contextDeadline
+	}
+	if err := conn.SetDeadline(deadline); err != nil {
+		return fmt.Errorf("set smtp deadline failed: %w", err)
+	}
+	return nil
+}
+
+func (c *emailClient) sendSMTPTransaction(client *smtp.Client, auth smtp.Auth, to []string, msg []byte) error {
 	if err := client.Auth(auth); err != nil {
 		return fmt.Errorf("smtp auth failed: %w", err)
 	}
@@ -103,20 +158,17 @@ func (c *emailClient) sendViaImplicitTLS(auth smtp.Auth, to []string, msg []byte
 	if err != nil {
 		return fmt.Errorf("smtp DATA failed: %w", err)
 	}
-	if _, err := w.Write(msg); err != nil {
+	if _, err = w.Write(msg); err != nil {
 		_ = w.Close()
 		return fmt.Errorf("smtp write body failed: %w", err)
 	}
-	if err := w.Close(); err != nil {
+	if err = w.Close(); err != nil {
 		return fmt.Errorf("smtp body close failed: %w", err)
 	}
+	if err = client.Quit(); err != nil {
+		return fmt.Errorf("smtp QUIT failed: %w", err)
+	}
 	return nil
-}
-
-// sendViaSTARTTLS 用 STARTTLS 显式升级发送（适配端口 25/587）
-func (c *emailClient) sendViaSTARTTLS(auth smtp.Auth, to []string, msg []byte) error {
-	addr := fmt.Sprintf("%s:%d", c.host, c.port)
-	return smtp.SendMail(addr, auth, c.from, to, msg)
 }
 
 // buildMIMEMessage 构造符合 RFC 5322 / MIME 的邮件原文

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -226,8 +227,17 @@ func (s *CopyTradeStore) migratePositionMarginStops() error {
 
 // LogCopyEvent 写入一条事件（INSERT OR IGNORE 保证 dedup_key 幂等）。
 func (s *CopyTradeStore) LogCopyEvent(e *CopyTradeEvent) error {
+	return s.LogCopyEventContext(context.Background(), e)
+}
+
+// LogCopyEventContext is the bounded variant used by ancillary observers such
+// as email delivery. Core execution callers keep the existing API above.
+func (s *CopyTradeStore) LogCopyEventContext(ctx context.Context, e *CopyTradeEvent) error {
 	if e == nil {
 		return fmt.Errorf("nil copy trade event")
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	if e.Category == "" || e.EventType == "" {
 		return fmt.Errorf("copy trade event missing category/event_type")
@@ -241,7 +251,7 @@ func (s *CopyTradeStore) LogCopyEvent(e *CopyTradeEvent) error {
 			detailJSON = string(b)
 		}
 	}
-	_, err := s.db.Exec(`
+	_, err := s.db.ExecContext(ctx, `
 		INSERT OR IGNORE INTO copy_trade_events
 			(trader_id, leader_id, provider_type, category, event_type, severity,
 			 symbol, side, margin_mode, leader_pos_id, follower_pos_id, cycle_id,

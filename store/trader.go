@@ -698,6 +698,55 @@ func (s *TraderStore) ResolveDisplayName(traderID string) string {
 	return strings.TrimSpace(t.Name)
 }
 
+// ResolveDisplayNamesContext resolves notification identities in one bounded
+// query. Missing/deleted traders retain their stable IDs and rows are fully
+// released before any notifier work begins.
+func (s *TraderStore) ResolveDisplayNamesContext(ctx context.Context, traderIDs []string) (map[string]string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	out := make(map[string]string, len(traderIDs))
+	placeholders := make([]string, 0, len(traderIDs))
+	args := make([]interface{}, 0, len(traderIDs))
+	for _, traderID := range traderIDs {
+		value := strings.TrimSpace(traderID)
+		if value == "" {
+			continue
+		}
+		if _, exists := out[value]; exists {
+			continue
+		}
+		out[value] = value
+		placeholders = append(placeholders, "?")
+		args = append(args, value)
+	}
+	if len(placeholders) == 0 {
+		return out, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT id,name FROM traders WHERE id IN (`+strings.Join(placeholders, ",")+`)`, args...)
+	if err != nil {
+		return out, err
+	}
+	for rows.Next() {
+		var id, name string
+		if err = rows.Scan(&id, &name); err != nil {
+			_ = rows.Close()
+			return out, err
+		}
+		if value := strings.TrimSpace(name); value != "" {
+			out[id] = value
+		}
+	}
+	if err = rows.Err(); err != nil {
+		_ = rows.Close()
+		return out, err
+	}
+	if err = rows.Close(); err != nil {
+		return out, err
+	}
+	return out, nil
+}
+
 func (s *TraderStore) ListAll() ([]*Trader, error) {
 	rows, err := s.db.Query(`
 		SELECT id, user_id, name, ai_model_id, exchange_id, COALESCE(strategy_id, ''),

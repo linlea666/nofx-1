@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"strings"
@@ -342,7 +343,32 @@ func (s *CopyTradeStore) MarkSourceHealthNotified(traderID string, at time.Time)
 }
 
 func (s *CopyTradeStore) MarkSourceHealthMailDelivery(traderID, status, message string, at time.Time) error {
-	_, err := s.db.Exec(`UPDATE copy_trade_source_health SET last_mail_status=?,last_mail_error=?,last_mail_at=? WHERE trader_id=?`, status, message, formatSourceHealthTime(&at), traderID)
+	return s.MarkSourceHealthMailDeliveryBatchContext(context.Background(), []string{traderID}, status, message, at)
+}
+
+func (s *CopyTradeStore) MarkSourceHealthMailDeliveryBatchContext(ctx context.Context, traderIDs []string, status, message string, at time.Time) error {
+	if len(traderIDs) == 0 {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if at.IsZero() {
+		at = time.Now()
+	}
+	placeholders := make([]string, 0, len(traderIDs))
+	args := make([]interface{}, 0, len(traderIDs)+3)
+	args = append(args, status, message, formatSourceHealthTime(&at))
+	for _, traderID := range traderIDs {
+		if value := strings.TrimSpace(traderID); value != "" {
+			placeholders = append(placeholders, "?")
+			args = append(args, value)
+		}
+	}
+	if len(placeholders) == 0 {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE copy_trade_source_health SET last_mail_status=?,last_mail_error=?,last_mail_at=? WHERE trader_id IN (`+strings.Join(placeholders, ",")+`)`, args...)
 	return err
 }
 

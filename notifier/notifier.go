@@ -1,6 +1,7 @@
 package notifier
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strconv"
@@ -27,6 +28,7 @@ type Config struct {
 	To            []string      // 收件人列表
 	MinInterval   time.Duration // 同 key 告警最小间隔，默认 60s
 	QueueSize     int           // 异步队列大小，默认 100
+	SendTimeout   time.Duration // 单封邮件总发送上限，默认 15s
 	SendOnStartup bool          // 启动时发送测试邮件，默认 true
 
 	// NotifyBinanceCopyActionEnabled 是否在"Binance 跟单成功执行动作"时也发邮件。
@@ -51,6 +53,7 @@ type Config struct {
 //	NOTIFY_TO              = a@x.com,b@y.com      (必填，逗号分隔)
 //	NOTIFY_MIN_INTERVAL    = 60                   (秒，默认 60)
 //	NOTIFY_QUEUE_SIZE      = 100                  (默认 100)
+//	NOTIFY_SEND_TIMEOUT_SECONDS = 15              (默认 15，必须 >0)
 //	NOTIFY_SEND_ON_STARTUP = true                 (默认 true)
 //	NOTIFY_BINANCE_COPY_ACTION_ENABLED = false    (默认 false，仅 Binance 跟单数据源生效)
 func LoadFromEnv() Config {
@@ -58,6 +61,7 @@ func LoadFromEnv() Config {
 		SMTPPort:      465,
 		MinInterval:   60 * time.Second,
 		QueueSize:     100,
+		SendTimeout:   15 * time.Second,
 		SendOnStartup: true,
 		FromName:      "NOFX Notifier",
 	}
@@ -95,6 +99,11 @@ func LoadFromEnv() Config {
 	if v := os.Getenv("NOTIFY_QUEUE_SIZE"); v != "" {
 		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
 			cfg.QueueSize = n
+		}
+	}
+	if v := os.Getenv("NOTIFY_SEND_TIMEOUT_SECONDS"); v != "" {
+		if sec, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && sec > 0 {
+			cfg.SendTimeout = time.Duration(sec) * time.Second
 		}
 	}
 	if v := os.Getenv("NOTIFY_SEND_ON_STARTUP"); v != "" {
@@ -301,6 +310,8 @@ type emailNotifier struct {
 	wg       sync.WaitGroup
 	stopOnce sync.Once
 	stopCh   chan struct{}
+	ctx      context.Context
+	cancel   context.CancelFunc
 
 	// 限流：rateKey -> 上次发送时间
 	lastSent sync.Map
@@ -310,15 +321,21 @@ type emailNotifier struct {
 }
 
 type mailSender interface {
-	Send(to []string, subject, body string) error
+	Send(ctx context.Context, to []string, subject, body string) error
 }
 
 func newEmailNotifier(cfg Config) *emailNotifier {
+	if cfg.SendTimeout <= 0 {
+		cfg.SendTimeout = 15 * time.Second
+	}
+	ctx, cancel := context.WithCancel(context.Background())
 	n := &emailNotifier{
 		cfg:    cfg,
 		client: newEmailClient(cfg),
 		queue:  make(chan Alert, cfg.QueueSize),
 		stopCh: make(chan struct{}),
+		ctx:    ctx,
+		cancel: cancel,
 	}
 	n.wg.Add(1)
 	go n.worker()
@@ -383,18 +400,7 @@ func (n *emailNotifier) worker() {
 	for {
 		select {
 		case <-n.stopCh:
-			// drain 剩余告警再退出（最多等 5 秒）
-			drainDeadline := time.After(5 * time.Second)
-			for {
-				select {
-				case a := <-n.queue:
-					n.send(a)
-				case <-drainDeadline:
-					return
-				default:
-					return
-				}
-			}
+			return
 		case a := <-n.queue:
 			n.send(a)
 		}
@@ -405,8 +411,18 @@ func (n *emailNotifier) worker() {
 func (n *emailNotifier) send(a Alert) {
 	subject := buildSubject(a)
 	body := buildBody(a)
+	parent := n.ctx
+	if parent == nil {
+		parent = context.Background()
+	}
+	timeout := n.cfg.SendTimeout
+	if timeout <= 0 {
+		timeout = 15 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
 
-	if err := n.client.Send(n.cfg.To, subject, body); err != nil {
+	if err := n.client.Send(ctx, n.cfg.To, subject, body); err != nil {
 		logger.Warnf("⚠️ 邮件发送失败: %v | subject=%s", err, subject)
 		// Queue acceptance is not delivery. A failed SMTP attempt must release
 		// both reservations so the durable caller can retry after its own
@@ -429,9 +445,13 @@ func alertRateKey(a Alert) string {
 	return a.Category + "|" + a.TraderID + "|" + a.Title
 }
 
-// Shutdown 等待队列消费完毕（最多 5 秒）
+// Shutdown cancels in-flight SMTP before waiting. Durable incident alerts that
+// were only QUEUED remain retryable through their persisted claim TTL.
 func (n *emailNotifier) Shutdown() {
 	n.stopOnce.Do(func() {
+		if n.cancel != nil {
+			n.cancel()
+		}
 		close(n.stopCh)
 		n.wg.Wait()
 	})

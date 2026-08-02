@@ -219,13 +219,10 @@ func NewEngine(
 	return e, nil
 }
 
-// reportBinanceCredentialsExpired 检测错误是否为 Binance 凭证过期
-// 若是则发送邮件告警，返回 true。仅 ProviderType=binance 时生效；其他 provider 永远返回 false。
-//
-// 全局化设计：
-//   - RateKey 按 label 维度限流（v1 单 label "default"），无论多少个 trader 触发只发一封
-//   - Body 列出所有受影响的 Binance trader（从 store 查询，让用户一目了然）
-//   - 标题与 body 中引导用户去"系统设置 → Binance 凭证"页面（v2 全局凭证位置）
+// reportBinanceCredentialsExpired detects a confirmed Binance Web credential
+// failure and hands it to the same durable incident observer used by 429 and
+// recovery notifications. It performs no database query, event write or SMTP
+// work on the polling goroutine.
 func (e *Engine) reportBinanceCredentialsExpired(err error, where string) bool {
 	if err == nil || e.config == nil || e.config.ProviderType != ProviderBinance {
 		return false
@@ -234,54 +231,20 @@ func (e *Engine) reportBinanceCredentialsExpired(err error, where string) bool {
 		return false
 	}
 
-	// 查询全部受影响的 Binance trader（用于告警 body；查询失败不阻断告警）
-	var affectedTraders []string
-	if e.store != nil {
-		if ids, qerr := e.store.BinanceCreds().CountBinanceCopyTraderIDs(); qerr == nil {
-			affectedTraders = ids
-		}
+	now := time.Now()
+	message := strings.TrimSpace(err.Error())
+	if strings.TrimSpace(where) != "" {
+		message = fmt.Sprintf("%s: %s", where, message)
 	}
-
-	logger.Warnf("🔐 [%s] Binance 跟单凭证未配置或已过期 | portfolioId=%s where=%s affected_traders=%d",
-		e.traderID, e.config.LeaderID, where, len(affectedTraders))
-
-	// label 在 v1 单账号场景下固定为 default；future-proof: 引擎层有 binanceCredLoader 时
-	// 实际 label 由 Provider 决定，这里仅用于 RateKey 与 Body 文案。
-	label := DefaultBinanceCredentialsLabel
-	traderName := e.traderID
-	if e.store != nil {
-		traderName = e.store.Trader().ResolveDisplayName(e.traderID)
-	}
-
-	notifier.Notify(notifier.Alert{
-		Time:       time.Now(),
-		Category:   "copy_trade",
-		TraderID:   e.traderID,
-		TraderName: traderName,
-		Title:      "Binance 跟单凭证未配置或已过期，请粘贴 cURL",
-		Body:       buildBinanceCredsExpiredAlertBody(label, e.traderID, e.config.LeaderID, where, affectedTraders),
-		// 🔑 全局唯一限流键：无论多少 trader 触发，60s 内只发一封
-		RateKey: "binance_creds_expired|" + label,
+	logger.Warnf("🔐 [%s] Binance 跟单凭证未配置或已过期 | portfolioId=%s where=%s",
+		e.traderID, e.config.LeaderID, where)
+	e.enqueueSourceIncidentObservation(store.SourceIncidentObservation{
+		ScopeKey: smartMoneyCredentialIncidentScope, ScopeKind: store.SourceIncidentScopeCredential,
+		TraderID: e.traderID, LeaderID: e.config.LeaderID, Cause: store.SourceHealthAuthFailed,
+		Error: message, Failed: true, ObservedAt: now,
+	}, &store.CopyTradeSourceHealth{
+		TraderID: e.traderID, LeaderID: e.config.LeaderID, Status: store.SourceHealthAuthFailed, LastError: message,
 	})
-
-	// Seam D：凭证失效会让 Binance 跟单静默停跟，写入统一日志便于排查。
-	// best-effort + 小时分桶去重（凭证检查可能每轮触发，避免刷屏）。
-	if e.store != nil {
-		if lerr := e.store.CopyTrade().LogCopyEvent(&store.CopyTradeEvent{
-			TraderID:     e.traderID,
-			LeaderID:     e.config.LeaderID,
-			ProviderType: string(e.config.ProviderType),
-			Category:     store.CopyEventCategoryError,
-			EventType:    "BINANCE_CREDENTIALS_EXPIRED",
-			Severity:     store.CopyEventSeverityError,
-			Status:       "failed",
-			Summary:      "Binance 跟单凭证未配置或已过期，跟单已停跟",
-			Detail:       map[string]interface{}{"where": where, "affected_traders": len(affectedTraders)},
-			DedupKey:     fmt.Sprintf("err|%s|binance_creds_expired|%d", e.traderID, time.Now().Unix()/3600),
-		}); lerr != nil {
-			logger.Warnf("⚠️ [%s] 保存凭证失效事件到跟单日志失败: %v", e.traderID, lerr)
-		}
-	}
 	return true
 }
 
@@ -556,7 +519,7 @@ func (e *Engine) recordSmartMoneySourceIncident(obs SourceHealthObservation, hea
 		observations = append(observations, store.SourceIncidentObservation{
 			ScopeKey: smartMoneyCredentialIncidentScope, ScopeKind: store.SourceIncidentScopeCredential,
 			TraderID: e.traderID, LeaderID: health.LeaderID, Cause: "HTTP_429", Error: health.LastError,
-			Failed: true, ObservedAt: now,
+			Failed: true, ObservedAt: now, InitialNotificationDelay: sourceIncident429Grace(),
 		})
 	} else if obs.CompleteSnapshot && health.Status == store.SourceHealthHealthy {
 		observations = append(observations,
@@ -575,14 +538,7 @@ func (e *Engine) recordSmartMoneySourceIncident(obs SourceHealthObservation, hea
 		}
 	}
 	for _, incidentObs := range observations {
-		incident, action, err := e.store.CopyTrade().RecordSourceIncidentObservation(incidentObs)
-		if err != nil {
-			logger.Warnf("⚠️ [%s] 保存 Smart Money 数据源事故失败: %v", e.traderID, err)
-			continue
-		}
-		if action != "" {
-			e.enqueueSmartMoneySourceIncidentNotification(incident, action, health, now)
-		}
+		e.enqueueSourceIncidentObservation(incidentObs, health)
 	}
 }
 
@@ -590,9 +546,17 @@ func (e *Engine) notifySmartMoneySourceIncident(incident *store.CopyTradeSourceI
 	if incident == nil || health == nil || e.store == nil {
 		return
 	}
-	members, _ := e.store.CopyTrade().ListSourceIncidentMembers(incident.ID)
+	ctx, cancel := context.WithTimeout(context.Background(), sourceIncidentNotificationDBTimeout)
+	members, memberErr := e.store.CopyTrade().ListSourceIncidentMembersContext(ctx, incident.ID)
+	cancel()
+	if memberErr != nil {
+		logger.Warnf("⚠️ [%s] 查询 Smart Money 事故成员失败: %v", e.traderID, memberErr)
+	}
 	if incident.ScopeKind == store.SourceIncidentScopeCredential {
-		if ids, err := e.store.CopyTrade().ListEnabledTraderIDsBySource(string(ProviderBinance), string(BinanceSourceSmartMoney)); err == nil {
+		ctx, cancel = context.WithTimeout(context.Background(), sourceIncidentNotificationDBTimeout)
+		ids, err := e.store.CopyTrade().ListEnabledTraderIDsByProviderContext(ctx, string(ProviderBinance))
+		cancel()
+		if err == nil {
 			members = ids
 		} else {
 			logger.Warnf("⚠️ [%s] 查询 Smart Money 事故成员失败，回退到已记录成员: %v", e.traderID, err)
@@ -601,45 +565,79 @@ func (e *Engine) notifySmartMoneySourceIncident(incident *store.CopyTradeSourceI
 	if len(members) == 0 {
 		members = []string{e.traderID}
 	}
+	ctx, cancel = context.WithTimeout(context.Background(), sourceIncidentNotificationDBTimeout)
+	names, nameErr := e.store.Trader().ResolveDisplayNamesContext(ctx, members)
+	cancel()
+	if nameErr != nil {
+		logger.Warnf("⚠️ [%s] 批量解析 Smart Money 事故账户名称失败，使用稳定ID: %v", e.traderID, nameErr)
+	}
 	displayNames := make([]string, 0, len(members))
 	for _, member := range members {
-		displayNames = append(displayNames, fmt.Sprintf("%s (%s)", e.store.Trader().ResolveDisplayName(member), member))
+		name := member
+		if value := strings.TrimSpace(names[member]); value != "" {
+			name = value
+		}
+		displayNames = append(displayNames, fmt.Sprintf("%s (%s)", name, member))
 	}
 	recovered := kind == store.SourceIncidentMailRecovered
 	title := "Binance 公开领航员数据源事故已冻结"
 	body := fmt.Sprintf("事故 #%d\n范围: %s\n原因: %s\n最后错误: %s\n受影响交易员: %s\n处理: 只冻结依赖新数据源快照的开仓/加仓；已有仓位止损、保护、下单查询和成交对账继续独立运行。",
 		incident.ID, incident.ScopeKind, incident.Cause, incident.LastError, strings.Join(displayNames, ", "))
+	if incident.FrozenMailSentCount > 0 && !recovered {
+		title = "Binance 公开领航员数据源仍未恢复提醒"
+	}
+	if incident.Cause == store.SourceHealthAuthFailed && !recovered {
+		title = "Binance 跟单凭证未配置或已过期，请粘贴 cURL"
+		if incident.FrozenMailSentCount > 0 {
+			title = "Binance 跟单凭证仍未恢复提醒"
+		}
+		body = buildBinanceCredsExpiredAlertBody(DefaultBinanceCredentialsLabel, e.traderID, health.LeaderID, incident.LastError, displayNames)
+	}
 	severity := store.CopyEventSeverityError
 	status := "failed"
 	if recovered {
 		title = "Binance 公开领航员数据源已稳定恢复"
+		if incident.Cause == store.SourceHealthAuthFailed {
+			title = "Binance 跟单凭证及数据源已稳定恢复"
+		}
 		body = fmt.Sprintf("事故 #%d\n范围: %s\n受影响交易员: %s\n稳定性: 已连续取得完整快照，且距最后一次失败不少于15分钟。\n处理: 风险减少信号立即处理；新开仓/加仓仍只接受新的完整快照。",
 			incident.ID, incident.ScopeKind, strings.Join(displayNames, ", "))
 		severity = store.CopyEventSeverityInfo
 		status = "success"
 	}
-	dedup := fmt.Sprintf("source_incident|%d|%s", incident.ID, strings.ToLower(kind))
-	traderName := e.store.Trader().ResolveDisplayName(e.traderID)
+	sequence := 1
+	if !recovered {
+		sequence = incident.FrozenMailSentCount + 1
+	}
+	rateKey := fmt.Sprintf("source_incident|%d|%s", incident.ID, strings.ToLower(kind))
+	dedup := fmt.Sprintf("%s|%d", rateKey, sequence)
+	traderName := e.traderID
+	if value := strings.TrimSpace(names[e.traderID]); value != "" {
+		traderName = value
+	}
 	notifier.Notify(notifier.Alert{
 		Time: now, Category: "copy_trade", TraderID: e.traderID, TraderName: traderName,
-		Title: title, Body: body, RateKey: dedup, DedupKey: dedup,
+		Title: title, Body: body, RateKey: rateKey, DedupKey: dedup,
 		Fields: map[string]string{"IncidentID": fmt.Sprint(incident.ID), "Scope": incident.ScopeKind, "LeaderID": health.LeaderID},
 		StatusHook: func(delivery notifier.DeliveryStatus, deliveryErr error) {
 			message := ""
 			if deliveryErr != nil {
 				message = deliveryErr.Error()
 			}
-			if err := e.store.CopyTrade().MarkSourceIncidentMailDelivery(incident.ID, kind, string(delivery), message, time.Now()); err != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), sourceIncidentNotificationDBTimeout)
+			if err := e.store.CopyTrade().MarkSourceIncidentMailDeliveryContext(ctx, incident.ID, kind, string(delivery), message, time.Now(), sourceIncidentMailPolicy()); err != nil {
 				logger.Warnf("⚠️ [%s] 保存 Smart Money 事故邮件投递状态失败: %v", e.traderID, err)
 			}
-			for _, member := range members {
-				if err := e.store.CopyTrade().MarkSourceHealthMailDelivery(member, string(delivery), message, time.Now()); err != nil {
-					logger.Warnf("⚠️ [%s] 保存 Smart Money 交易员邮件投递状态失败: %v", member, err)
-				}
+			cancel()
+			ctx, cancel = context.WithTimeout(context.Background(), sourceIncidentNotificationDBTimeout)
+			if err := e.store.CopyTrade().MarkSourceHealthMailDeliveryBatchContext(ctx, members, string(delivery), message, time.Now()); err != nil {
+				logger.Warnf("⚠️ [%s] 批量保存 Smart Money 交易员邮件投递状态失败: %v", e.traderID, err)
 			}
+			cancel()
 		},
 	})
-	if err := e.store.CopyTrade().LogCopyEvent(&store.CopyTradeEvent{
+	ctx, cancel = context.WithTimeout(context.Background(), sourceIncidentNotificationDBTimeout)
+	if err := e.store.CopyTrade().LogCopyEventContext(ctx, &store.CopyTradeEvent{
 		TraderID: e.traderID, LeaderID: health.LeaderID, ProviderType: string(ProviderBinance),
 		Category: map[bool]string{true: store.CopyEventCategoryReconcile, false: store.CopyEventCategoryError}[recovered], EventType: "SOURCE_INCIDENT_" + kind,
 		Severity: severity, Status: status, Summary: title,
@@ -648,6 +646,7 @@ func (e *Engine) notifySmartMoneySourceIncident(incident *store.CopyTradeSourceI
 	}); err != nil {
 		logger.Warnf("⚠️ [%s] 保存 Smart Money 数据源事故事件失败: %v", e.traderID, err)
 	}
+	cancel()
 }
 
 // rebaselineSmartMoneyRecovery deliberately absorbs only risk-increasing

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -723,7 +724,14 @@ func (s *CopyTradeStore) ListEnabled() ([]*CopyTradeConfig, error) {
 // Notification code must use this instead of ListEnabled so it never loads
 // credentials or Copy Guard risk policies on the source-signal hot path.
 func (s *CopyTradeStore) ListEnabledTraderIDsBySource(providerType, sourceMode string) ([]string, error) {
-	rows, err := s.db.Query(`
+	return s.ListEnabledTraderIDsBySourceContext(context.Background(), providerType, sourceMode)
+}
+
+func (s *CopyTradeStore) ListEnabledTraderIDsBySourceContext(ctx context.Context, providerType, sourceMode string) ([]string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	rows, err := s.db.QueryContext(ctx, `
 		SELECT trader_id
 		FROM copy_trade_configs
 		WHERE enabled = 1
@@ -748,6 +756,39 @@ func (s *CopyTradeStore) ListEnabledTraderIDsBySource(providerType, sourceMode s
 		return nil, err
 	}
 	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	return ids, nil
+}
+
+// ListEnabledTraderIDsByProviderContext is the credential-incident variant:
+// one shared Binance Web credential can affect more than one source mode.
+func (s *CopyTradeStore) ListEnabledTraderIDsByProviderContext(ctx context.Context, providerType string) ([]string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT trader_id
+		FROM copy_trade_configs
+		WHERE enabled = 1 AND LOWER(provider_type) = LOWER(?)
+		ORDER BY trader_id`, providerType)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0)
+	for rows.Next() {
+		var id string
+		if err = rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err = rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err = rows.Close(); err != nil {
 		return nil, err
 	}
 	return ids, nil

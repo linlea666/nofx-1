@@ -44,7 +44,18 @@ func seedIncidentTrader(t *testing.T, st *store.Store, id, sourceMode string, en
 	}
 }
 
+func useIsolatedIncidentDispatcher(t *testing.T, capacity int) *sourceIncidentNotificationDispatcher {
+	t.Helper()
+	d := newSourceIncidentNotificationDispatcher(capacity)
+	previous := smartMoneyIncidentNotificationDispatcher
+	smartMoneyIncidentNotificationDispatcher = d
+	t.Cleanup(func() { smartMoneyIncidentNotificationDispatcher = previous })
+	return d
+}
+
 func TestSourceIncidentNotificationDoesNotBlockSignalPath(t *testing.T) {
+	t.Setenv("COPYTRADE_SOURCE_INCIDENT_429_GRACE_SECONDS", "0")
+	useIsolatedIncidentDispatcher(t, 8)
 	st, err := store.New(filepath.Join(t.TempDir(), "incident-notification.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -117,8 +128,8 @@ func TestSourceIncidentNotificationDoesNotBlockSignalPath(t *testing.T) {
 		if len(blocking.alerts) == 1 {
 			alert := blocking.alerts[0]
 			blocking.mu.Unlock()
-			if !strings.Contains(alert.Body, "smart-a") || !strings.Contains(alert.Body, "smart-b") || strings.Contains(alert.Body, "regular") {
-				t.Fatalf("credential incident members were not resolved by lightweight source query: %s", alert.Body)
+			if !strings.Contains(alert.Body, "smart-a") || !strings.Contains(alert.Body, "smart-b") || !strings.Contains(alert.Body, "regular") {
+				t.Fatalf("credential incident members were not resolved by lightweight provider query: %s", alert.Body)
 			}
 			break
 		}
@@ -139,6 +150,47 @@ func TestSourceIncidentNotificationDoesNotBlockSignalPath(t *testing.T) {
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("notification status hook did not complete: %s", status)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestCredentialIncidentDoesNotWaitForBusyDatabase(t *testing.T) {
+	useIsolatedIncidentDispatcher(t, 8)
+	st, err := store.New(filepath.Join(t.TempDir(), "credential-incident-nonblocking.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	seedIncidentTrader(t, st, "smart", "smart_money", true)
+
+	tx, err := st.DB().Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := &Engine{traderID: "smart", store: st, config: &CopyConfig{
+		ProviderType: ProviderBinance, BinanceSourceMode: BinanceSourceSmartMoney, LeaderID: "leader",
+	}}
+	started := time.Now()
+	if !engine.reportBinanceCredentialsExpired(ErrBinanceCredentialsExpired, "poll/GetFills") {
+		t.Fatal("credential error was not recognized")
+	}
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("credential notification waited for database: %s", elapsed)
+	}
+	if err = tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		var count int
+		err = st.DB().QueryRow(`SELECT COUNT(*) FROM copy_trade_source_incidents WHERE cause=?`, store.SourceHealthAuthFailed).Scan(&count)
+		if err == nil && count == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("credential incident was not persisted asynchronously: count=%d err=%v", count, err)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
