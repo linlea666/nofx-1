@@ -11,8 +11,9 @@ import (
 )
 
 // rotatingFileWriter keeps one active file per calendar day and additionally
-// rotates at maxBytes. Archives are gzip-compressed and intentionally have no
-// retention deletion policy: operators retain the complete history.
+// rotates at maxBytes. Archives are gzip-compressed; the writer itself never
+// deletes them. Expiry belongs to store.RetentionService, which removes both
+// nofx_<date>.log and nofx_<date>.*.log.gz past RETENTION_LOG_FILE_DAYS.
 type rotatingFileWriter struct {
 	mu       sync.Mutex
 	dir      string

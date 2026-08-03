@@ -126,6 +126,9 @@ type CopyGuardPolicy struct {
 	UnprotectableDisposition string `json:"unprotectable_disposition,omitempty"`
 	UnprotectableAction      string `json:"unprotectable_action"`
 	ReentryNoiseOverride     bool   `json:"reentry_noise_override"`
+	// v8 结构性可保护下限（字段含义见 store.CopyTradeConfig 同名注释）
+	MinStopATRRatio         float64 `json:"min_stop_atr_ratio"`
+	MinStopATRRatioExplicit bool    `json:"min_stop_atr_ratio_explicit,omitempty"`
 	// DefaultsVersion: 默认值代次书签。
 	//   2 = v4.1 默认值迁移（risk_account_pct 0.02→0.20、cooldown 60→300、
 	//       leverage_max_loss 0.5→0.3）
@@ -636,6 +639,8 @@ func policyFromConfig(c *CopyTradeConfig) CopyGuardPolicy {
 		AIConfidenceThreshold: c.RiskAIConfidenceThreshold, AIMinReviewSeconds: c.RiskAIMinReviewSeconds,
 		AIDailyCallLimit: c.RiskAIDailyCallLimit, AILifecycleCallLimit: c.RiskAILifecycleCallLimit,
 		NotificationLevel:             c.RiskNotificationLevel,
+		MinStopATRRatio:               c.RiskMinStopATRRatio,
+		MinStopATRRatioExplicit:       c.RiskMinStopATRRatioExplicit,
 		ReentryMinRecoveryATR:         c.RiskReentryMinRecoveryATR,
 		ReentryMinRecoveryATRExplicit: c.RiskReentryMinRecoveryATRExplicit,
 		ReentryCooldownEscalation:     c.RiskReentryCooldownEscalation,
@@ -704,6 +709,8 @@ func (s *CopyTradeStore) loadCopyGuardPolicy(c *CopyTradeConfig) error {
 	c.RiskAIDailyCallLimit = p.AIDailyCallLimit
 	c.RiskAILifecycleCallLimit = p.AILifecycleCallLimit
 	c.RiskNotificationLevel = p.NotificationLevel
+	c.RiskMinStopATRRatio = p.MinStopATRRatio
+	c.RiskMinStopATRRatioExplicit = p.MinStopATRRatioExplicit
 	c.RiskReentryMinRecoveryATR = p.ReentryMinRecoveryATR
 	c.RiskReentryMinRecoveryATRExplicit = p.ReentryMinRecoveryATRExplicit
 	c.RiskReentryCooldownEscalation = p.ReentryCooldownEscalation
@@ -1052,9 +1059,69 @@ func (s *CopyTradeStore) UpdateCopyGuardExecutionOrder(id int64, entryOrderID, e
 	return err
 }
 
-func (s *CopyTradeStore) UpdateCopyGuardFollowerPosition(id int64, followerPosID string, entryPrice, notional float64) error {
-	_, err := s.db.Exec(`UPDATE copy_guard_cycles SET follower_pos_id=CASE WHEN ?<>'' THEN ? ELSE follower_pos_id END,follower_entry_price=CASE WHEN ?>0 THEN ? ELSE follower_entry_price END,follower_notional=CASE WHEN ?>0 THEN ? ELSE follower_notional END,updated_at=CURRENT_TIMESTAMP WHERE id=?`, followerPosID, followerPosID, entryPrice, entryPrice, notional, notional, id)
+// maxFollowerNotionalLeverage bounds a cycle's recorded follower notional at
+// the highest leverage any supported venue offers. Exceeding it is physically
+// impossible for the account, so the value can only be an accounting artifact.
+const maxFollowerNotionalLeverage = 125.0
+
+type cycleNotionalGuardExecutor interface {
+	Exec(query string, args ...interface{}) (sql.Result, error)
+	QueryRow(query string, args ...interface{}) *sql.Row
+}
+
+// enforceFollowerNotionalInvariant clamps a cycle's follower_notional to what
+// the account could actually carry, recording any breach.
+//
+// follower_notional has two writers with opposite semantics: the AI reentry
+// partial-fill path accumulates (follower_notional + delta) while
+// UpdateCopyGuardFollowerPosition replaces with a fresh exchange read. When the
+// replace does not land between increments the accumulation keeps compounding —
+// 19 production cycles ended above 50x equity, the worst recording 44587 USD
+// against a 68 USD mean equity.
+//
+// A polluted value is not cosmetic: baseline_pnl and net_guard_effect are both
+// scaled by it, so it silently corrupts the very numbers used to judge whether
+// Copy Guard helps or hurts. Clamping keeps those metrics usable, and the event
+// preserves the observed value so the underlying write race stays diagnosable.
+//
+// Called with the caller's tx where one exists, so the clamp commits atomically
+// with the write that would otherwise have left the row inconsistent.
+func enforceFollowerNotionalInvariant(q cycleNotionalGuardExecutor, cycleID int64) error {
+	var traderID string
+	var notional, equity float64
+	if err := q.QueryRow(`SELECT trader_id,COALESCE(follower_notional,0),COALESCE(account_equity,0) FROM copy_guard_cycles WHERE id=?`,
+		cycleID).Scan(&traderID, &notional, &equity); err != nil {
+		return err
+	}
+	// Equity is backfilled asynchronously when the open-time snapshot was rate
+	// limited; without it there is no basis to call any notional impossible.
+	if equity <= 0 || notional <= 0 {
+		return nil
+	}
+	limit := equity * maxFollowerNotionalLeverage
+	if notional <= limit {
+		return nil
+	}
+	if _, err := q.Exec(`UPDATE copy_guard_cycles SET follower_notional=?,updated_at=CURRENT_TIMESTAMP WHERE id=?`, limit, cycleID); err != nil {
+		return err
+	}
+	raw, err := json.Marshal(map[string]interface{}{
+		"observed_notional": notional, "clamped_to": limit,
+		"account_equity": equity, "max_leverage": maxFollowerNotionalLeverage,
+	})
+	if err != nil {
+		return err
+	}
+	_, err = q.Exec(`INSERT INTO copy_guard_events(cycle_id,trader_id,type,notional,metadata_json) VALUES(?,?,?,?,?)`,
+		cycleID, traderID, "FOLLOWER_NOTIONAL_INVARIANT_BREACH", notional, string(raw))
 	return err
+}
+
+func (s *CopyTradeStore) UpdateCopyGuardFollowerPosition(id int64, followerPosID string, entryPrice, notional float64) error {
+	if _, err := s.db.Exec(`UPDATE copy_guard_cycles SET follower_pos_id=CASE WHEN ?<>'' THEN ? ELSE follower_pos_id END,follower_entry_price=CASE WHEN ?>0 THEN ? ELSE follower_entry_price END,follower_notional=CASE WHEN ?>0 THEN ? ELSE follower_notional END,updated_at=CURRENT_TIMESTAMP WHERE id=?`, followerPosID, followerPosID, entryPrice, entryPrice, notional, notional, id); err != nil {
+		return err
+	}
+	return enforceFollowerNotionalInvariant(s.db, id)
 }
 
 func (s *CopyTradeStore) UpdateCopyGuardShadow(id int64, leaderEntry, lastPrice, baselineNotional, leaderSize float64) error {
@@ -1966,7 +2033,20 @@ func (s *CopyTradeStore) UpdateCopyGuardAttemptProtection(cycleID int64, attempt
 	return err
 }
 
-func (s *CopyTradeStore) UpdateCopyGuardAttemptAIAudit(cycleID int64, attempt int, actualLeverage, initialMargin, plannedNotional, executionNotional float64, promotionReason string, aiStop, finalStop, expectedPositionLossPct float64, governedBy string) error {
+// UpdateCopyGuardAttemptRiskAudit records the post-fill risk basis of an
+// attempt: the leverage actually used, the margin that backs it, and which rule
+// produced the protective stop.
+//
+// Every armed attempt must land here, AI reentry and ordinary leader-following
+// alike. While this was reachable only from the AI branch, all 496 production
+// attempts carried zeroes, so no stop policy could be evaluated after the fact:
+// governed_by is the only record of whether ATR, the margin ceiling or the
+// liquidation clamp chose the distance.
+//
+// plannedNotional/executionNotional/promotionReason/aiStop describe AI sizing
+// and stay zero-valued on the ordinary path, where the copied notional is the
+// plan by definition.
+func (s *CopyTradeStore) UpdateCopyGuardAttemptRiskAudit(cycleID int64, attempt int, actualLeverage, initialMargin, plannedNotional, executionNotional float64, promotionReason string, aiStop, finalStop, expectedPositionLossPct float64, governedBy string) error {
 	_, err := s.db.Exec(`UPDATE copy_guard_attempts SET actual_leverage=?,initial_margin_basis=?,planned_notional=?,promoted_notional=?,promotion_reason=?,ai_stop_price=?,final_stop_price=?,stop_validation_result='POST_FILL_VALIDATED',expected_position_loss_pct=?,governed_by=? WHERE cycle_id=? AND attempt_no=?`,
 		actualLeverage, initialMargin, plannedNotional, executionNotional, promotionReason, aiStop, finalStop, expectedPositionLossPct, governedBy, cycleID, attempt)
 	return err

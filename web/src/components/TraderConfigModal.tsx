@@ -304,6 +304,7 @@ interface FormState {
   risk_trigger_price_type: 'mark' | 'last' | 'index'
   risk_slippage_buffer_bps: number
   risk_liquidation_buffer_atr: number
+  risk_min_stop_atr_ratio: number
   risk_max_reentries: number
   risk_reentry_band_atr: number
   risk_reentry_cooldown_seconds: number
@@ -393,6 +394,7 @@ export function TraderConfigModal({
     risk_trigger_price_type: 'mark',
     risk_slippage_buffer_bps: 10,
     risk_liquidation_buffer_atr: 0.5,
+    risk_min_stop_atr_ratio: 1.0,
     risk_max_reentries: 2, // v7 AI guarded 最多 2 次
     risk_reentry_band_atr: 0.5,
     risk_reentry_cooldown_seconds: 300, // v4.1：默认冷却 300s
@@ -565,6 +567,7 @@ export function TraderConfigModal({
             risk_trigger_price_type: cfg.risk_trigger_price_type ?? 'mark',
             risk_slippage_buffer_bps: cfg.risk_slippage_buffer_bps ?? 10,
             risk_liquidation_buffer_atr: cfg.risk_liquidation_buffer_atr ?? 0.5,
+            risk_min_stop_atr_ratio: cfg.risk_min_stop_atr_ratio ?? 1.0,
             risk_max_reentries: cfg.risk_max_reentries ?? 2,
             risk_reentry_band_atr: cfg.risk_reentry_band_atr ?? 0.5,
             risk_reentry_cooldown_seconds:
@@ -735,6 +738,7 @@ export function TraderConfigModal({
         risk_trigger_price_type: 'mark',
         risk_slippage_buffer_bps: 10,
         risk_liquidation_buffer_atr: 0.5,
+        risk_min_stop_atr_ratio: 1.0,
         risk_max_reentries: 2,
         risk_reentry_band_atr: 0.5,
         risk_reentry_cooldown_seconds: 300,
@@ -1007,6 +1011,7 @@ export function TraderConfigModal({
             risk_trigger_price_type: formData.risk_trigger_price_type,
             risk_slippage_buffer_bps: formData.risk_slippage_buffer_bps,
             risk_liquidation_buffer_atr: formData.risk_liquidation_buffer_atr,
+            risk_min_stop_atr_ratio: formData.risk_min_stop_atr_ratio,
             risk_max_reentries: formData.risk_max_reentries,
             risk_reentry_band_atr: formData.risk_reentry_band_atr,
             risk_reentry_cooldown_seconds:
@@ -1972,6 +1977,7 @@ export function TraderConfigModal({
                                       risk_leverage_max_loss: 50,
                                       risk_slippage_buffer_bps: 10,
                                       risk_liquidation_buffer_atr: 0.5,
+                                      risk_min_stop_atr_ratio: 1.0,
                                       risk_reentry_enabled: true,
                                       risk_reentry_ratio: 50,
                                       risk_reentry_decision_mode: 'ai_guarded',
@@ -2099,6 +2105,29 @@ export function TraderConfigModal({
                                   }
                                   className="mt-1 w-full px-2 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF]"
                                 />
+                              </label>
+                              <label className="col-span-2 text-xs text-[#848E9C]">
+                                结构性可保护下限（ATR 倍数）
+                                <input
+                                  type="number"
+                                  min="0"
+                                  max="3"
+                                  step="0.1"
+                                  value={formData.risk_min_stop_atr_ratio}
+                                  onChange={(e) =>
+                                    handleInputChange(
+                                      'risk_min_stop_atr_ratio',
+                                      Number(e.target.value)
+                                    )
+                                  }
+                                  className="mt-1 w-full px-2 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF]"
+                                />
+                                <span className="mt-1 block leading-relaxed">
+                                  止损距离被强平缓冲压到不足该 ATR
+                                  倍数时，说明这个仓位没有既躲得开正常波动、
+                                  又落在强平之内的止损价。此时不挂止损，转为无保护高危告警并继续跟随领航员，
+                                  由 AI 接管观察。填 0 关闭该判定（恢复旧行为：仍会挂出噪音区内的极紧止损）。
+                                </span>
                               </label>
                               <div className="col-span-2 rounded border border-[#2B3139] bg-[#0B0E11] p-3 text-xs text-[#848E9C]">
                                 旧“加仓风险预算”字段已停用，仅为旧客户端和回滚保留。

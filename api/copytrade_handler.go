@@ -1112,6 +1112,7 @@ type CopyTradeConfigRequest struct {
 	RiskTriggerPriceType        *string  `json:"risk_trigger_price_type,omitempty"`
 	RiskSlippageBufferBPS       *float64 `json:"risk_slippage_buffer_bps,omitempty"`
 	RiskLiquidationBufferATR    *float64 `json:"risk_liquidation_buffer_atr,omitempty"`
+	RiskMinStopATRRatio         *float64 `json:"risk_min_stop_atr_ratio,omitempty"`
 	RiskMaxReentries            *int     `json:"risk_max_reentries,omitempty"`
 	RiskReentryBandATR          *float64 `json:"risk_reentry_band_atr,omitempty"`
 	RiskReentryCooldownSeconds  *int     `json:"risk_reentry_cooldown_seconds,omitempty"`
@@ -1623,6 +1624,15 @@ func applyCopyGuardV4Request(c, old *store.CopyTradeConfig, r *CopyTradeConfigRe
 	} else if old != nil {
 		c.RiskReentryMinRecoveryATR = old.RiskReentryMinRecoveryATR
 		c.RiskReentryMinRecoveryATRExplicit = old.RiskReentryMinRecoveryATRExplicit
+	}
+	// 显式 0 表示关闭结构性不可保护判定，必须与"字段缺失"区分，否则
+	// FillRiskDefaults 会把用户的关闭意图重新填回 1.0。
+	if r.RiskMinStopATRRatio != nil {
+		c.RiskMinStopATRRatio = *r.RiskMinStopATRRatio
+		c.RiskMinStopATRRatioExplicit = true
+	} else if old != nil {
+		c.RiskMinStopATRRatio = old.RiskMinStopATRRatio
+		c.RiskMinStopATRRatioExplicit = old.RiskMinStopATRRatioExplicit
 	}
 	if r.RiskReentryCooldownEscalation != nil {
 		c.RiskReentryCooldownEscalation = *r.RiskReentryCooldownEscalation

@@ -60,10 +60,17 @@ type CopyTradeConfig struct {
 	RiskATRMultiplier float64 `json:"risk_atr_multiplier"` // 默认 2.0，范围 0.5-5
 	RiskATRTimeframe  string  `json:"risk_atr_timeframe"`  // 默认 "1h"，可选 "15m"/"1h"/"4h"
 
-	// 仓位保证金止损（新配置默认开启 50%；存量配置由有版本的数据库迁移处理）。
+	// 仓位保证金止损上限（新配置默认 50%）。v8 起它只是告警阈值：止损距离由
+	// ATR/结构决定，用它收紧距离会在高杠杆下把止损压进噪音区。
 	RiskLeverageFallback           bool    `json:"risk_leverage_fallback"`
 	RiskLeverageMaxLoss            float64 `json:"risk_leverage_max_loss"`
 	RiskMarginStopMigrationVersion int     `json:"risk_margin_stop_migration_version"`
+
+	// RiskMinStopATRRatio 结构性可保护下限：最终止损距离低于该 ATR 倍数时判定
+	// 为不可保护（不挂止损，按 UnprotectableDisposition 处置），默认 1.0。
+	// 显式 0 关闭该判定并保留旧行为，故需 Explicit 标记区分"未设置"。
+	RiskMinStopATRRatio         float64 `json:"risk_min_stop_atr_ratio"`
+	RiskMinStopATRRatioExplicit bool    `json:"-"`
 
 	// 二次进场：新配置默认 ai_guarded，旧配置保留 legacy_rule。
 	RiskReentryEnabled bool    `json:"risk_reentry_enabled"`
@@ -146,6 +153,15 @@ type CopyTradeConfig struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
+// DefaultMinStopATRRatio 结构性可保护下限的默认值。
+//
+// 取 1.0 而非更小值的依据来自线上 156 次止损：距离/ATR < 0.3 的 20 次平均单次
+// 亏损 15.28（合计 -305.50），0.3-0.5 的 19 次平均 -4.17，而 >= 2 ATR 的 43 次
+// 平均只亏 1.59。止损距离不足一个平均小时波幅时，触发的多是噪音而非趋势。
+// 该值同时是 RiskATRMultiplier 默认 2.0 的一半，即"抗噪预算被强平约束吃掉
+// 一半以上"就不再挂单。
+const DefaultMinStopATRRatio = 1.0
+
 // FillRiskDefaults 为零值字段填充默认值
 // 调用时机：从数据库读出后立即调用，或前端未传字段时
 // 设计目的：保证旧库（ALTER TABLE 后字段为 0/false/""）也能跑出合理默认行为
@@ -153,7 +169,8 @@ type CopyTradeConfig struct {
 // v5.2 默认值选型（与 copytrade.CopyConfig.FillRiskDefaults 保持一致）：
 //   - RiskATRMultiplier 2.0：止损距离基线（k×ATR），抗噪主力线
 //   - RiskAccountPct 0.02：v7 单次尝试风险预算（含费用与滑点）
-//   - RiskLeverageMaxLoss 0.50：仓位初始保证金预计总损失硬上限（默认开启）
+//   - RiskLeverageMaxLoss 0.50：仓位保证金损失告警阈值（v8 起不再收紧距离）
+//   - RiskMinStopATRRatio 1.0：低于该 ATR 倍数判定结构性不可保护
 func (c *CopyTradeConfig) FillRiskDefaults() {
 	if c.CopyCatchupWindowSeconds <= 0 {
 		c.CopyCatchupWindowSeconds = 60
@@ -179,6 +196,9 @@ func (c *CopyTradeConfig) FillRiskDefaults() {
 	}
 	if c.RiskLeverageMaxLoss == 0 {
 		c.RiskLeverageMaxLoss = 0.5
+	}
+	if c.RiskMinStopATRRatio == 0 && !c.RiskMinStopATRRatioExplicit {
+		c.RiskMinStopATRRatio = DefaultMinStopATRRatio
 	}
 	if c.RiskReentryRatio == 0 {
 		c.RiskReentryRatio = 0.5
@@ -299,6 +319,7 @@ func NewCopyGuardDefaults() *CopyTradeConfig {
 		RiskWatchTimeoutMinutes:        4320,
 		RiskMigrationConfirmed:         true,
 		RiskAddonBudgetPct:             0.15,
+		RiskMinStopATRRatio:            DefaultMinStopATRRatio,
 		RiskReentryMinRecoveryATR:      0.5,
 		RiskUnprotectableDisposition:   "warn",
 		RiskUnprotectableAction:        "follow",

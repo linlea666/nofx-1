@@ -39,7 +39,7 @@ func TestCopyGuardCycleAndEventLedger(t *testing.T) {
 	if err := cs.ReconcileCopyGuardAttempt(cycle.ID, 0, -25, 2, -1, 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := cs.UpdateCopyGuardAttemptAIAudit(cycle.ID, 0, 10, 100, 1000, 1000, "", 0, 0, 0, "margin_stop"); err != nil {
+	if err := cs.UpdateCopyGuardAttemptRiskAudit(cycle.ID, 0, 10, 100, 1000, 1000, "", 0, 0, 0, "margin_stop"); err != nil {
 		t.Fatal(err)
 	}
 	cycle, _ = cs.GetCopyGuardCycle(cycle.ID)
@@ -62,7 +62,7 @@ func TestCopyGuardCycleAndEventLedger(t *testing.T) {
 	if err := cs.UpdateCopyGuardAttemptIdentity(cycle.ID, 1, "follower-pos-1", "entry-1", ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := cs.UpdateCopyGuardAttemptAIAudit(cycle.ID, 1, 5, 100, 40, 500, "AI_REENTRY_PROMOTED_TO_MINIMUM", 96, 96.1, .25, "ai_absolute_stop"); err != nil {
+	if err := cs.UpdateCopyGuardAttemptRiskAudit(cycle.ID, 1, 5, 100, 40, 500, "AI_REENTRY_PROMOTED_TO_MINIMUM", 96, 96.1, .25, "ai_absolute_stop"); err != nil {
 		t.Fatal(err)
 	}
 	if err := cs.UpdateCopyGuardAttemptProtection(cycle.ID, 1, 96.1, "algo-ai", CopyGuardProtectionVerified, 1); err != nil {

@@ -32,9 +32,6 @@ const (
 	regenerateCooldown = 60 * time.Second
 	// backfillEvery 结局盈亏回填频率：每 12 轮（约 60s）扫一次已执行信号
 	backfillEvery = 12
-	// maxAutoAnalysisRetries 自动 AI 分析失败后的补跑上限（首跑之外），
-	// 防止模型持续故障时无限烧 API
-	maxAutoAnalysisRetries = 2
 	// manualAnalyzeCooldown 手动"内置 AI 分析"按钮冷却，防误触连击烧 token
 	manualAnalyzeCooldown = 30 * time.Second
 	// marketEventScanInterval bounds public-market polling. The scan only
@@ -58,9 +55,7 @@ type Advisor struct {
 	inflightMu     sync.Mutex
 	inflight       map[int64]bool
 	inflightTrader map[string]bool
-	// aiRetries 自动分析失败补跑计数（analysis ID → 已补跑次数，内存态，
-	// 重启清零重新给额度）；analyzeLast 手动 analyze 冷却（analysis ID → 上次触发）
-	aiRetries   map[int64]int
+	// analyzeLast 手动 analyze 冷却（analysis ID → 上次触发）
 	analyzeLast map[int64]time.Time
 
 	marketEventMu       sync.Mutex
@@ -85,7 +80,6 @@ func Start(st *store.Store) *Advisor {
 		stopCh:              make(chan struct{}),
 		inflight:            map[int64]bool{},
 		inflightTrader:      map[string]bool{},
-		aiRetries:           map[int64]int{},
 		analyzeLast:         map[int64]time.Time{},
 		marketEventLastScan: map[int64]time.Time{},
 		marketEventState:    map[int64]marketEventSnapshot{},
@@ -590,31 +584,6 @@ func (a *Advisor) recordCandidateEvent(c *store.CopyGuardReentryCandidate, event
 	_ = a.st.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: c.CycleID, TraderID: c.TraderID, Type: event, Price: price, Notional: notional, Metadata: detail})
 }
 
-// maybeRetryAnalysis 对 PENDING 信号的最新快照补跑自动 AI 分析：
-// 仅当该快照既无原始回复也无结论（首跑失败或生成时自动分析未开启），
-// 且未在分析中、补跑次数未超上限时触发。修复"自动分析与生成事件一次性
-// 绑定，瞬时故障后永不重试"的缺口。
-func (a *Advisor) maybeRetryAnalysis(signalID int64) {
-	latest, err := a.st.ReentryAI().LatestReentryAnalysisBySignal(signalID)
-	if err != nil || latest == nil {
-		return
-	}
-	if latest.RawResponse != "" || latest.Verdict != "" {
-		return // 已有结果（含"已回复但不可解析"，那是模型输出问题，不自动重跑）
-	}
-	a.inflightMu.Lock()
-	if a.inflight[latest.ID] || a.aiRetries[latest.ID] >= maxAutoAnalysisRetries {
-		a.inflightMu.Unlock()
-		return
-	}
-	a.aiRetries[latest.ID]++
-	attempt := a.aiRetries[latest.ID]
-	a.inflightMu.Unlock()
-	logger.Infof("[ReentryAdvisor] 补跑自动 AI 分析 (analysis=%d, signal=%d, 第 %d/%d 次)",
-		latest.ID, signalID, attempt, maxAutoAnalysisRetries)
-	a.spawnAnalysis(latest.ID, true)
-}
-
 // spawnAnalysis 以受管 goroutine 启动内置 AI 分析：纳入 wg（Stop 会等待
 // 收尾，避免对已关闭资源写入），插件已停止时不再启动。
 func (a *Advisor) spawnAnalysis(analysisID int64, autoTriggered bool, traderIDs ...string) bool {
@@ -719,13 +688,6 @@ func (a *Advisor) backfillOutcomes() {
 			break
 		}
 	}
-}
-
-func orNone(s string) string {
-	if s == "" {
-		return "无"
-	}
-	return s
 }
 
 // generateForSignal 组装数据包 → 生成 Prompt（含配置页自定义模板）→ 落库一条分析记录

@@ -908,7 +908,8 @@ func (t *FuturesTrader) GetPositionsFresh() ([]map[string]interface{}, error) {
 }
 
 func (t *FuturesTrader) PlaceProtectiveStop(req ProtectiveStopRequest) (*ProtectiveStopOrder, error) {
-	if _, err := t.resolveBinanceInstrument(req.Symbol); err != nil {
+	inst, err := t.resolveBinanceInstrument(req.Symbol)
+	if err != nil {
 		return nil, err
 	}
 	if req.ClientID == "" || len(req.ClientID) > 36 {
@@ -945,7 +946,7 @@ func (t *FuturesTrader) PlaceProtectiveStop(req ProtectiveStopRequest) (*Protect
 	}
 	created, err := t.client.NewCreateAlgoOrderService().Symbol(strings.ToUpper(req.Symbol)).Side(side).
 		PositionSide(positionSide).Type(futures.AlgoOrderTypeStopMarket).
-		TriggerPrice(strconv.FormatFloat(req.TriggerPrice, 'f', -1, 64)).WorkingType(workingType).
+		TriggerPrice(QuantizeAndFormatPrice(req.TriggerPrice, inst.PriceTickSize, protectiveStopRoundsDown(req.PositionSide))).WorkingType(workingType).
 		ClosePosition(true).ClientAlgoId(req.ClientID).Do(context.Background())
 	if err != nil {
 		if existing, queryErr := t.GetProtectiveStopByClientID(req.ClientID, req.Symbol); queryErr == nil && existing != nil && strings.EqualFold(existing.State, "live") {
@@ -1420,6 +1421,18 @@ func (t *FuturesTrader) CalculatePositionSize(balance, riskPercent, price float6
 	return quantity
 }
 
+// formatTriggerPrice serializes an algo trigger price on the symbol's tick
+// grid. When the instrument catalog is unavailable it keeps the historical
+// fixed-width form rather than failing an order the AI trader expects to place.
+func (t *FuturesTrader) formatTriggerPrice(symbol string, price float64, roundDown bool) string {
+	inst, err := t.resolveBinanceInstrument(symbol)
+	if err != nil || inst == nil || inst.PriceTickSize <= 0 {
+		logger.Warnf("⚠️ 无法解析 %s 价格步长，触发价沿用固定精度: %v", symbol, err)
+		return fmt.Sprintf("%.8f", price)
+	}
+	return QuantizeAndFormatPrice(price, inst.PriceTickSize, roundDown)
+}
+
 // SetStopLoss sets stop-loss order using new Algo Order API
 // Binance has migrated stop orders to Algo Order system (error -4120 STOP_ORDER_SWITCH_ALGO)
 func (t *FuturesTrader) SetStopLoss(symbol string, positionSide string, quantity, stopPrice float64) error {
@@ -1440,7 +1453,7 @@ func (t *FuturesTrader) SetStopLoss(symbol string, positionSide string, quantity
 		Side(side).
 		PositionSide(posSide).
 		Type(futures.AlgoOrderTypeStopMarket).
-		TriggerPrice(fmt.Sprintf("%.8f", stopPrice)).
+		TriggerPrice(t.formatTriggerPrice(symbol, stopPrice, positionSide == "SHORT")).
 		WorkingType(futures.WorkingTypeContractPrice).
 		ClosePosition(true).
 		ClientAlgoId(getBrOrderID()).
@@ -1474,7 +1487,7 @@ func (t *FuturesTrader) SetTakeProfit(symbol string, positionSide string, quanti
 		Side(side).
 		PositionSide(posSide).
 		Type(futures.AlgoOrderTypeTakeProfitMarket).
-		TriggerPrice(fmt.Sprintf("%.8f", takeProfitPrice)).
+		TriggerPrice(t.formatTriggerPrice(symbol, takeProfitPrice, positionSide != "SHORT")).
 		WorkingType(futures.WorkingTypeContractPrice).
 		ClosePosition(true).
 		ClientAlgoId(getBrOrderID()).

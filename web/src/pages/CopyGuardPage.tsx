@@ -26,6 +26,14 @@ import type {
 
 const money = (v: number) => `${v >= 0 ? '+' : ''}${v.toFixed(2)} USDT`
 
+function formatDurationSeconds(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds <= 0) return '—'
+  if (seconds < 60) return `${Math.round(seconds)} 秒`
+  if (seconds < 3600) return `${(seconds / 60).toFixed(1)} 分钟`
+  if (seconds < 86400) return `${(seconds / 3600).toFixed(1)} 小时`
+  return `${(seconds / 86400).toFixed(1)} 天`
+}
+
 const statusLabels: Record<string, string> = {
   FOLLOWING: '正常跟随',
   STOP_TRIGGERED: '止损已触发',
@@ -1181,6 +1189,26 @@ function AdvisorSettingsCard() {
                   {Object.entries(stats.candidate_evaluation_outcomes ?? {})
                     .map(([outcome, count]) => `${outcome} ${count}`)
                     .join(' · ') || '周期闭合后生成'}
+                </div>
+                <div className="border-t border-[#2B3139] pt-2">
+                  候选生命周期：
+                  {Object.entries(stats.candidate_lifecycle ?? {})
+                    .map(([status, count]) => `${status} ${count}`)
+                    .join(' · ') || '暂无'}
+                </div>
+                <div className="text-[#848E9C]">
+                  已终结 {stats.candidate_closed ?? 0} 个，其中{' '}
+                  {stats.candidate_never_reviewed ?? 0}{' '}
+                  个一次 AI 审查都没轮到就失效。平均存活{' '}
+                  {formatDurationSeconds(
+                    stats.candidate_mean_lifetime_seconds ?? 0
+                  )}
+                  ，平均审查间隔{' '}
+                  {formatDurationSeconds(
+                    stats.candidate_mean_review_gap_seconds ?? 0
+                  )}
+                  。审查间隔接近或超过存活时长，说明候选多在轮到审查前就被领航员平仓，
+                  瓶颈在审查节奏而非置信度阈值。
                 </div>
               </div>
             )}

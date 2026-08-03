@@ -59,7 +59,10 @@ func TestAccountProtectionVolatilityFirstWarnsWithoutCompressingATR(t *testing.T
 	}
 }
 
-func TestAccountProtectionIncludesFeesInPositionMarginCap(t *testing.T) {
+// The position margin ceiling reports, it never tightens. Tightening is what
+// pushed high-leverage stops into the noise band and made Copy Guard lose more
+// than holding to the leader's close.
+func TestPositionMarginCapReportsWithoutTighteningDistance(t *testing.T) {
 	cfg := &CopyConfig{
 		RiskStopPriority:      "volatility_first",
 		RiskLeverageFallback:  true,
@@ -67,6 +70,9 @@ func TestAccountProtectionIncludesFeesInPositionMarginCap(t *testing.T) {
 		RiskSlippageBufferBPS: 10,
 		RiskRoundTripFeeBPS:   10,
 	}
+	// Initial margin=100, total cap=50. Friction=2, so the price loss budget is
+	// 48 and the cap distance is 4.8 — the friction arithmetic this test has
+	// always pinned. ATR=4 sits below it, so nothing is near the ceiling.
 	got, err := ComputeAccountProtectionDistance(
 		cfg, SideLong, 100, 1000, 1000,
 		2, 4, 0, 0.30, 10,
@@ -74,12 +80,15 @@ func TestAccountProtectionIncludesFeesInPositionMarginCap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Initial margin=100, total cap=50. Friction=2, so price loss budget=48
-	// and the trigger distance is 4.8. ATR=4 remains tighter in this case.
 	if got.GovernedBy != "atr" || math.Abs(got.ExpectedMarginLossPct-0.42) > 1e-9 {
 		t.Fatalf("unexpected wider margin cap result: %+v", got)
 	}
+	if math.Abs(got.MarginCapDistance-4.8) > 1e-9 || got.MarginCapExceeded {
+		t.Fatalf("cap distance must include friction and report no breach: %+v", got)
+	}
 
+	// ATR=8 now exceeds the 4.8 ceiling. The distance must stay at 8 and the
+	// breach must surface as a flag, not as a rewritten stop.
 	got, err = ComputeAccountProtectionDistance(
 		cfg, SideLong, 100, 1000, 1000,
 		2, 8, 0, 0.30, 10,
@@ -87,8 +96,39 @@ func TestAccountProtectionIncludesFeesInPositionMarginCap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.GovernedBy != "margin_cap" || math.Abs(got.Distance-4.8) > 1e-9 || math.Abs(got.ExpectedMarginLossPct-0.50) > 1e-9 {
-		t.Fatalf("position margin cap must include friction exactly: %+v", got)
+	if got.GovernedBy != "atr" || math.Abs(got.Distance-8) > 1e-9 {
+		t.Fatalf("margin cap must not tighten the ATR distance: %+v", got)
+	}
+	if !got.MarginCapExceeded || math.Abs(got.MarginCapDistance-4.8) > 1e-9 {
+		t.Fatalf("margin cap breach must be reported: %+v", got)
+	}
+	// 8/100 + 0.002 friction on 1000 notional against 100 initial margin.
+	if math.Abs(got.ExpectedMarginLossPct-0.82) > 1e-9 {
+		t.Fatalf("expected margin loss must reflect the untightened stop: %+v", got)
+	}
+}
+
+// account_cap is the opt-in backward-compatible hard ceiling. It is the one
+// mode still allowed to tighten, and must keep doing so.
+func TestAccountCapPriorityStillTightens(t *testing.T) {
+	cfg := &CopyConfig{
+		RiskStopPriority:      "account_cap",
+		RiskLeverageFallback:  true,
+		RiskLeverageMaxLoss:   0.50,
+		RiskSlippageBufferBPS: 10,
+		RiskRoundTripFeeBPS:   10,
+	}
+	// Account budget = 1000 equity × 3% = 30; friction on 1000 notional = 2, so
+	// the price budget is 28 and the cap distance 2.8 — tighter than ATR=8.
+	got, err := ComputeAccountProtectionDistance(
+		cfg, SideLong, 100, 1000, 1000,
+		2, 8, 0, 0.03, 10,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GovernedBy != "account_cap" || math.Abs(got.Distance-2.8) > 1e-9 || !got.NoiseConflict {
+		t.Fatalf("account_cap mode must still bound the distance: %+v", got)
 	}
 }
 
@@ -108,7 +148,7 @@ func TestFinalizeAccountStopRoundsTowardSafetyAndRecomputesRisk(t *testing.T) {
 				MaxAccountLossPct: 0.10,
 			}
 			result := &StopLossCalcResult{SLDistance: 9.4, ATRValue: 2}
-			got, err := finalizeStopLossPrice(input, result, 0.25)
+			got, err := finalizeStopLossPrice(input, result, 0.25, 0)
 			if err != nil {
 				t.Fatal(err)
 			}

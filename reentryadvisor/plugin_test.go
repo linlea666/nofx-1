@@ -137,9 +137,9 @@ func TestBackfillOutcomes(t *testing.T) {
 	a.backfillOutcomes()
 }
 
-// TestMaybeRetryAnalysis 自动 AI 分析失败补跑：空结果快照限次补跑（≤2），
-// 已有结果（含不可解析的 raw）不补跑；插件停止后不再启动协程。
-func TestMaybeRetryAnalysis(t *testing.T) {
+// TestSpawnAnalysisRefusesAfterStop 保留自动补跑测试中唯一仍有生产路径的
+// 断言：Stop 之后不得再拉起分析协程（否则会向已关闭资源写入）。
+func TestSpawnAnalysisRefusesAfterStop(t *testing.T) {
 	st, err := store.New(filepath.Join(t.TempDir(), "airetry.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -157,31 +157,10 @@ func TestMaybeRetryAnalysis(t *testing.T) {
 
 	a := &Advisor{
 		st: st, bn: newBinanceClient(), stopCh: make(chan struct{}),
-		inflight: map[int64]bool{}, aiRetries: map[int64]int{}, analyzeLast: map[int64]time.Time{},
+		inflight: map[int64]bool{}, analyzeLast: map[int64]time.Time{},
 	}
 	a.started = true
 
-	// 空结果 → 补跑（测试库无 AI 模型，runAnalysis 在模型解析处失败返回，
-	// raw 保持为空，不影响计数断言）
-	for i := 1; i <= maxAutoAnalysisRetries+2; i++ {
-		a.maybeRetryAnalysis(sig.ID)
-		a.wg.Wait() // 等本次分析协程退出，避免 inflight 干扰下一次判断
-	}
-	if got := a.aiRetries[analysis.ID]; got != maxAutoAnalysisRetries {
-		t.Fatalf("retries = %d, want capped at %d", got, maxAutoAnalysisRetries)
-	}
-
-	// 已有 raw（即使结论不可解析）→ 不再补跑
-	if err := st.ReentryAI().UpdateReentryInternalResult(analysis.ID, "垃圾回复", "", 0, ""); err != nil {
-		t.Fatal(err)
-	}
-	a.aiRetries[analysis.ID] = 0
-	a.maybeRetryAnalysis(sig.ID)
-	if got := a.aiRetries[analysis.ID]; got != 0 {
-		t.Fatalf("analysis with raw should not retry, counter = %d", got)
-	}
-
-	// 插件停止后 spawnAnalysis 拒绝启动
 	a.Stop()
 	if a.spawnAnalysis(analysis.ID, false) {
 		t.Fatal("spawnAnalysis should refuse after Stop")

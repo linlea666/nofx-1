@@ -601,6 +601,22 @@ type ReentryAIStats struct {
 	CandidateCycles                  int            `json:"candidate_cycles"`
 	CandidateMissedReversalCycles    int            `json:"candidate_missed_reversal_cycles"`
 	CandidateMissedReversalDecisions int            `json:"candidate_missed_reversal_decisions"`
+
+	// Candidate lifecycle funnel. The analyses counters above only see
+	// candidates the advisor actually got to review, which hides the dominant
+	// loss channel: 62 of 93 production candidates were invalidated by the
+	// leader closing before AI ever approved one, and only 7 reached
+	// REENTERED. Confidence thresholds cannot explain that — review cadence
+	// versus candidate lifetime can, so both are measured here.
+	CandidateLifecycle map[string]int `json:"candidate_lifecycle"` // status → 候选数
+	// CandidateNeverReviewed 已终结但一次 AI 审查都没轮到的候选数。
+	CandidateNeverReviewed int `json:"candidate_never_reviewed"`
+	CandidateClosed        int `json:"candidate_closed"`
+	// CandidateMeanLifetimeSeconds 终结候选的平均存活时长；与
+	// CandidateMeanReviewGapSeconds（实际平均审查间隔）对比即可判断
+	// RiskAIMinReviewSeconds 是否慢于领航员平仓节奏。
+	CandidateMeanLifetimeSeconds  float64 `json:"candidate_mean_lifetime_seconds"`
+	CandidateMeanReviewGapSeconds float64 `json:"candidate_mean_review_gap_seconds"`
 }
 
 // sqlMarks 生成 "?,?,...,?" 占位符
@@ -618,6 +634,7 @@ func (s *ReentryAIStore) GetReentryAIStats(traderIDs []string) (*ReentryAIStats,
 		CandidateCallStatuses:       map[string]int{},
 		CandidateEvaluationOutcomes: map[string]int{},
 		CandidateMarketOutcomes:     map[string]int{},
+		CandidateLifecycle:          map[string]int{},
 	}
 	if len(traderIDs) == 0 {
 		return st, nil
@@ -739,7 +756,55 @@ func (s *ReentryAIStore) GetReentryAIStats(traderIDs []string) (*ReentryAIStats,
 		args...).Scan(&st.CandidateExecutionRequested, &st.CandidateExecutionSubmitted, &st.CandidateExecutionFilled, &st.CandidateExecutionProtected); err != nil {
 		return nil, err
 	}
+	if err := s.fillCandidateLifecycle(st, marks, args); err != nil {
+		return nil, err
+	}
 	return st, nil
+}
+
+// fillCandidateLifecycle aggregates the candidate table itself rather than the
+// analyses derived from it, so candidates that expired before any review are
+// counted instead of silently missing from the funnel.
+//
+// Lifetime and review gap are averaged over terminated candidates only: an
+// open candidate's clock is still running and would drag the mean toward zero.
+func (s *ReentryAIStore) fillCandidateLifecycle(st *ReentryAIStats, marks string, args []interface{}) error {
+	rows, err := s.db.Query(`SELECT status,COUNT(*),
+		COALESCE(SUM(CASE WHEN closed_at IS NOT NULL THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN closed_at IS NOT NULL AND review_count=0 THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN closed_at IS NOT NULL THEN review_count ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN closed_at IS NOT NULL
+			THEN MAX(strftime('%s',closed_at)-strftime('%s',created_at),0) ELSE 0 END),0)
+		FROM copy_guard_reentry_candidates WHERE trader_id IN (`+marks+`) GROUP BY status`, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	closedReviews := 0
+	closedLifetimeSeconds := 0.0
+	for rows.Next() {
+		var status string
+		var total, closed, neverReviewed, reviews int
+		var lifetimeSeconds float64
+		if err := rows.Scan(&status, &total, &closed, &neverReviewed, &reviews, &lifetimeSeconds); err != nil {
+			return err
+		}
+		st.CandidateLifecycle[status] = total
+		st.CandidateClosed += closed
+		st.CandidateNeverReviewed += neverReviewed
+		closedReviews += reviews
+		closedLifetimeSeconds += lifetimeSeconds
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if st.CandidateClosed > 0 {
+		st.CandidateMeanLifetimeSeconds = closedLifetimeSeconds / float64(st.CandidateClosed)
+	}
+	if closedReviews > 0 {
+		st.CandidateMeanReviewGapSeconds = closedLifetimeSeconds / float64(closedReviews)
+	}
+	return nil
 }
 
 // GetReentryAIConfig 读全局配置；无行时返回默认值（enabled=true）

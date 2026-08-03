@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"nofx/logger"
@@ -384,28 +385,47 @@ func (r *RetentionService) cleanDebates() int64 {
 		cutoff(r.policy.DebateDays))
 }
 
-// cleanLogFiles deletes data/nofx_YYYY-MM-DD.log files older than
-// LogFileDays. Today's file (currently open by the logger) is never in range.
+// logFileDatePrefix is the fixed-width YYYY-MM-DD that every rotated log name
+// starts with after the "nofx_" prefix.
+const logFileDatePrefix = len("2006-01-02")
+
+// cleanLogFiles deletes rotated log files older than LogFileDays. The active
+// day's file is never in range.
+//
+// Two naming shapes must both be covered, and neither was:
+//
+//   - The size-rotation archives are nofx_<date>.<HHMMSS>.<seq>.log.gz. A
+//     "nofx_*.log" glob never sees a .gz suffix, so every compressed archive
+//     accumulated permanently — the production data directory reached 6.7 GB
+//     while this job kept reporting success.
+//   - Even matched, those names cannot be date-parsed by stripping the
+//     extension: the remainder is "2026-08-01.100000.001", not a date. Only the
+//     leading fixed-width date is parsed, which also covers the plain
+//     nofx_<date>.log daily files.
 func (r *RetentionService) cleanLogFiles() {
 	if r.policy.LogFileDays <= 0 || r.logDir == "" {
 		return
 	}
-	matches, err := filepath.Glob(filepath.Join(r.logDir, "nofx_*.log"))
-	if err != nil {
-		return
-	}
 	cutoffDay := time.Now().AddDate(0, 0, -r.policy.LogFileDays)
 	removed := 0
-	for _, path := range matches {
-		name := filepath.Base(path)
-		dateStr := name[len("nofx_") : len(name)-len(".log")]
-		day, err := time.ParseInLocation("2006-01-02", dateStr, time.Local)
+	for _, pattern := range []string{"nofx_*.log", "nofx_*.log.gz"} {
+		matches, err := filepath.Glob(filepath.Join(r.logDir, pattern))
 		if err != nil {
 			continue
 		}
-		if day.Before(cutoffDay) {
-			if err := os.Remove(path); err == nil {
-				removed++
+		for _, path := range matches {
+			name := strings.TrimPrefix(filepath.Base(path), "nofx_")
+			if len(name) < logFileDatePrefix {
+				continue
+			}
+			day, err := time.ParseInLocation("2006-01-02", name[:logFileDatePrefix], time.Local)
+			if err != nil {
+				continue
+			}
+			if day.Before(cutoffDay) {
+				if err := os.Remove(path); err == nil {
+					removed++
+				}
 			}
 		}
 	}

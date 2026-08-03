@@ -239,7 +239,7 @@ func (t *OKXTrader) PlaceProtectiveStop(req ProtectiveStopRequest) (*ProtectiveS
 	if clientID == "" {
 		clientID = genOkxClOrdID()
 	}
-	body := map[string]interface{}{"instId": t.convertSymbol(req.Symbol), "tdMode": mode, "side": side, "posSide": posSide, "ordType": "conditional", "sz": sz, "slTriggerPx": strconv.FormatFloat(req.TriggerPrice, 'f', -1, 64), "slTriggerPxType": normalizeOKXTriggerType(req.TriggerType), "slOrdPx": "-1", "algoClOrdId": clientID, "tag": okxTag}
+	body := map[string]interface{}{"instId": t.convertSymbol(req.Symbol), "tdMode": mode, "side": side, "posSide": posSide, "ordType": "conditional", "sz": sz, "slTriggerPx": QuantizeAndFormatPrice(req.TriggerPrice, inst.TickSz, protectiveStopRoundsDown(req.PositionSide)), "slTriggerPxType": normalizeOKXTriggerType(req.TriggerType), "slOrdPx": "-1", "algoClOrdId": clientID, "tag": okxTag}
 	data, err := t.doRequest("POST", okxAlgoOrderPath, body)
 	if err != nil {
 		return nil, err
@@ -272,7 +272,7 @@ func (t *OKXTrader) AmendProtectiveStop(algoID string, req ProtectiveStopRequest
 	if err != nil {
 		return err
 	}
-	body := map[string]interface{}{"instId": t.convertSymbol(req.Symbol), "algoId": algoID, "newSz": newSize, "newSlTriggerPx": strconv.FormatFloat(req.TriggerPrice, 'f', -1, 64), "newSlOrdPx": "-1"}
+	body := map[string]interface{}{"instId": t.convertSymbol(req.Symbol), "algoId": algoID, "newSz": newSize, "newSlTriggerPx": QuantizeAndFormatPrice(req.TriggerPrice, inst.TickSz, protectiveStopRoundsDown(req.PositionSide)), "newSlOrdPx": "-1"}
 	data, err := t.doRequest("POST", okxAmendAlgoPath, body)
 	if err != nil {
 		return err
@@ -1830,7 +1830,7 @@ func (t *OKXTrader) SetStopLoss(symbol string, positionSide string, quantity, st
 		"posSide":     posSide,
 		"ordType":     "conditional",
 		"sz":          szStr,
-		"slTriggerPx": fmt.Sprintf("%.8f", stopPrice),
+		"slTriggerPx": QuantizeAndFormatPrice(stopPrice, inst.TickSz, posSide == "short"),
 		"slOrdPx":     "-1", // Market price
 		"tag":         okxTag,
 	}

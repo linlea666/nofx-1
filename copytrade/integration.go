@@ -323,6 +323,8 @@ func (ti *TraderIntegration) StartCopyTrading() error {
 		RiskAddonBudgetPct:         copyConfig.RiskAddonBudgetPct,
 
 		// v4.1 重入加严 + v5 可保护性/噪音档
+		RiskMinStopATRRatio:               copyConfig.RiskMinStopATRRatio,
+		RiskMinStopATRRatioExplicit:       copyConfig.RiskMinStopATRRatioExplicit,
 		RiskReentryMinRecoveryATR:         copyConfig.RiskReentryMinRecoveryATR,
 		RiskReentryMinRecoveryATRExplicit: copyConfig.RiskReentryMinRecoveryATRExplicit,
 		RiskReentryCooldownEscalation:     copyConfig.RiskReentryCooldownEscalation,
@@ -2563,7 +2565,7 @@ func (ti *TraderIntegration) retryDegradedV4Protections() {
 		if cycle.ProtectionRetries >= protectionRetryMaxAttempts &&
 			(cycle.ProtectionStatus == store.CopyGuardProtectionPending || cycle.ProtectionStatus == store.CopyGuardProtectionDegraded) {
 			ti.handleUnprotectableCycle(cycle,
-				fmt.Errorf("protection retries exhausted (%d attempts): %s", cycle.ProtectionRetries, cycle.ProtectionError),
+				fmt.Errorf("%w (%d attempts): %s", errUnprotectableRetriesExhausted, cycle.ProtectionRetries, cycle.ProtectionError),
 				requiresUnprotectedForcedExit(cycle))
 			continue
 		}
@@ -2580,6 +2582,38 @@ func (ti *TraderIntegration) retryDegradedV4Protections() {
 func requiresUnprotectedForcedExit(cycle *store.CopyGuardCycle) bool {
 	return cycle != nil &&
 		(cycle.Status == store.CopyGuardFollowingReentry || cycle.ReentryCount > 0)
+}
+
+// Unprotectable causes carry a machine-readable reason so operators can tell
+// the three failure modes apart in events and alerts. They mean very different
+// things: a structural-noise position is one the risk policy deliberately
+// declines to protect, while retry exhaustion is an execution fault worth
+// investigating. Without the distinction every GUARD_UNPROTECTABLE looks like
+// the same incident.
+//
+// The reason travels wrapped inside the cause rather than as a parameter, so
+// the ~14 existing call sites that have no specific reason keep compiling and
+// simply report UNSPECIFIED.
+var (
+	errUnprotectableStructuralNoise   = errors.New("stop distance falls inside the market noise band")
+	errUnprotectableLiquidationBuffer = errors.New("stop price sits inside the liquidation safety buffer")
+	errUnprotectableRetriesExhausted  = errors.New("protection retries exhausted")
+	errUnprotectableStopCrossed       = errors.New("stop trigger is already crossed by the market")
+)
+
+func unprotectableReason(cause error) string {
+	switch {
+	case errors.Is(cause, errUnprotectableStructuralNoise):
+		return "STRUCTURAL_NOISE"
+	case errors.Is(cause, errUnprotectableLiquidationBuffer):
+		return "LIQUIDATION_BUFFER"
+	case errors.Is(cause, errUnprotectableRetriesExhausted):
+		return "RETRIES_EXHAUSTED"
+	case errors.Is(cause, errUnprotectableStopCrossed):
+		return "STOP_ALREADY_CROSSED"
+	default:
+		return "UNSPECIFIED"
+	}
 }
 
 // handleUnprotectableForDecision 决策路径进入 GUARD_UNPROTECTABLE 处置
@@ -2704,9 +2738,10 @@ func (ti *TraderIntegration) handleUnprotectableCycle(cycle *store.CopyGuardCycl
 	if forceClose {
 		action = "close"
 	}
-	logger.Errorf("🚨 [%s] Copy Guard 仓位不可保护 | cycle=%d %s %s | 处置=%s | %s", ti.traderID, cycle.ID, cycle.Symbol, cycle.Side, action, message)
+	reason := unprotectableReason(cause)
+	logger.Errorf("🚨 [%s] Copy Guard 仓位不可保护 | cycle=%d %s %s | 处置=%s 原因=%s | %s", ti.traderID, cycle.ID, cycle.Symbol, cycle.Side, action, reason, message)
 	_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "GUARD_UNPROTECTABLE", Metadata: map[string]interface{}{
-		"action": action, "forced": forceClose, "error": message, "leader_pos_id": cycle.LeaderPosID, "symbol": cycle.Symbol, "side": cycle.Side, "retries": cycle.ProtectionRetries,
+		"action": action, "reason": reason, "forced": forceClose, "error": message, "leader_pos_id": cycle.LeaderPosID, "symbol": cycle.Symbol, "side": cycle.Side, "retries": cycle.ProtectionRetries,
 	}})
 	if action == "warn" {
 		if err := ti.store.CopyTrade().UpdateCopyGuardProtectionHealth(cycle.ID, store.CopyGuardProtectionUnprotectedWarning, 0, message, cycle.FollowerPosID, cycle.EntryOrderID, false); err != nil {
@@ -5783,6 +5818,40 @@ func (ti *TraderIntegration) shouldManageStopLoss(dec *decision.Decision) bool {
 	return true
 }
 
+// stopTriggerReferencePrice returns the price the venue will actually compare
+// the protective trigger against, plus a label for diagnostics.
+//
+// The stop is armed with slTriggerPxType = RiskTriggerPriceType (mark by
+// default), so checking "is this stop already crossed?" against the last traded
+// price asks the wrong question. Mark and last routinely diverge by 0.1-0.5%
+// during the volatility spikes that produce these stops, which is the same
+// order of magnitude as the stop distance itself at high leverage — the check
+// would clear a stop the venue then rejects, or reject one it would accept.
+//
+// positionMarkPrice comes from the fresh position read the caller already
+// performed. When the venue omits it, last price is a better answer than no
+// check at all, and the label records which one was used.
+func (ti *TraderIntegration) stopTriggerReferencePrice(symbol string, positionMarkPrice float64) (float64, string) {
+	triggerType := ""
+	if ti.engine != nil && ti.engine.config != nil {
+		triggerType = ti.engine.config.RiskTriggerPriceType
+	}
+	if triggerType == "mark" && positionMarkPrice > 0 {
+		return positionMarkPrice, "mark"
+	}
+	if priceProvider, ok := ti.executor.(StopLossManager); ok {
+		if current, err := priceProvider.GetMarketPrice(symbol); err == nil && current > 0 {
+			return current, "last"
+		}
+	}
+	// Index-triggered stops have no local index feed; the position mark price
+	// tracks the index far more closely than the last trade does.
+	if positionMarkPrice > 0 {
+		return positionMarkPrice, "mark"
+	}
+	return 0, ""
+}
+
 // refreshStopLossAfterExecute 执行成功后用实际成交均价精确重挂保护单
 //
 // 调用时机：跟单开仓/加仓/部分减仓执行成功 + mapping 更新完成后（Copy Guard 数据源）
@@ -5861,6 +5930,7 @@ func (ti *TraderIntegration) refreshStopLossAfterExecute(dec *decision.Decision)
 	entryPrice := getFloatField(matchedPos, "entryPrice", "entry_price")
 	quantity := absFloat(getFloatField(matchedPos, "positionAmt", "quantity"))
 	liquidationPrice := getFloatField(matchedPos, "liquidationPrice", "liquidation_price")
+	positionMarkPrice := getFloatField(matchedPos, "markPrice", "mark_price")
 	leverage := getIntOrFloatField(matchedPos, "leverage")
 	if leverage <= 0 {
 		leverage = dec.Leverage
@@ -6017,6 +6087,10 @@ func (ti *TraderIntegration) refreshStopLossAfterExecute(dec *decision.Decision)
 					"governed_by": slResult.GovernedBy, "max_account_loss_pct": effectiveStopPct,
 					"max_account_loss_source": stopPctSource, "structure_invalidation": slInput.StructureInvalidation,
 					"expected_loss_usd": slResult.ExpectedLossUSD, "expected_loss_pct": slResult.ExpectedLossPct,
+					// 保证金上限自 v8 起只报不改：这两个字段是它唯一的留痕。
+					"expected_margin_loss_pct": slResult.ExpectedMarginLossPct,
+					"margin_cap_exceeded":      slResult.MarginCapExceeded,
+					"distance_atr_ratio":       slResult.DistanceATRRatio,
 				},
 			})
 		}
@@ -6061,9 +6135,13 @@ func (ti *TraderIntegration) refreshStopLossAfterExecute(dec *decision.Decision)
 	// → 不再无限重试，按普通跟单 warn/close 配置处置；AI 重入强制离场。
 	if slResult.SLPrice <= 0 {
 		cause := fmt.Errorf("no valid protective trigger price")
-		if slResult.Unprotectable {
-			cause = fmt.Errorf("stop price inside liquidation buffer even after clamp (liq=%.4f)", liquidationPrice)
-		} else if slResult.OpenImmediateHit {
+		switch {
+		case slResult.UnprotectableStructural:
+			cause = fmt.Errorf("%w: distance %.4f ATR below the %.2f ATR floor (leverage=%d liq=%.4f)",
+				errUnprotectableStructuralNoise, slResult.DistanceATRRatio, ti.engine.config.RiskMinStopATRRatio, leverage, liquidationPrice)
+		case slResult.Unprotectable:
+			cause = fmt.Errorf("%w even after clamp (liq=%.4f)", errUnprotectableLiquidationBuffer, liquidationPrice)
+		case slResult.OpenImmediateHit:
 			cause = fmt.Errorf("stop distance below 0.1%% of entry (entry=%.4f)", entryPrice)
 		}
 		if slResult.Unprotectable || slResult.OpenImmediateHit {
@@ -6073,13 +6151,12 @@ func (ti *TraderIntegration) refreshStopLossAfterExecute(dec *decision.Decision)
 		ti.markProtectionIssueForDecision(dec, store.CopyGuardProtectionDegraded, "PROTECTION_DEGRADED", cause, 0)
 		return
 	}
-	if priceProvider, ok := ti.executor.(StopLossManager); ok {
-		if current, priceErr := priceProvider.GetMarketPrice(dec.Symbol); priceErr == nil && current > 0 {
-			crossed := (expectedSide == "long" && current <= slResult.SLPrice) || (expectedSide == "short" && current >= slResult.SLPrice)
-			if crossed {
-				ti.handleUnprotectableForDecision(dec, expectedSide, quantity, entryPrice, fmt.Errorf("stop %.8f already crossed by current price %.8f", slResult.SLPrice, current))
-				return
-			}
+	if current, priceKind := ti.stopTriggerReferencePrice(dec.Symbol, positionMarkPrice); current > 0 {
+		crossed := (expectedSide == "long" && current <= slResult.SLPrice) || (expectedSide == "short" && current >= slResult.SLPrice)
+		if crossed {
+			ti.handleUnprotectableForDecision(dec, expectedSide, quantity, entryPrice,
+				fmt.Errorf("%w: stop %.8f vs %s price %.8f", errUnprotectableStopCrossed, slResult.SLPrice, priceKind, current))
+			return
 		}
 	}
 	if slResult.LiquidationPriceIgnored {
@@ -6254,24 +6331,32 @@ func (ti *TraderIntegration) upsertV4Protection(dec *decision.Decision, side str
 	_ = ti.store.CopyTrade().UpdateCopyGuardFollowerPosition(cycle.ID, followerPosID, entryPrice, entryPrice*quantity)
 	_ = ti.store.CopyTrade().UpdateCopyGuardAttemptPosition(cycle.ID, cycle.ReentryCount, entryPrice, entryPrice*quantity, quantity, result.ATRValue)
 	_ = ti.store.CopyTrade().UpdateCopyGuardAttemptIdentity(cycle.ID, cycle.ReentryCount, followerPosID, cycle.EntryOrderID, "")
-	if isAIReentryDecision(dec) {
+	// 风控审计对普通跟单与 AI 重入同样必要：governed_by / actual_leverage 是
+	// 事后判断止损距离由 ATR、保证金上限还是强平钳位决定的唯一依据。此前只在
+	// AI 分支写入，线上 496 条 attempt 的这些列全为空，止损策略无法复盘。
+	{
 		actualNotional := entryPrice * quantity
-		plannedNotional := dec.AIPlannedNotional
-		if plannedNotional <= 0 {
-			plannedNotional = actualNotional
-		}
-		executionNotional := dec.AIExecutionNotional
-		if executionNotional <= 0 {
-			executionNotional = actualNotional
-		}
 		initialMargin := 0.0
 		if dec.Leverage > 0 {
 			initialMargin = actualNotional / float64(dec.Leverage)
 		}
-		if err := ti.store.CopyTrade().UpdateCopyGuardAttemptAIAudit(cycle.ID, cycle.ReentryCount,
-			float64(dec.Leverage), initialMargin, plannedNotional, executionNotional, dec.AIPromotionReason,
-			dec.StopLoss, result.SLPrice, result.ExpectedMarginLossPct, result.GovernedBy); err != nil {
-			logger.Warnf("⚠️ [%s] 保存 AI 重入尝试风控审计失败: %v", ti.traderID, err)
+		// AI 定量字段仅在 AI 路径有意义；普通跟单的名义即领航员名义，
+		// 不存在"计划 vs 提升"的差异，留零以免制造虚假的提升记录。
+		plannedNotional, executionNotional, promotionReason, aiStop := 0.0, 0.0, "", 0.0
+		if isAIReentryDecision(dec) {
+			plannedNotional, executionNotional = dec.AIPlannedNotional, dec.AIExecutionNotional
+			if plannedNotional <= 0 {
+				plannedNotional = actualNotional
+			}
+			if executionNotional <= 0 {
+				executionNotional = actualNotional
+			}
+			promotionReason, aiStop = dec.AIPromotionReason, dec.StopLoss
+		}
+		if err := ti.store.CopyTrade().UpdateCopyGuardAttemptRiskAudit(cycle.ID, cycle.ReentryCount,
+			float64(dec.Leverage), initialMargin, plannedNotional, executionNotional, promotionReason,
+			aiStop, result.SLPrice, result.ExpectedMarginLossPct, result.GovernedBy); err != nil {
+			logger.Warnf("⚠️ [%s] 保存尝试风控审计失败: %v", ti.traderID, err)
 		}
 	}
 	// M9：upsert 每个 poll 周期都会经过这里；持续故障期间无去重会把事件表
@@ -6386,6 +6471,16 @@ func (ti *TraderIntegration) upsertV4Protection(dec *decision.Decision, side str
 		coverage := 0.0
 		if storedErr == nil {
 			coverage = protectionCoverage(stored.Quantity, quantity)
+		}
+		// A venue that rejects the trigger as already-crossed will reject it
+		// identically on every retry, so the generic backoff would spend its
+		// whole budget re-submitting a doomed order while the position runs
+		// naked. Go straight to the disposition, which re-derives the stop from
+		// a fresh price on the next recheck.
+		if trader.IsProtectiveStopAlreadyTriggerable(err) {
+			ti.handleUnprotectableForDecision(dec, side, quantity, entryPrice,
+				fmt.Errorf("%w: %v", errUnprotectableStopCrossed, err))
+			return
 		}
 		ti.markProtectionIssue(cycle, store.CopyGuardProtectionDegraded, "PROTECTION_CREATE_FAILED", err, coverage, incrementRetry)
 		return

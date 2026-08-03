@@ -144,7 +144,7 @@ func TestLiquidationPriceDirectionValidation(t *testing.T) {
 func TestFinalizeStopLossIgnoresImplausibleLiquidation(t *testing.T) {
 	input := &StopLossCalcInput{Symbol: "ETHUSDT", Side: SideLong, EntryPrice: 1717.33, PositionValue: 110, FollowerEquity: 22.14, LiquidationPrice: 2630.40}
 	result := &StopLossCalcResult{SLPrice: 1711.63, SLDistance: 1717.33 - 1711.63, ATRValue: 7.59}
-	out, err := finalizeStopLossPrice(input, result, 0.5)
+	out, err := finalizeStopLossPrice(input, result, 0.5, 0)
 	if err != nil {
 		t.Fatalf("implausible liquidation must not block the ATR stop: %v", err)
 	}
@@ -159,7 +159,7 @@ func TestFinalizeStopLossIgnoresImplausibleLiquidation(t *testing.T) {
 	// buffer = min(0.5×ATR=3.795, 0.15%×entry≈2.576) ≈ 2.58 → 安全线 ≈ 1712.6，
 	// 原 SL 1711.63 落在线下 → 钳到 1712.6 附近
 	input.LiquidationPrice = 1710
-	out, err = finalizeStopLossPrice(input, &StopLossCalcResult{SLPrice: 1711.63, SLDistance: 5.7, ATRValue: 7.59}, 0.5)
+	out, err = finalizeStopLossPrice(input, &StopLossCalcResult{SLPrice: 1711.63, SLDistance: 5.7, ATRValue: 7.59}, 0.5, 0)
 	if err != nil {
 		t.Fatalf("stop inside the liquidation buffer must clamp, not error: %v", err)
 	}
@@ -172,7 +172,7 @@ func TestFinalizeStopLossIgnoresImplausibleLiquidation(t *testing.T) {
 // 调用方必须走 GUARD_UNPROTECTABLE 处置
 func TestFinalizeStopLossUnprotectableWhenClampTooTight(t *testing.T) {
 	input := &StopLossCalcInput{Symbol: "ETHUSDT", Side: SideLong, EntryPrice: 1717.33, PositionValue: 110, FollowerEquity: 22.14, LiquidationPrice: 1716.9}
-	out, err := finalizeStopLossPrice(input, &StopLossCalcResult{SLPrice: 1711.63, SLDistance: 5.7, ATRValue: 7.59}, 0.5)
+	out, err := finalizeStopLossPrice(input, &StopLossCalcResult{SLPrice: 1711.63, SLDistance: 5.7, ATRValue: 7.59}, 0.5, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

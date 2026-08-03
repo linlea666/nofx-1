@@ -25,6 +25,11 @@ type RiskDistanceResult struct {
 	// NoiseConflict: 最终生效的硬 cap 比 ATR 基线更紧（止损落在噪音区内）
 	NoiseConflict                bool
 	AccountRiskThresholdExceeded bool
+	// MarginCapDistance 仓位保证金上限换算出的价格距离（0 = 未启用）。
+	// MarginCapExceeded 表示实际止损距离已超出该上限：普通跟单路径下这是
+	// 告警信号而非收紧依据——收紧它等于把止损压进噪音区。
+	MarginCapDistance float64
+	MarginCapExceeded bool
 }
 
 type ProtectionPlan struct {
@@ -167,20 +172,36 @@ func ComputeAccountProtectionDistance(c *CopyConfig, side SideType, entryPrice, 
 	if frictionRate < 0 {
 		frictionRate = 0
 	}
-	noiseConflict := false
+	// The position margin ceiling is a reporting threshold here, never a
+	// distance tightener.
+	//
+	// Its price-space form is entry × (RiskLeverageMaxLoss/leverage − friction),
+	// i.e. inversely proportional to leverage, so a single percentage produces
+	// wildly different noise tolerance: at a 0.75% hourly ATR it leaves 6.4 ATR
+	// of room at 10x but only 0.37 ATR at 100x. Letting it win the min() pushed
+	// the stop inside the noise band on every high-leverage position, and the
+	// production ledger shows exactly that — 137 stopped cycles realized
+	// -968.69 against a -843.77 hold-to-leader-close baseline, with the sub-0.3
+	// ATR bucket alone averaging -15.28 per stop.
+	//
+	// Auto-deriving the percentage per leverage does not help either: solving
+	// RiskLeverageMaxLoss = leverage × (k×ATR% + friction) collapses the cap
+	// distance back to exactly k×ATR, so a volatility-first distance already is
+	// the correctly leverage-tiered answer. The ceiling can therefore only ever
+	// bind on the harmful side, and the physical limit that must still be
+	// respected — liquidation — is enforced by finalizeStopLossPrice.
+	marginCapExceeded := false
+	marginCapDistance := 0.0
 	if c.RiskLeverageFallback && c.RiskLeverageMaxLoss > 0 {
 		initialMargin := positionNotional / float64(leverage)
 		priceRiskBudget := initialMargin*c.RiskLeverageMaxLoss - positionNotional*frictionRate
 		if priceRiskBudget <= 0 {
 			return RiskDistanceResult{}, fmt.Errorf("trading friction exhausts position margin loss cap")
 		}
-		marginCapDistance := priceRiskBudget / positionNotional * entryPrice
-		if marginCapDistance < distance {
-			distance = marginCapDistance
-			governedBy = "margin_cap"
-			noiseConflict = true
-		}
+		marginCapDistance = priceRiskBudget / positionNotional * entryPrice
+		marginCapExceeded = distance > marginCapDistance
 	}
+	noiseConflict := false
 	if c.RiskStopPriority == "account_cap" {
 		priceRiskBudget := accountEquity*maxAccountLossPct - positionNotional*frictionRate
 		if priceRiskBudget <= 0 {
@@ -205,6 +226,8 @@ func ComputeAccountProtectionDistance(c *CopyConfig, side SideType, entryPrice, 
 		GovernedBy:                   governedBy,
 		NoiseConflict:                noiseConflict,
 		AccountRiskThresholdExceeded: expected/accountEquity > maxAccountLossPct+1e-12,
+		MarginCapDistance:            marginCapDistance,
+		MarginCapExceeded:            marginCapExceeded,
 	}
 	if initialMargin := positionNotional / float64(leverage); initialMargin > 0 {
 		result.ExpectedMarginLossPct = expected / initialMargin
@@ -523,6 +546,11 @@ func ValidateRiskPolicyV4(c *CopyConfig) error {
 	}
 	if invalidRange(c.RiskLiquidationBufferATR, 0, 5) {
 		return fmt.Errorf("risk_liquidation_buffer_atr must be 0..5")
+	}
+	// 上界 3 与 RiskATRMultiplier 的 0.5..5 呼应：下限设得比止损距离基线还高
+	// 会让绝大多数仓位判为不可保护，等于变相关闭止损。
+	if c.RiskMinStopATRRatio < 0 || c.RiskMinStopATRRatio > 3 {
+		return fmt.Errorf("risk_min_stop_atr_ratio must be 0..3")
 	}
 	maxReentries := 10
 	if c.RiskReentryDecisionMode == "ai_guarded" {

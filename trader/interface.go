@@ -3,6 +3,7 @@ package trader
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -13,6 +14,33 @@ import (
 var ErrProtectiveStopNotFound = errors.New("protective stop not found")
 
 var ErrExecutionInstrumentUnsupported = errors.New("execution instrument unsupported")
+
+// IsProtectiveStopAlreadyTriggerable reports that a venue refused a protective
+// stop because its trigger price is already on the wrong side of the market —
+// OKX 51280 and Binance -2021 ("Order would immediately trigger").
+//
+// This is a deterministic rejection of the price, not a transient fault. Both
+// venues re-evaluate identically on every attempt, so the generic retry path
+// burns its full budget (10 attempts with backoff, several minutes) placing the
+// same doomed order while the position runs unprotected. Callers must instead
+// route straight to the unprotectable disposition, which either re-derives the
+// stop from a fresh price or hands the position over with an alert.
+//
+// Matching is on substrings because both adapters wrap venue payloads in
+// formatted strings rather than typed errors; the numeric code is always
+// present and is paired with a phrase check so an unrelated message that merely
+// contains the digits cannot be misread as a price rejection.
+func IsProtectiveStopAlreadyTriggerable(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "51280") &&
+		(strings.Contains(msg, "trigger price") || strings.Contains(msg, "last price")) {
+		return true
+	}
+	return strings.Contains(msg, "-2021") || strings.Contains(msg, "immediately trigger")
+}
 
 // ExecutionInstrument keeps contract identity separate from USD value
 // normalization. An execution venue may only accept an exact base+quote/settle

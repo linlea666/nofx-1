@@ -340,6 +340,8 @@ export interface CopyConfigRequest {
   risk_trigger_price_type?: 'mark' | 'last' | 'index'
   risk_slippage_buffer_bps?: number
   risk_liquidation_buffer_atr?: number
+  // 结构性可保护下限：止损距离不足该 ATR 倍数时不挂止损，转告警观察。0 = 关闭
+  risk_min_stop_atr_ratio?: number
   risk_max_reentries?: number
   risk_reentry_band_atr?: number
   risk_reentry_cooldown_seconds?: number
@@ -865,6 +867,8 @@ export interface CopyTradeConfig {
   risk_trigger_price_type?: 'mark' | 'last' | 'index'
   risk_slippage_buffer_bps?: number
   risk_liquidation_buffer_atr?: number
+  // 结构性可保护下限：止损距离不足该 ATR 倍数时不挂止损，转告警观察。0 = 关闭
+  risk_min_stop_atr_ratio?: number
   risk_max_reentries?: number
   risk_reentry_band_atr?: number
   risk_reentry_cooldown_seconds?: number
@@ -1423,6 +1427,12 @@ export interface ReentryAIStats {
   candidate_execution_protected: number
   candidate_evaluation_outcomes: Record<string, number>
   candidate_market_outcomes: Record<string, number>
+  // 候选生命周期漏斗：平均存活时长 vs 平均审查间隔可判断审查节奏是否慢于领航员平仓
+  candidate_lifecycle: Record<string, number>
+  candidate_never_reviewed: number
+  candidate_closed: number
+  candidate_mean_lifetime_seconds: number
+  candidate_mean_review_gap_seconds: number
 }
 
 // 市场指标实时预览（A2，与信号无关；market 结构与数据包 market 段一致，

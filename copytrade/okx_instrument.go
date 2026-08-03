@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -12,6 +11,7 @@ import (
 	"time"
 
 	"nofx/logger"
+	"nofx/trader"
 )
 
 // ============================================================================
@@ -226,14 +226,9 @@ func convertSymbolToOKXInstID(symbol string) string {
 //
 // 设计原则：「宁可更安全（更早触发），不要因为档位失配挂单失败」
 //
-// 入参 tickSize <= 0 时退化为 4 位小数（兜底，避免传 0 导致 NaN）
+// 实现委托给 trader.QuantizePrice，与下单适配器共用同一个取整边界：本地
+// 自行 Floor/Ceil 再乘回会引入二进制残差（633826*0.1 = 63382.600000000006），
+// 交易所据此判定精度非法并永久拒单。入参 tickSize <= 0 时退化为 4 位小数。
 func alignToTickSize(price, tickSize float64, roundDown bool) float64 {
-	if tickSize <= 0 {
-		// Fallback: 保留 4 位小数（OKX 大部分合约 tickSz 在 1e-4 ~ 1e-1 范围）
-		tickSize = 0.0001
-	}
-	if roundDown {
-		return math.Floor(price/tickSize) * tickSize
-	}
-	return math.Ceil(price/tickSize) * tickSize
+	return trader.QuantizePrice(price, tickSize, roundDown)
 }

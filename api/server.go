@@ -610,6 +610,9 @@ type CopyConfigReq struct {
 	RiskUnprotectableDisposition string `json:"risk_unprotectable_disposition,omitempty"`
 	RiskUnprotectableAction      string `json:"risk_unprotectable_action,omitempty"`
 	RiskReentryNoiseOverride     *bool  `json:"risk_reentry_noise_override,omitempty"`
+
+	// v8 结构性可保护下限（显式 0 关闭判定，故用指针）
+	RiskMinStopATRRatio *float64 `json:"risk_min_stop_atr_ratio,omitempty"`
 }
 
 // applyCopyConfigRiskFields 把 CopyConfigReq 中的 Copy Guard 风控字段透传到 store.CopyTradeConfig
@@ -705,6 +708,11 @@ func applyCopyConfigRiskFields(copyConfig *store.CopyTradeConfig, req *CopyConfi
 	if req.RiskReentryMinRecoveryATR != nil {
 		copyConfig.RiskReentryMinRecoveryATR = *req.RiskReentryMinRecoveryATR
 		copyConfig.RiskReentryMinRecoveryATRExplicit = true
+	}
+	// 显式 0 表示关闭结构性不可保护判定。
+	if req.RiskMinStopATRRatio != nil {
+		copyConfig.RiskMinStopATRRatio = *req.RiskMinStopATRRatio
+		copyConfig.RiskMinStopATRRatioExplicit = true
 	}
 	if req.RiskReentryCooldownEscalation != 0 {
 		copyConfig.RiskReentryCooldownEscalation = req.RiskReentryCooldownEscalation

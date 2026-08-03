@@ -19,10 +19,15 @@ import (
 // 设计哲学：跟单平时 100% 跟随领航员，不主动止盈/分批/干预；
 // 仅在「价格反向走到风险线」时由交易所托管的 algo 条件单兜底平仓。
 //
-// 算法（calcStopLossPrice → ComputeRiskDistanceV4）：各项纯取严（min）
-//   - ATR 基线：噪音参考线（默认 RiskATRMultiplier=2.0 × ATR_1h_14），不再放宽硬 cap
-//   - 仓位保证金止损（margin cap）：仅 RiskLeverageFallback 开启时参与；
-//     新配置和已迁移的全局止损配置默认开启 50%
+// 算法（calcStopLossPrice → ComputeAccountProtectionDistance / ComputeRiskDistanceV4）：
+//   - ATR/结构主导距离：默认 RiskATRMultiplier=2.0 × ATR_1h_14，取结构失效位与
+//     执行最小距离中的较宽者
+//   - 仓位保证金上限（RiskLeverageMaxLoss，默认 50%）：v8 起在普通跟单路径上
+//     只作告警口径（MarginCapExceeded），不再收紧距离——它与杠杆成反比，收紧
+//     会把高杠杆止损压进噪音区；AI 重入路径仍按预算取严
+//   - 强平安全线：finalizeStopLossPrice 钳位，钳不出有效距离即判不可保护
+//   - 结构性下限：距离/ATR < RiskMinStopATRRatio（默认 1.0）同样判不可保护，
+//     交由 UnprotectableDisposition 处置而非挂出必被扫的止损
 //   - 风险预算：单次尝试默认最多亏账户的 RiskAccountPct（v7 默认 2%）
 //
 // 由 SupportsCopyGuard 的数据源（OKX / Binance 领航员）在 v4+ 配置下调用；
@@ -74,9 +79,18 @@ type StopLossCalcResult struct {
 	// Clamped: v5 可保护性状态机——正常止损价落入强平缓冲区内，已被 clamp
 	// 到强平安全线上的极紧止损（触发概率高，但保护真实存在）
 	Clamped bool
-	// Unprotectable: clamp 后距离仍 < 0.1%（连极紧止损都挂不出），调用方
-	// 必须走 GUARD_UNPROTECTABLE 处置（warn/close），禁止静默裸跑
+	// Unprotectable: 连有意义的止损都挂不出（clamp 后距离 < 0.1%，或距离/ATR
+	// 低于 RiskMinStopATRRatio 的结构性噪音档），调用方必须走
+	// GUARD_UNPROTECTABLE 处置（warn/close），禁止静默裸跑
 	Unprotectable bool
+	// UnprotectableStructural 区分不可保护的成因：true 表示"止损落在噪音区
+	// 内、挂了大概率被扫"（高杠杆 × 高波动的结构性问题），false 表示挤在
+	// 强平缓冲区里。两者处置相同但运维含义完全不同。
+	UnprotectableStructural bool
+	// MarginCapDistance / MarginCapExceeded 见 RiskDistanceResult：仓位保证金
+	// 上限已降级为告警口径，不再收紧止损距离。
+	MarginCapDistance float64
+	MarginCapExceeded bool
 }
 
 func riskATRCacheMaxAge(cfg *CopyConfig) time.Duration {
@@ -147,7 +161,9 @@ func calcStopLossPrice(cfg *CopyConfig, input *StopLossCalcInput) (*StopLossCalc
 		result.ExpectedLossPct = computed.ExpectedLossPct
 		result.ExpectedMarginLossPct = computed.ExpectedMarginLossPct
 		result.DistanceATRRatio = computed.DistanceATRRatio
-		return finalizeStopLossPrice(input, result, cfg.RiskLiquidationBufferATR)
+		result.MarginCapDistance = computed.MarginCapDistance
+		result.MarginCapExceeded = computed.MarginCapExceeded
+		return finalizeStopLossPrice(input, result, cfg.RiskLiquidationBufferATR, cfg.RiskMinStopATRRatio)
 	}
 	computed, err := ComputeRiskDistanceV4(cfg, input.EntryPrice, input.PositionValue, input.FollowerEquity, result.ATRDistance, input.Leverage)
 	if err != nil {
@@ -160,7 +176,9 @@ func calcStopLossPrice(cfg *CopyConfig, input *StopLossCalcInput) (*StopLossCalc
 	result.ExpectedLossPct = computed.ExpectedLossPct
 	result.ExpectedMarginLossPct = computed.ExpectedMarginLossPct
 	result.DistanceATRRatio = computed.DistanceATRRatio
-	return finalizeStopLossPrice(input, result, cfg.RiskLiquidationBufferATR)
+	result.MarginCapDistance = computed.MarginCapDistance
+	result.MarginCapExceeded = computed.MarginCapExceeded
+	return finalizeStopLossPrice(input, result, cfg.RiskLiquidationBufferATR, cfg.RiskMinStopATRRatio)
 }
 
 // structuralInvalidationPrice uses only completed 5m/15m OKX mark candles.
@@ -234,9 +252,12 @@ func liquidationSafetyBuffer(tickSize, atrValue, entryPrice, bufferATR float64) 
 //   - 正常：SLPrice 高于（多）/低于（空）强平安全线 → 直接挂单
 //   - clamp：正常价落入强平缓冲区 → 钳到强平安全线上的极紧止损（Clamped=true，
 //     调用方记 PROTECTION_CLAMPED + 告警），保护真实存在
-//   - 不可保护：clamp 后距离 < 0.1%（连极紧止损都无意义）→ Unprotectable=true，
-//     调用方必须走 GUARD_UNPROTECTABLE 处置，禁止静默裸跑
-func finalizeStopLossPrice(input *StopLossCalcInput, result *StopLossCalcResult, liquidationBufferATR float64) (*StopLossCalcResult, error) {
+//   - 不可保护：clamp 后距离 < 0.1%，或最终距离/ATR < minStopATRRatio（止损落在
+//     噪音区，挂了大概率被扫）→ Unprotectable=true，调用方必须走
+//     GUARD_UNPROTECTABLE 处置，禁止静默裸跑
+//
+// minStopATRRatio <= 0 关闭结构性噪音判定（保留旧行为）。
+func finalizeStopLossPrice(input *StopLossCalcInput, result *StopLossCalcResult, liquidationBufferATR, minStopATRRatio float64) (*StopLossCalcResult, error) {
 	frictionRate := float64(0)
 	if input.PositionValue > 0 && input.EntryPrice > 0 {
 		frictionRate = result.ExpectedLossUSD/input.PositionValue - result.SLDistance/input.EntryPrice
@@ -320,6 +341,16 @@ func finalizeStopLossPrice(input *StopLossCalcInput, result *StopLossCalcResult,
 	result.AccountRiskThresholdExceeded = input.MaxAccountLossPct > 0 && result.ExpectedLossPct > input.MaxAccountLossPct+1e-9
 	if input.AccountCapHard && result.AccountRiskThresholdExceeded {
 		return nil, fmt.Errorf("aligned stop exceeds account loss cap: expected %.8f cap %.8f", result.ExpectedLossPct, input.MaxAccountLossPct)
+	}
+	result.MarginCapExceeded = result.MarginCapDistance > 0 && result.SLDistance > result.MarginCapDistance
+	// 结构性噪音档：距离已被强平缓冲压到正常波动之内，此时挂出的止损不是
+	// 保护而是一台扫损机——线上距离/ATR < 0.3 的 20 次止损平均单次亏损
+	// 15.28，而 >= 2 ATR 的 43 次平均只亏 1.59。这类仓位（高杠杆 × 高波动）
+	// 不存在既躲得开噪音又落在强平之内的止损价，只能交由处置策略决定。
+	if minStopATRRatio > 0 && result.ATRValue > 0 && result.DistanceATRRatio < minStopATRRatio {
+		result.SLPrice = 0
+		result.Unprotectable = true
+		result.UnprotectableStructural = true
 	}
 	return result, nil
 }

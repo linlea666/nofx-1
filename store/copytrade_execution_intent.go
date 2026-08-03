@@ -631,6 +631,11 @@ func (s *CopyTradeStore) ApplyAIReentryFillSnapshot(c AIReentryFillSnapshot) (AI
 			out.DeltaNotional, c.ExchangeOrderID, c.ExchangeOrderID, cycleID); err != nil {
 			return out, err
 		}
+		// 这是唯一的累加写入口，也是 follower_notional 膨胀的来源；在同一
+		// 事务内校验，避免污染值参与后续基线与净保护效果计算。
+		if err = enforceFollowerNotionalInvariant(tx, cycleID); err != nil {
+			return out, err
+		}
 		if _, err = tx.Exec(`UPDATE copy_guard_attempts SET
 			entry_price=CASE WHEN quantity+?>0 THEN ((entry_price*quantity)+?)/(quantity+?) ELSE entry_price END,
 			quantity=quantity+?,notional=notional+?,

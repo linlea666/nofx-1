@@ -4,6 +4,8 @@ package copytrade
 
 import (
 	"time"
+
+	"nofx/store"
 )
 
 // ProviderType 数据源类型
@@ -246,6 +248,9 @@ type CopyConfig struct {
 	// RiskAddonBudgetPct is deprecated protocol compatibility. Ordinary leader
 	// adds are proportional and never read this field.
 	RiskAddonBudgetPct float64 `json:"risk_addon_budget_pct"`
+	// v8 结构性可保护下限（字段含义见 store.CopyTradeConfig 同名注释）
+	RiskMinStopATRRatio         float64 `json:"risk_min_stop_atr_ratio"`
+	RiskMinStopATRRatioExplicit bool    `json:"-"`
 	// v4.1 重入加严（字段含义见 store.CopyTradeConfig 同名注释）
 	RiskReentryMinRecoveryATR         float64 `json:"risk_reentry_min_recovery_atr"`
 	RiskReentryMinRecoveryATRExplicit bool    `json:"-"`
@@ -349,6 +354,9 @@ func (c *CopyConfig) FillRiskDefaults() {
 		}
 		if c.RiskAddonBudgetPct == 0 {
 			c.RiskAddonBudgetPct = 0.15
+		}
+		if c.RiskMinStopATRRatio == 0 && !c.RiskMinStopATRRatioExplicit {
+			c.RiskMinStopATRRatio = store.DefaultMinStopATRRatio
 		}
 		if c.RiskReentryMinRecoveryATR == 0 && !c.RiskReentryMinRecoveryATRExplicit {
 			c.RiskReentryMinRecoveryATR = 0.5
