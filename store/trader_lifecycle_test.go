@@ -195,21 +195,46 @@ func TestStopBlockersDistinguishHistoricalTerminalWorkFromActiveRisk(t *testing.
 			t.Fatal(err)
 		}
 	}
+	// All three intents are settled: their exchange outcome is known, so none of
+	// them is unfinished reconciliation work that could hold up the stop.
 	blockers, err := st.Trader().GetStopBlockers("trader-1")
-	if err != nil {
-		t.Fatal(err)
+	if err != nil || len(blockers) != 0 {
+		t.Fatalf("settled fills polluted stop blockers: %+v err=%v", blockers, err)
 	}
-	if len(blockers) != 1 || blockers[0].Symbol != "ETHUSDT" || blockers[0].Status != ExecutionIntentFilled {
-		t.Fatalf("historical terminal work polluted stop blockers: %+v", blockers)
+	// The unprotected one is still archive risk, and the same discrimination
+	// applies: PROTECTED bookkeeping and a closed mapping are both exemptions.
+	unprotected := filterLifecycleBlockers(t, st, "trader-1", "UNPROTECTED_FILL_UNRESOLVED")
+	if len(unprotected) != 1 || unprotected[0].Symbol != "ETHUSDT" ||
+		unprotected[0].Status != ExecutionIntentFilled {
+		t.Fatalf("historical terminal work polluted archive blockers: %+v", unprotected)
 	}
 }
 
-// TestStopBlockersTrustVerifiedCycleProtectionOverIntentBookkeeping covers the
+// filterLifecycleBlockers returns the archive blockers carrying the given code.
+// GetArchiveBlockers intentionally aggregates several independent risk sources,
+// so assertions must name the one under test instead of counting the total.
+func filterLifecycleBlockers(t *testing.T, st *Store, traderID, code string) []TraderLifecycleBlocker {
+	t.Helper()
+	all, err := st.Trader().GetArchiveBlockers(traderID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var matched []TraderLifecycleBlocker
+	for _, blocker := range all {
+		if blocker.Code == code {
+			matched = append(matched, blocker)
+		}
+	}
+	return matched
+}
+
+// TestArchiveBlockersTrustVerifiedCycleProtectionOverIntentBookkeeping covers the
 // deadlock found in production: protected_at is only written by the
 // FILLED->PROTECTED transition, so protection established on a later retry leaves
 // it NULL, and once the trader stops nothing can backfill it. The position was
-// fully protected (VERIFIED, coverage 1.0) yet blocked the stop forever.
-func TestStopBlockersTrustVerifiedCycleProtectionOverIntentBookkeeping(t *testing.T) {
+// fully protected (VERIFIED, coverage 1.0) yet counted as naked risk. The check
+// now gates archive rather than the stop, but must keep the same discrimination.
+func TestArchiveBlockersTrustVerifiedCycleProtectionOverIntentBookkeeping(t *testing.T) {
 	st, err := New(filepath.Join(t.TempDir(), "stop-blocker-verified-protection.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -232,27 +257,115 @@ func TestStopBlockersTrustVerifiedCycleProtectionOverIntentBookkeeping(t *testin
 		t.Fatal(err)
 	}
 
-	blockers, err := st.Trader().GetStopBlockers("trader-1")
-	if err != nil || len(blockers) != 0 {
-		t.Fatalf("verified protection still reported as unsettled risk: %+v err=%v", blockers, err)
+	if blockers := filterLifecycleBlockers(t, st, "trader-1", "UNPROTECTED_FILL_UNRESOLVED"); len(blockers) != 0 {
+		t.Fatalf("verified protection still reported as naked risk: %+v", blockers)
 	}
 
 	// The check must not be weakened: partial coverage is real naked risk again.
 	if _, err = st.DB().Exec(`UPDATE copy_guard_cycles SET protection_coverage=0.5 WHERE id=501`); err != nil {
 		t.Fatal(err)
 	}
-	blockers, err = st.Trader().GetStopBlockers("trader-1")
-	if err != nil || len(blockers) != 1 || blockers[0].Symbol != "ETHUSDT" {
-		t.Fatalf("partially covered position must still block the stop: %+v err=%v", blockers, err)
+	blockers := filterLifecycleBlockers(t, st, "trader-1", "UNPROTECTED_FILL_UNRESOLVED")
+	if len(blockers) != 1 || blockers[0].Symbol != "ETHUSDT" {
+		t.Fatalf("partially covered position must still block the archive: %+v", blockers)
 	}
 
 	if _, err = st.DB().Exec(`UPDATE copy_guard_cycles
 		SET protection_coverage=1.0,protection_status='DEGRADED' WHERE id=501`); err != nil {
 		t.Fatal(err)
 	}
-	blockers, err = st.Trader().GetStopBlockers("trader-1")
-	if err != nil || len(blockers) != 1 {
-		t.Fatalf("degraded protection must still block the stop: %+v err=%v", blockers, err)
+	if blockers = filterLifecycleBlockers(t, st, "trader-1", "UNPROTECTED_FILL_UNRESOLVED"); len(blockers) != 1 {
+		t.Fatalf("degraded protection must still block the archive: %+v", blockers)
+	}
+	// Whatever the protection verdict, a settled fill never holds up the stop.
+	if stopBlockers, stopErr := st.Trader().GetStopBlockers("trader-1"); stopErr != nil || len(stopBlockers) != 0 {
+		t.Fatalf("unprotected fill blocked the stop: %+v err=%v", stopBlockers, stopErr)
+	}
+}
+
+// TestUnprotectedFillWithoutCopyGuardCycleNeverFreezesLifecycle reproduces the
+// production freeze on trader zhu-exz00. Copy Guard was never active for it, so
+// refreshStopLossAfterExecute returned early: no cycle was created (cycle_id=0)
+// and protected_at was never written. The old FILLED-unprotected stop blocker
+// then had no reachable exemption — both cycle exemptions join
+// copy_guard_cycles.id=i.cycle_id and no row can have id 0, while the mapping
+// exemption needs the stopped engine to close the mapping — so stop, start and
+// archive all died at once on a trader that never opted into Copy Guard.
+func TestUnprotectedFillWithoutCopyGuardCycleNeverFreezesLifecycle(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "unprotected-without-cycle.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	createLifecycleTestTrader(t, st, "trader-1", TraderLifecycleStoppingReconcileRequired, 1)
+
+	if _, err = st.DB().Exec(`INSERT INTO copy_trade_position_mappings
+		(trader_id,leader_pos_id,leader_id,symbol,side,margin_mode,status)
+		VALUES('trader-1','active-leader','leader','BTCUSDT','long','cross','active')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = st.DB().Exec(`INSERT INTO copy_trade_execution_intents
+		(trader_id,leader_pos_id,source_revision,cycle_id,action,symbol,side,status,
+		 submitted_at,filled_at,protected_at,terminal_at,exchange_order_id,exchange_state,filled_quantity)
+		VALUES('trader-1','active-leader',1,0,'open_long','BTCUSDT','long','FILLED',
+		       CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL,CURRENT_TIMESTAMP,'real-order','FILLED',0.0867)`); err != nil {
+		t.Fatal(err)
+	}
+
+	blockers, err := st.Trader().GetStopBlockers("trader-1")
+	if err != nil || len(blockers) != 0 {
+		t.Fatalf("settled fill without a Copy Guard cycle froze the stop: %+v err=%v", blockers, err)
+	}
+	if err = st.Trader().CompleteStop("user-1", "trader-1", 1); err != nil {
+		t.Fatalf("stop could not be completed: %v", err)
+	}
+	current, err := st.Trader().GetLifecycle("trader-1")
+	if err != nil || current.Status != TraderLifecycleStopped {
+		t.Fatalf("trader did not reach STOPPED: %+v err=%v", current, err)
+	}
+	// The naked position is not forgotten: archive still refuses it, and the
+	// active ownership mapping is reported alongside as a second, independent
+	// reason so a data gap in one source cannot silently open the archive gate.
+	unprotected := filterLifecycleBlockers(t, st, "trader-1", "UNPROTECTED_FILL_UNRESOLVED")
+	if len(unprotected) != 1 || unprotected[0].Symbol != "BTCUSDT" {
+		t.Fatalf("unprotected fill was lost from archive blockers: %+v", unprotected)
+	}
+	if mappings := filterLifecycleBlockers(t, st, "trader-1", "OWNERSHIP_MAPPING_ACTIVE"); len(mappings) != 1 {
+		t.Fatalf("active ownership mapping was lost from archive blockers: %+v", mappings)
+	}
+}
+
+// TestBeginStartEscapesStoppingStates pins the second half of that freeze: with
+// start gated on STOPPED, a single unclearable stop blocker left the operator no
+// action at all. Startup recovery is what resolves unsettled work, so the
+// stopping states must be startable; archived ones still must not be.
+func TestBeginStartEscapesStoppingStates(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "start-escape.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	for _, from := range []string{
+		TraderLifecycleStopped,
+		TraderLifecycleStopping,
+		TraderLifecycleStoppingReconcileRequired,
+	} {
+		traderID := "trader-" + from
+		createLifecycleTestTrader(t, st, traderID, from, 3)
+		lifecycle, startErr := st.Trader().BeginStart("user-1", traderID)
+		if startErr != nil {
+			t.Fatalf("start from %s was rejected: %v", from, startErr)
+		}
+		if lifecycle.Status != TraderLifecycleStarting || lifecycle.Generation != 4 {
+			t.Fatalf("start from %s did not fence the previous generation: %+v", from, lifecycle)
+		}
+	}
+	for _, from := range []string{TraderLifecycleArchived, TraderLifecycleArchiving} {
+		traderID := "trader-" + from
+		createLifecycleTestTrader(t, st, traderID, from, 1)
+		if _, startErr := st.Trader().BeginStart("user-1", traderID); !errors.Is(startErr, ErrTraderArchived) {
+			t.Fatalf("archived trader became startable from %s: %v", from, startErr)
+		}
 	}
 }
 

@@ -22,6 +22,14 @@ const (
 	ReentryCandidateInvalidatedTraderArchived = "INVALIDATED_TRADER_ARCHIVED"
 )
 
+// Blocker codes consumed outside this package are named so a rename cannot
+// silently turn a consumer into a no-op. copytrade drives its stop-time
+// protection bookkeeping repair off TraderLifecycleBlockerUnprotectedFill.
+const (
+	TraderLifecycleBlockerExecutionReconcile = "EXECUTION_RECONCILE_REQUIRED"
+	TraderLifecycleBlockerUnprotectedFill    = "UNPROTECTED_FILL_UNRESOLVED"
+)
+
 var (
 	ErrTraderArchived          = errors.New("trader is archived")
 	ErrTraderLifecycleConflict = errors.New("trader lifecycle transition conflict")
@@ -139,7 +147,16 @@ func (s *TraderStore) BeginStart(userID, traderID string) (*TraderLifecycle, err
 	if from == TraderLifecycleRunning {
 		return &TraderLifecycle{TraderID: traderID, Status: from, Generation: generation, IsRunning: true}, tx.Commit()
 	}
-	if from != TraderLifecycleStopped {
+	// STOPPING / STOPPING_RECONCILE_REQUIRED are startable on purpose. Startup
+	// recovery (execution intent recovery, Copy Guard cycle recovery, margin stop
+	// reconciliation) is precisely the machinery that resolves unsettled work, and
+	// it needs the runtime up: requiring STOPPED first inverts the dependency and
+	// turns any unclearable stop blocker into a trader with no operator action
+	// left. The generation bump below fences every callback from the prior
+	// generation, so the previous runtime cannot mutate state after this point.
+	if from != TraderLifecycleStopped &&
+		from != TraderLifecycleStopping &&
+		from != TraderLifecycleStoppingReconcileRequired {
 		return nil, fmt.Errorf("%w: cannot start from %s", ErrTraderLifecycleConflict, from)
 	}
 	generation++
@@ -333,71 +350,45 @@ func (s *TraderStore) finishStop(userID, traderID string, generation int64, targ
 	return tx.Commit()
 }
 
-// GetStopBlockers lists execution intents that represent unsettled exchange risk
-// and therefore prevent the trader from reaching STOPPED.
+// GetStopBlockers lists execution intents whose exchange outcome is still
+// unknown and therefore prevent the trader from reaching STOPPED.
 //
-// Every blocker must correspond to real risk. A blocker that can never clear is
-// its own outage: the trader is stuck in STOPPING_RECONCILE_REQUIRED and can no
-// longer be archived or deleted. Both branches below are therefore evidence-based.
+// Scope is deliberately narrow: only work that was (or may have been) submitted
+// without a confirmed outcome belongs here. Such an intent is resolvable while
+// the trader is stopped, because handleReconcileTrader looks the order up on the
+// venue and terminalizes it. Risk that is already *settled* — a confirmed fill we
+// know we own — is not a stop blocker but an archive blocker: STOPPED explicitly
+// permits retained real positions, archive is the gate that demands flat.
+//
+// Every blocker must correspond to real risk AND have a reachable exit. A
+// blocker that can never clear is its own outage: the trader freezes in
+// STOPPING_RECONCILE_REQUIRED, which also removes start (BeginStart used to
+// require STOPPED) and archive, leaving no operator action at all.
 func (s *TraderStore) GetStopBlockers(traderID string) ([]TraderLifecycleBlocker, error) {
 	rows, err := s.db.Query(`SELECT CAST(i.id AS TEXT),COALESCE(i.symbol,''),i.status
 		FROM copy_trade_execution_intents i
-		WHERE i.trader_id=? AND (
-			(
-				i.terminal_at IS NULL AND (
-					i.status IN ('SUBMITTED','PARTIALLY_FILLED')
-					OR (
-						-- RECONCILING is grouped with RESERVED/FAILED rather than treated
-						-- as unconditional risk: an intent can be moved to RECONCILING
-						-- before it ever reaches the exchange, and such an intent has
-						-- nothing to reconcile while permanently blocking the stop.
-						i.status IN ('RESERVED','FAILED','RECONCILING')
-						AND (
-							i.submitted_at IS NOT NULL
-							OR COALESCE(i.exchange_order_id,'')<>''
-							OR COALESCE(i.filled_quantity,0)>0
-							OR EXISTS (
-								SELECT 1 FROM copy_trade_execution_order_attempts a
-								WHERE a.intent_id=i.id AND (
-									a.submitted_at IS NOT NULL
-									OR COALESCE(a.exchange_order_id,'')<>''
-									OR COALESCE(a.filled_quantity,0)>0
-									OR a.status IN ('SUBMITTED','PARTIALLY_FILLED','FILLED','UNKNOWN')
-								)
-							)
+		WHERE i.trader_id=?
+		  AND i.terminal_at IS NULL AND (
+			i.status IN ('SUBMITTED','PARTIALLY_FILLED')
+			OR (
+				-- RECONCILING is grouped with RESERVED/FAILED rather than treated
+				-- as unconditional risk: an intent can be moved to RECONCILING
+				-- before it ever reaches the exchange, and such an intent has
+				-- nothing to reconcile while permanently blocking the stop.
+				i.status IN ('RESERVED','FAILED','RECONCILING')
+				AND (
+					i.submitted_at IS NOT NULL
+					OR COALESCE(i.exchange_order_id,'')<>''
+					OR COALESCE(i.filled_quantity,0)>0
+					OR EXISTS (
+						SELECT 1 FROM copy_trade_execution_order_attempts a
+						WHERE a.intent_id=i.id AND (
+							a.submitted_at IS NOT NULL
+							OR COALESCE(a.exchange_order_id,'')<>''
+							OR COALESCE(a.filled_quantity,0)>0
+							OR a.status IN ('SUBMITTED','PARTIALLY_FILLED','FILLED','UNKNOWN')
 						)
 					)
-				)
-			)
-			OR (
-				i.status='FILLED'
-				AND LOWER(i.action) IN ('open_long','open_short')
-				AND i.protected_at IS NULL
-				AND (
-					COALESCE(i.filled_quantity,0)>0
-					OR i.filled_at IS NOT NULL
-					OR UPPER(COALESCE(i.exchange_state,''))='FILLED'
-				)
-				AND NOT EXISTS (
-					SELECT 1 FROM copy_guard_cycles c
-					WHERE c.id=i.cycle_id AND c.closed_at IS NOT NULL
-				)
-				AND NOT EXISTS (
-					SELECT 1 FROM copy_trade_position_mappings m
-					WHERE m.trader_id=i.trader_id AND m.leader_pos_id=i.leader_pos_id
-					  AND m.status<>'active'
-				)
-				-- protected_at is written only by the FILLED->PROTECTED transition, so a
-				-- protection established on a later retry leaves it NULL forever. Once
-				-- the trader stops, the Copy Guard monitor exits and nothing can ever
-				-- backfill it: a fully protected position then blocks the stop
-				-- permanently. Trust the cycle's verified protection state instead of
-				-- the intent's bookkeeping column.
-				AND NOT EXISTS (
-					SELECT 1 FROM copy_guard_cycles c
-					WHERE c.id=i.cycle_id
-					  AND c.protection_status IN ('VERIFIED','CLAMPED')
-					  AND COALESCE(c.protection_coverage,0)>=0.999
 				)
 			)
 		)
@@ -409,7 +400,72 @@ func (s *TraderStore) GetStopBlockers(traderID string) ([]TraderLifecycleBlocker
 	var blockers []TraderLifecycleBlocker
 	for rows.Next() {
 		var b TraderLifecycleBlocker
-		b.Code = "EXECUTION_RECONCILE_REQUIRED"
+		b.Code = TraderLifecycleBlockerExecutionReconcile
+		if err = rows.Scan(&b.ResourceID, &b.Symbol, &b.Status); err != nil {
+			return nil, err
+		}
+		blockers = append(blockers, b)
+	}
+	return blockers, rows.Err()
+}
+
+// GetUnprotectedFillBlockers lists confirmed opening fills that never reached a
+// verified protective stop. This is archive-only risk, never a stop blocker.
+//
+// Refusing STOPPED for these positions protected nothing — the Copy Guard monitor
+// that could arm a stop has already exited — while it did block the restart that
+// would bring that monitor back, and it blocked archive. Worse, its exemptions
+// were unreachable for intents Copy Guard never managed: a follower running with
+// stop loss off gets cycle_id=0, and both cycle-based exemptions join
+// copy_guard_cycles.id=i.cycle_id, where no row can ever have id 0.
+//
+// Archive keeps blocking such positions through this check plus
+// OWNERSHIP_MAPPING_ACTIVE, OPEN_POSITION and the fresh exchange snapshot in
+// ReconcileStoppedTrader, so nothing is silently lost by moving it here.
+//
+// Exported because copy trading's stop reconciliation repairs exactly this set:
+// it re-derives protection from live exchange orders and backfills the intent
+// bookkeeping the FILLED->PROTECTED transition missed.
+func (s *TraderStore) GetUnprotectedFillBlockers(traderID string) ([]TraderLifecycleBlocker, error) {
+	rows, err := s.db.Query(`SELECT CAST(i.id AS TEXT),COALESCE(i.symbol,''),i.status
+		FROM copy_trade_execution_intents i
+		WHERE i.trader_id=?
+		  AND i.status='FILLED'
+		  AND LOWER(i.action) IN ('open_long','open_short')
+		  AND i.protected_at IS NULL
+		  AND (
+			COALESCE(i.filled_quantity,0)>0
+			OR i.filled_at IS NOT NULL
+			OR UPPER(COALESCE(i.exchange_state,''))='FILLED'
+		  )
+		  AND NOT EXISTS (
+			SELECT 1 FROM copy_guard_cycles c
+			WHERE c.id=i.cycle_id AND c.closed_at IS NOT NULL
+		  )
+		  AND NOT EXISTS (
+			SELECT 1 FROM copy_trade_position_mappings m
+			WHERE m.trader_id=i.trader_id AND m.leader_pos_id=i.leader_pos_id
+			  AND m.status<>'active'
+		  )
+		  -- protected_at is written only by the FILLED->PROTECTED transition, so a
+		  -- protection established on a later retry leaves it NULL forever. Trust
+		  -- the cycle's verified protection state instead of the intent's
+		  -- bookkeeping column.
+		  AND NOT EXISTS (
+			SELECT 1 FROM copy_guard_cycles c
+			WHERE c.id=i.cycle_id
+			  AND c.protection_status IN ('VERIFIED','CLAMPED')
+			  AND COALESCE(c.protection_coverage,0)>=0.999
+		  )
+		ORDER BY i.id`, traderID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var blockers []TraderLifecycleBlocker
+	for rows.Next() {
+		var b TraderLifecycleBlocker
+		b.Code = TraderLifecycleBlockerUnprotectedFill
 		if err = rows.Scan(&b.ResourceID, &b.Symbol, &b.Status); err != nil {
 			return nil, err
 		}
@@ -423,6 +479,11 @@ func (s *TraderStore) GetArchiveBlockers(traderID string) ([]TraderLifecycleBloc
 	if err != nil {
 		return nil, err
 	}
+	unprotected, err := s.GetUnprotectedFillBlockers(traderID)
+	if err != nil {
+		return nil, err
+	}
+	blockers = append(blockers, unprotected...)
 	rows, err := s.db.Query(`SELECT CAST(id AS TEXT),symbol,status
 		FROM copy_trade_position_mappings
 		WHERE trader_id=? AND status='active' ORDER BY id`, traderID)

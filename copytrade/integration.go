@@ -8101,16 +8101,20 @@ func (ti *TraderIntegration) PrepareStop() []store.TraderLifecycleBlocker {
 			store.ExecutionIntentReconciling, "TRADER_STOP_FILL_RECONCILE_REQUIRED",
 			"submitted risk-increasing order has a fill or non-terminal state", orderID, 0, 0, filled)
 	}
+	// Repairing the protection bookkeeping is worth doing on every stop even
+	// though those fills no longer hold up the stop itself: it is the only moment
+	// an exchange client is still available to prove a live protective order, and
+	// the repair is what later lets the position be archived.
+	if unprotected, unprotectedErr := ti.store.Trader().GetUnprotectedFillBlockers(ti.traderID); unprotectedErr == nil {
+		ti.healStoppedProtectionBookkeeping(unprotected)
+	} else {
+		logger.Warnf("⚠️ [%s] 读取未保护成交清单失败，跳过保护记账补写: %v", ti.traderID, unprotectedErr)
+	}
 	blockers, err := ti.store.Trader().GetStopBlockers(ti.traderID)
 	if err != nil {
 		return []store.TraderLifecycleBlocker{{
 			Code: "STOP_BLOCKER_QUERY_FAILED", ResourceID: ti.traderID, Status: err.Error(),
 		}}
-	}
-	if ti.healStoppedProtectionBookkeeping(blockers) {
-		if refreshed, refreshErr := ti.store.Trader().GetStopBlockers(ti.traderID); refreshErr == nil {
-			blockers = refreshed
-		}
 	}
 	return blockers
 }
@@ -8121,9 +8125,8 @@ func (ti *TraderIntegration) PrepareStop() []store.TraderLifecycleBlocker {
 // protected_at is written only by the FILLED->PROTECTED transition. When protection
 // succeeds on a later retry the column stays NULL, and once the trader stops the
 // Copy Guard monitor exits, so nothing can ever backfill it: a fully protected
-// position blocks the stop forever and the trader can no longer be archived or
-// deleted. Reconciliation is the one place that can repair this without restarting
-// the engine.
+// position would keep counting as naked risk and block the archive. Reconciliation
+// is the one place that can repair this without restarting the engine.
 //
 // The bar for repair is exchange evidence, not local bookkeeping: a live protective
 // order whose quantity actually covers the current follower position. Anything less
@@ -8135,7 +8138,8 @@ func (ti *TraderIntegration) healStoppedProtectionBookkeeping(blockers []store.T
 	}
 	healed := false
 	for _, blocker := range blockers {
-		if blocker.Code != "EXECUTION_RECONCILE_REQUIRED" || blocker.Status != store.ExecutionIntentFilled {
+		if blocker.Code != store.TraderLifecycleBlockerUnprotectedFill ||
+			blocker.Status != store.ExecutionIntentFilled {
 			continue
 		}
 		intentID, parseErr := strconv.ParseInt(blocker.ResourceID, 10, 64)
