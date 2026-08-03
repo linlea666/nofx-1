@@ -91,14 +91,20 @@ type GuardSection struct {
 	Attempts []AttemptEntry `json:"attempts"`
 	LastStop *LastStopInfo  `json:"last_stop,omitempty"`
 
-	Policy              map[string]interface{}           `json:"risk_policy"`
-	ProtectionStatus    string                           `json:"protection_status"`
-	ProtectionCoverage  float64                          `json:"protection_coverage"`
-	ProtectionError     string                           `json:"protection_error,omitempty"`
-	CurrentAccount      *copytrade.ExecutionRiskSnapshot `json:"current_account,omitempty"`
-	PreviousAIDecisions []AIDecisionHistory              `json:"previous_ai_decisions,omitempty"`
-	RecentEvents        []GuardEventHistory              `json:"recent_events,omitempty"`
-	LeaderTimeline      []LeaderTimelinePoint            `json:"leader_timeline,omitempty"`
+	Policy             map[string]interface{}           `json:"risk_policy"`
+	ProtectionStatus   string                           `json:"protection_status"`
+	ProtectionCoverage float64                          `json:"protection_coverage"`
+	ProtectionError    string                           `json:"protection_error,omitempty"`
+	CurrentAccount     *copytrade.ExecutionRiskSnapshot `json:"current_account,omitempty"`
+	// PendingRearmConditions are the revival conditions the model itself wrote
+	// on its last THESIS_INVALID_NOW verdict. Without them in the datapack a
+	// woken candidate has no memory of what it said would make the thesis valid
+	// again, so nothing ever evaluates the conditions.
+	PendingRearmConditions []string              `json:"pending_rearm_conditions,omitempty"`
+	WakeTrigger            string                `json:"wake_trigger,omitempty"`
+	PreviousAIDecisions    []AIDecisionHistory   `json:"previous_ai_decisions,omitempty"`
+	RecentEvents           []GuardEventHistory   `json:"recent_events,omitempty"`
+	LeaderTimeline         []LeaderTimelinePoint `json:"leader_timeline,omitempty"`
 }
 
 type AIDecisionHistory struct {
@@ -146,6 +152,13 @@ func buildDataPackForCandidate(st *store.Store, bn *binanceClient, c *store.Copy
 		pack.CopyGuard.CurrentAccount = account
 	} else {
 		pack.Meta.MissingFields = append(pack.Meta.MissingFields, "execution_account_snapshot")
+	}
+	if c.LastDecision == store.ReentryVerdictThesisInvalid {
+		var conditions []string
+		if err := json.Unmarshal([]byte(c.RearmConditionsJSON), &conditions); err == nil {
+			pack.CopyGuard.PendingRearmConditions = conditions
+		}
+		pack.CopyGuard.WakeTrigger = c.PendingTrigger
 	}
 	if history, historyErr := st.ReentryAI().ListReentryAnalysesByCycle(c.CycleID, 30); historyErr == nil {
 		for _, previous := range history {

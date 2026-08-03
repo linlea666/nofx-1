@@ -92,6 +92,16 @@ func (ti *TraderIntegration) reconcileStartupPositionMarginStops() (bool, error)
 			pending = true
 			continue
 		}
+		// This path exists to stop pre-v4 positions from running naked after the
+		// upgrade — not to enforce a margin percentage on positions Copy Guard is
+		// already managing. Since v8 the stop distance is chosen by ATR, so a
+		// protected position at 50x legitimately sits well past RiskLeverageMaxLoss
+		// on its way to a 2 ATR stop. Force-closing it here would reinstate exactly
+		// the fixed-margin exit the v8 rework removed, and only on the restarts
+		// where this reconciler happens to be running.
+		if cycleFullyProtected(cycle) || cycleProtectionVerdictReached(cycle) {
+			continue
+		}
 		unfinished, unfinishedErr := ti.hasUnfinishedMigrationIntent(cycle.ID)
 		if unfinishedErr != nil {
 			return true, unfinishedErr

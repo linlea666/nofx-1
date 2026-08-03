@@ -210,7 +210,7 @@ func GetOKXCompletedCandles(symbol, timeframe string, limit int) ([]Kline, error
 }
 
 func getOKXCompletedCandles(symbol, timeframe string, limit int, endpoint string, includeVolume bool) ([]Kline, error) {
-	bar := map[string]string{"5m": "5m", "15m": "15m", "1h": "1H", "4h": "4H"}[strings.ToLower(timeframe)]
+	bar := map[string]string{"5m": "5m", "15m": "15m", "30m": "30m", "1h": "1H", "4h": "4H"}[strings.ToLower(timeframe)]
 	if bar == "" {
 		return nil, fmt.Errorf("unsupported OKX candle timeframe: %s", timeframe)
 	}

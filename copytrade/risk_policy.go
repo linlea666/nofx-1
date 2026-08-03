@@ -47,6 +47,9 @@ type ProtectionPlan struct {
 	ExpectedLossPct       float64 `json:"expected_loss_pct"`
 	ExpectedMarginLossPct float64 `json:"expected_margin_loss_pct"`
 	GovernedBy            string  `json:"governed_by"`
+	// MarginCapExceeded mirrors RiskDistanceResult: the position margin ceiling
+	// is a reporting threshold, not a veto. See BuildAIProtectionPlanFromStop.
+	MarginCapExceeded bool `json:"margin_cap_exceeded"`
 }
 
 type AIProtectionPlanInput struct {
@@ -92,8 +95,17 @@ func BuildAIProtectionPlanFromStop(c *CopyConfig, in AIProtectionPlanInput) (*Pr
 	}
 	distance := math.Abs(in.EntryPrice - stop)
 	atrRatio := distance / in.ATR
-	if atrRatio < 0.5-1e-9 || atrRatio > 4+1e-9 {
-		return nil, fmt.Errorf("AI stop distance %.4f ATR is outside [0.5,4]", atrRatio)
+	// The lower bound is the same structural floor ordinary copying uses: below
+	// it a stop is inside the noise band and is a loss generator rather than a
+	// protection. Keeping a separate hardcoded 0.5 here meant an AI stop at 0.7
+	// ATR was armed while an identical ordinary-copy stop was declared
+	// unprotectable. Zero disables the floor, matching finalizeStopLossPrice.
+	minATRRatio := c.RiskMinStopATRRatio
+	if minATRRatio < 0 {
+		minATRRatio = 0
+	}
+	if atrRatio < minATRRatio-1e-9 || atrRatio > 4+1e-9 {
+		return nil, fmt.Errorf("AI stop distance %.4f ATR is outside [%.2f,4]", atrRatio, minATRRatio)
 	}
 	if in.LiquidationPrice > 0 && isLiquidationPriceDirectionValid(in.Side, in.EntryPrice, in.LiquidationPrice) {
 		buffer := liquidationSafetyBuffer(in.PriceTickSize, in.ATR, in.EntryPrice, c.RiskLiquidationBufferATR)
@@ -118,15 +130,25 @@ func BuildAIProtectionPlanFromStop(c *CopyConfig, in AIProtectionPlanInput) (*Pr
 	if initialMargin := in.PlannedNotional / float64(in.Leverage); initialMargin > 0 {
 		marginLossPct = expected / initialMargin
 	}
-	if c.RiskLeverageFallback && c.RiskLeverageMaxLoss > 0 && marginLossPct > c.RiskLeverageMaxLoss+1e-9 {
-		return nil, fmt.Errorf("AI stop margin loss %.6f exceeds position cap %.6f", marginLossPct, c.RiskLeverageMaxLoss)
-	}
+	// The position margin ceiling is recorded, never enforced — the same
+	// demotion ComputeAccountProtectionDistance applies to ordinary copying.
+	//
+	// As a veto it was worse than as a tightener. Its price-space width is
+	// 0.5/leverage, so at a 0.75% ATR it admits 1.33 ATR at 50x and 0.67 ATR at
+	// 100x, while the structural floor above demands at least 1.0 ATR: beyond
+	// roughly 67x the admissible band is empty and every AI stop was rejected.
+	// Rejection here happens after the entry is already filled, so the outcome
+	// was an unprotected position heading for forced exit rather than a safer
+	// one. Real budgets — account, cycle, portfolio (AvailableRiskUSD above),
+	// the liquidation buffer and the crossed-price check — still veto.
+	marginCapExceeded := c.RiskLeverageFallback && c.RiskLeverageMaxLoss > 0 &&
+		marginLossPct > c.RiskLeverageMaxLoss+1e-9
 	return &ProtectionPlan{
 		EntryPrice: in.EntryPrice, StopPrice: stop, StopDistance: distance, ATR: in.ATR,
 		SlippageBPS: c.RiskSlippageBufferBPS, RoundTripFeeBPS: c.RiskRoundTripFeeBPS,
 		MaxRiskUSD: in.AvailableRiskUSD, MaxNotional: in.PlannedNotional, PlannedNotional: in.PlannedNotional,
 		ExpectedLossUSD: expected, ExpectedLossPct: expected / in.Equity, ExpectedMarginLossPct: marginLossPct,
-		GovernedBy: "ai_stop",
+		GovernedBy: "ai_stop", MarginCapExceeded: marginCapExceeded,
 	}, nil
 }
 
@@ -641,5 +663,5 @@ func ValidateStoredRiskPolicy(c *store.CopyTradeConfig) error {
 	if c.RiskPolicyVersion < 4 {
 		return nil
 	}
-	return ValidateRiskPolicyV4(&CopyConfig{ProviderType: ProviderType(c.ProviderType), RiskPolicyVersion: c.RiskPolicyVersion, RiskStopMode: c.RiskStopMode, RiskStopPriority: c.RiskStopPriority, RiskATRPeriod: c.RiskATRPeriod, RiskATRCacheMaxAgeMinutes: c.RiskATRCacheMaxAgeMinutes, RiskATRMultiplier: c.RiskATRMultiplier, RiskATRFallbackPct: c.RiskATRFallbackPct, RiskTriggerPriceType: c.RiskTriggerPriceType, RiskAccountPct: c.RiskAccountPct, RiskLeverageFallback: c.RiskLeverageFallback, RiskLeverageMaxLoss: c.RiskLeverageMaxLoss, RiskCycleLossBudgetPct: c.RiskCycleLossBudgetPct, RiskPortfolioLossBudgetPct: c.RiskPortfolioLossBudgetPct, RiskRoundTripFeeBPS: c.RiskRoundTripFeeBPS, RiskSlippageBufferBPS: c.RiskSlippageBufferBPS, RiskLiquidationBufferATR: c.RiskLiquidationBufferATR, RiskMaxReentries: c.RiskMaxReentries, RiskReentryRatio: c.RiskReentryRatio, RiskReentryDecisionMode: c.RiskReentryDecisionMode, RiskReentryMinNotional: c.RiskReentryMinNotional, RiskAIConfidenceThreshold: c.RiskAIConfidenceThreshold, RiskAIMinReviewSeconds: c.RiskAIMinReviewSeconds, RiskAIDailyCallLimit: c.RiskAIDailyCallLimit, RiskAILifecycleCallLimit: c.RiskAILifecycleCallLimit, RiskNotificationLevel: c.RiskNotificationLevel, RiskReentryBandATR: c.RiskReentryBandATR, RiskReentryCooldownSeconds: c.RiskReentryCooldownSeconds, RiskReentryMaxChaseATR: c.RiskReentryMaxChaseATR, RiskReentryMaxATRExpansion: c.RiskReentryMaxATRExpansion, RiskWatchTimeoutMinutes: c.RiskWatchTimeoutMinutes, RiskAddonBudgetPct: c.RiskAddonBudgetPct, RiskReentryMinRecoveryATR: c.RiskReentryMinRecoveryATR, RiskReentryCooldownEscalation: c.RiskReentryCooldownEscalation, RiskReentryRecoveryEscalation: c.RiskReentryRecoveryEscalation, RiskUnprotectableDisposition: c.RiskUnprotectableDisposition, RiskUnprotectableAction: c.RiskUnprotectableAction})
+	return ValidateRiskPolicyV4(&CopyConfig{ProviderType: ProviderType(c.ProviderType), RiskPolicyVersion: c.RiskPolicyVersion, RiskStopMode: c.RiskStopMode, RiskStopPriority: c.RiskStopPriority, RiskATRPeriod: c.RiskATRPeriod, RiskATRCacheMaxAgeMinutes: c.RiskATRCacheMaxAgeMinutes, RiskATRMultiplier: c.RiskATRMultiplier, RiskATRFallbackPct: c.RiskATRFallbackPct, RiskTriggerPriceType: c.RiskTriggerPriceType, RiskAccountPct: c.RiskAccountPct, RiskLeverageFallback: c.RiskLeverageFallback, RiskLeverageMaxLoss: c.RiskLeverageMaxLoss, RiskCycleLossBudgetPct: c.RiskCycleLossBudgetPct, RiskPortfolioLossBudgetPct: c.RiskPortfolioLossBudgetPct, RiskRoundTripFeeBPS: c.RiskRoundTripFeeBPS, RiskSlippageBufferBPS: c.RiskSlippageBufferBPS, RiskLiquidationBufferATR: c.RiskLiquidationBufferATR, RiskMaxReentries: c.RiskMaxReentries, RiskReentryRatio: c.RiskReentryRatio, RiskReentryDecisionMode: c.RiskReentryDecisionMode, RiskReentryMinNotional: c.RiskReentryMinNotional, RiskAIConfidenceThreshold: c.RiskAIConfidenceThreshold, RiskAIMinReviewSeconds: c.RiskAIMinReviewSeconds, RiskAIDailyCallLimit: c.RiskAIDailyCallLimit, RiskAILifecycleCallLimit: c.RiskAILifecycleCallLimit, RiskNotificationLevel: c.RiskNotificationLevel, RiskReentryBandATR: c.RiskReentryBandATR, RiskReentryCooldownSeconds: c.RiskReentryCooldownSeconds, RiskReentryMaxChaseATR: c.RiskReentryMaxChaseATR, RiskReentryMaxATRExpansion: c.RiskReentryMaxATRExpansion, RiskWatchTimeoutMinutes: c.RiskWatchTimeoutMinutes, RiskAddonBudgetPct: c.RiskAddonBudgetPct, RiskMinStopATRRatio: c.RiskMinStopATRRatio, RiskMinStopATRRatioExplicit: c.RiskMinStopATRRatioExplicit, RiskReentryMinRecoveryATR: c.RiskReentryMinRecoveryATR, RiskReentryCooldownEscalation: c.RiskReentryCooldownEscalation, RiskReentryRecoveryEscalation: c.RiskReentryRecoveryEscalation, RiskUnprotectableDisposition: c.RiskUnprotectableDisposition, RiskUnprotectableAction: c.RiskUnprotectableAction})
 }

@@ -999,6 +999,43 @@ func (e *Engine) checkReentryConditions() {
 	}
 }
 
+// candidateStopProtectable pre-checks whether a reentry of the given notional
+// could carry a real stop, using the same distance rules the position will be
+// held to after it fills.
+//
+// It previously called ComputeRiskDistanceV4, which still lets the position
+// margin ceiling tighten the distance. That made the precheck disagree with
+// what actually happens at arm time in two directions at once: it approved
+// candidates whose margin-capped distance sat inside the noise band, and it
+// measured a distance no longer used on the ordinary path. Since the verdict
+// gates candidate creation and is published to the model in the datapack, a
+// wrong verdict corrupts both the funnel and the AI's own reasoning.
+//
+// This remains an estimate: the liquidation clamp needs a liquidation price
+// that only exists once the position is open, and the structural invalidation
+// level is deliberately omitted because it can only widen the distance, which
+// keeps the check conservative.
+func (e *Engine) candidateStopProtectable(side string, mark, notional, equity, atr float64, leverage int) bool {
+	if e.config == nil || atr <= 0 || mark <= 0 {
+		return false
+	}
+	policy, policyErr := e.store.CopyTrade().EffectiveCopyGuardStopPolicy(e.traderID, e.config.RiskStopMaxAccountLossPct)
+	if policyErr != nil {
+		// Unknown policy must not manufacture an optimistic verdict; the model
+		// would then be told a position is protectable that arming will refuse.
+		return false
+	}
+	p, err := ComputeAccountProtectionDistance(e.config, SideType(side), mark, notional, equity,
+		atr, atr*e.config.RiskATRMultiplier, 0, policy.MaxPositionLossPct, leverage)
+	if err != nil || p.Distance/mark < 0.001 || p.Distance > 4*atr {
+		return false
+	}
+	if e.config.RiskMinStopATRRatio > 0 && p.Distance < atr*e.config.RiskMinStopATRRatio {
+		return false
+	}
+	return true
+}
+
 // handleAIGuardedReentry 把已完全止损的周期转换为 AI 候选。这里不调用模型、
 // 不下单，只负责确定性数据快照、费用软预警和可保护性预检。
 func (e *Engine) handleAIGuardedReentry(mapping *store.CopyTradePositionMapping, leaderPos *Position, cycle *store.CopyGuardCycle, stoppedAttempt *store.CopyGuardAttempt, followerEquity float64, coolingDown bool, terminalStatus string) {
@@ -1079,8 +1116,7 @@ func (e *Engine) handleAIGuardedReentry(mapping *store.CopyTradePositionMapping,
 		if usageErr == nil && capacityErr == nil {
 			if sized, sizeErr := MaxNotionalForRiskDistance(e.config, equity, mark, atr*e.config.RiskATRMultiplier, availableRisk/equity, nominalCap); sizeErr == nil {
 				maxNotional = sized
-				p, err := ComputeRiskDistanceV4(e.config, mark, maxNotional, equity, atr*e.config.RiskATRMultiplier, leaderPos.Leverage)
-				protectable = err == nil && p.Distance/mark >= 0.001 && p.Distance <= 4*atr
+				protectable = e.candidateStopProtectable(mapping.Side, mark, maxNotional, equity, atr, leaderPos.Leverage)
 			}
 		}
 	}

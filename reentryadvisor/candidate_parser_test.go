@@ -45,6 +45,53 @@ func TestParseAICandidateVerdictStrictSchema(t *testing.T) {
 	}
 }
 
+// The structured close-invalidation pair is optional on purpose: close_invalidation
+// itself stays the required prose field, and a decision must never be thrown away
+// because the machine-readable mirror was omitted or mislabelled.
+func TestCloseInvalidationPairIsOptionalAndValidated(t *testing.T) {
+	absent, err := parseAICandidateVerdict(validCandidateJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if absent.CloseInvalidationTimeframe != "" || absent.CloseInvalidationLevel != 0 {
+		t.Fatalf("a response without the pair must not invent one: %+v", absent)
+	}
+
+	withPair := strings.Replace(validCandidateJSON,
+		`"close_invalidation":"15m close below 98"`,
+		`"close_invalidation":"15m close below 98","close_invalidation_timeframe":"15M","close_invalidation_level":98`, 1)
+	parsed, err := parseAICandidateVerdict(withPair)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.CloseInvalidationTimeframe != "15m" || parsed.CloseInvalidationLevel != 98 {
+		t.Fatalf("structured pair not normalized: %+v", parsed)
+	}
+
+	for name, raw := range map[string]string{
+		"unsupported timeframe":   `"close_invalidation_timeframe":"2h","close_invalidation_level":98`,
+		"daily is too slow":       `"close_invalidation_timeframe":"1d","close_invalidation_level":98`,
+		"level without timeframe": `"close_invalidation_timeframe":"","close_invalidation_level":98`,
+		"timeframe without level": `"close_invalidation_timeframe":"15m","close_invalidation_level":0`,
+		"negative level":          `"close_invalidation_timeframe":"15m","close_invalidation_level":-3`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			dropped, parseErr := parseAICandidateVerdict(strings.Replace(validCandidateJSON,
+				`"close_invalidation":"15m close below 98"`,
+				`"close_invalidation":"15m close below 98",`+raw, 1))
+			if parseErr != nil {
+				t.Fatalf("an inconsistent pair must be dropped, not rejected: %v", parseErr)
+			}
+			if dropped.CloseInvalidationTimeframe != "" || dropped.CloseInvalidationLevel != 0 {
+				t.Fatalf("inconsistent pair leaked through: %+v", dropped)
+			}
+			if dropped.CloseInvalidation == "" {
+				t.Fatal("the authoritative prose condition must survive")
+			}
+		})
+	}
+}
+
 func TestCandidateClosed5mCandleKeyUsesPersistedMarketBar(t *testing.T) {
 	open := time.Date(2026, 7, 17, 10, 5, 0, 0, time.UTC)
 	analysis := &store.ReentryAIAnalysis{

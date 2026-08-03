@@ -32,48 +32,55 @@ type CopyGuardReentryCandidate struct {
 	MarginMode  string `json:"margin_mode"`
 	Status      string `json:"status"`
 
-	TriggerPrice            float64    `json:"trigger_price"`
-	ATR                     float64    `json:"atr"`
-	MaxNotional             float64    `json:"max_notional"`
-	StopCount               int        `json:"stop_count"`
-	ReentryCount            int        `json:"reentry_count"`
-	LeaderSize              float64    `json:"leader_size"`
-	LeaderEntryPrice        float64    `json:"leader_entry_price"`
-	LastStopPrice           float64    `json:"last_stop_price"`
-	DistanceATRRatio        float64    `json:"distance_atr_ratio"`
-	Protectable             bool       `json:"protectable"`
-	FeatureHash             string     `json:"feature_hash"`
-	PendingTrigger          string     `json:"pending_trigger"`
-	DecisionGeneration      int        `json:"decision_generation"`
-	ReviewCount             int        `json:"review_count"`
-	FailureCount            int        `json:"failure_count"`
-	LastDecision            string     `json:"last_decision"`
-	Regime                  string     `json:"regime"`
-	Confidence              float64    `json:"confidence"`
-	SizeFactor              float64    `json:"size_factor"`
-	EntryPriceLow           float64    `json:"entry_price_low"`
-	EntryPriceHigh          float64    `json:"entry_price_high"`
-	AttentionPriceLow       float64    `json:"attention_price_low"`
-	AttentionPriceHigh      float64    `json:"attention_price_high"`
-	AIStopPrice             float64    `json:"ai_stop_price"`
-	StopBasis               string     `json:"stop_basis"`
-	CloseInvalidation       string     `json:"close_invalidation"`
-	SupportZonesJSON        string     `json:"support_zones_json"`
-	ResistanceZonesJSON     string     `json:"resistance_zones_json"`
-	TargetZonesJSON         string     `json:"target_zones_json"`
-	RearmConditionsJSON     string     `json:"rearm_conditions_json"`
-	ConsecutiveAbandons     int        `json:"consecutive_abandons"`
-	LastAbandonCandle       string     `json:"last_abandon_candle"`
-	LastAnalysisID          int64      `json:"last_analysis_id"`
-	DecisionTTLSeconds      int        `json:"decision_ttl_seconds"`
-	LastError               string     `json:"last_error"`
-	FailureBackoffUntil     *time.Time `json:"failure_backoff_until,omitempty"`
-	LastUnactionableCode    string     `json:"last_unactionable_code,omitempty"`
-	LastUnactionableEventAt *time.Time `json:"last_unactionable_event_at,omitempty"`
-	DecisionExpiresAt       *time.Time `json:"decision_expires_at,omitempty"`
-	RegularReviewAt         *time.Time `json:"regular_review_at,omitempty"`
-	EventReviewAt           *time.Time `json:"event_review_at,omitempty"`
-	BudgetBlockedUntil      *time.Time `json:"budget_blocked_until,omitempty"`
+	TriggerPrice       float64 `json:"trigger_price"`
+	ATR                float64 `json:"atr"`
+	MaxNotional        float64 `json:"max_notional"`
+	StopCount          int     `json:"stop_count"`
+	ReentryCount       int     `json:"reentry_count"`
+	LeaderSize         float64 `json:"leader_size"`
+	LeaderEntryPrice   float64 `json:"leader_entry_price"`
+	LastStopPrice      float64 `json:"last_stop_price"`
+	DistanceATRRatio   float64 `json:"distance_atr_ratio"`
+	Protectable        bool    `json:"protectable"`
+	FeatureHash        string  `json:"feature_hash"`
+	PendingTrigger     string  `json:"pending_trigger"`
+	DecisionGeneration int     `json:"decision_generation"`
+	ReviewCount        int     `json:"review_count"`
+	FailureCount       int     `json:"failure_count"`
+	LastDecision       string  `json:"last_decision"`
+	Regime             string  `json:"regime"`
+	Confidence         float64 `json:"confidence"`
+	SizeFactor         float64 `json:"size_factor"`
+	EntryPriceLow      float64 `json:"entry_price_low"`
+	EntryPriceHigh     float64 `json:"entry_price_high"`
+	AttentionPriceLow  float64 `json:"attention_price_low"`
+	AttentionPriceHigh float64 `json:"attention_price_high"`
+	AIStopPrice        float64 `json:"ai_stop_price"`
+	StopBasis          string  `json:"stop_basis"`
+	CloseInvalidation  string  `json:"close_invalidation"`
+	// CloseInvalidationTimeframe/Level are the machine-checkable form of
+	// CloseInvalidation, which is free prose and cannot be evaluated reliably.
+	// Both must be present for the condition to be evaluated at all; the prose
+	// stays authoritative for display.
+	CloseInvalidationTimeframe string     `json:"close_invalidation_timeframe"`
+	CloseInvalidationLevel     float64    `json:"close_invalidation_level"`
+	CloseInvalidationHitAt     *time.Time `json:"close_invalidation_hit_at,omitempty"`
+	SupportZonesJSON           string     `json:"support_zones_json"`
+	ResistanceZonesJSON        string     `json:"resistance_zones_json"`
+	TargetZonesJSON            string     `json:"target_zones_json"`
+	RearmConditionsJSON        string     `json:"rearm_conditions_json"`
+	ConsecutiveAbandons        int        `json:"consecutive_abandons"`
+	LastAbandonCandle          string     `json:"last_abandon_candle"`
+	LastAnalysisID             int64      `json:"last_analysis_id"`
+	DecisionTTLSeconds         int        `json:"decision_ttl_seconds"`
+	LastError                  string     `json:"last_error"`
+	FailureBackoffUntil        *time.Time `json:"failure_backoff_until,omitempty"`
+	LastUnactionableCode       string     `json:"last_unactionable_code,omitempty"`
+	LastUnactionableEventAt    *time.Time `json:"last_unactionable_event_at,omitempty"`
+	DecisionExpiresAt          *time.Time `json:"decision_expires_at,omitempty"`
+	RegularReviewAt            *time.Time `json:"regular_review_at,omitempty"`
+	EventReviewAt              *time.Time `json:"event_review_at,omitempty"`
+	BudgetBlockedUntil         *time.Time `json:"budget_blocked_until,omitempty"`
 
 	// Effective per-trader policy is populated by the API and is not persisted
 	// on the candidate row. This prevents the dashboard from presenting the
@@ -116,6 +123,8 @@ func (s *ReentryAIStore) initReentryCandidateTables() error {
 			entry_price_low REAL DEFAULT 0, entry_price_high REAL DEFAULT 0,
 			attention_price_low REAL DEFAULT 0, attention_price_high REAL DEFAULT 0,
 			ai_stop_price REAL DEFAULT 0, stop_basis TEXT DEFAULT '', close_invalidation TEXT DEFAULT '',
+			close_invalidation_timeframe TEXT DEFAULT '', close_invalidation_level REAL DEFAULT 0,
+			close_invalidation_hit_at DATETIME,
 			support_zones_json TEXT DEFAULT '[]', resistance_zones_json TEXT DEFAULT '[]',
 			target_zones_json TEXT DEFAULT '[]', rearm_conditions_json TEXT DEFAULT '[]',
 			consecutive_abandons INTEGER DEFAULT 0, last_abandon_candle TEXT DEFAULT '',
@@ -154,6 +163,9 @@ func (s *ReentryAIStore) initReentryCandidateTables() error {
 		{"copy_guard_reentry_candidates", "ai_stop_price", "REAL DEFAULT 0"},
 		{"copy_guard_reentry_candidates", "stop_basis", "TEXT DEFAULT ''"},
 		{"copy_guard_reentry_candidates", "close_invalidation", "TEXT DEFAULT ''"},
+		{"copy_guard_reentry_candidates", "close_invalidation_timeframe", "TEXT DEFAULT ''"},
+		{"copy_guard_reentry_candidates", "close_invalidation_level", "REAL DEFAULT 0"},
+		{"copy_guard_reentry_candidates", "close_invalidation_hit_at", "DATETIME"},
 		{"copy_guard_reentry_candidates", "support_zones_json", "TEXT DEFAULT '[]'"},
 		{"copy_guard_reentry_candidates", "resistance_zones_json", "TEXT DEFAULT '[]'"},
 		{"copy_guard_reentry_candidates", "target_zones_json", "TEXT DEFAULT '[]'"},
@@ -343,7 +355,9 @@ const reentryCandidateColumns = `id,cycle_id,trader_id,leader_pos_id,symbol,side
 	trigger_price,atr,max_notional,stop_count,reentry_count,leader_size,leader_entry_price,last_stop_price,
 	distance_atr_ratio,protectable,feature_hash,pending_trigger,decision_generation,review_count,failure_count,
 	last_decision,regime,confidence,size_factor,entry_price_low,entry_price_high,attention_price_low,attention_price_high,
-	ai_stop_price,stop_basis,close_invalidation,support_zones_json,resistance_zones_json,target_zones_json,rearm_conditions_json,
+	ai_stop_price,stop_basis,close_invalidation,
+	COALESCE(close_invalidation_timeframe,''),COALESCE(close_invalidation_level,0),close_invalidation_hit_at,
+	support_zones_json,resistance_zones_json,target_zones_json,rearm_conditions_json,
 	consecutive_abandons,last_abandon_candle,last_analysis_id,decision_ttl_seconds,last_error,
 	failure_backoff_until,COALESCE(last_unactionable_code,''),last_unactionable_event_at,
 	decision_expires_at,regular_review_at,event_review_at,budget_blocked_until,
@@ -354,11 +368,14 @@ func scanReentryCandidate(row rowScanner) (*CopyGuardReentryCandidate, error) {
 	var c CopyGuardReentryCandidate
 	var snapshot, next, created, updated string
 	var last, closed, failureBackoff, unactionableEvent, decisionExpires, regularReview, eventReview, budgetBlocked sql.NullString
+	var closeInvalidationHit sql.NullString
 	if err := row.Scan(&c.ID, &c.CycleID, &c.TraderID, &c.LeaderPosID, &c.Symbol, &c.Side, &c.MarginMode, &c.Status,
 		&c.TriggerPrice, &c.ATR, &c.MaxNotional, &c.StopCount, &c.ReentryCount, &c.LeaderSize, &c.LeaderEntryPrice, &c.LastStopPrice,
 		&c.DistanceATRRatio, &c.Protectable, &c.FeatureHash, &c.PendingTrigger, &c.DecisionGeneration, &c.ReviewCount, &c.FailureCount,
 		&c.LastDecision, &c.Regime, &c.Confidence, &c.SizeFactor, &c.EntryPriceLow, &c.EntryPriceHigh, &c.AttentionPriceLow, &c.AttentionPriceHigh,
-		&c.AIStopPrice, &c.StopBasis, &c.CloseInvalidation, &c.SupportZonesJSON, &c.ResistanceZonesJSON, &c.TargetZonesJSON, &c.RearmConditionsJSON,
+		&c.AIStopPrice, &c.StopBasis, &c.CloseInvalidation,
+		&c.CloseInvalidationTimeframe, &c.CloseInvalidationLevel, &closeInvalidationHit,
+		&c.SupportZonesJSON, &c.ResistanceZonesJSON, &c.TargetZonesJSON, &c.RearmConditionsJSON,
 		&c.ConsecutiveAbandons, &c.LastAbandonCandle, &c.LastAnalysisID, &c.DecisionTTLSeconds, &c.LastError,
 		&failureBackoff, &c.LastUnactionableCode, &unactionableEvent, &decisionExpires, &regularReview, &eventReview, &budgetBlocked,
 		&snapshot, &last, &next, &created, &updated, &closed); err != nil {
@@ -399,6 +416,9 @@ func scanReentryCandidate(row rowScanner) (*CopyGuardReentryCandidate, error) {
 		return nil, err
 	}
 	if c.ClosedAt, err = parseNullableDBTime(closed); err != nil {
+		return nil, err
+	}
+	if c.CloseInvalidationHitAt, err = parseNullableDBTime(closeInvalidationHit); err != nil {
 		return nil, err
 	}
 	return &c, nil
@@ -473,12 +493,26 @@ func (s *ReentryAIStore) EnsureReentryCandidate(c *CopyGuardReentryCandidate, fi
 	return s.GetReentryCandidateByCycle(c.CycleID)
 }
 
+// DormantRearmHeartbeat bounds how long a DORMANT_REARM candidate can wait for
+// a wake-up. Dormancy is entered on THESIS_INVALID_NOW and is only left when
+// pollMarketEventReviews observes a derivative-state flip, so a candidate whose
+// funding/OI/CVD/ATR regimes all stay put — and whose own rearm_conditions
+// nobody evaluates — could sit dormant until the leader closed the position.
+// That was the tail of the reentry funnel leaking. The interval is deliberately
+// far longer than the normal review cadence: this is a liveness guarantee, not
+// a second review schedule.
+const DormantRearmHeartbeat = 2 * time.Hour
+
 func (s *ReentryAIStore) ListDueReentryCandidates(limit int) ([]*CopyGuardReentryCandidate, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 50
 	}
 	rows, err := s.db.Query(`SELECT `+reentryCandidateColumns+` FROM copy_guard_reentry_candidates
-			WHERE status IN ('WATCHING','WAITING') AND next_review_at<=CURRENT_TIMESTAMP
+			WHERE (
+				(status IN ('WATCHING','WAITING') AND next_review_at<=CURRENT_TIMESTAMP)
+				OR (status='DORMANT_REARM'
+				    AND (julianday(CURRENT_TIMESTAMP)-julianday(COALESCE(last_review_at,snapshot_at)))*86400>=?)
+			)
 			AND EXISTS(SELECT 1 FROM traders t
 				WHERE t.id=copy_guard_reentry_candidates.trader_id
 				  AND t.lifecycle_status='RUNNING' AND t.is_running=1)
@@ -490,7 +524,7 @@ func (s *ReentryAIStore) ListDueReentryCandidates(limit int) ([]*CopyGuardReentr
 					'ATTEMPTS_EXHAUSTED','BUDGET_SUSPENDED'
 				  ))
 			AND (failure_backoff_until IS NULL OR failure_backoff_until<=CURRENT_TIMESTAMP)
-			ORDER BY next_review_at,id LIMIT ?`, limit)
+			ORDER BY next_review_at,id LIMIT ?`, DormantRearmHeartbeat.Seconds(), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -541,7 +575,9 @@ func (s *ReentryAIStore) ClaimReentryCandidateReview(id int64, minInterval time.
 	var cycleReviewable bool
 	var cycleID int64
 	var traderID string
+	var priorTrigger string
 	if err = tx.QueryRow(`SELECT c.status,c.review_count,c.last_review_at,
+			COALESCE(c.pending_trigger,''),
 			COALESCE(c.cycle_id,0),COALESCE(c.trader_id,''),
 			COALESCE(t.lifecycle_status,''),COALESCE(t.lifecycle_generation,0),
 			EXISTS(SELECT 1 FROM copy_guard_cycles g
@@ -552,17 +588,25 @@ func (s *ReentryAIStore) ClaimReentryCandidateReview(id int64, minInterval time.
 				  ))
 			FROM copy_guard_reentry_candidates c
 			LEFT JOIN traders t ON t.id=c.trader_id WHERE c.id=?`, id).
-		Scan(&status, &count, &last, &cycleID, &traderID, &lifecycleStatus, &lifecycleGeneration, &cycleReviewable); err != nil {
+		Scan(&status, &count, &last, &priorTrigger, &cycleID, &traderID, &lifecycleStatus, &lifecycleGeneration, &cycleReviewable); err != nil {
 		return nil, false, err
 	}
-	if status != ReentryCandidateWatching && status != ReentryCandidateWaiting {
+	// DORMANT_REARM is claimable only on the heartbeat, never on the normal
+	// cadence: ListDueReentryCandidates surfaces it after DormantRearmHeartbeat,
+	// and the check is repeated here because the claim races the scheduler.
+	if status != ReentryCandidateWatching && status != ReentryCandidateWaiting &&
+		status != ReentryCandidateDormantRearm {
 		return nil, false, nil
 	}
 	if lifecycleStatus != TraderLifecycleRunning || !cycleReviewable {
 		return nil, false, nil
 	}
+	claimInterval := minInterval
+	if status == ReentryCandidateDormantRearm && claimInterval < DormantRearmHeartbeat {
+		claimInterval = DormantRearmHeartbeat
+	}
 	if last.Valid {
-		if t, e := parseDBTime(last.String); e == nil && time.Since(t) < minInterval {
+		if t, e := parseDBTime(last.String); e == nil && time.Since(t) < claimInterval {
 			return nil, false, nil
 		}
 	}
@@ -580,7 +624,11 @@ func (s *ReentryAIStore) ClaimReentryCandidateReview(id int64, minInterval time.
 			return nil, false, recordReentryBudgetBlockTx(tx, cycleID, traderID, id, "daily_24h", daily, dailyLimit)
 		}
 	}
-	res, err := tx.Exec(`UPDATE copy_guard_reentry_candidates SET status=?,decision_generation=decision_generation+1,review_count=review_count+1,last_review_at=CURRENT_TIMESTAMP,next_review_at=?,event_review_at=NULL,budget_blocked_until=NULL,pending_trigger='',updated_at=CURRENT_TIMESTAMP WHERE id=? AND status IN ('WATCHING','WAITING')`, ReentryCandidateReviewing, time.Now().Add(minInterval).UTC(), id)
+	wakeTrigger := priorTrigger
+	if status == ReentryCandidateDormantRearm {
+		wakeTrigger = "DORMANT_HEARTBEAT"
+	}
+	res, err := tx.Exec(`UPDATE copy_guard_reentry_candidates SET status=?,decision_generation=decision_generation+1,review_count=review_count+1,last_review_at=CURRENT_TIMESTAMP,next_review_at=?,event_review_at=NULL,budget_blocked_until=NULL,pending_trigger='',updated_at=CURRENT_TIMESTAMP WHERE id=? AND status IN ('WATCHING','WAITING','DORMANT_REARM')`, ReentryCandidateReviewing, time.Now().Add(claimInterval).UTC(), id)
 	if err != nil {
 		return nil, false, err
 	}
@@ -594,6 +642,11 @@ func (s *ReentryAIStore) ClaimReentryCandidateReview(id int64, minInterval time.
 	c, err := s.GetReentryCandidate(id)
 	if c != nil {
 		c.TraderLifecycleGeneration = lifecycleGeneration
+		// The claim clears pending_trigger, so the reason this candidate woke up
+		// would be lost before the datapack is built. Carry it on the in-memory
+		// copy; the model needs to know whether it was a market-state flip or the
+		// dormancy heartbeat that brought it back.
+		c.PendingTrigger = wakeTrigger
 	}
 	return c, true, err
 }
@@ -654,6 +707,8 @@ type ReentryCandidateDecision struct {
 	EnterApproved                         bool
 	AIStopPrice                           float64
 	StopBasis, CloseInvalidation          string
+	CloseInvalidationTimeframe            string
+	CloseInvalidationLevel                float64
 	SupportZonesJSON, ResistanceZonesJSON string
 	TargetZonesJSON, RearmConditionsJSON  string
 }
@@ -693,11 +748,11 @@ func (s *ReentryAIStore) FinishReentryCandidateReview(id int64, d ReentryCandida
 		}
 		decisionExpires = expiresAt.UTC()
 	}
-	res, err := s.db.Exec(`UPDATE copy_guard_reentry_candidates SET status=?,last_decision=?,regime=?,confidence=?,size_factor=?,entry_price_low=?,entry_price_high=?,attention_price_low=?,attention_price_high=?,ai_stop_price=?,stop_basis=?,close_invalidation=?,support_zones_json=?,resistance_zones_json=?,target_zones_json=?,rearm_conditions_json=?,next_review_at=?,regular_review_at=?,event_review_at=NULL,last_analysis_id=?,decision_ttl_seconds=?,decision_expires_at=?,failure_count=0,last_error='',failure_backoff_until=NULL,consecutive_abandons=CASE WHEN ? AND last_abandon_candle<>? THEN consecutive_abandons+1 WHEN ? THEN consecutive_abandons ELSE 0 END,last_abandon_candle=CASE WHEN ? THEN ? ELSE '' END,updated_at=CURRENT_TIMESTAMP
+	res, err := s.db.Exec(`UPDATE copy_guard_reentry_candidates SET status=?,last_decision=?,regime=?,confidence=?,size_factor=?,entry_price_low=?,entry_price_high=?,attention_price_low=?,attention_price_high=?,ai_stop_price=?,stop_basis=?,close_invalidation=?,close_invalidation_timeframe=?,close_invalidation_level=?,close_invalidation_hit_at=NULL,support_zones_json=?,resistance_zones_json=?,target_zones_json=?,rearm_conditions_json=?,next_review_at=?,regular_review_at=?,event_review_at=NULL,last_analysis_id=?,decision_ttl_seconds=?,decision_expires_at=?,failure_count=0,last_error='',failure_backoff_until=NULL,consecutive_abandons=CASE WHEN ? AND last_abandon_candle<>? THEN consecutive_abandons+1 WHEN ? THEN consecutive_abandons ELSE 0 END,last_abandon_candle=CASE WHEN ? THEN ? ELSE '' END,updated_at=CURRENT_TIMESTAMP
 		WHERE id=? AND status=? AND EXISTS(
 			SELECT 1 FROM traders t WHERE t.id=copy_guard_reentry_candidates.trader_id
 			  AND t.lifecycle_status='RUNNING' AND t.is_running=1
-		)`, status, d.Decision, d.Regime, d.Confidence, d.SizeFactor, d.EntryPriceLow, d.EntryPriceHigh, d.AttentionPriceLow, d.AttentionPriceHigh, d.AIStopPrice, d.StopBasis, d.CloseInvalidation, d.SupportZonesJSON, d.ResistanceZonesJSON, d.TargetZonesJSON, d.RearmConditionsJSON, d.NextReview.UTC(), d.NextReview.UTC(), d.AnalysisID, d.TTLSeconds, decisionExpires, d.ConfirmAbandon, d.CandleKey, d.ConfirmAbandon, d.ConfirmAbandon, d.CandleKey, id, ReentryCandidateReviewing)
+		)`, status, d.Decision, d.Regime, d.Confidence, d.SizeFactor, d.EntryPriceLow, d.EntryPriceHigh, d.AttentionPriceLow, d.AttentionPriceHigh, d.AIStopPrice, d.StopBasis, d.CloseInvalidation, d.CloseInvalidationTimeframe, d.CloseInvalidationLevel, d.SupportZonesJSON, d.ResistanceZonesJSON, d.TargetZonesJSON, d.RearmConditionsJSON, d.NextReview.UTC(), d.NextReview.UTC(), d.AnalysisID, d.TTLSeconds, decisionExpires, d.ConfirmAbandon, d.CandleKey, d.ConfirmAbandon, d.ConfirmAbandon, d.CandleKey, id, ReentryCandidateReviewing)
 	if err != nil {
 		return err
 	}
@@ -849,6 +904,53 @@ func (s *ReentryAIStore) MarkReentryCandidateStatus(id int64, status, message st
 	}
 	_, err := s.db.Exec(`UPDATE copy_guard_reentry_candidates SET status=?,last_error=?,updated_at=CURRENT_TIMESTAMP`+closed+` WHERE id=?`, status, message, id)
 	return err
+}
+
+// ListCloseInvalidationWatch returns filled AI reentries whose close
+// invalidation condition is machine-checkable and not yet reported.
+//
+// The condition only means something while the position it was written for is
+// still open, so the still-open FOLLOWING_REENTRY cycle is part of the
+// predicate rather than something the caller has to remember. A candidate that
+// stops out again leaves REENTERED and drops out here on its own.
+func (s *ReentryAIStore) ListCloseInvalidationWatch(traderID string, limit int) ([]*CopyGuardReentryCandidate, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 50
+	}
+	rows, err := s.db.Query(`SELECT `+reentryCandidateColumns+` FROM copy_guard_reentry_candidates
+		WHERE trader_id=? AND status=? AND close_invalidation_hit_at IS NULL
+		  AND COALESCE(close_invalidation_timeframe,'')<>'' AND COALESCE(close_invalidation_level,0)>0
+		  AND EXISTS(SELECT 1 FROM copy_guard_cycles g
+			WHERE g.id=copy_guard_reentry_candidates.cycle_id
+			  AND g.closed_at IS NULL AND g.status=?)
+		ORDER BY id LIMIT ?`, traderID, ReentryCandidateReentered, CopyGuardFollowingReentry, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*CopyGuardReentryCandidate
+	for rows.Next() {
+		c, scanErr := scanReentryCandidate(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// MarkCloseInvalidationHit records the breach once. The conditional update is
+// the deduplication: the evaluator re-reads the same closed candle on every
+// poll until the timeframe advances, and must report it exactly once.
+func (s *ReentryAIStore) MarkCloseInvalidationHit(id int64) (bool, error) {
+	res, err := s.db.Exec(`UPDATE copy_guard_reentry_candidates
+		SET close_invalidation_hit_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP
+		WHERE id=? AND close_invalidation_hit_at IS NULL`, id)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n == 1, nil
 }
 
 // CompleteReentryCandidate performs the one-way commit after exchange

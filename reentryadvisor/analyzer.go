@@ -40,16 +40,21 @@ type aiVerdict struct {
 	AIStopPrice         float64           `json:"ai_stop_price"`
 	StopBasis           string            `json:"stop_basis"`
 	CloseInvalidation   string            `json:"close_invalidation"`
-	SupportZones        []aiStructureZone `json:"support_zones"`
-	ResistanceZones     []aiStructureZone `json:"resistance_zones"`
-	TargetZones         []aiTargetZone    `json:"target_zones"`
-	AttentionPriceLow   float64           `json:"attention_price_low"`
-	AttentionPriceHigh  float64           `json:"attention_price_high"`
-	TTLSeconds          int               `json:"ttl_seconds"`
-	NextReviewSeconds   int               `json:"next_review_seconds"`
-	RearmConditions     []string          `json:"rearm_conditions"`
-	Reasons             []string          `json:"reasons"`
-	RiskNotes           []string          `json:"risk_notes"`
+	// close_invalidation is prose and cannot be evaluated by code. These two
+	// optional fields are the same condition in machine-checkable form; the pair
+	// is used only when both are present and consistent.
+	CloseInvalidationTimeframe string            `json:"close_invalidation_timeframe"`
+	CloseInvalidationLevel     float64           `json:"close_invalidation_level"`
+	SupportZones               []aiStructureZone `json:"support_zones"`
+	ResistanceZones            []aiStructureZone `json:"resistance_zones"`
+	TargetZones                []aiTargetZone    `json:"target_zones"`
+	AttentionPriceLow          float64           `json:"attention_price_low"`
+	AttentionPriceHigh         float64           `json:"attention_price_high"`
+	TTLSeconds                 int               `json:"ttl_seconds"`
+	NextReviewSeconds          int               `json:"next_review_seconds"`
+	RearmConditions            []string          `json:"rearm_conditions"`
+	Reasons                    []string          `json:"reasons"`
+	RiskNotes                  []string          `json:"risk_notes"`
 }
 
 type aiStructureZone struct {
@@ -102,8 +107,36 @@ type parsedVerdict struct {
 	TTLSeconds, NextReviewSeconds         int
 	AIStopPrice                           float64
 	StopBasis, CloseInvalidation          string
+	CloseInvalidationTimeframe            string
+	CloseInvalidationLevel                float64
 	SupportZonesJSON, ResistanceZonesJSON string
 	TargetZonesJSON, RearmConditionsJSON  string
+}
+
+// closeInvalidationTimeframes are the timeframes the evaluator can fetch
+// completed candles for. 1d is excluded: a daily close arrives too late to be
+// an actionable invalidation signal for a reentry.
+var closeInvalidationTimeframes = map[string]struct{}{
+	"5m": {}, "15m": {}, "30m": {}, "1h": {}, "4h": {},
+}
+
+// normalizeCloseInvalidationLevel accepts the structured condition only when it
+// is complete and self-consistent, and drops it otherwise.
+//
+// It deliberately does not fail the analysis. The prose close_invalidation
+// remains the required, authoritative field; these two are an additive
+// convenience for the evaluator, and rejecting a whole ENTER decision because
+// the model mislabelled a timeframe would trade a real entry for a monitoring
+// nicety. A dropped pair simply means the condition stays observational.
+func normalizeCloseInvalidation(timeframe string, level float64) (string, float64) {
+	tf := strings.ToLower(strings.TrimSpace(timeframe))
+	if tf == "" || level <= 0 {
+		return "", 0
+	}
+	if _, ok := closeInvalidationTimeframes[tf]; !ok {
+		return "", 0
+	}
+	return tf, level
 }
 
 func parseAICandidateVerdict(raw string) (*parsedVerdict, error) {
@@ -133,6 +166,12 @@ func parseAICandidateVerdictForVersion(raw, version string) (*parsedVerdict, err
 		if _, exists := keys[key]; !exists {
 			return nil, fmt.Errorf("缺少必填字段 %s", key)
 		}
+	}
+	if v6 {
+		// Optional, not required: a v6 model that never learned about them, and a
+		// v7 model that omits them on a WAIT verdict, must both still parse.
+		allowedKeys["close_invalidation_timeframe"] = struct{}{}
+		allowedKeys["close_invalidation_level"] = struct{}{}
 	}
 	for key := range keys {
 		if _, allowed := allowedKeys[key]; !allowed {
@@ -229,14 +268,15 @@ func parseAICandidateVerdictForVersion(raw, version string) (*parsedVerdict, err
 	resistanceJSON, _ := json.Marshal(v.ResistanceZones)
 	targetJSON, _ := json.Marshal(v.TargetZones)
 	rearmJSON, _ := json.Marshal(v.RearmConditions)
-	payload, _ := json.Marshal(map[string]interface{}{"reasons": v.Reasons, "risk_notes": v.RiskNotes, "regime": regime, "multi_timeframe_trend": v.MultiTimeframeTrend, "market_phase": v.MarketPhase, "size_factor": v.SizeFactor, "entry_price_low": v.EntryPriceLow, "entry_price_high": v.EntryPriceHigh, "ai_stop_price": v.AIStopPrice, "stop_basis": v.StopBasis, "close_invalidation": v.CloseInvalidation, "support_zones": v.SupportZones, "resistance_zones": v.ResistanceZones, "target_zones": v.TargetZones, "attention_price_low": v.AttentionPriceLow, "attention_price_high": v.AttentionPriceHigh, "ttl_seconds": v.TTLSeconds, "next_review_seconds": v.NextReviewSeconds, "rearm_conditions": v.RearmConditions})
+	closeTF, closeLevel := normalizeCloseInvalidation(v.CloseInvalidationTimeframe, v.CloseInvalidationLevel)
+	payload, _ := json.Marshal(map[string]interface{}{"reasons": v.Reasons, "risk_notes": v.RiskNotes, "regime": regime, "multi_timeframe_trend": v.MultiTimeframeTrend, "market_phase": v.MarketPhase, "size_factor": v.SizeFactor, "entry_price_low": v.EntryPriceLow, "entry_price_high": v.EntryPriceHigh, "ai_stop_price": v.AIStopPrice, "stop_basis": v.StopBasis, "close_invalidation": v.CloseInvalidation, "close_invalidation_timeframe": closeTF, "close_invalidation_level": closeLevel, "support_zones": v.SupportZones, "resistance_zones": v.ResistanceZones, "target_zones": v.TargetZones, "attention_price_low": v.AttentionPriceLow, "attention_price_high": v.AttentionPriceHigh, "ttl_seconds": v.TTLSeconds, "next_review_seconds": v.NextReviewSeconds, "rearm_conditions": v.RearmConditions})
 	normalized := decision
 	if decision == "ENTER_NOW" {
 		normalized = store.ReentryVerdictEnter
 	} else if v6 && decision == store.ReentryVerdictAbandon {
 		normalized = store.ReentryVerdictThesisInvalid
 	}
-	return &parsedVerdict{Verdict: normalized, Confidence: v.Confidence, ReasonsJSON: string(payload), Regime: regime, SizeFactor: v.SizeFactor, EntryPriceLow: v.EntryPriceLow, EntryPriceHigh: v.EntryPriceHigh, AttentionPriceLow: v.AttentionPriceLow, AttentionPriceHigh: v.AttentionPriceHigh, TTLSeconds: v.TTLSeconds, NextReviewSeconds: v.NextReviewSeconds, AIStopPrice: v.AIStopPrice, StopBasis: v.StopBasis, CloseInvalidation: v.CloseInvalidation, SupportZonesJSON: string(supportJSON), ResistanceZonesJSON: string(resistanceJSON), TargetZonesJSON: string(targetJSON), RearmConditionsJSON: string(rearmJSON)}, nil
+	return &parsedVerdict{Verdict: normalized, Confidence: v.Confidence, ReasonsJSON: string(payload), Regime: regime, SizeFactor: v.SizeFactor, EntryPriceLow: v.EntryPriceLow, EntryPriceHigh: v.EntryPriceHigh, AttentionPriceLow: v.AttentionPriceLow, AttentionPriceHigh: v.AttentionPriceHigh, TTLSeconds: v.TTLSeconds, NextReviewSeconds: v.NextReviewSeconds, AIStopPrice: v.AIStopPrice, StopBasis: v.StopBasis, CloseInvalidation: v.CloseInvalidation, CloseInvalidationTimeframe: closeTF, CloseInvalidationLevel: closeLevel, SupportZonesJSON: string(supportJSON), ResistanceZonesJSON: string(resistanceJSON), TargetZonesJSON: string(targetJSON), RearmConditionsJSON: string(rearmJSON)}, nil
 }
 
 func validateAIStructureZones(zones []aiStructureZone) error {
@@ -627,7 +667,7 @@ func (a *Advisor) finishCandidateAnalysis(analysis *store.ReentryAIAnalysis, cfg
 	next := time.Now().Add(time.Duration(nextSeconds) * time.Second)
 	candle := candidateClosed5mCandleKey(analysis)
 	enterApproved := pv.Verdict == store.ReentryVerdictEnter && pv.Confidence >= traderCfg.RiskAIConfidenceThreshold
-	d := store.ReentryCandidateDecision{Decision: pv.Verdict, Regime: pv.Regime, Confidence: pv.Confidence, SizeFactor: pv.SizeFactor, EntryPriceLow: pv.EntryPriceLow, EntryPriceHigh: pv.EntryPriceHigh, AttentionPriceLow: pv.AttentionPriceLow, AttentionPriceHigh: pv.AttentionPriceHigh, NextReview: next, AnalysisID: analysis.ID, TTLSeconds: pv.TTLSeconds, CandleKey: candle, ConfirmAbandon: pv.Verdict == store.ReentryVerdictAbandon && pv.Confidence >= abandonThreshold && candle != "", EnterApproved: enterApproved, AIStopPrice: pv.AIStopPrice, StopBasis: pv.StopBasis, CloseInvalidation: pv.CloseInvalidation, SupportZonesJSON: pv.SupportZonesJSON, ResistanceZonesJSON: pv.ResistanceZonesJSON, TargetZonesJSON: pv.TargetZonesJSON, RearmConditionsJSON: pv.RearmConditionsJSON}
+	d := store.ReentryCandidateDecision{Decision: pv.Verdict, Regime: pv.Regime, Confidence: pv.Confidence, SizeFactor: pv.SizeFactor, EntryPriceLow: pv.EntryPriceLow, EntryPriceHigh: pv.EntryPriceHigh, AttentionPriceLow: pv.AttentionPriceLow, AttentionPriceHigh: pv.AttentionPriceHigh, NextReview: next, AnalysisID: analysis.ID, TTLSeconds: pv.TTLSeconds, CandleKey: candle, ConfirmAbandon: pv.Verdict == store.ReentryVerdictAbandon && pv.Confidence >= abandonThreshold && candle != "", EnterApproved: enterApproved, AIStopPrice: pv.AIStopPrice, StopBasis: pv.StopBasis, CloseInvalidation: pv.CloseInvalidation, CloseInvalidationTimeframe: pv.CloseInvalidationTimeframe, CloseInvalidationLevel: pv.CloseInvalidationLevel, SupportZonesJSON: pv.SupportZonesJSON, ResistanceZonesJSON: pv.ResistanceZonesJSON, TargetZonesJSON: pv.TargetZonesJSON, RearmConditionsJSON: pv.RearmConditionsJSON}
 	if err := a.st.ReentryAI().FinishReentryCandidateReview(c.ID, d); err != nil {
 		return err
 	}

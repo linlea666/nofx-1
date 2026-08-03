@@ -279,7 +279,7 @@ func TestAvailableCopyGuardRiskUsesSmallestRemainingBudget(t *testing.T) {
 }
 
 func TestBuildAIProtectionPlanFromStopContract(t *testing.T) {
-	cfg := &CopyConfig{RiskSlippageBufferBPS: 5, RiskRoundTripFeeBPS: 10, RiskLeverageFallback: true, RiskLeverageMaxLoss: 0.50, RiskLiquidationBufferATR: 0.5}
+	cfg := &CopyConfig{RiskSlippageBufferBPS: 5, RiskRoundTripFeeBPS: 10, RiskLeverageFallback: true, RiskLeverageMaxLoss: 0.50, RiskLiquidationBufferATR: 0.5, RiskMinStopATRRatio: 0.5}
 	base := AIProtectionPlanInput{Side: SideLong, EntryPrice: 100, CurrentPrice: 100, AIStopPrice: 98.03, ATR: 2, Equity: 1000, AvailableRiskUSD: 50, PlannedNotional: 100, PriceTickSize: 0.1, Leverage: 5}
 	plan, err := BuildAIProtectionPlanFromStop(cfg, base)
 	if err != nil {
@@ -311,5 +311,62 @@ func TestBuildAIProtectionPlanFromStopContract(t *testing.T) {
 	plan, err = BuildAIProtectionPlanFromStop(cfg, short)
 	if err != nil || math.Abs(plan.StopPrice-101.9) > 1e-9 {
 		t.Fatalf("short stop must floor toward safety: plan=%+v err=%v", plan, err)
+	}
+}
+
+// The AI stop floor must be the same configured structural floor ordinary
+// copying uses. While it was hardcoded at 0.5 ATR, an AI stop at 0.75 ATR was
+// armed on a position whose identical ordinary-copy stop was declared
+// unprotectable, so the two paths disagreed about the same instrument.
+func TestAIProtectionPlanFloorFollowsConfiguredRatio(t *testing.T) {
+	cfg := func(minRatio float64) *CopyConfig {
+		return &CopyConfig{RiskSlippageBufferBPS: 5, RiskRoundTripFeeBPS: 10, RiskLiquidationBufferATR: 0.5, RiskMinStopATRRatio: minRatio}
+	}
+	// 0.75 ATR: below the production 1.0 floor, above the retired 0.5 constant.
+	in := AIProtectionPlanInput{Side: SideLong, EntryPrice: 100, CurrentPrice: 100, AIStopPrice: 98.5,
+		ATR: 2, Equity: 1000, AvailableRiskUSD: 50, PlannedNotional: 100, PriceTickSize: 0.1, Leverage: 5}
+
+	if _, err := BuildAIProtectionPlanFromStop(cfg(1.0), in); err == nil {
+		t.Fatal("a 0.75 ATR stop must be rejected under the 1.0 ATR floor")
+	}
+	if _, err := BuildAIProtectionPlanFromStop(cfg(0.5), in); err != nil {
+		t.Fatalf("the same stop must be accepted under a 0.5 floor: %v", err)
+	}
+	// Zero disables the floor on both paths alike.
+	tight := in
+	tight.AIStopPrice = 99.7
+	if _, err := BuildAIProtectionPlanFromStop(cfg(0), tight); err != nil {
+		t.Fatalf("floor 0 must accept any distance the other checks allow: %v", err)
+	}
+}
+
+// The position margin ceiling is inversely proportional to leverage, so as a
+// veto it made every structurally sound stop impossible above roughly 67x —
+// and it fired after the entry had already filled, leaving the position
+// unprotected. It must now only be reported.
+func TestAIProtectionPlanReportsMarginCapWithoutRejecting(t *testing.T) {
+	cfg := &CopyConfig{RiskSlippageBufferBPS: 5, RiskRoundTripFeeBPS: 10, RiskLiquidationBufferATR: 0.5,
+		RiskMinStopATRRatio: 1.0, RiskLeverageFallback: true, RiskLeverageMaxLoss: 0.50}
+	// 100x, 2 ATR stop: 2% adverse move is 200% of the initial margin, far past
+	// the 50% ceiling, yet well inside the account risk budget.
+	in := AIProtectionPlanInput{Side: SideLong, EntryPrice: 100, CurrentPrice: 100, AIStopPrice: 98,
+		ATR: 1, Equity: 1000, AvailableRiskUSD: 50, PlannedNotional: 100, PriceTickSize: 0.1, Leverage: 100}
+
+	plan, err := BuildAIProtectionPlanFromStop(cfg, in)
+	if err != nil {
+		t.Fatalf("margin ceiling must not veto a structurally sound stop: %v", err)
+	}
+	if !plan.MarginCapExceeded {
+		t.Fatalf("the breach must still be recorded for alerting: %+v", plan)
+	}
+	if plan.ExpectedMarginLossPct <= cfg.RiskLeverageMaxLoss {
+		t.Fatalf("test no longer exercises a breach: %+v", plan)
+	}
+
+	// Real budgets must still veto: the same stop against a 1 USD budget.
+	starved := in
+	starved.AvailableRiskUSD = 1
+	if _, err := BuildAIProtectionPlanFromStop(cfg, starved); err == nil {
+		t.Fatal("account/cycle/portfolio risk budget must remain a hard veto")
 	}
 }

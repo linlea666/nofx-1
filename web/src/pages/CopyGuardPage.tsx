@@ -15,7 +15,6 @@ import type {
   AIModel,
   CopyGuardAICandidate,
   CopyGuardCycle,
-  CopyGuardManualSignal,
   ReentryAIAnalysis,
   ReentryAIConfig,
   ReentryAIDecisionEvaluation,
@@ -102,11 +101,13 @@ const attemptLabels: Record<string, string> = {
   STOPPED: '已止损',
   CLOSED: '已平仓',
 }
+// 部分条目已无后端发射点，但历史事件行仍存在于库中，删掉标签只会让旧周期
+// 显示原始枚举名，因此保留并标注「历史」。
 const eventLabels: Record<string, string> = {
   INITIAL_ENTRY_FILLED: '首次跟随成交',
   PROTECTION_PENDING: '保护单建立中',
   PROTECTION_ACTIVE: '保护单已生效',
-  PROTECTIVE_STOP_ACTIVE: '保护单已生效',
+  PROTECTIVE_STOP_ACTIVE: '保护单已生效（历史事件名，现为 PROTECTION_ACTIVE）',
   PROTECTION_RETRY: '重试建立保护',
   PROTECTION_CREATE_FAILED: '保护单创建失败',
   PROTECTION_VERIFY_UNKNOWN: '保护单无法验证',
@@ -123,7 +124,7 @@ const eventLabels: Record<string, string> = {
   ACCOUNTING_IDENTITY_CAPTURED: '已记录跟单仓位',
   ACCOUNTING_IDENTITY_CAPTURE_FAILED: '跟单仓位识别失败',
   ACCOUNTING_RECONCILED: '实际盈亏已对账',
-  ACCOUNTING_NEEDS_REVIEW: '对账延迟（历史事件）',
+  ACCOUNTING_NEEDS_REVIEW: '对账延迟（历史）',
   ACCOUNTING_DELAYED: '交易所结算数据延迟，自动重试中',
   ACCOUNTING_UNRECOVERABLE: '对账数据不可自动恢复',
   PROTECTIVE_STOP_ADOPTED: '接管已存在的保护单',
@@ -151,9 +152,9 @@ const eventLabels: Record<string, string> = {
   AI_REVIEW_THESIS_INVALID: 'AI 当前论点失效，休眠等待结构恢复',
   AI_DECISION_OUTCOME_FINALIZED: 'AI 单次决策后验评价完成',
   AI_CANDIDATE_OUTCOME_FINALIZED: 'AI 候选周期评价完成',
-  ADDON_RISK_WARNING: '加仓风险告警（仍跟随）',
-  ADDON_SKIPPED_BUDGET: '加仓超预算被拦截（旧版）',
-  CYCLE_LOSS_BREAKER: '周期亏损熔断触发',
+  ADDON_RISK_WARNING: '加仓风险告警（历史）',
+  ADDON_SKIPPED_BUDGET: '加仓超预算被拦截（历史）',
+  CYCLE_LOSS_BREAKER: '周期亏损熔断触发（历史）',
   REENTRY_GATE_CHANGED: '重入门控条件变化',
   REENTRY_WINDOW_COLLAPSED: '旧规则重入窗口不可行',
   WATCH_RESUMED: '观察采样断档后恢复',
@@ -161,11 +162,61 @@ const eventLabels: Record<string, string> = {
   MAPPING_OWNERSHIP_RECOVERED: '跟单仓位所有权已恢复',
   OWNERSHIP_AMBIGUOUS: '跟单仓位所有权待核验',
   OWNERSHIP_GAP_FLAT_RETIRED: '所有权缺口已按实时空仓安全收尾',
+  // 止损执行链
+  STOP_PENDING_FLAT: '止损已触发，等待确认完全平仓',
+  STOP_PARTIAL: '止损仅部分成交（残留敞口）',
+  STOP_FLAT_CONFIRMED: '止损后已确认完全平仓',
+  STOP_DUST_RESIDUAL: '止损后残留粉尘仓位',
+  FORCED_EXIT: '强制离场',
+  GUARD_FORCED_EXIT_SUBMITTED: '强制离场指令已提交',
+  GUARD_FORCED_EXIT_FAILED: '强制离场失败',
+  GUARD_UNPROTECTED_WARNING: '无法保护·保留仓位并持续告警',
+  // 保护单挂单链
+  PROTECTION_PLAN: '保护单方案已确定',
+  PROTECTION_REPLACEMENT_PENDING: '保护单换单中',
+  PROTECTION_REPLACEMENT_COMPLETED: '保护单换单完成',
+  PROTECTION_DISABLED_CANCELED: '止损功能关闭，已撤销保护单',
+  RISK_STEP_OVERRIDE_ACCEPTED: '已采用交易所数量步长',
+  EXECUTION_INSTRUMENT_UNSUPPORTED: '执行合约精度不可解析',
+  // AI 二次入场
+  AI_ANALYSIS: 'AI 分析已生成',
+  AI_CANDIDATE_CREATED: 'AI 候选已建立',
+  AI_CANDIDATE_UNACTIONABLE: 'AI 候选不可执行',
+  AI_CANDIDATE_TERMINATED: 'AI 候选已终结',
+  AI_REVIEW_WAIT: 'AI 裁决：继续等待',
+  AI_REVIEW_ENTER: 'AI 裁决：立即入场',
+  AI_REVIEW_ABANDON: 'AI 裁决：放弃本周期',
+  AI_REVIEW_FAILED: 'AI 裁决失败',
+  AI_RESULT_STALE: 'AI 结论已过期',
+  AI_BUDGET_SUSPENDED: 'AI 调用预算已暂停',
+  AI_REENTRY_PROMOTED_TO_MINIMUM: 'AI 重入名义已提到最小可执行额',
+  AI_CLOSE_INVALIDATION_HIT: 'AI 收盘失效条件命中（仅记录）',
+  ENTER_APPROVED_EXECUTION_DISABLED: 'AI 批准入场但执行已关闭',
+  ENTER_LEASE_WAITING_PRICE: 'AI ENTER 租约等待价格回到区间',
+  INELIGIBLE_PROMOTION_CEILING: '提额后仍超出可执行上限',
+  REENTRY_SUBMITTED: '重入订单已提交',
+  REENTRY_PREFLIGHT_REJECTED: '重入下单前校验未通过',
+  REENTRY_RECONCILIATION_PENDING: '重入成交结果待对账',
+  // 周期收尾与迁移
+  CYCLE_CLOSED_SUMMARY: '周期收尾统计',
   SUPERSEDED_BY_RECOVERED_POSITION: '重复开仓意图已由恢复仓位取代',
-  // v5.1 人工重入
-  GUARD_MANUAL_REENTRY_SIGNAL: '人工重入信号（等待确认）',
-  GUARD_MANUAL_REENTRY_CONFIRMED: '人工重入已确认（系统代执行）',
-  GUARD_MANUAL_REENTRY_DISMISSED: '人工重入信号已忽略',
+  MIGRATION_RECONCILING: '存量仓位迁移对账中',
+  MIGRATION_RECONCILED: '存量仓位迁移对账完成',
+  MIGRATION_MARGIN_STOP_EXIT: '迁移兜底：无保护仓位强制离场',
+  MIGRATION_MARGIN_STOP_EXIT_CONFIRMED: '迁移兜底离场已确认',
+  POSITION_MARGIN_STOP_MIGRATED: '仓位保证金止损已迁移',
+  // 周期汇总邮件
+  CYCLE_SUMMARY_EMAIL_QUEUED: '周期汇总邮件已入队',
+  CYCLE_SUMMARY_EMAIL_SENT: '周期汇总邮件已发送',
+  CYCLE_SUMMARY_EMAIL_FAILED: '周期汇总邮件发送失败',
+  CYCLE_SUMMARY_EMAIL_DEDUPED: '周期汇总邮件重复已去重',
+  CYCLE_SUMMARY_EMAIL_RATE_LIMITED: '周期汇总邮件被限频',
+  CYCLE_SUMMARY_EMAIL_DROPPED: '周期汇总邮件已丢弃',
+  CYCLE_SUMMARY_EMAIL_DISABLED: '周期汇总邮件未启用',
+  // v5.1 人工重入（已退役，仅历史事件）
+  GUARD_MANUAL_REENTRY_SIGNAL: '人工重入信号（历史，功能已退役）',
+  GUARD_MANUAL_REENTRY_CONFIRMED: '人工重入已确认（历史，功能已退役）',
+  GUARD_MANUAL_REENTRY_DISMISSED: '人工重入信号已忽略（历史，功能已退役）',
 }
 
 // 观察期采样的门控原因（copy_guard_watch_samples.gate / REENTRY_GATE_CHANGED metadata）
@@ -197,6 +248,84 @@ const baselineSourceLabels: Record<string, string> = {
 
 const localized = (labels: Record<string, string>, value: string) =>
   labels[value] ?? value
+
+// 不可保护成因（GUARD_UNPROTECTABLE metadata.reason）
+const unprotectableReasonLabels: Record<string, string> = {
+  STRUCTURAL_NOISE: '止损落在噪音区·主动不挂单',
+  LIQUIDATION_BUFFER: '挤在清算缓冲区内',
+  RETRIES_EXHAUSTED: '挂单重试用尽',
+  STOP_ALREADY_CROSSED: '止损价已被行情穿越',
+  UNSPECIFIED: '未标注成因',
+}
+
+// 事件行上的风险徽章。
+//
+// 这些判定必须跟随后端的控线字段：v8 之前保证金上限会收紧距离并把 governed_by
+// 写成 margin_cap，徽章据此触发；改为只报不改之后该值不再出现，徽章会永久静默，
+// 而超限信息改由 margin_cap_exceeded 承载。
+const eventRiskBadges = (e: { type: string; metadata?: Record<string, unknown> | null }) => {
+  const meta = e.metadata
+  if (!meta) return null
+  const badges: { key: string; text: string; title: string; tone: string }[] = []
+  const atrRatio =
+    typeof meta.distance_atr_ratio === 'number' ? meta.distance_atr_ratio : null
+
+  if (
+    e.type === 'PROTECTION_PLAN' ||
+    e.type === 'PROTECTION_ACTIVE' ||
+    e.type === 'PROTECTIVE_STOP_ACTIVE'
+  ) {
+    // 下限随配置变化（默认 1.0），必须用事件里记录的当时值判断；旧事件行没有
+    // 该字段，回退到 v8 之前的 0.5。
+    const floor =
+      typeof meta.min_stop_atr_ratio === 'number' && meta.min_stop_atr_ratio > 0
+        ? meta.min_stop_atr_ratio
+        : 0.5
+    if (atrRatio !== null && atrRatio < floor) {
+      badges.push({
+        key: 'tight',
+        text: '⚠️ 止损偏紧·易扫损',
+        title: `止损距离仅 ${atrRatio.toFixed(2)}×ATR，低于结构下限 ${floor.toFixed(2)}×ATR（控线=${String(meta.governed_by ?? '-')}），易被行情噪音扫到`,
+        tone: 'text-yellow-500',
+      })
+    }
+    if (meta.margin_cap_exceeded === true) {
+      const marginPct =
+        typeof meta.expected_margin_loss_pct === 'number'
+          ? `${(meta.expected_margin_loss_pct * 100).toFixed(0)}%`
+          : '未知'
+      badges.push({
+        key: 'margincap',
+        text: '保证金超预警线',
+        title: `按当前止损距离，预计损失约占初始保证金 ${marginPct}，超过配置的预警线。高杠杆下这是波动率定距离的预期结果，不会因此收紧止损`,
+        tone: 'text-[#F0B90B]',
+      })
+    }
+  }
+
+  if (e.type === 'GUARD_UNPROTECTABLE' && typeof meta.reason === 'string') {
+    badges.push({
+      key: 'unprotectable',
+      text: `成因：${localized(unprotectableReasonLabels, meta.reason)}`,
+      title:
+        meta.reason === 'STRUCTURAL_NOISE'
+          ? '止损距离低于配置的结构性下限（risk_min_stop_atr_ratio），挂出的止损大概率被噪音扫到，因此不挂止损、转告警并交由 AI 观察'
+          : String(meta.error ?? ''),
+      tone: meta.reason === 'STRUCTURAL_NOISE' ? 'text-[#848E9C]' : 'text-red-400',
+    })
+  }
+
+  if (badges.length === 0) return null
+  return (
+    <>
+      {badges.map((b) => (
+        <span key={b.key} className={`ml-2 text-xs ${b.tone}`} title={b.title}>
+          {b.text}
+        </span>
+      ))}
+    </>
+  )
+}
 const sideLabel = (side: string) =>
   side.toLowerCase() === 'long'
     ? '多'
@@ -418,9 +547,9 @@ function InternalVerdictCard({ analysis }: { analysis: ReentryAIAnalysis }) {
   )
 }
 
-// AnalysisModalTarget 弹窗只依赖信号的标识与展示字段，历史列表（信号可能已
-// 关闭）与待确认横幅共用同一弹窗
-type AnalysisModalTarget = Pick<CopyGuardManualSignal, 'id' | 'symbol' | 'side'>
+// AnalysisModalTarget 弹窗只依赖信号的标识与展示字段，历史信号列表（信号可能
+// 已关闭）据此打开分析记录
+type AnalysisModalTarget = { id: number; symbol: string; side: string }
 
 // 重入 AI 助手分析弹窗：三段可复制（System Prompt / User Prompt / 纯数据 JSON）
 // + 内置 AI 结论（Phase 2）+ 外部 AI 结论粘贴区（永久可编辑，供准确率对比留档）。
@@ -1537,250 +1666,6 @@ function MarketPreviewCard() {
   )
 }
 
-/** @deprecated 后端确认入口已退役；仅保留一个发布周期用于历史前端兼容。 */
-// v5.1 人工重入待确认横幅：自动重入次数用尽后出现合格信号时（邮件同步提醒），
-// 用户在此确认（系统代执行）或忽略。30 秒轮询，无待处理信号时不渲染。
-function ManualSignalsBanner() {
-  const { data: signals = [], mutate } = useSWR<CopyGuardManualSignal[]>(
-    'copy-guard-manual-signals',
-    () => api.getCopyGuardManualSignals('?status=PENDING,EXECUTING'),
-    { refreshInterval: 30000 }
-  )
-  const [confirming, setConfirming] = useState<CopyGuardManualSignal | null>(
-    null
-  )
-  const [analyzing, setAnalyzing] = useState<CopyGuardManualSignal | null>(null)
-  const [confirmAmount, setConfirmAmount] = useState('')
-  const [busy, setBusy] = useState(false)
-  const [error, setError] = useState('')
-  const [notice, setNotice] = useState('')
-  const [bannerError, setBannerError] = useState('')
-
-  const doConfirm = async () => {
-    if (!confirming) return
-    // 金额可编辑：预填建议值，允许调低（上界=建议金额，下界由后端按最小下单额复核）
-    const amount = Number(confirmAmount)
-    if (!Number.isFinite(amount) || amount <= 0) {
-      setError('请输入有效的执行金额')
-      return
-    }
-    // +0.01 容差：预填值经 toFixed(2) 四舍五入可能比原始建议值高出半分钱
-    if (amount > confirming.recommended_notional + 0.01) {
-      setError(
-        `执行金额不能超过建议上限 ${confirming.recommended_notional.toFixed(2)} USDT（重入风险以首仓名义为界）`
-      )
-      return
-    }
-    setBusy(true)
-    setError('')
-    try {
-      await api.confirmCopyGuardManualSignal(confirming.id, amount)
-      setNotice(
-        `已确认重入 ${confirming.symbol} ${sideLabel(confirming.side)}单，系统正在执行；执行结果稍后可在周期明细的事件流中查看`
-      )
-      setConfirming(null)
-      void mutate()
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-      void mutate()
-    } finally {
-      setBusy(false)
-    }
-  }
-  const doDismiss = async (sig: CopyGuardManualSignal) => {
-    if (
-      !window.confirm(
-        `忽略 ${sig.symbol} ${sideLabel(sig.side)}单的人工重入信号？忽略后本条信号不再提示（后续行情再次满足条件会生成新信号）。`
-      )
-    )
-      return
-    setBannerError('')
-    try {
-      await api.dismissCopyGuardManualSignal(sig.id)
-      void mutate()
-    } catch (e) {
-      setBannerError(e instanceof Error ? e.message : String(e))
-      void mutate()
-    }
-  }
-
-  if (signals.length === 0 && !notice && !bannerError) return null
-  return (
-    <>
-      {notice && (
-        <div className="flex items-center justify-between border border-[#0ECB81] bg-[#0ECB81]/10 rounded-lg p-4 text-sm text-[#0ECB81]">
-          <span>{notice}</span>
-          <button
-            onClick={() => setNotice('')}
-            className="ml-3 text-xs underline"
-          >
-            关闭
-          </button>
-        </div>
-      )}
-      {bannerError && (
-        <div className="flex items-center justify-between border border-[#F6465D] bg-[#F6465D]/10 rounded-lg p-4 text-sm text-[#F6465D]">
-          <span>{bannerError}</span>
-          <button
-            onClick={() => setBannerError('')}
-            className="ml-3 text-xs underline"
-          >
-            关闭
-          </button>
-        </div>
-      )}
-      {signals.length > 0 && (
-        <div className="border border-[#F0B90B] bg-[#F0B90B]/10 rounded-lg p-4 space-y-3">
-          <div className="text-sm font-medium text-[#F0B90B]">
-            📣 人工重入待确认（{signals.length}
-            ）：自动重入次数已用尽，出现了合格的重入信号。确认后系统将实时复核并代为执行；不需要可忽略。
-          </div>
-          {signals.map((sig) => (
-            <div
-              key={sig.id}
-              className="flex flex-wrap items-center gap-x-4 gap-y-2 rounded bg-[#181A20] p-3 text-sm"
-            >
-              <span className="font-medium" title={sig.trader_id}>
-                {sig.trader_name || sig.trader_id}
-              </span>
-              <span>
-                {sig.symbol} {sideLabel(sig.side)}单
-                {sig.margin_mode ? ` · ${sig.margin_mode}` : ''}
-              </span>
-              <span>信号价 {sig.trigger_price}</span>
-              <span>建议金额 {sig.recommended_notional.toFixed(2)} USDT</span>
-              <span>
-                已止损 {sig.stop_count} 次 / 已自动重入 {sig.reentry_count} 次
-              </span>
-              <span
-                className={
-                  sig.protectable ? 'text-[#0ECB81]' : 'text-[#F6465D]'
-                }
-              >
-                {sig.protectable
-                  ? '✓ 预计可挂保护止损'
-                  : '⚠️ 预计难以挂保护止损'}
-              </span>
-              <span className="text-xs text-[#848E9C]">
-                {dateLabel(sig.created_at)}
-              </span>
-              <span className="ml-auto flex gap-2">
-                <button
-                  onClick={() => setAnalyzing(sig)}
-                  className="rounded bg-[#2B3139] px-3 py-1 hover:bg-[#3B424C]"
-                  title="查看重入决策数据包与 Prompt（可复制给外部 AI 判断）"
-                >
-                  分析数据
-                </button>
-                {sig.status === 'EXECUTING' ? (
-                  <span className="px-3 py-1 text-[#F0B90B]">执行中…</span>
-                ) : (
-                  <>
-                    <button
-                      onClick={() => {
-                        setError('')
-                        setConfirmAmount(sig.recommended_notional.toFixed(2))
-                        setConfirming(sig)
-                      }}
-                      className="rounded bg-[#0ECB81] px-3 py-1 font-medium text-black hover:opacity-90"
-                    >
-                      确认重入
-                    </button>
-                    <button
-                      onClick={() => void doDismiss(sig)}
-                      className="rounded bg-[#2B3139] px-3 py-1 hover:bg-[#3B424C]"
-                    >
-                      忽略
-                    </button>
-                  </>
-                )}
-              </span>
-            </div>
-          ))}
-        </div>
-      )}
-      {analyzing && (
-        <AnalysisModal signal={analyzing} onClose={() => setAnalyzing(null)} />
-      )}
-      {confirming && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
-          <div className="w-full max-w-lg space-y-4 rounded-lg border border-[#2B3139] bg-[#181A20] p-6 text-sm">
-            <div className="text-base font-bold">
-              确认人工重入：{confirming.symbol} {sideLabel(confirming.side)}单
-            </div>
-            <div className="grid grid-cols-2 gap-2 text-[#EAECEF]">
-              <span className="text-[#848E9C]">交易员</span>
-              <span>{confirming.trader_name || confirming.trader_id}</span>
-              <span className="text-[#848E9C]">信号价格</span>
-              <span>{confirming.trigger_price}</span>
-              <span className="text-[#848E9C]">执行金额（可编辑）</span>
-              <span className="flex items-center gap-2">
-                <input
-                  type="number"
-                  min={0}
-                  step="0.01"
-                  max={confirming.recommended_notional}
-                  value={confirmAmount}
-                  onChange={(e) => setConfirmAmount(e.target.value)}
-                  className="w-28 rounded border border-[#2B3139] bg-[#0B0E11] px-2 py-1 text-[#EAECEF]"
-                />
-                <span className="text-xs text-[#848E9C]">
-                  USDT · 建议 {confirming.recommended_notional.toFixed(2)}
-                  （上限）
-                </span>
-              </span>
-              <span className="text-[#848E9C]">本周期已止损</span>
-              <span>{confirming.stop_count} 次</span>
-              <span className="text-[#848E9C]">保护单预检</span>
-              <span
-                className={
-                  confirming.protectable ? 'text-[#0ECB81]' : 'text-[#F6465D]'
-                }
-              >
-                {confirming.protectable
-                  ? '预计可挂出保护止损'
-                  : '预计难以挂出保护止损'}
-              </span>
-            </div>
-            <div className="rounded bg-[#0B0E11] p-3 text-xs leading-relaxed text-[#848E9C]">
-              确认后系统会实时复核：领航员是否仍持有该仓位、方向是否一致、您本地是否已有同向仓位、金额是否达到最小下单额。复核通过将
-              <span className="text-[#EAECEF]">立即按当前市价下单</span>
-              （即使价格与信号价有偏移），并自动挂出保护止损。
-              {!confirming.protectable && (
-                <span className="text-[#F6465D]">
-                  {' '}
-                  注意：预检显示重入后可能无法建立有效保护止损；AI
-                  重入成交后若无法确认保护，系统始终立即市价退出，且不会把该退出再次计为止损重入信号。
-                </span>
-              )}
-            </div>
-            {error && <div className="text-[#F6465D]">{error}</div>}
-            <div className="flex justify-end gap-2">
-              <button
-                onClick={() => setConfirming(null)}
-                disabled={busy}
-                className="rounded bg-[#2B3139] px-4 py-2 disabled:opacity-40"
-              >
-                取消
-              </button>
-              <button
-                onClick={() => void doConfirm()}
-                disabled={busy}
-                className="rounded bg-[#0ECB81] px-4 py-2 font-medium text-black disabled:opacity-40"
-              >
-                {busy ? '执行中…' : '确认执行'}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-    </>
-  )
-}
-
-// 旧组件保留一个发布周期供历史分析代码兼容，但不再挂载到页面；后端确认接口
-// 已返回 410，真实执行入口只有下方 AI candidate 面板。
-void ManualSignalsBanner
 
 function AICandidatesPanel() {
   const { data, mutate } = useSWR<{
@@ -2828,6 +2713,63 @@ export function CopyGuardPage() {
           <div className="mb-4 text-xs text-[#848E9C] break-all">
             策略快照：{detail.cycle.policy_snapshot}
           </div>
+          {detail.attribution && (
+            <div className="mb-4 rounded border border-[#2B3139] bg-[#181A20] p-4 text-sm">
+              <div className="mb-2 flex items-center gap-2">
+                <span className="font-medium">止损成效归因</span>
+                {detail.attribution.final ? (
+                  <span className="text-xs text-[#0ECB81]">已对账·结论可用</span>
+                ) : (
+                  <span className="text-xs text-[#848E9C]">
+                    周期未收尾，挽回/错过待对账后才计算
+                  </span>
+                )}
+              </div>
+              <div className="grid md:grid-cols-3 gap-3">
+                <Metric
+                  label="不止损基准 → 实际结果"
+                  value={`${money(detail.attribution.baseline_no_guard_pnl)} → ${money(detail.attribution.actual_copy_guard_pnl)}`}
+                />
+                <Metric
+                  label="止损挽回 / 错过利润"
+                  value={
+                    detail.attribution.final
+                      ? `${money(detail.attribution.stop_savings)} / ${money(detail.attribution.missed_profit)}`
+                      : '待对账'
+                  }
+                />
+                <Metric
+                  label="仅止损段盈亏"
+                  value={money(detail.attribution.stop_only_pnl)}
+                />
+                <Metric
+                  label="重入贡献（首次 / 第二次）"
+                  value={`${money(detail.attribution.reentry_contribution)}（${money(detail.attribution.first_reentry_pnl)} / ${money(detail.attribution.second_reentry_pnl)}）`}
+                />
+                <Metric
+                  label="止损后最大有利 / 不利偏移"
+                  value={`+${detail.attribution.max_post_stop_mfe_usd.toFixed(2)} / -${detail.attribution.max_post_stop_mae_usd.toFixed(2)}`}
+                />
+                <Metric
+                  label="领航员方向收益"
+                  value={`${(detail.attribution.leader_direction_return * 100).toFixed(2)}%`}
+                />
+                <Metric
+                  label="最差单次尝试 / 路径最大回撤"
+                  value={`${money(detail.attribution.worst_attempt_pnl)} / -${detail.attribution.realized_path_max_drawdown_usd.toFixed(2)}`}
+                />
+                <Metric
+                  label="费用 / 滑点"
+                  value={`${money(detail.attribution.fees)} / ${money(detail.attribution.slippage)}`}
+                />
+              </div>
+              <p className="mt-2 text-xs text-[#5E6673]">
+                「止损挽回」= 仅止损段盈亏 −
+                不止损基准，为正说明止损这一刀比放任不管更好；「错过利润」是同一个差值为负时的绝对值，
+                即止损扫在了本可回本的位置。「止损后最大有利偏移」越大，说明离场后价格越往原方向走，止损越可能过紧。
+              </p>
+            </div>
+          )}
           {watchSummary && (
             <div className="mb-4 rounded border border-[#2B3139] bg-[#181A20] p-4 text-sm">
               <div className="mb-2 font-medium">
@@ -3103,21 +3045,7 @@ export function CopyGuardPage() {
                     ? `：${localized(gateLabels, String(e.metadata.from ?? ''))} → ${localized(gateLabels, String(e.metadata.to ?? ''))}`
                     : ''}
                   {count > 1 ? ` ×${count}` : ''}
-                  {(e.type === 'PROTECTIVE_STOP_ACTIVE' ||
-                    e.type === 'PROTECTION_ACTIVE') &&
-                  e.metadata &&
-                  (e.metadata.governed_by === 'margin_cap' ||
-                    e.metadata.governed_by === 'account_cap' ||
-                    e.metadata.governed_by === 'clamp') &&
-                  typeof e.metadata.distance_atr_ratio === 'number' &&
-                  e.metadata.distance_atr_ratio < 0.5 ? (
-                    <span
-                      className="ml-2 text-xs text-yellow-500"
-                      title={`止损距离仅 ${(e.metadata.distance_atr_ratio as number).toFixed(2)}×ATR（控线=${String(e.metadata.governed_by)}），易被行情噪音扫到`}
-                    >
-                      ⚠️ 止损偏紧·易扫损
-                    </span>
-                  ) : null}
+                  {eventRiskBadges(e)}
                 </span>
                 <span>价格 {e.price || '-'}</span>
                 <span>盈亏 {e.pnl?.toFixed(2) ?? '0.00'}</span>

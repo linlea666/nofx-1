@@ -81,6 +81,9 @@ type Engine struct {
 	smartEmptySnapshotCandidateAt time.Time
 	// lastBaselineRefresh 限频 refreshEstimatedBaselines（每分钟一次）
 	lastBaselineRefresh time.Time
+	// closeInvalidationChecked 限频 AI 收盘失效条件取数（按候选、按周期时长）。
+	closeInvalidationChecked map[int64]time.Time
+	closeInvalidationMu      sync.Mutex
 
 	// 决策输出
 	decisionCh chan *decision.FullDecision
@@ -3032,6 +3035,7 @@ func (e *Engine) syncLeaderState() error {
 	if e.config != nil && SupportsCopyGuard(e.config.ProviderType) && e.config.RiskPolicyVersion >= 4 {
 		e.checkStoppedByRisk()
 		e.checkReentryConditions()
+		e.evaluateCloseInvalidations()
 		e.refreshEstimatedBaselines()
 	}
 

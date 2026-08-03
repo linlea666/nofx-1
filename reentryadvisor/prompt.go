@@ -10,12 +10,19 @@ import (
 
 // promptVersion 记入每条分析记录，用于后续准确率统计时区分模板代次
 const promptVersion = "v1-legacy-history"
-const candidatePromptVersion = "v6-structure-stop-contract"
+
+// v7 replaces the hardcoded 0.5 ATR stop floor with the configured structural
+// floor and asks for close_invalidation in machine-checkable form. Both
+// additions are backward compatible with the v6 parser: the new fields are
+// optional, so a model still answering in v6 shape parses unchanged and the
+// shared self-test contract keeps working.
+const candidatePromptVersion = "v7-structural-stop-floor"
 const candidatePromptVersionV5 = "v5-ai-guarded-lifecycle"
 
-// activeCandidatePromptVersion is the production rollback switch. v6 is the
-// default; setting COPY_GUARD_AI_PROMPT_VERSION=v5 restores the immutable v5
-// prompt/parser contract without changing stored trader configuration.
+// activeCandidatePromptVersion is the production rollback switch. The current
+// version is the default; setting COPY_GUARD_AI_PROMPT_VERSION=v5 restores the
+// immutable v5 prompt/parser contract without changing stored trader
+// configuration.
 func activeCandidatePromptVersion() string {
 	if strings.EqualFold(strings.TrimSpace(os.Getenv("COPY_GUARD_AI_PROMPT_VERSION")), "v5") {
 		return candidatePromptVersionV5
@@ -134,18 +141,20 @@ func candidateSystemPrompt(analysisFocus string) string {
 - 领航员平仓/反向、观察超时、最低可执行金额超过原止损仓位、或永久无法保护由确定性代码处理，不由模型猜测。
 
 ## 必须分析
-1. 5m、15m、1h、4h、1d 的趋势、行情阶段和高低点结构；只引用已收盘 K 线。
+1. 5m、15m、30m、1h、4h、1d 的趋势、行情阶段和高低点结构；只引用已收盘 K 线。
 2. 支撑区和阻力区：价格范围、强度 0~100、周期、触碰次数、最近触碰时间、角色互换及消耗程度。
 3. ATR、MA20/50/100/200、成交量、突破回踩、假突破；VWAP/斐波那契仅在 available=true 时使用。
 4. 领航员是否仍持有原方向、是否减仓/逆势摊平，以及止损是否更像噪声扫损。
 5. CVD、OI、Funding、多空比和基差只在 available=true 时使用。链上、ETF、宏观、期权或筹码数据为 UNAVAILABLE 时禁止补造。
 6. 执行交易所 mark price 是主价格；辅助来源必须核对 source 和 timestamp。
 7. copy_guard.current_account 已给出交易所 min_quantity/min_notional/quantity_step、配置固定下限、有效下限、原止损仓位金额、size_factor=1 时的比例目标/提升候选，以及该候选金额的最大安全止损距离。你可选择更小 size_factor，但不得假设确定性代码会缩窄你的止损或绕过风险预算。
+8. 若 copy_guard.pending_rearm_conditions 非空，说明该候选此前被你自己判为 THESIS_INVALID_NOW 而休眠，这些是你当时写下的复活条件；copy_guard.wake_trigger 是本次唤醒原因（市场状态翻转，或 DORMANT_HEARTBEAT 表示只是休眠超时的定期复查）。必须逐条核对这些条件是否已用已收盘 K 线满足，并在 reasons 中给出结论。未满足则继续返回 THESIS_INVALID_NOW 并在 rearm_conditions 中给出修订后的条件，不要因为被唤醒就降低标准。
 
 ## AI 止损要求
 - 多单 ai_stop_price 必须低于整个入场区；空单必须高于整个入场区。
-- 止损应放在交易论点真正失效的位置，通常距入场 0.5~4 ATR；不得为了迎合仓位金额任意缩窄。
-- close_invalidation 必须说明哪个周期收盘、收在哪里代表失效。
+- 止损应放在交易论点真正失效的位置。距入场的下限是 copy_guard.risk_policy.risk_min_stop_atr_ratio（缺失时按 1.0）个 ATR，上限 4 个 ATR；低于下限的止损落在正常波动噪音区内，会被确定性代码判为不可保护而整单否决，不得为了迎合仓位金额缩到该下限以内。
+- 保证金损失百分比不是止损距离的约束。高杠杆下一个结构上正确的止损必然对应很高的保证金损失百分比，这是允许的；真正的硬约束是 copy_guard.current_account 给出的风险预算与清算安全线。
+- close_invalidation 必须说明哪个周期收盘、收在哪里代表失效。同时用 close_invalidation_timeframe（5m|15m|30m|1h|4h）与 close_invalidation_level（价格数值）给出同一条件的可执行形式：多单表示"该周期收盘价低于该数值即失效"，空单表示"高于该数值即失效"，两者必须与文字描述一致。确定性代码只用已收盘 K 线核对这一对数值，命中即记录事件供复盘（当前不自动离场）。若本次判断没有可用数值，两个字段填 ""/0。
 - ENTER_NOW 必须提供至少一个支撑区、一个阻力区、一个目标区、stop_basis 和 rearm_conditions。
 - 确定性代码会用同一绝对止损价复核价格是否已穿越、tick 对齐、清算缓冲和账户/周期/组合/仓位风险。代码只能否决，不能替换你的止损。
 
@@ -162,6 +171,8 @@ func candidateSystemPrompt(analysisFocus string) string {
   "ai_stop_price": 0.0,
   "stop_basis": "引用结构与数值",
   "close_invalidation": "周期收盘失效条件",
+  "close_invalidation_timeframe": "5m|15m|30m|1h|4h 或空字符串",
+  "close_invalidation_level": 0.0,
   "support_zones": [{"low":0.0,"high":0.0,"strength":0,"timeframes":["1h"],"touches":0,"last_touch_at":"RFC3339或UNAVAILABLE","role_reversal":false,"exhaustion":"FRESH|TESTED|WEAKENED"}],
   "resistance_zones": [{"low":0.0,"high":0.0,"strength":0,"timeframes":["1h"],"touches":0,"last_touch_at":"RFC3339或UNAVAILABLE","role_reversal":false,"exhaustion":"FRESH|TESTED|WEAKENED"}],
   "target_zones": [{"low":0.0,"high":0.0,"basis":"引用证据"}],

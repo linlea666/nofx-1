@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"fmt"
 	"math"
 	"path/filepath"
 	"sync"
@@ -44,6 +45,106 @@ func ensureReviewableReentryCycle(t *testing.T, st *Store, id int64, traderID, l
 		VALUES(?,?,?,?,?,?,?,'AI_WAITING','{}')`,
 		id, traderID, "leader", leaderPosID, symbol, side, "cross"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// The close-invalidation watch must be scoped to positions the condition was
+// actually written for, and each breach must be reportable exactly once — the
+// evaluator sees the same closed candle on every poll until the bar advances.
+func TestCloseInvalidationWatchScopeAndSingleReport(t *testing.T) {
+	st, err := newReentryCandidateTestStore(t, filepath.Join(t.TempDir(), "close-invalidation.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	rs := st.ReentryAI()
+	ensureReviewableReentryCycle(t, st, 910, "trader-a", "p-ci", "BTCUSDT", "long")
+	candidate, err := rs.EnsureReentryCandidate(&CopyGuardReentryCandidate{
+		CycleID: 910, TraderID: "trader-a", LeaderPosID: "p-ci", Symbol: "BTCUSDT", Side: "long", FeatureHash: "ci",
+	}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	setState := func(status string, tf string, level float64, cycleStatus string) {
+		if _, err = st.db.Exec(`UPDATE copy_guard_reentry_candidates
+			SET status=?,close_invalidation_timeframe=?,close_invalidation_level=? WHERE id=?`,
+			status, tf, level, candidate.ID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = st.db.Exec(`UPDATE copy_guard_cycles SET status=? WHERE id=?`, cycleStatus, 910); err != nil {
+			t.Fatal(err)
+		}
+	}
+	watched := func() bool {
+		list, listErr := rs.ListCloseInvalidationWatch("trader-a", 10)
+		if listErr != nil {
+			t.Fatal(listErr)
+		}
+		for _, c := range list {
+			if c.ID == candidate.ID {
+				return true
+			}
+		}
+		return false
+	}
+
+	setState(ReentryCandidateReentered, "15m", 98, CopyGuardFollowingReentry)
+	if !watched() {
+		t.Fatal("a filled AI reentry with a structured condition must be watched")
+	}
+	// Prose-only conditions are not machine-checkable and must not be guessed at.
+	setState(ReentryCandidateReentered, "", 0, CopyGuardFollowingReentry)
+	if watched() {
+		t.Fatal("a candidate without the structured pair must not be watched")
+	}
+	// The condition describes a position; once it is gone the condition is moot.
+	setState(ReentryCandidateReentered, "15m", 98, CopyGuardStoppedWatching)
+	if watched() {
+		t.Fatal("a stopped-out cycle must leave the watch")
+	}
+	// Still deciding, nothing filled yet.
+	setState(ReentryCandidateWatching, "15m", 98, CopyGuardFollowingReentry)
+	if watched() {
+		t.Fatal("only filled reentries carry an evaluable condition")
+	}
+
+	setState(ReentryCandidateReentered, "15m", 98, CopyGuardFollowingReentry)
+	first, err := rs.MarkCloseInvalidationHit(candidate.ID)
+	if err != nil || !first {
+		t.Fatalf("first breach must be reported: marked=%v err=%v", first, err)
+	}
+	second, err := rs.MarkCloseInvalidationHit(candidate.ID)
+	if err != nil || second {
+		t.Fatalf("a repeated read of the same candle must not report again: marked=%v err=%v", second, err)
+	}
+	if watched() {
+		t.Fatal("a reported candidate must leave the watch")
+	}
+	stored, err := rs.GetReentryCandidate(candidate.ID)
+	if err != nil || stored.CloseInvalidationHitAt == nil {
+		t.Fatalf("hit timestamp not persisted: candidate=%+v err=%v", stored, err)
+	}
+
+	// A fresh AI decision replaces the condition, so a stale breach must not
+	// suppress the new one.
+	if _, err = st.db.Exec(`UPDATE copy_guard_reentry_candidates SET status=? WHERE id=?`, ReentryCandidateReviewing, candidate.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err = rs.FinishReentryCandidateReview(candidate.ID, ReentryCandidateDecision{
+		Decision: ReentryVerdictWait, NextReview: time.Now().Add(time.Hour), TTLSeconds: 30,
+		CloseInvalidation: "15m close below 95", CloseInvalidationTimeframe: "15m", CloseInvalidationLevel: 95,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	refreshed, err := rs.GetReentryCandidate(candidate.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refreshed.CloseInvalidationHitAt != nil {
+		t.Fatal("a new decision must clear the previous breach marker")
+	}
+	if refreshed.CloseInvalidationTimeframe != "15m" || refreshed.CloseInvalidationLevel != 95 {
+		t.Fatalf("new condition not stored: %+v", refreshed)
 	}
 }
 
@@ -862,6 +963,87 @@ func TestThesisInvalidSleepsUntilStructuralRearmCreatesNewGeneration(t *testing.
 	claimed, ok, err := rs.ClaimReentryCandidateReview(candidate.ID, 5*time.Minute, 0, 0)
 	if err != nil || !ok || claimed.Status != ReentryCandidateReviewing || claimed.DecisionGeneration != dormant.DecisionGeneration+1 {
 		t.Fatalf("rearmed review did not create a new generation: ok=%v candidate=%+v err=%v", ok, claimed, err)
+	}
+	// The claim clears pending_trigger, so the wake reason must be carried on the
+	// returned copy; the datapack is built from it and the model needs to know
+	// why it was woken.
+	if claimed.PendingTrigger != "STRUCTURE_RECLAIMED" {
+		t.Fatalf("wake trigger lost across the claim: %q", claimed.PendingTrigger)
+	}
+}
+
+// A DORMANT_REARM candidate only ever left dormancy when a derivative-state
+// flip happened to be observed. If funding/OI/CVD/ATR regimes all held steady,
+// the conditions the model itself wrote were never evaluated and the candidate
+// could stay dormant until the leader closed — the tail of the reentry funnel
+// leaking. The heartbeat is the liveness floor for that case.
+func TestDormantCandidateBecomesDueOnHeartbeat(t *testing.T) {
+	st, err := newReentryCandidateTestStore(t, filepath.Join(t.TempDir(), "dormant-heartbeat.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ensureReviewableReentryCycle(t, st, 881, "trader-a", "p-heartbeat", "ETHUSDT", "short")
+	rs := st.ReentryAI()
+	candidate, err := rs.EnsureReentryCandidate(&CopyGuardReentryCandidate{CycleID: 881, TraderID: "trader-a", LeaderPosID: "p-heartbeat", Symbol: "ETHUSDT", Side: "short", FeatureHash: "heartbeat"}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = st.db.Exec(`UPDATE copy_guard_reentry_candidates SET status=? WHERE id=?`, ReentryCandidateReviewing, candidate.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err = rs.FinishReentryCandidateReview(candidate.ID, ReentryCandidateDecision{
+		Decision: ReentryVerdictThesisInvalid, NextReview: time.Now().Add(15 * time.Minute), TTLSeconds: 30,
+		RearmConditionsJSON: `["15m close reclaims 2000"]`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Freshly dormant: the AI's own next_review_at is due within minutes, but
+	// dormancy must not be reviewed on that cadence.
+	if _, err = st.db.Exec(`UPDATE copy_guard_reentry_candidates
+		SET next_review_at=CURRENT_TIMESTAMP,last_review_at=CURRENT_TIMESTAMP WHERE id=?`, candidate.ID); err != nil {
+		t.Fatal(err)
+	}
+	due, err := rs.ListDueReentryCandidates(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range due {
+		if c.ID == candidate.ID {
+			t.Fatal("a freshly dormant candidate must not be reviewed on the normal cadence")
+		}
+	}
+	if _, ok, claimErr := rs.ClaimReentryCandidateReview(candidate.ID, time.Minute, 0, 0); claimErr != nil || ok {
+		t.Fatalf("dormant claim must respect the heartbeat: ok=%v err=%v", ok, claimErr)
+	}
+
+	// Past the heartbeat: it becomes due and claimable, tagged so the model can
+	// tell a timeout re-check from a real market event.
+	if _, err = st.db.Exec(`UPDATE copy_guard_reentry_candidates
+		SET last_review_at=datetime('now', ?) WHERE id=?`,
+		fmt.Sprintf("-%d seconds", int(DormantRearmHeartbeat.Seconds())+60), candidate.ID); err != nil {
+		t.Fatal(err)
+	}
+	due, err = rs.ListDueReentryCandidates(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, c := range due {
+		if c.ID == candidate.ID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("dormant candidate never became due, the funnel still leaks")
+	}
+	claimed, ok, err := rs.ClaimReentryCandidateReview(candidate.ID, time.Minute, 0, 0)
+	if err != nil || !ok || claimed.Status != ReentryCandidateReviewing {
+		t.Fatalf("heartbeat claim failed: ok=%v candidate=%+v err=%v", ok, claimed, err)
+	}
+	if claimed.PendingTrigger != "DORMANT_HEARTBEAT" {
+		t.Fatalf("heartbeat wake must be labelled: %q", claimed.PendingTrigger)
 	}
 }
 

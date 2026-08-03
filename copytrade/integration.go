@@ -158,9 +158,9 @@ type TraderIntegration struct {
 	// stopRiskAlerts remembers, per cycle attempt, that the expected stop loss has
 	// already been reported as exceeding the account warning line. See
 	// shouldAlertStopRiskThreshold.
-	stopRiskAlerts    map[string]*stopRiskAlertState
-	residualCloseLast map[int64]time.Time
-	residualCloseTries  map[int64]int
+	stopRiskAlerts     map[string]*stopRiskAlertState
+	residualCloseLast  map[int64]time.Time
+	residualCloseTries map[int64]int
 	// protectionRearms counts protective-stop re-arms per cycle inside a rolling
 	// window. protection_retries cannot detect an oscillation, because it is reset
 	// as soon as the cycle reports healthy again — so a "re-arm succeeds, then
@@ -2614,6 +2614,37 @@ func unprotectableReason(cause error) string {
 	default:
 		return "UNSPECIFIED"
 	}
+}
+
+// cycleFullyProtected reports whether a live protective stop currently covers
+// the whole position. CLAMPED counts as protected: the trigger is tighter than
+// the policy would like, but it exists and will fire.
+func cycleFullyProtected(cycle *store.CopyGuardCycle) bool {
+	if cycle == nil {
+		return false
+	}
+	return (cycle.ProtectionStatus == store.CopyGuardProtectionVerified ||
+		cycle.ProtectionStatus == store.CopyGuardProtectionClamped) &&
+		cycle.ProtectionCoverage >= 0.999
+}
+
+// cycleProtectionVerdictReached reports whether Copy Guard has already decided
+// how to handle a position it cannot protect. These three states are policy
+// outcomes, not gaps: UNPROTECTED_WARNING is the user-configured "keep
+// following the leader under an alert" disposition, and FORCED_EXIT_PENDING
+// already has an exit in flight. Any other subsystem that force-closes such a
+// position is overriding a decision the risk policy deliberately made.
+func cycleProtectionVerdictReached(cycle *store.CopyGuardCycle) bool {
+	if cycle == nil {
+		return false
+	}
+	switch cycle.ProtectionStatus {
+	case store.CopyGuardProtectionUnprotectedWarning,
+		store.CopyGuardProtectionUnprotectable,
+		store.CopyGuardProtectionForcedExitPending:
+		return true
+	}
+	return false
 }
 
 // handleUnprotectableForDecision 决策路径进入 GUARD_UNPROTECTABLE 处置
@@ -6042,7 +6073,8 @@ func (ti *TraderIntegration) refreshStopLossAfterExecute(dec *decision.Decision)
 			ATRValue: aiPlan.ATR, GovernedBy: aiPlan.GovernedBy, TickSize: slInput.PriceTickSize,
 			QuantityStep: slInput.BaseQuantityStep, ExpectedLossUSD: aiPlan.ExpectedLossUSD,
 			ExpectedLossPct: aiPlan.ExpectedLossPct, ExpectedMarginLossPct: aiPlan.ExpectedMarginLossPct,
-			DistanceATRRatio: aiPlan.StopDistance / aiPlan.ATR,
+			DistanceATRRatio:  aiPlan.StopDistance / aiPlan.ATR,
+			MarginCapExceeded: aiPlan.MarginCapExceeded,
 		}
 	} else {
 		slResult, err = calcStopLossPrice(ti.engine.config, slInput)
@@ -6091,6 +6123,9 @@ func (ti *TraderIntegration) refreshStopLossAfterExecute(dec *decision.Decision)
 					"expected_margin_loss_pct": slResult.ExpectedMarginLossPct,
 					"margin_cap_exceeded":      slResult.MarginCapExceeded,
 					"distance_atr_ratio":       slResult.DistanceATRRatio,
+					// 判断一条止损是否偏紧，只有对照当时生效的结构下限才有意义；
+					// 下限可配置且已随版本变化，前端不能自带常量。
+					"min_stop_atr_ratio": ti.engine.config.RiskMinStopATRRatio,
 				},
 			})
 		}
@@ -6180,7 +6215,7 @@ func (ti *TraderIntegration) enforceAIReentryProtection(dec *decision.Decision) 
 		return
 	}
 	candidate, candidateErr := ti.store.ReentryAI().GetReentryCandidateByCycle(cycle.ID)
-	protected := (cycle.ProtectionStatus == store.CopyGuardProtectionVerified || cycle.ProtectionStatus == store.CopyGuardProtectionClamped) && cycle.ProtectionCoverage >= 0.999
+	protected := cycleFullyProtected(cycle)
 	if protected {
 		// A protected position is safe to keep, but it is not an auditable AI
 		// success unless the exact ENTRY_PENDING candidate can be committed. Do
@@ -6259,7 +6294,7 @@ func (ti *TraderIntegration) enforceAIGuardedPositionProtection(dec *decision.De
 	if err != nil || (cycle.Status != store.CopyGuardFollowing && cycle.Status != store.CopyGuardFollowingReentry) {
 		return
 	}
-	if (cycle.ProtectionStatus == store.CopyGuardProtectionVerified || cycle.ProtectionStatus == store.CopyGuardProtectionClamped) && cycle.ProtectionCoverage >= 0.999 {
+	if cycleFullyProtected(cycle) {
 		return
 	}
 	ti.handleUnprotectableCycle(cycle, fmt.Errorf("new AI-guarded position is not fully protected (status=%s coverage=%.4f)", cycle.ProtectionStatus, cycle.ProtectionCoverage), true)
@@ -7835,11 +7870,12 @@ func GetExecutionRiskSnapshotForTrader(traderID string, cycleID int64) (*Executi
 					snapshot.ReentryRatio = cfg.RiskReentryRatio
 					snapshot.BaseTargetNotional = cycleMax * cfg.RiskReentryRatio
 					snapshot.PromotionCandidateNotional = math.Max(snapshot.BaseTargetNotional, snapshot.EffectiveMinNotional)
+					// Only real budgets narrow the distance advertised to the model.
+					// The position margin ceiling used to be folded in here as well,
+					// which at 100x reported a 0.67 ATR "max safe" distance and
+					// steered the model into the noise band — the exact behaviour
+					// the v8 stop rework removed from ordinary copying.
 					availableRisk := math.Min(snapshot.AttemptBudgetUSD, math.Min(snapshot.CycleRemainingUSD, snapshot.PortfolioRemainingUSD))
-					if cfg.RiskLeverageFallback && cfg.RiskLeverageMaxLoss > 0 && snapshot.PlannedLeverage > 0 {
-						positionRisk := snapshot.PromotionCandidateNotional / float64(snapshot.PlannedLeverage) * cfg.RiskLeverageMaxLoss
-						availableRisk = math.Min(availableRisk, positionRisk)
-					}
 					friction := math.Max((cfg.RiskRoundTripFeeBPS+cfg.RiskSlippageBufferBPS)/10000, 0)
 					if snapshot.PromotionCandidateNotional > 0 && availableRisk > 0 {
 						snapshot.MaxSafeStopDistancePct = math.Max(availableRisk/snapshot.PromotionCandidateNotional-friction, 0)

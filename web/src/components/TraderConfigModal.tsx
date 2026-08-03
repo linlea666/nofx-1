@@ -311,7 +311,6 @@ interface FormState {
   risk_reentry_max_chase_atr: number
   risk_reentry_max_atr_expansion: number
   risk_watch_timeout_minutes: number
-  risk_migration_confirmed: boolean
   risk_addon_budget_pct: number // deprecated：仅协议兼容，普通跟单加仓不读取
   // v4.1 重入加严
   risk_reentry_min_recovery_atr: number // 默认 0.5：重入最小恢复幅度（ATR 倍数）
@@ -401,7 +400,6 @@ export function TraderConfigModal({
     risk_reentry_max_chase_atr: 0.5,
     risk_reentry_max_atr_expansion: 2,
     risk_watch_timeout_minutes: 4320,
-    risk_migration_confirmed: true,
     risk_addon_budget_pct: 15,
     // v4.1 重入加严
     risk_reentry_min_recovery_atr: 0.5,
@@ -576,7 +574,6 @@ export function TraderConfigModal({
             risk_reentry_max_atr_expansion:
               cfg.risk_reentry_max_atr_expansion ?? 2,
             risk_watch_timeout_minutes: cfg.risk_watch_timeout_minutes ?? 4320,
-            risk_migration_confirmed: cfg.risk_migration_confirmed ?? false,
             risk_addon_budget_pct:
               cfg.risk_addon_budget_pct != null && cfg.risk_addon_budget_pct > 0
                 ? cfg.risk_addon_budget_pct * 100
@@ -745,7 +742,6 @@ export function TraderConfigModal({
         risk_reentry_max_chase_atr: 0.5,
         risk_reentry_max_atr_expansion: 2,
         risk_watch_timeout_minutes: 4320,
-        risk_migration_confirmed: true,
         risk_addon_budget_pct: 15,
         risk_reentry_min_recovery_atr: 0.5,
         risk_reentry_cooldown_escalation: 3,
@@ -1020,7 +1016,10 @@ export function TraderConfigModal({
             risk_reentry_max_atr_expansion:
               formData.risk_reentry_max_atr_expansion,
             risk_watch_timeout_minutes: formData.risk_watch_timeout_minutes,
-            risk_migration_confirmed: formData.risk_migration_confirmed,
+            // risk_migration_confirmed 是后端的 v3→v4 升级书签，不是用户设置。
+            // 表单里没有对应控件，之前却把 `cfg.risk_migration_confirmed ?? false`
+            // 原样回传：GET 未返回该字段时会把书签改写成 false。省略字段后后端
+            // 沿用已存值。
             risk_high_risk_confirmed: highRiskConfirmed,
             risk_extreme_risk_confirm_value: extremeRiskConfirmValue,
             risk_stop_extreme_confirm_value: stopExtremeRiskConfirmValue,
@@ -2389,12 +2388,11 @@ export function TraderConfigModal({
                               <div className="flex items-center justify-between mb-2">
                                 <div>
                                   <label className="text-sm text-[#EAECEF]">
-                                    仓位保证金止损上限
+                                    仓位保证金亏损预警线
                                   </label>
                                   <p className="text-xs text-[#848E9C]">
-                                    普通跟单与 AI
-                                    重入共用：预计总损失（含手续费和滑点）达到初始保证金比例时，执行
-                                    reduce-only 离场。默认开启 50%
+                                    预计总损失（含手续费和滑点）占初始保证金的比例超过该值时记录并告警。默认开启
+                                    50%
                                   </p>
                                 </div>
                                 <button
@@ -2415,7 +2413,7 @@ export function TraderConfigModal({
                               {formData.risk_leverage_fallback && (
                                 <div>
                                   <label className="text-xs text-[#848E9C] block mb-1">
-                                    最大保证金亏损{' '}
+                                    保证金亏损预警线{' '}
                                     <span className="text-[#F0B90B]">
                                       {formData.risk_leverage_max_loss.toFixed(
                                         0
@@ -2437,16 +2435,22 @@ export function TraderConfigModal({
                                     }
                                     className="w-full accent-[#F0B90B]"
                                   />
-                                  {formData.risk_policy_version >= 4 && (
-                                    <p className="text-xs text-[#848E9C] mt-1">
-                                      默认
-                                      50%（硬上限，任何情况不放宽）。示例：20x
-                                      杠杆、上限 50% → 含费用后的允许反向波动约
-                                      2.5%。若 AI
-                                      给出的结构止损会超过该风险上限，本次重入进入等待，不会偷偷缩窄
-                                      AI 止损
-                                    </p>
-                                  )}
+                                  {formData.risk_policy_version >= 4 &&
+                                    (formData.risk_stop_priority ===
+                                    'account_cap' ? (
+                                      <p className="text-xs text-[#F0B90B] mt-1">
+                                        当前止损优先级为「账户上限优先」：该比例是硬上限，会收紧止损距离。示例：20x
+                                        杠杆、上限 50% →
+                                        含费用后的允许反向波动约 2.5%
+                                      </p>
+                                    ) : (
+                                      <p className="text-xs text-[#848E9C] mt-1">
+                                        当前止损优先级为「波动率优先」：该比例只用于预警，不再收紧止损距离。它换算出的距离与杠杆成反比（50x
+                                        约 1.3×ATR、100x 约
+                                        0.7×ATR），用它取严会把高杠杆止损压进噪音区，因此止损距离改由
+                                        ATR/结构决定，真正的硬约束是清算安全线与账户风险预算。高杠杆仓位超出本预警线属预期
+                                      </p>
+                                    ))}
                                 </div>
                               )}
                             </div>

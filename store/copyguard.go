@@ -978,17 +978,27 @@ func (s *CopyTradeStore) BeginCopyGuardProtectionRetry(cycle *CopyGuardCycle, de
 	if err != nil || changed == 0 {
 		return false, err
 	}
+	eventMetadata := map[string]interface{}{
+		"retry":      cycle.ProtectionRetries + 1,
+		"last_error": message,
+		"coverage":   cycle.ProtectionCoverage,
+	}
 	if recordEvent {
-		metadata, _ := json.Marshal(map[string]interface{}{
-			"retry":      cycle.ProtectionRetries + 1,
-			"last_error": message,
-			"coverage":   cycle.ProtectionCoverage,
-		})
+		metadata, _ := json.Marshal(eventMetadata)
 		if _, err = tx.Exec(`INSERT INTO copy_guard_events(cycle_id,trader_id,type,metadata_json) VALUES(?,?,?,?)`, cycle.ID, cycle.TraderID, "PROTECTION_RETRY", string(metadata)); err != nil {
 			return false, err
 		}
 	}
-	return true, tx.Commit()
+	if err = tx.Commit(); err != nil {
+		return false, err
+	}
+	// Seam B：提交后镜像（best-effort）。此前该事件是唯一在事务内直写、却没有
+	// 补镜像调用的类型，所以统一事件日志里从来看不到保护重试——而重试正是判断
+	// 一个仓位为何长时间没有保护的关键线索。调用方已按状态签名节流，不会刷屏。
+	if recordEvent {
+		s.mirrorGuardEventToCopyEvents(cycle.ID, cycle.TraderID, "PROTECTION_RETRY", 0, 0, 0, 0, eventMetadata)
+	}
+	return true, nil
 }
 
 func (s *CopyTradeStore) ListOpenCopyGuardCycles(traderID string) ([]*CopyGuardCycle, error) {

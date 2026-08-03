@@ -1145,7 +1145,9 @@ export interface CopyTradeEvent {
   created_at: string
 }
 
-// v5.1 人工重入信号（自动重入次数用尽后，合格信号等待用户确认）
+// v5.1 人工重入信号。功能已退役：后端确认/忽略端点固定返回 410，前端面板与
+// API 封装已移除。类型保留以描述历史 GUARD_MANUAL_REENTRY_* 事件与库中旧行的
+// 形状，供排查历史周期时参照。
 export interface CopyGuardManualSignal {
   id: number
   cycle_id: number

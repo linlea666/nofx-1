@@ -381,23 +381,26 @@ type CopyGuardEventSpec struct {
 }
 
 var copyGuardEventSpecs = map[string]CopyGuardEventSpec{
-	"STOP_TRIGGERED":                   {CopyEventCategoryStopLoss, CopyEventSeverityWarn, "important", true},
-	"STOP_CONFIRMED":                   {CopyEventCategoryStopLoss, CopyEventSeverityWarn, "important", true},
-	"STOP_PENDING_FLAT":                {CopyEventCategoryStopLoss, CopyEventSeverityWarn, "verbose", true},
-	"STOP_PARTIAL":                     {CopyEventCategoryStopLoss, CopyEventSeverityError, "critical", true},
-	"STOP_FLAT_CONFIRMED":              {CopyEventCategoryStopLoss, CopyEventSeverityWarn, "important", true},
-	"STOP_DUST_RESIDUAL":               {CopyEventCategoryStopLoss, CopyEventSeverityError, "critical", true},
-	"STOP_RISK_THRESHOLD_EXCEEDED":     {CopyEventCategoryProtection, CopyEventSeverityWarn, "important", true},
-	"CATCHUP_TIMEOUT":                  {CopyEventCategoryAction, CopyEventSeverityWarn, "important", false},
-	"CATCHUP_PRICE_LIMIT":              {CopyEventCategoryAction, CopyEventSeverityWarn, "important", false},
-	"AI_CANDIDATE_CREATED":             {CopyEventCategoryTakeover, CopyEventSeverityInfo, "verbose", true},
-	"AI_CANDIDATE_UNACTIONABLE":        {CopyEventCategoryTakeover, CopyEventSeverityInfo, "verbose", true},
-	"REENTRY_SUBMITTED":                {CopyEventCategoryTakeover, CopyEventSeverityInfo, "verbose", true},
-	"AI_REVIEW_WAIT":                   {CopyEventCategoryTakeover, CopyEventSeverityInfo, "verbose", true},
-	"AI_REVIEW_REQUESTED":              {CopyEventCategoryTakeover, CopyEventSeverityInfo, "verbose", true},
-	"AI_REVIEW_ENTER":                  {CopyEventCategoryTakeover, CopyEventSeverityInfo, "verbose", true},
-	"AI_REVIEW_ABANDON":                {CopyEventCategoryTakeover, CopyEventSeverityWarn, "important", true},
-	"AI_REVIEW_THESIS_INVALID":         {CopyEventCategoryTakeover, CopyEventSeverityInfo, "verbose", true},
+	"STOP_TRIGGERED":               {CopyEventCategoryStopLoss, CopyEventSeverityWarn, "important", true},
+	"STOP_CONFIRMED":               {CopyEventCategoryStopLoss, CopyEventSeverityWarn, "important", true},
+	"STOP_PENDING_FLAT":            {CopyEventCategoryStopLoss, CopyEventSeverityWarn, "verbose", true},
+	"STOP_PARTIAL":                 {CopyEventCategoryStopLoss, CopyEventSeverityError, "critical", true},
+	"STOP_FLAT_CONFIRMED":          {CopyEventCategoryStopLoss, CopyEventSeverityWarn, "important", true},
+	"STOP_DUST_RESIDUAL":           {CopyEventCategoryStopLoss, CopyEventSeverityError, "critical", true},
+	"STOP_RISK_THRESHOLD_EXCEEDED": {CopyEventCategoryProtection, CopyEventSeverityWarn, "important", true},
+	"CATCHUP_TIMEOUT":              {CopyEventCategoryAction, CopyEventSeverityWarn, "important", false},
+	"CATCHUP_PRICE_LIMIT":          {CopyEventCategoryAction, CopyEventSeverityWarn, "important", false},
+	"AI_CANDIDATE_CREATED":         {CopyEventCategoryTakeover, CopyEventSeverityInfo, "verbose", true},
+	"AI_CANDIDATE_UNACTIONABLE":    {CopyEventCategoryTakeover, CopyEventSeverityInfo, "verbose", true},
+	"REENTRY_SUBMITTED":            {CopyEventCategoryTakeover, CopyEventSeverityInfo, "verbose", true},
+	"AI_REVIEW_WAIT":               {CopyEventCategoryTakeover, CopyEventSeverityInfo, "verbose", true},
+	"AI_REVIEW_REQUESTED":          {CopyEventCategoryTakeover, CopyEventSeverityInfo, "verbose", true},
+	"AI_REVIEW_ENTER":              {CopyEventCategoryTakeover, CopyEventSeverityInfo, "verbose", true},
+	"AI_REVIEW_ABANDON":            {CopyEventCategoryTakeover, CopyEventSeverityWarn, "important", true},
+	"AI_REVIEW_THESIS_INVALID":     {CopyEventCategoryTakeover, CopyEventSeverityInfo, "verbose", true},
+	// 观察态：命中不改变仓位，但它是评估「是否该按此条件离场」的唯一样本来源，
+	// 因此按 important 留存，不随 verbose 一起被保留策略清掉。
+	"AI_CLOSE_INVALIDATION_HIT":        {CopyEventCategoryTakeover, CopyEventSeverityWarn, "important", true},
 	"AI_REVIEW_FAILED":                 {CopyEventCategoryTakeover, CopyEventSeverityWarn, "important", true},
 	"AI_BUDGET_SUSPENDED":              {CopyEventCategoryTakeover, CopyEventSeverityWarn, "important", true},
 	"AI_RESULT_STALE":                  {CopyEventCategoryTakeover, CopyEventSeverityWarn, "verbose", true},
@@ -426,6 +429,7 @@ var copyGuardEventSpecs = map[string]CopyGuardEventSpec{
 	"PROTECTION_CLAMPED":               {CopyEventCategoryProtection, CopyEventSeverityWarn, "important", true},
 	"PROTECTION_COVERAGE_LOW":          {CopyEventCategoryProtection, CopyEventSeverityWarn, "important", true},
 	"PROTECTION_COVERAGE_UNATTRIBUTED": {CopyEventCategoryProtection, CopyEventSeverityWarn, "important", true},
+	"PROTECTION_RETRY":                 {CopyEventCategoryProtection, CopyEventSeverityWarn, "verbose", true},
 	"PROTECTION_RETRY_THROTTLED":       {CopyEventCategoryProtection, CopyEventSeverityWarn, "important", true},
 	"PROTECTION_BOOKKEEPING_HEALED":    {CopyEventCategoryProtection, CopyEventSeverityInfo, "verbose", true},
 	"PROTECTIVE_STOP_GONE":             {CopyEventCategoryProtection, CopyEventSeverityWarn, "important", true},
@@ -565,6 +569,8 @@ func guardEventSummary(eventType, symbol, side, operator string) string {
 		return fmt.Sprintf("AI 建议放弃候选 | %s", pair)
 	case "AI_REVIEW_THESIS_INVALID":
 		return fmt.Sprintf("AI 判断当前论点失效，候选休眠等待结构恢复 | %s", pair)
+	case "AI_CLOSE_INVALIDATION_HIT":
+		return fmt.Sprintf("AI 收盘失效条件已命中（仅记录，未自动离场）| %s", pair)
 	case "AI_REVIEW_FAILED", "AI_BUDGET_SUSPENDED", "AI_RESULT_STALE":
 		return fmt.Sprintf("AI 重入审查异常（%s）| %s", eventType, pair)
 	case "AI_CANDIDATE_TERMINATED":

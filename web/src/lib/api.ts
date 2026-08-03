@@ -1162,35 +1162,6 @@ export const api = {
     if (!result.success) throw new Error(result.message || '终止候选失败')
   },
 
-  // v5.1 旧人工信号只保留读取兼容；确认/忽略接口已由后端废弃。
-  async getCopyGuardManualSignals(params = '') {
-    const result = await httpClient.get<{
-      signals: import('../types').CopyGuardManualSignal[]
-    }>(`${API_BASE}/copytrade/risk/manual-signals${params}`)
-    if (!result.success)
-      throw new Error(result.message || '获取人工重入信号失败')
-    return result.data!.signals
-  },
-  async confirmCopyGuardManualSignal(id: number, notional?: number) {
-    // notional：确认弹窗中编辑后的执行金额；缺省用信号建议金额（后端界校验）
-    const result = await httpClient.post<{
-      message: string
-      signal: import('../types').CopyGuardManualSignal
-    }>(
-      `${API_BASE}/copytrade/risk/manual-signals/${id}/confirm`,
-      notional && notional > 0 ? { notional } : undefined
-    )
-    if (!result.success) throw new Error(result.message || '确认人工重入失败')
-    return result.data!
-  },
-  async dismissCopyGuardManualSignal(id: number) {
-    const result = await httpClient.post<{ message: string }>(
-      `${API_BASE}/copytrade/risk/manual-signals/${id}/dismiss`
-    )
-    if (!result.success) throw new Error(result.message || '忽略信号失败')
-    return result.data!
-  },
-
   // 重入 AI 助手（Reentry Advisor 插件）
   async getReentryAnalyses(signalId: number) {
     const result = await httpClient.get<{
