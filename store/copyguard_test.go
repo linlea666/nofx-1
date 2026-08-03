@@ -348,11 +348,11 @@ func TestCopyGuardProtectionRetryIsAtomic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	claimed, err := cs.BeginCopyGuardProtectionRetry(cycle, 0)
+	claimed, err := cs.BeginCopyGuardProtectionRetry(cycle, 0, true)
 	if err != nil || !claimed {
 		t.Fatalf("first retry claim = %v, %v", claimed, err)
 	}
-	claimed, err = cs.BeginCopyGuardProtectionRetry(cycle, 0)
+	claimed, err = cs.BeginCopyGuardProtectionRetry(cycle, 0, true)
 	if err != nil || claimed {
 		t.Fatalf("stale retry claim = %v, %v", claimed, err)
 	}
@@ -360,6 +360,35 @@ func TestCopyGuardProtectionRetryIsAtomic(t *testing.T) {
 	events, _ := cs.ListCopyGuardEvents(cycle.ID)
 	if got.ProtectionRetries != 1 || len(events) != 1 || events[0].Type != "PROTECTION_RETRY" {
 		t.Fatalf("retry was not atomic: cycle=%+v events=%+v", got, events)
+	}
+}
+
+// A throttled audit row must not weaken the claim itself: the retry slot and the
+// backoff timestamp are control state, the event row is only observability.
+func TestCopyGuardProtectionRetryClaimsWithoutEvent(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "copyguard-retry-throttled.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cs := st.CopyTrade()
+	cycle, err := cs.EnsureCopyGuardCycle(&CopyGuardCycle{TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "pos-retry-throttled", Symbol: "BTCUSDT", Side: "long", MarginMode: "cross", Status: CopyGuardFollowing, PolicySnapshot: "{}"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := cs.BeginCopyGuardProtectionRetry(cycle, 0, false)
+	if err != nil || !claimed {
+		t.Fatalf("throttled retry must still claim: %v, %v", claimed, err)
+	}
+	got, _ := cs.GetCopyGuardCycle(cycle.ID)
+	if got.ProtectionRetries != 1 {
+		t.Fatalf("retry counter must advance even when the event is throttled: %d", got.ProtectionRetries)
+	}
+	if got.ProtectionLastRetryAt == nil {
+		t.Fatal("backoff timestamp must advance even when the event is throttled")
+	}
+	if events, _ := cs.ListCopyGuardEvents(cycle.ID); len(events) != 0 {
+		t.Fatalf("throttled retry must not write an event row: %+v", events)
 	}
 }
 

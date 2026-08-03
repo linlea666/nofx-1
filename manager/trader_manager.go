@@ -7,6 +7,7 @@ import (
 	"nofx/debate"
 	"nofx/decision"
 	"nofx/logger"
+	"nofx/notifier"
 	"nofx/store"
 	"nofx/trader"
 	"sort"
@@ -63,12 +64,37 @@ func cloneCompetitionData(data map[string]interface{}) map[string]interface{} {
 	return cloned
 }
 
+// accountSnapshot is the last account read that actually succeeded for a trader.
+//
+// It exists so a failed read can be reported as a failure. Writing 0.0 on failure
+// made an outage indistinguishable from an empty account: in production a trader
+// whose copy trading had been stalled for hours by rejected API timestamps simply
+// showed a 0.00 balance and a RUNNING badge.
+type accountSnapshot struct {
+	equity        float64
+	pnl           float64
+	pnlPct        float64
+	positionCount interface{}
+	marginUsedPct float64
+	at            time.Time
+}
+
+// accountUnavailableAlertAfter: how long a running trader may fail to produce any
+// account read before it is escalated. Silence here means proportional copy
+// trading is suspended, so it must not stay invisible.
+const accountUnavailableAlertAfter = 10 * time.Minute
+
 // TraderManager manages multiple trader instances
 type TraderManager struct {
 	traders          map[string]*trader.AutoTrader // key: trader ID
 	loadErrors       map[string]error              // key: trader ID, stores last load error
 	competitionCache *CompetitionCache
 	mu               sync.RWMutex
+
+	accountMu        sync.Mutex
+	lastAccount      map[string]accountSnapshot // key: trader ID, last successful read
+	accountFailedAt  map[string]time.Time       // key: trader ID, start of the current failure streak
+	accountAlertedAt map[string]time.Time       // key: trader ID, last escalation
 }
 
 // NewTraderManager creates a trader manager
@@ -79,7 +105,47 @@ func NewTraderManager() *TraderManager {
 		competitionCache: &CompetitionCache{
 			data: make(map[string]interface{}),
 		},
+		lastAccount:      make(map[string]accountSnapshot),
+		accountFailedAt:  make(map[string]time.Time),
+		accountAlertedAt: make(map[string]time.Time),
 	}
+}
+
+// recordAccountSuccess stores the reading and clears the failure streak.
+func (tm *TraderManager) recordAccountSuccess(traderID string, snapshot accountSnapshot) {
+	tm.accountMu.Lock()
+	defer tm.accountMu.Unlock()
+	tm.lastAccount[traderID] = snapshot
+	delete(tm.accountFailedAt, traderID)
+	delete(tm.accountAlertedAt, traderID)
+}
+
+// recordAccountFailure returns the last successful reading (if any) and how long
+// the current failure streak has lasted.
+func (tm *TraderManager) recordAccountFailure(traderID string) (accountSnapshot, bool, time.Duration) {
+	tm.accountMu.Lock()
+	defer tm.accountMu.Unlock()
+	now := time.Now()
+	if _, streaking := tm.accountFailedAt[traderID]; !streaking {
+		tm.accountFailedAt[traderID] = now
+	}
+	snapshot, known := tm.lastAccount[traderID]
+	return snapshot, known, now.Sub(tm.accountFailedAt[traderID])
+}
+
+// shouldAlertAccountUnavailable reports whether the failure streak has lasted long
+// enough to escalate, at most once per streak per alert window.
+func (tm *TraderManager) shouldAlertAccountUnavailable(traderID string, streak time.Duration) bool {
+	if streak < accountUnavailableAlertAfter {
+		return false
+	}
+	tm.accountMu.Lock()
+	defer tm.accountMu.Unlock()
+	if last, alerted := tm.accountAlertedAt[traderID]; alerted && time.Since(last) < time.Hour {
+		return false
+	}
+	tm.accountAlertedAt[traderID] = time.Now()
+	return true
 }
 
 // GetLoadError returns the last load error for a trader
@@ -406,40 +472,20 @@ func (tm *TraderManager) getConcurrentTraderData(traders []*trader.AutoTrader) [
 					"is_running":             status["is_running"],
 					"system_prompt_template": trader.GetSystemPromptTemplate(),
 				}
+				tm.recordAccountSuccess(trader.GetID(), accountSnapshot{
+					equity:        toFloat(account["total_equity"]),
+					pnl:           toFloat(account["total_pnl"]),
+					pnlPct:        toFloat(account["total_pnl_pct"]),
+					positionCount: account["position_count"],
+					marginUsedPct: toFloat(account["margin_used_pct"]),
+					at:            time.Now(),
+				})
 			case err := <-errorChan:
-				// Failed to get account info
-				logger.Infof("⚠️ Failed to get account info for trader %s: %v", trader.GetID(), err)
-				traderData = map[string]interface{}{
-					"trader_id":              trader.GetID(),
-					"trader_name":            trader.GetName(),
-					"ai_model":               trader.GetAIModel(),
-					"exchange":               trader.GetExchange(),
-					"total_equity":           0.0,
-					"total_pnl":              0.0,
-					"total_pnl_pct":          0.0,
-					"position_count":         0,
-					"margin_used_pct":        0.0,
-					"is_running":             status["is_running"],
-					"system_prompt_template": trader.GetSystemPromptTemplate(),
-					"error":                  "Failed to get account data",
-				}
+				logger.Warnf("⚠️ Failed to get account info for trader %s: %v", trader.GetID(), err)
+				traderData = tm.unavailableTraderData(trader, status, "Failed to get account data", err.Error())
 			case <-ctx.Done():
-				// Timeout
-				logger.Infof("⏰ Timeout getting account info for trader %s", trader.GetID())
-				traderData = map[string]interface{}{
-					"trader_id":              trader.GetID(),
-					"trader_name":            trader.GetName(),
-					"ai_model":               trader.GetAIModel(),
-					"exchange":               trader.GetExchange(),
-					"total_equity":           0.0,
-					"total_pnl":              0.0,
-					"total_pnl_pct":          0.0,
-					"position_count":         0,
-					"margin_used_pct":        0.0,
-					"is_running":             status["is_running"],
-					"system_prompt_template": trader.GetSystemPromptTemplate(),
-					"error":                  "Request timeout",
-				}
+				logger.Warnf("⏰ Timeout getting account info for trader %s", trader.GetID())
+				traderData = tm.unavailableTraderData(trader, status, "Request timeout", "account read exceeded 3s")
 			}
 
 			resultChan <- traderResult{index: index, data: traderData}
@@ -454,6 +500,70 @@ func (tm *TraderManager) getConcurrentTraderData(traders []*trader.AutoTrader) [
 	}
 
 	return results
+}
+
+func toFloat(value interface{}) float64 {
+	switch typed := value.(type) {
+	case float64:
+		return typed
+	case float32:
+		return float64(typed)
+	case int:
+		return float64(typed)
+	case int64:
+		return float64(typed)
+	}
+	return 0
+}
+
+// unavailableTraderData builds the leaderboard row for a trader whose account
+// could not be read. It falls back to the last successful reading and marks the
+// row stale, so the UI can say "读取失败" instead of showing a fabricated 0.00.
+func (tm *TraderManager) unavailableTraderData(
+	t *trader.AutoTrader, status map[string]interface{}, reason, detail string,
+) map[string]interface{} {
+	snapshot, known, streak := tm.recordAccountFailure(t.GetID())
+	data := map[string]interface{}{
+		"trader_id":              t.GetID(),
+		"trader_name":            t.GetName(),
+		"ai_model":               t.GetAIModel(),
+		"exchange":               t.GetExchange(),
+		"total_equity":           0.0,
+		"total_pnl":              0.0,
+		"total_pnl_pct":          0.0,
+		"position_count":         0,
+		"margin_used_pct":        0.0,
+		"is_running":             status["is_running"],
+		"system_prompt_template": t.GetSystemPromptTemplate(),
+		"error":                  reason,
+		"stale":                  true,
+	}
+	if known {
+		data["total_equity"] = snapshot.equity
+		data["total_pnl"] = snapshot.pnl
+		data["total_pnl_pct"] = snapshot.pnlPct
+		data["margin_used_pct"] = snapshot.marginUsedPct
+		if snapshot.positionCount != nil {
+			data["position_count"] = snapshot.positionCount
+		}
+		data["stale_age_seconds"] = int64(time.Since(snapshot.at).Seconds())
+	}
+	running, _ := status["is_running"].(bool)
+	if running && tm.shouldAlertAccountUnavailable(t.GetID(), streak) {
+		traderName := t.GetName()
+		// Hour-bucketed dedupe key, matching the pattern used elsewhere: the
+		// notifier dedupes once per process, so a bare key would silence every
+		// recurrence for the rest of the process lifetime.
+		key := fmt.Sprintf("account_unavailable|%s", t.GetID())
+		notifier.Notify(notifier.Alert{
+			Category: "trader", TraderID: t.GetID(), TraderName: traderName,
+			Title: fmt.Sprintf("%s | 账户数据持续读取失败", traderName),
+			Body: fmt.Sprintf("交易员仍处于运行中，但已连续 %.0f 分钟无法读取账户数据。\n交易所: %s\n原因: %s\n详情: %s\n\n影响: 权威权益不可得时按比例跟单会暂停，界面权益为最近一次成功读取的陈旧值。\n建议: 检查交易所 API 密钥、网络与系统时间同步（Binance 签名对时钟偏移敏感）。",
+				streak.Minutes(), t.GetExchange(), reason, detail),
+			RateKey: key, DedupKey: fmt.Sprintf("%s|%d", key, time.Now().Unix()/3600),
+		})
+	}
+	return data
 }
 
 // GetTopTradersData retrieves top 5 traders data (for performance comparison)

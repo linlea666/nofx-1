@@ -67,6 +67,21 @@ type FuturesTrader struct {
 	instrumentsCache      map[string]*binanceExecutionInstrument
 	instrumentsCacheTime  time.Time
 	instrumentsCacheMutex sync.RWMutex
+
+	// Server-time offset upkeep, see binanceClock.
+	clock binanceClock
+}
+
+// binanceClock tracks when the client's TimeOffset was last derived from
+// Binance's own clock.
+//
+// Resync is lazy (driven by whichever signed call notices staleness) instead of
+// a background ticker: traders are created and archived while the process runs,
+// so a per-trader ticker without a stop channel would leak one goroutine per
+// archived trader.
+type binanceClock struct {
+	mu       sync.Mutex
+	lastSync time.Time
 }
 
 type binanceExecutionInstrument struct {
@@ -87,13 +102,16 @@ func NewFuturesTrader(apiKey, secretKey string, userId string) *FuturesTrader {
 		client = hookRes.GetResult()
 	}
 
-	// Sync time to avoid "Timestamp ahead" error
-	syncBinanceServerTime(client)
 	trader := &FuturesTrader{
 		client:           client,
 		cacheDuration:    15 * time.Second, // 15-second cache
 		instrumentsCache: make(map[string]*binanceExecutionInstrument),
 	}
+
+	// Sync time to avoid "Timestamp ahead" errors. This is only the first sample;
+	// the offset is kept fresh from the signed read paths (see binanceClock),
+	// because a one-shot sync cannot survive a later NTP step correction.
+	trader.syncClockLocked("startup")
 
 	// Set dual-side position mode (Hedge Mode)
 	// This is required because the code uses PositionSide (LONG/SHORT)
@@ -126,18 +144,117 @@ func (t *FuturesTrader) setDualSidePosition() error {
 	return nil
 }
 
-// syncBinanceServerTime syncs Binance server time to ensure request timestamps are valid
-func syncBinanceServerTime(client *futures.Client) {
+const (
+	// binanceClockResyncInterval bounds how long a derived server-time offset may
+	// be reused. Binance rejects any signed request whose timestamp is more than
+	// 1000ms ahead of its own clock, and go-binance signs with
+	// `timestamp = localNow - TimeOffset`. A permanently frozen offset therefore
+	// turns a single NTP step correction into an outage that lasts until the
+	// process restarts (observed in production: ~33k -1021 errors per hour while
+	// the OS clock itself was correctly synchronised).
+	binanceClockResyncInterval = 5 * time.Minute
+
+	// binanceClockSafetyMarginMs biases our timestamps slightly behind Binance's
+	// clock. Binance's tolerance is asymmetric: "behind" is accepted up to
+	// recvWindow (5000ms by default) while "ahead" is hard-rejected at 1000ms
+	// regardless of recvWindow, so the margin must be spent on the safe side.
+	binanceClockSafetyMarginMs = 500
+
+	// binanceClockMinResyncGap collapses a burst of concurrent -1021 failures
+	// into a single recovery round trip.
+	binanceClockMinResyncGap = 5 * time.Second
+)
+
+// syncBinanceServerTime derives the client's TimeOffset from Binance's clock.
+//
+// The offset is sampled at the midpoint of the request window so that symmetric
+// network latency cancels out instead of being folded into the offset, then
+// biased by binanceClockSafetyMarginMs onto the tolerated side.
+func syncBinanceServerTime(client *futures.Client) error {
+	start := time.Now()
 	serverTime, err := client.NewServerTimeService().Do(context.Background())
 	if err != nil {
-		logger.Infof("⚠️ Failed to sync Binance server time: %v", err)
+		return err
+	}
+	end := time.Now()
+
+	// Local clock reading at the instant Binance sampled its own clock.
+	localAtServerSample := start.Add(end.Sub(start) / 2).UnixMilli()
+	skew := localAtServerSample - serverTime
+
+	// go-binance signs with localNow-TimeOffset, so offset = skew + margin lands
+	// the signed timestamp `margin` milliseconds behind Binance's clock.
+	client.TimeOffset = skew + binanceClockSafetyMarginMs
+	logger.Infof("⏱ Binance server time synced | skew=%dms offset=%dms rtt=%dms",
+		skew, client.TimeOffset, end.Sub(start).Milliseconds())
+	return nil
+}
+
+// ensureClockFresh resyncs the server-time offset once it ages past
+// binanceClockResyncInterval. Called from the signed read paths, which run at
+// least once per cache window, so keeping them fresh also keeps order
+// submission on the same client fresh.
+func (t *FuturesTrader) ensureClockFresh() {
+	t.clock.mu.Lock()
+	defer t.clock.mu.Unlock()
+	if !t.clock.lastSync.IsZero() && time.Since(t.clock.lastSync) < binanceClockResyncInterval {
 		return
 	}
+	t.syncClockLocked("periodic")
+}
 
-	now := time.Now().UnixMilli()
-	offset := now - serverTime
-	client.TimeOffset = offset
-	logger.Infof("⏱ Binance server time synced, offset %dms", offset)
+// forceClockResync recovers from a rejected timestamp without waiting for the
+// periodic window.
+func (t *FuturesTrader) forceClockResync(reason string) {
+	t.clock.mu.Lock()
+	defer t.clock.mu.Unlock()
+	// A concurrent caller may already have resynced while we waited on the mutex.
+	if !t.clock.lastSync.IsZero() && time.Since(t.clock.lastSync) < binanceClockMinResyncGap {
+		return
+	}
+	t.syncClockLocked(reason)
+}
+
+func (t *FuturesTrader) syncClockLocked(reason string) {
+	if err := syncBinanceServerTime(t.client); err != nil {
+		// Keep the previous offset: it is at worst stale, whereas zeroing it would
+		// hand every request the raw local clock.
+		logger.Warnf("⚠️ Failed to sync Binance server time (reason=%s): %v", reason, err)
+		return
+	}
+	t.clock.lastSync = time.Now()
+}
+
+// isBinanceTimestampRejected reports whether Binance refused the request because
+// its timestamp fell outside the accepted window.
+//
+// Deliberately limited to -1021. -1022 ("signature not valid") is a credential
+// or payload problem that a resync cannot fix, and retrying it would only mask
+// the real cause.
+func isBinanceTimestampRejected(err error) bool {
+	if err == nil {
+		return false
+	}
+	var apiErr *common.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.Code == -1021
+	}
+	return false
+}
+
+// binanceCallWithClockRetry runs a signed call, healing a stale server-time
+// offset in place: refresh when due, and on a timestamp rejection resync once
+// and retry so a frozen offset degrades to a transient blip rather than a
+// standing outage.
+func binanceCallWithClockRetry[T any](t *FuturesTrader, op string, fn func() (T, error)) (T, error) {
+	t.ensureClockFresh()
+	result, err := fn()
+	if !isBinanceTimestampRejected(err) {
+		return result, err
+	}
+	logger.Warnf("⚠️ Binance rejected request timestamp (%s), resyncing server time and retrying once", op)
+	t.forceClockResync(op)
+	return fn()
 }
 
 // GetBalance gets account balance (with cache)
@@ -147,16 +264,18 @@ func (t *FuturesTrader) GetBalance() (map[string]interface{}, error) {
 	if t.cachedBalance != nil && time.Since(t.balanceCacheTime) < t.cacheDuration {
 		cacheAge := time.Since(t.balanceCacheTime)
 		t.balanceCacheMutex.RUnlock()
-		logger.Infof("✓ Using cached account balance (cache age: %.1f seconds ago)", cacheAge.Seconds())
+		logger.Debugf("✓ Using cached account balance (cache age: %.1f seconds ago)", cacheAge.Seconds())
 		return t.cachedBalance, nil
 	}
 	t.balanceCacheMutex.RUnlock()
 
 	// Cache expired or doesn't exist, call API
-	logger.Infof("🔄 Cache expired, calling Binance API to get account balance...")
-	account, err := t.client.NewGetAccountService().Do(context.Background())
+	logger.Debugf("🔄 Cache expired, calling Binance API to get account balance...")
+	account, err := binanceCallWithClockRetry(t, "get_account", func() (*futures.Account, error) {
+		return t.client.NewGetAccountService().Do(context.Background())
+	})
 	if err != nil {
-		logger.Infof("❌ Binance API call failed: %v", err)
+		logger.Warnf("❌ Binance API call failed: %v", err)
 		return nil, fmt.Errorf("failed to get account info: %w", err)
 	}
 
@@ -186,14 +305,16 @@ func (t *FuturesTrader) GetPositions() ([]map[string]interface{}, error) {
 	if t.cachedPositions != nil && time.Since(t.positionsCacheTime) < t.cacheDuration {
 		cacheAge := time.Since(t.positionsCacheTime)
 		t.positionsCacheMutex.RUnlock()
-		logger.Infof("✓ Using cached position information (cache age: %.1f seconds ago)", cacheAge.Seconds())
+		logger.Debugf("✓ Using cached position information (cache age: %.1f seconds ago)", cacheAge.Seconds())
 		return t.cachedPositions, nil
 	}
 	t.positionsCacheMutex.RUnlock()
 
 	// Cache expired or doesn't exist, call API
-	logger.Infof("🔄 Cache expired, calling Binance API to get position information...")
-	positions, err := t.client.NewGetPositionRiskService().Do(context.Background())
+	logger.Debugf("🔄 Cache expired, calling Binance API to get position information...")
+	positions, err := binanceCallWithClockRetry(t, "get_position_risk", func() ([]*futures.PositionRisk, error) {
+		return t.client.NewGetPositionRiskService().Do(context.Background())
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get positions: %w", err)
 	}

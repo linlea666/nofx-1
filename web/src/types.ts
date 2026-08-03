@@ -409,6 +409,12 @@ export interface CompetitionTraderData {
   position_count: number
   margin_used_pct: number
   is_running: boolean
+  // Present when the account read failed. The numeric fields then hold the last
+  // successful reading (or 0 if there was never one) and must not be shown as a
+  // current value — a fetch failure is not a zero balance.
+  error?: string
+  stale?: boolean
+  stale_age_seconds?: number
 }
 
 export interface CompetitionData {

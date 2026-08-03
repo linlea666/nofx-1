@@ -2248,13 +2248,13 @@ export function TraderConfigModal({
                                 ],
                                 [
                                   'risk_ai_daily_call_limit',
-                                  '24 小时费用软预警线',
+                                  '24 小时 AI 调用上限',
                                   1,
                                   null,
                                 ],
                                 [
                                   'risk_ai_lifecycle_call_limit',
-                                  '单候选费用软预警线',
+                                  '单候选 AI 调用上限',
                                   1,
                                   null,
                                 ],
@@ -2284,8 +2284,9 @@ export function TraderConfigModal({
                                 </label>
                               ))}
                               <div className="col-span-2 text-[11px] text-[#F0B90B]">
-                                兼容字段已改为费用软预警：达到数值只告警和展示成本，不会暂停候选、跳过后续反转复审或产生
-                                BUDGET_SUSPENDED。
+                                两个上限按「单个候选」统计并真实生效：达到上限后不再发起付费模型调用，并记录
+                                AI_BUDGET_SUSPENDED
+                                事件。24小时上限为滚动窗口，会自动恢复；单候选上限达到后该候选不再复查。已建立的止损保护与领航员平仓跟随不受影响。
                               </div>
                               <p className="col-span-2 text-xs text-[#848E9C]">
                                 WAIT

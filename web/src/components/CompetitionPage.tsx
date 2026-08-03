@@ -307,17 +307,35 @@ export function CompetitionPage() {
 
                     {/* Stats */}
                     <div className="flex items-center gap-2 md:gap-3 flex-wrap md:flex-nowrap">
-                      {/* Total Equity */}
+                      {/* Total Equity. A failed read is shown as a failure: the
+                          old code rendered 0.00, which made an API outage look
+                          like an empty account. */}
                       <div className="text-right">
                         <div className="text-xs" style={{ color: '#848E9C' }}>
                           {t('equity', language)}
                         </div>
-                        <div
-                          className="text-xs md:text-sm font-bold mono"
-                          style={{ color: '#EAECEF' }}
-                        >
-                          {trader.total_equity?.toFixed(2) || '0.00'}
-                        </div>
+                        {trader.stale ? (
+                          <div
+                            className="text-xs md:text-sm font-bold mono"
+                            style={{ color: '#FFC107' }}
+                            title={`账户数据读取失败（${trader.error || '未知原因'}）${
+                              trader.stale_age_seconds
+                                ? `，显示为 ${Math.round(trader.stale_age_seconds / 60)} 分钟前的数值`
+                                : ''
+                            }。请检查交易所 API 密钥、网络与系统时间同步。`}
+                          >
+                            {trader.total_equity
+                              ? `${trader.total_equity.toFixed(2)} ⚠`
+                              : '读取失败'}
+                          </div>
+                        ) : (
+                          <div
+                            className="text-xs md:text-sm font-bold mono"
+                            style={{ color: '#EAECEF' }}
+                          >
+                            {trader.total_equity?.toFixed(2) || '0.00'}
+                          </div>
+                        )}
                       </div>
 
                       {/* P&L */}

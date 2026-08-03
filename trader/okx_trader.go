@@ -711,12 +711,12 @@ func (t *OKXTrader) GetBalance() (map[string]interface{}, error) {
 	t.balanceCacheMutex.RLock()
 	if t.cachedBalance != nil && time.Since(t.balanceCacheTime) < t.cacheDuration {
 		t.balanceCacheMutex.RUnlock()
-		logger.Infof("✓ Using cached OKX account balance")
+		logger.Debugf("✓ Using cached OKX account balance")
 		return t.cachedBalance, nil
 	}
 	t.balanceCacheMutex.RUnlock()
 
-	logger.Infof("🔄 Calling OKX API to get account balance...")
+	logger.Debugf("🔄 Calling OKX API to get account balance...")
 	data, err := t.doRequest("GET", okxAccountPath, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get account balance: %w", err)
@@ -758,13 +758,21 @@ func (t *OKXTrader) GetBalance() (map[string]interface{}, error) {
 
 	totalEq, _ := strconv.ParseFloat(balance.TotalEq, 64)
 
+	// OKX totalEq 已包含未实现盈亏（eq = cashBal + upl），而下游
+	// auto_trader 统一按 totalEquity = totalWalletBalance + totalUnrealizedProfit 汇总。
+	// 因此这里必须扣除同一口径的 UPL，否则持仓时 UPL 会被计入两次。
+	// 扣减量与 totalUnrealizedProfit 取值严格一致，保证
+	// totalWalletBalance + totalUnrealizedProfit == totalEq。
+	walletBalance := totalEq - usdtUPL
+
 	result := map[string]interface{}{
-		"totalWalletBalance":    totalEq,
+		"totalWalletBalance":    walletBalance, // 钱包余额（不含未实现盈亏），与其他交易所适配器口径一致
 		"availableBalance":      usdtAvail,
 		"totalUnrealizedProfit": usdtUPL,
+		"total_equity":          totalEq, // 权威账户权益，供只取权益的调用方精确使用
 	}
 
-	logger.Infof("✓ OKX balance: Total equity=%.2f, Available=%.2f, Unrealized PnL=%.2f", totalEq, usdtAvail, usdtUPL)
+	logger.Infof("✓ OKX balance: Total equity=%.2f, Wallet=%.2f, Available=%.2f, Unrealized PnL=%.2f", totalEq, walletBalance, usdtAvail, usdtUPL)
 
 	// Update cache
 	t.balanceCacheMutex.Lock()
@@ -785,12 +793,12 @@ func (t *OKXTrader) GetPositions() ([]map[string]interface{}, error) {
 		// 确保缓存数据中的 mgnMode 不为空（可能在缓存时 OKX API 返回了空值）
 		result := t.ensureMgnModeInPositions(t.cachedPositions)
 		t.positionsCacheMutex.RUnlock()
-		logger.Infof("✓ Using cached OKX positions")
+		logger.Debugf("✓ Using cached OKX positions")
 		return result, nil
 	}
 	t.positionsCacheMutex.RUnlock()
 
-	logger.Infof("🔄 Calling OKX API to get positions...")
+	logger.Debugf("🔄 Calling OKX API to get positions...")
 	data, err := t.doRequest("GET", okxPositionPath+"?instType=SWAP", nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get positions: %w", err)

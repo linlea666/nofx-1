@@ -1608,12 +1608,12 @@ func (e *Engine) matchOpenAddSignal(signal *TradeSignal, leaderPosMap map[string
 		// 🛑 风控止损熔断：该 posId 已被账户保护止损触发，等领航员完全平掉旧 posId 才能恢复
 		// 用户如果启用了二次进场（RiskReentryEnabled），由 reentryMonitor 异步推决策，不走这里
 		if mapping.Status == store.MappingStatusStoppedByRisk {
-			logger.Infof("🛑 [%s] 账户保护止损熔断中 | posId=%s → 忽略开仓/加仓信号（等领航员平掉旧 posId 或触发二次进场）",
+			logger.Debugf("🛑 [%s] 账户保护止损熔断中 | posId=%s → 忽略开仓/加仓信号（等领航员平掉旧 posId 或触发二次进场）",
 				e.traderID, posID)
 			continue
 		}
 		if mapping.Status == store.MappingStatusDetached {
-			logger.Infof("🟠 [%s] 跟随仓位已脱离 | posId=%s → 仅跟踪领航员终态，不再开仓/加仓或触发 AI",
+			logger.Debugf("🟠 [%s] 跟随仓位已脱离 | posId=%s → 仅跟踪领航员终态，不再开仓/加仓或触发 AI",
 				e.traderID, posID)
 			continue
 		}
@@ -1623,7 +1623,7 @@ func (e *Engine) matchOpenAddSignal(signal *TradeSignal, leaderPosMap map[string
 			if e.config.ProviderType == ProviderOKX || e.config.ProviderType == ProviderBinance {
 				// OKX/Binance: ignored 表示启动前已存在的历史仓位，当前仍在持仓中时不跟随。
 				// Binance 如果该仓位先消失，checkIgnoredPositionsClosed 会标记 closed，后续重新开仓可按新仓处理。
-				logger.Infof("📊 [%s] 历史仓位 | posId=%s status=ignored → 不跟随（%s）",
+				logger.Debugf("📊 [%s] 历史仓位 | posId=%s status=ignored → 不跟随（%s）",
 					e.traderID, posID, e.config.ProviderType)
 				continue
 			}
@@ -1638,7 +1638,7 @@ func (e *Engine) matchOpenAddSignal(signal *TradeSignal, leaderPosMap map[string
 				break
 			}
 			// ActionAdd = 对历史仓位加仓，继续跳过
-			logger.Infof("📊 [%s] 历史仓位加仓 | posId=%s status=ignored → 跳过",
+			logger.Debugf("📊 [%s] 历史仓位加仓 | posId=%s status=ignored → 跳过",
 				e.traderID, posID)
 		}
 	}
@@ -1766,7 +1766,7 @@ func (e *Engine) matchOpenAddSignal(signal *TradeSignal, leaderPosMap map[string
 			singleActiveMapping != nil &&
 			singleActiveMapping.LastKnownSize > 0 &&
 			singleActivePos.Size <= singleActiveMapping.LastKnownSize+binancePositionSizeEpsilon {
-			logger.Infof("📊 [%s] %s 未检测到 size 增加 | posId=%s 上次=%.4f 当前=%.4f → 跳过迟到/重复成交",
+			logger.Debugf("📊 [%s] %s 未检测到 size 增加 | posId=%s 上次=%.4f 当前=%.4f → 跳过迟到/重复成交",
 				e.traderID, e.config.ProviderType, posID, singleActiveMapping.LastKnownSize, singleActivePos.Size)
 			return &SignalMatchResult{
 				ShouldFollow: false,
@@ -1822,7 +1822,7 @@ func (e *Engine) matchCloseReduceSignal(signal *TradeSignal, leaderPosMap map[st
 	}
 
 	if len(activeMappings) == 0 {
-		logger.Infof("📊 [%s] 无活跃映射 | %s %s → 不跟随",
+		logger.Debugf("📊 [%s] 无活跃映射 | %s %s → 不跟随",
 			e.traderID, fill.Symbol, fill.PositionSide)
 		return &SignalMatchResult{
 			ShouldFollow: false,
@@ -1907,7 +1907,7 @@ func (e *Engine) matchCloseReduceSignal(signal *TradeSignal, leaderPosMap map[st
 		if leaderPos != nil &&
 			mapping.LastKnownSize > 0 &&
 			mapping.LastKnownSize <= leaderPos.Size+binancePositionSizeEpsilon {
-			logger.Infof("📊 [%s] Binance 未检测到 size 减少 | posId=%s 上次=%.4f 当前=%.4f → 跳过迟到/重复成交",
+			logger.Debugf("📊 [%s] Binance 未检测到 size 减少 | posId=%s 上次=%.4f 当前=%.4f → 跳过迟到/重复成交",
 				e.traderID, mapping.LeaderPosID, mapping.LastKnownSize, leaderPos.Size)
 			return &SignalMatchResult{
 				ShouldFollow: false,
@@ -1951,7 +1951,7 @@ func (e *Engine) matchCloseReduceSignal(signal *TradeSignal, leaderPosMap map[st
 	}
 
 	// 所有映射都在领航员持仓中，但没有 size 变化（可能是重复信号）
-	logger.Infof("📊 [%s] 未检测到 size 变化 | %s %s → 跳过",
+	logger.Debugf("📊 [%s] 未检测到 size 变化 | %s %s → 跳过",
 		e.traderID, fill.Symbol, fill.PositionSide)
 	return &SignalMatchResult{
 		ShouldFollow: false,
@@ -1994,7 +1994,7 @@ func (e *Engine) processSignal(signal *TradeSignal) {
 	matchResult := e.matchSignalWithMapping(signal)
 
 	if !matchResult.ShouldFollow {
-		logger.Infof("🎯 [%s] ❌ 跳过 | %s | 原因: %s", e.traderID, fill.Symbol, matchResult.Reason)
+		logger.Debugf("🎯 [%s] ❌ 跳过 | %s | 原因: %s", e.traderID, fill.Symbol, matchResult.Reason)
 		e.stats.SignalsSkipped++
 		return
 	}

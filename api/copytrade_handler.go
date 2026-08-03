@@ -263,15 +263,16 @@ func (h *CopyTradeHandler) ListAICandidates(c *gin.Context) {
 		if calls, callsErr := h.store.ReentryAI().CountReentryCandidateCalls24h(candidate.ID); callsErr == nil {
 			candidate.AIDailyCallsUsed = calls
 		}
-		candidate.AICallLimitsDeprecated = true
+		candidate.AICallLimitsDeprecated = false
+		// Now an actual block on further paid model calls, not a display-only flag.
 		candidate.AICostWarningExceeded =
 			(candidate.AIDailyCallLimit > 0 && candidate.AIDailyCallsUsed >= candidate.AIDailyCallLimit) ||
 				(candidate.AILifecycleCallLimit > 0 && candidate.ReviewCount >= candidate.AILifecycleCallLimit)
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"candidates": candidates, "trader_names": names, "count": len(candidates),
-		"call_limits_deprecated": true,
-		"call_limit_semantics":   "soft_cost_warning_only",
+		"call_limits_deprecated": false,
+		"call_limit_semantics":   "enforced_per_candidate",
 	})
 }
 

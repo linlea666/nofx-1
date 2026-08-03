@@ -565,8 +565,12 @@ func TestCandidatePreparationFailureDoesNotConsumeCallQuota(t *testing.T) {
 	}
 }
 
-func TestCandidateSoftCostWarningsNeverSuspendLaterReviews(t *testing.T) {
-	st, err := newReentryCandidateTestStore(t, filepath.Join(t.TempDir(), "candidate-soft-cost-warning.db"))
+// TestCandidateLifecycleCostLimitBlocksWithoutStranding covers the cost guard that
+// used to be discarded: the lifecycle limit must actually stop paid model calls, yet
+// must not resurrect the retired failure mode where a blocked candidate was closed or
+// pinned behind budget_blocked_until and could never be reviewed again.
+func TestCandidateLifecycleCostLimitBlocksWithoutStranding(t *testing.T) {
+	st, err := newReentryCandidateTestStore(t, filepath.Join(t.TempDir(), "candidate-lifecycle-cost-limit.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -575,15 +579,17 @@ func TestCandidateSoftCostWarningsNeverSuspendLaterReviews(t *testing.T) {
 	ensureReviewableReentryCycle(t, st, 79, "trader-a", "p", "HYPEUSDT", "long")
 	candidate, err := rs.EnsureReentryCandidate(&CopyGuardReentryCandidate{
 		CycleID: 79, TraderID: "trader-a", LeaderPosID: "p",
-		Symbol: "HYPEUSDT", Side: "long", FeatureHash: "soft-warning",
+		Symbol: "HYPEUSDT", Side: "long", FeatureHash: "lifecycle-limit",
 	}, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
-	for review := 1; review <= 20; review++ {
-		claimed, ok, claimErr := rs.ClaimReentryCandidateReview(candidate.ID, 0, 1, 1)
+
+	const lifecycleLimit = 3
+	for review := 1; review <= lifecycleLimit; review++ {
+		claimed, ok, claimErr := rs.ClaimReentryCandidateReview(candidate.ID, 0, 0, lifecycleLimit)
 		if claimErr != nil || !ok || claimed == nil {
-			t.Fatalf("review %d was blocked by retired hard limits: candidate=%+v ok=%v err=%v",
+			t.Fatalf("review %d below the limit was refused: candidate=%+v ok=%v err=%v",
 				review, claimed, ok, claimErr)
 		}
 		if finishErr := rs.FinishReentryCandidateReview(candidate.ID, ReentryCandidateDecision{
@@ -592,13 +598,83 @@ func TestCandidateSoftCostWarningsNeverSuspendLaterReviews(t *testing.T) {
 			t.Fatalf("finish review %d: %v", review, finishErr)
 		}
 	}
-	candidate, err = rs.GetReentryCandidate(candidate.ID)
+
+	// Reviews past the limit must be refused, and refused repeatedly (the scheduler
+	// keeps polling), without an error surfacing as a store failure.
+	for attempt := 1; attempt <= 3; attempt++ {
+		claimed, ok, claimErr := rs.ClaimReentryCandidateReview(candidate.ID, 0, 0, lifecycleLimit)
+		if claimErr != nil {
+			t.Fatalf("attempt %d over the limit returned an error: %v", attempt, claimErr)
+		}
+		if ok || claimed != nil {
+			t.Fatalf("attempt %d over the lifecycle limit was allowed: candidate=%+v", attempt, claimed)
+		}
+	}
+
+	fresh, err := rs.GetReentryCandidate(candidate.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if candidate.Status == ReentryCandidateBudgetSuspended || candidate.ReviewCount != 20 ||
-		candidate.BudgetBlockedUntil != nil {
-		t.Fatalf("soft warning changed review eligibility: %+v", candidate)
+	if fresh.Status == ReentryCandidateBudgetSuspended || fresh.BudgetBlockedUntil != nil ||
+		fresh.ClosedAt != nil || fresh.ReviewCount != lifecycleLimit {
+		t.Fatalf("cost block stranded the candidate: %+v", fresh)
+	}
+
+	// The refusal is auditable but throttled: repeated blocked attempts emit one event.
+	var events int
+	if err = st.DB().QueryRow(`SELECT COUNT(*) FROM copy_guard_events
+		WHERE cycle_id=79 AND type='AI_BUDGET_SUSPENDED'`).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if events != 1 {
+		t.Fatalf("expected exactly 1 throttled budget event, got %d", events)
+	}
+
+	// A raised limit takes effect immediately: no manual unblock step is required.
+	claimed, ok, err := rs.ClaimReentryCandidateReview(candidate.ID, 0, 0, lifecycleLimit+1)
+	if err != nil || !ok || claimed == nil {
+		t.Fatalf("raising the limit did not restore eligibility: candidate=%+v ok=%v err=%v", claimed, ok, err)
+	}
+}
+
+// TestCandidateDailyCostLimitCountsRealModelCalls verifies the 24h guard keys off
+// actual model invocations, so pre-call preparation failures never consume quota.
+func TestCandidateDailyCostLimitCountsRealModelCalls(t *testing.T) {
+	st, err := newReentryCandidateTestStore(t, filepath.Join(t.TempDir(), "candidate-daily-cost-limit.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	rs := st.ReentryAI()
+	ensureReviewableReentryCycle(t, st, 80, "trader-a", "p", "HYPEUSDT", "long")
+	candidate, err := rs.EnsureReentryCandidate(&CopyGuardReentryCandidate{
+		CycleID: 80, TraderID: "trader-a", LeaderPosID: "p",
+		Symbol: "HYPEUSDT", Side: "long", FeatureHash: "daily-limit",
+	}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ok, claimErr := rs.ClaimReentryCandidateReview(candidate.ID, 0, 1, 0); claimErr != nil || !ok {
+		t.Fatalf("first claim of the day was refused: ok=%v err=%v", ok, claimErr)
+	}
+	if _, err = rs.SaveReentryAnalysis(&ReentryAIAnalysis{
+		CandidateID: candidate.ID, TraderID: candidate.TraderID, CycleID: candidate.CycleID,
+		CallStatus: "COMPLETED",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err = rs.FinishReentryCandidateReview(candidate.ID, ReentryCandidateDecision{
+		Decision: ReentryVerdictWait, NextReview: time.Now().Add(-time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if claimed, ok, claimErr := rs.ClaimReentryCandidateReview(candidate.ID, 0, 1, 0); claimErr != nil || ok || claimed != nil {
+		t.Fatalf("second claim exceeded the daily limit: candidate=%+v ok=%v err=%v", claimed, ok, claimErr)
+	}
+	if claimed, ok, claimErr := rs.ClaimReentryCandidateReview(candidate.ID, 0, 2, 0); claimErr != nil || !ok || claimed == nil {
+		t.Fatalf("claim within the daily limit was refused: candidate=%+v ok=%v err=%v", claimed, ok, claimErr)
 	}
 }
 

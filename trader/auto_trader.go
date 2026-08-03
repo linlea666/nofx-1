@@ -2486,7 +2486,7 @@ func (at *AutoTrader) GetPositions() ([]map[string]interface{}, error) {
 		// Calculate P&L percentage (based on margin)
 		pnlPct := calculatePnLPercentage(unrealizedPnl, marginUsed)
 
-		result = append(result, map[string]interface{}{
+		normalized := map[string]interface{}{
 			"symbol":             symbol,
 			"side":               side,
 			"entry_price":        entryPrice,
@@ -2497,10 +2497,33 @@ func (at *AutoTrader) GetPositions() ([]map[string]interface{}, error) {
 			"unrealized_pnl_pct": pnlPct,
 			"liquidation_price":  liquidationPrice,
 			"margin_used":        marginUsed,
-		})
+		}
+		// Position identity must survive normalization. Copy Guard scopes a
+		// protective stop to one position via margin mode and (on OKX) posId; when
+		// these were dropped here its margin-mode filter silently matched every
+		// position of the same symbol/side and summed cross+isolated into one
+		// coverage baseline, so coverage could never reconcile.
+		if mgnMode := firstStringField(pos, "mgnMode", "marginMode"); mgnMode != "" {
+			normalized["mgnMode"] = mgnMode
+			normalized["marginMode"] = mgnMode
+		}
+		if posID := firstStringField(pos, "posId", "positionId"); posID != "" {
+			normalized["posId"] = posID
+		}
+		result = append(result, normalized)
 	}
 
 	return result, nil
+}
+
+// firstStringField returns the first non-empty string value among the given keys.
+func firstStringField(m map[string]interface{}, keys ...string) string {
+	for _, key := range keys {
+		if s, ok := m[key].(string); ok && s != "" {
+			return s
+		}
+	}
+	return ""
 }
 
 // calculatePnLPercentage calculates P&L percentage (based on margin, automatically considers leverage)

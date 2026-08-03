@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"math"
 	"time"
@@ -511,12 +512,22 @@ func (s *ReentryAIStore) CountReentryCandidateCalls24h(candidateID int64) (int, 
 	return count, err
 }
 
-// ClaimReentryCandidateReview atomically leases a review. The legacy daily and
-// lifecycle values are accepted for one compatibility version but are soft
-// cost-warning lines only and never affect eligibility.
+// reentryBudgetEventCooldown throttles AI_BUDGET_SUSPENDED so a blocked candidate
+// reports the block once rather than on every scheduling tick.
+const reentryBudgetEventCooldown = time.Hour
+
+// ClaimReentryCandidateReview atomically leases a review.
+//
+// dailyLimit and lifecycleLimit are cost guards on paid model calls and are
+// enforced here: previously they travelled the whole way from the UI through the
+// API, database and policy snapshot only to be discarded, so the user believed
+// they were capping spend while nothing was.
+//
+// They are evaluated from live counts and deliberately do not write a suspended
+// status or budget_blocked_until. The 24h window rolls off by itself, so a
+// candidate can never be stranded by a limit it no longer exceeds, and the startup
+// migration that clears legacy suspensions keeps working unchanged.
 func (s *ReentryAIStore) ClaimReentryCandidateReview(id int64, minInterval time.Duration, dailyLimit, lifecycleLimit int) (*CopyGuardReentryCandidate, bool, error) {
-	_ = dailyLimit
-	_ = lifecycleLimit
 	tx, err := s.db.Begin()
 	if err != nil {
 		return nil, false, err
@@ -528,7 +539,10 @@ func (s *ReentryAIStore) ClaimReentryCandidateReview(id int64, minInterval time.
 	var lifecycleStatus string
 	var lifecycleGeneration int64
 	var cycleReviewable bool
+	var cycleID int64
+	var traderID string
 	if err = tx.QueryRow(`SELECT c.status,c.review_count,c.last_review_at,
+			COALESCE(c.cycle_id,0),COALESCE(c.trader_id,''),
 			COALESCE(t.lifecycle_status,''),COALESCE(t.lifecycle_generation,0),
 			EXISTS(SELECT 1 FROM copy_guard_cycles g
 				WHERE g.id=c.cycle_id AND g.closed_at IS NULL
@@ -538,7 +552,7 @@ func (s *ReentryAIStore) ClaimReentryCandidateReview(id int64, minInterval time.
 				  ))
 			FROM copy_guard_reentry_candidates c
 			LEFT JOIN traders t ON t.id=c.trader_id WHERE c.id=?`, id).
-		Scan(&status, &count, &last, &lifecycleStatus, &lifecycleGeneration, &cycleReviewable); err != nil {
+		Scan(&status, &count, &last, &cycleID, &traderID, &lifecycleStatus, &lifecycleGeneration, &cycleReviewable); err != nil {
 		return nil, false, err
 	}
 	if status != ReentryCandidateWatching && status != ReentryCandidateWaiting {
@@ -550,6 +564,20 @@ func (s *ReentryAIStore) ClaimReentryCandidateReview(id int64, minInterval time.
 	if last.Valid {
 		if t, e := parseDBTime(last.String); e == nil && time.Since(t) < minInterval {
 			return nil, false, nil
+		}
+	}
+	if lifecycleLimit > 0 && count >= lifecycleLimit {
+		return nil, false, recordReentryBudgetBlockTx(tx, cycleID, traderID, id, "lifecycle", count, lifecycleLimit)
+	}
+	if dailyLimit > 0 {
+		var daily int
+		if err = tx.QueryRow(`SELECT COUNT(*) FROM reentry_ai_analyses
+			WHERE candidate_id=? AND call_status IN ('RUNNING','COMPLETED','INVALID','FAILED')
+			  AND created_at>=datetime('now','-24 hours')`, id).Scan(&daily); err != nil {
+			return nil, false, err
+		}
+		if daily >= dailyLimit {
+			return nil, false, recordReentryBudgetBlockTx(tx, cycleID, traderID, id, "daily_24h", daily, dailyLimit)
 		}
 	}
 	res, err := tx.Exec(`UPDATE copy_guard_reentry_candidates SET status=?,decision_generation=decision_generation+1,review_count=review_count+1,last_review_at=CURRENT_TIMESTAMP,next_review_at=?,event_review_at=NULL,budget_blocked_until=NULL,pending_trigger='',updated_at=CURRENT_TIMESTAMP WHERE id=? AND status IN ('WATCHING','WAITING')`, ReentryCandidateReviewing, time.Now().Add(minInterval).UTC(), id)
@@ -568,6 +596,38 @@ func (s *ReentryAIStore) ClaimReentryCandidateReview(id int64, minInterval time.
 		c.TraderLifecycleGeneration = lifecycleGeneration
 	}
 	return c, true, err
+}
+
+// recordReentryBudgetBlockTx records that a review was refused for cost reasons and
+// commits, so the refusal is auditable instead of looking like an idle scheduler.
+// Throttled per cycle and limit kind, because the scheduler retries continuously.
+func recordReentryBudgetBlockTx(tx *sql.Tx, cycleID int64, traderID string, candidateID int64, kind string, used, limit int) error {
+	if cycleID <= 0 || traderID == "" {
+		return nil
+	}
+	var recent int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM copy_guard_events
+		WHERE cycle_id=? AND type='AI_BUDGET_SUSPENDED'
+		  AND metadata_json LIKE ?
+		  AND created_at>=datetime('now',?)`,
+		cycleID, `%"limit_kind":"`+kind+`"%`,
+		fmt.Sprintf("-%d seconds", int(reentryBudgetEventCooldown.Seconds()))).Scan(&recent); err != nil {
+		return err
+	}
+	if recent > 0 {
+		return nil
+	}
+	metadata, _ := json.Marshal(map[string]interface{}{
+		"limit_kind":   kind,
+		"used":         used,
+		"limit":        limit,
+		"candidate_id": candidateID,
+	})
+	if _, err := tx.Exec(`INSERT INTO copy_guard_events(cycle_id,trader_id,type,metadata_json) VALUES(?,?,?,?)`,
+		cycleID, traderID, "AI_BUDGET_SUSPENDED", string(metadata)); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *ReentryAIStore) GetFirstCandidateModelCallAt(candidateID int64) (*time.Time, error) {

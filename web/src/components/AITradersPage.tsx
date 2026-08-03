@@ -1251,13 +1251,18 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
                         </button>
                       )}
 
+                    {/* Editing is blocked only while the trader is live. Saved
+                        config takes effect on the next start, and the backend
+                        imposes no lifecycle restriction, so keeping edit disabled
+                        during STOPPING / STOPPING_RECONCILE_REQUIRED bought no
+                        safety while making a stuck reconciliation also block
+                        configuration changes. */}
                     <button
                       onClick={() => handleEditTrader(trader.trader_id)}
-                      disabled={
-                        (trader.lifecycle_status ||
-                          (trader.is_running ? 'RUNNING' : 'STOPPED')) !==
-                        'STOPPED'
-                      }
+                      disabled={['RUNNING', 'STARTING'].includes(
+                        trader.lifecycle_status ||
+                          (trader.is_running ? 'RUNNING' : 'STOPPED')
+                      )}
                       className="px-2 md:px-3 py-1.5 md:py-2 rounded text-xs md:text-sm font-semibold transition-all hover:scale-105 disabled:opacity-50 disabled:cursor-not-allowed whitespace-nowrap flex items-center gap-1"
                       style={{
                         background: trader.is_running
@@ -1265,6 +1270,14 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
                           : 'rgba(255, 193, 7, 0.1)',
                         color: trader.is_running ? '#848E9C' : '#FFC107',
                       }}
+                      title={
+                        ['RUNNING', 'STARTING'].includes(
+                          trader.lifecycle_status ||
+                            (trader.is_running ? 'RUNNING' : 'STOPPED')
+                        )
+                          ? '运行中不可编辑，请先停止交易员'
+                          : '修改将在下次启动时生效'
+                      }
                     >
                       <Pencil className="w-3 h-3 md:w-4 md:h-4" />
                       {t('edit', language)}
@@ -1341,9 +1354,13 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
                       }
                       className="px-2 md:px-3 py-1.5 md:py-2 rounded text-xs md:text-sm font-semibold transition-all hover:scale-105 disabled:opacity-40 disabled:cursor-not-allowed"
                       title={
-                        trader.pending_blockers?.length
-                          ? `存在 ${trader.pending_blockers.length} 项阻塞，不能归档`
-                          : '仅 STOPPED 且无仓位、未决订单、未核实保护单时可归档'
+                        (trader.lifecycle_status ||
+                          (trader.is_running ? 'RUNNING' : 'STOPPED')) !==
+                        'STOPPED'
+                          ? '需先完成对账：点击「继续对账」向交易所核实仓位与挂单，状态变为 STOPPED 后即可归档'
+                          : trader.pending_blockers?.length
+                            ? `存在 ${trader.pending_blockers.length} 项阻塞，不能归档。点击「核对归档条件」重新向交易所核实；若确认已空仓且无挂单，阻塞会自动清除`
+                            : '仅 STOPPED 且无仓位、未决订单、未核实保护单时可归档'
                       }
                       style={{
                         background: 'rgba(246, 70, 93, 0.1)',

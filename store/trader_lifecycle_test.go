@@ -204,6 +204,90 @@ func TestStopBlockersDistinguishHistoricalTerminalWorkFromActiveRisk(t *testing.
 	}
 }
 
+// TestStopBlockersTrustVerifiedCycleProtectionOverIntentBookkeeping covers the
+// deadlock found in production: protected_at is only written by the
+// FILLED->PROTECTED transition, so protection established on a later retry leaves
+// it NULL, and once the trader stops nothing can backfill it. The position was
+// fully protected (VERIFIED, coverage 1.0) yet blocked the stop forever.
+func TestStopBlockersTrustVerifiedCycleProtectionOverIntentBookkeeping(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "stop-blocker-verified-protection.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	createLifecycleTestTrader(t, st, "trader-1", TraderLifecycleStoppingReconcileRequired, 2)
+
+	if _, err = st.DB().Exec(`INSERT INTO copy_guard_cycles
+		(id,trader_id,leader_id,leader_pos_id,symbol,side,margin_mode,status,policy_snapshot,
+		 protection_status,protection_coverage)
+		VALUES(501,'trader-1','leader','active-leader','ETHUSDT','long','cross','FOLLOWING','{}',
+		       'VERIFIED',1.0)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = st.DB().Exec(`INSERT INTO copy_trade_execution_intents
+		(trader_id,leader_pos_id,source_revision,cycle_id,action,symbol,side,status,
+		 submitted_at,filled_at,protected_at,terminal_at,exchange_order_id,exchange_state,filled_quantity)
+		VALUES('trader-1','active-leader',1,501,'open_long','ETHUSDT','long','FILLED',
+		       CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL,CURRENT_TIMESTAMP,'active-order','FILLED',1)`); err != nil {
+		t.Fatal(err)
+	}
+
+	blockers, err := st.Trader().GetStopBlockers("trader-1")
+	if err != nil || len(blockers) != 0 {
+		t.Fatalf("verified protection still reported as unsettled risk: %+v err=%v", blockers, err)
+	}
+
+	// The check must not be weakened: partial coverage is real naked risk again.
+	if _, err = st.DB().Exec(`UPDATE copy_guard_cycles SET protection_coverage=0.5 WHERE id=501`); err != nil {
+		t.Fatal(err)
+	}
+	blockers, err = st.Trader().GetStopBlockers("trader-1")
+	if err != nil || len(blockers) != 1 || blockers[0].Symbol != "ETHUSDT" {
+		t.Fatalf("partially covered position must still block the stop: %+v err=%v", blockers, err)
+	}
+
+	if _, err = st.DB().Exec(`UPDATE copy_guard_cycles
+		SET protection_coverage=1.0,protection_status='DEGRADED' WHERE id=501`); err != nil {
+		t.Fatal(err)
+	}
+	blockers, err = st.Trader().GetStopBlockers("trader-1")
+	if err != nil || len(blockers) != 1 {
+		t.Fatalf("degraded protection must still block the stop: %+v err=%v", blockers, err)
+	}
+}
+
+// TestStopBlockersIgnoreReconcilingIntentThatNeverReachedExchange pins the
+// evidence requirement for RECONCILING. An intent can be moved to RECONCILING
+// before it is ever sent to the exchange; treating that as unsettled risk left
+// traders unable to ever finish stopping.
+func TestStopBlockersIgnoreReconcilingIntentThatNeverReachedExchange(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "stop-blocker-reconciling-evidence.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	createLifecycleTestTrader(t, st, "trader-1", TraderLifecycleStoppingReconcileRequired, 2)
+
+	if _, err = st.DB().Exec(`INSERT INTO copy_trade_execution_intents
+		(trader_id,leader_pos_id,source_revision,action,symbol,side,status,filled_quantity)
+		VALUES('trader-1','never-sent',1,'open_long','SOLUSDT','long','RECONCILING',0)`); err != nil {
+		t.Fatal(err)
+	}
+	blockers, err := st.Trader().GetStopBlockers("trader-1")
+	if err != nil || len(blockers) != 0 {
+		t.Fatalf("intent that never reached the exchange became a blocker: %+v err=%v", blockers, err)
+	}
+
+	if _, err = st.DB().Exec(`UPDATE copy_trade_execution_intents
+		SET exchange_order_id='real-order' WHERE trader_id='trader-1'`); err != nil {
+		t.Fatal(err)
+	}
+	blockers, err = st.Trader().GetStopBlockers("trader-1")
+	if err != nil || len(blockers) != 1 || blockers[0].Symbol != "SOLUSDT" {
+		t.Fatalf("reconciling intent with exchange evidence must block: %+v err=%v", blockers, err)
+	}
+}
+
 func TestStopBlockersIgnorePreparedAttemptUntilSubmissionBoundary(t *testing.T) {
 	st, err := New(filepath.Join(t.TempDir(), "stop-prepared-boundary.db"))
 	if err != nil {

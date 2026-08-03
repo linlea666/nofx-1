@@ -939,9 +939,13 @@ func (s *CopyTradeStore) UpdateCopyGuardProtectionHealth(id int64, status string
 	return err
 }
 
-// BeginCopyGuardProtectionRetry atomically claims one retry slot and records
-// the event. Multiple monitors or fast ticks cannot create duplicate retries.
-func (s *CopyTradeStore) BeginCopyGuardProtectionRetry(cycle *CopyGuardCycle, delay time.Duration) (bool, error) {
+// BeginCopyGuardProtectionRetry atomically claims one retry slot. Multiple
+// monitors or fast ticks cannot create duplicate retries.
+//
+// recordEvent lets the caller throttle the PROTECTION_RETRY audit row: claiming a
+// slot is a control-flow decision that must always happen, while writing one row
+// per claim let a retry loop running at poll cadence dominate the event log.
+func (s *CopyTradeStore) BeginCopyGuardProtectionRetry(cycle *CopyGuardCycle, delay time.Duration, recordEvent bool) (bool, error) {
 	if cycle == nil {
 		return false, fmt.Errorf("nil copy guard cycle")
 	}
@@ -967,13 +971,15 @@ func (s *CopyTradeStore) BeginCopyGuardProtectionRetry(cycle *CopyGuardCycle, de
 	if err != nil || changed == 0 {
 		return false, err
 	}
-	metadata, _ := json.Marshal(map[string]interface{}{
-		"retry":      cycle.ProtectionRetries + 1,
-		"last_error": message,
-		"coverage":   cycle.ProtectionCoverage,
-	})
-	if _, err = tx.Exec(`INSERT INTO copy_guard_events(cycle_id,trader_id,type,metadata_json) VALUES(?,?,?,?)`, cycle.ID, cycle.TraderID, "PROTECTION_RETRY", string(metadata)); err != nil {
-		return false, err
+	if recordEvent {
+		metadata, _ := json.Marshal(map[string]interface{}{
+			"retry":      cycle.ProtectionRetries + 1,
+			"last_error": message,
+			"coverage":   cycle.ProtectionCoverage,
+		})
+		if _, err = tx.Exec(`INSERT INTO copy_guard_events(cycle_id,trader_id,type,metadata_json) VALUES(?,?,?,?)`, cycle.ID, cycle.TraderID, "PROTECTION_RETRY", string(metadata)); err != nil {
+			return false, err
+		}
 	}
 	return true, tx.Commit()
 }

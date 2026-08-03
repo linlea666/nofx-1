@@ -333,15 +333,25 @@ func (s *TraderStore) finishStop(userID, traderID string, generation int64, targ
 	return tx.Commit()
 }
 
+// GetStopBlockers lists execution intents that represent unsettled exchange risk
+// and therefore prevent the trader from reaching STOPPED.
+//
+// Every blocker must correspond to real risk. A blocker that can never clear is
+// its own outage: the trader is stuck in STOPPING_RECONCILE_REQUIRED and can no
+// longer be archived or deleted. Both branches below are therefore evidence-based.
 func (s *TraderStore) GetStopBlockers(traderID string) ([]TraderLifecycleBlocker, error) {
 	rows, err := s.db.Query(`SELECT CAST(i.id AS TEXT),COALESCE(i.symbol,''),i.status
 		FROM copy_trade_execution_intents i
 		WHERE i.trader_id=? AND (
 			(
 				i.terminal_at IS NULL AND (
-					i.status IN ('SUBMITTED','PARTIALLY_FILLED','RECONCILING')
+					i.status IN ('SUBMITTED','PARTIALLY_FILLED')
 					OR (
-						i.status IN ('RESERVED','FAILED')
+						-- RECONCILING is grouped with RESERVED/FAILED rather than treated
+						-- as unconditional risk: an intent can be moved to RECONCILING
+						-- before it ever reaches the exchange, and such an intent has
+						-- nothing to reconcile while permanently blocking the stop.
+						i.status IN ('RESERVED','FAILED','RECONCILING')
 						AND (
 							i.submitted_at IS NOT NULL
 							OR COALESCE(i.exchange_order_id,'')<>''
@@ -376,6 +386,18 @@ func (s *TraderStore) GetStopBlockers(traderID string) ([]TraderLifecycleBlocker
 					SELECT 1 FROM copy_trade_position_mappings m
 					WHERE m.trader_id=i.trader_id AND m.leader_pos_id=i.leader_pos_id
 					  AND m.status<>'active'
+				)
+				-- protected_at is written only by the FILLED->PROTECTED transition, so a
+				-- protection established on a later retry leaves it NULL forever. Once
+				-- the trader stops, the Copy Guard monitor exits and nothing can ever
+				-- backfill it: a fully protected position then blocks the stop
+				-- permanently. Trust the cycle's verified protection state instead of
+				-- the intent's bookkeeping column.
+				AND NOT EXISTS (
+					SELECT 1 FROM copy_guard_cycles c
+					WHERE c.id=i.cycle_id
+					  AND c.protection_status IN ('VERIFIED','CLAMPED')
+					  AND COALESCE(c.protection_coverage,0)>=0.999
 				)
 			)
 		)
