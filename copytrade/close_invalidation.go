@@ -63,7 +63,7 @@ func (e *Engine) nextCloseInvalidationCheck(candidateID int64, interval time.Dur
 // 只读已完成 K 线：未收盘的那根随时会翻回去，用它判定等于把「收盘失效」降级成
 // 「触碰失效」，与 AI 的原意不符。
 func (e *Engine) evaluateCloseInvalidations() {
-	if e.store == nil || e.config == nil || e.config.RiskReentryDecisionMode != "ai_guarded" {
+	if e.store == nil || e.config == nil {
 		return
 	}
 	candidates, err := e.store.ReentryAI().ListCloseInvalidationWatch(e.traderID, 50)

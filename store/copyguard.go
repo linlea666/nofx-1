@@ -87,34 +87,43 @@ const (
 
 // CopyGuardPolicy is persisted as JSON so v4 can evolve without widening the legacy v3 table.
 type CopyGuardPolicy struct {
-	Version                int     `json:"version"`
-	StopMode               string  `json:"stop_mode"`
-	StopPriority           string  `json:"stop_priority"`
-	StopMaxAccountLossPct  float64 `json:"stop_max_account_loss_pct,omitempty"`
-	ATRPeriod              int     `json:"atr_period"`
-	ATRCacheMaxAgeMinutes  int     `json:"atr_cache_max_age_minutes"`
-	ATRFallbackPct         float64 `json:"atr_fallback_pct"`
-	TriggerPriceType       string  `json:"trigger_price_type"`
-	SlippageBufferBPS      float64 `json:"slippage_buffer_bps"`
-	RoundTripFeeBPS        float64 `json:"round_trip_fee_bps"`
-	LiquidationBufferATR   float64 `json:"liquidation_buffer_atr"`
-	MaxReentries           int     `json:"max_reentries"`
-	ReentryBandATR         float64 `json:"reentry_band_atr"`
-	ReentryCooldownSec     int     `json:"reentry_cooldown_seconds"`
-	ReentryMaxChaseATR     float64 `json:"reentry_max_chase_atr"`
-	MaxATRExpansion        float64 `json:"max_atr_expansion"`
-	WatchTimeoutMinutes    int     `json:"watch_timeout_minutes"`
-	MigrationConfirmed     bool    `json:"migration_confirmed"`
-	AddonBudgetPct         float64 `json:"addon_budget_pct"`
-	CycleLossBudgetPct     float64 `json:"cycle_loss_budget_pct"`
-	PortfolioLossBudgetPct float64 `json:"portfolio_loss_budget_pct"`
-	ReentryDecisionMode    string  `json:"reentry_decision_mode"`
-	ReentryMinNotional     float64 `json:"reentry_min_notional"`
-	AIConfidenceThreshold  float64 `json:"ai_confidence_threshold"`
-	AIMinReviewSeconds     int     `json:"ai_min_review_seconds"`
-	AIDailyCallLimit       int     `json:"ai_daily_call_limit"`
-	AILifecycleCallLimit   int     `json:"ai_lifecycle_call_limit"`
-	NotificationLevel      string  `json:"notification_level"`
+	Version                int      `json:"version"`
+	ProtectionMode         string   `json:"risk_protection_mode,omitempty"`
+	PositionMarginStopPct  float64  `json:"risk_position_margin_stop_pct,omitempty"`
+	AccountPct             *float64 `json:"account_pct,omitempty"`
+	ATRMultiplier          *float64 `json:"atr_multiplier,omitempty"`
+	ATRTimeframe           *string  `json:"atr_timeframe,omitempty"`
+	LeverageFallback       *bool    `json:"leverage_fallback,omitempty"`
+	LeverageMaxLoss        *float64 `json:"leverage_max_loss,omitempty"`
+	StopMode               string   `json:"stop_mode"`
+	StopPriority           string   `json:"stop_priority"`
+	StopMaxAccountLossPct  float64  `json:"stop_max_account_loss_pct,omitempty"`
+	ATRPeriod              int      `json:"atr_period"`
+	ATRCacheMaxAgeMinutes  int      `json:"atr_cache_max_age_minutes"`
+	ATRFallbackPct         float64  `json:"atr_fallback_pct"`
+	TriggerPriceType       string   `json:"trigger_price_type"`
+	SlippageBufferBPS      float64  `json:"slippage_buffer_bps"`
+	RoundTripFeeBPS        float64  `json:"round_trip_fee_bps"`
+	LiquidationBufferATR   float64  `json:"liquidation_buffer_atr"`
+	ReentryEnabled         *bool    `json:"reentry_enabled,omitempty"`
+	ReentryRatio           *float64 `json:"reentry_ratio,omitempty"`
+	MaxReentries           int      `json:"max_reentries"`
+	ReentryBandATR         float64  `json:"reentry_band_atr"`
+	ReentryCooldownSec     int      `json:"reentry_cooldown_seconds"`
+	ReentryMaxChaseATR     float64  `json:"reentry_max_chase_atr"`
+	MaxATRExpansion        float64  `json:"max_atr_expansion"`
+	WatchTimeoutMinutes    int      `json:"watch_timeout_minutes"`
+	MigrationConfirmed     bool     `json:"migration_confirmed"`
+	AddonBudgetPct         float64  `json:"addon_budget_pct"`
+	CycleLossBudgetPct     float64  `json:"cycle_loss_budget_pct"`
+	PortfolioLossBudgetPct float64  `json:"portfolio_loss_budget_pct"`
+	ReentryDecisionMode    string   `json:"reentry_decision_mode"`
+	ReentryMinNotional     float64  `json:"reentry_min_notional"`
+	AIConfidenceThreshold  float64  `json:"ai_confidence_threshold"`
+	AIMinReviewSeconds     int      `json:"ai_min_review_seconds"`
+	AIDailyCallLimit       int      `json:"ai_daily_call_limit"`
+	AILifecycleCallLimit   int      `json:"ai_lifecycle_call_limit"`
+	NotificationLevel      string   `json:"notification_level"`
 	// v4.1 重入加严（字段含义见 store.CopyTradeConfig 同名注释）
 	// v5 注：stop_noise_floor_atr / cycle_max_loss_pct 已下线，旧 JSON 中的
 	// 存量值在反序列化时被忽略。
@@ -248,43 +257,63 @@ type CopyGuardEvent struct {
 }
 
 type CopyGuardAttempt struct {
-	ID                      int64      `json:"id"`
-	CycleID                 int64      `json:"cycle_id"`
-	AttemptNo               int        `json:"attempt_no"`
-	Status                  string     `json:"status"`
-	EntryPrice              float64    `json:"entry_price"`
-	ExitPrice               float64    `json:"exit_price"`
-	Quantity                float64    `json:"quantity"`
-	Notional                float64    `json:"notional"`
-	StopTriggerPrice        float64    `json:"stop_trigger_price"`
-	StopFillPrice           float64    `json:"stop_fill_price"`
-	StopAlgoID              string     `json:"stop_algo_id"`
-	ProtectionAlgoID        string     `json:"protection_algo_id"`
-	ProtectionStatus        string     `json:"protection_status"`
-	ProtectionCoverage      float64    `json:"protection_coverage"`
-	ProtectionUpdatedAt     *time.Time `json:"protection_updated_at,omitempty"`
-	FollowerPosID           string     `json:"follower_pos_id"`
-	EntryOrderID            string     `json:"entry_order_id"`
-	ExitOrderID             string     `json:"exit_order_id"`
-	PnL                     float64    `json:"pnl"`
-	Fee                     float64    `json:"fee"`
-	FundingFee              float64    `json:"funding_fee"`
-	LiquidationPenalty      float64    `json:"liquidation_penalty"`
-	Reconciled              bool       `json:"reconciled"`
-	ATR                     float64    `json:"atr"`
-	ActualLeverage          float64    `json:"actual_leverage"`
-	InitialMarginBasis      float64    `json:"initial_margin_basis"`
-	PlannedNotional         float64    `json:"planned_notional"`
-	PromotedNotional        float64    `json:"promoted_notional"`
-	PromotionReason         string     `json:"promotion_reason,omitempty"`
-	AIStopPrice             float64    `json:"ai_stop_price"`
-	FinalStopPrice          float64    `json:"final_stop_price"`
-	StopValidationResult    string     `json:"stop_validation_result,omitempty"`
-	ExpectedPositionLossPct float64    `json:"expected_position_loss_pct"`
-	ActualPositionLossPct   float64    `json:"actual_position_loss_pct"`
-	GovernedBy              string     `json:"governed_by,omitempty"`
-	OpenedAt                time.Time  `json:"opened_at"`
-	ClosedAt                *time.Time `json:"closed_at,omitempty"`
+	ID                          int64      `json:"id"`
+	CycleID                     int64      `json:"cycle_id"`
+	AttemptNo                   int        `json:"attempt_no"`
+	Status                      string     `json:"status"`
+	EntryPrice                  float64    `json:"entry_price"`
+	ExitPrice                   float64    `json:"exit_price"`
+	Quantity                    float64    `json:"quantity"`
+	Notional                    float64    `json:"notional"`
+	StopTriggerPrice            float64    `json:"stop_trigger_price"`
+	StopFillPrice               float64    `json:"stop_fill_price"`
+	StopAlgoID                  string     `json:"stop_algo_id"`
+	ProtectionAlgoID            string     `json:"protection_algo_id"`
+	ProtectionStatus            string     `json:"protection_status"`
+	ProtectionCoverage          float64    `json:"protection_coverage"`
+	ProtectionUpdatedAt         *time.Time `json:"protection_updated_at,omitempty"`
+	FollowerPosID               string     `json:"follower_pos_id"`
+	EntryOrderID                string     `json:"entry_order_id"`
+	ExitOrderID                 string     `json:"exit_order_id"`
+	PnL                         float64    `json:"pnl"`
+	Fee                         float64    `json:"fee"`
+	FundingFee                  float64    `json:"funding_fee"`
+	LiquidationPenalty          float64    `json:"liquidation_penalty"`
+	Reconciled                  bool       `json:"reconciled"`
+	ATR                         float64    `json:"atr"`
+	ActualLeverage              float64    `json:"actual_leverage"`
+	InitialMarginBasis          float64    `json:"initial_margin_basis"`
+	PlannedNotional             float64    `json:"planned_notional"`
+	PromotedNotional            float64    `json:"promoted_notional"`
+	PromotionReason             string     `json:"promotion_reason,omitempty"`
+	AIStopPrice                 float64    `json:"ai_stop_price"`
+	FinalStopPrice              float64    `json:"final_stop_price"`
+	StopAnchorEntryPrice        float64    `json:"stop_anchor_entry_price"`
+	StopAnchorLeverage          float64    `json:"stop_anchor_leverage"`
+	StopAnchorInitialMargin     float64    `json:"stop_anchor_initial_margin"`
+	StopAnchorPrice             float64    `json:"stop_anchor_price"`
+	StopConfiguredMarginLossPct float64    `json:"stop_configured_margin_loss_pct"`
+	StopValidationResult        string     `json:"stop_validation_result,omitempty"`
+	ExpectedPositionLossPct     float64    `json:"expected_position_loss_pct"`
+	ActualPositionLossPct       float64    `json:"actual_position_loss_pct"`
+	GovernedBy                  string     `json:"governed_by,omitempty"`
+	OpenedAt                    time.Time  `json:"opened_at"`
+	ClosedAt                    *time.Time `json:"closed_at,omitempty"`
+}
+
+// CopyGuardStopAnchor is the immutable first-fill basis for
+// position_margin_pct. Mutable attempt entry/quantity fields continue to track
+// the current exchange position and must never be used as this anchor.
+type CopyGuardStopAnchor struct {
+	EntryPrice              float64 `json:"stop_anchor_entry_price"`
+	Leverage                float64 `json:"stop_anchor_leverage"`
+	InitialMargin           float64 `json:"stop_anchor_initial_margin"`
+	Price                   float64 `json:"stop_anchor_price"`
+	ConfiguredMarginLossPct float64 `json:"stop_configured_margin_loss_pct"`
+}
+
+func invalidPositiveNumber(v float64) bool {
+	return math.IsNaN(v) || math.IsInf(v, 0) || v <= 0
 }
 
 func (s *CopyTradeStore) initCopyGuardTables() error {
@@ -336,6 +365,9 @@ func (s *CopyTradeStore) initCopyGuardTables() error {
 			actual_leverage REAL DEFAULT 0, initial_margin_basis REAL DEFAULT 0,
 			planned_notional REAL DEFAULT 0, promoted_notional REAL DEFAULT 0, promotion_reason TEXT DEFAULT '',
 			ai_stop_price REAL DEFAULT 0, final_stop_price REAL DEFAULT 0, stop_validation_result TEXT DEFAULT '',
+			stop_anchor_entry_price REAL DEFAULT 0, stop_anchor_leverage REAL DEFAULT 0,
+			stop_anchor_initial_margin REAL DEFAULT 0, stop_anchor_price REAL DEFAULT 0,
+			stop_configured_margin_loss_pct REAL DEFAULT 0,
 			expected_position_loss_pct REAL DEFAULT 0, governed_by TEXT DEFAULT '',
 			opened_at DATETIME DEFAULT CURRENT_TIMESTAMP, closed_at DATETIME,
 			UNIQUE(cycle_id, attempt_no)
@@ -385,6 +417,35 @@ func (s *CopyTradeStore) initCopyGuardTables() error {
 		);
 		CREATE INDEX IF NOT EXISTS idx_copy_guard_shadow_policy
 			ON copy_guard_shadow_evaluations(trader_id,policy,status,cycle_id);
+		CREATE TABLE IF NOT EXISTS copy_guard_position_margin_shadows (
+			cycle_id INTEGER PRIMARY KEY,
+			trader_id TEXT NOT NULL,
+			status TEXT NOT NULL DEFAULT 'ACTIVE',
+			side TEXT NOT NULL,
+			anchor_entry_price REAL NOT NULL,
+			anchor_leverage REAL NOT NULL,
+			anchor_initial_margin REAL NOT NULL,
+			anchor_stop_price REAL NOT NULL,
+			configured_margin_loss_pct REAL NOT NULL,
+			price_tick_size REAL NOT NULL,
+			quantity_step REAL NOT NULL,
+			initial_quantity REAL NOT NULL,
+			current_entry_price REAL NOT NULL,
+			current_quantity REAL NOT NULL,
+			current_leverage REAL NOT NULL,
+			effective_stop_price REAL NOT NULL,
+			last_leader_size REAL NOT NULL DEFAULT 0,
+			crossed_entry_price REAL NOT NULL DEFAULT 0,
+			crossed_quantity REAL NOT NULL DEFAULT 0,
+			crossed_leverage REAL NOT NULL DEFAULT 0,
+			crossed_price REAL NOT NULL DEFAULT 0,
+			crossed_effective_margin_loss_pct REAL NOT NULL DEFAULT 0,
+			crossed_at DATETIME,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);
+		CREATE INDEX IF NOT EXISTS idx_copy_guard_position_margin_shadows_active
+			ON copy_guard_position_margin_shadows(trader_id,status,cycle_id);
 	`)
 	if err == nil {
 		migrations := []struct {
@@ -425,6 +486,11 @@ func (s *CopyTradeStore) initCopyGuardTables() error {
 			{"copy_guard_attempts", "promotion_reason", "TEXT DEFAULT ''"},
 			{"copy_guard_attempts", "ai_stop_price", "REAL DEFAULT 0"},
 			{"copy_guard_attempts", "final_stop_price", "REAL DEFAULT 0"},
+			{"copy_guard_attempts", "stop_anchor_entry_price", "REAL DEFAULT 0"},
+			{"copy_guard_attempts", "stop_anchor_leverage", "REAL DEFAULT 0"},
+			{"copy_guard_attempts", "stop_anchor_initial_margin", "REAL DEFAULT 0"},
+			{"copy_guard_attempts", "stop_anchor_price", "REAL DEFAULT 0"},
+			{"copy_guard_attempts", "stop_configured_margin_loss_pct", "REAL DEFAULT 0"},
 			{"copy_guard_attempts", "stop_validation_result", "TEXT DEFAULT ''"},
 			{"copy_guard_attempts", "expected_position_loss_pct", "REAL DEFAULT 0"},
 			{"copy_guard_attempts", "governed_by", "TEXT DEFAULT ''"},
@@ -623,13 +689,25 @@ func scanCopyGuardWatchSample(scan func(dest ...interface{}) error) (*CopyGuardW
 }
 
 func policyFromConfig(c *CopyTradeConfig) CopyGuardPolicy {
+	accountPct := c.RiskAccountPct
+	atrMultiplier := c.RiskATRMultiplier
+	atrTimeframe := c.RiskATRTimeframe
+	leverageFallback := c.RiskLeverageFallback
+	leverageMaxLoss := c.RiskLeverageMaxLoss
+	reentryEnabled := c.RiskReentryEnabled
+	reentryRatio := c.RiskReentryRatio
 	return CopyGuardPolicy{
-		Version: c.RiskPolicyVersion, StopMode: c.RiskStopMode, StopPriority: c.RiskStopPriority,
+		Version: c.RiskPolicyVersion, ProtectionMode: c.RiskProtectionMode,
+		PositionMarginStopPct: c.RiskPositionMarginStopPct,
+		AccountPct:            &accountPct, ATRMultiplier: &atrMultiplier, ATRTimeframe: &atrTimeframe,
+		LeverageFallback: &leverageFallback, LeverageMaxLoss: &leverageMaxLoss,
+		StopMode: c.RiskStopMode, StopPriority: c.RiskStopPriority,
 		StopMaxAccountLossPct: c.RiskStopMaxAccountLossPct,
 		ATRPeriod:             c.RiskATRPeriod, ATRCacheMaxAgeMinutes: c.RiskATRCacheMaxAgeMinutes,
 		ATRFallbackPct: c.RiskATRFallbackPct, TriggerPriceType: c.RiskTriggerPriceType,
 		SlippageBufferBPS: c.RiskSlippageBufferBPS, RoundTripFeeBPS: c.RiskRoundTripFeeBPS,
-		LiquidationBufferATR: c.RiskLiquidationBufferATR, MaxReentries: c.RiskMaxReentries,
+		LiquidationBufferATR: c.RiskLiquidationBufferATR,
+		ReentryEnabled:       &reentryEnabled, ReentryRatio: &reentryRatio, MaxReentries: c.RiskMaxReentries,
 		ReentryBandATR: c.RiskReentryBandATR, ReentryCooldownSec: c.RiskReentryCooldownSeconds,
 		ReentryMaxChaseATR: c.RiskReentryMaxChaseATR, MaxATRExpansion: c.RiskReentryMaxATRExpansion,
 		WatchTimeoutMinutes: c.RiskWatchTimeoutMinutes, MigrationConfirmed: c.RiskMigrationConfirmed,
@@ -689,12 +767,35 @@ func (s *CopyTradeStore) loadCopyGuardPolicy(c *CopyTradeConfig) error {
 		return err
 	}
 	c.RiskPolicyVersion, c.RiskStopMode, c.RiskATRPeriod = p.Version, p.StopMode, p.ATRPeriod
+	c.RiskProtectionMode = p.ProtectionMode
+	c.RiskPositionMarginStopPct = p.PositionMarginStopPct
+	if p.AccountPct != nil {
+		c.RiskAccountPct = *p.AccountPct
+	}
+	if p.ATRMultiplier != nil {
+		c.RiskATRMultiplier = *p.ATRMultiplier
+	}
+	if p.ATRTimeframe != nil {
+		c.RiskATRTimeframe = *p.ATRTimeframe
+	}
+	if p.LeverageFallback != nil {
+		c.RiskLeverageFallback = *p.LeverageFallback
+	}
+	if p.LeverageMaxLoss != nil {
+		c.RiskLeverageMaxLoss = *p.LeverageMaxLoss
+	}
 	c.RiskStopPriority = p.StopPriority
 	c.RiskStopMaxAccountLossPct = p.StopMaxAccountLossPct
 	c.RiskATRCacheMaxAgeMinutes = p.ATRCacheMaxAgeMinutes
 	c.RiskATRFallbackPct, c.RiskTriggerPriceType = p.ATRFallbackPct, p.TriggerPriceType
 	c.RiskSlippageBufferBPS, c.RiskLiquidationBufferATR = p.SlippageBufferBPS, p.LiquidationBufferATR
 	c.RiskRoundTripFeeBPS = p.RoundTripFeeBPS
+	if p.ReentryEnabled != nil {
+		c.RiskReentryEnabled = *p.ReentryEnabled
+	}
+	if p.ReentryRatio != nil {
+		c.RiskReentryRatio = *p.ReentryRatio
+	}
 	c.RiskMaxReentries, c.RiskReentryBandATR = p.MaxReentries, p.ReentryBandATR
 	c.RiskReentryCooldownSeconds, c.RiskReentryMaxChaseATR = p.ReentryCooldownSec, p.ReentryMaxChaseATR
 	c.RiskReentryMaxATRExpansion, c.RiskWatchTimeoutMinutes = p.MaxATRExpansion, p.WatchTimeoutMinutes
@@ -2062,11 +2163,168 @@ func (s *CopyTradeStore) UpdateCopyGuardAttemptRiskAudit(cycleID int64, attempt 
 	return err
 }
 
+// InitializeCopyGuardStopAnchor atomically freezes the first confirmed
+// follower fill. Concurrent retries and process recovery always read the
+// winner; a later weighted-average entry can never overwrite it.
+func (s *CopyTradeStore) InitializeCopyGuardStopAnchor(cycleID int64, attempt int, proposed CopyGuardStopAnchor) (*CopyGuardStopAnchor, bool, error) {
+	if cycleID <= 0 || attempt < 0 || invalidPositiveNumber(proposed.EntryPrice) || invalidPositiveNumber(proposed.Leverage) ||
+		invalidPositiveNumber(proposed.InitialMargin) || invalidPositiveNumber(proposed.Price) ||
+		invalidPositiveNumber(proposed.ConfiguredMarginLossPct) || proposed.ConfiguredMarginLossPct >= 1 {
+		return nil, false, fmt.Errorf("invalid copy guard stop anchor")
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, false, err
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`UPDATE copy_guard_attempts SET
+		stop_anchor_entry_price=?,stop_anchor_leverage=?,stop_anchor_initial_margin=?,
+		stop_anchor_price=?,stop_configured_margin_loss_pct=?
+		WHERE cycle_id=? AND attempt_no=? AND COALESCE(stop_anchor_price,0)<=0`,
+		proposed.EntryPrice, proposed.Leverage, proposed.InitialMargin,
+		proposed.Price, proposed.ConfiguredMarginLossPct, cycleID, attempt)
+	if err != nil {
+		return nil, false, err
+	}
+	written, err := res.RowsAffected()
+	if err != nil {
+		return nil, false, err
+	}
+	var anchor CopyGuardStopAnchor
+	if err = tx.QueryRow(`SELECT stop_anchor_entry_price,stop_anchor_leverage,
+		stop_anchor_initial_margin,stop_anchor_price,stop_configured_margin_loss_pct
+		FROM copy_guard_attempts WHERE cycle_id=? AND attempt_no=?`, cycleID, attempt).
+		Scan(&anchor.EntryPrice, &anchor.Leverage, &anchor.InitialMargin, &anchor.Price, &anchor.ConfiguredMarginLossPct); err != nil {
+		return nil, false, err
+	}
+	if err = tx.Commit(); err != nil {
+		return nil, false, err
+	}
+	return &anchor, written == 1, nil
+}
+
+// GetCopyGuardStopAnchor returns only a fully initialized anchor. Callers use
+// this before calculating a proposal so recovery cannot be blocked by a later
+// weighted-average entry or leverage value that was never part of the anchor.
+func (s *CopyTradeStore) GetCopyGuardStopAnchor(cycleID int64, attempt int) (*CopyGuardStopAnchor, error) {
+	var anchor CopyGuardStopAnchor
+	err := s.db.QueryRow(`SELECT stop_anchor_entry_price,stop_anchor_leverage,
+		stop_anchor_initial_margin,stop_anchor_price,stop_configured_margin_loss_pct
+		FROM copy_guard_attempts WHERE cycle_id=? AND attempt_no=?`, cycleID, attempt).
+		Scan(&anchor.EntryPrice, &anchor.Leverage, &anchor.InitialMargin, &anchor.Price, &anchor.ConfiguredMarginLossPct)
+	if err != nil {
+		return nil, err
+	}
+	if anchor.EntryPrice <= 0 || anchor.Leverage <= 0 || anchor.InitialMargin <= 0 ||
+		anchor.Price <= 0 || anchor.ConfiguredMarginLossPct <= 0 || anchor.ConfiguredMarginLossPct >= 1 {
+		return nil, sql.ErrNoRows
+	}
+	return &anchor, nil
+}
+
+// GetCopyGuardAttemptFinalStop returns the durable one-way stop state. It is
+// intentionally separate from the live protective-order row: a safe
+// replacement may have canceled the old venue order before placing its
+// successor, but that temporary gap must never authorize widening a previous
+// liquidation-safety tightening back to the original anchor.
+func (s *CopyTradeStore) GetCopyGuardAttemptFinalStop(cycleID int64, attempt int) (float64, error) {
+	var stop float64
+	if err := s.db.QueryRow(`SELECT final_stop_price FROM copy_guard_attempts
+		WHERE cycle_id=? AND attempt_no=?`, cycleID, attempt).Scan(&stop); err != nil {
+		return 0, err
+	}
+	if stop <= 0 {
+		return 0, sql.ErrNoRows
+	}
+	return stop, nil
+}
+
+// TightenCopyGuardPositionMarginStopAudit atomically persists the mutable
+// fixed-stop audit while enforcing the one-way stop invariant at the storage
+// boundary. This remains safe across monitor/action races and overlapping
+// process recovery: a long stop can only increase and a short stop can only
+// decrease after its first positive value.
+func (s *CopyTradeStore) TightenCopyGuardPositionMarginStopAudit(
+	cycleID int64,
+	attempt int,
+	side string,
+	actualLeverage, initialMargin, currentEntry, candidateStop float64,
+	governedBy string,
+) (float64, error) {
+	if cycleID <= 0 || attempt < 0 || (side != "long" && side != "short") ||
+		invalidPositiveNumber(actualLeverage) || invalidPositiveNumber(initialMargin) ||
+		invalidPositiveNumber(currentEntry) || invalidPositiveNumber(candidateStop) {
+		return 0, fmt.Errorf("invalid copy guard position-margin stop audit")
+	}
+	if strings.TrimSpace(governedBy) == "" {
+		governedBy = "position_margin_anchor"
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`UPDATE copy_guard_attempts SET
+		actual_leverage=?,initial_margin_basis=?,stop_validation_result='POST_FILL_VALIDATED',
+		governed_by=CASE
+			WHEN COALESCE(final_stop_price,0)<=0 THEN ?
+			WHEN ?='long' AND final_stop_price>=? THEN COALESCE(NULLIF(governed_by,''),'position_margin_existing_tighter')
+			WHEN ?='short' AND final_stop_price<=? THEN COALESCE(NULLIF(governed_by,''),'position_margin_existing_tighter')
+			ELSE ?
+		END,
+		final_stop_price=CASE
+			WHEN ?='long' THEN MAX(COALESCE(final_stop_price,0),?)
+			WHEN COALESCE(final_stop_price,0)<=0 THEN ?
+			ELSE MIN(final_stop_price,?)
+		END
+		WHERE cycle_id=? AND attempt_no=?`,
+		actualLeverage, initialMargin,
+		governedBy, side, candidateStop, side, candidateStop, governedBy,
+		side, candidateStop, candidateStop, candidateStop,
+		cycleID, attempt)
+	if err != nil {
+		return 0, err
+	}
+	if n, rowsErr := res.RowsAffected(); rowsErr != nil {
+		return 0, rowsErr
+	} else if n != 1 {
+		return 0, fmt.Errorf("copy guard attempt %d/%d not found", cycleID, attempt)
+	}
+	var finalStop float64
+	var effectiveGoverned string
+	if err = tx.QueryRow(`SELECT final_stop_price,COALESCE(governed_by,'')
+		FROM copy_guard_attempts WHERE cycle_id=? AND attempt_no=?`, cycleID, attempt).
+		Scan(&finalStop, &effectiveGoverned); err != nil {
+		return 0, err
+	}
+	adverseDistance := 0.0
+	if side == "long" && finalStop < currentEntry {
+		adverseDistance = currentEntry - finalStop
+	}
+	if side == "short" && finalStop > currentEntry {
+		adverseDistance = finalStop - currentEntry
+	}
+	expectedPct := adverseDistance / currentEntry * actualLeverage
+	if math.IsNaN(expectedPct) || math.IsInf(expectedPct, 0) || expectedPct < 0 {
+		return 0, fmt.Errorf("copy guard position-margin stop audit overflows")
+	}
+	if _, err = tx.Exec(`UPDATE copy_guard_attempts SET expected_position_loss_pct=?
+		WHERE cycle_id=? AND attempt_no=?`, expectedPct, cycleID, attempt); err != nil {
+		return 0, err
+	}
+	if err = tx.Commit(); err != nil {
+		return 0, err
+	}
+	return finalStop, nil
+}
+
 func (s *CopyTradeStore) ListCopyGuardAttempts(cycleID int64) ([]*CopyGuardAttempt, error) {
 	rows, err := s.db.Query(`SELECT id,cycle_id,attempt_no,status,entry_price,exit_price,quantity,notional,stop_trigger_price,stop_fill_price,stop_algo_id,
 		COALESCE(protection_algo_id,''),COALESCE(protection_status,'PENDING'),COALESCE(protection_coverage,0),protection_updated_at,
 		follower_pos_id,entry_order_id,exit_order_id,pnl,fee,funding_fee,liquidation_penalty,reconciled,atr,opened_at,closed_at
-		,actual_leverage,initial_margin_basis,planned_notional,promoted_notional,COALESCE(promotion_reason,''),ai_stop_price,final_stop_price,COALESCE(stop_validation_result,''),expected_position_loss_pct,COALESCE(governed_by,'')
+		,actual_leverage,initial_margin_basis,planned_notional,promoted_notional,COALESCE(promotion_reason,''),ai_stop_price,final_stop_price,
+		stop_anchor_entry_price,stop_anchor_leverage,stop_anchor_initial_margin,stop_anchor_price,stop_configured_margin_loss_pct,
+		COALESCE(stop_validation_result,''),expected_position_loss_pct,COALESCE(governed_by,'')
 		FROM copy_guard_attempts WHERE cycle_id=? ORDER BY attempt_no,id`, cycleID)
 	if err != nil {
 		return nil, err
@@ -2080,7 +2338,9 @@ func (s *CopyTradeStore) ListCopyGuardAttempts(cycleID int64) ([]*CopyGuardAttem
 		if err := rows.Scan(&a.ID, &a.CycleID, &a.AttemptNo, &a.Status, &a.EntryPrice, &a.ExitPrice, &a.Quantity, &a.Notional, &a.StopTriggerPrice, &a.StopFillPrice, &a.StopAlgoID,
 			&a.ProtectionAlgoID, &a.ProtectionStatus, &a.ProtectionCoverage, &protectionUpdated,
 			&a.FollowerPosID, &a.EntryOrderID, &a.ExitOrderID, &a.PnL, &a.Fee, &a.FundingFee, &a.LiquidationPenalty, &a.Reconciled, &a.ATR, &opened, &closed,
-			&a.ActualLeverage, &a.InitialMarginBasis, &a.PlannedNotional, &a.PromotedNotional, &a.PromotionReason, &a.AIStopPrice, &a.FinalStopPrice, &a.StopValidationResult, &a.ExpectedPositionLossPct, &a.GovernedBy); err != nil {
+			&a.ActualLeverage, &a.InitialMarginBasis, &a.PlannedNotional, &a.PromotedNotional, &a.PromotionReason, &a.AIStopPrice, &a.FinalStopPrice,
+			&a.StopAnchorEntryPrice, &a.StopAnchorLeverage, &a.StopAnchorInitialMargin, &a.StopAnchorPrice, &a.StopConfiguredMarginLossPct,
+			&a.StopValidationResult, &a.ExpectedPositionLossPct, &a.GovernedBy); err != nil {
 			return nil, err
 		}
 		if a.OpenedAt, err = parseDBTime(opened); err != nil {

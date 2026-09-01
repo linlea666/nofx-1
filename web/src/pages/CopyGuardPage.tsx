@@ -173,6 +173,21 @@ const eventLabels: Record<string, string> = {
   GUARD_UNPROTECTED_WARNING: '无法保护·保留仓位并持续告警',
   // 保护单挂单链
   PROTECTION_PLAN: '保护单方案已确定',
+  POSITION_MARGIN_STOP_ANCHOR_FROZEN: '首仓固定止损锚点已固化',
+  POSITION_MARGIN_PROTECTION_QUANTITY_SYNCED: '固定止损保护数量已同步',
+  POSITION_MARGIN_LIQUIDATION_TIGHTENED: '固定止损因强平安全线单向收紧',
+  POSITION_MARGIN_STOP_TRIGGERED: '固定仓位止损已触发',
+  POSITION_MARGIN_STOP_EXIT_SUBMITTED: '固定仓位止损平仓已提交',
+  POSITION_MARGIN_STOP_RESIDUAL_EXIT_SUBMITTED:
+    '固定仓位止损残余仓位已再次平仓',
+  POSITION_MARGIN_STOP_FLAT_UNKNOWN: '固定仓位止损等待空仓确认',
+  POSITION_MARGIN_REENTRY_DISABLED: '固定仓位止损禁止二次进场',
+  POSITION_MARGIN_REENTRY_BLOCKED: '固定仓位止损拦截二次进场',
+  POSITION_MARGIN_SIGNAL_IGNORED: '止损后领航员信号已忽略',
+  SHADOW_POSITION_MARGIN_ANCHOR_FROZEN: '80% 影子止损锚点已固化',
+  SHADOW_POSITION_MARGIN_QUANTITY_SYNCED: '80% 影子仓位数量已同步',
+  SHADOW_POSITION_MARGIN_LIQUIDATION_TIGHTENED: '80% 影子止损因强平线收紧',
+  SHADOW_POSITION_MARGIN_STOP_CROSSED: '80% 影子止损首次穿越',
   PROTECTION_REPLACEMENT_PENDING: '保护单换单中',
   PROTECTION_REPLACEMENT_COMPLETED: '保护单换单完成',
   PROTECTION_DISABLED_CANCELED: '止损功能关闭，已撤销保护单',
@@ -263,10 +278,14 @@ const unprotectableReasonLabels: Record<string, string> = {
 // 这些判定必须跟随后端的控线字段：v8 之前保证金上限会收紧距离并把 governed_by
 // 写成 margin_cap，徽章据此触发；改为只报不改之后该值不再出现，徽章会永久静默，
 // 而超限信息改由 margin_cap_exceeded 承载。
-const eventRiskBadges = (e: { type: string; metadata?: Record<string, unknown> | null }) => {
+const eventRiskBadges = (e: {
+  type: string
+  metadata?: Record<string, unknown> | null
+}) => {
   const meta = e.metadata
   if (!meta) return null
-  const badges: { key: string; text: string; title: string; tone: string }[] = []
+  const badges: { key: string; text: string; title: string; tone: string }[] =
+    []
   const atrRatio =
     typeof meta.distance_atr_ratio === 'number' ? meta.distance_atr_ratio : null
 
@@ -311,7 +330,8 @@ const eventRiskBadges = (e: { type: string; metadata?: Record<string, unknown> |
         meta.reason === 'STRUCTURAL_NOISE'
           ? '止损距离低于配置的结构性下限（risk_min_stop_atr_ratio），挂出的止损大概率被噪音扫到，因此不挂止损、转告警并交由 AI 观察'
           : String(meta.error ?? ''),
-      tone: meta.reason === 'STRUCTURAL_NOISE' ? 'text-[#848E9C]' : 'text-red-400',
+      tone:
+        meta.reason === 'STRUCTURAL_NOISE' ? 'text-[#848E9C]' : 'text-red-400',
     })
   }
 
@@ -1327,8 +1347,8 @@ function AdvisorSettingsCard() {
                 </div>
                 <div className="text-[#848E9C]">
                   已终结 {stats.candidate_closed ?? 0} 个，其中{' '}
-                  {stats.candidate_never_reviewed ?? 0}{' '}
-                  个一次 AI 审查都没轮到就失效。平均存活{' '}
+                  {stats.candidate_never_reviewed ?? 0} 个一次 AI
+                  审查都没轮到就失效。平均存活{' '}
                   {formatDurationSeconds(
                     stats.candidate_mean_lifetime_seconds ?? 0
                   )}
@@ -1665,7 +1685,6 @@ function MarketPreviewCard() {
     </details>
   )
 }
-
 
 function AICandidatesPanel() {
   const { data, mutate } = useSWR<{
@@ -2718,7 +2737,9 @@ export function CopyGuardPage() {
               <div className="mb-2 flex items-center gap-2">
                 <span className="font-medium">止损成效归因</span>
                 {detail.attribution.final ? (
-                  <span className="text-xs text-[#0ECB81]">已对账·结论可用</span>
+                  <span className="text-xs text-[#0ECB81]">
+                    已对账·结论可用
+                  </span>
                 ) : (
                   <span className="text-xs text-[#848E9C]">
                     周期未收尾，挽回/错过待对账后才计算
@@ -2987,20 +3008,119 @@ export function CopyGuardPage() {
                     <span>离场 {a.exit_price || '-'}</span>
                     <span>净盈亏 {a.pnl.toFixed(2)}</span>
                   </div>
-                  {a.ai_stop_price > 0 && (
+                  {(a.ai_stop_price > 0 || a.stop_anchor_price > 0) && (
                     <div className="grid gap-1 text-xs text-[#848E9C] sm:grid-cols-3">
-                      <span>
-                        金额：计划 {a.planned_notional.toFixed(2)} → 执行{' '}
-                        {a.promoted_notional.toFixed(2)} USDT
-                      </span>
-                      <span>
-                        杠杆 {a.actual_leverage || '-'}× · 初始保证金{' '}
-                        {a.initial_margin_basis.toFixed(2)} USDT
-                      </span>
-                      <span>
-                        AI 止损 {a.ai_stop_price} · 最终止损{' '}
-                        {a.final_stop_price || '-'}
-                      </span>
+                      {a.ai_stop_price > 0 && (
+                        <>
+                          <span>
+                            AI 金额：计划 {a.planned_notional.toFixed(2)} → 执行{' '}
+                            {a.promoted_notional.toFixed(2)} USDT
+                          </span>
+                          <span>
+                            AI 杠杆 {a.actual_leverage || '-'}× · 保证金{' '}
+                            {a.initial_margin_basis.toFixed(2)} USDT
+                          </span>
+                          <span>
+                            AI 止损 {a.ai_stop_price} · 最终止损{' '}
+                            {a.final_stop_price || '-'}
+                          </span>
+                        </>
+                      )}
+                      {a.stop_anchor_price > 0 &&
+                        (() => {
+                          const effectiveStop =
+                            a.final_stop_price > 0
+                              ? a.final_stop_price
+                              : a.stop_anchor_price
+                          const actualHostedStop =
+                            detail.protection?.status?.toLowerCase() ===
+                              'live' && detail.protection.trigger_price > 0
+                              ? detail.protection.trigger_price
+                              : null
+                          const priceDistance = Math.max(
+                            0,
+                            detail.cycle.side === 'long'
+                              ? a.entry_price - effectiveStop
+                              : effectiveStop - a.entry_price
+                          )
+                          const equivalentMovePct =
+                            a.entry_price > 0
+                              ? (priceDistance / a.entry_price) * 100
+                              : 0
+                          const atrDistance =
+                            a.atr > 0 ? priceDistance / a.atr : null
+                          const safetyTightened =
+                            Math.abs(effectiveStop - a.stop_anchor_price) >
+                            1e-12
+                          return (
+                            <>
+                              <span>
+                                首仓锚定均价 {a.stop_anchor_entry_price} · 杠杆{' '}
+                                {a.stop_anchor_leverage}×
+                              </span>
+                              <span>
+                                首仓理论保证金{' '}
+                                {a.stop_anchor_initial_margin.toFixed(2)} USDT ·
+                                配置{' '}
+                                {(
+                                  a.stop_configured_margin_loss_pct * 100
+                                ).toFixed(2)}
+                                %
+                              </span>
+                              <span>
+                                首仓理论风险{' '}
+                                {(
+                                  a.stop_anchor_initial_margin *
+                                  a.stop_configured_margin_loss_pct
+                                ).toFixed(2)}{' '}
+                                USDT
+                              </span>
+                              <span>
+                                固定策略止损 {a.stop_anchor_price} · 当前策略{' '}
+                                {effectiveStop}
+                              </span>
+                              <span>
+                                当前实际挂单{' '}
+                                {actualHostedStop === null
+                                  ? '未确认（系统持续重试）'
+                                  : actualHostedStop}
+                              </span>
+                              <span>
+                                当前仓位 {a.quantity} · 均价 {a.entry_price} ·
+                                杠杆 {a.actual_leverage || '-'}×
+                              </span>
+                              <span>
+                                当前止损风险{' '}
+                                {(priceDistance * a.quantity).toFixed(2)} USDT
+                              </span>
+                              <span>
+                                当前等效保证金亏损{' '}
+                                {(
+                                  equivalentMovePct * a.actual_leverage
+                                ).toFixed(2)}
+                                %
+                              </span>
+                              <span>
+                                等价价格波动 {equivalentMovePct.toFixed(4)}% ·
+                                ATR 距离{' '}
+                                {atrDistance === null
+                                  ? '—'
+                                  : `${atrDistance.toFixed(2)}×`}
+                              </span>
+                              <span
+                                className={
+                                  safetyTightened ? 'text-[#F0B90B]' : ''
+                                }
+                              >
+                                强平安全修正：
+                                {safetyTightened ? '已单向收紧' : '未触发'}
+                              </span>
+                              <span className="text-[#F0B90B] sm:col-span-3">
+                                费用、资金费、滑点和跳空不计入触发公式；实际成交损失可能高于理论风险。
+                              </span>
+                            </>
+                          )
+                        })()}
                       <span>
                         预计仓位亏损{' '}
                         {(a.expected_position_loss_pct * 100).toFixed(2)}%

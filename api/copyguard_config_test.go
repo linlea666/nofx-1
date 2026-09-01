@@ -2,7 +2,9 @@ package api
 
 import (
 	"math"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"nofx/copytrade"
 	"nofx/store"
@@ -176,5 +178,90 @@ func TestApplyCopyConfigRiskFieldsKeepsBinance(t *testing.T) {
 	}
 	if !cfg.RiskReentryEnabled || cfg.RiskMaxReentries != 2 || cfg.RiskReentryCooldownSeconds != 300 || cfg.RiskSlippageBufferBPS != 10 {
 		t.Fatalf("[binance] unexpected v4 defaults: %+v", cfg)
+	}
+}
+
+func TestApplyCopyConfigRiskFieldsPositionMarginModeRequiresIsolatedSettings(t *testing.T) {
+	mode := store.RiskProtectionModePositionMarginPct
+	pct := 0.80
+	disabled := false
+	zero := 0
+	disabledMode := "disabled"
+	cfg := store.NewCopyGuardDefaults()
+	cfg.ProviderType = "binance"
+	applyCopyConfigRiskFields(cfg, &CopyConfigReq{
+		RiskPolicyVersion:         4,
+		RiskProtectionMode:        &mode,
+		RiskPositionMarginStopPct: &pct,
+		RiskTriggerPriceType:      "mark",
+		RiskReentryEnabled:        &disabled,
+		RiskReentryDecisionMode:   &disabledMode,
+		RiskMaxReentries:          &zero,
+	})
+	if cfg.RiskProtectionMode != mode || cfg.RiskPositionMarginStopPct != pct {
+		t.Fatalf("fixed stop fields were not applied: %+v", cfg)
+	}
+	if err := copytrade.ValidateStoredRiskPolicy(cfg); err != nil {
+		t.Fatalf("valid fixed stop request was rejected: %v", err)
+	}
+	cfg.RiskReentryEnabled = true
+	if err := copytrade.ValidateStoredRiskPolicy(cfg); err == nil {
+		t.Fatal("fixed mode accepted a contradictory reentry request")
+	}
+}
+
+func TestConfigSwitchToFixedKeepsActiveATRLifecycleCandidate(t *testing.T) {
+	st, err := store.New(filepath.Join(t.TempDir(), "copyguard-config-switch.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if _, err = st.DB().Exec(`INSERT INTO traders
+		(id,user_id,name,ai_model_id,exchange_id,initial_balance,is_running,lifecycle_status,lifecycle_generation)
+		VALUES('trader-1','user-1','Trader 1','model-1','exchange-1',1000,1,?,1)`, store.TraderLifecycleRunning); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = st.DB().Exec(`INSERT INTO copy_guard_cycles
+		(id,trader_id,leader_id,leader_pos_id,symbol,side,margin_mode,status,policy_snapshot)
+		VALUES(1,'trader-1','leader-1','position-1','BTCUSDT','long','cross','AI_WAITING',?)`,
+		`{"version":4,"risk_protection_mode":"atr_structure","reentry_enabled":true,"reentry_decision_mode":"ai_guarded","max_reentries":2}`); err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := st.ReentryAI().EnsureReentryCandidate(&store.CopyGuardReentryCandidate{
+		CycleID: 1, TraderID: "trader-1", LeaderPosID: "position-1", Symbol: "BTCUSDT", Side: "long",
+		FeatureHash: "snapshot-switch", Protectable: true,
+	}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	old := store.NewCopyGuardDefaults()
+	old.TraderID = "trader-1"
+	old.RiskStopLossEnabled = true
+	old.RiskReentryEnabled = true
+	old.RiskReentryDecisionMode = "ai_guarded"
+	current := *old
+	current.RiskProtectionMode = store.RiskProtectionModePositionMarginPct
+	current.RiskReentryEnabled = false
+	current.RiskReentryDecisionMode = "disabled"
+	current.RiskMaxReentries = 0
+	disableReentryCandidatesAfterConfigSave(st, old, &current)
+
+	kept, err := st.ReentryAI().GetReentryCandidate(candidate.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kept.Status == store.ReentryCandidateInvalidated {
+		t.Fatalf("template mode switch invalidated an active ATR lifecycle candidate: %+v", kept)
+	}
+
+	current.RiskStopLossEnabled = false
+	disableReentryCandidatesAfterConfigSave(st, old, &current)
+	disabled, err := st.ReentryAI().GetReentryCandidate(candidate.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if disabled.Status != store.ReentryCandidateInvalidated {
+		t.Fatalf("master protection disable did not invalidate an unsubmitted candidate: %+v", disabled)
 	}
 }

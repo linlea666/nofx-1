@@ -275,6 +275,8 @@ interface FormState {
   // stop_noise_floor / cycle_max_loss）已随 v5 下线。
   // ============================================================
   risk_stop_loss_enabled: boolean // 默认 true：启用账户保护硬止损
+  risk_protection_mode: 'atr_structure' | 'position_margin_pct'
+  risk_position_margin_stop_pct: number // 前端百分比，默认80
   risk_stop_max_account_loss_pct: number // 0=继承账户默认值；否则为交易员覆盖百分比
   risk_account_pct: number // 单次尝试风险（前端百分比）
   risk_cycle_loss_budget_pct: number
@@ -365,6 +367,8 @@ export function TraderConfigModal({
     copy_binance_csrf_token: '',
     // 账户保护 v5 风控默认值（与后端 store.FillRiskDefaults 保持一致）
     risk_stop_loss_enabled: true,
+    risk_protection_mode: 'atr_structure',
+    risk_position_margin_stop_pct: 80,
     risk_stop_max_account_loss_pct: 0,
     risk_account_pct: 2,
     risk_cycle_loss_budget_pct: 5,
@@ -518,6 +522,9 @@ export function TraderConfigModal({
             copy_binance_csrf_token: cfg.binance_csrf_token ?? '',
             // 风控字段回填（× 100 转百分比展示，与 store.FillRiskDefaults 保持一致）
             risk_stop_loss_enabled: cfg.risk_stop_loss_enabled ?? true,
+            risk_protection_mode: cfg.risk_protection_mode ?? 'atr_structure',
+            risk_position_margin_stop_pct:
+              (cfg.risk_position_margin_stop_pct ?? 0.8) * 100,
             risk_stop_max_account_loss_pct:
               (cfg.risk_stop_max_account_loss_pct ?? 0) * 100,
             risk_account_pct:
@@ -623,6 +630,9 @@ export function TraderConfigModal({
         setFormData((prev) => ({
           ...prev,
           risk_stop_loss_enabled: cfg.risk_stop_loss_enabled ?? true,
+          risk_protection_mode: cfg.risk_protection_mode ?? 'atr_structure',
+          risk_position_margin_stop_pct:
+            (cfg.risk_position_margin_stop_pct ?? 0.8) * 100,
           risk_stop_max_account_loss_pct:
             (cfg.risk_stop_max_account_loss_pct ?? 0) * 100,
           copy_catchup_window_seconds: cfg.copy_catchup_window_seconds ?? 60,
@@ -707,6 +717,8 @@ export function TraderConfigModal({
         copy_binance_csrf_token: '',
         // 风控默认值（与 useState 初始值保持一致）
         risk_stop_loss_enabled: true,
+        risk_protection_mode: 'atr_structure',
+        risk_position_margin_stop_pct: 80,
         risk_stop_max_account_loss_pct: 0,
         risk_account_pct: 2,
         risk_cycle_loss_budget_pct: 5,
@@ -806,11 +818,15 @@ export function TraderConfigModal({
       formData.decision_mode === 'copy_trade' &&
       copyGuardCapableProvider(formData.copy_provider_type) &&
       formData.risk_policy_version >= 4
+    const isFixedPositionMargin =
+      isCopyGuardEnabled &&
+      formData.risk_protection_mode === 'position_margin_pct'
     let highRiskConfirmed = false
     let extremeRiskConfirmValue: number | undefined
     let stopExtremeRiskConfirmValue: number | undefined
     if (
       isCopyGuardEnabled &&
+      !isFixedPositionMargin &&
       !(
         formData.risk_account_pct >= 0.1 &&
         formData.risk_account_pct <= formData.risk_cycle_loss_budget_pct &&
@@ -824,7 +840,11 @@ export function TraderConfigModal({
       )
       return
     }
-    if (isCopyGuardEnabled && formData.risk_account_pct > 8) {
+    if (
+      isCopyGuardEnabled &&
+      !isFixedPositionMargin &&
+      formData.risk_account_pct > 8
+    ) {
       const typed = window.prompt(
         `单次风险 ${formData.risk_account_pct.toFixed(2)}% 属于极高风险。请输入该百分比数值确认：`
       )
@@ -835,6 +855,7 @@ export function TraderConfigModal({
     }
     if (
       isCopyGuardEnabled &&
+      !isFixedPositionMargin &&
       formData.risk_account_pct > 4 &&
       formData.risk_account_pct <= 8 &&
       !window.confirm(
@@ -843,11 +864,16 @@ export function TraderConfigModal({
     ) {
       return
     }
-    if (isCopyGuardEnabled && formData.risk_account_pct > 4) {
+    if (
+      isCopyGuardEnabled &&
+      !isFixedPositionMargin &&
+      formData.risk_account_pct > 4
+    ) {
       highRiskConfirmed = true
     }
     if (
       isCopyGuardEnabled &&
+      !isFixedPositionMargin &&
       (formData.risk_stop_max_account_loss_pct < 0 ||
         (formData.risk_stop_max_account_loss_pct > 0 &&
           formData.risk_stop_max_account_loss_pct < 0.1) ||
@@ -858,6 +884,7 @@ export function TraderConfigModal({
     }
     if (
       isCopyGuardEnabled &&
+      !isFixedPositionMargin &&
       formData.risk_stop_priority === 'account_cap' &&
       formData.risk_stop_max_account_loss_pct > 10
     ) {
@@ -872,6 +899,14 @@ export function TraderConfigModal({
       }
       highRiskConfirmed = true
       stopExtremeRiskConfirmValue = Number(typed)
+    }
+    if (
+      isFixedPositionMargin &&
+      (formData.risk_position_margin_stop_pct < 1 ||
+        formData.risk_position_margin_stop_pct > 99)
+    ) {
+      window.alert('首仓保证金止损比例必须为 1%～99%')
+      return
     }
 
     let normalizedTopTraderID: string | null = null
@@ -974,6 +1009,9 @@ export function TraderConfigModal({
           Object.assign(saveData.copy_config, {
             // 前端展示百分比 → 后端存比例，× 0.01 转换
             risk_stop_loss_enabled: formData.risk_stop_loss_enabled,
+            risk_protection_mode: formData.risk_protection_mode,
+            risk_position_margin_stop_pct:
+              formData.risk_position_margin_stop_pct / 100,
             risk_stop_max_account_loss_pct:
               formData.risk_stop_max_account_loss_pct / 100,
             risk_account_pct: formData.risk_account_pct / 100,
@@ -986,9 +1024,13 @@ export function TraderConfigModal({
             risk_atr_timeframe: formData.risk_atr_timeframe,
             risk_leverage_fallback: formData.risk_leverage_fallback,
             risk_leverage_max_loss: formData.risk_leverage_max_loss / 100,
-            risk_reentry_enabled: formData.risk_reentry_enabled,
+            risk_reentry_enabled: isFixedPositionMargin
+              ? false
+              : formData.risk_reentry_enabled,
             risk_reentry_ratio: formData.risk_reentry_ratio / 100,
-            risk_reentry_decision_mode: formData.risk_reentry_decision_mode,
+            risk_reentry_decision_mode: isFixedPositionMargin
+              ? 'disabled'
+              : formData.risk_reentry_decision_mode,
             risk_reentry_min_notional: formData.risk_reentry_min_notional,
             risk_ai_confidence_threshold:
               formData.risk_ai_confidence_threshold / 100,
@@ -1004,11 +1046,15 @@ export function TraderConfigModal({
             risk_atr_cache_max_age_minutes:
               formData.risk_atr_cache_max_age_minutes,
             risk_atr_fallback_pct: formData.risk_atr_fallback_pct / 100,
-            risk_trigger_price_type: formData.risk_trigger_price_type,
+            risk_trigger_price_type: isFixedPositionMargin
+              ? 'mark'
+              : formData.risk_trigger_price_type,
             risk_slippage_buffer_bps: formData.risk_slippage_buffer_bps,
             risk_liquidation_buffer_atr: formData.risk_liquidation_buffer_atr,
             risk_min_stop_atr_ratio: formData.risk_min_stop_atr_ratio,
-            risk_max_reentries: formData.risk_max_reentries,
+            risk_max_reentries: isFixedPositionMargin
+              ? 0
+              : formData.risk_max_reentries,
             risk_reentry_band_atr: formData.risk_reentry_band_atr,
             risk_reentry_cooldown_seconds:
               formData.risk_reentry_cooldown_seconds,
@@ -1070,6 +1116,11 @@ export function TraderConfigModal({
   // 持有 seenFills、仓位映射与 Copy Guard 周期，热切换来源身份会产生孤儿映射
   // 与误信号；必须先停止跟单再改。
   const sourceSwitchLocked = isEditMode && !!traderData?.is_running
+  const showAtrStructureRiskControls =
+    formData.risk_policy_version >= 4 &&
+    formData.risk_protection_mode === 'atr_structure'
+  const atrStructureVisibilityClass =
+    formData.risk_protection_mode === 'position_margin_pct' ? 'hidden' : ''
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50 backdrop-blur-sm p-4 overflow-y-auto">
@@ -1894,7 +1945,103 @@ export function TraderConfigModal({
                       {/* 风控参数（开关打开时显示） */}
                       {formData.risk_stop_loss_enabled && (
                         <>
-                          {formData.risk_policy_version >= 4 && (
+                          <label className="block text-xs text-[#848E9C]">
+                            止损模式
+                            <select
+                              value={formData.risk_protection_mode}
+                              onChange={(e) => {
+                                const mode = e.target.value as
+                                  | 'atr_structure'
+                                  | 'position_margin_pct'
+                                setFormData((value) => ({
+                                  ...value,
+                                  risk_protection_mode: mode,
+                                  ...(mode === 'position_margin_pct'
+                                    ? {
+                                        risk_trigger_price_type:
+                                          'mark' as const,
+                                        risk_reentry_enabled: false,
+                                        risk_reentry_decision_mode:
+                                          'disabled' as const,
+                                        risk_manual_reentry_enabled: false,
+                                        risk_max_reentries: 0,
+                                      }
+                                    : {}),
+                                }))
+                              }}
+                              className="mt-1 w-full px-2 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF]"
+                            >
+                              <option value="atr_structure">
+                                ATR / 结构止损（现有模式）
+                              </option>
+                              <option value="position_margin_pct">
+                                首仓固化保证金比例止损
+                              </option>
+                            </select>
+                          </label>
+
+                          {formData.risk_protection_mode ===
+                            'position_margin_pct' && (
+                            <div className="rounded border border-[#F0B90B55] bg-[#F0B90B0D] p-3 space-y-3">
+                              <label className="block text-xs text-[#848E9C]">
+                                首仓保证金止损比例（1%～99%）
+                                <div className="relative mt-1">
+                                  <input
+                                    type="number"
+                                    min="1"
+                                    max="99"
+                                    step="1"
+                                    value={
+                                      formData.risk_position_margin_stop_pct
+                                    }
+                                    onChange={(e) =>
+                                      handleInputChange(
+                                        'risk_position_margin_stop_pct',
+                                        Number(e.target.value)
+                                      )
+                                    }
+                                    className="w-full px-2 py-2 pr-8 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF]"
+                                  />
+                                  <span className="absolute right-3 top-2 text-[#848E9C]">
+                                    %
+                                  </span>
+                                </div>
+                              </label>
+                              <div className="text-xs leading-5 text-[#848E9C]">
+                                <p className="text-[#EAECEF]">
+                                  首次真实成交后固化绝对止损价；多单 = 首仓价 ×
+                                  (1 − 比例 ÷ 杠杆)，空单 = 首仓价 × (1 + 比例 ÷
+                                  杠杆)。
+                                </p>
+                                <p>
+                                  当前 {formData.risk_position_margin_stop_pct}%
+                                  对应价格距离：10x 约
+                                  {(
+                                    formData.risk_position_margin_stop_pct / 10
+                                  ).toFixed(2)}
+                                  %，20x 约
+                                  {(
+                                    formData.risk_position_margin_stop_pct / 20
+                                  ).toFixed(2)}
+                                  %，30x 约
+                                  {(
+                                    formData.risk_position_margin_stop_pct / 30
+                                  ).toFixed(2)}
+                                  %。
+                                </p>
+                                <p>
+                                  加仓、减仓、均价和普通杠杆变化只同步保护数量，不重算价格；仅当强平安全线冲突时单向收紧，之后不再放宽。
+                                </p>
+                                <p className="text-[#F0B90B]">
+                                  此模式固定使用标记价格触发，并关闭
+                                  AI、自动和人工二次进场。费用、资金费、滑点与跳空不进入
+                                  配置比例公式，实际成交损失可能更高。
+                                </p>
+                              </div>
+                            </div>
+                          )}
+
+                          {showAtrStructureRiskControls && (
                             <div className="grid grid-cols-2 gap-3">
                               <label className="col-span-2 text-xs text-[#848E9C]">
                                 止损优先级
@@ -2125,7 +2272,8 @@ export function TraderConfigModal({
                                   止损距离被强平缓冲压到不足该 ATR
                                   倍数时，说明这个仓位没有既躲得开正常波动、
                                   又落在强平之内的止损价。此时不挂止损，转为无保护高危告警并继续跟随领航员，
-                                  由 AI 接管观察。填 0 关闭该判定（恢复旧行为：仍会挂出噪音区内的极紧止损）。
+                                  由 AI 接管观察。填 0
+                                  关闭该判定（恢复旧行为：仍会挂出噪音区内的极紧止损）。
                                 </span>
                               </label>
                               <div className="col-span-2 rounded border border-[#2B3139] bg-[#0B0E11] p-3 text-xs text-[#848E9C]">
@@ -2135,7 +2283,9 @@ export function TraderConfigModal({
                               </div>
                             </div>
                           )}
-                          <div className="grid grid-cols-2 gap-3 border-t border-[#2B3139] pt-3">
+                          <div
+                            className={`grid grid-cols-2 gap-3 border-t border-[#2B3139] pt-3 ${atrStructureVisibilityClass}`}
+                          >
                             <label className="text-xs text-[#848E9C] col-span-2">
                               重入决策模式
                               <select
@@ -2252,7 +2402,9 @@ export function TraderConfigModal({
                             ))}
                           </div>
                           {formData.risk_account_pct > 4 && (
-                            <div className="p-2 bg-[#F6465D11] border border-[#F6465D44] rounded text-xs text-[#F6465D]">
+                            <div
+                              className={`p-2 bg-[#F6465D11] border border-[#F6465D44] rounded text-xs text-[#F6465D] ${atrStructureVisibilityClass}`}
+                            >
                               高风险：单次尝试风险超过 4%；超过 8%
                               保存时必须输入数值二次确认。
                             </div>
@@ -2260,7 +2412,9 @@ export function TraderConfigModal({
 
                           {formData.risk_reentry_decision_mode ===
                             'ai_guarded' && (
-                            <div className="grid grid-cols-2 gap-3 border border-[#2B3139] rounded p-3">
+                            <div
+                              className={`grid grid-cols-2 gap-3 border border-[#2B3139] rounded p-3 ${atrStructureVisibilityClass}`}
+                            >
                               {[
                                 [
                                   'risk_ai_confidence_threshold',
@@ -2325,7 +2479,9 @@ export function TraderConfigModal({
                           )}
 
                           {/* ATR 波动参数 */}
-                          <div className="border-t border-[#2B3139] pt-3">
+                          <div
+                            className={`border-t border-[#2B3139] pt-3 ${atrStructureVisibilityClass}`}
+                          >
                             <div className="flex items-center justify-between mb-2">
                               <div>
                                 <label className="text-sm text-[#EAECEF]">
@@ -2384,7 +2540,9 @@ export function TraderConfigModal({
 
                           {/* 杠杆兜底 / 保证金止损上限（v3 与 v4 共用 risk_leverage_max_loss） */}
                           {
-                            <div className="border-t border-[#2B3139] pt-3">
+                            <div
+                              className={`border-t border-[#2B3139] pt-3 ${atrStructureVisibilityClass}`}
+                            >
                               <div className="flex items-center justify-between mb-2">
                                 <div>
                                   <label className="text-sm text-[#EAECEF]">
@@ -2458,7 +2616,9 @@ export function TraderConfigModal({
 
                           {/* v5 不可保护处置 */}
                           {formData.risk_policy_version >= 4 && (
-                            <div className="border-t border-[#2B3139] pt-3">
+                            <div
+                              className={`border-t border-[#2B3139] pt-3 ${atrStructureVisibilityClass}`}
+                            >
                               <label className="text-sm text-[#EAECEF] block mb-1">
                                 无法建立保护单时的处置
                               </label>
@@ -2486,7 +2646,9 @@ export function TraderConfigModal({
                           )}
 
                           {/* 二次进场（高级） */}
-                          <div className="border-t border-[#2B3139] pt-3">
+                          <div
+                            className={`border-t border-[#2B3139] pt-3 ${atrStructureVisibilityClass}`}
+                          >
                             <div className="flex items-center justify-between mb-2">
                               <div>
                                 <label className="text-sm text-[#EAECEF]">
@@ -2840,7 +3002,9 @@ export function TraderConfigModal({
                           </div>
 
                           {/* 风控说明 */}
-                          <div className="p-3 bg-[#1E2329] border border-[#F0B90B33] rounded flex items-start gap-2">
+                          <div
+                            className={`p-3 bg-[#1E2329] border border-[#F0B90B33] rounded flex items-start gap-2 ${atrStructureVisibilityClass}`}
+                          >
                             <svg
                               xmlns="http://www.w3.org/2000/svg"
                               className="w-4 h-4 text-[#F0B90B] mt-0.5 flex-shrink-0"

@@ -809,6 +809,13 @@ func TestExplicitZeroReentryRecoverySurvivesPolicyRoundTrip(t *testing.T) {
 	cfg.LeaderID = "leader"
 	cfg.RiskReentryMinRecoveryATR = 0
 	cfg.RiskReentryMinRecoveryATRExplicit = true
+	cfg.RiskAccountPct = .03
+	cfg.RiskATRMultiplier = 2.5
+	cfg.RiskATRTimeframe = "4H"
+	cfg.RiskLeverageFallback = false
+	cfg.RiskLeverageMaxLoss = .4
+	cfg.RiskReentryEnabled = false
+	cfg.RiskReentryRatio = .35
 	if err = st.CopyTrade().Upsert(cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -818,6 +825,23 @@ func TestExplicitZeroReentryRecoverySurvivesPolicyRoundTrip(t *testing.T) {
 	}
 	if got.RiskReentryMinRecoveryATR != 0 || !got.RiskReentryMinRecoveryATRExplicit {
 		t.Fatalf("explicit zero recovery threshold did not survive save/load: %+v", got)
+	}
+	var raw string
+	if err = st.DB().QueryRow(`SELECT policy_json FROM copy_guard_policies WHERE trader_id=?`, cfg.TraderID).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	var snapshot CopyGuardPolicy
+	if err = json.Unmarshal([]byte(raw), &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.AccountPct == nil || *snapshot.AccountPct != .03 ||
+		snapshot.ATRMultiplier == nil || *snapshot.ATRMultiplier != 2.5 ||
+		snapshot.ATRTimeframe == nil || *snapshot.ATRTimeframe != "4H" ||
+		snapshot.LeverageFallback == nil || *snapshot.LeverageFallback ||
+		snapshot.LeverageMaxLoss == nil || *snapshot.LeverageMaxLoss != .4 ||
+		snapshot.ReentryEnabled == nil || *snapshot.ReentryEnabled ||
+		snapshot.ReentryRatio == nil || *snapshot.ReentryRatio != .35 {
+		t.Fatalf("lifecycle policy omitted mutable base fields: %+v", snapshot)
 	}
 }
 

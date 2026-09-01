@@ -67,6 +67,56 @@ type Advisor struct {
 	pollCount int
 }
 
+// lifecycleReentryConfig applies the immutable Copy Guard policy carried by
+// an AI candidate's lifecycle. Editing a trader to fixed position-margin mode
+// is a template change for later positions; it must neither kill nor reprice
+// an ATR candidate that was already stopped and entered the review pipeline.
+func (a *Advisor) lifecycleReentryConfig(candidate *store.CopyGuardReentryCandidate, fallback *store.CopyTradeConfig) (*store.CopyTradeConfig, error) {
+	if candidate == nil || fallback == nil {
+		return nil, fmt.Errorf("candidate lifecycle configuration unavailable")
+	}
+	cycle, err := a.st.CopyTrade().GetCopyGuardCycle(candidate.CycleID)
+	if err != nil {
+		return nil, err
+	}
+	cfg := *fallback
+	var policy store.CopyGuardPolicy
+	if err = json.Unmarshal([]byte(cycle.PolicySnapshot), &policy); err != nil {
+		return nil, err
+	}
+	if policy.ProtectionMode == store.RiskProtectionModePositionMarginPct {
+		cfg.RiskProtectionMode = policy.ProtectionMode
+		cfg.RiskReentryEnabled = false
+		cfg.RiskReentryDecisionMode = "disabled"
+		cfg.RiskMaxReentries = 0
+		return &cfg, nil
+	}
+	if policy.ReentryEnabled != nil {
+		cfg.RiskReentryEnabled = *policy.ReentryEnabled
+	} else if policy.ReentryDecisionMode != "" {
+		cfg.RiskReentryEnabled = policy.ReentryDecisionMode != "disabled" && policy.MaxReentries > 0
+	}
+	if policy.ReentryDecisionMode != "" {
+		cfg.RiskReentryDecisionMode = policy.ReentryDecisionMode
+	}
+	hasPolicy := policy.Version >= 4 || policy.DefaultsVersion > 0 ||
+		policy.ReentryDecisionMode != "" || policy.ProtectionMode != ""
+	if hasPolicy {
+		cfg.RiskMaxReentries = policy.MaxReentries
+		cfg.RiskReentryMinNotional = policy.ReentryMinNotional
+	}
+	if policy.AIMinReviewSeconds > 0 {
+		cfg.RiskAIMinReviewSeconds = policy.AIMinReviewSeconds
+	}
+	if policy.AIDailyCallLimit > 0 {
+		cfg.RiskAIDailyCallLimit = policy.AIDailyCallLimit
+	}
+	if policy.AILifecycleCallLimit > 0 {
+		cfg.RiskAILifecycleCallLimit = policy.AILifecycleCallLimit
+	}
+	return &cfg, nil
+}
+
 var (
 	defaultAdvisor   *Advisor
 	defaultAdvisorMu sync.RWMutex
@@ -329,8 +379,11 @@ func (a *Advisor) pollMarketEventReviews() {
 			continue
 		}
 		traderCfg, cfgErr := a.st.CopyTrade().GetByTraderID(candidate.TraderID)
-		if cfgErr != nil || traderCfg.RiskReentryDecisionMode != "ai_guarded" ||
-			!traderCfg.RiskReentryEnabled {
+		if cfgErr == nil {
+			traderCfg, cfgErr = a.lifecycleReentryConfig(candidate, traderCfg)
+		}
+		if cfgErr != nil || !traderCfg.RiskStopLossEnabled ||
+			traderCfg.RiskReentryDecisionMode != "ai_guarded" || !traderCfg.RiskReentryEnabled {
 			continue
 		}
 		minInterval := time.Duration(traderCfg.RiskAIMinReviewSeconds) * time.Second
@@ -387,6 +440,9 @@ func (a *Advisor) pollAICandidates(cfg *store.ReentryAIConfig) {
 			continue
 		}
 		traderCfg, err := a.st.CopyTrade().GetByTraderID(candidate.TraderID)
+		if err == nil {
+			traderCfg, err = a.lifecycleReentryConfig(candidate, traderCfg)
+		}
 		if err != nil || !traderCfg.RiskStopLossEnabled || traderCfg.RiskReentryDecisionMode != "ai_guarded" || !traderCfg.RiskReentryEnabled {
 			continue
 		}

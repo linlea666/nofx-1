@@ -310,6 +310,8 @@ export interface CopyConfigRequest {
   // risk_stop_noise_floor_atr / risk_cycle_max_loss_pct）已随 v5 下线。
   // ============================================================
   risk_stop_loss_enabled?: boolean // 默认 true：启用账户保护硬止损
+  risk_protection_mode?: 'atr_structure' | 'position_margin_pct'
+  risk_position_margin_stop_pct?: number // 0.80 = 首仓保证金亏损80%
   risk_stop_max_account_loss_pct?: number // 0=继承执行账户默认值（默认10%）
   risk_account_pct?: number // 默认 0.02：单次尝试风险预算
   risk_cycle_loss_budget_pct?: number
@@ -839,6 +841,8 @@ export interface CopyTradeConfig {
   source_generation?: number
   // Copy Guard v7，详见 CopyConfigRequest
   risk_stop_loss_enabled?: boolean
+  risk_protection_mode?: 'atr_structure' | 'position_margin_pct'
+  risk_position_margin_stop_pct?: number
   risk_stop_max_account_loss_pct?: number
   risk_account_pct?: number
   risk_cycle_loss_budget_pct?: number

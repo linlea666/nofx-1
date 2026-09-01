@@ -1024,6 +1024,7 @@ export const api = {
         pnl: number
         fee: number
         funding_fee: number
+        atr: number
         actual_leverage: number
         initial_margin_basis: number
         planned_notional: number
@@ -1031,6 +1032,12 @@ export const api = {
         promotion_reason?: string
         ai_stop_price: number
         final_stop_price: number
+        stop_trigger_price: number
+        stop_anchor_entry_price: number
+        stop_anchor_leverage: number
+        stop_anchor_initial_margin: number
+        stop_anchor_price: number
+        stop_configured_margin_loss_pct: number
         stop_validation_result?: string
         expected_position_loss_pct: number
         actual_position_loss_pct: number

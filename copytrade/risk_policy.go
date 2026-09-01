@@ -1,6 +1,7 @@
 package copytrade
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"strings"
@@ -8,6 +9,182 @@ import (
 	"nofx/logger"
 	"nofx/store"
 )
+
+// copyGuardProtectionSettings reads the immutable lifecycle snapshot. A
+// legacy snapshot without the new fields is deliberately ATR mode even if the
+// trader configuration is changed while that position remains open.
+func copyGuardProtectionSettings(cycle *store.CopyGuardCycle, fallback *CopyConfig) (string, float64) {
+	mode := store.RiskProtectionModeATRStructure
+	pct := store.DefaultRiskPositionMarginStopPct
+	if cycle != nil {
+		var snapshot struct {
+			Mode string  `json:"risk_protection_mode"`
+			Pct  float64 `json:"risk_position_margin_stop_pct"`
+		}
+		if json.Unmarshal([]byte(cycle.PolicySnapshot), &snapshot) == nil {
+			if snapshot.Mode == store.RiskProtectionModeATRStructure || snapshot.Mode == store.RiskProtectionModePositionMarginPct {
+				mode = snapshot.Mode
+			}
+			if snapshot.Pct >= 0.01 && snapshot.Pct <= 0.99 {
+				pct = snapshot.Pct
+			}
+		}
+		return mode, pct
+	}
+	if fallback != nil {
+		if fallback.RiskProtectionMode == store.RiskProtectionModePositionMarginPct {
+			mode = fallback.RiskProtectionMode
+		}
+		if fallback.RiskPositionMarginStopPct >= 0.01 && fallback.RiskPositionMarginStopPct <= 0.99 {
+			pct = fallback.RiskPositionMarginStopPct
+		}
+	}
+	return mode, pct
+}
+
+// copyGuardLifecycleConfig reconstructs the risk settings frozen when a
+// lifecycle was opened. Trader settings may be edited while the engine keeps
+// running; those edits are the template for later positions and must not
+// silently change an existing ATR lifecycle into fixed mode (or disable its
+// already-snapshotted reentry contract). Newly-added pointer fields preserve a
+// safe fallback for snapshots written by older binaries.
+func copyGuardLifecycleConfig(cycle *store.CopyGuardCycle, fallback *CopyConfig) *CopyConfig {
+	if fallback == nil {
+		return nil
+	}
+	cfg := *fallback
+	if cycle == nil || strings.TrimSpace(cycle.PolicySnapshot) == "" {
+		return &cfg
+	}
+	var p store.CopyGuardPolicy
+	if json.Unmarshal([]byte(cycle.PolicySnapshot), &p) != nil {
+		return &cfg
+	}
+	hasPolicy := p.Version >= 4 || p.DefaultsVersion > 0 ||
+		p.ProtectionMode == store.RiskProtectionModeATRStructure ||
+		p.ProtectionMode == store.RiskProtectionModePositionMarginPct
+	if !hasPolicy {
+		return &cfg
+	}
+
+	if p.Version > 0 {
+		cfg.RiskPolicyVersion = p.Version
+	}
+	mode, pct := copyGuardProtectionSettings(cycle, fallback)
+	cfg.RiskProtectionMode = mode
+	cfg.RiskPositionMarginStopPct = pct
+	if p.AccountPct != nil {
+		cfg.RiskAccountPct = *p.AccountPct
+	}
+	if p.ATRMultiplier != nil {
+		cfg.RiskATRMultiplier = *p.ATRMultiplier
+	}
+	if p.ATRTimeframe != nil {
+		cfg.RiskATRTimeframe = *p.ATRTimeframe
+	}
+	if p.LeverageFallback != nil {
+		cfg.RiskLeverageFallback = *p.LeverageFallback
+	}
+	if p.LeverageMaxLoss != nil {
+		cfg.RiskLeverageMaxLoss = *p.LeverageMaxLoss
+	}
+	if p.StopMode != "" {
+		cfg.RiskStopMode = p.StopMode
+	}
+	if p.StopPriority != "" {
+		cfg.RiskStopPriority = p.StopPriority
+	}
+	cfg.RiskStopMaxAccountLossPct = p.StopMaxAccountLossPct
+	if p.ATRPeriod > 0 {
+		cfg.RiskATRPeriod = p.ATRPeriod
+	}
+	if p.ATRCacheMaxAgeMinutes > 0 {
+		cfg.RiskATRCacheMaxAgeMinutes = p.ATRCacheMaxAgeMinutes
+	}
+	if p.ATRFallbackPct > 0 {
+		cfg.RiskATRFallbackPct = p.ATRFallbackPct
+	}
+	if p.TriggerPriceType != "" {
+		cfg.RiskTriggerPriceType = p.TriggerPriceType
+	}
+	cfg.RiskSlippageBufferBPS = p.SlippageBufferBPS
+	cfg.RiskRoundTripFeeBPS = p.RoundTripFeeBPS
+	cfg.RiskLiquidationBufferATR = p.LiquidationBufferATR
+	if p.ReentryEnabled != nil {
+		cfg.RiskReentryEnabled = *p.ReentryEnabled
+	} else if p.ReentryDecisionMode != "" {
+		// Older policy snapshots did not persist the boolean. Their decision
+		// mode and attempt count are durable evidence of the intended state.
+		cfg.RiskReentryEnabled = p.ReentryDecisionMode != "disabled" && p.MaxReentries > 0
+	}
+	if p.ReentryRatio != nil {
+		cfg.RiskReentryRatio = *p.ReentryRatio
+	}
+	cfg.RiskMaxReentries = p.MaxReentries
+	cfg.RiskReentryBandATR = p.ReentryBandATR
+	cfg.RiskReentryCooldownSeconds = p.ReentryCooldownSec
+	cfg.RiskReentryMaxChaseATR = p.ReentryMaxChaseATR
+	cfg.RiskReentryMaxATRExpansion = p.MaxATRExpansion
+	cfg.RiskWatchTimeoutMinutes = p.WatchTimeoutMinutes
+	cfg.RiskMigrationConfirmed = p.MigrationConfirmed
+	cfg.RiskAddonBudgetPct = p.AddonBudgetPct
+	cfg.RiskCycleLossBudgetPct = p.CycleLossBudgetPct
+	cfg.RiskPortfolioLossBudgetPct = p.PortfolioLossBudgetPct
+	if p.ReentryDecisionMode != "" {
+		cfg.RiskReentryDecisionMode = p.ReentryDecisionMode
+	}
+	cfg.RiskReentryMinNotional = p.ReentryMinNotional
+	cfg.RiskAIConfidenceThreshold = p.AIConfidenceThreshold
+	cfg.RiskAIMinReviewSeconds = p.AIMinReviewSeconds
+	cfg.RiskAIDailyCallLimit = p.AIDailyCallLimit
+	cfg.RiskAILifecycleCallLimit = p.AILifecycleCallLimit
+	if p.NotificationLevel != "" {
+		cfg.RiskNotificationLevel = p.NotificationLevel
+	}
+	cfg.RiskReentryMinRecoveryATR = p.ReentryMinRecoveryATR
+	cfg.RiskReentryMinRecoveryATRExplicit = p.ReentryMinRecoveryATRExplicit
+	cfg.RiskReentryCooldownEscalation = p.ReentryCooldownEscalation
+	cfg.RiskReentryRecoveryEscalation = p.ReentryRecoveryEscalation
+	if p.UnprotectableDisposition != "" {
+		cfg.RiskUnprotectableDisposition = p.UnprotectableDisposition
+	}
+	if p.UnprotectableAction != "" {
+		cfg.RiskUnprotectableAction = p.UnprotectableAction
+	}
+	cfg.RiskReentryNoiseOverride = p.ReentryNoiseOverride
+	cfg.RiskMinStopATRRatio = p.MinStopATRRatio
+	cfg.RiskMinStopATRRatioExplicit = p.MinStopATRRatioExplicit
+
+	if mode == store.RiskProtectionModePositionMarginPct {
+		cfg.RiskTriggerPriceType = "mark"
+		cfg.RiskReentryEnabled = false
+		cfg.RiskManualReentryEnabled = false
+		cfg.RiskReentryDecisionMode = "disabled"
+		cfg.RiskMaxReentries = 0
+	}
+	return &cfg
+}
+
+// copyGuardLiquidationBufferATR follows the same lifecycle-snapshot rule as
+// the fixed stop mode. The safety clamp is part of the stop contract: changing
+// trader configuration must not silently move an already-open lifecycle.
+func copyGuardLiquidationBufferATR(cycle *store.CopyGuardCycle, fallback *CopyConfig) float64 {
+	const defaultBuffer = 0.5
+	if cycle != nil {
+		var snapshot struct {
+			Buffer *float64 `json:"risk_liquidation_buffer_atr"`
+		}
+		if json.Unmarshal([]byte(cycle.PolicySnapshot), &snapshot) == nil && snapshot.Buffer != nil &&
+			!invalidRange(*snapshot.Buffer, 0, 5) {
+			return *snapshot.Buffer
+		}
+		return defaultBuffer
+	}
+	if fallback != nil && !invalidRange(fallback.RiskLiquidationBufferATR, 0, 5) {
+		return fallback.RiskLiquidationBufferATR
+	}
+	return defaultBuffer
+}
 
 type RiskDistanceResult struct {
 	Distance        float64
@@ -30,6 +207,206 @@ type RiskDistanceResult struct {
 	// 告警信号而非收紧依据——收紧它等于把止损压进噪音区。
 	MarginCapDistance float64
 	MarginCapExceeded bool
+}
+
+// PositionMarginStopAnchorPlan is the immutable first-fill calculation used
+// by the fixed position-margin percentage mode. Fees, funding and slippage are
+// intentionally excluded from the trigger formula; they remain execution
+// attribution and may make the realized loss larger than ConfiguredRiskUSD.
+type PositionMarginStopAnchorPlan struct {
+	EntryPrice              float64
+	Leverage                float64
+	Quantity                float64
+	ConfiguredMarginLossPct float64
+	RawStopPrice            float64
+	StopPrice               float64
+	InitialMargin           float64
+	ConfiguredRiskUSD       float64
+	AlignedPriceRiskUSD     float64
+	EquivalentPriceMovePct  float64
+}
+
+type PositionMarginStopEvaluationInput struct {
+	Side                 SideType
+	CurrentEntryPrice    float64
+	CurrentQuantity      float64
+	CurrentLeverage      float64
+	AnchorStopPrice      float64
+	ExistingStopPrice    float64
+	MarkPrice            float64
+	LiquidationPrice     float64
+	PriceTickSize        float64
+	BaseQuantityStep     float64
+	ATRValue             float64
+	LiquidationBufferATR float64
+	FollowerEquity       float64
+}
+
+type PositionMarginStopEvaluation struct {
+	StopPrice                     float64
+	CurrentRiskUSD                float64
+	CurrentMargin                 float64
+	CurrentEffectiveMarginLossPct float64
+	CurrentAccountLossPct         float64
+	EquivalentPriceMovePct        float64
+	DistanceATRRatio              float64
+	LiquidationPriceIgnored       bool
+	Clamped                       bool
+	AlreadyCrossed                bool
+	GovernedBy                    string
+}
+
+// BuildPositionMarginStopAnchor calculates and aligns a first-fill fixed stop.
+// Long stops ceil and short stops floor so tick quantization can only tighten
+// the configured loss ceiling.
+func BuildPositionMarginStopAnchor(side SideType, entryPrice, quantity, leverage, configuredPct, tickSize float64) (*PositionMarginStopAnchorPlan, error) {
+	if side != SideLong && side != SideShort {
+		return nil, fmt.Errorf("invalid position-margin stop side %s", side)
+	}
+	if invalidPositive(entryPrice) || invalidPositive(quantity) || invalidPositive(leverage) || invalidPositive(tickSize) ||
+		invalidRange(configuredPct, 0.01, 0.99) {
+		return nil, fmt.Errorf("invalid position-margin stop anchor input")
+	}
+	move := configuredPct / leverage
+	raw := entryPrice * (1 - move)
+	roundDown := false
+	if side == SideShort {
+		raw = entryPrice * (1 + move)
+		roundDown = true
+	}
+	stop := alignToTickSize(raw, tickSize, roundDown)
+	valid := stop > 0 && ((side == SideLong && stop < entryPrice) || (side == SideShort && stop > entryPrice))
+	if !valid || invalidPositive(raw) || invalidPositive(stop) {
+		return nil, fmt.Errorf("position-margin stop cannot be represented at tick size")
+	}
+	margin := entryPrice * quantity / leverage
+	risk := margin * configuredPct
+	alignedRisk := math.Abs(entryPrice-stop) * quantity
+	if invalidPositive(margin) || invalidPositive(risk) || invalidPositive(alignedRisk) {
+		return nil, fmt.Errorf("position-margin stop anchor overflows")
+	}
+	return &PositionMarginStopAnchorPlan{
+		EntryPrice: entryPrice, Leverage: leverage, Quantity: quantity,
+		ConfiguredMarginLossPct: configuredPct, RawStopPrice: raw, StopPrice: stop,
+		InitialMargin: margin, ConfiguredRiskUSD: risk,
+		AlignedPriceRiskUSD:    alignedRisk,
+		EquivalentPriceMovePct: move,
+	}, nil
+}
+
+// EvaluatePositionMarginStop keeps the immutable anchor price through every
+// add/reduce/average/leverage change. The only permitted price change is a
+// one-way tightening above/below the current liquidation safety boundary; a
+// previously tighter live stop is therefore always retained.
+func EvaluatePositionMarginStop(in PositionMarginStopEvaluationInput) (*PositionMarginStopEvaluation, error) {
+	if in.Side != SideLong && in.Side != SideShort {
+		return nil, fmt.Errorf("invalid position-margin stop side %s", in.Side)
+	}
+	if invalidPositive(in.CurrentEntryPrice) || invalidPositive(in.CurrentQuantity) || invalidPositive(in.CurrentLeverage) ||
+		invalidPositive(in.AnchorStopPrice) || invalidPositive(in.PriceTickSize) || invalidPositive(in.BaseQuantityStep) ||
+		invalidNonNegative(in.ExistingStopPrice) || invalidNonNegative(in.MarkPrice) || invalidNonNegative(in.LiquidationPrice) ||
+		invalidNonNegative(in.ATRValue) || invalidNonNegative(in.LiquidationBufferATR) || invalidNonNegative(in.FollowerEquity) {
+		return nil, fmt.Errorf("invalid position-margin stop evaluation input")
+	}
+	result := &PositionMarginStopEvaluation{StopPrice: in.AnchorStopPrice, GovernedBy: "position_margin_anchor"}
+	if in.ExistingStopPrice > 0 {
+		keepExisting := (in.Side == SideLong && in.ExistingStopPrice > result.StopPrice) ||
+			(in.Side == SideShort && in.ExistingStopPrice < result.StopPrice)
+		if keepExisting {
+			result.StopPrice = in.ExistingStopPrice
+			result.GovernedBy = "position_margin_existing_tighter"
+		}
+	}
+	if in.LiquidationPrice > 0 {
+		if !isLiquidationPriceDirectionValid(in.Side, in.CurrentEntryPrice, in.LiquidationPrice) {
+			result.LiquidationPriceIgnored = true
+		} else {
+			buffer := liquidationSafetyBuffer(in.PriceTickSize, in.ATRValue, in.CurrentEntryPrice, in.LiquidationBufferATR)
+			if in.Side == SideLong && result.StopPrice <= in.LiquidationPrice+buffer {
+				result.StopPrice = alignToTickSize(in.LiquidationPrice+buffer, in.PriceTickSize, false)
+				result.Clamped = true
+				result.GovernedBy = "position_margin_liquidation_clamp"
+			}
+			if in.Side == SideShort && result.StopPrice >= in.LiquidationPrice-buffer {
+				result.StopPrice = alignToTickSize(in.LiquidationPrice-buffer, in.PriceTickSize, true)
+				result.Clamped = true
+				result.GovernedBy = "position_margin_liquidation_clamp"
+			}
+		}
+	}
+	if invalidPositive(result.StopPrice) {
+		return nil, fmt.Errorf("position-margin liquidation clamp is not representable")
+	}
+	adverseDistance := float64(0)
+	if in.Side == SideLong && result.StopPrice < in.CurrentEntryPrice {
+		adverseDistance = in.CurrentEntryPrice - result.StopPrice
+	}
+	if in.Side == SideShort && result.StopPrice > in.CurrentEntryPrice {
+		adverseDistance = result.StopPrice - in.CurrentEntryPrice
+	}
+	result.CurrentRiskUSD = adverseDistance * in.CurrentQuantity
+	result.CurrentMargin = in.CurrentEntryPrice * in.CurrentQuantity / in.CurrentLeverage
+	if result.CurrentMargin > 0 {
+		result.CurrentEffectiveMarginLossPct = result.CurrentRiskUSD / result.CurrentMargin
+	}
+	if in.FollowerEquity > 0 {
+		result.CurrentAccountLossPct = result.CurrentRiskUSD / in.FollowerEquity
+	}
+	if invalidNonNegative(result.CurrentRiskUSD) || invalidPositive(result.CurrentMargin) ||
+		invalidNonNegative(result.CurrentEffectiveMarginLossPct) || invalidNonNegative(result.CurrentAccountLossPct) {
+		return nil, fmt.Errorf("position-margin stop evaluation overflows")
+	}
+	result.EquivalentPriceMovePct = adverseDistance / in.CurrentEntryPrice
+	if in.ATRValue > 0 {
+		result.DistanceATRRatio = adverseDistance / in.ATRValue
+	}
+	if in.MarkPrice > 0 {
+		result.AlreadyCrossed = (in.Side == SideLong && in.MarkPrice <= result.StopPrice) ||
+			(in.Side == SideShort && in.MarkPrice >= result.StopPrice)
+	}
+	return result, nil
+}
+
+func InferPositionMarginStopAnchorEntry(side SideType, stopPrice, leverage, configuredPct float64) (float64, error) {
+	if invalidPositive(stopPrice) || invalidPositive(leverage) || invalidRange(configuredPct, 0.01, 0.99) {
+		return 0, fmt.Errorf("invalid position-margin inverse input")
+	}
+	denominator := 1 - configuredPct/leverage
+	if side == SideShort {
+		denominator = 1 + configuredPct/leverage
+	} else if side != SideLong {
+		return 0, fmt.Errorf("invalid position-margin inverse side %s", side)
+	}
+	if denominator <= 0 {
+		return 0, fmt.Errorf("invalid position-margin inverse denominator")
+	}
+	entry := stopPrice / denominator
+	if invalidPositive(entry) {
+		return 0, fmt.Errorf("position-margin inverse overflows")
+	}
+	return entry, nil
+}
+
+func PositionMarginEffectiveLossPct(side SideType, currentEntry, stopPrice, leverage float64) (float64, error) {
+	if invalidPositive(currentEntry) || invalidPositive(stopPrice) || invalidPositive(leverage) {
+		return 0, fmt.Errorf("invalid position-margin effective loss input")
+	}
+	move := float64(0)
+	if side == SideLong {
+		move = (currentEntry - stopPrice) / currentEntry
+	} else if side == SideShort {
+		move = (stopPrice - currentEntry) / currentEntry
+	} else {
+		return 0, fmt.Errorf("invalid position-margin effective loss side %s", side)
+	}
+	if move < 0 {
+		move = 0
+	}
+	result := move * leverage
+	if invalidNonNegative(result) {
+		return 0, fmt.Errorf("position-margin effective loss overflows")
+	}
+	return result, nil
 }
 
 type ProtectionPlan struct {
@@ -519,6 +896,13 @@ func ValidateRiskPolicyV4(c *CopyConfig) error {
 	if c.RiskPolicyVersion < 4 {
 		return nil
 	}
+	// In ATR/legacy configs zero means "field absent" and is defaulted below.
+	// Once fixed mode is explicitly selected it is a real user value: accepting
+	// zero here would silently turn an invalid 0% request into the 80% default.
+	if c.RiskProtectionMode == store.RiskProtectionModePositionMarginPct &&
+		invalidRange(c.RiskPositionMarginStopPct, 0.01, 0.99) {
+		return fmt.Errorf("risk_position_margin_stop_pct must be 1%%..99%%")
+	}
 	// API/存储路径在校验前会补默认值，纯函数调用与旧测试也必须得到
 	// 同一契约；复制后补值避免校验函数意外修改调用方配置。
 	normalized := *c
@@ -526,6 +910,22 @@ func ValidateRiskPolicyV4(c *CopyConfig) error {
 	c = &normalized
 	if !SupportsCopyGuard(c.ProviderType) {
 		return fmt.Errorf("copy guard v4 is only supported for OKX or Binance leader sources")
+	}
+	if c.RiskProtectionMode != store.RiskProtectionModeATRStructure &&
+		c.RiskProtectionMode != store.RiskProtectionModePositionMarginPct {
+		return fmt.Errorf("risk_protection_mode must be atr_structure or position_margin_pct")
+	}
+	if invalidRange(c.RiskPositionMarginStopPct, 0.01, 0.99) {
+		return fmt.Errorf("risk_position_margin_stop_pct must be 1%%..99%%")
+	}
+	if c.RiskProtectionMode == store.RiskProtectionModePositionMarginPct {
+		if c.RiskTriggerPriceType != "mark" {
+			return fmt.Errorf("position_margin_pct requires mark trigger price")
+		}
+		if c.RiskReentryEnabled || c.RiskManualReentryEnabled ||
+			c.RiskReentryDecisionMode != "disabled" || c.RiskMaxReentries != 0 {
+			return fmt.Errorf("position_margin_pct forbids AI, automatic and manual reentry")
+		}
 	}
 	if c.RiskStopMode != "volatility_priority" && c.RiskStopMode != "account_hard_limit" {
 		return fmt.Errorf("invalid risk_stop_mode %q", c.RiskStopMode)
@@ -649,9 +1049,21 @@ func invalidRange(v, min, max float64) bool {
 	return math.IsNaN(v) || math.IsInf(v, 0) || v < min || v > max
 }
 
+func invalidPositive(v float64) bool {
+	return math.IsNaN(v) || math.IsInf(v, 0) || v <= 0
+}
+
+func invalidNonNegative(v float64) bool {
+	return math.IsNaN(v) || math.IsInf(v, 0) || v < 0
+}
+
 func ValidateStoredRiskPolicy(c *store.CopyTradeConfig) error {
 	if c == nil {
 		return nil
+	}
+	if c.RiskPolicyVersion >= 4 && c.RiskProtectionMode == store.RiskProtectionModePositionMarginPct &&
+		invalidRange(c.RiskPositionMarginStopPct, 0.01, 0.99) {
+		return fmt.Errorf("risk_position_margin_stop_pct must be 1%%..99%%")
 	}
 	c.FillRiskDefaults()
 	if c.CopyCatchupWindowSeconds < 1 || c.CopyCatchupWindowSeconds > 600 {
@@ -663,5 +1075,5 @@ func ValidateStoredRiskPolicy(c *store.CopyTradeConfig) error {
 	if c.RiskPolicyVersion < 4 {
 		return nil
 	}
-	return ValidateRiskPolicyV4(&CopyConfig{ProviderType: ProviderType(c.ProviderType), RiskPolicyVersion: c.RiskPolicyVersion, RiskStopMode: c.RiskStopMode, RiskStopPriority: c.RiskStopPriority, RiskATRPeriod: c.RiskATRPeriod, RiskATRCacheMaxAgeMinutes: c.RiskATRCacheMaxAgeMinutes, RiskATRMultiplier: c.RiskATRMultiplier, RiskATRFallbackPct: c.RiskATRFallbackPct, RiskTriggerPriceType: c.RiskTriggerPriceType, RiskAccountPct: c.RiskAccountPct, RiskLeverageFallback: c.RiskLeverageFallback, RiskLeverageMaxLoss: c.RiskLeverageMaxLoss, RiskCycleLossBudgetPct: c.RiskCycleLossBudgetPct, RiskPortfolioLossBudgetPct: c.RiskPortfolioLossBudgetPct, RiskRoundTripFeeBPS: c.RiskRoundTripFeeBPS, RiskSlippageBufferBPS: c.RiskSlippageBufferBPS, RiskLiquidationBufferATR: c.RiskLiquidationBufferATR, RiskMaxReentries: c.RiskMaxReentries, RiskReentryRatio: c.RiskReentryRatio, RiskReentryDecisionMode: c.RiskReentryDecisionMode, RiskReentryMinNotional: c.RiskReentryMinNotional, RiskAIConfidenceThreshold: c.RiskAIConfidenceThreshold, RiskAIMinReviewSeconds: c.RiskAIMinReviewSeconds, RiskAIDailyCallLimit: c.RiskAIDailyCallLimit, RiskAILifecycleCallLimit: c.RiskAILifecycleCallLimit, RiskNotificationLevel: c.RiskNotificationLevel, RiskReentryBandATR: c.RiskReentryBandATR, RiskReentryCooldownSeconds: c.RiskReentryCooldownSeconds, RiskReentryMaxChaseATR: c.RiskReentryMaxChaseATR, RiskReentryMaxATRExpansion: c.RiskReentryMaxATRExpansion, RiskWatchTimeoutMinutes: c.RiskWatchTimeoutMinutes, RiskAddonBudgetPct: c.RiskAddonBudgetPct, RiskMinStopATRRatio: c.RiskMinStopATRRatio, RiskMinStopATRRatioExplicit: c.RiskMinStopATRRatioExplicit, RiskReentryMinRecoveryATR: c.RiskReentryMinRecoveryATR, RiskReentryCooldownEscalation: c.RiskReentryCooldownEscalation, RiskReentryRecoveryEscalation: c.RiskReentryRecoveryEscalation, RiskUnprotectableDisposition: c.RiskUnprotectableDisposition, RiskUnprotectableAction: c.RiskUnprotectableAction})
+	return ValidateRiskPolicyV4(&CopyConfig{ProviderType: ProviderType(c.ProviderType), RiskPolicyVersion: c.RiskPolicyVersion, RiskProtectionMode: c.RiskProtectionMode, RiskPositionMarginStopPct: c.RiskPositionMarginStopPct, RiskStopMode: c.RiskStopMode, RiskStopPriority: c.RiskStopPriority, RiskATRPeriod: c.RiskATRPeriod, RiskATRCacheMaxAgeMinutes: c.RiskATRCacheMaxAgeMinutes, RiskATRMultiplier: c.RiskATRMultiplier, RiskATRFallbackPct: c.RiskATRFallbackPct, RiskTriggerPriceType: c.RiskTriggerPriceType, RiskAccountPct: c.RiskAccountPct, RiskLeverageFallback: c.RiskLeverageFallback, RiskLeverageMaxLoss: c.RiskLeverageMaxLoss, RiskCycleLossBudgetPct: c.RiskCycleLossBudgetPct, RiskPortfolioLossBudgetPct: c.RiskPortfolioLossBudgetPct, RiskRoundTripFeeBPS: c.RiskRoundTripFeeBPS, RiskSlippageBufferBPS: c.RiskSlippageBufferBPS, RiskLiquidationBufferATR: c.RiskLiquidationBufferATR, RiskMaxReentries: c.RiskMaxReentries, RiskReentryEnabled: c.RiskReentryEnabled, RiskManualReentryEnabled: c.RiskManualReentryEnabled, RiskReentryRatio: c.RiskReentryRatio, RiskReentryDecisionMode: c.RiskReentryDecisionMode, RiskReentryMinNotional: c.RiskReentryMinNotional, RiskAIConfidenceThreshold: c.RiskAIConfidenceThreshold, RiskAIMinReviewSeconds: c.RiskAIMinReviewSeconds, RiskAIDailyCallLimit: c.RiskAIDailyCallLimit, RiskAILifecycleCallLimit: c.RiskAILifecycleCallLimit, RiskNotificationLevel: c.RiskNotificationLevel, RiskReentryBandATR: c.RiskReentryBandATR, RiskReentryCooldownSeconds: c.RiskReentryCooldownSeconds, RiskReentryMaxChaseATR: c.RiskReentryMaxChaseATR, RiskReentryMaxATRExpansion: c.RiskReentryMaxATRExpansion, RiskWatchTimeoutMinutes: c.RiskWatchTimeoutMinutes, RiskAddonBudgetPct: c.RiskAddonBudgetPct, RiskMinStopATRRatio: c.RiskMinStopATRRatio, RiskMinStopATRRatioExplicit: c.RiskMinStopATRRatioExplicit, RiskReentryMinRecoveryATR: c.RiskReentryMinRecoveryATR, RiskReentryCooldownEscalation: c.RiskReentryCooldownEscalation, RiskReentryRecoveryEscalation: c.RiskReentryRecoveryEscalation, RiskUnprotectableDisposition: c.RiskUnprotectableDisposition, RiskUnprotectableAction: c.RiskUnprotectableAction})
 }

@@ -206,6 +206,8 @@ type CopyConfig struct {
 	// v3 旧策略与噪音下限/周期熔断/反加仓铁律等参数已于 v5 下线
 	// ============================================================
 	RiskStopLossEnabled            bool    `json:"risk_stop_loss_enabled"`
+	RiskProtectionMode             string  `json:"risk_protection_mode"`
+	RiskPositionMarginStopPct      float64 `json:"risk_position_margin_stop_pct"`
 	RiskStopMaxAccountLossPct      float64 `json:"risk_stop_max_account_loss_pct,omitempty"`
 	RiskAccountPct                 float64 `json:"risk_account_pct"`    // v7：单次尝试风险预算，默认 0.02
 	RiskATRMultiplier              float64 `json:"risk_atr_multiplier"` // v5.2：止损距离基线 k×ATR，默认 2.0
@@ -280,6 +282,12 @@ func (c *CopyConfig) FillRiskDefaults() {
 	}
 	if c.CopyCatchupMaxAdverseBPS <= 0 {
 		c.CopyCatchupMaxAdverseBPS = 20
+	}
+	if c.RiskProtectionMode == "" {
+		c.RiskProtectionMode = store.RiskProtectionModeATRStructure
+	}
+	if c.RiskPositionMarginStopPct == 0 {
+		c.RiskPositionMarginStopPct = store.DefaultRiskPositionMarginStopPct
 	}
 	if c.RiskAccountPct == 0 {
 		c.RiskAccountPct = 0.02

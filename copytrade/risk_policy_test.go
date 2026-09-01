@@ -370,3 +370,206 @@ func TestAIProtectionPlanReportsMarginCapWithoutRejecting(t *testing.T) {
 		t.Fatal("account/cycle/portfolio risk budget must remain a hard veto")
 	}
 }
+
+func TestBuildPositionMarginStopAnchorFormulaAndSafeTickRounding(t *testing.T) {
+	long, err := BuildPositionMarginStopAnchor(SideLong, 100, 2, 3, 0.80, 0.01)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if math.Abs(long.RawStopPrice-73.33333333333333) > 1e-9 || math.Abs(long.StopPrice-73.34) > 1e-9 {
+		t.Fatalf("long stop must use entry*(1-pct/leverage) and ceil toward safety: %+v", long)
+	}
+	if math.Abs(long.InitialMargin-66.66666666666667) > 1e-9 || math.Abs(long.ConfiguredRiskUSD-53.333333333333336) > 1e-9 {
+		t.Fatalf("long margin/risk audit is wrong: %+v", long)
+	}
+	short, err := BuildPositionMarginStopAnchor(SideShort, 100, 2, 3, 0.80, 0.01)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if math.Abs(short.RawStopPrice-126.66666666666667) > 1e-9 || math.Abs(short.StopPrice-126.66) > 1e-9 {
+		t.Fatalf("short stop must use entry*(1+pct/leverage) and floor toward safety: %+v", short)
+	}
+	for _, invalid := range []struct {
+		entry, quantity, leverage, pct, tick float64
+	}{
+		{0, 1, 10, .8, .1}, {100, 0, 10, .8, .1}, {100, 1, 0, .8, .1},
+		{100, 1, 10, 0, .1}, {100, 1, 10, 1, .1}, {100, 1, 10, .8, 0},
+		{math.NaN(), 1, 10, .8, .1}, {100, math.Inf(1), 10, .8, .1},
+	} {
+		if _, err := BuildPositionMarginStopAnchor(SideLong, invalid.entry, invalid.quantity, invalid.leverage, invalid.pct, invalid.tick); err == nil {
+			t.Fatalf("invalid anchor accepted: %+v", invalid)
+		}
+	}
+}
+
+func TestPositionMarginStopScreenshotRegression(t *testing.T) {
+	tests := []struct {
+		name                                string
+		side                                SideType
+		currentEntry, stop, leverage        float64
+		wantAnchorEntry, wantEffectiveRatio float64
+	}{
+		{"BTC short", SideShort, 78859.30, 80951.40, 30, 78848.76623376623, 0.7959},
+		{"ETH short", SideShort, 2494.43, 2585.36, 20, 2485.923076923077, 0.7291},
+		{"MU long", SideLong, 935.28, 911.89, 20, 949.8854166666667, 0.5002},
+		{"SNDK long", SideLong, 1496.28, 1421.46, 10, 1545.0652173913043, 0.5000},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			anchor, err := InferPositionMarginStopAnchorEntry(tc.side, tc.stop, tc.leverage, .80)
+			if err != nil || math.Abs(anchor-tc.wantAnchorEntry) > 1e-6 {
+				t.Fatalf("inverse anchor=%v want=%v err=%v", anchor, tc.wantAnchorEntry, err)
+			}
+			effective, err := PositionMarginEffectiveLossPct(tc.side, tc.currentEntry, tc.stop, tc.leverage)
+			if err != nil || math.Abs(effective-tc.wantEffectiveRatio) > 0.00015 {
+				t.Fatalf("effective ratio=%v want≈%v err=%v", effective, tc.wantEffectiveRatio, err)
+			}
+		})
+	}
+}
+
+func TestEvaluatePositionMarginStopKeepsAnchorAndOnlyTightens(t *testing.T) {
+	base := PositionMarginStopEvaluationInput{
+		Side: SideLong, CurrentEntryPrice: 100, CurrentQuantity: 2,
+		CurrentLeverage: 10, AnchorStopPrice: 92, MarkPrice: 100,
+		PriceTickSize: .1, BaseQuantityStep: .01, FollowerEquity: 1000,
+	}
+	result, err := EvaluatePositionMarginStop(base)
+	if err != nil || result.StopPrice != 92 || math.Abs(result.CurrentRiskUSD-16) > 1e-9 || math.Abs(result.CurrentEffectiveMarginLossPct-.8) > 1e-9 {
+		t.Fatalf("base evaluation=%+v err=%v", result, err)
+	}
+	// Add/average/leverage changes affect audit values, never the anchor price.
+	changed := base
+	changed.CurrentEntryPrice, changed.CurrentQuantity, changed.CurrentLeverage = 95, 4, 20
+	result, err = EvaluatePositionMarginStop(changed)
+	if err != nil || result.StopPrice != 92 || math.Abs(result.CurrentRiskUSD-12) > 1e-9 {
+		t.Fatalf("position change moved the fixed stop: %+v err=%v", result, err)
+	}
+	// Liquidation safety can tighten once; an existing tighter stop is retained
+	// after the liquidation line later moves back.
+	clamped := base
+	clamped.LiquidationPrice = 95
+	result, err = EvaluatePositionMarginStop(clamped)
+	if err != nil || !result.Clamped || math.Abs(result.StopPrice-95.2) > 1e-9 {
+		t.Fatalf("liquidation clamp=%+v err=%v", result, err)
+	}
+	recovered := base
+	recovered.ExistingStopPrice, recovered.LiquidationPrice = result.StopPrice, 80
+	result, err = EvaluatePositionMarginStop(recovered)
+	if err != nil || result.StopPrice != 95.2 || result.GovernedBy != "position_margin_existing_tighter" {
+		t.Fatalf("safety recovery widened the stop: %+v err=%v", result, err)
+	}
+	recovered.MarkPrice = 95.1
+	result, err = EvaluatePositionMarginStop(recovered)
+	if err != nil || !result.AlreadyCrossed {
+		t.Fatalf("crossed fixed stop was not detected: %+v err=%v", result, err)
+	}
+}
+
+func TestFixedPositionMarginPolicyRequiresIsolation(t *testing.T) {
+	cfg := &CopyConfig{ProviderType: ProviderOKX, RiskPolicyVersion: 4}
+	cfg.FillRiskDefaults()
+	cfg.RiskProtectionMode = store.RiskProtectionModePositionMarginPct
+	cfg.RiskPositionMarginStopPct = .80
+	cfg.RiskTriggerPriceType = "mark"
+	cfg.RiskReentryEnabled = false
+	cfg.RiskManualReentryEnabled = false
+	cfg.RiskReentryDecisionMode = "disabled"
+	cfg.RiskMaxReentries = 0
+	if err := ValidateRiskPolicyV4(cfg); err != nil {
+		t.Fatalf("valid fixed policy rejected: %v", err)
+	}
+	for name, mutate := range map[string]func(*CopyConfig){
+		"zero percent":    func(c *CopyConfig) { c.RiskPositionMarginStopPct = 0 },
+		"hundred percent": func(c *CopyConfig) { c.RiskPositionMarginStopPct = 1 },
+		"last trigger":    func(c *CopyConfig) { c.RiskTriggerPriceType = "last" },
+		"AI reentry":      func(c *CopyConfig) { c.RiskReentryEnabled = true; c.RiskReentryDecisionMode = "ai_guarded" },
+		"manual":          func(c *CopyConfig) { c.RiskManualReentryEnabled = true },
+		"second entry":    func(c *CopyConfig) { c.RiskMaxReentries = 1 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := *cfg
+			mutate(&candidate)
+			if err := ValidateRiskPolicyV4(&candidate); err == nil {
+				t.Fatal("contradictory fixed policy was accepted")
+			}
+		})
+	}
+}
+
+func TestPositionMarginLifecycleSettingsUseImmutableSnapshot(t *testing.T) {
+	cycle := &store.CopyGuardCycle{PolicySnapshot: `{
+		"risk_protection_mode":"position_margin_pct",
+		"risk_position_margin_stop_pct":0.8,
+		"risk_liquidation_buffer_atr":0.25
+	}`}
+	fallback := &CopyConfig{
+		RiskProtectionMode:        store.RiskProtectionModeATRStructure,
+		RiskPositionMarginStopPct: 0.4,
+		RiskLiquidationBufferATR:  1.5,
+	}
+	mode, pct := copyGuardProtectionSettings(cycle, fallback)
+	if mode != store.RiskProtectionModePositionMarginPct || pct != .8 {
+		t.Fatalf("active lifecycle was changed by current config: mode=%s pct=%v", mode, pct)
+	}
+	if got := copyGuardLiquidationBufferATR(cycle, fallback); got != .25 {
+		t.Fatalf("active lifecycle liquidation buffer=%v want=.25", got)
+	}
+
+	// A legacy snapshot without the new mode remains ATR and uses the historic
+	// safety default instead of inheriting a later trader configuration.
+	legacy := &store.CopyGuardCycle{PolicySnapshot: `{}`}
+	mode, pct = copyGuardProtectionSettings(legacy, fallback)
+	if mode != store.RiskProtectionModeATRStructure || pct != store.DefaultRiskPositionMarginStopPct {
+		t.Fatalf("legacy lifecycle compatibility changed: mode=%s pct=%v", mode, pct)
+	}
+	if got := copyGuardLiquidationBufferATR(legacy, fallback); got != .5 {
+		t.Fatalf("legacy lifecycle liquidation buffer=%v want=.5", got)
+	}
+
+	// Switching the trader template to fixed mode also turns off the current
+	// reentry fields. An ATR lifecycle must continue with the settings that were
+	// frozen when it opened instead of inheriting that later isolation change.
+	currentFixed := *fallback
+	currentFixed.RiskProtectionMode = store.RiskProtectionModePositionMarginPct
+	currentFixed.RiskTriggerPriceType = "mark"
+	currentFixed.RiskReentryEnabled = false
+	currentFixed.RiskReentryDecisionMode = "disabled"
+	currentFixed.RiskMaxReentries = 0
+	atrSnapshot := &store.CopyGuardCycle{PolicySnapshot: `{
+		"version":4,
+		"risk_protection_mode":"atr_structure",
+		"trigger_price_type":"last",
+		"reentry_enabled":true,
+		"reentry_ratio":0.4,
+		"max_reentries":2,
+		"reentry_decision_mode":"ai_guarded",
+		"reentry_band_atr":0.75,
+		"reentry_cooldown_seconds":600
+	}`}
+	active := copyGuardLifecycleConfig(atrSnapshot, &currentFixed)
+	if active == nil || active.RiskProtectionMode != store.RiskProtectionModeATRStructure ||
+		!active.RiskReentryEnabled || active.RiskReentryDecisionMode != "ai_guarded" ||
+		active.RiskMaxReentries != 2 || active.RiskReentryRatio != .4 ||
+		active.RiskTriggerPriceType != "last" || active.RiskReentryCooldownSeconds != 600 {
+		t.Fatalf("ATR lifecycle inherited the later fixed template: %+v", active)
+	}
+
+	currentATR := currentFixed
+	currentATR.RiskProtectionMode = store.RiskProtectionModeATRStructure
+	currentATR.RiskReentryEnabled = true
+	currentATR.RiskReentryDecisionMode = "ai_guarded"
+	currentATR.RiskMaxReentries = 2
+	fixedSnapshot := &store.CopyGuardCycle{PolicySnapshot: `{
+		"risk_protection_mode":"position_margin_pct",
+		"risk_position_margin_stop_pct":0.8,
+		"reentry_enabled":true,
+		"max_reentries":2,
+		"reentry_decision_mode":"ai_guarded"
+	}`}
+	isolated := copyGuardLifecycleConfig(fixedSnapshot, &currentATR)
+	if isolated == nil || isolated.RiskReentryEnabled || isolated.RiskReentryDecisionMode != "disabled" ||
+		isolated.RiskMaxReentries != 0 || isolated.RiskTriggerPriceType != "mark" {
+		t.Fatalf("fixed lifecycle isolation was not enforced from its snapshot: %+v", isolated)
+	}
+}

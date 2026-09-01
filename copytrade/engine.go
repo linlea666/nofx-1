@@ -1611,8 +1611,11 @@ func (e *Engine) matchOpenAddSignal(signal *TradeSignal, leaderPosMap map[string
 		// 🛑 风控止损熔断：该 posId 已被账户保护止损触发，等领航员完全平掉旧 posId 才能恢复
 		// 用户如果启用了二次进场（RiskReentryEnabled），由 reentryMonitor 异步推决策，不走这里
 		if mapping.Status == store.MappingStatusStoppedByRisk {
-			logger.Debugf("🛑 [%s] 账户保护止损熔断中 | posId=%s → 忽略开仓/加仓信号（等领航员平掉旧 posId 或触发二次进场）",
-				e.traderID, posID)
+			if e.recordFixedPositionMarginSignalIgnored(mapping, fill) {
+				logger.Debugf("🛑 [%s] 固定仓位止损已触发 | posId=%s → 忽略开仓/加仓信号（等领航员完全平仓；不二次进场）", e.traderID, posID)
+			} else {
+				logger.Debugf("🛑 [%s] 账户保护止损熔断中 | posId=%s → 忽略开仓/加仓信号（等领航员平掉旧 posId 或触发二次进场）", e.traderID, posID)
+			}
 			continue
 		}
 		if mapping.Status == store.MappingStatusDetached {
@@ -1825,6 +1828,13 @@ func (e *Engine) matchCloseReduceSignal(signal *TradeSignal, leaderPosMap map[st
 	}
 
 	if len(activeMappings) == 0 {
+		if stoppedMappings, stoppedErr := e.store.CopyTrade().ListStoppedByRiskMappings(e.traderID); stoppedErr == nil {
+			for _, mapping := range stoppedMappings {
+				if mapping.Symbol == fill.Symbol && strings.EqualFold(mapping.Side, string(fill.PositionSide)) {
+					e.recordFixedPositionMarginSignalIgnored(mapping, fill)
+				}
+			}
+		}
 		logger.Debugf("📊 [%s] 无活跃映射 | %s %s → 不跟随",
 			e.traderID, fill.Symbol, fill.PositionSide)
 		return &SignalMatchResult{
@@ -1960,6 +1970,28 @@ func (e *Engine) matchCloseReduceSignal(signal *TradeSignal, leaderPosMap map[st
 		ShouldFollow: false,
 		Reason:       "未检测到 size 变化，可能是重复信号",
 	}
+}
+
+func (e *Engine) recordFixedPositionMarginSignalIgnored(mapping *store.CopyTradePositionMapping, fill *Fill) bool {
+	if e == nil || e.store == nil || mapping == nil || fill == nil {
+		return false
+	}
+	cycle, err := e.store.CopyTrade().GetOpenCopyGuardCycle(e.traderID, mapping.LeaderPosID)
+	if err != nil {
+		return false
+	}
+	if mode, _ := copyGuardProtectionSettings(cycle, e.config); mode != store.RiskProtectionModePositionMarginPct {
+		return false
+	}
+	_ = e.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{
+		CycleID: cycle.ID, TraderID: e.traderID, Type: "POSITION_MARGIN_SIGNAL_IGNORED",
+		Price: fill.Price, Quantity: fill.Size, Notional: fill.Value,
+		Metadata: map[string]interface{}{
+			"source_action": string(fill.Action), "source_fill_id": fill.ID,
+			"reason": "stopped_by_risk until leader lifecycle closes",
+		},
+	})
+	return true
 }
 
 // findLeaderPosition 在领航员持仓映射中查找指定 symbol+side 的仓位
@@ -3090,9 +3122,10 @@ func (e *Engine) lookupLeaderHistory(leaderPosID, symbol, side string) *OKXLeade
 }
 
 // closeCopyGuardCycleAtLeaderExit is the single attribution close path for a
-// source position that has disappeared. It is shared by verified protective
-// stops and protection-establishment exits: both need the leader's final price
-// before no-Guard baseline and net protection effect can be scored.
+// source position that disappeared or reversed under the same stable id. It is
+// shared by verified protective stops and protection-establishment exits: both
+// need the leader's final price before no-Guard baseline and net protection
+// effect can be scored.
 func (e *Engine) closeCopyGuardCycleAtLeaderExit(mapping *store.CopyTradePositionMapping) bool {
 	if mapping == nil || e.config == nil || e.config.RiskPolicyVersion < 4 {
 		return true
@@ -3110,6 +3143,16 @@ func (e *Engine) closeCopyGuardCycleAtLeaderExit(mapping *store.CopyTradePositio
 	// with the latest healthy observation and let refreshEstimatedBaselines
 	// calibrate the outcome later.
 	closePrice, baselineSource := cycle.LastObservedPrice, "last_observed"
+	terminalStatus, terminalEvent := store.CopyGuardLeaderClosed, "LEADER_CLOSED"
+	terminalNewSide := ""
+	if leader := e.buildLeaderPosMap()[mapping.LeaderPosID]; leader != nil &&
+		!strings.EqualFold(string(leader.Side), mapping.Side) {
+		terminalStatus, terminalEvent = store.CopyGuardLeaderReversed, "LEADER_REVERSED"
+		terminalNewSide = string(leader.Side)
+		if leader.MarkPrice > 0 {
+			closePrice, baselineSource = leader.MarkPrice, "leader_reversal_mark"
+		}
+	}
 	if rec := e.lookupLeaderHistory(mapping.LeaderPosID, cycle.Symbol, cycle.Side); rec != nil && rec.ExitPrice > 0 {
 		closePrice, baselineSource = rec.ExitPrice, "leader_history"
 	}
@@ -3129,6 +3172,9 @@ func (e *Engine) closeCopyGuardCycleAtLeaderExit(mapping *store.CopyTradePositio
 	// The observation summary must be persisted before CloseCopyGuardCycle
 	// invalidates all still-open evaluation state.
 	emitWatchSummary(e.store.CopyTrade(), e.traderID, cycle, closePrice)
+	if shadowErr := e.store.CopyTrade().FinalizeCopyGuardPositionMarginShadow(cycle.ID, closePrice); shadowErr != nil {
+		logger.Warnf("⚠️ [%s] 80%% 影子评测闭合失败: %v | cycle=%d", e.traderID, shadowErr, cycle.ID)
+	}
 	// CloseCopyGuardCycle may synchronously emit the final reconciled summary.
 	// Persist evidence quality first so every downstream reader observes the
 	// same attribution source.
@@ -3136,15 +3182,17 @@ func (e *Engine) closeCopyGuardCycleAtLeaderExit(mapping *store.CopyTradePositio
 		logger.Warnf("⚠️ [%s] Copy Guard 基线来源保存失败: %v | cycle=%d", e.traderID, err, cycle.ID)
 		return false
 	}
-	if err := e.store.CopyTrade().CloseCopyGuardCycle(cycle.ID, store.CopyGuardLeaderClosed, cycle.ActualPnL, baseline, cycle.Fees, cycle.FundingFee, cycle.LiquidationPenalty, cycle.Slippage); err != nil {
+	if err := e.store.CopyTrade().CloseCopyGuardCycle(cycle.ID, terminalStatus, cycle.ActualPnL, baseline, cycle.Fees, cycle.FundingFee, cycle.LiquidationPenalty, cycle.Slippage); err != nil {
 		logger.Warnf("⚠️ [%s] Copy Guard 周期关闭失败: %v | cycle=%d posId=%s", e.traderID, err, cycle.ID, mapping.LeaderPosID)
 		return false
 	}
 	_ = e.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{
-		CycleID: cycle.ID, TraderID: e.traderID, Type: "LEADER_CLOSED", Price: closePrice,
+		CycleID: cycle.ID, TraderID: e.traderID, Type: terminalEvent, Price: closePrice,
 		Metadata: map[string]interface{}{
 			"baseline_estimated": baselineSource != "leader_history",
 			"baseline_source":    baselineSource,
+			"old_side":           mapping.Side,
+			"new_side":           terminalNewSide,
 		},
 	})
 	return true
@@ -3265,7 +3313,9 @@ func (e *Engine) checkIgnoredPositionsClosed() {
 		return
 	}
 	for _, mapping := range stoppedMappings {
-		if _, exists := leaderPosIds[mapping.LeaderPosID]; !exists {
+		leader, exists := leaderPosMap[mapping.LeaderPosID]
+		lifecycleEnded := !exists || leader == nil || !strings.EqualFold(string(leader.Side), mapping.Side)
+		if lifecycleEnded {
 			if !e.closeCopyGuardCycleAtLeaderExit(mapping) {
 				continue
 			}

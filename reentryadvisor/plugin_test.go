@@ -8,6 +8,49 @@ import (
 	"nofx/store"
 )
 
+func TestLifecycleReentryConfigSurvivesTraderModeSwitch(t *testing.T) {
+	st, err := store.New(filepath.Join(t.TempDir(), "lifecycle-config.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{
+		TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "position-1",
+		Symbol: "ETHUSDT", Side: "long", Status: store.CopyGuardAIWaiting,
+		PolicySnapshot: `{
+			"version":4,
+			"risk_protection_mode":"atr_structure",
+			"reentry_enabled":true,
+			"max_reentries":2,
+			"reentry_decision_mode":"ai_guarded",
+			"reentry_min_notional":9,
+			"ai_min_review_seconds":900,
+			"ai_daily_call_limit":7,
+			"ai_lifecycle_call_limit":3
+		}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fallback := store.NewCopyGuardDefaults()
+	fallback.RiskProtectionMode = store.RiskProtectionModePositionMarginPct
+	fallback.RiskReentryEnabled = false
+	fallback.RiskReentryDecisionMode = "disabled"
+	fallback.RiskMaxReentries = 0
+
+	advisor := &Advisor{st: st}
+	got, err := advisor.lifecycleReentryConfig(&store.CopyGuardReentryCandidate{CycleID: cycle.ID}, fallback)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.RiskReentryEnabled || got.RiskReentryDecisionMode != "ai_guarded" ||
+		got.RiskMaxReentries != 2 || got.RiskReentryMinNotional != 9 ||
+		got.RiskAIMinReviewSeconds != 900 || got.RiskAIDailyCallLimit != 7 ||
+		got.RiskAILifecycleCallLimit != 3 {
+		t.Fatalf("advisor inherited the later fixed template: %+v", got)
+	}
+}
+
 // TestBackfillOutcomes 已执行信号 → 重入尝试闭合并对账后，分析记录回填
 // 结局净额（OKX 已含费的 pnl，不重复扣 fee），随后统计口径正确。
 func TestBackfillOutcomes(t *testing.T) {

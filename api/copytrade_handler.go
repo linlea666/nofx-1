@@ -82,11 +82,34 @@ func copyGuardAIActive(config *store.CopyTradeConfig) bool {
 		config.RiskReentryDecisionMode == "ai_guarded"
 }
 
+// validateCopyGuardAccountExclusivity prevents two independently running
+// protection state machines from owning the same execution account. The
+// startup transaction is the authoritative race barrier; save paths call this
+// helper as an early, user-friendly conflict check.
+func validateCopyGuardAccountExclusivity(st *store.Store, traderID, exchangeID string, config *store.CopyTradeConfig) error {
+	if st == nil || config == nil || config.RiskPolicyVersion < 4 ||
+		!config.RiskStopLossEnabled || !copytrade.SupportsCopyGuard(copytrade.ProviderType(config.ProviderType)) {
+		return nil
+	}
+	conflict, err := st.Trader().FindRunningCopyGuardConflict(traderID, exchangeID)
+	if err != nil {
+		return fmt.Errorf("check Copy Guard execution-account ownership: %w", err)
+	}
+	if conflict != "" {
+		return fmt.Errorf("该执行账户正由交易程序 %s 运行中；启用 Copy Guard 时同一账户只能由一个交易程序管理仓位和止损", conflict)
+	}
+	return nil
+}
+
 // disableReentryCandidatesAfterConfigSave closes only candidates that have not
-// reached an exchange submission. Submitted work remains owned by the durable
-// intent reconciler so disabling protection cannot hide an in-flight order.
+// reached an exchange submission, and only when the account-protection master
+// switch is turned off. Changing the trader template from ATR/AI to fixed
+// position-margin protection applies to later lifecycles; candidates belonging
+// to an already-open ATR lifecycle remain governed by its policy snapshot.
+// Submitted work remains owned by the durable intent reconciler so disabling
+// protection cannot hide an in-flight order.
 func disableReentryCandidatesAfterConfigSave(st *store.Store, old, current *store.CopyTradeConfig) {
-	if st == nil || current == nil || !copyGuardAIActive(old) || copyGuardAIActive(current) {
+	if st == nil || current == nil || !copyGuardAIActive(old) || current.RiskStopLossEnabled {
 		return
 	}
 	if err := st.ReentryAI().DisableReentryCandidatesForTrader(current.TraderID, "account protection or AI reentry disabled"); err != nil {
@@ -1082,6 +1105,8 @@ type CopyTradeConfigRequest struct {
 	// 前端传入将被忽略。
 	// ============================================================
 	RiskStopLossEnabled        *bool    `json:"risk_stop_loss_enabled,omitempty"`
+	RiskProtectionMode         *string  `json:"risk_protection_mode,omitempty"`
+	RiskPositionMarginStopPct  *float64 `json:"risk_position_margin_stop_pct,omitempty"`
 	RiskStopMaxAccountLossPct  *float64 `json:"risk_stop_max_account_loss_pct,omitempty"`
 	RiskAccountPct             *float64 `json:"risk_account_pct,omitempty"`
 	RiskATRMultiplier          *float64 `json:"risk_atr_multiplier,omitempty"`
@@ -1307,6 +1332,17 @@ func maskedCopyTradeConfig(config *store.CopyTradeConfig) *store.CopyTradeConfig
 // @Router /api/copytrade/config/{trader_id} [post]
 func (h *CopyTradeHandler) SaveConfig(c *gin.Context) {
 	traderID := c.Param("trader_id")
+	userID := c.GetString("user_id")
+	_, ownershipErr := h.store.Trader().GetLifecycleForUser(userID, traderID)
+	if ownershipErr != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "trader not found or access denied"})
+		return
+	}
+	ownedTrader, ownershipErr := h.store.Trader().GetByID(traderID)
+	if ownershipErr != nil || ownedTrader.UserID != userID {
+		c.JSON(http.StatusNotFound, gin.H{"error": "trader not found or access denied"})
+		return
+	}
 
 	var req CopyTradeConfigRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -1464,7 +1500,7 @@ func (h *CopyTradeHandler) SaveConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "copy guard is only supported for OKX or Binance leader sources"})
 		return
 	}
-	if config.RiskPolicyVersion >= 4 {
+	if config.RiskPolicyVersion >= 4 && config.RiskProtectionMode != store.RiskProtectionModePositionMarginPct {
 		if err := validateRiskConfirmation(config.RiskAccountPct, req.RiskHighRiskConfirmed, req.RiskExtremeConfirmValue); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
@@ -1494,6 +1530,10 @@ func (h *CopyTradeHandler) SaveConfig(c *gin.Context) {
 	}
 	if copyTradeSourceIdentityChanged(existing, config) && copytrade.IsCopyTradingRunning(traderID) {
 		c.JSON(http.StatusConflict, gin.H{"error": "跟单引擎仍在运行；切换领航员数据源前请先停止跟单，保存后再重新启动"})
+		return
+	}
+	if err := validateCopyGuardAccountExclusivity(h.store, traderID, ownedTrader.ExchangeID, config); err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 		return
 	}
 
@@ -1533,6 +1573,16 @@ func (h *CopyTradeHandler) SaveConfig(c *gin.Context) {
 }
 
 func applyCopyGuardV4Request(c, old *store.CopyTradeConfig, r *CopyTradeConfigRequest) {
+	if r.RiskProtectionMode != nil {
+		c.RiskProtectionMode = *r.RiskProtectionMode
+	} else if old != nil {
+		c.RiskProtectionMode = old.RiskProtectionMode
+	}
+	if r.RiskPositionMarginStopPct != nil {
+		c.RiskPositionMarginStopPct = *r.RiskPositionMarginStopPct
+	} else if old != nil {
+		c.RiskPositionMarginStopPct = old.RiskPositionMarginStopPct
+	}
 	if r.RiskPolicyVersion != nil {
 		c.RiskPolicyVersion = *r.RiskPolicyVersion
 	} else if old != nil {
@@ -1749,7 +1799,8 @@ func (h *CopyTradeHandler) DeleteConfig(c *gin.Context) {
 func (h *CopyTradeHandler) Start(c *gin.Context) {
 	traderID := c.Param("trader_id")
 	userID := c.GetString("user_id")
-	if _, err := h.store.Trader().GetFullConfig(userID, traderID); err != nil {
+	fullConfig, err := h.store.Trader().GetFullConfig(userID, traderID)
+	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "trader not found or access denied"})
 		return
 	}
@@ -1790,7 +1841,21 @@ func (h *CopyTradeHandler) Start(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	if err = h.store.Trader().CompleteStart(userID, traderID, lifecycle.Generation); err != nil {
+	persistedConfig, configErr := h.store.CopyTrade().GetByTraderID(traderID)
+	if configErr != nil {
+		_ = h.store.CopyTrade().SetEnabled(traderID, false)
+		_ = h.store.Trader().FailStart(userID, traderID, lifecycle.Generation, configErr.Error())
+		c.JSON(http.StatusConflict, gin.H{"error": configErr.Error()})
+		return
+	}
+	copyGuardExclusive := persistedConfig.RiskPolicyVersion >= 4 && persistedConfig.RiskStopLossEnabled &&
+		copytrade.SupportsCopyGuard(copytrade.ProviderType(persistedConfig.ProviderType))
+	if copyGuardExclusive {
+		err = h.store.Trader().CompleteCopyGuardStart(userID, traderID, lifecycle.Generation, fullConfig.Trader.ExchangeID)
+	} else {
+		err = h.store.Trader().CompleteStart(userID, traderID, lifecycle.Generation)
+	}
+	if err != nil {
 		_ = h.store.CopyTrade().SetEnabled(traderID, false)
 		_ = h.store.Trader().FailStart(userID, traderID, lifecycle.Generation, err.Error())
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})

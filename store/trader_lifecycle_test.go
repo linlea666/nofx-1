@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -17,6 +18,127 @@ func createLifecycleTestTrader(t *testing.T, st *Store, id, status string, gener
 		VALUES(?,?,?,?,?,?,?,?,?)`,
 		id, "user-1", id, "model-1", "exchange-1", 1000, running, status, generation); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestCopyGuardStartEnforcesExecutionAccountExclusivity(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "copyguard-account-exclusive.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	createLifecycleTestTrader(t, st, "guard-a", TraderLifecycleRunning, 1)
+	createLifecycleTestTrader(t, st, "guard-b", TraderLifecycleStarting, 2)
+	for _, traderID := range []string{"guard-a", "guard-b"} {
+		cfg := NewCopyGuardDefaults()
+		cfg.TraderID = traderID
+		cfg.ProviderType = "okx"
+		cfg.LeaderID = "leader-" + traderID
+		cfg.Enabled = true
+		cfg.RiskPolicyVersion = 4
+		if err = st.CopyTrade().Upsert(cfg); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	conflict, err := st.Trader().FindRunningCopyGuardConflict("guard-b", "exchange-1")
+	if err != nil || conflict != "guard-a" {
+		t.Fatalf("running account owner not found: conflict=%q err=%v", conflict, err)
+	}
+	if err = st.Trader().CompleteCopyGuardStart("user-1", "guard-b", 2, "exchange-1"); err == nil {
+		t.Fatal("second Copy Guard program started on the same execution account")
+	}
+	lifecycle, err := st.Trader().GetLifecycle("guard-b")
+	if err != nil || lifecycle.Status != TraderLifecycleStarting || lifecycle.IsRunning {
+		t.Fatalf("conflicted start mutated lifecycle: %+v err=%v", lifecycle, err)
+	}
+	if _, err = st.DB().Exec("UPDATE traders SET lifecycle_status=?,is_running=0 WHERE id='guard-a'", TraderLifecycleStopped); err != nil {
+		t.Fatal(err)
+	}
+	if err = st.Trader().CompleteCopyGuardStart("user-1", "guard-b", 2, "exchange-1"); err != nil {
+		t.Fatalf("account was not released after the first program stopped: %v", err)
+	}
+	lifecycle, err = st.Trader().GetLifecycle("guard-b")
+	if err != nil || lifecycle.Status != TraderLifecycleRunning || !lifecycle.IsRunning {
+		t.Fatalf("exclusive start did not commit: %+v err=%v", lifecycle, err)
+	}
+
+	// Account ownership is bidirectional: while guard-b owns the account, a
+	// plain AI program cannot start beside it.
+	createLifecycleTestTrader(t, st, "plain-c", TraderLifecycleStarting, 3)
+	if err = st.Trader().CompleteStart("user-1", "plain-c", 3); err == nil {
+		t.Fatal("plain trader started beside an active Copy Guard owner")
+	}
+	if _, err = st.DB().Exec("UPDATE traders SET lifecycle_status=?,is_running=0 WHERE id='guard-b'", TraderLifecycleStopped); err != nil {
+		t.Fatal(err)
+	}
+	if err = st.Trader().CompleteStart("user-1", "plain-c", 3); err != nil {
+		t.Fatalf("plain trader did not start after Copy Guard released account: %v", err)
+	}
+
+	// Conversely, a Copy Guard candidate cannot claim an account already used
+	// by a plain running program.
+	createLifecycleTestTrader(t, st, "guard-d", TraderLifecycleStarting, 4)
+	guardD := NewCopyGuardDefaults()
+	guardD.TraderID, guardD.ProviderType, guardD.LeaderID = "guard-d", "binance", "leader-d"
+	guardD.Enabled = true
+	if err = st.CopyTrade().Upsert(guardD); err != nil {
+		t.Fatal(err)
+	}
+	if err = st.Trader().CompleteCopyGuardStart("user-1", "guard-d", 4, "exchange-1"); err == nil {
+		t.Fatal("Copy Guard claimed an account with a plain running trader")
+	}
+
+	// Ordinary programs retain their prior behavior when no Copy Guard owns the
+	// account; this feature does not globally serialize all traders.
+	createLifecycleTestTrader(t, st, "plain-e", TraderLifecycleStarting, 5)
+	if err = st.Trader().CompleteStart("user-1", "plain-e", 5); err != nil {
+		t.Fatalf("plain traders were made globally exclusive: %v", err)
+	}
+}
+
+func TestConcurrentCopyGuardStartsCommitOnlyOneAccountOwner(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "copyguard-concurrent-owner.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	for i, traderID := range []string{"guard-a", "guard-b"} {
+		createLifecycleTestTrader(t, st, traderID, TraderLifecycleStarting, int64(i+1))
+		cfg := NewCopyGuardDefaults()
+		cfg.TraderID, cfg.ProviderType, cfg.LeaderID = traderID, "okx", "leader-"+traderID
+		cfg.Enabled = true
+		if err = st.CopyTrade().Upsert(cfg); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	var wg sync.WaitGroup
+	for i, traderID := range []string{"guard-a", "guard-b"} {
+		wg.Add(1)
+		go func(id string, generation int64) {
+			defer wg.Done()
+			<-start
+			results <- st.Trader().CompleteCopyGuardStart("user-1", id, generation, "exchange-1")
+		}(traderID, int64(i+1))
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	succeeded := 0
+	for callErr := range results {
+		if callErr == nil {
+			succeeded++
+		}
+	}
+	if succeeded != 1 {
+		t.Fatalf("concurrent Copy Guard starts committed %d owners, want exactly one", succeeded)
+	}
+	count, err := st.Trader().CountRunningByExchange("exchange-1")
+	if err != nil || count != 1 {
+		t.Fatalf("running account owners=%d err=%v, want 1", count, err)
 	}
 }
 

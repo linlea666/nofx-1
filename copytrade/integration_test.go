@@ -13,6 +13,15 @@ import (
 	"nofx/store"
 )
 
+type shadowMarketExecutor struct {
+	flatExecutor
+	marketPrice float64
+}
+
+func (e *shadowMarketExecutor) SetStopLoss(string, string, float64, float64) error { return nil }
+func (e *shadowMarketExecutor) CancelStopLossOrders(string) error                  { return nil }
+func (e *shadowMarketExecutor) GetMarketPrice(string) (float64, error)             { return e.marketPrice, nil }
+
 func TestClassifyExecutionFailurePreservesTypedPreSubmitReason(t *testing.T) {
 	err := fmt.Errorf("persist close short attempt: %w",
 		reasonError("PRE_SUBMIT", "prepare durable execution order attempt: database busy"))
@@ -36,6 +45,84 @@ func TestExecutionFailurePhaseOnlyMarksErrorsBeforeDurableSubmission(t *testing.
 	afterSubmitErr := preservePreSubmitExecutionFailure(dec, baseErr)
 	if afterSubmitErr != baseErr || ReasonCodeOf(afterSubmitErr) != "" {
 		t.Fatalf("post-submission failure was incorrectly made replayable: code=%s err=%v", ReasonCodeOf(afterSubmitErr), afterSubmitErr)
+	}
+}
+
+func TestWrappedPreSubmitPositionMissingUsesBenignClosePath(t *testing.T) {
+	ti := &TraderIntegration{
+		traderID: "test-trader",
+		engine: &Engine{config: &CopyConfig{
+			ProviderType: ProviderBinance,
+			LeaderID:     "leader",
+		}},
+	}
+	wrappedMissing := fmt.Errorf("prepare close attempt: %w", &ReasonCodedError{
+		Code: "PRE_SUBMIT", Cause: errors.New("long position not found for ETHUSDT"),
+	})
+	closeDecision := &decision.Decision{Action: "close_long", Symbol: "ETHUSDT"}
+	if ti.shouldReplayPreSubmitFailure(closeDecision, wrappedMissing) {
+		t.Fatal("wrapped benign close was shadowed by the PRE_SUBMIT replay branch")
+	}
+	if !ti.isBenignCloseError(closeDecision, wrappedMissing) {
+		t.Fatal("test setup no longer reaches the fresh-flat benign close candidate")
+	}
+	openDecision := &decision.Decision{Action: "open_long", Symbol: "ETHUSDT"}
+	if !ti.shouldReplayPreSubmitFailure(openDecision, wrappedMissing) {
+		t.Fatal("the same PRE_SUBMIT failure on a risk-increasing action must remain replayable")
+	}
+	nonBenign := reasonError("PRE_SUBMIT", "database busy")
+	if !ti.shouldReplayPreSubmitFailure(closeDecision, nonBenign) {
+		t.Fatal("a non-benign PRE_SUBMIT close failure must remain replayable")
+	}
+}
+
+func TestPositionMarginShadowTracksLeaderAfterATRStopWhenReentryDisabled(t *testing.T) {
+	e, st := newReentryTestEngine(t)
+	cycle := seedStoppedCycle(t, st, e.traderID, "long", 100)
+	e.config.RiskReentryEnabled = false
+	e.config.RiskReentryDecisionMode = "disabled"
+	_, created, err := st.CopyTrade().InitializeCopyGuardPositionMarginShadow(&store.CopyGuardPositionMarginShadow{
+		CycleID: cycle.ID, TraderID: e.traderID, Side: "long",
+		AnchorEntryPrice: 100, AnchorLeverage: 10, AnchorInitialMargin: 10,
+		AnchorStopPrice: 92, ConfiguredMarginLossPct: 0.80,
+		PriceTickSize: 0.1, QuantityStep: 0.01, InitialQuantity: 1,
+		CurrentEntryPrice: 100, CurrentQuantity: 1, CurrentLeverage: 10,
+		EffectiveStopPrice: 92, LastLeaderSize: 1,
+	})
+	if err != nil || !created {
+		t.Fatalf("initialize passive position-margin shadow: created=%v err=%v", created, err)
+	}
+	e.leaderState.Positions["ETHUSDT_long"] = &Position{
+		Symbol: "ETHUSDT", Side: SideLong, Size: 2, EntryPrice: 100,
+		MarkPrice: 110, MarginMode: "cross", PosID: "leader-pos",
+	}
+	ti := &TraderIntegration{
+		traderID: e.traderID, store: st, engine: e,
+		executor: &shadowMarketExecutor{marketPrice: 110},
+	}
+
+	ti.observePositionMarginStopShadows()
+	ti.observePositionMarginStopShadows() // idempotent: unchanged leader size must not write again
+
+	shadow, err := st.CopyTrade().GetCopyGuardPositionMarginShadow(cycle.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if shadow.CurrentQuantity != 2 || shadow.CurrentEntryPrice != 105 || shadow.LastLeaderSize != 2 {
+		t.Fatalf("disabled reentry stopped tracking the passive shadow: %+v", shadow)
+	}
+	events, err := st.CopyTrade().ListCopyGuardEvents(cycle.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	syncEvents := 0
+	for _, event := range events {
+		if event.Type == "SHADOW_POSITION_MARGIN_QUANTITY_SYNCED" {
+			syncEvents++
+		}
+	}
+	if syncEvents != 1 {
+		t.Fatalf("shadow quantity transition must be logged once, got %d events: %+v", syncEvents, events)
 	}
 }
 
@@ -1291,5 +1378,96 @@ func TestStopCopyTradingForTraderClearsLifecycleReservation(t *testing.T) {
 	if exists || reserved || ti.IsRunning() {
 		t.Fatalf("stop must remove integration and release lifecycle reservation: exists=%v reserved=%v running=%v",
 			exists, reserved, ti.IsRunning())
+	}
+}
+
+func TestFixedPositionMarginOrderFailureNeverUsesForcedExitDisposition(t *testing.T) {
+	ti := &TraderIntegration{engine: &Engine{config: &CopyConfig{RiskUnprotectableDisposition: "close"}}}
+	cycle := &store.CopyGuardCycle{PolicySnapshot: `{
+		"risk_protection_mode":"position_margin_pct",
+		"risk_position_margin_stop_pct":0.8,
+		"risk_unprotectable_disposition":"close"
+	}`}
+	if got := ti.unprotectableDisposition(cycle); got != "warn" {
+		t.Fatalf("fixed stop order failure disposition=%q want=warn", got)
+	}
+
+	atrCycle := &store.CopyGuardCycle{PolicySnapshot: `{
+		"risk_protection_mode":"atr_structure",
+		"risk_unprotectable_disposition":"close"
+	}`}
+	if got := ti.unprotectableDisposition(atrCycle); got != "close" {
+		t.Fatalf("ATR disposition compatibility changed: got=%q", got)
+	}
+}
+
+func TestPositionMarginAnchorInitializationRejectsLaterPositionTransitions(t *testing.T) {
+	baseMapping := &store.CopyTradePositionMapping{Status: store.MappingStatusActive}
+	initial := &decision.Decision{Action: "open_long", CopyTradeAction: "open"}
+	if !positionMarginAnchorInitializationAllowed(initial, baseMapping, 0) {
+		t.Fatal("confirmed first open was not allowed to initialize its anchor")
+	}
+	recoveredInitial := &decision.Decision{Action: "open_short", Reasoning: "Copy trading: recovered execution intent after restart"}
+	if !positionMarginAnchorInitializationAllowed(recoveredInitial, baseMapping, 0) {
+		t.Fatal("recovered first open with untouched mapping was not allowed")
+	}
+
+	for name, dec := range map[string]*decision.Decision{
+		"add":                {Action: "open_long", CopyTradeAction: "add"},
+		"catchup":            {Action: "open_long", CopyTradeAction: "catchup"},
+		"reduce":             {Action: "reduce_long", CopyTradeAction: "reduce"},
+		"reentry":            {Action: "open_long", CopyTradeAction: "ai_reentry"},
+		"policy reprice":     {Action: "open_long", CopyTradeAction: "protection_reprice"},
+		"recovered add hint": {Action: "open_long", Reasoning: "recovered acknowledged add"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if positionMarginAnchorInitializationAllowed(dec, baseMapping, 0) {
+				t.Fatal("later transition was allowed to manufacture a first-fill anchor")
+			}
+		})
+	}
+
+	added := *baseMapping
+	added.AddCount = 1
+	if positionMarginAnchorInitializationAllowed(recoveredInitial, &added, 0) {
+		t.Fatal("mapping with a prior add was allowed to initialize an anchor")
+	}
+	reduced := *baseMapping
+	reduced.ReduceCount = 1
+	if positionMarginAnchorInitializationAllowed(recoveredInitial, &reduced, 0) {
+		t.Fatal("mapping with a prior reduce was allowed to initialize an anchor")
+	}
+	if positionMarginAnchorInitializationAllowed(initial, baseMapping, 1) {
+		t.Fatal("reentry attempt was allowed to initialize a first-entry anchor")
+	}
+}
+
+func TestFixedPositionMarginStoppedSignalsAreAuditedWithoutExecution(t *testing.T) {
+	st, err := store.New(filepath.Join(t.TempDir(), "fixed-stop-signal-audit.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{
+		TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "position-1",
+		Symbol: "ETHUSDT", Side: "long", Status: store.CopyGuardStoppedWatching,
+		PolicySnapshot: `{"risk_protection_mode":"position_margin_pct","risk_position_margin_stop_pct":0.8}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := &Engine{traderID: "trader-1", store: st, config: &CopyConfig{}}
+	mapping := &store.CopyTradePositionMapping{LeaderPosID: "position-1", Status: store.MappingStatusStoppedByRisk}
+	engine.recordFixedPositionMarginSignalIgnored(mapping, &Fill{
+		ID: "reduce-1", Symbol: "ETHUSDT", PositionSide: SideLong,
+		Action: ActionReduce, Price: 90, Size: 0.5, Value: 45,
+	})
+	events, err := st.CopyTrade().ListCopyGuardEvents(cycle.ID)
+	if err != nil || len(events) != 1 {
+		t.Fatalf("ignored signal audit count=%d err=%v", len(events), err)
+	}
+	if events[0].Type != "POSITION_MARGIN_SIGNAL_IGNORED" ||
+		events[0].Metadata["source_action"] != string(ActionReduce) {
+		t.Fatalf("unexpected ignored signal audit: %+v", events[0])
 	}
 }

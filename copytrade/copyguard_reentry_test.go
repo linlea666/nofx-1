@@ -524,6 +524,115 @@ func TestWatchReversalClosesCycle(t *testing.T) {
 	}
 }
 
+func TestATRWatchUsesSnapshotAfterTraderSwitchesToFixed(t *testing.T) {
+	e, st := newReentryTestEngine(t)
+	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700)
+	if _, err := st.DB().Exec(`UPDATE copy_guard_cycles SET policy_snapshot=? WHERE id=?`, `{
+		"version":4,
+		"risk_protection_mode":"atr_structure",
+		"reentry_enabled":true,
+		"max_reentries":2,
+		"reentry_decision_mode":"legacy_rule"
+	}`, cycle.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	// The newly-saved trader template is fixed 80%, which correctly disables
+	// reentry for future lifecycles. It must not short-circuit this older ATR
+	// lifecycle before its own frozen policy is evaluated.
+	e.config.RiskProtectionMode = store.RiskProtectionModePositionMarginPct
+	e.config.RiskReentryEnabled = false
+	e.config.RiskReentryDecisionMode = "disabled"
+	e.config.RiskMaxReentries = 0
+	persisted, err := st.CopyTrade().GetByTraderID(e.traderID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted.RiskProtectionMode = store.RiskProtectionModePositionMarginPct
+	persisted.RiskPositionMarginStopPct = .8
+	persisted.RiskTriggerPriceType = "mark"
+	persisted.RiskReentryEnabled = false
+	persisted.RiskReentryDecisionMode = "disabled"
+	persisted.RiskMaxReentries = 0
+	if err = st.CopyTrade().Upsert(persisted); err != nil {
+		t.Fatal(err)
+	}
+
+	e.leaderState.Positions["ETHUSDT_short"] = &Position{
+		Symbol: "ETHUSDT", Side: SideShort, Size: 1, EntryPrice: 1700,
+		MarkPrice: 1695, MarginMode: "cross", PosID: "leader-pos",
+	}
+	e.checkReentryConditions()
+	got, err := st.CopyTrade().GetCopyGuardCycle(cycle.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != store.CopyGuardLeaderReversed || got.ClosedAt == nil {
+		t.Fatalf("ATR lifecycle was short-circuited by the later fixed template: %+v", got)
+	}
+}
+
+func TestFixedPositionMarginStoppedReversalClosesWithoutReentryMonitor(t *testing.T) {
+	e, st := newReentryTestEngine(t)
+	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700)
+	e.config.RiskProtectionMode = store.RiskProtectionModePositionMarginPct
+	e.config.RiskPositionMarginStopPct = 0.80
+	e.config.RiskReentryEnabled = false
+	e.config.RiskReentryDecisionMode = "disabled"
+
+	policy, err := st.CopyTrade().GetByTraderID(e.traderID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy.RiskProtectionMode = store.RiskProtectionModePositionMarginPct
+	policy.RiskPositionMarginStopPct = 0.80
+	policy.RiskReentryEnabled = false
+	policy.RiskManualReentryEnabled = false
+	policy.RiskReentryDecisionMode = "disabled"
+	if err = st.CopyTrade().Upsert(policy); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = st.DB().Exec(`UPDATE copy_guard_cycles SET policy_snapshot=? WHERE id=?`,
+		`{"risk_protection_mode":"position_margin_pct","risk_position_margin_stop_pct":0.8}`, cycle.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Fixed mode never enters the AI/reentry monitor. The ordinary lifecycle
+	// sweep must still recognize a same-id side reversal and release the old
+	// stopped mapping for the new short lifecycle.
+	e.leaderState.Positions["ETHUSDT_short"] = &Position{
+		Symbol: "ETHUSDT", Side: SideShort, Size: 1, EntryPrice: 1700,
+		MarkPrice: 1695, MarginMode: "cross", PosID: "leader-pos",
+	}
+	e.checkIgnoredPositionsClosed()
+
+	got, err := st.CopyTrade().GetCopyGuardCycle(cycle.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != store.CopyGuardLeaderReversed || got.ClosedAt == nil || got.BaselineSource != "leader_reversal_mark" {
+		t.Fatalf("fixed stopped reversal attribution mismatch: %+v", got)
+	}
+	stopped, err := st.CopyTrade().ListStoppedByRiskMappings(e.traderID)
+	if err != nil || len(stopped) != 0 {
+		t.Fatalf("reversed fixed lifecycle left stopped mapping: %+v err=%v", stopped, err)
+	}
+	events, err := st.CopyTrade().ListCopyGuardEvents(cycle.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, event := range events {
+		if event.Type == "LEADER_REVERSED" && event.Metadata["old_side"] == "long" && event.Metadata["new_side"] == "short" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("fixed reversal audit event missing old/new sides: %+v", events)
+	}
+}
+
 // ============================================================================
 // 存量持仓回填生命周期（L1）
 // ============================================================================

@@ -175,11 +175,51 @@ func (s *TraderStore) BeginStart(userID, traderID string) (*TraderLifecycle, err
 }
 
 func (s *TraderStore) CompleteStart(userID, traderID string, generation int64) error {
+	return s.completeStart(userID, traderID, generation, "", false)
+}
+
+// CompleteCopyGuardStart performs the account exclusivity check and RUNNING
+// transition in one SQLite transaction. The API also checks before save for a
+// clearer error; this is the authoritative race-safe startup barrier.
+func (s *TraderStore) CompleteCopyGuardStart(userID, traderID string, generation int64, exchangeID string) error {
+	return s.completeStart(userID, traderID, generation, exchangeID, true)
+}
+
+func (s *TraderStore) completeStart(userID, traderID string, generation int64, exchangeID string, copyGuardExclusive bool) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	if strings.TrimSpace(exchangeID) == "" {
+		if err = tx.QueryRow(`SELECT exchange_id FROM traders WHERE id=? AND user_id=?`, traderID, userID).Scan(&exchangeID); err != nil {
+			return err
+		}
+	}
+	if strings.TrimSpace(exchangeID) != "" {
+		var conflict string
+		err = tx.QueryRow(`SELECT t.id
+			FROM traders t
+			LEFT JOIN copy_trade_configs c ON c.trader_id=t.id
+			LEFT JOIN copy_guard_policies p ON p.trader_id=t.id
+			WHERE t.exchange_id=? AND t.id<>?
+			  AND t.lifecycle_status='RUNNING' AND t.is_running=1
+			  AND (? OR (
+				p.trader_id IS NOT NULL AND c.enabled=1
+				AND COALESCE(c.risk_stop_loss_enabled,1)=1
+				AND c.provider_type IN ('okx','binance')
+			  ))
+			ORDER BY t.id LIMIT 1`, exchangeID, traderID, copyGuardExclusive).Scan(&conflict)
+		if err != nil && err != sql.ErrNoRows {
+			return err
+		}
+		if conflict != "" {
+			if copyGuardExclusive {
+				return fmt.Errorf("execution account already has running trader %s and cannot be assigned to Copy Guard", conflict)
+			}
+			return fmt.Errorf("execution account is already controlled by Copy Guard trader %s", conflict)
+		}
+	}
 	res, err := tx.Exec(`UPDATE traders SET lifecycle_status=?,is_running=1
 		WHERE id=? AND user_id=? AND lifecycle_status=? AND lifecycle_generation=?`,
 		TraderLifecycleRunning, traderID, userID, TraderLifecycleStarting, generation)

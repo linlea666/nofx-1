@@ -559,6 +559,8 @@ type CopyConfigReq struct {
 	// v3 遗留字段（risk_atr_enabled / risk_reentry_tolerance / 反加仓铁律 /
 	// risk_stop_noise_floor_atr / risk_cycle_max_loss_pct）已随 v5 下线
 	RiskStopLossEnabled        *bool    `json:"risk_stop_loss_enabled,omitempty"`
+	RiskProtectionMode         *string  `json:"risk_protection_mode,omitempty"`
+	RiskPositionMarginStopPct  *float64 `json:"risk_position_margin_stop_pct,omitempty"`
 	RiskStopMaxAccountLossPct  *float64 `json:"risk_stop_max_account_loss_pct,omitempty"`
 	RiskAccountPct             float64  `json:"risk_account_pct,omitempty"`
 	RiskATRMultiplier          float64  `json:"risk_atr_multiplier,omitempty"`
@@ -640,6 +642,12 @@ func applyCopyConfigRiskFields(copyConfig *store.CopyTradeConfig, req *CopyConfi
 	}
 	// 开关：nil 用合理默认；非 nil 用 *值
 	copyConfig.RiskStopLossEnabled = derefBoolDefault(req.RiskStopLossEnabled, copyConfig.RiskStopLossEnabled)
+	if req.RiskProtectionMode != nil {
+		copyConfig.RiskProtectionMode = *req.RiskProtectionMode
+	}
+	if req.RiskPositionMarginStopPct != nil {
+		copyConfig.RiskPositionMarginStopPct = *req.RiskPositionMarginStopPct
+	}
 	if req.RiskStopMaxAccountLossPct != nil {
 		copyConfig.RiskStopMaxAccountLossPct = *req.RiskStopMaxAccountLossPct
 	}
@@ -913,6 +921,16 @@ func (s *Server) handleCreateTrader(c *gin.Context) {
 		exchangeIDShort = exchangeIDShort[:8]
 	}
 	traderID := fmt.Sprintf("%s_%s_%d", exchangeIDShort, req.AIModelID, time.Now().Unix())
+	if req.DecisionMode == "copy_trade" && req.CopyConfig != nil {
+		probe := store.NewCopyGuardDefaults()
+		probe.TraderID = traderID
+		probe.ProviderType = req.CopyConfig.ProviderType
+		applyCopyConfigRiskFields(probe, req.CopyConfig)
+		if err := validateCopyGuardAccountExclusivity(s.store, traderID, req.ExchangeID, probe); err != nil {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
+	}
 
 	// Set default values
 	isCrossMargin := true // Default to cross margin mode
@@ -1140,7 +1158,7 @@ func (s *Server) handleCreateTrader(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "copy guard v4 is only supported for OKX or Binance leader sources"})
 			return
 		}
-		if copyConfig.RiskPolicyVersion >= 4 {
+		if copyConfig.RiskPolicyVersion >= 4 && copyConfig.RiskProtectionMode != store.RiskProtectionModePositionMarginPct {
 			if err := validateRiskConfirmation(copyConfig.RiskAccountPct, req.CopyConfig.RiskHighRiskConfirmed, req.CopyConfig.RiskExtremeConfirmValue); err != nil {
 				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 				return
@@ -1169,6 +1187,10 @@ func (s *Server) handleCreateTrader(c *gin.Context) {
 		}
 		if copyConfig.CopyRatio > maxCopyRatio {
 			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("copy_ratio %.2f exceeds max %.0f", copyConfig.CopyRatio, maxCopyRatio)})
+			return
+		}
+		if err := validateCopyGuardAccountExclusivity(s.store, traderID, traderRecord.ExchangeID, copyConfig); err != nil {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 			return
 		}
 
@@ -1262,6 +1284,24 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 		return
 	}
 	if req.DecisionMode == "copy_trade" && req.CopyConfig != nil {
+		probe := store.NewCopyGuardDefaults()
+		if existingCopyCfg, copyErr := s.store.CopyTrade().GetByTraderID(traderID); copyErr == nil {
+			clone := *existingCopyCfg
+			probe = &clone
+		}
+		probe.TraderID = traderID
+		probe.ProviderType = req.CopyConfig.ProviderType
+		applyCopyConfigRiskFields(probe, req.CopyConfig)
+		exchangeID := req.ExchangeID
+		if exchangeID == "" {
+			exchangeID = existingTrader.ExchangeID
+		}
+		if err := validateCopyGuardAccountExclusivity(s.store, traderID, exchangeID, probe); err != nil {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	if req.DecisionMode == "copy_trade" && req.CopyConfig != nil {
 		existingCopyCfg, _ := s.store.CopyTrade().GetByTraderID(traderID)
 		candidate := store.NewCopyGuardDefaults()
 		if existingCopyCfg != nil {
@@ -1322,6 +1362,10 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 	if strategyID == "" {
 		strategyID = existingTrader.StrategyID
 	}
+	exchangeID := req.ExchangeID
+	if exchangeID == "" {
+		exchangeID = existingTrader.ExchangeID
+	}
 
 	// Update trader configuration
 	traderRecord := &store.Trader{
@@ -1329,7 +1373,7 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 		UserID:               userID,
 		Name:                 req.Name,
 		AIModelID:            req.AIModelID,
-		ExchangeID:           req.ExchangeID,
+		ExchangeID:           exchangeID,
 		StrategyID:           strategyID, // Associated strategy ID
 		InitialBalance:       req.InitialBalance,
 		BTCETHLeverage:       btcEthLeverage,
@@ -1419,7 +1463,7 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 				c.JSON(http.StatusBadRequest, gin.H{"error": "copy guard v4 is only supported for OKX or Binance leader sources"})
 				return
 			}
-			if copyConfig.RiskPolicyVersion >= 4 {
+			if copyConfig.RiskPolicyVersion >= 4 && copyConfig.RiskProtectionMode != store.RiskProtectionModePositionMarginPct {
 				if err := validateRiskConfirmation(copyConfig.RiskAccountPct, req.CopyConfig.RiskHighRiskConfirmed, req.CopyConfig.RiskExtremeConfirmValue); err != nil {
 					c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 					return
@@ -1452,6 +1496,10 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 			}
 			if copyConfig.CopyRatio > maxCopyRatio {
 				c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("copy_ratio %.2f exceeds max %.0f", copyConfig.CopyRatio, maxCopyRatio)})
+				return
+			}
+			if err := validateCopyGuardAccountExclusivity(s.store, traderID, traderRecord.ExchangeID, copyConfig); err != nil {
+				c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 				return
 			}
 
@@ -1676,7 +1724,24 @@ func (s *Server) handleStartTrader(c *gin.Context) {
 	// Check decision mode to determine startup type
 	decisionMode, _ := s.store.CopyTrade().GetDecisionMode(traderID)
 
-	if err = s.store.Trader().CompleteStart(userID, traderID, lifecycle.Generation); err != nil {
+	copyGuardExclusive := false
+	if decisionMode == "copy_trade" {
+		persistedConfig, configErr := s.store.CopyTrade().GetByTraderID(traderID)
+		if configErr != nil {
+			trader.Stop()
+			failStart(configErr)
+			c.JSON(http.StatusConflict, gin.H{"error": "Failed to load copy-trade configuration: " + configErr.Error()})
+			return
+		}
+		copyGuardExclusive = persistedConfig.RiskPolicyVersion >= 4 && persistedConfig.RiskStopLossEnabled &&
+			copytrade.SupportsCopyGuard(copytrade.ProviderType(persistedConfig.ProviderType))
+	}
+	if copyGuardExclusive {
+		err = s.store.Trader().CompleteCopyGuardStart(userID, traderID, lifecycle.Generation, fullConfig.Trader.ExchangeID)
+	} else {
+		err = s.store.Trader().CompleteStart(userID, traderID, lifecycle.Generation)
+	}
+	if err != nil {
 		trader.Stop()
 		failStart(err)
 		c.JSON(http.StatusConflict, gin.H{"error": "Failed to commit trader start: " + err.Error()})

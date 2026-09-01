@@ -615,6 +615,25 @@ func (s *TraderStore) CountRunningByExchange(exchangeID string) (int, error) {
 	return count, err
 }
 
+// FindRunningCopyGuardConflict returns any other RUNNING trader on the account
+// a Copy Guard candidate wants to own. Even a non-Guard program can mutate the
+// same exchange position and invalidate stop coverage, so candidate ownership
+// must be account-exclusive.
+func (s *TraderStore) FindRunningCopyGuardConflict(traderID, exchangeID string) (string, error) {
+	if strings.TrimSpace(exchangeID) == "" {
+		return "", nil
+	}
+	var conflict string
+	err := s.db.QueryRow(`SELECT t.id FROM traders t
+		WHERE t.exchange_id=? AND t.id<>?
+		  AND t.lifecycle_status='RUNNING' AND t.is_running=1
+		ORDER BY t.id LIMIT 1`, exchangeID, traderID).Scan(&conflict)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return conflict, err
+}
+
 func (s *TraderStore) CountNonArchivedByExchange(exchangeID string) (int, error) {
 	if strings.TrimSpace(exchangeID) == "" {
 		return 0, nil

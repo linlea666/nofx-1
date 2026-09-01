@@ -15,6 +15,12 @@ type CopyTradeStore struct {
 
 const positionMarginStopMigrationVersion = 1
 
+const (
+	RiskProtectionModeATRStructure      = "atr_structure"
+	RiskProtectionModePositionMarginPct = "position_margin_pct"
+	DefaultRiskPositionMarginStopPct    = 0.80
+)
+
 // CopyTradeConfig 跟单配置（存储在数据库中）
 type CopyTradeConfig struct {
 	TraderID                 string  `json:"trader_id"`
@@ -47,6 +53,11 @@ type CopyTradeConfig struct {
 
 	// 主开关
 	RiskStopLossEnabled bool `json:"risk_stop_loss_enabled"` // 默认 true
+	// RiskProtectionMode selects the independent stop-price policy. Historical
+	// policies default to atr_structure; position_margin_pct must be explicitly
+	// selected per trader and snapshots into each new Copy Guard lifecycle.
+	RiskProtectionMode        string  `json:"risk_protection_mode"`
+	RiskPositionMarginStopPct float64 `json:"risk_position_margin_stop_pct"`
 	// RiskStopMaxAccountLossPct is a per-trader override for the account-level
 	// position stop. Zero means inherit the follower exchange-account policy
 	// (default 10%). It is deliberately separate from RiskAccountPct, which is
@@ -184,6 +195,12 @@ func (c *CopyTradeConfig) FillRiskDefaults() {
 	if c.SourceGeneration <= 0 {
 		c.SourceGeneration = 1
 	}
+	if c.RiskProtectionMode == "" {
+		c.RiskProtectionMode = RiskProtectionModeATRStructure
+	}
+	if c.RiskPositionMarginStopPct == 0 {
+		c.RiskPositionMarginStopPct = DefaultRiskPositionMarginStopPct
+	}
 	if c.RiskAccountPct == 0 {
 		c.RiskAccountPct = 0.02
 	}
@@ -293,6 +310,8 @@ func NewCopyGuardDefaults() *CopyTradeConfig {
 		CopyCatchupWindowSeconds:       60,
 		CopyCatchupMaxAdverseBPS:       20,
 		RiskStopLossEnabled:            true,
+		RiskProtectionMode:             RiskProtectionModeATRStructure,
+		RiskPositionMarginStopPct:      DefaultRiskPositionMarginStopPct,
 		RiskAccountPct:                 0.02,
 		RiskATRMultiplier:              2.0,
 		RiskATRTimeframe:               "1h",
