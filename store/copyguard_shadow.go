@@ -245,7 +245,10 @@ func (s *CopyTradeStore) GetCopyGuardPositionMarginShadow(cycleID int64) (*CopyG
 }
 
 func (s *CopyTradeStore) ListActiveCopyGuardPositionMarginShadows(traderID string) ([]*CopyGuardPositionMarginShadow, error) {
-	rows, err := s.db.Query(positionMarginShadowSelect+` WHERE trader_id=? AND status='ACTIVE' ORDER BY cycle_id`, traderID)
+	// CROSSED rows remain observable until the leader lifecycle ends so v2 can
+	// measure post-stop reversal and mark-path coverage. The legacy v1 observer
+	// is terminal/idempotent for those rows and performs no additional writes.
+	rows, err := s.db.Query(positionMarginShadowSelect+` WHERE trader_id=? AND status IN ('ACTIVE','CROSSED') ORDER BY cycle_id`, traderID)
 	if err != nil {
 		return nil, err
 	}
@@ -262,6 +265,9 @@ func (s *CopyTradeStore) ListActiveCopyGuardPositionMarginShadows(traderID strin
 }
 
 func (s *CopyTradeStore) FinalizeCopyGuardPositionMarginShadow(cycleID int64, leaderClosePrice float64) error {
+	if err := s.finalizeCopyGuardPositionMarginShadowV2(cycleID, leaderClosePrice); err != nil {
+		return err
+	}
 	shadow, err := s.GetCopyGuardPositionMarginShadow(cycleID)
 	if err == sql.ErrNoRows {
 		return nil
@@ -362,35 +368,76 @@ type CopyGuardShadowEvaluation struct {
 	EntryPrice        float64   `json:"entry_price"`
 	ExitPrice         float64   `json:"exit_price"`
 	Reason            string    `json:"reason"`
+	BaselinePolicy    string    `json:"baseline_policy"`
+	BaselineNetPnL    float64   `json:"baseline_net_pnl"`
+	IncrementalEffect float64   `json:"incremental_net_effect"`
+	CostSource        string    `json:"cost_source"`
+	MarkCoverage      float64   `json:"mark_coverage"`
+	StopCrossed       bool      `json:"stop_crossed"`
+	CrossingVerified  bool      `json:"crossing_verified"`
+	MinimumMark       float64   `json:"minimum_mark"`
+	MaximumMark       float64   `json:"maximum_mark"`
+	PostStopReversed  bool      `json:"post_stop_reversed"`
+	SlippageBPS       float64   `json:"slippage_bps"`
+	MinimumLeverage   float64   `json:"minimum_leverage"`
+	MaximumLeverage   float64   `json:"maximum_leverage"`
+	MinimumNotional   float64   `json:"minimum_notional"`
+	MaximumNotional   float64   `json:"maximum_notional"`
 	CreatedAt         time.Time `json:"created_at"`
 	UpdatedAt         time.Time `json:"updated_at"`
 }
 
 func (s *CopyTradeStore) SaveCopyGuardShadowEvaluation(e *CopyGuardShadowEvaluation) error {
+	return upsertCopyGuardShadowEvaluation(s.db, e)
+}
+
+func upsertCopyGuardShadowEvaluation(exec interface {
+	Exec(query string, args ...interface{}) (sql.Result, error)
+}, e *CopyGuardShadowEvaluation) error {
 	if e == nil || e.CycleID <= 0 || strings.TrimSpace(e.TraderID) == "" ||
 		strings.TrimSpace(e.Policy) == "" || e.EvaluationVersion <= 0 {
 		return fmt.Errorf("invalid copy guard shadow evaluation")
 	}
-	_, err := s.db.Exec(`INSERT INTO copy_guard_shadow_evaluations
+	_, err := exec.Exec(`INSERT INTO copy_guard_shadow_evaluations
 		(cycle_id,trader_id,policy,evaluation_version,status,data_quality,gross_pnl,
-		 estimated_cost,net_pnl,size_factor,entry_price,exit_price,reason)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+		 estimated_cost,net_pnl,size_factor,entry_price,exit_price,reason,
+		 baseline_policy,baseline_net_pnl,incremental_net_effect,cost_source,
+		 mark_coverage,stop_crossed,crossing_verified,minimum_mark,maximum_mark,
+		 post_stop_reversed,slippage_bps,minimum_leverage,maximum_leverage,
+		 minimum_notional,maximum_notional)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(cycle_id,policy,evaluation_version) DO UPDATE SET
 			status=excluded.status,data_quality=excluded.data_quality,
 			gross_pnl=excluded.gross_pnl,estimated_cost=excluded.estimated_cost,
 			net_pnl=excluded.net_pnl,size_factor=excluded.size_factor,
 			entry_price=excluded.entry_price,exit_price=excluded.exit_price,
-			reason=excluded.reason,updated_at=CURRENT_TIMESTAMP`,
+			reason=excluded.reason,baseline_policy=excluded.baseline_policy,
+			baseline_net_pnl=excluded.baseline_net_pnl,
+			incremental_net_effect=excluded.incremental_net_effect,
+			cost_source=excluded.cost_source,mark_coverage=excluded.mark_coverage,
+			stop_crossed=excluded.stop_crossed,crossing_verified=excluded.crossing_verified,
+			minimum_mark=excluded.minimum_mark,maximum_mark=excluded.maximum_mark,
+			post_stop_reversed=excluded.post_stop_reversed,slippage_bps=excluded.slippage_bps,
+			minimum_leverage=excluded.minimum_leverage,maximum_leverage=excluded.maximum_leverage,
+			minimum_notional=excluded.minimum_notional,maximum_notional=excluded.maximum_notional,
+			updated_at=CURRENT_TIMESTAMP`,
 		e.CycleID, e.TraderID, e.Policy, e.EvaluationVersion, e.Status, e.DataQuality,
 		e.GrossPnL, e.EstimatedCost, e.NetPnL, e.SizeFactor, e.EntryPrice,
-		e.ExitPrice, e.Reason)
+		e.ExitPrice, e.Reason, e.BaselinePolicy, e.BaselineNetPnL,
+		e.IncrementalEffect, e.CostSource, e.MarkCoverage, e.StopCrossed,
+		e.CrossingVerified, e.MinimumMark, e.MaximumMark, e.PostStopReversed,
+		e.SlippageBPS, e.MinimumLeverage, e.MaximumLeverage, e.MinimumNotional,
+		e.MaximumNotional)
 	return err
 }
 
 func (s *CopyTradeStore) ListCopyGuardShadowEvaluations(cycleID int64) ([]*CopyGuardShadowEvaluation, error) {
 	rows, err := s.db.Query(`SELECT id,cycle_id,trader_id,policy,evaluation_version,status,
 		data_quality,gross_pnl,estimated_cost,net_pnl,size_factor,entry_price,exit_price,
-		reason,created_at,updated_at
+		reason,baseline_policy,baseline_net_pnl,incremental_net_effect,cost_source,
+		mark_coverage,stop_crossed,crossing_verified,minimum_mark,maximum_mark,
+		post_stop_reversed,slippage_bps,minimum_leverage,maximum_leverage,
+		minimum_notional,maximum_notional,created_at,updated_at
 		FROM copy_guard_shadow_evaluations WHERE cycle_id=?
 		ORDER BY policy,evaluation_version`, cycleID)
 	if err != nil {
@@ -423,7 +470,11 @@ func (s *CopyTradeStore) ListCopyGuardShadowEvaluationsForTraders(
 		to.UTC().Format("2006-01-02 15:04:05"))
 	rows, err := s.db.Query(`SELECT e.id,e.cycle_id,e.trader_id,e.policy,
 		e.evaluation_version,e.status,e.data_quality,e.gross_pnl,e.estimated_cost,
-		e.net_pnl,e.size_factor,e.entry_price,e.exit_price,e.reason,e.created_at,e.updated_at
+		e.net_pnl,e.size_factor,e.entry_price,e.exit_price,e.reason,
+		e.baseline_policy,e.baseline_net_pnl,e.incremental_net_effect,e.cost_source,
+		e.mark_coverage,e.stop_crossed,e.crossing_verified,e.minimum_mark,e.maximum_mark,
+		e.post_stop_reversed,e.slippage_bps,e.minimum_leverage,e.maximum_leverage,
+		e.minimum_notional,e.maximum_notional,e.created_at,e.updated_at
 		FROM copy_guard_shadow_evaluations e
 		JOIN copy_guard_cycles c ON c.id=e.cycle_id
 		WHERE e.trader_id IN (`+marks+`) AND c.closed_at>=? AND c.closed_at<?
@@ -476,7 +527,11 @@ func scanCopyGuardShadowEvaluation(row shadowEvaluationScanner) (*CopyGuardShado
 	if err := row.Scan(&e.ID, &e.CycleID, &e.TraderID, &e.Policy,
 		&e.EvaluationVersion, &e.Status, &e.DataQuality, &e.GrossPnL,
 		&e.EstimatedCost, &e.NetPnL, &e.SizeFactor, &e.EntryPrice,
-		&e.ExitPrice, &e.Reason, &createdAt, &updatedAt); err != nil {
+		&e.ExitPrice, &e.Reason, &e.BaselinePolicy, &e.BaselineNetPnL,
+		&e.IncrementalEffect, &e.CostSource, &e.MarkCoverage, &e.StopCrossed,
+		&e.CrossingVerified, &e.MinimumMark, &e.MaximumMark, &e.PostStopReversed,
+		&e.SlippageBPS, &e.MinimumLeverage, &e.MaximumLeverage,
+		&e.MinimumNotional, &e.MaximumNotional, &createdAt, &updatedAt); err != nil {
 		return nil, err
 	}
 	var err error

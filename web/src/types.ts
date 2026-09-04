@@ -843,6 +843,13 @@ export interface CopyTradeConfig {
   risk_stop_loss_enabled?: boolean
   risk_protection_mode?: 'atr_structure' | 'position_margin_pct'
   risk_position_margin_stop_pct?: number
+  atr_profile?: {
+    trigger_price_type: 'mark' | 'last' | 'index'
+    reentry_enabled: boolean
+    reentry_decision_mode: 'ai_guarded' | 'legacy_rule' | 'disabled'
+    manual_reentry_enabled: boolean
+    max_reentries: number
+  }
   risk_stop_max_account_loss_pct?: number
   risk_account_pct?: number
   risk_cycle_loss_budget_pct?: number
@@ -976,6 +983,7 @@ export interface CopyGuardShadowEvaluation {
     | 'WIDE_STOP_EQUAL_RISK'
     | 'STAGED_REDUCTION'
     | 'PROBE_REENTRY_25_PCT'
+    | 'FIRST_ENTRY_POSITION_MARGIN_80'
   evaluation_version: number
   status: 'SCORABLE' | 'NO_SIGNAL' | 'UNSCORABLE'
   data_quality: 'VERIFIED' | 'ESTIMATED_SHADOW' | 'UNSCORABLE'
@@ -986,6 +994,73 @@ export interface CopyGuardShadowEvaluation {
   entry_price: number
   exit_price: number
   reason: string
+  baseline_policy: string
+  baseline_net_pnl: number
+  incremental_net_effect: number
+  cost_source: string
+  mark_coverage: number
+  stop_crossed: boolean
+  crossing_verified: boolean
+  minimum_mark: number
+  maximum_mark: number
+  post_stop_reversed: boolean
+  slippage_bps: number
+  minimum_leverage: number
+  maximum_leverage: number
+  minimum_notional: number
+  maximum_notional: number
+}
+
+export interface CopyGuardPolicySummary {
+  snapshot_schema_version: number
+  policy_version: number
+  protection_mode: 'atr_structure' | 'position_margin_pct' | string
+  position_margin_stop_pct: number
+  trigger_price_type: string
+  reentry_enabled: boolean
+  reentry_decision_mode: string
+  max_reentries: number
+  dormant_atr_profile?: {
+    trigger_price_type: string
+    reentry_enabled: boolean
+    reentry_decision_mode: string
+    manual_reentry_enabled: boolean
+    max_reentries: number
+  }
+  data_quality: 'VERIFIED' | 'INVALID'
+  reason?: string
+}
+
+export interface CopyGuardPositionMarginAudit {
+  configured_margin_loss_pct: number
+  stop_anchor_entry_price: number
+  stop_anchor_leverage: number
+  stop_anchor_initial_margin: number
+  stop_anchor_theoretical_risk_usd: number
+  raw_formula_stop_price: number
+  tick_aligned_stop_price: number
+  effective_stop_price: number
+  current_entry_price: number
+  current_quantity: number
+  current_leverage: number
+  current_margin: number
+  current_stop_risk_usd: number
+  current_margin_loss_pct: number
+  current_account_loss_pct: number
+  equivalent_price_move_pct: number
+  distance_atr: number
+  last_mark_price: number
+  liquidation_clamped: boolean
+  governed_by: string
+  trigger_type: string
+  hosted_order_id: string
+  coverage_mode: 'CLOSE_ALL' | 'EXACT_QUANTITY' | string
+  coverage_ratio: number
+  protection_status: string
+  data_timestamp?: string
+  data_quality: 'VERIFIED' | 'PARTIAL' | 'DEGRADED' | 'UNSCORABLE'
+  unscorable_reason?: string
+  costs_excluded_from_trigger: boolean
 }
 
 export interface CopyGuardShadowPromotionReport {
@@ -995,17 +1070,27 @@ export interface CopyGuardShadowPromotionReport {
   requires_positive_median: boolean
   requires_non_negative_ci95: boolean
   requires_zero_unprotected: boolean
+  requires_mark_coverage: number
   policies: Array<{
     policy: string
     independent_cycles: number
     enter_samples: number
-    mean_net_pnl: number
-    median_net_pnl: number
+    mean_incremental_effect: number
+    median_incremental_effect: number
     bootstrap_ci95_low: number
     bootstrap_ci95_high: number
     unprotected_filled_count: number
     eligible_for_manual_enable: boolean
     blocking_reasons: string[]
+    verified_mark_coverage: number
+    verified_crossings: number
+    tail_loss_cvar_95_usd: number
+    post_stop_reversal_rate: number
+    average_slippage_bps: number
+    minimum_leverage: number
+    maximum_leverage: number
+    minimum_notional: number
+    maximum_notional: number
   }>
 }
 export interface RateEstimate {

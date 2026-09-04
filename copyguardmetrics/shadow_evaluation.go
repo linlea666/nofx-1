@@ -15,13 +15,22 @@ type ShadowPolicyGate struct {
 	Policy                  string   `json:"policy"`
 	IndependentCycles       int      `json:"independent_cycles"`
 	EnterSamples            int      `json:"enter_samples"`
-	MeanNetPnL              float64  `json:"mean_net_pnl"`
-	MedianNetPnL            float64  `json:"median_net_pnl"`
+	MeanIncrementalEffect   float64  `json:"mean_incremental_effect"`
+	MedianIncrementalEffect float64  `json:"median_incremental_effect"`
 	BootstrapCI95Low        float64  `json:"bootstrap_ci95_low"`
 	BootstrapCI95High       float64  `json:"bootstrap_ci95_high"`
 	UnprotectedFilledCount  int      `json:"unprotected_filled_count"`
 	EligibleForManualEnable bool     `json:"eligible_for_manual_enable"`
 	BlockingReasons         []string `json:"blocking_reasons"`
+	VerifiedMarkCoverage    float64  `json:"verified_mark_coverage"`
+	VerifiedCrossings       int      `json:"verified_crossings"`
+	TailLossCVaR95USD       float64  `json:"tail_loss_cvar_95_usd"`
+	PostStopReversalRate    float64  `json:"post_stop_reversal_rate"`
+	AverageSlippageBPS      float64  `json:"average_slippage_bps"`
+	MinimumLeverage         float64  `json:"minimum_leverage"`
+	MaximumLeverage         float64  `json:"maximum_leverage"`
+	MinimumNotional         float64  `json:"minimum_notional"`
+	MaximumNotional         float64  `json:"maximum_notional"`
 }
 
 type ShadowPromotionReport struct {
@@ -31,6 +40,7 @@ type ShadowPromotionReport struct {
 	RequiresPositiveMedian   bool               `json:"requires_positive_median"`
 	RequiresNonNegativeCI95  bool               `json:"requires_non_negative_ci95"`
 	RequiresZeroUnprotected  bool               `json:"requires_zero_unprotected"`
+	RequiresMarkCoverage     float64            `json:"requires_mark_coverage"`
 	Policies                 []ShadowPolicyGate `json:"policies"`
 }
 
@@ -131,9 +141,11 @@ func EvaluateCycleShadowPolicies(st *store.Store, cycleID int64) ([]*store.CopyG
 		shadowUnscorable(cycle, store.CopyGuardShadowProbeReentry25Pct, "post-stop path is unavailable"),
 	}
 	costs := observedCycleCosts(cycle)
+	currentNet, currentNetAvailable := float64(0), false
 	if cycle.AccountingStatus == store.CopyGuardAccountingReconciled {
 		gross, attributedCost, net, basisReason, basisOK := currentCycleNetPnL(st, cycle)
 		if basisOK {
+			currentNet, currentNetAvailable = net, true
 			results[0] = &store.CopyGuardShadowEvaluation{
 				CycleID: cycle.ID, TraderID: cycle.TraderID,
 				Policy:            store.CopyGuardShadowCurrentStop,
@@ -272,11 +284,24 @@ func EvaluateCycleShadowPolicies(st *store.Store, cycleID int64) ([]*store.CopyG
 			return nil, err
 		}
 	}
+	if err = st.CopyTrade().ReconcileCopyGuardPositionMarginShadowV2(cycle, currentNet, currentNetAvailable); err != nil {
+		return nil, err
+	}
+	if rows, listErr := st.CopyTrade().ListCopyGuardShadowEvaluations(cycleID); listErr == nil {
+		for _, row := range rows {
+			if row.Policy == store.CopyGuardShadowFirstEntryPositionMargin80 && row.EvaluationVersion == store.CopyGuardPositionMarginShadowEvaluationVersion {
+				results = append(results, row)
+				break
+			}
+		}
+	} else {
+		return nil, listErr
+	}
 	return results, nil
 }
 
 func shadowBootstrap(values []float64) (low, high float64, available bool) {
-	if len(values) < 30 {
+	if len(values) < 50 {
 		return 0, 0, false
 	}
 	rng := rand.New(rand.NewSource(7))
@@ -291,6 +316,35 @@ func shadowBootstrap(values []float64) (low, high float64, available bool) {
 	return means[124], means[4874], true
 }
 
+func shadowTailLossCVaR95(values []float64) float64 {
+	if len(values) == 0 {
+		return 0
+	}
+	sorted := append([]float64(nil), values...)
+	sort.Float64s(sorted)
+	n := int(math.Ceil(float64(len(sorted)) * .05))
+	if n < 1 {
+		n = 1
+	}
+	total := float64(0)
+	for _, value := range sorted[:n] {
+		if value < 0 {
+			total += -value
+		}
+	}
+	return total / float64(n)
+}
+
+func minPositiveMetric(current, candidate float64) float64 {
+	if candidate <= 0 {
+		return current
+	}
+	if current <= 0 || candidate < current {
+		return candidate
+	}
+	return current
+}
+
 func BuildShadowPromotionReport(
 	st *store.Store, traderIDs []string, from, to time.Time,
 ) (*ShadowPromotionReport, error) {
@@ -303,62 +357,84 @@ func BuildShadowPromotionReport(
 		return nil, err
 	}
 	report := &ShadowPromotionReport{
-		Status: "INSUFFICIENT_DATA", MinimumIndependentCycles: 30,
+		Status: "INSUFFICIENT_DATA", MinimumIndependentCycles: 50,
 		MinimumEnterSamples: 10, RequiresPositiveMedian: true,
 		RequiresNonNegativeCI95: true, RequiresZeroUnprotected: true,
+		RequiresMarkCoverage: .95,
 	}
 	for _, policy := range []string{
-		store.CopyGuardShadowWideStopEqualRisk,
-		store.CopyGuardShadowStagedReduction,
-		store.CopyGuardShadowProbeReentry25Pct,
+		store.CopyGuardShadowFirstEntryPositionMargin80,
 	} {
 		var values []float64
-		enterSamples := 0
+		var netValues []float64
+		verifiedCrossings, reversedCrossings := 0, 0
+		coverageTotal, slippageTotal := float64(0), float64(0)
 		cycles := make(map[int64]struct{})
 		for _, row := range rows {
-			if row == nil || row.Policy != policy ||
-				(row.Status != store.CopyGuardShadowScorable && row.Status != store.CopyGuardShadowNoSignal) {
+			if row == nil || row.Policy != policy || row.EvaluationVersion != store.CopyGuardPositionMarginShadowEvaluationVersion ||
+				row.Status != store.CopyGuardShadowScorable || row.DataQuality != store.CopyGuardShadowQualityVerified {
 				continue
 			}
 			cycles[row.CycleID] = struct{}{}
-			values = append(values, row.NetPnL)
-			if policy == store.CopyGuardShadowProbeReentry25Pct &&
-				row.Status == store.CopyGuardShadowScorable {
-				enterSamples++
+			values = append(values, row.IncrementalEffect)
+			netValues = append(netValues, row.NetPnL)
+			coverageTotal += row.MarkCoverage
+			slippageTotal += row.SlippageBPS
+			if row.StopCrossed && row.CrossingVerified {
+				verifiedCrossings++
+				if row.PostStopReversed {
+					reversedCrossings++
+				}
 			}
-		}
-		if policy != store.CopyGuardShadowProbeReentry25Pct {
-			enterSamples = len(values)
 		}
 		gate := ShadowPolicyGate{
-			Policy: policy, IndependentCycles: len(cycles), EnterSamples: enterSamples,
+			Policy: policy, IndependentCycles: len(cycles), EnterSamples: verifiedCrossings,
+			VerifiedCrossings:      verifiedCrossings,
 			UnprotectedFilledCount: unprotected,
 		}
+		for _, row := range rows {
+			if row == nil || row.Policy != policy || row.EvaluationVersion != store.CopyGuardPositionMarginShadowEvaluationVersion ||
+				row.Status != store.CopyGuardShadowScorable || row.DataQuality != store.CopyGuardShadowQualityVerified {
+				continue
+			}
+			gate.MinimumLeverage = minPositiveMetric(gate.MinimumLeverage, row.MinimumLeverage)
+			gate.MaximumLeverage = math.Max(gate.MaximumLeverage, row.MaximumLeverage)
+			gate.MinimumNotional = minPositiveMetric(gate.MinimumNotional, row.MinimumNotional)
+			gate.MaximumNotional = math.Max(gate.MaximumNotional, row.MaximumNotional)
+		}
+		if len(values) > 0 {
+			gate.VerifiedMarkCoverage = coverageTotal / float64(len(values))
+			gate.AverageSlippageBPS = slippageTotal / float64(len(values))
+		}
+		if verifiedCrossings > 0 {
+			gate.PostStopReversalRate = float64(reversedCrossings) / float64(verifiedCrossings)
+		}
+		gate.TailLossCVaR95USD = shadowTailLossCVaR95(netValues)
 		if len(values) > 0 {
 			for _, value := range values {
-				gate.MeanNetPnL += value
+				gate.MeanIncrementalEffect += value
 			}
-			gate.MeanNetPnL /= float64(len(values))
+			gate.MeanIncrementalEffect /= float64(len(values))
 			sorted := append([]float64(nil), values...)
 			sort.Float64s(sorted)
 			middle := len(sorted) / 2
-			gate.MedianNetPnL = sorted[middle]
+			gate.MedianIncrementalEffect = sorted[middle]
 			if len(sorted)%2 == 0 {
-				gate.MedianNetPnL = (sorted[middle-1] + sorted[middle]) / 2
+				gate.MedianIncrementalEffect = (sorted[middle-1] + sorted[middle]) / 2
 			}
 		}
 		ciAvailable := false
 		gate.BootstrapCI95Low, gate.BootstrapCI95High, ciAvailable = shadowBootstrap(values)
-		if gate.IndependentCycles < 30 {
-			gate.BlockingReasons = append(gate.BlockingReasons, "NEED_30_INDEPENDENT_CLOSED_CYCLES")
+		if gate.IndependentCycles < 50 {
+			gate.BlockingReasons = append(gate.BlockingReasons, "NEED_50_INDEPENDENT_CLOSED_CYCLES")
 		}
 		if gate.EnterSamples < 10 {
-			gate.BlockingReasons = append(gate.BlockingReasons, "NEED_10_ENTER_SAMPLES")
+			gate.BlockingReasons = append(gate.BlockingReasons, "NEED_10_VERIFIED_STOP_CROSSINGS")
 		}
-		if gate.MeanNetPnL <= 0 {
+		if gate.MeanIncrementalEffect <= 0 {
 			gate.BlockingReasons = append(gate.BlockingReasons, "NET_MEAN_NOT_POSITIVE_AFTER_COSTS")
 		}
-		if gate.MedianNetPnL <= 0 {
+		if gate.MedianIncrementalEffect <= 0 {
 			gate.BlockingReasons = append(gate.BlockingReasons, "MEDIAN_CYCLE_NOT_POSITIVE")
 		}
 		if !ciAvailable || gate.BootstrapCI95Low < 0 {
@@ -366,6 +442,9 @@ func BuildShadowPromotionReport(
 		}
 		if unprotected > 0 {
 			gate.BlockingReasons = append(gate.BlockingReasons, "UNPROTECTED_FILLED_EXECUTIONS_PRESENT")
+		}
+		if gate.VerifiedMarkCoverage < .95 {
+			gate.BlockingReasons = append(gate.BlockingReasons, "VERIFIED_MARK_COVERAGE_BELOW_95_PERCENT")
 		}
 		gate.EligibleForManualEnable = len(gate.BlockingReasons) == 0
 		report.Policies = append(report.Policies, gate)

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -261,6 +262,210 @@ func TestCommitLeaderExecutionFillAtomicallyAdvancesMappingAndIntent(t *testing.
 	mapping, err = cs.GetMapping("t1", "p1")
 	if err != nil || mapping.OpenSizeUSD != commit.FilledNotional {
 		t.Fatalf("idempotent replay duplicated mapping notional: mapping=%+v err=%v", mapping, err)
+	}
+}
+
+func TestCommitLeaderExecutionFillAtomicallyCreatesCopyGuardLifecycle(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "atomic-copyguard-fill.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cs := st.CopyTrade()
+	policy := NewCopyGuardDefaults()
+	policy.TraderID = "t1"
+	policy.ProviderType = "okx"
+	policy.RiskProtectionMode = RiskProtectionModePositionMarginPct
+	policy.RiskPositionMarginStopPct = .80
+	policy.RiskReentryEnabled = false
+	policy.RiskReentryDecisionMode = "disabled"
+	policy.RiskManualReentryEnabled = false
+	policy.RiskMaxReentries = 0
+	policySnapshot, err := EncodeCopyGuardPolicySnapshot(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reserveInitial := func(traderID, leaderPosID, clientID string) *CopyTradeExecutionIntent {
+		t.Helper()
+		intent, claimed, reserveErr := cs.ReserveExecutionIntent(&CopyTradeExecutionIntent{
+			TraderID: traderID, LeaderPosID: leaderPosID,
+			SourceRevision: 1, SourceKind: "LEADER_TRANSITION",
+			CanonicalKey: "leader|" + traderID + "|" + leaderPosID + "|1",
+			Action:       "open_long", Symbol: "ETHUSDT", Side: "long", MarginMode: "cross",
+			LeaderTargetSize: 1, RequestedQuantity: 1, QuantizedQuantity: 1, ClientOrderID: clientID,
+		})
+		if reserveErr != nil || !claimed {
+			t.Fatalf("reserve %s/%s: claimed=%v err=%v", traderID, leaderPosID, claimed, reserveErr)
+		}
+		if updateErr := cs.UpdateExecutionIntent(intent.ID, ExecutionIntentSubmitted, "", "", clientID+"-venue", 1, 1, 0); updateErr != nil {
+			t.Fatal(updateErr)
+		}
+		return intent
+	}
+	commitFor := func(intent *CopyTradeExecutionIntent, traderID, leaderPosID, clientID, snapshot string) LeaderExecutionCommit {
+		return LeaderExecutionCommit{
+			IntentID: intent.ID, TraderID: traderID, LeaderID: "leader", LeaderPosID: leaderPosID,
+			SourceRevision: 1, Action: "open_long", Symbol: "ETHUSDT", SourceSymbol: "ETHUSDT",
+			ExecutionSymbol: "ETHUSDT", Side: "long", MarginMode: "cross", LeaderTargetSize: 1,
+			FillPrice: 100, FilledQuantity: 1, FilledNotional: 100, ClientOrderID: clientID,
+			ExchangeOrderID: clientID + "-venue", ExchangeState: "FILLED", OrderTerminal: true,
+			InitialCopyGuard: &InitialCopyGuardLifecycle{
+				PolicySnapshot: snapshot, LeaderEntryPrice: 101, AccountEquity: 1000, ATRAtEntry: 2,
+			},
+		}
+	}
+
+	intent := reserveInitial("t1", "p1", "initial")
+	commit := commitFor(intent, "t1", "p1", "initial", policySnapshot)
+	if err = cs.CommitLeaderExecutionFill(commit); err != nil {
+		t.Fatal(err)
+	}
+	cycle, err := cs.GetOpenCopyGuardCycle("t1", "p1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cycle.InitialIntentID != intent.ID || cycle.EntryOrderID != "initial-venue" {
+		t.Fatalf("cycle did not retain initial fill identity: %+v", cycle)
+	}
+	attempts, err := cs.ListCopyGuardAttempts(cycle.ID)
+	if err != nil || len(attempts) != 1 || attempts[0].AttemptNo != 0 || attempts[0].Status != "OPEN" {
+		t.Fatalf("attempt zero was not atomically created: attempts=%+v err=%v", attempts, err)
+	}
+	storedIntent, err := cs.GetExecutionIntentByID(intent.ID)
+	if err != nil || storedIntent.CycleID != cycle.ID || storedIntent.Status != ExecutionIntentFilled {
+		t.Fatalf("intent was not bound to initial cycle: intent=%+v err=%v", storedIntent, err)
+	}
+	if err = cs.CommitLeaderExecutionFill(commit); err != nil {
+		t.Fatalf("idempotent initial fill replay failed: %v", err)
+	}
+	var cycles, attemptCount, initialEvents int
+	if err = st.db.QueryRow(`SELECT COUNT(*) FROM copy_guard_cycles WHERE trader_id='t1' AND leader_pos_id='p1'`).Scan(&cycles); err != nil {
+		t.Fatal(err)
+	}
+	if err = st.db.QueryRow(`SELECT COUNT(*) FROM copy_guard_attempts WHERE cycle_id=?`, cycle.ID).Scan(&attemptCount); err != nil {
+		t.Fatal(err)
+	}
+	if err = st.db.QueryRow(`SELECT COUNT(*) FROM copy_guard_events WHERE cycle_id=? AND type='INITIAL_ENTRY_FILLED'`, cycle.ID).Scan(&initialEvents); err != nil {
+		t.Fatal(err)
+	}
+	if cycles != 1 || attemptCount != 1 || initialEvents != 1 {
+		t.Fatalf("initial lifecycle replay duplicated rows: cycles=%d attempts=%d events=%d", cycles, attemptCount, initialEvents)
+	}
+
+	// Later leader fills bind to the same lifecycle inside the mapping commit.
+	// This signed ledger is the only trustworthy baseline for detecting manual
+	// or second-program quantity changes on the execution account.
+	addIntent, claimed, err := cs.ReserveExecutionIntent(&CopyTradeExecutionIntent{
+		TraderID: "t1", LeaderPosID: "p1", SourceRevision: 2, SourceKind: "LEADER_TRANSITION",
+		CanonicalKey: "leader|t1|p1|2", Action: "open_long", Symbol: "ETHUSDT", Side: "long", MarginMode: "cross",
+		LeaderTargetSize: 1.5, RequestedQuantity: .5, QuantizedQuantity: .5, ClientOrderID: "add",
+	})
+	if err != nil || !claimed {
+		t.Fatalf("reserve add: claimed=%v err=%v", claimed, err)
+	}
+	if err = cs.UpdateExecutionIntent(addIntent.ID, ExecutionIntentSubmitted, "", "", "add-venue", .5, .5, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err = cs.CommitLeaderExecutionFill(LeaderExecutionCommit{
+		IntentID: addIntent.ID, TraderID: "t1", LeaderID: "leader", LeaderPosID: "p1",
+		SourceRevision: 2, Action: "open_long", IsAdd: true, Symbol: "ETHUSDT", Side: "long", MarginMode: "cross",
+		LeaderTargetSize: 1.5, FillPrice: 102, FilledQuantity: .5, FilledNotional: 51,
+		ClientOrderID: "add", ExchangeOrderID: "add-venue", ExchangeState: "FILLED", OrderTerminal: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	reduceIntent, claimed, err := cs.ReserveExecutionIntent(&CopyTradeExecutionIntent{
+		TraderID: "t1", LeaderPosID: "p1", SourceRevision: 3, SourceKind: "LEADER_TRANSITION",
+		CanonicalKey: "leader|t1|p1|3", Action: "reduce_long", Symbol: "ETHUSDT", Side: "long", MarginMode: "cross",
+		LeaderTargetSize: 1.3, RequestedQuantity: .2, QuantizedQuantity: .2, ClientOrderID: "reduce",
+	})
+	if err != nil || !claimed {
+		t.Fatalf("reserve reduce: claimed=%v err=%v", claimed, err)
+	}
+	if err = cs.UpdateExecutionIntent(reduceIntent.ID, ExecutionIntentSubmitted, "", "", "reduce-venue", .2, .2, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err = cs.CommitLeaderExecutionFill(LeaderExecutionCommit{
+		IntentID: reduceIntent.ID, TraderID: "t1", LeaderID: "leader", LeaderPosID: "p1",
+		SourceRevision: 3, Action: "reduce_long", Symbol: "ETHUSDT", Side: "long", MarginMode: "cross",
+		LeaderTargetSize: 1.3, FillPrice: 103, FilledQuantity: .2, FilledNotional: 20.6,
+		ClientOrderID: "reduce", ExchangeOrderID: "reduce-venue", ExchangeState: "FILLED", OrderTerminal: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []int64{addIntent.ID, reduceIntent.ID} {
+		bound, getErr := cs.GetExecutionIntentByID(id)
+		if getErr != nil || bound.CycleID != cycle.ID {
+			t.Fatalf("later intent %d was not atomically cycle-bound: %+v err=%v", id, bound, getErr)
+		}
+	}
+	expected, err := cs.GetCopyGuardPositionOwnershipExpectation(cycle.ID)
+	if err != nil || !expected.Reliable || expected.InFlight || math.Abs(expected.ExpectedQuantity-1.3) > 1e-12 || len(expected.ContributingIntents) != 3 {
+		t.Fatalf("signed ownership ledger is wrong: %+v err=%v", expected, err)
+	}
+	if _, _, err = cs.InitializeCopyGuardPositionMarginShadowV2(&CopyGuardPositionMarginShadowV2{
+		CycleID: cycle.ID, TraderID: cycle.TraderID, Side: "long",
+		AnchorEntryPrice: 100, AnchorLeverage: 10, AnchorInitialMargin: 10,
+		AnchorStopPrice: 92, ConfiguredMarginLossPct: .8,
+		PriceTickSize: .1, QuantityStep: .001, InitialQuantity: 1,
+		CurrentEntryPrice: 100, CurrentQuantity: 1.3, CurrentLeverage: 10,
+		EffectiveStopPrice: 92, LastLeaderSize: 1.3,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := cs.MarkCopyGuardPositionOwnershipAnomaly(cycle.ID, "t1", expected.ExpectedQuantity, 1.7, .001, expected.ContributingIntents)
+	if err != nil || !changed {
+		t.Fatalf("position ownership anomaly was not recorded: changed=%v err=%v", changed, err)
+	}
+	if changed, err = cs.MarkCopyGuardPositionOwnershipAnomaly(cycle.ID, "t1", expected.ExpectedQuantity, 1.8, .001, expected.ContributingIntents); err != nil || changed {
+		t.Fatalf("same anomaly reason was not idempotent: changed=%v err=%v", changed, err)
+	}
+	cycle, err = cs.GetCopyGuardCycle(cycle.ID)
+	if err != nil || cycle.AccountingStatus != CopyGuardAccountingUnscorable || !strings.HasPrefix(cycle.AccountingError, "POSITION_OWNERSHIP_ANOMALY:") {
+		t.Fatalf("ownership anomaly remained scoreable: cycle=%+v err=%v", cycle, err)
+	}
+	shadowV2, err := cs.GetCopyGuardPositionMarginShadowV2(cycle.ID)
+	if err != nil || shadowV2.DataQuality != CopyGuardShadowQualityUnscorable ||
+		!strings.HasPrefix(shadowV2.UnscorableReason, "POSITION_OWNERSHIP_ANOMALY:") {
+		t.Fatalf("ownership anomaly did not exclude the v2 shadow: shadow=%+v err=%v", shadowV2, err)
+	}
+	var ownershipEvents int
+	if err = st.db.QueryRow(`SELECT COUNT(*) FROM copy_guard_events WHERE cycle_id=? AND type='POSITION_OWNERSHIP_ANOMALY'`, cycle.ID).Scan(&ownershipEvents); err != nil || ownershipEvents != 1 {
+		t.Fatalf("ownership anomaly event count=%d err=%v", ownershipEvents, err)
+	}
+	if err = cs.CloseCopyGuardCycle(cycle.ID, CopyGuardLeaderClosed, 5, 7, .1, 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err = cs.CompleteCopyGuardAccounting(cycle.ID, 0, 105, 5, .1, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	cycle, err = cs.GetCopyGuardCycle(cycle.ID)
+	if err != nil || cycle.AccountingStatus != CopyGuardAccountingUnscorable || cycle.TrackingDifference != 0 || cycle.NetGuardEffect != 0 || !strings.HasPrefix(cycle.AccountingError, "POSITION_OWNERSHIP_ANOMALY:") {
+		t.Fatalf("settlement made ownership anomaly scoreable: cycle=%+v err=%v", cycle, err)
+	}
+
+	badIntent := reserveInitial("t2", "p2", "bad-initial")
+	badCommit := commitFor(badIntent, "t2", "p2", "bad-initial", `{not-json`)
+	if err = cs.CommitLeaderExecutionFill(badCommit); err == nil {
+		t.Fatal("invalid lifecycle policy unexpectedly committed a partial mapping")
+	}
+	var mappings, badCycles, fillCommits int
+	if err = st.db.QueryRow(`SELECT COUNT(*) FROM copy_trade_position_mappings WHERE trader_id='t2' AND leader_pos_id='p2'`).Scan(&mappings); err != nil {
+		t.Fatal(err)
+	}
+	if err = st.db.QueryRow(`SELECT COUNT(*) FROM copy_guard_cycles WHERE trader_id='t2' AND leader_pos_id='p2'`).Scan(&badCycles); err != nil {
+		t.Fatal(err)
+	}
+	if err = st.db.QueryRow(`SELECT COUNT(*) FROM copy_trade_execution_fill_commits WHERE intent_id=?`, badIntent.ID).Scan(&fillCommits); err != nil {
+		t.Fatal(err)
+	}
+	badStored, err := cs.GetExecutionIntentByID(badIntent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mappings != 0 || badCycles != 0 || fillCommits != 0 || badStored.Status != ExecutionIntentSubmitted {
+		t.Fatalf("failed lifecycle left partial state: mappings=%d cycles=%d fills=%d intent=%+v", mappings, badCycles, fillCommits, badStored)
 	}
 }
 

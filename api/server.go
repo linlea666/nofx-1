@@ -1150,6 +1150,11 @@ func (s *Server) handleCreateTrader(c *gin.Context) {
 
 		// v3 风控字段透传（修复 bug：之前 CopyConfigReq 无 risk_* 字段，前端传值被 JSON unmarshal 静默丢弃）
 		manualReentryDeprecated = applyCopyConfigRiskFields(copyConfig, req.CopyConfig)
+		if err := validateFixedModeExplicitSettings(copyConfig.RiskProtectionMode, req.CopyConfig.RiskTriggerPriceType, req.CopyConfig.RiskTriggerPriceType != "", req.CopyConfig.RiskReentryEnabled, req.CopyConfig.RiskReentryDecisionMode, req.CopyConfig.RiskManualReentryEnabled, req.CopyConfig.RiskMaxReentries); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		store.NormalizeCopyGuardProtectionModeTransition(copyConfig, nil)
 		if err := copytrade.ValidateStoredRiskPolicy(copyConfig); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
@@ -1451,6 +1456,14 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 
 			// v3 风控字段透传（修复 bug：之前 CopyConfigReq 无 risk_* 字段，前端传值被 JSON unmarshal 静默丢弃）
 			manualReentryDeprecated = applyCopyConfigRiskFields(copyConfig, req.CopyConfig)
+			if err := validateFixedModeExplicitSettings(copyConfig.RiskProtectionMode, req.CopyConfig.RiskTriggerPriceType, req.CopyConfig.RiskTriggerPriceType != "", req.CopyConfig.RiskReentryEnabled, req.CopyConfig.RiskReentryDecisionMode, req.CopyConfig.RiskManualReentryEnabled, req.CopyConfig.RiskMaxReentries); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+			profileDefaulted := store.NormalizeCopyGuardProtectionModeTransition(copyConfig, existingCopyCfg)
+			if profileDefaulted {
+				logger.Warnf("⚠️ Copy Guard trader %s had no dormant ATR profile; restored canonical defaults", traderID)
+			}
 			if err := validateLegacyReentrySelection(existingCopyCfg, copyConfig.RiskReentryDecisionMode); err != nil {
 				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 				return
@@ -1503,7 +1516,7 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 				return
 			}
 
-			if err := s.store.CopyTrade().Upsert(copyConfig); err != nil {
+			if err := s.store.CopyTrade().UpsertWithATRProfileDefaultMigration(copyConfig, profileDefaulted); err != nil {
 				// 同 Create 路径：静默吞掉会让用户以为已保存，实际引擎仍
 				// 在用旧配置运行。Upsert 幂等，返回 500 让用户重试。
 				logger.Errorf("❌ Failed to update copy trade config: %v", err)
@@ -1733,8 +1746,15 @@ func (s *Server) handleStartTrader(c *gin.Context) {
 			c.JSON(http.StatusConflict, gin.H{"error": "Failed to load copy-trade configuration: " + configErr.Error()})
 			return
 		}
-		copyGuardExclusive = persistedConfig.RiskPolicyVersion >= 4 && persistedConfig.RiskStopLossEnabled &&
-			copytrade.SupportsCopyGuard(copytrade.ProviderType(persistedConfig.ProviderType))
+		hasOpenCycles, openErr := s.store.CopyTrade().HasOpenCopyGuardCycles(traderID)
+		if openErr != nil {
+			trader.Stop()
+			failStart(openErr)
+			c.JSON(http.StatusConflict, gin.H{"error": "Failed to inspect active Copy Guard lifecycles: " + openErr.Error()})
+			return
+		}
+		copyGuardExclusive = copytrade.SupportsCopyGuard(copytrade.ProviderType(persistedConfig.ProviderType)) &&
+			((persistedConfig.RiskPolicyVersion >= 4 && persistedConfig.RiskStopLossEnabled) || hasOpenCycles)
 	}
 	if copyGuardExclusive {
 		err = s.store.Trader().CompleteCopyGuardStart(userID, traderID, lifecycle.Generation, fullConfig.Trader.ExchangeID)

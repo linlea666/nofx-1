@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	"nofx/decision"
@@ -395,6 +396,55 @@ func (e *Engine) findLocalPositionForMapping(localPositions map[string]*Position
 	return false
 }
 
+// deferPositionAbsentRiskExitForLiveProtection keeps the position-absent
+// fallback from outrunning the venue's own stop state. A follower position can
+// also disappear because of manual/second-program activity. When the durable
+// protective order is still explicitly live, that is positive evidence that
+// the exchange has not reported a stop trigger yet: mark any reliable quantity
+// mismatch unscorable and wait for triggered/filled/invalid convergence.
+//
+// The fallback remains available as soon as the protective state is no longer
+// live, including the OKX purged-order path. This only delays attribution; it
+// never cancels protection or submits an order.
+func (e *Engine) deferPositionAbsentRiskExitForLiveProtection(cycle *store.CopyGuardCycle) bool {
+	if e == nil || e.store == nil || cycle == nil {
+		return false
+	}
+	protective, err := e.store.CopyTrade().GetCopyGuardProtectiveOrder(cycle.ID)
+	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			logger.Warnf("⚠️ [%s] 仓位消失时保护单状态读取失败，本轮不抢先归因为止损 | cycle=%d: %v", e.traderID, cycle.ID, err)
+			return true
+		}
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(protective.Status), "live") {
+		return false
+	}
+
+	expected, expectationErr := e.store.CopyTrade().GetCopyGuardPositionOwnershipExpectation(cycle.ID)
+	if expectationErr != nil {
+		logger.Warnf("⚠️ [%s] 仓位消失时归属账本读取失败，等待交易所保护单状态收敛 | cycle=%d: %v", e.traderID, cycle.ID, expectationErr)
+		return true
+	}
+	if expected.Reliable && !expected.InFlight &&
+		(expected.LastIntentUpdated.IsZero() || time.Since(expected.LastIntentUpdated) >= 15*time.Second) {
+		tolerance := math.Max(protective.QuantityStep, expected.ExpectedQuantity*1e-8)
+		if expected.ExpectedQuantity > tolerance+1e-12 {
+			changed, markErr := e.store.CopyTrade().MarkCopyGuardPositionOwnershipAnomaly(
+				cycle.ID, e.traderID, expected.ExpectedQuantity, 0, tolerance, expected.ContributingIntents,
+			)
+			if markErr != nil {
+				logger.Errorf("❌ [%s] 空仓归属异常持久化失败，等待交易所保护单状态收敛 | cycle=%d: %v", e.traderID, cycle.ID, markErr)
+			} else if changed {
+				logger.Errorf("🚨 [%s] 保护单仍 live 但跟随仓位已归零，判为仓位归属异常而非可信止损 | cycle=%d %s %s",
+					e.traderID, cycle.ID, cycle.Symbol, cycle.Side)
+			}
+		}
+	}
+	return true
+}
+
 // checkStoppedByRisk 对账识别 SL 被交易所触发
 //
 // 触发条件（同时满足）：
@@ -412,10 +462,6 @@ func (e *Engine) checkStoppedByRisk() {
 	if !SupportsCopyGuard(e.config.ProviderType) {
 		return
 	}
-	if !e.config.RiskStopLossEnabled {
-		return
-	}
-
 	// 拉本地仓位（跟随者）
 	// 注意：getFollowerPositions 失败时返回空 map（无法区分"真的空"和"API 抖动"），
 	// 必须配合 stopRiskSuspectCount 多次确认机制做防御
@@ -454,6 +500,14 @@ func (e *Engine) checkStoppedByRisk() {
 	suspectPosIds := make(map[string]bool)
 
 	for _, mapping := range activeMappings {
+		// The current master switch governs future lifecycles only. Existing
+		// mappings are risk-observed exclusively when an immutable open cycle
+		// exists; unprotected mappings created after the switch was disabled are
+		// never mistaken for a stop trigger.
+		if _, cycleErr := e.store.CopyTrade().GetOpenCopyGuardCycle(e.traderID, mapping.LeaderPosID); cycleErr != nil {
+			delete(e.stopRiskSuspectCount, mapping.LeaderPosID)
+			continue
+		}
 		// 本地是否还有这个仓位？（用 symbol+side+marginMode 三元组匹配）
 		if e.findLocalPositionForMapping(localPositions, mapping) {
 			// 本地仓位还在，重置该 mapping 的疑似计数（如果之前累积过）
@@ -503,26 +557,45 @@ func (e *Engine) checkStoppedByRisk() {
 		leaderSize := leaderPos.Size
 		addCount := mapping.AddCount
 
-		// The lifecycle ledger must commit before the mapping leaves active.
-		// Previously MarkStoppedByRisk ran first and Record... errors were ignored;
-		// one DB failure permanently removed the mapping from this retry loop while
-		// leaving the cycle falsely FOLLOWING. Keeping it active on failure makes
-		// the next confirmed poll retry the same idempotent transition.
+		// Establish the in-memory execution gate first, then atomically move the
+		// mapping/cycle/protection ledger into STOP_PENDING_FLAT. This position-
+		// absent path already has a fresh flat confirmation, so it may immediately
+		// finalize the same exit; a failure after Begin remains recoverable by the
+		// integration pending-exit monitor without reopening ordinary signals.
 		cycle, cerr := e.store.CopyTrade().GetOpenCopyGuardCycle(e.traderID, mapping.LeaderPosID)
 		if cerr != nil {
 			logger.Errorf("❌ [%s] 仓位已消失但 Copy Guard 周期不可用: %v | posId=%s", e.traderID, cerr, mapping.LeaderPosID)
 			continue
 		}
-		cycleConfig := copyGuardLifecycleConfig(cycle, e.config)
-		atr, _ := market.GetOKXATRWithMaxAge(mapping.Symbol, cycleConfig.RiskATRTimeframe, cycleConfig.RiskATRPeriod, riskATRCacheMaxAge(cycleConfig))
-		// 统计口径修正（v5）：领航员浮亏是参考信息，写 metadata；事件
-		// pnl 字段留给跟随者自身盈亏（此路径无法得知，由 attempt 对账补）
-		if recordErr := e.store.CopyTrade().RecordCopyGuardStopObserved(cycle.ID, e.traderID, cycle.ReentryCount, atr, leaderPos.MarkPrice, leaderSize, map[string]interface{}{"confirmation": "position_absent_fallback", "leader_unrealized_pnl": leaderPnL}); recordErr != nil {
-			logger.Errorf("[CopyGuard] trader=%s cycle=%d attempt=%d event=STOP_PERSIST_FAILED reason=%v", e.traderID, cycle.ID, cycle.ReentryCount, recordErr)
+		if e.deferPositionAbsentRiskExitForLiveProtection(cycle) {
+			logger.Debugf("⏳ [%s] 跟随仓位已消失但保护单仍 live，等待交易所状态收敛 | cycle=%d posId=%s",
+				e.traderID, cycle.ID, mapping.LeaderPosID)
 			continue
 		}
-		if err := e.store.CopyTrade().MarkStoppedByRisk(e.traderID, mapping.LeaderPosID, leaderPnL, leaderSize, addCount); err != nil {
-			logger.Errorf("❌ [%s] 标记 stopped_by_risk 失败: %v | posId=%s", e.traderID, err, mapping.LeaderPosID)
+		cycleConfig := copyGuardLifecycleConfig(cycle, e.config)
+		atr, _ := market.GetOKXATRWithMaxAge(mapping.Symbol, cycleConfig.RiskATRTimeframe, cycleConfig.RiskATRPeriod, riskATRCacheMaxAge(cycleConfig))
+		metadata := map[string]interface{}{"confirmation": "position_absent_fallback", "leader_unrealized_pnl": leaderPnL}
+		begin := store.CopyGuardRiskExitBegin{
+			CycleID: cycle.ID, TraderID: e.traderID, LeaderPosID: mapping.LeaderPosID,
+			AttemptNo: cycle.ReentryCount, TriggerPrice: leaderPos.MarkPrice, Quantity: leaderSize,
+			TriggerSource: "position_absent_fallback", LeaderPnL: leaderPnL, LeaderSize: leaderSize,
+			AddCount: addCount, Metadata: metadata,
+		}
+		var beginErr error
+		if e.copyGuardRiskExitBegin != nil {
+			beginErr = e.copyGuardRiskExitBegin(begin)
+		} else {
+			_, beginErr = e.store.CopyTrade().BeginCopyGuardRiskExit(begin)
+		}
+		if beginErr != nil {
+			logger.Errorf("[CopyGuard] trader=%s cycle=%d attempt=%d event=STOP_BEGIN_FAILED reason=%v", e.traderID, cycle.ID, cycle.ReentryCount, beginErr)
+			continue
+		}
+		if _, finalizeErr := e.store.CopyTrade().FinalizeCopyGuardRiskExit(store.CopyGuardRiskExitFinalize{
+			CopyGuardRiskExitBegin: begin, ATR: atr, ExitPrice: leaderPos.MarkPrice,
+			Observed: true, VenueState: "position_absent",
+		}); finalizeErr != nil {
+			logger.Errorf("[CopyGuard] trader=%s cycle=%d attempt=%d event=STOP_FINALIZE_FAILED reason=%v", e.traderID, cycle.ID, cycle.ReentryCount, finalizeErr)
 			continue
 		}
 		// 快照止损时的领航员均价，供重入保守锚点使用
@@ -587,17 +660,6 @@ const (
 // 满足时通过 e.decisionCh 推一个 Open 决策出去
 func (e *Engine) checkReentryConditions() {
 	if e.store == nil || e.config == nil {
-		return
-	}
-	// Configuration can be changed while the copy engine keeps running. Always
-	// gate reentry from the persisted policy so disabling account protection is
-	// effective without waiting for a process restart.
-	persisted, persistedErr := e.store.CopyTrade().GetByTraderID(e.traderID)
-	if persistedErr != nil {
-		logger.Errorf("❌ [%s] AI 二次入场配置读取失败，本轮安全暂停: %v", e.traderID, persistedErr)
-		return
-	}
-	if persisted.RiskPolicyVersion < 4 || !persisted.RiskStopLossEnabled {
 		return
 	}
 	if !SupportsCopyGuard(e.config.ProviderType) {
@@ -715,7 +777,7 @@ func (e *Engine) checkReentryConditions() {
 		if leaderPos.Side != "" && string(leaderPos.Side) != mapping.Side {
 			// 观察期以反手价（当前标记价）作为"领航员离场价"汇总观察期数据
 			emitWatchSummary(e.store.CopyTrade(), e.traderID, v4Cycle, leaderPos.MarkPrice)
-			if shadowErr := e.store.CopyTrade().FinalizeCopyGuardPositionMarginShadow(v4Cycle.ID, leaderPos.MarkPrice); shadowErr != nil {
+			if shadowErr := e.finalizeCopyGuardPositionMarginShadow(v4Cycle.ID, leaderPos.MarkPrice); shadowErr != nil {
 				logger.Warnf("⚠️ [%s] 80%% 影子评测闭合失败: %v | cycle=%d", e.traderID, shadowErr, v4Cycle.ID)
 			}
 			if err := e.store.CopyTrade().SetCopyGuardBaselineSource(v4Cycle.ID, "last_observed"); err != nil {

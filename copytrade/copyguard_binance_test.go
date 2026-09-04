@@ -2,6 +2,7 @@ package copytrade
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -145,6 +146,95 @@ func TestBinanceStoppedByRiskDetectedForV4(t *testing.T) {
 	cycle, err = st.CopyTrade().GetCopyGuardCycle(cycle.ID)
 	if err != nil || cycle.Status != store.CopyGuardStoppedWatching || cycle.StopCount != 1 {
 		t.Fatalf("stop ledger was not committed before mapping transition: cycle=%+v err=%v", cycle, err)
+	}
+}
+
+func TestPositionAbsentWaitsWhileProtectiveOrderIsStillLive(t *testing.T) {
+	const posID = "1239518824_ETHUSDT_LONG"
+	e, st := newTestCopyTradeEngine(t, ProviderBinance)
+	e.config.RiskPolicyVersion = 4
+	e.config.RiskStopLossEnabled = true
+	e.stopRiskSuspectCount = make(map[string]int)
+
+	policy := store.NewCopyGuardDefaults()
+	policy.TraderID = e.traderID
+	policy.ProviderType = string(ProviderBinance)
+	policy.LeaderID = e.config.LeaderID
+	snapshot, err := store.EncodeCopyGuardPolicySnapshot(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent, claimed, err := st.CopyTrade().ReserveExecutionIntent(&store.CopyTradeExecutionIntent{
+		TraderID: e.traderID, LeaderPosID: posID, SourceRevision: 1,
+		SourceKind: "LEADER_TRANSITION", CanonicalKey: "leader|test-trader|live-stop-flat|1",
+		Action: "open_long", Symbol: "ETHUSDT", Side: "long", MarginMode: "cross",
+		LeaderTargetSize: .02, RequestedQuantity: .02, QuantizedQuantity: .02,
+		ClientOrderID: "initial-live-stop",
+	})
+	if err != nil || !claimed {
+		t.Fatalf("reserve initial intent: claimed=%v err=%v", claimed, err)
+	}
+	if err = st.CopyTrade().UpdateExecutionIntent(intent.ID, store.ExecutionIntentSubmitted, "", "", "entry-order", .02, .02, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err = st.CopyTrade().CommitLeaderExecutionFill(store.LeaderExecutionCommit{
+		IntentID: intent.ID, TraderID: e.traderID, LeaderID: e.config.LeaderID, LeaderPosID: posID,
+		SourceRevision: 1, Action: "open_long", Symbol: "ETHUSDT", SourceSymbol: "ETHUSDT",
+		ExecutionSymbol: "ETHUSDT", Side: "long", MarginMode: "cross", LeaderTargetSize: .02,
+		FillPrice: 2096.58, FilledQuantity: .02, FilledNotional: 41.9316,
+		ClientOrderID: "initial-live-stop", ExchangeOrderID: "entry-order", ExchangeState: "FILLED", OrderTerminal: true,
+		InitialCopyGuard: &store.InitialCopyGuardLifecycle{
+			PolicySnapshot: snapshot, LeaderEntryPrice: 2096.58, AccountEquity: 100,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cycle, err := st.CopyTrade().GetOpenCopyGuardCycle(e.traderID, posID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = st.CopyTrade().UpsertCopyGuardProtectiveOrder(&store.CopyGuardProtectiveOrder{
+		CycleID: cycle.ID, TraderID: e.traderID, AlgoID: "live-stop", Symbol: "ETHUSDT",
+		Side: "long", MarginMode: "cross", Quantity: .02, QuantityStep: .001,
+		CoverageMode: store.CopyGuardCoverageCloseAll, TriggerPrice: 2050,
+		TriggerType: "mark", Status: "live",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = st.DB().Exec(`UPDATE copy_trade_execution_intents SET updated_at=datetime('now','-1 minute') WHERE id=?`, intent.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	e.leaderState.Positions[posID] = binanceTestPosition(posID, .02)
+	e.getFollowerPositionsResult = func() (map[string]*Position, error) {
+		return map[string]*Position{}, nil
+	}
+	for i := 0; i < stopRiskSuspectThreshold; i++ {
+		e.checkStoppedByRisk()
+	}
+	if active, activeErr := st.CopyTrade().GetActiveMapping(e.traderID, posID); activeErr != nil || active == nil {
+		t.Fatalf("live protective order was falsely attributed as a risk stop: mapping=%+v err=%v", active, activeErr)
+	}
+	cycle, err = st.CopyTrade().GetCopyGuardCycle(cycle.ID)
+	if err != nil || cycle.StopCount != 0 || cycle.AccountingStatus != store.CopyGuardAccountingUnscorable ||
+		!strings.HasPrefix(cycle.AccountingError, "POSITION_OWNERSHIP_ANOMALY:") {
+		t.Fatalf("external flat was not isolated from scoring: cycle=%+v err=%v", cycle, err)
+	}
+
+	// Once the venue no longer calls the order live, the existing position-
+	// absent fallback remains available and converges through the same atomic
+	// risk-exit transaction.
+	if err = st.CopyTrade().UpdateCopyGuardProtectiveOrderStatus(cycle.ID, "triggered"); err != nil {
+		t.Fatal(err)
+	}
+	e.checkStoppedByRisk()
+	stopped, err := st.CopyTrade().ListStoppedByRiskMappings(e.traderID)
+	if err != nil || len(stopped) != 1 || stopped[0].LeaderPosID != posID {
+		t.Fatalf("venue trigger evidence did not release the deferred risk exit: stopped=%+v err=%v", stopped, err)
+	}
+	cycle, err = st.CopyTrade().GetCopyGuardCycle(cycle.ID)
+	if err != nil || cycle.Status != store.CopyGuardStoppedWatching || cycle.StopCount != 1 || cycle.AccountingStatus != store.CopyGuardAccountingUnscorable {
+		t.Fatalf("deferred risk exit did not converge without restoring scoreability: cycle=%+v err=%v", cycle, err)
 	}
 }
 

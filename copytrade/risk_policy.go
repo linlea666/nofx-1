@@ -1,7 +1,6 @@
 package copytrade
 
 import (
-	"encoding/json"
 	"fmt"
 	"math"
 	"strings"
@@ -17,16 +16,12 @@ func copyGuardProtectionSettings(cycle *store.CopyGuardCycle, fallback *CopyConf
 	mode := store.RiskProtectionModeATRStructure
 	pct := store.DefaultRiskPositionMarginStopPct
 	if cycle != nil {
-		var snapshot struct {
-			Mode string  `json:"risk_protection_mode"`
-			Pct  float64 `json:"risk_position_margin_stop_pct"`
-		}
-		if json.Unmarshal([]byte(cycle.PolicySnapshot), &snapshot) == nil {
-			if snapshot.Mode == store.RiskProtectionModeATRStructure || snapshot.Mode == store.RiskProtectionModePositionMarginPct {
-				mode = snapshot.Mode
+		if snapshot, err := store.DecodeCopyGuardPolicySnapshot(cycle.PolicySnapshot); err == nil {
+			if snapshot.ProtectionMode == store.RiskProtectionModeATRStructure || snapshot.ProtectionMode == store.RiskProtectionModePositionMarginPct {
+				mode = snapshot.ProtectionMode
 			}
-			if snapshot.Pct >= 0.01 && snapshot.Pct <= 0.99 {
-				pct = snapshot.Pct
+			if snapshot.PositionMarginStopPct >= 0.01 && snapshot.PositionMarginStopPct <= 0.99 {
+				pct = snapshot.PositionMarginStopPct
 			}
 		}
 		return mode, pct
@@ -56,8 +51,8 @@ func copyGuardLifecycleConfig(cycle *store.CopyGuardCycle, fallback *CopyConfig)
 	if cycle == nil || strings.TrimSpace(cycle.PolicySnapshot) == "" {
 		return &cfg
 	}
-	var p store.CopyGuardPolicy
-	if json.Unmarshal([]byte(cycle.PolicySnapshot), &p) != nil {
+	p, err := store.DecodeCopyGuardPolicySnapshot(cycle.PolicySnapshot)
+	if err != nil {
 		return &cfg
 	}
 	hasPolicy := p.Version >= 4 || p.DefaultsVersion > 0 ||
@@ -66,6 +61,10 @@ func copyGuardLifecycleConfig(cycle *store.CopyGuardCycle, fallback *CopyConfig)
 	if !hasPolicy {
 		return &cfg
 	}
+	// A lifecycle can only have been created while protection was enabled. The
+	// current trader master switch is a template for future positions and must
+	// not disable the immutable contract of this already-open cycle.
+	cfg.RiskStopLossEnabled = true
 
 	if p.Version > 0 {
 		cfg.RiskPolicyVersion = p.Version
@@ -116,6 +115,11 @@ func copyGuardLifecycleConfig(cycle *store.CopyGuardCycle, fallback *CopyConfig)
 		// Older policy snapshots did not persist the boolean. Their decision
 		// mode and attempt count are durable evidence of the intended state.
 		cfg.RiskReentryEnabled = p.ReentryDecisionMode != "disabled" && p.MaxReentries > 0
+	}
+	if p.ManualReentryEnabled != nil {
+		cfg.RiskManualReentryEnabled = *p.ManualReentryEnabled
+	} else if p.ATRProfile != nil && mode == store.RiskProtectionModeATRStructure {
+		cfg.RiskManualReentryEnabled = p.ATRProfile.ManualReentryEnabled
 	}
 	if p.ReentryRatio != nil {
 		cfg.RiskReentryRatio = *p.ReentryRatio
@@ -171,12 +175,10 @@ func copyGuardLifecycleConfig(cycle *store.CopyGuardCycle, fallback *CopyConfig)
 func copyGuardLiquidationBufferATR(cycle *store.CopyGuardCycle, fallback *CopyConfig) float64 {
 	const defaultBuffer = 0.5
 	if cycle != nil {
-		var snapshot struct {
-			Buffer *float64 `json:"risk_liquidation_buffer_atr"`
-		}
-		if json.Unmarshal([]byte(cycle.PolicySnapshot), &snapshot) == nil && snapshot.Buffer != nil &&
-			!invalidRange(*snapshot.Buffer, 0, 5) {
-			return *snapshot.Buffer
+		if snapshot, err := store.DecodeCopyGuardPolicySnapshot(cycle.PolicySnapshot); err == nil &&
+			(snapshot.SnapshotSchemaVersion > 0 || snapshot.Version > 0 || snapshot.DefaultsVersion > 0) &&
+			!invalidRange(snapshot.LiquidationBufferATR, 0, 5) {
+			return snapshot.LiquidationBufferATR
 		}
 		return defaultBuffer
 	}
@@ -256,6 +258,28 @@ type PositionMarginStopEvaluation struct {
 	GovernedBy                    string
 }
 
+// PositionMarginRawStopPrice is the single source of truth for the fixed
+// initial-margin-loss formula. It deliberately excludes price-tick alignment,
+// fees, funding and slippage; callers that place an exchange order must apply
+// the venue's tick rule afterwards.
+func PositionMarginRawStopPrice(side SideType, entryPrice, leverage, configuredPct float64) (float64, error) {
+	if side != SideLong && side != SideShort {
+		return 0, fmt.Errorf("invalid position-margin stop side %s", side)
+	}
+	if invalidPositive(entryPrice) || invalidPositive(leverage) || invalidRange(configuredPct, 0.01, 0.99) {
+		return 0, fmt.Errorf("invalid position-margin stop formula input")
+	}
+	move := configuredPct / leverage
+	raw := entryPrice * (1 - move)
+	if side == SideShort {
+		raw = entryPrice * (1 + move)
+	}
+	if invalidPositive(raw) {
+		return 0, fmt.Errorf("position-margin stop formula overflows")
+	}
+	return raw, nil
+}
+
 // BuildPositionMarginStopAnchor calculates and aligns a first-fill fixed stop.
 // Long stops ceil and short stops floor so tick quantization can only tighten
 // the configured loss ceiling.
@@ -268,10 +292,12 @@ func BuildPositionMarginStopAnchor(side SideType, entryPrice, quantity, leverage
 		return nil, fmt.Errorf("invalid position-margin stop anchor input")
 	}
 	move := configuredPct / leverage
-	raw := entryPrice * (1 - move)
+	raw, err := PositionMarginRawStopPrice(side, entryPrice, leverage, configuredPct)
+	if err != nil {
+		return nil, err
+	}
 	roundDown := false
 	if side == SideShort {
-		raw = entryPrice * (1 + move)
 		roundDown = true
 	}
 	stop := alignToTickSize(raw, tickSize, roundDown)

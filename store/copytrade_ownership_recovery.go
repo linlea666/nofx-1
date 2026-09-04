@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 )
 
@@ -475,12 +476,39 @@ func (s *CopyTradeStore) RestoreConfirmedMappingOwnership(req RestoreMappingOwne
 // keeping the trading lifecycle open for later evidence/recovery. Repeated
 // identical observations are idempotent and do not spam the event timeline.
 func (s *CopyTradeStore) MarkCopyGuardOwnershipAmbiguous(cycleID int64, traderID, reasonCode, detail string) (bool, error) {
+	return s.markCopyGuardOwnershipUnscorable(cycleID, traderID, "OWNERSHIP_AMBIGUOUS", "OWNERSHIP_AMBIGUOUS", reasonCode, detail, nil)
+}
+
+// MarkCopyGuardPositionOwnershipAnomaly records an unexplained exchange-side
+// quantity mutation without interrupting trading or protection. The lifecycle
+// remains open, but its evaluation is permanently excluded because manual or
+// second-program activity makes strategy attribution impossible.
+func (s *CopyTradeStore) MarkCopyGuardPositionOwnershipAnomaly(cycleID int64, traderID string, expectedQuantity, actualQuantity, tolerance float64, intentIDs []int64) (bool, error) {
+	if math.IsNaN(expectedQuantity) || math.IsInf(expectedQuantity, 0) || expectedQuantity < 0 ||
+		math.IsNaN(actualQuantity) || math.IsInf(actualQuantity, 0) || actualQuantity < 0 ||
+		math.IsNaN(tolerance) || math.IsInf(tolerance, 0) || tolerance < 0 {
+		return false, fmt.Errorf("invalid position ownership anomaly quantities")
+	}
+	detail := fmt.Sprintf("expected=%.12g actual=%.12g tolerance=%.12g", expectedQuantity, actualQuantity, tolerance)
+	extra := map[string]interface{}{
+		"expected_quantity": expectedQuantity,
+		"actual_quantity":   actualQuantity,
+		"tolerance":         tolerance,
+		"intent_ids":        intentIDs,
+		"protection_action": "continue_covering_actual_position",
+	}
+	return s.markCopyGuardOwnershipUnscorable(cycleID, traderID, "POSITION_OWNERSHIP_ANOMALY", "POSITION_OWNERSHIP_ANOMALY", "UNEXPLAINED_QUANTITY_CHANGE", detail, extra)
+}
+
+func (s *CopyTradeStore) markCopyGuardOwnershipUnscorable(cycleID int64, traderID, eventType, messagePrefix, reasonCode, detail string, extra map[string]interface{}) (bool, error) {
 	reasonCode = strings.TrimSpace(reasonCode)
 	detail = strings.TrimSpace(detail)
-	if cycleID <= 0 || traderID == "" || reasonCode == "" {
+	eventType = strings.TrimSpace(eventType)
+	messagePrefix = strings.TrimSpace(messagePrefix)
+	if cycleID <= 0 || traderID == "" || eventType == "" || messagePrefix == "" || reasonCode == "" {
 		return false, fmt.Errorf("invalid ambiguous ownership gap")
 	}
-	message := "OWNERSHIP_AMBIGUOUS:" + reasonCode
+	message := messagePrefix + ":" + reasonCode
 	if detail != "" {
 		message += ": " + detail
 	}
@@ -494,7 +522,7 @@ func (s *CopyTradeStore) MarkCopyGuardOwnershipAmbiguous(cycleID int64, traderID
 		FROM copy_guard_cycles WHERE id=? AND trader_id=? AND closed_at IS NULL`, cycleID, traderID).Scan(&priorStatus, &priorError); err != nil {
 		return false, err
 	}
-	prefix := "OWNERSHIP_AMBIGUOUS:"
+	prefix := messagePrefix + ":"
 	priorCode := ""
 	if strings.HasPrefix(priorError, prefix) {
 		priorCode = strings.TrimSpace(strings.SplitN(strings.TrimPrefix(priorError, prefix), ":", 2)[0])
@@ -507,20 +535,29 @@ func (s *CopyTradeStore) MarkCopyGuardOwnershipAmbiguous(cycleID int64, traderID
 		WHERE id=? AND trader_id=? AND closed_at IS NULL`, CopyGuardAccountingUnscorable, message, cycleID, traderID); err != nil {
 		return false, err
 	}
+	if _, err = tx.Exec(`UPDATE copy_guard_position_margin_shadow_v2 SET
+		data_quality='UNSCORABLE',unscorable_reason=CASE WHEN unscorable_reason='' THEN ? ELSE unscorable_reason END,
+		updated_at=CURRENT_TIMESTAMP WHERE cycle_id=? AND status<>'FINALIZED'`, message, cycleID); err != nil {
+		return false, err
+	}
 	if !reasonChanged {
 		return false, tx.Commit()
 	}
-	metadata := normalizeCopyGuardEventMetadata(cycleID, traderID, "OWNERSHIP_AMBIGUOUS", map[string]interface{}{
+	metadata := map[string]interface{}{
 		"reason_code": reasonCode, "detail": detail,
-	})
+	}
+	for key, value := range extra {
+		metadata[key] = value
+	}
+	metadata = normalizeCopyGuardEventMetadata(cycleID, traderID, eventType, metadata)
 	raw, _ := json.Marshal(metadata)
-	if _, err = tx.Exec(`INSERT INTO copy_guard_events(cycle_id,trader_id,type,metadata_json) VALUES(?,?,?,?)`, cycleID, traderID, "OWNERSHIP_AMBIGUOUS", string(raw)); err != nil {
+	if _, err = tx.Exec(`INSERT INTO copy_guard_events(cycle_id,trader_id,type,metadata_json) VALUES(?,?,?,?)`, cycleID, traderID, eventType, string(raw)); err != nil {
 		return false, err
 	}
 	if err = tx.Commit(); err != nil {
 		return false, err
 	}
-	s.mirrorGuardEventToCopyEvents(cycleID, traderID, "OWNERSHIP_AMBIGUOUS", 0, 0, 0, 0, metadata)
+	s.mirrorGuardEventToCopyEvents(cycleID, traderID, eventType, 0, 0, 0, 0, metadata)
 	return true, nil
 }
 

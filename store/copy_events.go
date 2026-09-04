@@ -49,6 +49,12 @@ const (
 	CopyEventTypeAdd    = "ADD"
 	CopyEventTypeReduce = "REDUCE"
 	CopyEventTypeClose  = "CLOSE"
+
+	// CopyEventTypeATRProfileDefaulted is a configuration-migration audit
+	// event. It is persisted in the same transaction as the repaired policy so
+	// the event can never claim a repair that was not committed (or omit one
+	// that was).
+	CopyEventTypeATRProfileDefaulted = "COPY_GUARD_ATR_PROFILE_DEFAULTED"
 )
 
 // CopyTradeEvent 一条跟单事件
@@ -87,6 +93,34 @@ type CopyEventFilter struct {
 	Severity  string
 	Symbol    string
 	EventType string
+}
+
+func logCopyGuardATRProfileDefaultedWithExecutor(exec sqlExecer, config *CopyTradeConfig) error {
+	if exec == nil || config == nil || config.RiskATRProfile == nil {
+		return fmt.Errorf("copy guard ATR profile default migration is incomplete")
+	}
+	detailJSON, err := json.Marshal(map[string]interface{}{
+		"reason":                 "historical_fixed_policy_missing_atr_profile",
+		"protection_mode":        config.RiskProtectionMode,
+		"trigger_price_type":     config.RiskATRProfile.TriggerPriceType,
+		"reentry_enabled":        config.RiskATRProfile.ReentryEnabled,
+		"reentry_decision_mode":  config.RiskATRProfile.ReentryDecisionMode,
+		"manual_reentry_enabled": config.RiskATRProfile.ManualReentryEnabled,
+		"max_reentries":          config.RiskATRProfile.MaxReentries,
+	})
+	if err != nil {
+		return err
+	}
+	_, err = exec.Exec(`
+		INSERT OR IGNORE INTO copy_trade_events
+			(trader_id, leader_id, provider_type, category, event_type, severity,
+			 status, operator, summary, detail_json, dedup_key)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, config.TraderID, config.LeaderID, config.ProviderType,
+		CopyEventCategoryReconcile, CopyEventTypeATRProfileDefaulted, CopyEventSeverityWarn,
+		"success", "system:migration", "历史固定止损缺少休眠 ATR 配置，已恢复项目默认值", string(detailJSON),
+		fmt.Sprintf("copy_guard_atr_profile_defaulted|%s", config.TraderID))
+	return err
 }
 
 func (s *CopyTradeStore) initCopyEventTable() error {
@@ -400,67 +434,75 @@ var copyGuardEventSpecs = map[string]CopyGuardEventSpec{
 	"AI_REVIEW_THESIS_INVALID":     {CopyEventCategoryTakeover, CopyEventSeverityInfo, "verbose", true},
 	// 观察态：命中不改变仓位，但它是评估「是否该按此条件离场」的唯一样本来源，
 	// 因此按 important 留存，不随 verbose 一起被保留策略清掉。
-	"AI_CLOSE_INVALIDATION_HIT":        {CopyEventCategoryTakeover, CopyEventSeverityWarn, "important", true},
-	"AI_REVIEW_FAILED":                 {CopyEventCategoryTakeover, CopyEventSeverityWarn, "important", true},
-	"AI_BUDGET_SUSPENDED":              {CopyEventCategoryTakeover, CopyEventSeverityWarn, "important", true},
-	"AI_RESULT_STALE":                  {CopyEventCategoryTakeover, CopyEventSeverityWarn, "verbose", true},
-	"AI_ENTRY_LEASE_WAITING_PRICE":     {CopyEventCategoryTakeover, CopyEventSeverityInfo, "verbose", true},
-	"ENTER_WINDOW_EXPIRED":             {CopyEventCategoryTakeover, CopyEventSeverityWarn, "important", true},
-	"AI_CANDIDATE_TERMINATED":          {CopyEventCategoryTakeover, CopyEventSeverityWarn, "important", true},
-	"AI_ANALYSIS":                      {CopyEventCategoryTakeover, CopyEventSeverityInfo, "verbose", true},
-	"AI_DECISION_OUTCOME_FINALIZED":    {CopyEventCategoryTakeover, CopyEventSeverityInfo, "", true},
-	"AI_CANDIDATE_OUTCOME_FINALIZED":   {CopyEventCategoryTakeover, CopyEventSeverityInfo, "", true},
-	"REENTRY_PREFLIGHT_REJECTED":       {CopyEventCategoryReentry, CopyEventSeverityWarn, "verbose", true},
-	"REENTRY_REQUESTED":                {CopyEventCategoryReentry, CopyEventSeverityInfo, "verbose", true},
-	"REENTRY_FILLED":                   {CopyEventCategoryReentry, CopyEventSeverityInfo, "important", true},
-	"REENTRY_FILL_INCREMENT":           {CopyEventCategoryReentry, CopyEventSeverityInfo, "verbose", true},
-	"REENTRY_RECOVERED_AFTER_RESTART":  {CopyEventCategoryReentry, CopyEventSeverityInfo, "important", true},
-	"REENTRY_WINDOW_COLLAPSED":         {CopyEventCategoryReentry, CopyEventSeverityWarn, "important", true},
-	"REENTRY_FAILED":                   {CopyEventCategoryReentry, CopyEventSeverityError, "important", true},
-	"REENTRY_RECOVERY_PENDING":         {CopyEventCategoryReentry, CopyEventSeverityWarn, "important", true},
-	"GUARD_MANUAL_REENTRY_SIGNAL":      {CopyEventCategoryTakeover, CopyEventSeverityInfo, "verbose", true},
-	"GUARD_MANUAL_REENTRY_CONFIRMED":   {CopyEventCategoryTakeover, CopyEventSeverityInfo, "verbose", true},
-	"GUARD_MANUAL_REENTRY_DISMISSED":   {CopyEventCategoryTakeover, CopyEventSeverityInfo, "verbose", true},
-	"PROTECTION_RECOVERED":             {CopyEventCategoryProtection, CopyEventSeverityInfo, "verbose", true},
-	"PROTECTIVE_STOP_ACTIVE":           {CopyEventCategoryProtection, CopyEventSeverityInfo, "verbose", true},
-	"PROTECTION_PENDING":               {CopyEventCategoryProtection, CopyEventSeverityInfo, "verbose", true},
-	"PROTECTION_ACTIVE":                {CopyEventCategoryProtection, CopyEventSeverityInfo, "verbose", true},
-	"PROTECTION_DEGRADED":              {CopyEventCategoryProtection, CopyEventSeverityWarn, "important", true},
-	"PROTECTION_CLAMPED":               {CopyEventCategoryProtection, CopyEventSeverityWarn, "important", true},
-	"PROTECTION_COVERAGE_LOW":          {CopyEventCategoryProtection, CopyEventSeverityWarn, "important", true},
-	"PROTECTION_COVERAGE_UNATTRIBUTED": {CopyEventCategoryProtection, CopyEventSeverityWarn, "important", true},
-	"PROTECTION_RETRY":                 {CopyEventCategoryProtection, CopyEventSeverityWarn, "verbose", true},
-	"PROTECTION_RETRY_THROTTLED":       {CopyEventCategoryProtection, CopyEventSeverityWarn, "important", true},
-	"PROTECTION_BOOKKEEPING_HEALED":    {CopyEventCategoryProtection, CopyEventSeverityInfo, "verbose", true},
-	"PROTECTIVE_STOP_GONE":             {CopyEventCategoryProtection, CopyEventSeverityWarn, "important", true},
-	"PROTECTION_VERIFY_UNKNOWN":        {CopyEventCategoryProtection, CopyEventSeverityWarn, "important", true},
-	"ADDON_RISK_WARNING":               {CopyEventCategoryProtection, CopyEventSeverityWarn, "important", true},
-	"ADDON_RISK_SHRUNK":                {CopyEventCategoryProtection, CopyEventSeverityWarn, "important", true},
-	"FORCED_EXIT":                      {CopyEventCategoryProtection, CopyEventSeverityWarn, "important", true},
-	"PROTECTION_CREATE_FAILED":         {CopyEventCategoryProtection, CopyEventSeverityError, "critical", true},
-	"GUARD_UNPROTECTABLE":              {CopyEventCategoryProtection, CopyEventSeverityError, "critical", true},
-	"GUARD_FORCED_EXIT":                {CopyEventCategoryProtection, CopyEventSeverityError, "critical", true},
-	"GUARD_FORCED_EXIT_FAILED":         {CopyEventCategoryProtection, CopyEventSeverityError, "critical", true},
-	"ACCOUNTING_RECONCILED":            {CopyEventCategoryReconcile, CopyEventSeverityInfo, "verbose", true},
-	"ATTEMPT_RECONCILED":               {CopyEventCategoryReconcile, CopyEventSeverityInfo, "verbose", true},
-	"WATCH_SUMMARY":                    {CopyEventCategoryReconcile, CopyEventSeverityInfo, "verbose", false},
-	"BASELINE_CALIBRATED":              {CopyEventCategoryReconcile, CopyEventSeverityInfo, "verbose", true},
-	"MAPPING_OWNERSHIP_RECOVERED":      {CopyEventCategoryReconcile, CopyEventSeverityWarn, "important", true},
-	"OWNERSHIP_AMBIGUOUS":              {CopyEventCategoryReconcile, CopyEventSeverityError, "critical", true},
-	"OWNERSHIP_GAP_FLAT_RETIRED":       {CopyEventCategoryReconcile, CopyEventSeverityWarn, "important", true},
-	"SUPERSEDED_BY_RECOVERED_POSITION": {CopyEventCategoryReconcile, CopyEventSeverityInfo, "verbose", true},
-	"LEADER_CLOSED":                    {CopyEventCategoryReconcile, CopyEventSeverityInfo, "important", true},
-	"CYCLE_CLOSED_SUMMARY":             {CopyEventCategoryReconcile, CopyEventSeverityInfo, "important", true},
-	"CYCLE_SUMMARY_EMAIL_QUEUED":       {CopyEventCategoryReconcile, CopyEventSeverityInfo, "verbose", false},
-	"CYCLE_SUMMARY_EMAIL_RATE_LIMITED": {CopyEventCategoryReconcile, CopyEventSeverityInfo, "verbose", false},
-	"CYCLE_SUMMARY_EMAIL_DEDUPED":      {CopyEventCategoryReconcile, CopyEventSeverityInfo, "verbose", false},
-	"CYCLE_SUMMARY_EMAIL_SENT":         {CopyEventCategoryReconcile, CopyEventSeverityInfo, "verbose", false},
-	"CYCLE_SUMMARY_EMAIL_FAILED":       {CopyEventCategoryReconcile, CopyEventSeverityWarn, "important", false},
-	"CYCLE_SUMMARY_EMAIL_DROPPED":      {CopyEventCategoryReconcile, CopyEventSeverityWarn, "important", false},
-	"CYCLE_SUMMARY_EMAIL_DISABLED":     {CopyEventCategoryReconcile, CopyEventSeverityInfo, "verbose", false},
-	"LEADER_REVERSED":                  {CopyEventCategoryReconcile, CopyEventSeverityWarn, "important", true},
-	"ACCOUNTING_DELAYED":               {CopyEventCategoryReconcile, CopyEventSeverityWarn, "important", true},
-	"ACCOUNTING_UNRECOVERABLE":         {CopyEventCategoryReconcile, CopyEventSeverityError, "critical", true},
+	"AI_CLOSE_INVALIDATION_HIT":                  {CopyEventCategoryTakeover, CopyEventSeverityWarn, "important", true},
+	"AI_REVIEW_FAILED":                           {CopyEventCategoryTakeover, CopyEventSeverityWarn, "important", true},
+	"AI_BUDGET_SUSPENDED":                        {CopyEventCategoryTakeover, CopyEventSeverityWarn, "important", true},
+	"AI_RESULT_STALE":                            {CopyEventCategoryTakeover, CopyEventSeverityWarn, "verbose", true},
+	"AI_ENTRY_LEASE_WAITING_PRICE":               {CopyEventCategoryTakeover, CopyEventSeverityInfo, "verbose", true},
+	"ENTER_WINDOW_EXPIRED":                       {CopyEventCategoryTakeover, CopyEventSeverityWarn, "important", true},
+	"AI_CANDIDATE_TERMINATED":                    {CopyEventCategoryTakeover, CopyEventSeverityWarn, "important", true},
+	"AI_ANALYSIS":                                {CopyEventCategoryTakeover, CopyEventSeverityInfo, "verbose", true},
+	"AI_DECISION_OUTCOME_FINALIZED":              {CopyEventCategoryTakeover, CopyEventSeverityInfo, "", true},
+	"AI_CANDIDATE_OUTCOME_FINALIZED":             {CopyEventCategoryTakeover, CopyEventSeverityInfo, "", true},
+	"REENTRY_PREFLIGHT_REJECTED":                 {CopyEventCategoryReentry, CopyEventSeverityWarn, "verbose", true},
+	"REENTRY_REQUESTED":                          {CopyEventCategoryReentry, CopyEventSeverityInfo, "verbose", true},
+	"REENTRY_FILLED":                             {CopyEventCategoryReentry, CopyEventSeverityInfo, "important", true},
+	"REENTRY_FILL_INCREMENT":                     {CopyEventCategoryReentry, CopyEventSeverityInfo, "verbose", true},
+	"REENTRY_RECOVERED_AFTER_RESTART":            {CopyEventCategoryReentry, CopyEventSeverityInfo, "important", true},
+	"REENTRY_WINDOW_COLLAPSED":                   {CopyEventCategoryReentry, CopyEventSeverityWarn, "important", true},
+	"REENTRY_FAILED":                             {CopyEventCategoryReentry, CopyEventSeverityError, "important", true},
+	"REENTRY_RECOVERY_PENDING":                   {CopyEventCategoryReentry, CopyEventSeverityWarn, "important", true},
+	"GUARD_MANUAL_REENTRY_SIGNAL":                {CopyEventCategoryTakeover, CopyEventSeverityInfo, "verbose", true},
+	"GUARD_MANUAL_REENTRY_CONFIRMED":             {CopyEventCategoryTakeover, CopyEventSeverityInfo, "verbose", true},
+	"GUARD_MANUAL_REENTRY_DISMISSED":             {CopyEventCategoryTakeover, CopyEventSeverityInfo, "verbose", true},
+	"PROTECTION_RECOVERED":                       {CopyEventCategoryProtection, CopyEventSeverityInfo, "verbose", true},
+	"PROTECTIVE_STOP_ACTIVE":                     {CopyEventCategoryProtection, CopyEventSeverityInfo, "verbose", true},
+	"PROTECTION_PENDING":                         {CopyEventCategoryProtection, CopyEventSeverityInfo, "verbose", true},
+	"PROTECTION_ACTIVE":                          {CopyEventCategoryProtection, CopyEventSeverityInfo, "verbose", true},
+	"PROTECTION_DEGRADED":                        {CopyEventCategoryProtection, CopyEventSeverityWarn, "important", true},
+	"PROTECTION_CLAMPED":                         {CopyEventCategoryProtection, CopyEventSeverityWarn, "important", true},
+	"PROTECTION_COVERAGE_LOW":                    {CopyEventCategoryProtection, CopyEventSeverityWarn, "important", true},
+	"PROTECTION_COVERAGE_UNATTRIBUTED":           {CopyEventCategoryProtection, CopyEventSeverityWarn, "important", true},
+	"PROTECTION_RETRY":                           {CopyEventCategoryProtection, CopyEventSeverityWarn, "verbose", true},
+	"PROTECTION_RETRY_THROTTLED":                 {CopyEventCategoryProtection, CopyEventSeverityWarn, "important", true},
+	"PROTECTION_BOOKKEEPING_HEALED":              {CopyEventCategoryProtection, CopyEventSeverityInfo, "verbose", true},
+	"POSITION_MARGIN_STOP_ANCHOR_FROZEN":         {CopyEventCategoryProtection, CopyEventSeverityInfo, "important", true},
+	"POSITION_MARGIN_PROTECTION_QUANTITY_SYNCED": {CopyEventCategoryProtection, CopyEventSeverityInfo, "verbose", true},
+	"POSITION_MARGIN_LIQUIDATION_TIGHTENED":      {CopyEventCategoryProtection, CopyEventSeverityWarn, "important", true},
+	"POSITION_MARGIN_MARK_UNAVAILABLE":           {CopyEventCategoryProtection, CopyEventSeverityError, "critical", true},
+	"POSITION_MARGIN_STOP_TRIGGERED":             {CopyEventCategoryStopLoss, CopyEventSeverityWarn, "important", true},
+	"POSITION_MARGIN_SIGNAL_IGNORED":             {CopyEventCategoryStopLoss, CopyEventSeverityInfo, "verbose", true},
+	"RISK_EXIT_SIGNAL_IGNORED":                   {CopyEventCategoryStopLoss, CopyEventSeverityInfo, "verbose", true},
+	"PROTECTIVE_STOP_GONE":                       {CopyEventCategoryProtection, CopyEventSeverityWarn, "important", true},
+	"PROTECTION_VERIFY_UNKNOWN":                  {CopyEventCategoryProtection, CopyEventSeverityWarn, "important", true},
+	"ADDON_RISK_WARNING":                         {CopyEventCategoryProtection, CopyEventSeverityWarn, "important", true},
+	"ADDON_RISK_SHRUNK":                          {CopyEventCategoryProtection, CopyEventSeverityWarn, "important", true},
+	"FORCED_EXIT":                                {CopyEventCategoryProtection, CopyEventSeverityWarn, "important", true},
+	"PROTECTION_CREATE_FAILED":                   {CopyEventCategoryProtection, CopyEventSeverityError, "critical", true},
+	"GUARD_UNPROTECTABLE":                        {CopyEventCategoryProtection, CopyEventSeverityError, "critical", true},
+	"GUARD_FORCED_EXIT":                          {CopyEventCategoryProtection, CopyEventSeverityError, "critical", true},
+	"GUARD_FORCED_EXIT_FAILED":                   {CopyEventCategoryProtection, CopyEventSeverityError, "critical", true},
+	"ACCOUNTING_RECONCILED":                      {CopyEventCategoryReconcile, CopyEventSeverityInfo, "verbose", true},
+	"ATTEMPT_RECONCILED":                         {CopyEventCategoryReconcile, CopyEventSeverityInfo, "verbose", true},
+	"WATCH_SUMMARY":                              {CopyEventCategoryReconcile, CopyEventSeverityInfo, "verbose", false},
+	"BASELINE_CALIBRATED":                        {CopyEventCategoryReconcile, CopyEventSeverityInfo, "verbose", true},
+	"MAPPING_OWNERSHIP_RECOVERED":                {CopyEventCategoryReconcile, CopyEventSeverityWarn, "important", true},
+	"OWNERSHIP_AMBIGUOUS":                        {CopyEventCategoryReconcile, CopyEventSeverityError, "critical", true},
+	"POSITION_OWNERSHIP_ANOMALY":                 {CopyEventCategoryReconcile, CopyEventSeverityError, "critical", true},
+	"OWNERSHIP_GAP_FLAT_RETIRED":                 {CopyEventCategoryReconcile, CopyEventSeverityWarn, "important", true},
+	"SUPERSEDED_BY_RECOVERED_POSITION":           {CopyEventCategoryReconcile, CopyEventSeverityInfo, "verbose", true},
+	"LEADER_CLOSED":                              {CopyEventCategoryReconcile, CopyEventSeverityInfo, "important", true},
+	"CYCLE_CLOSED_SUMMARY":                       {CopyEventCategoryReconcile, CopyEventSeverityInfo, "important", true},
+	"CYCLE_SUMMARY_EMAIL_QUEUED":                 {CopyEventCategoryReconcile, CopyEventSeverityInfo, "verbose", false},
+	"CYCLE_SUMMARY_EMAIL_RATE_LIMITED":           {CopyEventCategoryReconcile, CopyEventSeverityInfo, "verbose", false},
+	"CYCLE_SUMMARY_EMAIL_DEDUPED":                {CopyEventCategoryReconcile, CopyEventSeverityInfo, "verbose", false},
+	"CYCLE_SUMMARY_EMAIL_SENT":                   {CopyEventCategoryReconcile, CopyEventSeverityInfo, "verbose", false},
+	"CYCLE_SUMMARY_EMAIL_FAILED":                 {CopyEventCategoryReconcile, CopyEventSeverityWarn, "important", false},
+	"CYCLE_SUMMARY_EMAIL_DROPPED":                {CopyEventCategoryReconcile, CopyEventSeverityWarn, "important", false},
+	"CYCLE_SUMMARY_EMAIL_DISABLED":               {CopyEventCategoryReconcile, CopyEventSeverityInfo, "verbose", false},
+	"LEADER_REVERSED":                            {CopyEventCategoryReconcile, CopyEventSeverityWarn, "important", true},
+	"ACCOUNTING_DELAYED":                         {CopyEventCategoryReconcile, CopyEventSeverityWarn, "important", true},
+	"ACCOUNTING_UNRECOVERABLE":                   {CopyEventCategoryReconcile, CopyEventSeverityError, "critical", true},
 }
 
 func classifyGuardEvent(eventType string) (category, severity string, include bool) {
@@ -557,6 +599,18 @@ func guardEventSummary(eventType, symbol, side, operator string) string {
 		return fmt.Sprintf("止损单已触发，等待仓位归零 | %s", pair)
 	case "STOP_PARTIAL", "STOP_DUST_RESIDUAL":
 		return fmt.Sprintf("止损后仍有残仓（%s）| %s", eventType, pair)
+	case "POSITION_MARGIN_STOP_ANCHOR_FROZEN":
+		return fmt.Sprintf("首仓固定比例止损锚点已固化 | %s", pair)
+	case "POSITION_MARGIN_PROTECTION_QUANTITY_SYNCED":
+		return fmt.Sprintf("固定止损保护数量已同步 | %s", pair)
+	case "POSITION_MARGIN_LIQUIDATION_TIGHTENED":
+		return fmt.Sprintf("固定止损已按强平安全线收紧 | %s", pair)
+	case "POSITION_MARGIN_MARK_UNAVAILABLE":
+		return fmt.Sprintf("固定止损缺少权威标记价 | %s", pair)
+	case "POSITION_MARGIN_STOP_TRIGGERED":
+		return fmt.Sprintf("首仓固定比例止损触发 | %s", pair)
+	case "POSITION_MARGIN_SIGNAL_IGNORED", "RISK_EXIT_SIGNAL_IGNORED":
+		return fmt.Sprintf("风控退出后领航员信号已忽略 | %s", pair)
 	case "AI_CANDIDATE_CREATED":
 		return fmt.Sprintf("AI 持续观察候选已创建 | %s", pair)
 	case "AI_REVIEW_WAIT":
@@ -629,6 +683,8 @@ func guardEventSummary(eventType, symbol, side, operator string) string {
 		return fmt.Sprintf("跟单仓位所有权已恢复 | %s", pair)
 	case "OWNERSHIP_AMBIGUOUS":
 		return fmt.Sprintf("跟单仓位所有权待核验 | %s", pair)
+	case "POSITION_OWNERSHIP_ANOMALY":
+		return fmt.Sprintf("执行账户出现非跟单仓位变化 | %s", pair)
 	case "OWNERSHIP_GAP_FLAT_RETIRED":
 		return fmt.Sprintf("所有权缺口已按实时空仓安全收尾 | %s", pair)
 	case "SUPERSEDED_BY_RECOVERED_POSITION":

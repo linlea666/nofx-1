@@ -114,6 +114,7 @@ const eventLabels: Record<string, string> = {
   PROTECTION_DEGRADED: '保护已降级',
   PROTECTION_COVERAGE_LOW: '保护覆盖不足',
   PROTECTION_COVERAGE_UNATTRIBUTED: '保护覆盖无法归属（已按本地数量校验）',
+  POSITION_OWNERSHIP_ANOMALY: '仓位数量存在外部改动，周期已标记不可评分',
   PROTECTION_RETRY_THROTTLED: '保护单反复重挂，已转慢速重试',
   PROTECTION_BOOKKEEPING_HEALED: '停机对账已补齐保护记账',
   PROTECTION_RECOVERED: '保护已恢复',
@@ -2240,9 +2241,10 @@ export function CopyGuardPage() {
         <div className="border border-[#2B3139] bg-[#181A20] rounded-lg p-4">
           <div className="font-semibold mb-1">影子策略人工启用门槛</div>
           <div className="text-xs text-[#848E9C] mb-3">
-            仅做离线评测，不会改变当前止损或自动下单。需至少 30
-            个独立关闭周期、10 个可进场样本、成本后均值与中位数为正、95%
-            Bootstrap 下界不为负，且没有未保护成交。
+            仅做离线评测，不会改变当前止损或自动下单。需至少 50
+            个独立关闭周期、10 个已验证固定止损穿越、mark 覆盖率至少
+            95%、相对当前策略的成本后增量均值与中位数为正、95% Bootstrap
+            下界不为负，且没有未保护成交。
           </div>
           <div className="grid md:grid-cols-3 gap-3">
             {summary.shadow_promotion.policies.map((policy) => (
@@ -2254,16 +2256,33 @@ export function CopyGuardPage() {
                   {policy.policy}
                 </div>
                 <div>
-                  周期 / 进场样本：{policy.independent_cycles} /{' '}
-                  {policy.enter_samples}
+                  周期 / 已验证止损穿越：{policy.independent_cycles} /{' '}
+                  {policy.verified_crossings}
                 </div>
                 <div>
-                  成本后均值 / 中位数：{money(policy.mean_net_pnl)} /{' '}
-                  {money(policy.median_net_pnl)}
+                  相对当前策略增量均值 / 中位数：
+                  {money(policy.mean_incremental_effect)} /{' '}
+                  {money(policy.median_incremental_effect)}
                 </div>
                 <div>
                   95% CI：[{money(policy.bootstrap_ci95_low)},{' '}
                   {money(policy.bootstrap_ci95_high)}]
+                </div>
+                <div>
+                  mark 覆盖 / 止损后反转：
+                  {(policy.verified_mark_coverage * 100).toFixed(2)}% /{' '}
+                  {(policy.post_stop_reversal_rate * 100).toFixed(2)}%
+                </div>
+                <div>
+                  尾部亏损 CVaR95 / 平均滑点：
+                  {money(-policy.tail_loss_cvar_95_usd)} /{' '}
+                  {policy.average_slippage_bps.toFixed(2)} bps
+                </div>
+                <div>
+                  杠杆 / 名义区间：{policy.minimum_leverage || '-'}–
+                  {policy.maximum_leverage || '-'}× /{' '}
+                  {policy.minimum_notional.toFixed(2)}–
+                  {policy.maximum_notional.toFixed(2)} USDT
                 </div>
                 <div
                   className="mt-2 font-semibold"
@@ -2729,9 +2748,128 @@ export function CopyGuardPage() {
               对账说明：{detail.cycle.accounting_error}
             </div>
           )}
-          <div className="mb-4 text-xs text-[#848E9C] break-all">
-            策略快照：{detail.cycle.policy_snapshot}
+          <div className="mb-4 rounded border border-[#2B3139] bg-[#181A20] p-4 text-sm">
+            <div className="mb-2 flex items-center gap-2">
+              <span className="font-medium">本周期固化策略</span>
+              <span className="text-xs text-[#848E9C]">
+                快照协议 v{detail.policy.snapshot_schema_version} · 风控策略 v
+                {detail.policy.policy_version}
+              </span>
+            </div>
+            <div className="grid gap-3 md:grid-cols-3">
+              <Metric
+                label="保护模式"
+                value={
+                  detail.policy.protection_mode === 'position_margin_pct'
+                    ? `首仓固化 ${(detail.policy.position_margin_stop_pct * 100).toFixed(2)}%`
+                    : 'ATR / 结构优先'
+                }
+              />
+              <Metric
+                label="触发价格"
+                value={detail.policy.trigger_price_type || '-'}
+              />
+              <Metric
+                label="止损后重入"
+                value={
+                  detail.policy.reentry_enabled
+                    ? `${detail.policy.reentry_decision_mode} · 最多 ${detail.policy.max_reentries} 次`
+                    : '关闭'
+                }
+              />
+            </div>
+            {detail.policy.dormant_atr_profile &&
+              detail.policy.protection_mode === 'position_margin_pct' && (
+                <p className="mt-2 text-xs text-[#848E9C]">
+                  ATR 配置已休眠保存；切回 ATR 后将恢复触发价{' '}
+                  {detail.policy.dormant_atr_profile.trigger_price_type}、重入{' '}
+                  {detail.policy.dormant_atr_profile.reentry_enabled
+                    ? `${detail.policy.dormant_atr_profile.reentry_decision_mode} / 最多 ${detail.policy.dormant_atr_profile.max_reentries} 次`
+                    : '关闭'}
+                  。当前配置切换只影响下一次全新开仓，不改变本周期。
+                </p>
+              )}
+            {detail.policy.data_quality !== 'VERIFIED' && (
+              <p className="mt-2 text-xs text-[#F6465D]">
+                策略快照不可验证：{detail.policy.reason || '未知原因'}
+              </p>
+            )}
           </div>
+          {detail.position_margin_audit && (
+            <div className="mb-4 rounded border border-[#2B3139] bg-[#181A20] p-4 text-sm">
+              <div className="mb-2 flex items-center gap-2">
+                <span className="font-medium">固定仓位止损审计</span>
+                <span
+                  className={`text-xs ${detail.position_margin_audit.data_quality === 'VERIFIED' ? 'text-[#0ECB81]' : 'text-[#F0B90B]'}`}
+                >
+                  {detail.position_margin_audit.data_quality}
+                </span>
+              </div>
+              <div className="grid gap-3 md:grid-cols-3">
+                <Metric
+                  label="配置 / 首仓锚点"
+                  value={`${(detail.position_margin_audit.configured_margin_loss_pct * 100).toFixed(2)}% · ${detail.position_margin_audit.stop_anchor_entry_price} @ ${detail.position_margin_audit.stop_anchor_leverage}×`}
+                />
+                <Metric
+                  label="首仓理论保证金 / 风险"
+                  value={`${detail.position_margin_audit.stop_anchor_initial_margin.toFixed(2)} / ${detail.position_margin_audit.stop_anchor_theoretical_risk_usd.toFixed(2)} USDT`}
+                />
+                <Metric
+                  label="公式价 / tick 对齐价"
+                  value={`${detail.position_margin_audit.raw_formula_stop_price || '-'} / ${detail.position_margin_audit.tick_aligned_stop_price || '-'}`}
+                />
+                <Metric
+                  label="当前有效止损 / mark"
+                  value={`${detail.position_margin_audit.effective_stop_price || '-'} / ${detail.position_margin_audit.last_mark_price || '-'}`}
+                />
+                <Metric
+                  label="当前均价 / 数量 / 杠杆"
+                  value={`${detail.position_margin_audit.current_entry_price || '-'} / ${detail.position_margin_audit.current_quantity || '-'} / ${detail.position_margin_audit.current_leverage || '-'}×`}
+                />
+                <Metric
+                  label="当前保证金 / 止损风险"
+                  value={`${detail.position_margin_audit.current_margin.toFixed(2)} / ${detail.position_margin_audit.current_stop_risk_usd.toFixed(2)} USDT`}
+                />
+                <Metric
+                  label="等效保证金 / 权益损失"
+                  value={`${(detail.position_margin_audit.current_margin_loss_pct * 100).toFixed(2)}% / ${(detail.position_margin_audit.current_account_loss_pct * 100).toFixed(2)}%`}
+                />
+                <Metric
+                  label="价格波动 / ATR 距离"
+                  value={`${(detail.position_margin_audit.equivalent_price_move_pct * 100).toFixed(4)}% / ${detail.position_margin_audit.distance_atr > 0 ? `${detail.position_margin_audit.distance_atr.toFixed(2)}×` : '-'}`}
+                />
+                <Metric
+                  label="强平修正"
+                  value={
+                    detail.position_margin_audit.liquidation_clamped
+                      ? `已单向收紧 · ${detail.position_margin_audit.governed_by}`
+                      : '未触发'
+                  }
+                />
+                <Metric
+                  label="交易所托管单"
+                  value={`${detail.position_margin_audit.hosted_order_id || '未确认'} · ${detail.position_margin_audit.trigger_type || '-'} · ${detail.position_margin_audit.coverage_mode}`}
+                />
+                <Metric
+                  label="保护覆盖"
+                  value={`${(detail.position_margin_audit.coverage_ratio * 100).toFixed(2)}% · ${detail.position_margin_audit.protection_status}`}
+                />
+                <Metric
+                  label="数据时间"
+                  value={dateLabel(detail.position_margin_audit.data_timestamp)}
+                />
+              </div>
+              {detail.position_margin_audit.unscorable_reason && (
+                <p className="mt-2 text-xs text-[#F0B90B]">
+                  数据说明：{detail.position_margin_audit.unscorable_reason}
+                </p>
+              )}
+              <p className="mt-2 text-xs text-[#F0B90B]">
+                费用、资金费、滑点和跳空不进入 80%
+                触发公式；真实成交损失可能高于理论值。
+              </p>
+            </div>
+          )}
           {detail.attribution && (
             <div className="mb-4 rounded border border-[#2B3139] bg-[#181A20] p-4 text-sm">
               <div className="mb-2 flex items-center gap-2">
@@ -2964,10 +3102,33 @@ export function CopyGuardPage() {
                     <div>
                       {evaluation.status} / {evaluation.data_quality}
                     </div>
-                    <div>
-                      成本后：{money(evaluation.net_pnl)}（成本{' '}
-                      {money(evaluation.estimated_cost)}）
-                    </div>
+                    {evaluation.evaluation_version >= 2 ? (
+                      <>
+                        <div>
+                          替代策略净盈亏：{money(evaluation.net_pnl)}（成本{' '}
+                          {money(evaluation.estimated_cost)} ·{' '}
+                          {evaluation.cost_source || '待对账'}）
+                        </div>
+                        <div>
+                          相对 {evaluation.baseline_policy || '当前策略'} 增量：
+                          {money(evaluation.incremental_net_effect)}
+                        </div>
+                        <div>
+                          mark 覆盖{' '}
+                          {(evaluation.mark_coverage * 100).toFixed(2)}% · 穿越{' '}
+                          {evaluation.stop_crossed
+                            ? evaluation.crossing_verified
+                              ? '已验证'
+                              : '未验证'
+                            : '未发生'}
+                        </div>
+                      </>
+                    ) : (
+                      <div>
+                        v1 估算净值：{money(evaluation.net_pnl)}（不进入 v2
+                        人工启用统计）
+                      </div>
+                    )}
                   </div>
                 ))}
               </div>
@@ -3026,101 +3187,6 @@ export function CopyGuardPage() {
                           </span>
                         </>
                       )}
-                      {a.stop_anchor_price > 0 &&
-                        (() => {
-                          const effectiveStop =
-                            a.final_stop_price > 0
-                              ? a.final_stop_price
-                              : a.stop_anchor_price
-                          const actualHostedStop =
-                            detail.protection?.status?.toLowerCase() ===
-                              'live' && detail.protection.trigger_price > 0
-                              ? detail.protection.trigger_price
-                              : null
-                          const priceDistance = Math.max(
-                            0,
-                            detail.cycle.side === 'long'
-                              ? a.entry_price - effectiveStop
-                              : effectiveStop - a.entry_price
-                          )
-                          const equivalentMovePct =
-                            a.entry_price > 0
-                              ? (priceDistance / a.entry_price) * 100
-                              : 0
-                          const atrDistance =
-                            a.atr > 0 ? priceDistance / a.atr : null
-                          const safetyTightened =
-                            Math.abs(effectiveStop - a.stop_anchor_price) >
-                            1e-12
-                          return (
-                            <>
-                              <span>
-                                首仓锚定均价 {a.stop_anchor_entry_price} · 杠杆{' '}
-                                {a.stop_anchor_leverage}×
-                              </span>
-                              <span>
-                                首仓理论保证金{' '}
-                                {a.stop_anchor_initial_margin.toFixed(2)} USDT ·
-                                配置{' '}
-                                {(
-                                  a.stop_configured_margin_loss_pct * 100
-                                ).toFixed(2)}
-                                %
-                              </span>
-                              <span>
-                                首仓理论风险{' '}
-                                {(
-                                  a.stop_anchor_initial_margin *
-                                  a.stop_configured_margin_loss_pct
-                                ).toFixed(2)}{' '}
-                                USDT
-                              </span>
-                              <span>
-                                固定策略止损 {a.stop_anchor_price} · 当前策略{' '}
-                                {effectiveStop}
-                              </span>
-                              <span>
-                                当前实际挂单{' '}
-                                {actualHostedStop === null
-                                  ? '未确认（系统持续重试）'
-                                  : actualHostedStop}
-                              </span>
-                              <span>
-                                当前仓位 {a.quantity} · 均价 {a.entry_price} ·
-                                杠杆 {a.actual_leverage || '-'}×
-                              </span>
-                              <span>
-                                当前止损风险{' '}
-                                {(priceDistance * a.quantity).toFixed(2)} USDT
-                              </span>
-                              <span>
-                                当前等效保证金亏损{' '}
-                                {(
-                                  equivalentMovePct * a.actual_leverage
-                                ).toFixed(2)}
-                                %
-                              </span>
-                              <span>
-                                等价价格波动 {equivalentMovePct.toFixed(4)}% ·
-                                ATR 距离{' '}
-                                {atrDistance === null
-                                  ? '—'
-                                  : `${atrDistance.toFixed(2)}×`}
-                              </span>
-                              <span
-                                className={
-                                  safetyTightened ? 'text-[#F0B90B]' : ''
-                                }
-                              >
-                                强平安全修正：
-                                {safetyTightened ? '已单向收紧' : '未触发'}
-                              </span>
-                              <span className="text-[#F0B90B] sm:col-span-3">
-                                费用、资金费、滑点和跳空不计入触发公式；实际成交损失可能高于理论风险。
-                              </span>
-                            </>
-                          )
-                        })()}
                       <span>
                         预计仓位亏损{' '}
                         {(a.expected_position_loss_pct * 100).toFixed(2)}%

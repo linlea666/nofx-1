@@ -235,14 +235,16 @@ func (s *Store) initTables() error {
 	if err := s.CopyTrade().initExecutionIntentTable(); err != nil {
 		return fmt.Errorf("failed to initialize copy trade execution intent table: %w", err)
 	}
+	// Snapshot migration can emit durable configuration-repair events, so the
+	// lightweight event table must exist before Copy Guard migrations run.
+	if err := s.CopyTrade().initCopyEventTable(); err != nil {
+		return fmt.Errorf("failed to initialize copy trade event table: %w", err)
+	}
 	if err := s.CopyTrade().initCopyGuardTables(); err != nil {
 		return fmt.Errorf("failed to initialize copy guard tables: %w", err)
 	}
 	if err := s.CopyTrade().finalizeExecutionIntentTerminalMigration(); err != nil {
 		return fmt.Errorf("failed to finalize execution intent terminal migration: %w", err)
-	}
-	if err := s.CopyTrade().initCopyEventTable(); err != nil {
-		return fmt.Errorf("failed to initialize copy trade event table: %w", err)
 	}
 	if err := s.CopyTrade().migratePositionMarginStops(); err != nil {
 		return fmt.Errorf("failed to migrate position margin stops: %w", err)

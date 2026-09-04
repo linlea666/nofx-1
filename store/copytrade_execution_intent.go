@@ -172,6 +172,7 @@ type LeaderExecutionCommit struct {
 	ExchangeState        string
 	AttemptQuantity      float64
 	OrderTerminal        bool
+	InitialCopyGuard     *InitialCopyGuardLifecycle
 }
 
 type AIReentryFillSnapshot struct {
@@ -249,16 +250,22 @@ func (s *CopyTradeStore) CommitLeaderExecutionFill(c LeaderExecutionCommit) erro
 		return err
 	}
 	defer tx.Rollback()
-	var intentStatus string
+	var intentStatus, intentAction, intentSourceKind string
+	var intentCycleID int64
 	var targetQuantity, previousFilled, previousFilledNotional float64
-	if err = tx.QueryRow(`SELECT status,
+	if err = tx.QueryRow(`SELECT status,action,
+		CASE WHEN COALESCE(source_kind,'')='' THEN 'LEADER_TRANSITION' ELSE source_kind END,
+		COALESCE(cycle_id,0),
 		COALESCE(NULLIF(target_quantity,0),NULLIF(quantized_quantity,0),requested_quantity,0),
 		COALESCE(filled_quantity,0),COALESCE(filled_notional,0)
 		FROM copy_trade_execution_intents
 		WHERE id=? AND trader_id=? AND leader_pos_id=? AND source_revision=?`,
 		c.IntentID, c.TraderID, c.LeaderPosID, c.SourceRevision).
-		Scan(&intentStatus, &targetQuantity, &previousFilled, &previousFilledNotional); err != nil {
+		Scan(&intentStatus, &intentAction, &intentSourceKind, &intentCycleID, &targetQuantity, &previousFilled, &previousFilledNotional); err != nil {
 		return err
+	}
+	if intentSourceKind != "LEADER_TRANSITION" || intentAction != c.Action {
+		return fmt.Errorf("intent %d identity mismatch: durable=%s/%s commit=%s", c.IntentID, intentSourceKind, intentAction, c.Action)
 	}
 	if intentStatus != ExecutionIntentFilled && intentStatus != ExecutionIntentProtected &&
 		intentStatus != ExecutionIntentSubmitted && intentStatus != ExecutionIntentReconciling &&
@@ -380,6 +387,7 @@ func (s *CopyTradeStore) CommitLeaderExecutionFill(c LeaderExecutionCommit) erro
 	if currentRevision != c.SourceRevision-1 {
 		return fmt.Errorf("mapping revision conflict for %s: current=%d expected=%d", c.LeaderPosID, currentRevision, c.SourceRevision-1)
 	}
+	initialOpen := open && !c.IsAdd && (err == sql.ErrNoRows || mappingStatus == MappingStatusClosed || mappingStatus == MappingStatusIgnored)
 	switch {
 	case open && err == sql.ErrNoRows:
 		_, err = tx.Exec(`INSERT INTO copy_trade_position_mappings
@@ -409,7 +417,44 @@ func (s *CopyTradeStore) CommitLeaderExecutionFill(c LeaderExecutionCommit) erro
 	if err != nil {
 		return err
 	}
+	var initialCycleID int64
+	initialCycleCreated := false
+	if initialOpen && c.InitialCopyGuard != nil {
+		lifecycle := *c.InitialCopyGuard
+		lifecycle.IntentID = c.IntentID
+		lifecycle.TraderID = c.TraderID
+		lifecycle.LeaderID = c.LeaderID
+		lifecycle.LeaderPosID = c.LeaderPosID
+		lifecycle.Symbol = c.Symbol
+		lifecycle.Side = c.Side
+		lifecycle.MarginMode = c.MarginMode
+		lifecycle.FollowerEntry = c.FillPrice
+		lifecycle.FollowerNotional = deltaNotional
+		lifecycle.FollowerQuantity = deltaFilled
+		lifecycle.LeaderSize = c.LeaderTargetSize
+		lifecycle.EntryOrderID = c.ExchangeOrderID
+		if lifecycle.LeaderEntryPrice <= 0 {
+			lifecycle.LeaderEntryPrice = c.FillPrice
+		}
+		initialCycleID, initialCycleCreated, err = ensureInitialCopyGuardLifecycleTx(tx, lifecycle, true)
+		if err != nil {
+			return fmt.Errorf("commit initial Copy Guard lifecycle: %w", err)
+		}
+	}
+	boundCycleID := initialCycleID
+	if boundCycleID == 0 {
+		cycleErr := tx.QueryRow(`SELECT id FROM copy_guard_cycles
+			WHERE trader_id=? AND leader_pos_id=? AND closed_at IS NULL LIMIT 1`,
+			c.TraderID, c.LeaderPosID).Scan(&boundCycleID)
+		if cycleErr != nil && cycleErr != sql.ErrNoRows {
+			return cycleErr
+		}
+	}
+	if intentCycleID > 0 && boundCycleID > 0 && intentCycleID != boundCycleID {
+		return fmt.Errorf("execution intent %d is bound to cycle %d, not active cycle %d", c.IntentID, intentCycleID, boundCycleID)
+	}
 	res, err := tx.Exec(`UPDATE copy_trade_execution_intents SET status=?,filled_quantity=?,filled_notional=?,
+		cycle_id=CASE WHEN ?>0 THEN ? ELSE cycle_id END,
 		reason_code=CASE WHEN ?='PARTIALLY_FILLED' THEN 'CATCHUP_PENDING' ELSE reason_code END,
 		last_catchup_reason=CASE WHEN ?='PARTIALLY_FILLED' THEN 'CATCHUP_PENDING' ELSE last_catchup_reason END,
 		exchange_order_id=CASE WHEN ?<>'' THEN ? ELSE exchange_order_id END,exchange_state=?,
@@ -417,7 +462,7 @@ func (s *CopyTradeStore) CommitLeaderExecutionFill(c LeaderExecutionCommit) erro
 		terminal_at=CASE WHEN ?='FILLED' THEN COALESCE(terminal_at,CURRENT_TIMESTAMP) ELSE NULL END,
 		updated_at=CURRENT_TIMESTAMP
 		WHERE id=? AND status IN ('RESERVED','SUBMITTED','RECONCILING','PARTIALLY_FILLED')`,
-		nextStatus, cumulativeFilled, cumulativeFilledNotional, nextStatus, nextStatus,
+		nextStatus, cumulativeFilled, cumulativeFilledNotional, boundCycleID, boundCycleID, nextStatus, nextStatus,
 		c.ExchangeOrderID, c.ExchangeOrderID, c.ExchangeState, nextStatus, c.IntentID)
 	if err != nil {
 		return err
@@ -428,7 +473,14 @@ func (s *CopyTradeStore) CommitLeaderExecutionFill(c LeaderExecutionCommit) erro
 	if _, err = tx.Exec(`UPDATE copy_trade_source_transitions SET status=?,updated_at=CURRENT_TIMESTAMP WHERE intent_id=?`, nextStatus, c.IntentID); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	if initialCycleCreated {
+		s.mirrorGuardEventToCopyEvents(initialCycleID, c.TraderID, "INITIAL_ENTRY_FILLED", c.FillPrice, deltaFilled, deltaNotional, 0,
+			map[string]interface{}{"intent_id": c.IntentID, "entry_order_id": c.ExchangeOrderID, "anchor_source": CopyGuardAnchorSourceInitialFill})
+	}
+	return nil
 }
 
 // ApplyAIReentryFillSnapshot applies one exchange cumulative-fill snapshot to
@@ -2314,4 +2366,119 @@ func (s *CopyTradeStore) ListExecutionIntentsByCycle(cycleID int64) ([]*CopyTrad
 		out = append(out, x)
 	}
 	return out, rows.Err()
+}
+
+// CopyGuardPositionOwnershipExpectation is the auditable position quantity
+// explained by durable execution fills for one active lifecycle. Reliable is
+// false for historical/unbound ledgers: callers must never label an exchange
+// quantity as external activity when our own fill history is incomplete.
+type CopyGuardPositionOwnershipExpectation struct {
+	CycleID             int64     `json:"cycle_id"`
+	ExpectedQuantity    float64   `json:"expected_quantity"`
+	Reliable            bool      `json:"reliable"`
+	InFlight            bool      `json:"in_flight"`
+	LastIntentUpdated   time.Time `json:"last_intent_updated_at"`
+	ContributingIntents []int64   `json:"contributing_intent_ids"`
+	Reason              string    `json:"reason,omitempty"`
+}
+
+// GetCopyGuardPositionOwnershipExpectation reconstructs the live quantity from
+// cumulative, exchange-confirmed intent fills. Opens add quantity; reductions
+// and closes subtract it. It is intentionally strict about cycle bindings and
+// action/source kinds so a legacy gap becomes "unknown", never a false anomaly.
+func (s *CopyTradeStore) GetCopyGuardPositionOwnershipExpectation(cycleID int64) (*CopyGuardPositionOwnershipExpectation, error) {
+	out := &CopyGuardPositionOwnershipExpectation{CycleID: cycleID}
+	if cycleID <= 0 {
+		return out, fmt.Errorf("invalid Copy Guard cycle id")
+	}
+	var traderID, leaderPosID, accountingStatus, mappingStatus string
+	var initialIntentID, mappingRevision int64
+	err := s.db.QueryRow(`SELECT c.trader_id,c.leader_pos_id,COALESCE(c.initial_intent_id,0),
+		COALESCE(c.accounting_status,''),COALESCE(m.status,''),COALESCE(m.source_revision,0)
+		FROM copy_guard_cycles c
+		LEFT JOIN copy_trade_position_mappings m
+		  ON m.trader_id=c.trader_id AND m.leader_pos_id=c.leader_pos_id
+		WHERE c.id=? AND c.closed_at IS NULL`, cycleID).Scan(
+		&traderID, &leaderPosID, &initialIntentID, &accountingStatus, &mappingStatus, &mappingRevision,
+	)
+	if err != nil {
+		return out, err
+	}
+	if initialIntentID <= 0 || accountingStatus == CopyGuardAccountingLegacyUnverified {
+		out.Reason = "initial fill intent is not verified"
+		return out, nil
+	}
+	if mappingStatus != MappingStatusActive {
+		out.Reason = "position mapping is not active"
+		return out, nil
+	}
+	rows, err := s.db.Query(`SELECT id,COALESCE(source_kind,'LEADER_TRANSITION'),action,
+		COALESCE(cycle_id,0),source_revision,COALESCE(filled_quantity,0),status,updated_at
+		FROM copy_trade_execution_intents
+		WHERE trader_id=? AND leader_pos_id=? AND id>=? AND source_revision<=?
+		ORDER BY id`, traderID, leaderPosID, initialIntentID, mappingRevision)
+	if err != nil {
+		return out, err
+	}
+	defer rows.Close()
+	foundInitial := false
+	for rows.Next() {
+		var id, boundCycleID, revision int64
+		var sourceKind, action, status, updatedRaw string
+		var filled float64
+		if err = rows.Scan(&id, &sourceKind, &action, &boundCycleID, &revision, &filled, &status, &updatedRaw); err != nil {
+			return out, err
+		}
+		updated, parseErr := parseDBTime(updatedRaw)
+		if parseErr != nil {
+			return out, parseErr
+		}
+		if updated.After(out.LastIntentUpdated) {
+			out.LastIntentUpdated = updated
+		}
+		switch status {
+		case ExecutionIntentReserved, ExecutionIntentSubmitted, ExecutionIntentReconciling, ExecutionIntentPartiallyFilled:
+			out.InFlight = true
+		}
+		if filled <= 0 {
+			continue
+		}
+		if id == initialIntentID {
+			foundInitial = true
+		}
+		if sourceKind != "LEADER_TRANSITION" {
+			out.Reason = fmt.Sprintf("filled intent %d has unsupported source kind %s", id, sourceKind)
+			return out, nil
+		}
+		if boundCycleID != cycleID {
+			out.Reason = fmt.Sprintf("filled intent %d is not bound to cycle", id)
+			return out, nil
+		}
+		switch action {
+		case "open_long", "open_short":
+			out.ExpectedQuantity += filled
+		case "reduce_long", "reduce_short", "close_long", "close_short":
+			out.ExpectedQuantity -= filled
+		default:
+			out.Reason = fmt.Sprintf("filled intent %d has unsupported action %s", id, action)
+			return out, nil
+		}
+		out.ContributingIntents = append(out.ContributingIntents, id)
+	}
+	if err = rows.Err(); err != nil {
+		return out, err
+	}
+	if !foundInitial {
+		out.Reason = "initial fill intent is missing from lifecycle ledger"
+		return out, nil
+	}
+	if out.ExpectedQuantity < 0 && math.Abs(out.ExpectedQuantity) <= 1e-9 {
+		out.ExpectedQuantity = 0
+	}
+	if out.ExpectedQuantity < 0 || math.IsNaN(out.ExpectedQuantity) || math.IsInf(out.ExpectedQuantity, 0) {
+		out.Reason = "execution fills produce an invalid negative quantity"
+		return out, nil
+	}
+	out.Reliable = true
+	return out, nil
 }

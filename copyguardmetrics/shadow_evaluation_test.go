@@ -1,6 +1,7 @@
 package copyguardmetrics
 
 import (
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -104,5 +105,61 @@ func TestEvaluateCycleShadowPoliciesIsReportOnlyAndCostAdjusted(t *testing.T) {
 	}
 	if report.Status != "INSUFFICIENT_DATA" {
 		t.Fatalf("one shadow cycle incorrectly enabled a strategy: %+v", report)
+	}
+}
+
+func TestShadowPromotionUsesOnlyVerifiedV2IncrementalEvidence(t *testing.T) {
+	st, err := store.New(filepath.Join(t.TempDir(), "shadow-v2-promotion.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	for i := 0; i < 50; i++ {
+		cycle, cycleErr := st.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{
+			TraderID: "trader-v2", LeaderID: "leader", LeaderPosID: fmt.Sprintf("position-%d", i),
+			Symbol: "BTCUSDT", Side: "long", MarginMode: "cross", Status: store.CopyGuardFollowing,
+			PolicySnapshot: "{}",
+		})
+		if cycleErr != nil {
+			t.Fatal(cycleErr)
+		}
+		if _, cycleErr = st.DB().Exec(`UPDATE copy_guard_cycles SET closed_at=CURRENT_TIMESTAMP WHERE id=?`, cycle.ID); cycleErr != nil {
+			t.Fatal(cycleErr)
+		}
+		crossed := i < 10
+		if cycleErr = st.CopyTrade().SaveCopyGuardShadowEvaluation(&store.CopyGuardShadowEvaluation{
+			CycleID: cycle.ID, TraderID: cycle.TraderID,
+			Policy:            store.CopyGuardShadowFirstEntryPositionMargin80,
+			EvaluationVersion: store.CopyGuardPositionMarginShadowEvaluationVersion,
+			Status:            store.CopyGuardShadowScorable, DataQuality: store.CopyGuardShadowQualityVerified,
+			NetPnL: 5, IncrementalEffect: 2, MarkCoverage: .99,
+			StopCrossed: crossed, CrossingVerified: crossed, PostStopReversed: crossed && i%2 == 0,
+			SlippageBPS: 1.5, MinimumLeverage: 10, MaximumLeverage: 20,
+			MinimumNotional: 100, MaximumNotional: 500,
+		}); cycleErr != nil {
+			t.Fatal(cycleErr)
+		}
+		// A legacy v1 row with a disastrous absolute result must never enter the
+		// v2 incremental promotion distribution.
+		if cycleErr = st.CopyTrade().SaveCopyGuardShadowEvaluation(&store.CopyGuardShadowEvaluation{
+			CycleID: cycle.ID, TraderID: cycle.TraderID, Policy: store.CopyGuardShadowWideStopEqualRisk,
+			EvaluationVersion: 1, Status: store.CopyGuardShadowScorable,
+			DataQuality: store.CopyGuardShadowQualityVerified, NetPnL: -100000,
+		}); cycleErr != nil {
+			t.Fatal(cycleErr)
+		}
+	}
+	report, err := BuildShadowPromotionReport(st, []string{"trader-v2"}, time.Now().Add(-time.Hour), time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Status != "MANUAL_ENABLE_ELIGIBLE" || report.MinimumIndependentCycles != 50 || len(report.Policies) != 1 {
+		t.Fatalf("v2 promotion gate mismatch: %+v", report)
+	}
+	gate := report.Policies[0]
+	if !gate.EligibleForManualEnable || gate.IndependentCycles != 50 || gate.VerifiedCrossings != 10 ||
+		gate.MeanIncrementalEffect != 2 || gate.MedianIncrementalEffect != 2 || gate.VerifiedMarkCoverage < .95 ||
+		gate.PostStopReversalRate != .5 || len(gate.BlockingReasons) != 0 {
+		t.Fatalf("verified v2 evidence was not evaluated correctly: %+v", gate)
 	}
 }

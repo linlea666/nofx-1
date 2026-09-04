@@ -1002,6 +1002,10 @@ export const api = {
   async getCopyGuardCycle(id: number) {
     const result = await httpClient.get<{
       cycle: import('../types').CopyGuardCycle
+      policy: import('../types').CopyGuardPolicySummary
+      position_margin_audit?:
+        | import('../types').CopyGuardPositionMarginAudit
+        | null
       execution_intents: import('../types').CopyTradeExecutionIntent[]
       events: Array<{
         id: number
@@ -1055,6 +1059,8 @@ export const api = {
         trigger_price: number
         trigger_type: string
         status: string
+        coverage_mode: 'CLOSE_ALL' | 'EXACT_QUANTITY' | string
+        updated_at: string
       }
       // v4.1 观察期采样时间线（出局后每个 tick 的价格/边界/门控轨迹）
       watch_samples?: Array<{

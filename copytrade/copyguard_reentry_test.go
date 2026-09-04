@@ -648,6 +648,12 @@ func TestBackfillV4Cycles(t *testing.T) {
 	}}
 	ti := NewTraderIntegration("trader-1", executor, st)
 	ti.engine = &Engine{config: &CopyConfig{ProviderType: ProviderOKX, LeaderID: "leader", RiskPolicyVersion: 4, RiskStopLossEnabled: true}}
+	policy := store.NewCopyGuardDefaults()
+	policy.TraderID, policy.ProviderType, policy.LeaderID = "trader-1", string(ProviderOKX), "leader"
+	ti.policySnapshot, err = store.EncodeCopyGuardPolicySnapshot(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// v4 前已跟随的存量仓位：active mapping 且无 open cycle
 	mapping := &store.CopyTradePositionMapping{TraderID: "trader-1", LeaderPosID: "legacy-pos", LeaderID: "leader", Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", OpenedAt: time.Now(), OpenPrice: 1720, OpenSizeUSD: 110, LastKnownSize: 1}
@@ -670,6 +676,9 @@ func TestBackfillV4Cycles(t *testing.T) {
 	}
 	if cycle.FollowerEntryPrice != 1717.33 {
 		t.Fatalf("backfill must use the real position entry price: %+v", cycle)
+	}
+	if cycle.AccountingStatus != store.CopyGuardAccountingLegacyUnverified || cycle.InitialIntentID != 0 {
+		t.Fatalf("legacy mapping without a confirmed initial fill must remain unscored: %+v", cycle)
 	}
 	attempts, err := st.CopyTrade().ListCopyGuardAttempts(cycle.ID)
 	if err != nil || len(attempts) != 1 || attempts[0].Status != "OPEN" {

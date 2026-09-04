@@ -366,9 +366,6 @@ func (ti *TraderIntegration) finalizeMigrationMarginStopIntent(intent *store.Cop
 		"actual_order_id": intent.ExchangeOrderID, "quantity": intent.RequestedQuantity,
 		"migration_version": ti.engine.config.RiskMarginStopMigrationVersion,
 	}
-	if err = ti.store.CopyTrade().RecordCopyGuardStopObserved(cycle.ID, ti.traderID, cycle.ReentryCount, 0, exitPrice, intent.RequestedQuantity, metadata); err != nil {
-		return err
-	}
 	mapping, mapErr := ti.store.CopyTrade().GetMapping(ti.traderID, intent.LeaderPosID)
 	if mapErr != nil && !errors.Is(mapErr, sql.ErrNoRows) {
 		return mapErr
@@ -377,7 +374,19 @@ func (ti *TraderIntegration) finalizeMigrationMarginStopIntent(intent *store.Cop
 	if mapping != nil {
 		leaderSize, addCount = mapping.LastKnownSize, mapping.AddCount
 	}
-	if err = ti.store.CopyTrade().MarkStoppedByRisk(ti.traderID, intent.LeaderPosID, 0, leaderSize, addCount); err != nil {
+	begin := store.CopyGuardRiskExitBegin{
+		CycleID: cycle.ID, TraderID: ti.traderID, LeaderPosID: intent.LeaderPosID,
+		AttemptNo: cycle.ReentryCount, TriggerPrice: exitPrice, Quantity: intent.RequestedQuantity,
+		TriggerSource: "migration_margin_stop", LeaderSize: leaderSize, AddCount: addCount,
+		Metadata: metadata,
+	}
+	if err = ti.establishRiskExitGate(begin); err != nil {
+		return err
+	}
+	if _, err = ti.store.CopyTrade().FinalizeCopyGuardRiskExit(store.CopyGuardRiskExitFinalize{
+		CopyGuardRiskExitBegin: begin, ExitPrice: exitPrice, ActualOrderID: intent.ExchangeOrderID,
+		Observed: true, VenueState: "migration_flat_confirmed",
+	}); err != nil {
 		return err
 	}
 	_ = ti.store.CopyTrade().SnapshotCopyGuardLeaderEntryAtStop(cycle.ID, cycle.LeaderEntryPrice)

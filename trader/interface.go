@@ -141,7 +141,13 @@ type ProtectiveStopRequest struct {
 	TriggerPrice float64
 	TriggerType  string
 	ClientID     string
+	CoverageMode string
 }
+
+const (
+	ProtectiveStopCoverageCloseAll      = "CLOSE_ALL"
+	ProtectiveStopCoverageExactQuantity = "EXACT_QUANTITY"
+)
 
 type ProtectiveStopOrder struct {
 	AlgoID        string
@@ -152,6 +158,7 @@ type ProtectiveStopOrder struct {
 	Quantity      float64
 	TriggerPrice  float64
 	TriggerType   string
+	CoverageMode  string
 	State         string
 	ActualOrderID string
 }
@@ -163,6 +170,40 @@ type ProtectiveStopManager interface {
 	GetProtectiveStop(algoID, symbol string) (*ProtectiveStopOrder, error)
 	GetProtectiveStopByClientID(clientID, symbol string) (*ProtectiveStopOrder, error)
 	CancelProtectiveStop(algoID, symbol string) error
+}
+
+type ProtectiveStopCoverageModeProvider interface {
+	ProtectiveStopCoverageMode() string
+}
+
+// MarkPriceProvider returns the exchange's authoritative mark price. It is
+// deliberately separate from Trader.GetMarketPrice, whose implementations
+// return the last traded/ticker price and therefore cannot be used to decide
+// whether a MARK_PRICE protective stop has crossed.
+type MarkPriceProvider interface {
+	GetMarkPrice(symbol string) (float64, error)
+}
+
+// MarkPriceCandle is an exchange-authoritative mark-price interval used only
+// to repair Copy Guard shadow-evaluation gaps after a disconnect or restart.
+type MarkPriceCandle struct {
+	OpenTime  time.Time
+	CloseTime time.Time
+	High      float64
+	Low       float64
+	Close     float64
+}
+
+type MarkPriceHistoryProvider interface {
+	GetMarkPriceHistory(symbol string, from, to time.Time) ([]MarkPriceCandle, error)
+}
+
+// CopyGuardPositionModeValidator verifies the live account mode required for
+// side-specific reduce-only protection. Constructors may attempt to set the
+// mode, but Copy Guard startup must query it again and fail closed if the
+// exchange did not actually accept the change.
+type CopyGuardPositionModeValidator interface {
+	ValidateCopyGuardPositionMode() error
 }
 
 // ProtectiveStopEnsureResult represents a safe replacement. If retiring is

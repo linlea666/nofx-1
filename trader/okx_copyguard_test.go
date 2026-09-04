@@ -45,6 +45,71 @@ func TestOKXErrorClassifiers(t *testing.T) {
 	}
 }
 
+func TestOKXMarkPriceHistoryIsSortedAndAuthoritative(t *testing.T) {
+	start := time.UnixMilli(1700000000000).UTC().Truncate(time.Minute)
+	trader := newOKXTestServer(t, func(path string) (int, string) {
+		if strings.Contains(path, okxPositionModePath) {
+			return 200, `{"code":"0","msg":"","data":[{"sCode":"0"}]}`
+		}
+		if !strings.Contains(path, okxMarkHistoryPath) || !strings.Contains(path, "instId=BTC-USDT-SWAP") || !strings.Contains(path, "bar=1m") {
+			t.Fatalf("unexpected OKX mark-history request: %s", path)
+		}
+		return 200, fmt.Sprintf(`{"code":"0","msg":"","data":[["%d","101","103","100","102","1"],["%d","100","102","99","101","1"],["%d","102","104","101","103","0"]]}`,
+			start.Add(time.Minute).UnixMilli(), start.UnixMilli(), start.Add(2*time.Minute).UnixMilli())
+	})
+	rows, err := trader.GetMarkPriceHistory("BTCUSDT", start.Add(30*time.Second), start.Add(3*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 || !rows[0].OpenTime.Equal(start) || rows[0].Low != 99 || rows[1].High != 103 {
+		t.Fatalf("unexpected OKX mark candles: %+v", rows)
+	}
+}
+
+func TestOKXGetMarkPriceUsesDedicatedEndpointWithoutPosition(t *testing.T) {
+	trader := newOKXTestServer(t, func(path string) (int, string) {
+		if strings.Contains(path, okxPositionModePath) {
+			return 200, `{"code":"0","msg":"","data":[{"sCode":"0"}]}`
+		}
+		if !strings.Contains(path, okxMarkPricePath) || !strings.Contains(path, "instId=BTC-USDT-SWAP") {
+			t.Fatalf("unexpected OKX mark-price request: %s", path)
+		}
+		return 200, `{"code":"0","msg":"","data":[{"instId":"BTC-USDT-SWAP","markPx":"61234.50"}]}`
+	})
+	price, err := trader.GetMarkPrice("BTCUSDT")
+	if err != nil || price != 61234.5 {
+		t.Fatalf("unexpected OKX mark price %.8f err=%v", price, err)
+	}
+}
+
+func TestOKXCopyGuardPositionModeIsQueriedAndVerified(t *testing.T) {
+	t.Run("long short mode", func(t *testing.T) {
+		trader := newOKXTestServer(t, func(path string) (int, string) {
+			if strings.Contains(path, okxAccountConfigPath) {
+				return 200, `{"code":"0","msg":"","data":[{"posMode":"long_short_mode"}]}`
+			}
+			return 200, `{"code":"0","msg":"","data":[]}`
+		})
+		if err := trader.ValidateCopyGuardPositionMode(); err != nil {
+			t.Fatalf("long/short mode rejected: %v", err)
+		}
+	})
+	t.Run("mode change rejected", func(t *testing.T) {
+		trader := newOKXTestServer(t, func(path string) (int, string) {
+			if strings.Contains(path, okxAccountConfigPath) {
+				return 200, `{"code":"0","msg":"","data":[{"posMode":"net_mode"}]}`
+			}
+			if strings.Contains(path, okxPositionModePath) {
+				return 200, `{"code":"51000","msg":"position mode cannot be changed","data":[]}`
+			}
+			return 200, `{"code":"0","msg":"","data":[]}`
+		})
+		if err := trader.ValidateCopyGuardPositionMode(); err == nil {
+			t.Fatal("unsafe OKX net mode was accepted")
+		}
+	})
+}
+
 func TestGetProtectiveStopErrorClassification(t *testing.T) {
 	t.Run("query failure is not not-found", func(t *testing.T) {
 		trader := newOKXTestServer(t, func(string) (int, string) {

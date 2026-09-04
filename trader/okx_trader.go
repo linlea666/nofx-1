@@ -27,6 +27,7 @@ var okxBaseURL = "https://www.okx.com"
 // OKX API endpoints
 const (
 	okxAccountPath       = "/api/v5/account/balance"
+	okxAccountConfigPath = "/api/v5/account/config"
 	okxPositionPath      = "/api/v5/account/positions"
 	okxOrderPath         = "/api/v5/trade/order"
 	okxLeveragePath      = "/api/v5/account/set-leverage"
@@ -41,6 +42,8 @@ const (
 	okxAmendAlgoPath     = "/api/v5/trade/amend-algos"
 	okxPositionModePath  = "/api/v5/account/set-position-mode"
 	okxFillsHistoryPath  = "/api/v5/trade/fills-history"
+	okxMarkPricePath     = "/api/v5/public/mark-price"
+	okxMarkHistoryPath   = "/api/v5/market/history-mark-price-candles"
 )
 
 // GetPendingOrdersFresh returns both regular and conditional pending orders.
@@ -86,6 +89,112 @@ func (t *OKXTrader) GetPendingOrdersFresh() ([]PendingOrderSnapshot, error) {
 		}
 	}
 	return snapshots, nil
+}
+
+// GetMarkPrice reads the execution venue's dedicated public mark endpoint.
+// It remains available when the account has no live position, which is
+// required to continue a fixed-stop shadow after the real ATR stop exits.
+func (t *OKXTrader) GetMarkPrice(symbol string) (float64, error) {
+	instID := t.convertSymbol(symbol)
+	if strings.TrimSpace(instID) == "" {
+		return 0, fmt.Errorf("empty OKX mark-price instrument")
+	}
+	data, err := t.doRequest("GET", fmt.Sprintf("%s?instType=SWAP&instId=%s", okxMarkPricePath, instID), nil)
+	if err != nil {
+		return 0, fmt.Errorf("query OKX mark price: %w", err)
+	}
+	var rows []struct {
+		InstrumentID string `json:"instId"`
+		MarkPrice    string `json:"markPx"`
+	}
+	if err = json.Unmarshal(data, &rows); err != nil {
+		return 0, fmt.Errorf("parse OKX mark price: %w", err)
+	}
+	for _, row := range rows {
+		if !strings.EqualFold(row.InstrumentID, instID) {
+			continue
+		}
+		price, parseErr := strconv.ParseFloat(row.MarkPrice, 64)
+		if parseErr != nil || price <= 0 || math.IsNaN(price) || math.IsInf(price, 0) {
+			return 0, fmt.Errorf("invalid OKX mark price for %s", instID)
+		}
+		return price, nil
+	}
+	return 0, fmt.Errorf("OKX mark price not found for %s", instID)
+}
+
+// GetMarkPriceHistory returns completed one-minute OKX mark candles for
+// Copy Guard shadow gap repair. OKX pages newest-first, so the result is sorted
+// and de-duplicated before it crosses the adapter boundary.
+func (t *OKXTrader) GetMarkPriceHistory(symbol string, from, to time.Time) ([]MarkPriceCandle, error) {
+	if strings.TrimSpace(symbol) == "" || from.IsZero() || to.IsZero() || !from.Before(to) {
+		return nil, fmt.Errorf("invalid OKX mark-price history range")
+	}
+	cursorEnd := to.UTC()
+	seen := make(map[int64]struct{})
+	result := make([]MarkPriceCandle, 0)
+	for page := 0; cursorEnd.After(from); page++ {
+		if page >= 1000 {
+			return nil, fmt.Errorf("OKX mark-price history exceeded 1000 pages")
+		}
+		path := fmt.Sprintf("%s?instId=%s&bar=1m&after=%d&limit=100", okxMarkHistoryPath, t.convertSymbol(symbol), cursorEnd.UnixMilli())
+		data, err := t.doRequest("GET", path, nil)
+		if err != nil {
+			return nil, fmt.Errorf("query OKX mark-price history: %w", err)
+		}
+		var rows [][]string
+		if err = json.Unmarshal(data, &rows); err != nil {
+			return nil, fmt.Errorf("parse OKX mark-price history: %w", err)
+		}
+		if len(rows) == 0 {
+			break
+		}
+		oldest := cursorEnd
+		for _, row := range rows {
+			if len(row) < 6 {
+				return nil, fmt.Errorf("invalid OKX mark-price candle")
+			}
+			// OKX explicitly labels an unfinished candle with confirm=0. It
+			// cannot repair a historical evidence gap because its high/low may
+			// still change after we persist the checkpoint.
+			if row[5] != "1" {
+				continue
+			}
+			millis, timeErr := strconv.ParseInt(row[0], 10, 64)
+			high, highErr := strconv.ParseFloat(row[2], 64)
+			low, lowErr := strconv.ParseFloat(row[3], 64)
+			closePrice, closeErr := strconv.ParseFloat(row[4], 64)
+			if timeErr != nil || highErr != nil || lowErr != nil || closeErr != nil || high <= 0 || low <= 0 || closePrice <= 0 || low > high {
+				return nil, fmt.Errorf("invalid OKX mark-price candle values")
+			}
+			openAt := time.UnixMilli(millis).UTC()
+			closeAt := openAt.Add(time.Minute)
+			if openAt.Before(oldest) {
+				oldest = openAt
+			}
+			// Include the first candle when the requested resume timestamp lies
+			// inside it. The consumer clamps OpenTime to the exact resume point;
+			// dropping this overlap would manufacture up to 59 seconds of gap on
+			// every restart.
+			if !closeAt.After(from) || closeAt.After(to) {
+				continue
+			}
+			if _, duplicate := seen[millis]; duplicate {
+				continue
+			}
+			seen[millis] = struct{}{}
+			result = append(result, MarkPriceCandle{OpenTime: openAt, CloseTime: closeAt, High: high, Low: low, Close: closePrice})
+		}
+		if !oldest.Before(cursorEnd) {
+			break
+		}
+		cursorEnd = oldest
+		if len(rows) < 100 || !cursorEnd.After(from) {
+			break
+		}
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].OpenTime.Before(result[j].OpenTime) })
+	return result, nil
 }
 
 // GetTradesForSymbol reads immutable OKX fill rows and paginates the complete
@@ -257,7 +366,11 @@ func (t *OKXTrader) PlaceProtectiveStop(req ProtectiveStopRequest) (*ProtectiveS
 		reqJSON, _ := json.Marshal(body)
 		return nil, fmt.Errorf("OKX protective stop rejected: %v (request=%s)", out, reqJSON)
 	}
-	return &ProtectiveStopOrder{AlgoID: out[0].AlgoID, ClientID: out[0].AlgoClOrdID, Symbol: req.Symbol, PositionSide: posSide, MarginMode: mode, Quantity: req.Quantity, TriggerPrice: req.TriggerPrice, TriggerType: req.TriggerType, State: "live"}, nil
+	return &ProtectiveStopOrder{AlgoID: out[0].AlgoID, ClientID: out[0].AlgoClOrdID, Symbol: req.Symbol, PositionSide: posSide, MarginMode: mode, Quantity: req.Quantity, TriggerPrice: req.TriggerPrice, TriggerType: req.TriggerType, CoverageMode: ProtectiveStopCoverageExactQuantity, State: "live"}, nil
+}
+
+func (t *OKXTrader) ProtectiveStopCoverageMode() string {
+	return ProtectiveStopCoverageExactQuantity
 }
 
 func (t *OKXTrader) AmendProtectiveStop(algoID string, req ProtectiveStopRequest) error {
@@ -358,7 +471,7 @@ func (t *OKXTrader) getProtectiveStopFromPaths(paths []string, symbol string, no
 				return nil, fmt.Errorf("resolve OKX protective quantity: %w", quantityErr)
 			}
 			px, _ := strconv.ParseFloat(rows[0].SlTriggerPx, 64)
-			return &ProtectiveStopOrder{AlgoID: rows[0].AlgoID, ClientID: rows[0].AlgoClOrdID, Symbol: symbol, PositionSide: rows[0].PosSide, MarginMode: rows[0].TdMode, Quantity: q, TriggerPrice: px, TriggerType: rows[0].SlTriggerPxType, State: rows[0].State, ActualOrderID: rows[0].OrdID}, nil
+			return &ProtectiveStopOrder{AlgoID: rows[0].AlgoID, ClientID: rows[0].AlgoClOrdID, Symbol: symbol, PositionSide: rows[0].PosSide, MarginMode: rows[0].TdMode, Quantity: q, TriggerPrice: px, TriggerType: rows[0].SlTriggerPxType, CoverageMode: ProtectiveStopCoverageExactQuantity, State: rows[0].State, ActualOrderID: rows[0].OrdID}, nil
 		}
 	}
 	if lastQueryErr != nil {
@@ -554,6 +667,46 @@ func (t *OKXTrader) setPositionMode() error {
 	}
 
 	logger.Infof("  ✓ OKX account switched to dual position mode")
+	return nil
+}
+
+// ValidateCopyGuardPositionMode verifies that OKX actually operates in
+// long_short_mode. A best-effort constructor call is insufficient because OKX
+// can reject a mode switch while positions or orders exist.
+func (t *OKXTrader) ValidateCopyGuardPositionMode() error {
+	readMode := func() (string, error) {
+		data, err := t.doRequest("GET", okxAccountConfigPath, nil)
+		if err != nil {
+			return "", err
+		}
+		var configs []struct {
+			PositionMode string `json:"posMode"`
+		}
+		if err = json.Unmarshal(data, &configs); err != nil {
+			return "", fmt.Errorf("parse OKX account configuration: %w", err)
+		}
+		if len(configs) == 0 {
+			return "", fmt.Errorf("OKX account configuration is empty")
+		}
+		return configs[0].PositionMode, nil
+	}
+	mode, err := readMode()
+	if err != nil {
+		return fmt.Errorf("query OKX position mode: %w", err)
+	}
+	if mode == "long_short_mode" {
+		return nil
+	}
+	if err = t.setPositionMode(); err != nil {
+		return fmt.Errorf("set OKX long/short mode: %w", err)
+	}
+	mode, err = readMode()
+	if err != nil {
+		return fmt.Errorf("verify OKX long/short mode: %w", err)
+	}
+	if mode != "long_short_mode" {
+		return fmt.Errorf("OKX account position mode is %q after mode change, want long_short_mode", mode)
+	}
 	return nil
 }
 

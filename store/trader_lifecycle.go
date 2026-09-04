@@ -205,9 +205,11 @@ func (s *TraderStore) completeStart(userID, traderID string, generation int64, e
 			WHERE t.exchange_id=? AND t.id<>?
 			  AND t.lifecycle_status='RUNNING' AND t.is_running=1
 			  AND (? OR (
-				p.trader_id IS NOT NULL AND c.enabled=1
-				AND COALESCE(c.risk_stop_loss_enabled,1)=1
-				AND c.provider_type IN ('okx','binance')
+				(p.trader_id IS NOT NULL AND c.enabled=1
+				 AND COALESCE(c.risk_stop_loss_enabled,1)=1
+				 AND c.provider_type IN ('okx','binance'))
+				OR EXISTS (SELECT 1 FROM copy_guard_cycles active_cycle
+					WHERE active_cycle.trader_id=t.id AND active_cycle.closed_at IS NULL)
 			  ))
 			ORDER BY t.id LIMIT 1`, exchangeID, traderID, copyGuardExclusive).Scan(&conflict)
 		if err != nil && err != sql.ErrNoRows {

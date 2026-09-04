@@ -89,8 +89,11 @@ func TestBuildDataPackGuardLayerWithMarketUnavailable(t *testing.T) {
 	if _, ok := g.Policy["other_field"]; ok {
 		t.Fatal("policy should not contain unrelated fields")
 	}
-	if g.Policy["min_trade_warn"] == nil || g.Policy["risk_reentry_max_chase_atr"] == nil {
+	if g.Policy["risk_reentry_max_chase_atr"] == nil {
 		t.Fatalf("policy missing risk fields: %+v", g.Policy)
+	}
+	if _, ok := g.Policy["min_trade_warn"]; ok {
+		t.Fatalf("ordinary copy settings must not survive lifecycle policy sanitization: %+v", g.Policy)
 	}
 	// 空单：当前价 3336 低于止损价 3360 → 沿方向恢复为正
 	if g.LastStop == nil || g.LastStop.Price != 3360 || g.LastStop.DistanceFromCurrentATR <= 0 {

@@ -864,6 +864,66 @@ func (at *AutoTrader) GetMarketPrice(symbol string) (float64, error) {
 	return at.trader.GetMarketPrice(symbol)
 }
 
+// GetMarkPrice exposes an authoritative mark-price path for Copy Guard. Use a
+// venue-specific implementation when available; otherwise force an uncached
+// position refresh and read the exchange-provided markPrice field. It never
+// falls back to the last traded price.
+func (at *AutoTrader) GetMarkPrice(symbol string) (float64, error) {
+	var providerErr error
+	if provider, ok := at.trader.(MarkPriceProvider); ok {
+		price, err := provider.GetMarkPrice(symbol)
+		if err == nil && price > 0 && !math.IsNaN(price) && !math.IsInf(price, 0) {
+			return price, nil
+		}
+		if err != nil {
+			providerErr = err
+		} else {
+			providerErr = fmt.Errorf("dedicated mark-price endpoint returned an invalid value")
+		}
+	}
+	positions, err := at.GetPositionsFresh()
+	if err != nil {
+		if providerErr != nil {
+			return 0, fmt.Errorf("mark-price endpoint failed (%v); load fresh positions for mark price: %w", providerErr, err)
+		}
+		return 0, fmt.Errorf("load fresh positions for mark price: %w", err)
+	}
+	for _, position := range positions {
+		positionSymbol, _ := position["symbol"].(string)
+		if !strings.EqualFold(positionSymbol, symbol) {
+			continue
+		}
+		var price float64
+		switch value := position["markPrice"].(type) {
+		case float64:
+			price = value
+		case float32:
+			price = float64(value)
+		case int:
+			price = float64(value)
+		case int64:
+			price = float64(value)
+		case string:
+			price, _ = strconv.ParseFloat(value, 64)
+		}
+		if price > 0 && !math.IsNaN(price) && !math.IsInf(price, 0) {
+			return price, nil
+		}
+	}
+	if providerErr != nil {
+		return 0, fmt.Errorf("authoritative mark price unavailable for %s after endpoint failure: %w", symbol, providerErr)
+	}
+	return 0, fmt.Errorf("authoritative mark price unavailable for %s", symbol)
+}
+
+func (at *AutoTrader) GetMarkPriceHistory(symbol string, from, to time.Time) ([]MarkPriceCandle, error) {
+	provider, ok := at.trader.(MarkPriceHistoryProvider)
+	if !ok {
+		return nil, fmt.Errorf("exchange does not support mark-price history")
+	}
+	return provider.GetMarkPriceHistory(symbol, from, to)
+}
+
 // SupportsProtectiveStops reports whether the underlying exchange trader can
 // place exchange-managed protective stops (Copy Guard). It inspects the
 // concrete trader rather than the AutoTrader wrapper: AutoTrader always
@@ -874,6 +934,15 @@ func (at *AutoTrader) GetMarketPrice(symbol string) (float64, error) {
 func (at *AutoTrader) SupportsProtectiveStops() bool {
 	_, ok := at.trader.(ProtectiveStopManager)
 	return ok
+}
+
+func (at *AutoTrader) ProtectiveStopCoverageMode() string {
+	if provider, ok := at.trader.(ProtectiveStopCoverageModeProvider); ok {
+		if mode := provider.ProtectiveStopCoverageMode(); mode != "" {
+			return mode
+		}
+	}
+	return ProtectiveStopCoverageExactQuantity
 }
 
 func (at *AutoTrader) ValidateCopyGuardCapabilities() error {
@@ -898,6 +967,14 @@ func (at *AutoTrader) ValidateCopyGuardCapabilities() error {
 		return fmt.Errorf("execution exchange does not support precise closed PnL reconciliation")
 	}
 	return nil
+}
+
+func (at *AutoTrader) ValidateCopyGuardPositionMode() error {
+	validator, ok := at.trader.(CopyGuardPositionModeValidator)
+	if !ok {
+		return fmt.Errorf("execution exchange cannot verify its live Copy Guard position mode")
+	}
+	return validator.ValidateCopyGuardPositionMode()
 }
 
 func implementsTraderCapability[T any](value interface{}) bool {
@@ -942,7 +1019,7 @@ func (at *AutoTrader) EnsureProtectiveStop(existing *ProtectiveStopOrder, req Pr
 	if err := mgr.AmendProtectiveStop(existing.AlgoID, req); err != nil {
 		return nil, err
 	}
-	return &ProtectiveStopEnsureResult{Current: &ProtectiveStopOrder{AlgoID: existing.AlgoID, ClientID: existing.ClientID, Symbol: req.Symbol, PositionSide: req.PositionSide, MarginMode: req.MarginMode, Quantity: req.Quantity, TriggerPrice: req.TriggerPrice, TriggerType: req.TriggerType, State: "live"}}, nil
+	return &ProtectiveStopEnsureResult{Current: &ProtectiveStopOrder{AlgoID: existing.AlgoID, ClientID: existing.ClientID, Symbol: req.Symbol, PositionSide: req.PositionSide, MarginMode: req.MarginMode, Quantity: req.Quantity, TriggerPrice: req.TriggerPrice, TriggerType: req.TriggerType, CoverageMode: req.CoverageMode, State: "live"}}, nil
 }
 func (at *AutoTrader) GetProtectiveStop(algoID, symbol string) (*ProtectiveStopOrder, error) {
 	mgr, ok := at.trader.(ProtectiveStopManager)

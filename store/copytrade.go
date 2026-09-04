@@ -58,6 +58,9 @@ type CopyTradeConfig struct {
 	// selected per trader and snapshots into each new Copy Guard lifecycle.
 	RiskProtectionMode        string  `json:"risk_protection_mode"`
 	RiskPositionMarginStopPct float64 `json:"risk_position_margin_stop_pct"`
+	// RiskATRProfile is stored inside copy_guard_policies. It is dormant while
+	// fixed mode is active and restored atomically when switching back to ATR.
+	RiskATRProfile *CopyGuardATRProfile `json:"atr_profile,omitempty"`
 	// RiskStopMaxAccountLossPct is a per-trader override for the account-level
 	// position stop. Zero means inherit the follower exchange-account policy
 	// (default 10%). It is deliberately separate from RiskAccountPct, which is
@@ -356,6 +359,76 @@ func NewCopyGuardDefaults() *CopyTradeConfig {
 	return c
 }
 
+func copyGuardATRProfileFromConfig(c *CopyTradeConfig) *CopyGuardATRProfile {
+	if c == nil {
+		c = NewCopyGuardDefaults()
+	}
+	return &CopyGuardATRProfile{
+		TriggerPriceType:     c.RiskTriggerPriceType,
+		ReentryEnabled:       c.RiskReentryEnabled,
+		ReentryDecisionMode:  c.RiskReentryDecisionMode,
+		ManualReentryEnabled: c.RiskManualReentryEnabled,
+		MaxReentries:         c.RiskMaxReentries,
+	}
+}
+
+// NormalizeCopyGuardProtectionModeTransition is the single persistence
+// boundary for ATR <-> fixed mode changes. Fixed mode owns only its effective
+// safety settings; the prior ATR/reentry contract is stored separately and can
+// therefore be restored without trusting browser state.
+//
+// The return value reports that a historical fixed row had no dormant profile
+// and was repaired with the project's current ATR defaults.
+func NormalizeCopyGuardProtectionModeTransition(current, previous *CopyTradeConfig) (profileDefaulted bool) {
+	if current == nil {
+		return false
+	}
+	current.FillRiskDefaults()
+	currentMode := current.RiskProtectionMode
+	previousMode := RiskProtectionModeATRStructure
+	if previous != nil {
+		previousMode = previous.RiskProtectionMode
+		if previousMode == "" {
+			previousMode = RiskProtectionModeATRStructure
+		}
+	}
+
+	if currentMode == RiskProtectionModePositionMarginPct {
+		switch {
+		case previous != nil && previousMode != RiskProtectionModePositionMarginPct:
+			current.RiskATRProfile = copyGuardATRProfileFromConfig(previous)
+		case previous != nil && previous.RiskATRProfile != nil:
+			current.RiskATRProfile = cloneCopyGuardATRProfile(previous.RiskATRProfile)
+		case current.RiskATRProfile != nil:
+			current.RiskATRProfile = cloneCopyGuardATRProfile(current.RiskATRProfile)
+		default:
+			current.RiskATRProfile = copyGuardATRProfileFromConfig(NewCopyGuardDefaults())
+			profileDefaulted = previous != nil
+		}
+		current.RiskTriggerPriceType = "mark"
+		current.RiskReentryEnabled = false
+		current.RiskReentryDecisionMode = "disabled"
+		current.RiskManualReentryEnabled = false
+		current.RiskMaxReentries = 0
+		return profileDefaulted
+	}
+
+	if previous != nil && previousMode == RiskProtectionModePositionMarginPct {
+		profile := previous.RiskATRProfile
+		if profile == nil {
+			profile = copyGuardATRProfileFromConfig(NewCopyGuardDefaults())
+			profileDefaulted = true
+		}
+		current.RiskATRProfile = cloneCopyGuardATRProfile(profile)
+		current.RiskTriggerPriceType = profile.TriggerPriceType
+		current.RiskReentryEnabled = profile.ReentryEnabled
+		current.RiskReentryDecisionMode = profile.ReentryDecisionMode
+		current.RiskManualReentryEnabled = profile.ManualReentryEnabled
+		current.RiskMaxReentries = profile.MaxReentries
+	}
+	return profileDefaulted
+}
+
 // upgradeLegacyRiskPolicy v5：v3 旧止损策略已下线。存量 Copy Guard 数据源
 // （OKX / Binance，与 copytrade.SupportsCopyGuard 对齐；store 不能反向依赖
 // copytrade 包，故此处内联集合）+ 启用止损但仍是 v3（version<4）的配置在
@@ -550,8 +623,20 @@ func (s *CopyTradeStore) Update(config *CopyTradeConfig) error {
 	return tx.Commit()
 }
 
-// Upsert 创建或更新跟单配置
+// Upsert 创建或更新跟单配置。
 func (s *CopyTradeStore) Upsert(config *CopyTradeConfig) error {
+	return s.upsert(config, false)
+}
+
+// UpsertWithATRProfileDefaultMigration atomically persists a repaired dormant
+// ATR profile and its audit event. The explicit boolean keeps ordinary config
+// writes unchanged while preventing an API-level best-effort log from drifting
+// away from the policy transaction.
+func (s *CopyTradeStore) UpsertWithATRProfileDefaultMigration(config *CopyTradeConfig, profileDefaulted bool) error {
+	return s.upsert(config, profileDefaulted)
+}
+
+func (s *CopyTradeStore) upsert(config *CopyTradeConfig, profileDefaulted bool) error {
 	config.FillRiskDefaults()
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -609,6 +694,11 @@ func (s *CopyTradeStore) Upsert(config *CopyTradeConfig) error {
 	}
 	if err = saveCopyGuardPolicyWithExecutor(tx, config); err != nil {
 		return err
+	}
+	if profileDefaulted {
+		if err = logCopyGuardATRProfileDefaultedWithExecutor(tx, config); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }

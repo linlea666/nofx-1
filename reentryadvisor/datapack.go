@@ -1052,20 +1052,12 @@ func roundSig(v float64) float64 {
 	return round(v, digits)
 }
 
-// extractRiskPolicy 从周期 policy_snapshot 提取 risk_* 与 min_trade_warn 字段
+// extractRiskPolicy exposes the canonical lifecycle policy through the legacy
+// risk_* diagnostic keys. Ordinary copy fields and credentials are never copied.
 func extractRiskPolicy(snapshot string) map[string]interface{} {
-	out := map[string]interface{}{}
-	if snapshot == "" {
-		return out
-	}
-	var full map[string]interface{}
-	if err := json.Unmarshal([]byte(snapshot), &full); err != nil {
-		return out
-	}
-	for k, v := range full {
-		if strings.HasPrefix(k, "risk_") || k == "min_trade_warn" || k == "copy_ratio" {
-			out[k] = v
-		}
+	out, err := store.CopyGuardPolicyRuntimeRiskMap(snapshot)
+	if err != nil {
+		return map[string]interface{}{}
 	}
 	return out
 }

@@ -672,6 +672,10 @@ func TestBinanceCalculateFallbackOnDetailListFailure(t *testing.T) {
 	e.config.LeaderID = "any-id"
 	e.config.CopyRatio = 1.2
 	e.provider = bp
+	// This test exercises only the fail-closed sizing result. Detach the store
+	// so the expected credential error cannot enqueue a process-global incident
+	// worker that outlives the test's temporary database cleanup.
+	e.store = nil
 	e.leaderState = &AccountState{TotalEquity: 3493.16, Positions: map[string]*Position{}}
 
 	signal := &TradeSignal{

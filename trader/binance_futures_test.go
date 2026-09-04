@@ -296,6 +296,43 @@ func NewBinanceFuturesTestSuite(t *testing.T) *BinanceFuturesTestSuite {
 	}
 }
 
+func TestBinanceMarkPriceHistoryUsesAuthoritativeMarkKlines(t *testing.T) {
+	start := time.UnixMilli(1700000000000).UTC()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/fapi/v1/markPriceKlines" || r.URL.Query().Get("symbol") != "BTCUSDT" ||
+			r.URL.Query().Get("interval") != "1m" || r.URL.Query().Get("startTime") == "" || r.URL.Query().Get("endTime") == "" {
+			t.Fatalf("unexpected Binance mark-history request: %s", r.URL.String())
+		}
+		_, _ = w.Write([]byte(fmt.Sprintf(`[[%d,"100","102","99","101","0",%d,"0",0,"0","0"]]`, start.UnixMilli(), start.Add(time.Minute-time.Millisecond).UnixMilli())))
+	}))
+	defer server.Close()
+	client := futures.NewClient("", "")
+	client.BaseURL = server.URL
+	rows, err := (&FuturesTrader{client: client}).GetMarkPriceHistory("btcusdt", start, start.Add(2*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Low != 99 || rows[0].High != 102 || rows[0].Close != 101 || !rows[0].OpenTime.Equal(start) {
+		t.Fatalf("unexpected Binance mark candles: %+v", rows)
+	}
+}
+
+func TestBinanceGetMarkPriceUsesPremiumIndexWithoutPosition(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/fapi/v1/premiumIndex" || r.URL.Query().Get("symbol") != "BTCUSDT" {
+			t.Fatalf("unexpected Binance mark-price request: %s", r.URL.String())
+		}
+		_, _ = w.Write([]byte(`{"symbol":"BTCUSDT","markPrice":"61234.50","indexPrice":"61230","estimatedSettlePrice":"0","lastFundingRate":"0","nextFundingTime":0,"interestRate":"0","time":1}`))
+	}))
+	defer server.Close()
+	client := futures.NewClient("", "")
+	client.BaseURL = server.URL
+	price, err := (&FuturesTrader{client: client}).GetMarkPrice("btcusdt")
+	if err != nil || price != 61234.5 {
+		t.Fatalf("unexpected Binance mark price %.8f err=%v", price, err)
+	}
+}
+
 // Cleanup cleans up resources
 func (s *BinanceFuturesTestSuite) Cleanup() {
 	if s.mockServer != nil {
@@ -311,6 +348,37 @@ func (s *BinanceFuturesTestSuite) Cleanup() {
 // TestFuturesTrader_InterfaceCompliance tests interface compliance
 func TestFuturesTrader_InterfaceCompliance(t *testing.T) {
 	var _ Trader = (*FuturesTrader)(nil)
+	var _ CopyGuardPositionModeValidator = (*FuturesTrader)(nil)
+}
+
+func TestBinanceCopyGuardPositionModeIsQueriedAndVerified(t *testing.T) {
+	for _, testCase := range []struct {
+		name     string
+		dualSide bool
+		wantErr  bool
+	}{
+		{name: "hedge mode", dualSide: true},
+		{name: "mode change did not take effect", dualSide: false, wantErr: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if r.Method == http.MethodGet && r.URL.Path == "/fapi/v1/positionSide/dual" {
+					_ = json.NewEncoder(w).Encode(map[string]interface{}{"dualSidePosition": testCase.dualSide})
+					return
+				}
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{"code": 200, "msg": "success"})
+			}))
+			defer server.Close()
+			client := futures.NewClient("key", "secret")
+			client.BaseURL = server.URL
+			trader := &FuturesTrader{client: client}
+			err := trader.ValidateCopyGuardPositionMode()
+			if (err != nil) != testCase.wantErr {
+				t.Fatalf("ValidateCopyGuardPositionMode() error=%v wantErr=%v", err, testCase.wantErr)
+			}
+		})
+	}
 }
 
 // TestFuturesTrader_CommonInterface runs all common interface tests using test suite

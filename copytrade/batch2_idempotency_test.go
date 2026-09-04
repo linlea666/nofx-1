@@ -234,6 +234,7 @@ func TestStopPartialEscalatesToUnprotectableAfterRetriesExhausted(t *testing.T) 
 	// finalizes the already-triggered protective stop.
 	executor.positions = nil
 	ti.pollV4ProtectiveStops()
+	ti.reconcilePositionMarginStopPendingExits()
 	got, err := st.CopyTrade().GetCopyGuardCycle(cycle.ID)
 	if err != nil {
 		t.Fatal(err)

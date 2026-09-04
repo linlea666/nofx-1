@@ -415,6 +415,8 @@ export function TraderConfigModal({
   })
   const [isSaving, setIsSaving] = useState(false)
   const [loadedLegacyReentry, setLoadedLegacyReentry] = useState(false)
+  const [dormantATRProfile, setDormantATRProfile] =
+    useState<CopyTradeConfig['atr_profile']>()
   const [strategies, setStrategies] = useState<Strategy[]>([])
   const [isFetchingBalance, setIsFetchingBalance] = useState(false)
   const [balanceFetchError, setBalanceFetchError] = useState<string>('')
@@ -487,6 +489,7 @@ export function TraderConfigModal({
     const fetchCopyTradeConfig = async () => {
       if (!isEditMode || !traderData?.trader_id) return
       setLoadedLegacyReentry(false)
+      setDormantATRProfile(undefined)
       setSourceHealth(null)
       try {
         const result = await httpClient.get<CopyTradeConfigResponse>(
@@ -495,8 +498,19 @@ export function TraderConfigModal({
         if (result.success && result.data?.config) {
           const cfg = result.data.config
           setSourceHealth(result.data.source_health ?? null)
+          setDormantATRProfile(
+            cfg.atr_profile ?? {
+              trigger_price_type: cfg.risk_trigger_price_type ?? 'mark',
+              reentry_enabled: cfg.risk_reentry_enabled ?? true,
+              reentry_decision_mode:
+                cfg.risk_reentry_decision_mode ?? 'ai_guarded',
+              manual_reentry_enabled: false,
+              max_reentries: cfg.risk_max_reentries ?? 2,
+            }
+          )
           setLoadedLegacyReentry(
-            cfg.risk_reentry_decision_mode === 'legacy_rule'
+            cfg.risk_reentry_decision_mode === 'legacy_rule' ||
+              cfg.atr_profile?.reentry_decision_mode === 'legacy_rule'
           )
           // 只加载跟单参数，decision_mode 由 traderData 决定
           // 风控字段：后端用比例（如 0.02=2%）存，前端用百分比展示，× 100 转换
@@ -606,6 +620,7 @@ export function TraderConfigModal({
       } catch (error) {
         // 没有跟单配置，保持当前状态
         setLoadedLegacyReentry(false)
+        setDormantATRProfile(undefined)
         setSourceHealth(null)
         console.log('No copy trade config found')
       }
@@ -627,6 +642,16 @@ export function TraderConfigModal({
       .then((result) => {
         const cfg = result.data?.defaults
         if (!result.success || !cfg || cancelled) return
+        setDormantATRProfile(
+          cfg.atr_profile ?? {
+            trigger_price_type: cfg.risk_trigger_price_type ?? 'mark',
+            reentry_enabled: cfg.risk_reentry_enabled ?? true,
+            reentry_decision_mode:
+              cfg.risk_reentry_decision_mode ?? 'ai_guarded',
+            manual_reentry_enabled: false,
+            max_reentries: cfg.risk_max_reentries ?? 2,
+          }
+        )
         setFormData((prev) => ({
           ...prev,
           risk_stop_loss_enabled: cfg.risk_stop_loss_enabled ?? true,
@@ -692,6 +717,13 @@ export function TraderConfigModal({
       }))
     } else if (!isEditMode) {
       setLoadedLegacyReentry(false)
+      setDormantATRProfile({
+        trigger_price_type: 'mark',
+        reentry_enabled: true,
+        reentry_decision_mode: 'ai_guarded',
+        manual_reentry_enabled: false,
+        max_reentries: 2,
+      })
       setSourceHealth(null)
       setFormData({
         trader_name: '',
@@ -1923,7 +1955,7 @@ export function TraderConfigModal({
                             启用账户保护止损
                           </label>
                           <p className="text-xs text-[#848E9C]">
-                            开仓时自动挂交易所托管的硬止损单，防止极端反向走势打穿账户
+                            只影响下一次全新开仓；已有周期继续沿用其固化策略、保护单和退出合同
                           </p>
                         </div>
                         <button
@@ -1966,7 +1998,19 @@ export function TraderConfigModal({
                                         risk_manual_reentry_enabled: false,
                                         risk_max_reentries: 0,
                                       }
-                                    : {}),
+                                    : dormantATRProfile
+                                      ? {
+                                          risk_trigger_price_type:
+                                            dormantATRProfile.trigger_price_type,
+                                          risk_reentry_enabled:
+                                            dormantATRProfile.reentry_enabled,
+                                          risk_reentry_decision_mode:
+                                            dormantATRProfile.reentry_decision_mode,
+                                          risk_manual_reentry_enabled: false,
+                                          risk_max_reentries:
+                                            dormantATRProfile.max_reentries,
+                                        }
+                                      : {}),
                                 }))
                               }}
                               className="mt-1 w-full px-2 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF]"
@@ -2037,6 +2081,17 @@ export function TraderConfigModal({
                                   AI、自动和人工二次进场。费用、资金费、滑点与跳空不进入
                                   配置比例公式，实际成交损失可能更高。
                                 </p>
+                                {dormantATRProfile && (
+                                  <p className="text-[#EAECEF]">
+                                    休眠 ATR 配置已由后端保存：触发价{' '}
+                                    {dormantATRProfile.trigger_price_type}，重入{' '}
+                                    {dormantATRProfile.reentry_enabled
+                                      ? `${dormantATRProfile.reentry_decision_mode} / 最多 ${dormantATRProfile.max_reentries} 次`
+                                      : '关闭'}
+                                    ；切回 ATR
+                                    时将从该配置恢复，不依赖本页面缓存。
+                                  </p>
+                                )}
                               </div>
                             </div>
                           )}

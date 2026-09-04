@@ -92,6 +92,14 @@ type Engine struct {
 	// 设计：buffered channel，写入失败时 select-default 降级（丢事件不阻塞主流程）
 	// 容量 32：考虑极端情况下批量 SL 触发，3 秒 poll 周期内 32 个告警足够
 	riskEventCh chan *RiskEvent
+	// Installed by TraderIntegration so a trusted trigger closes the in-memory
+	// order gate before its atomic database transition. Standalone engine users
+	// fall back to the same store transaction directly.
+	copyGuardRiskExitBegin func(store.CopyGuardRiskExitBegin) error
+	// Installed by TraderIntegration so lifecycle closure first flushes the
+	// current minute's in-memory mark extrema. Standalone engine users retain a
+	// store-only fallback for deterministic tests and non-integrated callers.
+	copyGuardShadowFinalize func(int64, float64) error
 
 	// 预警日志
 	warnings   []Warning
@@ -285,6 +293,24 @@ func (e *Engine) GetDecisionChannel() <-chan *decision.FullDecision {
 // 由 integration 层消费，转发为邮件告警
 func (e *Engine) GetRiskEventChannel() <-chan *RiskEvent {
 	return e.riskEventCh
+}
+
+func (e *Engine) SetCopyGuardRiskExitBegin(fn func(store.CopyGuardRiskExitBegin) error) {
+	e.copyGuardRiskExitBegin = fn
+}
+
+func (e *Engine) SetCopyGuardShadowFinalize(fn func(int64, float64) error) {
+	e.copyGuardShadowFinalize = fn
+}
+
+func (e *Engine) finalizeCopyGuardPositionMarginShadow(cycleID int64, closePrice float64) error {
+	if e.copyGuardShadowFinalize != nil {
+		return e.copyGuardShadowFinalize(cycleID, closePrice)
+	}
+	if e.store == nil {
+		return fmt.Errorf("copy guard store is unavailable")
+	}
+	return e.store.CopyTrade().FinalizeCopyGuardPositionMarginShadow(cycleID, closePrice)
 }
 
 // emitRiskEvent 推送风控事件（非阻塞）
@@ -3172,7 +3198,7 @@ func (e *Engine) closeCopyGuardCycleAtLeaderExit(mapping *store.CopyTradePositio
 	// The observation summary must be persisted before CloseCopyGuardCycle
 	// invalidates all still-open evaluation state.
 	emitWatchSummary(e.store.CopyTrade(), e.traderID, cycle, closePrice)
-	if shadowErr := e.store.CopyTrade().FinalizeCopyGuardPositionMarginShadow(cycle.ID, closePrice); shadowErr != nil {
+	if shadowErr := e.finalizeCopyGuardPositionMarginShadow(cycle.ID, closePrice); shadowErr != nil {
 		logger.Warnf("⚠️ [%s] 80%% 影子评测闭合失败: %v | cycle=%d", e.traderID, shadowErr, cycle.ID)
 	}
 	// CloseCopyGuardCycle may synchronously emit the final reconciled summary.

@@ -70,7 +70,14 @@ func TestSmartMoneyCredentialGateRestoresCadenceAfterCompleteSnapshots(t *testin
 }
 
 func TestClassicBinanceSourceRequestsUseCredentialScoped429Gate(t *testing.T) {
-	p := NewBinanceProvider("classic-gate-p20t", "csrf")
+	const credential = "classic-gate-p20t"
+	key := smartMoneyCredentialKey(credential)
+	// The production gate is intentionally process-global. Tests must remove
+	// their credential-scoped entry before and after use or a repeated/full
+	// suite can inherit this test's 60-second 429 backoff.
+	smartMoneyCredentialGates.Delete(key)
+	t.Cleanup(func() { smartMoneyCredentialGates.Delete(key) })
+	p := NewBinanceProvider(credential, "csrf")
 	calls := 0
 	p.client.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
 		calls++

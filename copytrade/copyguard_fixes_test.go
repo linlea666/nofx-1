@@ -474,7 +474,7 @@ func TestMatchLeaderHistoryRecord(t *testing.T) {
 func TestProtectiveVerificationWaitsForAcknowledgedTargetToSettle(t *testing.T) {
 	mgr := &settlingStopMgr{}
 	ti := &TraderIntegration{}
-	got, err := ti.verifyProtectiveStopWithGrace(mgr, "algo", "ETHUSDT", "long", "cross", 1, 97, 0.1, 0.1)
+	got, err := ti.verifyProtectiveStopWithGrace(mgr, "algo", "ETHUSDT", "long", "cross", 1, 97, 0.1, 0.1, trader.ProtectiveStopCoverageExactQuantity)
 	if err != nil {
 		t.Fatal(err)
 	}

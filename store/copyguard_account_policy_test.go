@@ -48,3 +48,58 @@ func TestCopyGuardAccountPolicyDefaultAndTraderOverride(t *testing.T) {
 		t.Fatal("policy above 30% must be rejected")
 	}
 }
+
+func TestCopyGuardLifecycleSnapshotFreezesInheritedAccountPolicy(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "lifecycle-policy.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	exchangeID, err := st.Exchange().Create(
+		"user-1", "okx", "main", true, "", "", "", false,
+		"", "", "", "", "", "", "", 0,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = st.Trader().Create(&Trader{
+		ID: "trader-1", UserID: "user-1", Name: "copy", AIModelID: "ai",
+		ExchangeID: exchangeID, InitialBalance: 100,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err = st.CopyTrade().UpsertCopyGuardAccountPolicy(exchangeID, 0.20); err != nil {
+		t.Fatal(err)
+	}
+
+	config := NewCopyGuardDefaults()
+	config.TraderID = "trader-1"
+	config.RiskStopMaxAccountLossPct = 0
+	snapshot, err := st.CopyTrade().EncodeCopyGuardLifecyclePolicySnapshot(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, err := DecodeCopyGuardPolicySnapshot(snapshot)
+	if err != nil || policy.StopMaxAccountLossPct != 0.20 {
+		t.Fatalf("inherited policy was not frozen: policy=%+v err=%v", policy, err)
+	}
+
+	if err = st.CopyTrade().UpsertCopyGuardAccountPolicy(exchangeID, 0.10); err != nil {
+		t.Fatal(err)
+	}
+	policy, err = DecodeCopyGuardPolicySnapshot(snapshot)
+	if err != nil || policy.StopMaxAccountLossPct != 0.20 {
+		t.Fatalf("existing lifecycle leaked a later account-policy change: policy=%+v err=%v", policy, err)
+	}
+
+	config.RiskProtectionMode = RiskProtectionModePositionMarginPct
+	fixedSnapshot, err := st.CopyTrade().EncodeCopyGuardLifecyclePolicySnapshot(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixedPolicy, err := DecodeCopyGuardPolicySnapshot(fixedSnapshot)
+	if err != nil || fixedPolicy.StopMaxAccountLossPct != 0 {
+		t.Fatalf("fixed mode unexpectedly consumed the account stop: policy=%+v err=%v", fixedPolicy, err)
+	}
+}

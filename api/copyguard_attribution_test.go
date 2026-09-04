@@ -1,6 +1,9 @@
 package api
 
 import (
+	"encoding/json"
+	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -33,5 +36,111 @@ func TestBuildCopyGuardAttributionSeparatesAttempts(t *testing.T) {
 	got = buildCopyGuardAttribution(cycle, attempts, events)
 	if got.Final || got.StopSavings != 0 || got.MissedProfit != 0 {
 		t.Fatalf("unreconciled cycle must not produce final conclusions: %+v", got)
+	}
+}
+
+func TestPositionMarginAuditUsesBackendFormulaAndSanitizedPolicy(t *testing.T) {
+	now := time.Now().UTC()
+	cfg := store.NewCopyGuardDefaults()
+	cfg.RiskProtectionMode = store.RiskProtectionModePositionMarginPct
+	cfg.RiskPositionMarginStopPct = .8
+	cfg.RiskTriggerPriceType = "mark"
+	cfg.RiskReentryEnabled = false
+	cfg.RiskReentryDecisionMode = "disabled"
+	cfg.RiskMaxReentries = 0
+	snapshot, err := store.EncodeCopyGuardPolicySnapshot(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cycle := &store.CopyGuardCycle{
+		ID: 7, Side: "long", PolicySnapshot: snapshot, AccountEquity: 1000,
+		LastObservedPrice: 101, ProtectionCoverage: 1,
+		ProtectionStatus: store.CopyGuardProtectionClamped,
+		AccountingStatus: store.CopyGuardAccountingOpen, UpdatedAt: now,
+	}
+	artifacts := &copyGuardCycleArtifacts{
+		Attempts: []*store.CopyGuardAttempt{{
+			AttemptNo: 0, EntryPrice: 100, Quantity: 2, ActualLeverage: 10, ATR: 2,
+			CurrentMarkPrice: 101, CurrentMarkAt: &now,
+			StopAnchorEntryPrice: 100, StopAnchorLeverage: 20,
+			StopAnchorInitialMargin: 5, StopAnchorPrice: 96,
+			StopConfiguredMarginLossPct: .8, FinalStopPrice: 97,
+			StopAnchorSource: store.CopyGuardAnchorSourceInitialFill,
+			GovernedBy:       "position_margin_liquidation_clamp",
+		}},
+		Protection: &store.CopyGuardProtectiveOrder{
+			AlgoID: "hosted-1", TriggerType: "mark", TriggerPrice: 97,
+			CoverageMode: store.CopyGuardCoverageCloseAll, Status: "live", UpdatedAt: now,
+		},
+	}
+	audit := buildPositionMarginAudit(cycle, artifacts)
+	if audit == nil {
+		t.Fatal("fixed cycle did not produce position-margin audit")
+	}
+	for label, gotWant := range map[string][2]float64{
+		"raw stop":         {audit.RawFormulaStopPrice, 96},
+		"anchor risk":      {audit.StopAnchorTheoreticalRiskUSD, 4},
+		"current margin":   {audit.CurrentMargin, 20},
+		"current risk":     {audit.CurrentStopRiskUSD, 6},
+		"current margin %": {audit.CurrentMarginLossPct, .3},
+		"account loss %":   {audit.CurrentAccountLossPct, .006},
+		"price move %":     {audit.EquivalentPriceMovePct, .03},
+		"ATR distance":     {audit.DistanceATR, 1.5},
+		"execution mark":   {audit.LastMarkPrice, 101},
+	} {
+		if math.Abs(gotWant[0]-gotWant[1]) > 1e-12 {
+			t.Fatalf("%s=%v want %v", label, gotWant[0], gotWant[1])
+		}
+	}
+	if audit.DataQuality != "VERIFIED" || !audit.LiquidationClamped || audit.CoverageMode != store.CopyGuardCoverageCloseAll || !audit.CostsExcludedFromTrigger {
+		t.Fatalf("audit semantics lost: %+v", audit)
+	}
+
+	doc := copyGuardCycleDocument(cycle, artifacts)
+	encoded, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "cookie") || doc["schema_version"] != 9 {
+		t.Fatalf("detail contract is unsafe or stale: %s", encoded)
+	}
+}
+
+func TestPositionMarginAuditRejectsFutureMarkTimestamp(t *testing.T) {
+	now := time.Now().UTC()
+	future := now.Add(time.Minute)
+	cfg := store.NewCopyGuardDefaults()
+	cfg.RiskProtectionMode = store.RiskProtectionModePositionMarginPct
+	cfg.RiskPositionMarginStopPct = .8
+	cfg.RiskTriggerPriceType = "mark"
+	cfg.RiskReentryEnabled = false
+	cfg.RiskReentryDecisionMode = "disabled"
+	cfg.RiskMaxReentries = 0
+	snapshot, err := store.EncodeCopyGuardPolicySnapshot(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cycle := &store.CopyGuardCycle{
+		ID: 8, Side: "long", PolicySnapshot: snapshot, AccountEquity: 1000,
+		ProtectionCoverage: 1, ProtectionStatus: store.CopyGuardProtectionVerified,
+		AccountingStatus: store.CopyGuardAccountingOpen, UpdatedAt: now,
+	}
+	artifacts := &copyGuardCycleArtifacts{
+		Attempts: []*store.CopyGuardAttempt{{
+			AttemptNo: 0, EntryPrice: 100, Quantity: 1, ActualLeverage: 10,
+			CurrentMarkPrice: 101, CurrentMarkAt: &future,
+			StopAnchorEntryPrice: 100, StopAnchorLeverage: 10,
+			StopAnchorInitialMargin: 10, StopAnchorPrice: 92,
+			StopConfiguredMarginLossPct: .8, FinalStopPrice: 92,
+			StopAnchorSource: store.CopyGuardAnchorSourceInitialFill,
+		}},
+		Protection: &store.CopyGuardProtectiveOrder{
+			AlgoID: "hosted-future", TriggerType: "mark", TriggerPrice: 92,
+			CoverageMode: store.CopyGuardCoverageCloseAll, Status: "live", UpdatedAt: now,
+		},
+	}
+	audit := buildPositionMarginAudit(cycle, artifacts)
+	if audit == nil || audit.DataQuality != "PARTIAL" || audit.UnscorableReason == "" {
+		t.Fatalf("future-dated mark was treated as verified: %+v", audit)
 	}
 }

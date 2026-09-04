@@ -144,6 +144,35 @@ func (t *FuturesTrader) setDualSidePosition() error {
 	return nil
 }
 
+// ValidateCopyGuardPositionMode queries the account instead of trusting the
+// constructor's best-effort mode change. Side-specific closePosition stops are
+// only safe in Binance Hedge Mode.
+func (t *FuturesTrader) ValidateCopyGuardPositionMode() error {
+	readMode := func() (*futures.PositionMode, error) {
+		return binanceCallWithClockRetry(t, "get_position_mode", func() (*futures.PositionMode, error) {
+			return t.client.NewGetPositionModeService().Do(context.Background())
+		})
+	}
+	mode, err := readMode()
+	if err != nil {
+		return fmt.Errorf("query Binance position mode: %w", err)
+	}
+	if mode != nil && mode.DualSidePosition {
+		return nil
+	}
+	if err = t.setDualSidePosition(); err != nil {
+		return fmt.Errorf("set Binance Hedge Mode: %w", err)
+	}
+	mode, err = readMode()
+	if err != nil {
+		return fmt.Errorf("verify Binance Hedge Mode: %w", err)
+	}
+	if mode == nil || !mode.DualSidePosition {
+		return fmt.Errorf("Binance account is not in Hedge Mode after mode change")
+	}
+	return nil
+}
+
 const (
 	// binanceClockResyncInterval bounds how long a derived server-time offset may
 	// be reused. Binance rejects any signed request whose timestamp is more than
@@ -907,6 +936,10 @@ func (t *FuturesTrader) GetPositionsFresh() ([]map[string]interface{}, error) {
 	return t.GetPositions()
 }
 
+func (t *FuturesTrader) ProtectiveStopCoverageMode() string {
+	return ProtectiveStopCoverageCloseAll
+}
+
 func (t *FuturesTrader) PlaceProtectiveStop(req ProtectiveStopRequest) (*ProtectiveStopOrder, error) {
 	inst, err := t.resolveBinanceInstrument(req.Symbol)
 	if err != nil {
@@ -959,7 +992,8 @@ func (t *FuturesTrader) PlaceProtectiveStop(req ProtectiveStopRequest) (*Protect
 		AlgoID: strconv.FormatInt(created.AlgoId, 10), ClientID: created.ClientAlgoId, Symbol: created.Symbol,
 		PositionSide: strings.ToLower(string(created.PositionSide)), MarginMode: req.MarginMode,
 		Quantity: quantity, TriggerPrice: parseBinanceFloat(created.TriggerPrice), TriggerType: req.TriggerType,
-		State: normalizeBinanceAlgoState(created.AlgoStatus),
+		CoverageMode: ProtectiveStopCoverageCloseAll,
+		State:        normalizeBinanceAlgoState(created.AlgoStatus),
 	}, nil
 }
 
@@ -1061,18 +1095,9 @@ func (t *FuturesTrader) binanceAlgoToProtective(order *futures.GetAlgoOrderResp,
 		return nil, fmt.Errorf("Binance algo symbol mismatch: got %s want %s", order.Symbol, expectedSymbol)
 	}
 	quantity := parseBinanceFloat(order.Quantity)
-	if order.ClosePosition && quantity <= 0 {
-		positions, err := t.GetPositionsFresh()
-		if err != nil {
-			return nil, fmt.Errorf("validate Binance closePosition coverage: %w", err)
-		}
-		wantedSide := strings.ToLower(string(order.PositionSide))
-		for _, pos := range positions {
-			if strings.EqualFold(binanceMapString(pos, "symbol"), order.Symbol) && strings.EqualFold(binanceMapString(pos, "side"), wantedSide) {
-				quantity = math.Abs(binanceMapFloat(pos, "positionAmt"))
-				break
-			}
-		}
+	coverageMode := ProtectiveStopCoverageExactQuantity
+	if order.ClosePosition {
+		coverageMode = ProtectiveStopCoverageCloseAll
 	}
 	triggerType := "contract"
 	if order.WorkingType == futures.WorkingTypeMarkPrice {
@@ -1082,7 +1107,7 @@ func (t *FuturesTrader) binanceAlgoToProtective(order *futures.GetAlgoOrderResp,
 		AlgoID: strconv.FormatInt(order.AlgoId, 10), ClientID: order.ClientAlgoId, Symbol: order.Symbol,
 		PositionSide: strings.ToLower(string(order.PositionSide)), Quantity: quantity,
 		TriggerPrice: parseBinanceFloat(order.TriggerPrice), TriggerType: triggerType,
-		State: normalizeBinanceAlgoState(order.AlgoStatus), ActualOrderID: order.ActualOrderId,
+		CoverageMode: coverageMode, State: normalizeBinanceAlgoState(order.AlgoStatus), ActualOrderID: order.ActualOrderId,
 	}, nil
 }
 
@@ -1411,6 +1436,86 @@ func (t *FuturesTrader) GetMarketPrice(symbol string) (float64, error) {
 	}
 
 	return price, nil
+}
+
+// GetMarkPrice reads Binance's public premium-index endpoint. Unlike the
+// position snapshot fallback, this remains available after the real ATR path
+// has exited and a counterfactual Copy Guard shadow still needs the execution
+// venue's mark path.
+func (t *FuturesTrader) GetMarkPrice(symbol string) (float64, error) {
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	if symbol == "" {
+		return 0, fmt.Errorf("empty Binance mark-price symbol")
+	}
+	rows, err := t.client.NewPremiumIndexService().Symbol(symbol).Do(context.Background())
+	if err != nil {
+		return 0, fmt.Errorf("query Binance mark price: %w", err)
+	}
+	for _, row := range rows {
+		if row == nil || !strings.EqualFold(row.Symbol, symbol) {
+			continue
+		}
+		price, parseErr := strconv.ParseFloat(row.MarkPrice, 64)
+		if parseErr != nil || price <= 0 || math.IsNaN(price) || math.IsInf(price, 0) {
+			return 0, fmt.Errorf("invalid Binance mark price for %s", symbol)
+		}
+		return price, nil
+	}
+	return 0, fmt.Errorf("Binance mark price not found for %s", symbol)
+}
+
+// GetMarkPriceHistory reads completed one-minute mark klines. It is report-only
+// evidence for Copy Guard shadow gap repair and never participates in live
+// order triggering.
+func (t *FuturesTrader) GetMarkPriceHistory(symbol string, from, to time.Time) ([]MarkPriceCandle, error) {
+	if strings.TrimSpace(symbol) == "" || from.IsZero() || to.IsZero() || !from.Before(to) {
+		return nil, fmt.Errorf("invalid Binance mark-price history range")
+	}
+	cursor := from.UTC()
+	end := to.UTC()
+	result := make([]MarkPriceCandle, 0)
+	for page := 0; cursor.Before(end); page++ {
+		if page >= 1000 {
+			return nil, fmt.Errorf("Binance mark-price history exceeded 1000 pages")
+		}
+		rows, err := t.client.NewMarkPriceKlinesService().Symbol(strings.ToUpper(symbol)).Interval("1m").
+			StartTime(cursor.UnixMilli()).EndTime(end.UnixMilli()).Limit(1500).Do(context.Background())
+		if err != nil {
+			return nil, fmt.Errorf("query Binance mark-price history: %w", err)
+		}
+		if len(rows) == 0 {
+			break
+		}
+		progress := cursor
+		for _, row := range rows {
+			if row == nil {
+				continue
+			}
+			openAt := time.UnixMilli(row.OpenTime).UTC()
+			closeAt := time.UnixMilli(row.CloseTime).UTC()
+			if closeAt.After(end) || closeAt.Before(from) {
+				continue
+			}
+			high, highErr := strconv.ParseFloat(row.High, 64)
+			low, lowErr := strconv.ParseFloat(row.Low, 64)
+			closePrice, closeErr := strconv.ParseFloat(row.Close, 64)
+			if highErr != nil || lowErr != nil || closeErr != nil || high <= 0 || low <= 0 || closePrice <= 0 || low > high {
+				return nil, fmt.Errorf("invalid Binance mark-price kline at %d", row.OpenTime)
+			}
+			result = append(result, MarkPriceCandle{OpenTime: openAt, CloseTime: closeAt, High: high, Low: low, Close: closePrice})
+			if next := closeAt.Add(time.Millisecond); next.After(progress) {
+				progress = next
+			}
+		}
+		if !progress.After(cursor) {
+			break
+		}
+		cursor = progress
+		if len(rows) < 1500 {
+			break
+		}
+	}
+	return result, nil
 }
 
 // CalculatePositionSize calculates position size

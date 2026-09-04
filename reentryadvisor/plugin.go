@@ -80,8 +80,8 @@ func (a *Advisor) lifecycleReentryConfig(candidate *store.CopyGuardReentryCandid
 		return nil, err
 	}
 	cfg := *fallback
-	var policy store.CopyGuardPolicy
-	if err = json.Unmarshal([]byte(cycle.PolicySnapshot), &policy); err != nil {
+	policy, err := store.DecodeCopyGuardPolicySnapshot(cycle.PolicySnapshot)
+	if err != nil {
 		return nil, err
 	}
 	if policy.ProtectionMode == store.RiskProtectionModePositionMarginPct {

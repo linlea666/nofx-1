@@ -101,6 +101,65 @@ func TestCopyGuardCycleAndEventLedger(t *testing.T) {
 	}
 }
 
+func TestBeginCopyGuardAccountingAndCloseMappingIsAtomic(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "copyguard-flat-close-atomic.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cs := st.CopyTrade()
+
+	seed := func(t *testing.T, positionID string, withMapping bool) *CopyGuardCycle {
+		t.Helper()
+		cycle, seedErr := cs.EnsureCopyGuardCycle(&CopyGuardCycle{
+			TraderID: "trader-flat", LeaderID: "leader", LeaderPosID: positionID,
+			Symbol: "BTCUSDT", Side: "long", MarginMode: "cross", Status: CopyGuardFollowing,
+			PolicySnapshot: "{}", LeaderEntryPrice: 100, FollowerEntryPrice: 100,
+			FollowerNotional: 10, AccountEquity: 100, LastObservedPrice: 99,
+		})
+		if seedErr != nil {
+			t.Fatal(seedErr)
+		}
+		if withMapping {
+			seedErr = cs.SavePositionMapping(&CopyTradePositionMapping{
+				TraderID: "trader-flat", LeaderPosID: positionID, LeaderID: "leader",
+				Symbol: "BTCUSDT", Side: "long", MarginMode: "cross", OpenedAt: time.Now(),
+				OpenPrice: 100, OpenSizeUSD: 10, LastKnownSize: 1,
+			})
+			if seedErr != nil {
+				t.Fatal(seedErr)
+			}
+		}
+		return cycle
+	}
+
+	success := seed(t, "position-success", true)
+	if err = cs.BeginCopyGuardAccountingAndCloseMapping(
+		success.ID, success.TraderID, success.LeaderPosID, CopyGuardLeaderClosed, "", -1, 99,
+	); err != nil {
+		t.Fatal(err)
+	}
+	closedCycle, err := cs.GetCopyGuardCycle(success.ID)
+	if err != nil || closedCycle.ClosedAt == nil || closedCycle.Status != CopyGuardLeaderClosed {
+		t.Fatalf("cycle was not closed with its mapping: cycle=%+v err=%v", closedCycle, err)
+	}
+	closedMapping, err := cs.GetMappingForReconciliation(success.TraderID, success.LeaderPosID)
+	if err != nil || closedMapping.Status != MappingStatusClosed || closedMapping.ClosePrice != 99 {
+		t.Fatalf("mapping was not atomically closed: mapping=%+v err=%v", closedMapping, err)
+	}
+
+	rollback := seed(t, "position-rollback", false)
+	if err = cs.BeginCopyGuardAccountingAndCloseMapping(
+		rollback.ID, rollback.TraderID, rollback.LeaderPosID, CopyGuardLeaderClosed, "", -1, 99,
+	); err == nil {
+		t.Fatal("missing active mapping must fail the joint transaction")
+	}
+	openCycle, err := cs.GetCopyGuardCycle(rollback.ID)
+	if err != nil || openCycle.ClosedAt != nil || openCycle.Status != CopyGuardFollowing {
+		t.Fatalf("failed mapping close partially terminated cycle: cycle=%+v err=%v", openCycle, err)
+	}
+}
+
 func TestParseDBTimeSupportsSQLiteAndRFC3339(t *testing.T) {
 	for _, value := range []string{"2026-07-03 13:05:43", "2026-07-03T13:05:43Z", "2026-07-03T13:05:43.123456789Z"} {
 		got, err := parseDBTime(value)
@@ -414,8 +473,15 @@ func TestCopyGuardProtectiveOrderPersistsQuantityStep(t *testing.T) {
 	if got.QuantityStep != want.QuantityStep {
 		t.Fatalf("quantity step = %v, want %v", got.QuantityStep, want.QuantityStep)
 	}
+	if got.CoverageMode != CopyGuardCoverageExactQuantity {
+		t.Fatalf("legacy/default coverage mode = %q, want %q", got.CoverageMode, CopyGuardCoverageExactQuantity)
+	}
+	want.CoverageMode = CopyGuardCoverageCloseAll
+	if err := cs.UpsertCopyGuardProtectiveOrder(want); err != nil {
+		t.Fatal(err)
+	}
 	active, err := cs.ListActiveCopyGuardProtectiveOrders("trader-1")
-	if err != nil || len(active) != 1 || active[0].QuantityStep != want.QuantityStep {
+	if err != nil || len(active) != 1 || active[0].QuantityStep != want.QuantityStep || active[0].CoverageMode != CopyGuardCoverageCloseAll {
 		t.Fatalf("active protection lost quantity step: %+v, %v", active, err)
 	}
 }
@@ -446,6 +512,84 @@ func TestExistingClosedCopyGuardCycleBecomesLegacyUnverified(t *testing.T) {
 	if got.AccountingStatus != CopyGuardAccountingLegacyUnverified {
 		t.Fatalf("legacy cycle status = %s", got.AccountingStatus)
 	}
+}
+
+func TestLegacyUnverifiedCycleNeverBecomesScoreableDuringAccounting(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "copyguard-legacy-accounting.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cs := st.CopyTrade()
+	policy := NewCopyGuardDefaults()
+	policy.TraderID, policy.ProviderType = "legacy-trader", "okx"
+	policySnapshot, err := EncodeCopyGuardPolicySnapshot(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	create := func(t *testing.T, posID string) *CopyGuardCycle {
+		t.Helper()
+		cycle, created, createErr := cs.EnsureLegacyUnverifiedCopyGuardLifecycle(LegacyUnverifiedCopyGuardLifecycle{
+			TraderID: "legacy-trader", LeaderID: "leader", LeaderPosID: posID,
+			Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", PolicySnapshot: policySnapshot,
+			LeaderEntryPrice: 100, FollowerEntry: 101, FollowerNotional: 101,
+			FollowerQuantity: 1, LeaderSize: 1, AccountEquity: 1000, Reason: "missing first fill",
+		})
+		if createErr != nil || !created {
+			t.Fatalf("create legacy lifecycle: created=%v err=%v", created, createErr)
+		}
+		return cycle
+	}
+	assertExcluded := func(t *testing.T, cycleID int64) {
+		t.Helper()
+		cycle, getErr := cs.GetCopyGuardCycle(cycleID)
+		if getErr != nil {
+			t.Fatal(getErr)
+		}
+		if cycle.AccountingStatus != CopyGuardAccountingLegacyUnverified || cycle.AccountingError != "missing first fill" {
+			t.Fatalf("legacy exclusion was overwritten: status=%s error=%q", cycle.AccountingStatus, cycle.AccountingError)
+		}
+		if cycle.TrackingDifference != 0 || cycle.NetGuardEffect != 0 || cycle.ReconciledAt != nil {
+			t.Fatalf("legacy cycle exposed scoreable metrics: %+v", cycle)
+		}
+		var summaries int
+		if getErr = st.db.QueryRow(`SELECT COUNT(*) FROM copy_guard_events WHERE cycle_id=? AND type='CYCLE_CLOSED_SUMMARY'`, cycleID).Scan(&summaries); getErr != nil {
+			t.Fatal(getErr)
+		}
+		if summaries != 0 {
+			t.Fatalf("legacy cycle emitted %d scored summaries", summaries)
+		}
+	}
+
+	t.Run("direct close", func(t *testing.T) {
+		cycle := create(t, "legacy-direct")
+		if err := cs.CloseCopyGuardCycle(cycle.ID, CopyGuardLeaderClosed, -5, -4, .1, .2, 0, .3); err != nil {
+			t.Fatal(err)
+		}
+		assertExcluded(t, cycle.ID)
+		if err := cs.CompleteCopyGuardAccounting(cycle.ID, 0, 95, -5, .1, .2, 0); err != nil {
+			t.Fatal(err)
+		}
+		if err := cs.FinalizeCopyGuardAccountingFromAttempts(cycle.ID); err != nil {
+			t.Fatal(err)
+		}
+		assertExcluded(t, cycle.ID)
+	})
+
+	t.Run("deferred settlement", func(t *testing.T) {
+		cycle := create(t, "legacy-deferred")
+		if err := cs.BeginCopyGuardAccounting(cycle.ID, CopyGuardLeaderClosed, "exit-1", -4); err != nil {
+			t.Fatal(err)
+		}
+		assertExcluded(t, cycle.ID)
+		if err := cs.CompleteCopyGuardAccounting(cycle.ID, 0, 95, -5, .1, .2, 0); err != nil {
+			t.Fatal(err)
+		}
+		if err := cs.FinalizeCopyGuardAccountingFromAttempts(cycle.ID); err != nil {
+			t.Fatal(err)
+		}
+		assertExcluded(t, cycle.ID)
+	})
 }
 
 func TestCopyGuardProtectionHealthAndShadowLedger(t *testing.T) {

@@ -3,8 +3,10 @@ package store
 import (
 	"math"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestCopyGuardStopAnchorIsAtomicImmutableAndRestartSafe(t *testing.T) {
@@ -14,15 +16,43 @@ func TestCopyGuardStopAnchorIsAtomicImmutableAndRestartSafe(t *testing.T) {
 		t.Fatal(err)
 	}
 	cs := st.CopyTrade()
-	cycle, err := cs.EnsureCopyGuardCycle(&CopyGuardCycle{
-		TraderID: "anchor-trader", LeaderID: "leader", LeaderPosID: "position",
-		Symbol: "ETHUSDT", Side: "long", Status: CopyGuardFollowing, PolicySnapshot: "{}",
-		FollowerEntryPrice: 100, FollowerNotional: 100,
-	})
+	policy := NewCopyGuardDefaults()
+	policy.TraderID = "anchor-trader"
+	policy.ProviderType = "okx"
+	policy.RiskPolicyVersion = 4
+	policy.RiskProtectionMode = RiskProtectionModePositionMarginPct
+	policy.RiskPositionMarginStopPct = .80
+	policy.FillRiskDefaults()
+	policySnapshot, err := EncodeCopyGuardPolicySnapshot(policy)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = cs.OpenCopyGuardAttempt(cycle.ID, 0, 100, 100, 1, 0); err != nil {
+	intent, claimed, err := cs.ReserveExecutionIntent(&CopyTradeExecutionIntent{
+		TraderID: "anchor-trader", LeaderPosID: "position",
+		SourceRevision: 1, SourceKind: "LEADER_TRANSITION", CanonicalKey: "leader|anchor-trader|position|1",
+		Action: "open_long", Symbol: "ETHUSDT", Side: "long", MarginMode: "cross",
+		LeaderTargetSize: 1, RequestedQuantity: 1, QuantizedQuantity: 1, ClientOrderID: "anchor-open",
+	})
+	if err != nil || !claimed {
+		t.Fatalf("reserve initial fill intent: claimed=%v err=%v", claimed, err)
+	}
+	if err = cs.UpdateExecutionIntent(intent.ID, ExecutionIntentSubmitted, "", "", "anchor-order", 1, 1, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err = cs.CommitLeaderExecutionFill(LeaderExecutionCommit{
+		IntentID: intent.ID, TraderID: "anchor-trader", LeaderID: "leader", LeaderPosID: "position",
+		SourceRevision: 1, Action: "open_long", Symbol: "ETHUSDT", SourceSymbol: "ETHUSDT",
+		ExecutionSymbol: "ETHUSDT", Side: "long", MarginMode: "cross", LeaderTargetSize: 1,
+		FillPrice: 100, FilledQuantity: 1, FilledNotional: 100, ClientOrderID: "anchor-open",
+		ExchangeOrderID: "anchor-order", ExchangeState: "FILLED", OrderTerminal: true,
+		InitialCopyGuard: &InitialCopyGuardLifecycle{
+			PolicySnapshot: policySnapshot, LeaderEntryPrice: 100, AccountEquity: 1000, ATRAtEntry: 2,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cycle, err := cs.GetOpenCopyGuardCycle("anchor-trader", "position")
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -44,6 +74,7 @@ func TestCopyGuardStopAnchorIsAtomicImmutableAndRestartSafe(t *testing.T) {
 			anchor, created, callErr := cs.InitializeCopyGuardStopAnchor(cycle.ID, 0, CopyGuardStopAnchor{
 				EntryPrice: entry, Leverage: 10, InitialMargin: entry / 10,
 				Price: entry * .92, ConfiguredMarginLossPct: .80,
+				Source: CopyGuardAnchorSourceInitialFill, SourceIntentID: intent.ID,
 			})
 			results <- result{anchor: anchor, created: created, err: callErr}
 		}(i)
@@ -86,7 +117,7 @@ func TestCopyGuardStopAnchorIsAtomicImmutableAndRestartSafe(t *testing.T) {
 	}
 	again, created, err := cs.InitializeCopyGuardStopAnchor(cycle.ID, 0, CopyGuardStopAnchor{
 		EntryPrice: 130, Leverage: 20, InitialMargin: 13, Price: 124.8,
-		ConfiguredMarginLossPct: .80,
+		ConfiguredMarginLossPct: .80, Source: CopyGuardAnchorSourceInitialFill, SourceIntentID: intent.ID,
 	})
 	if err != nil || created || *again != *winner {
 		t.Fatalf("weighted-average update overwrote immutable anchor: again=%+v created=%v err=%v winner=%+v", again, created, err, winner)
@@ -166,8 +197,8 @@ func TestCopyGuardPositionMarginStopAuditIsAtomicallyOneWay(t *testing.T) {
 	if stop, stopErr := cs.GetCopyGuardAttemptFinalStop(cycle.ID, 0); stopErr != nil || stop != 97 {
 		t.Fatalf("long concurrent tightening chose stop=%v err=%v, want 97", stop, stopErr)
 	}
-	if stop, callErr := cs.TightenCopyGuardPositionMarginStopAudit(
-		cycle.ID, 0, "long", 10, 10, 100, 94, "position_margin_anchor",
+	if stop, callErr := cs.TightenCopyGuardPositionMarginStopAuditWithMark(
+		cycle.ID, 0, "long", 10, 10, 100, 99, 94, "position_margin_anchor",
 	); callErr != nil || stop != 97 {
 		t.Fatalf("long wider update changed durable stop=%v err=%v", stop, callErr)
 	}
@@ -176,7 +207,8 @@ func TestCopyGuardPositionMarginStopAuditIsAtomicallyOneWay(t *testing.T) {
 		t.Fatalf("read long attempt: attempts=%+v err=%v", attempts, err)
 	}
 	if math.Abs(attempts[0].ExpectedPositionLossPct-.30) > 1e-12 ||
-		attempts[0].GovernedBy != "position_margin_liquidation_clamp" {
+		attempts[0].GovernedBy != "position_margin_liquidation_clamp" ||
+		attempts[0].CurrentMarkPrice != 99 || attempts[0].CurrentMarkAt == nil {
 		t.Fatalf("long durable audit was widened or relabeled: %+v", attempts[0])
 	}
 
@@ -334,5 +366,255 @@ func TestPositionMarginShadowNoCrossIsNoSignal(t *testing.T) {
 	evaluations, err := cs.ListCopyGuardShadowEvaluations(42)
 	if err != nil || len(evaluations) != 1 || evaluations[0].Status != CopyGuardShadowNoSignal {
 		t.Fatalf("no-cross shadow should be NO_SIGNAL: %+v err=%v", evaluations, err)
+	}
+}
+
+func TestPositionMarginShadowV2AccountsForAddsReductionsCrossingCostsAndCoverage(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "position-margin-v2.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cs := st.CopyTrade()
+	cycle, err := cs.EnsureCopyGuardCycle(&CopyGuardCycle{
+		TraderID: "shadow-v2-trader", LeaderID: "leader", LeaderPosID: "v2-pos",
+		Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", Status: CopyGuardFollowing,
+		PolicySnapshot: "{}",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, created, err := cs.InitializeCopyGuardPositionMarginShadowV2(&CopyGuardPositionMarginShadowV2{
+		CycleID: cycle.ID, TraderID: cycle.TraderID, Side: "long",
+		AnchorEntryPrice: 100, AnchorLeverage: 10, AnchorInitialMargin: 10,
+		AnchorStopPrice: 92, ConfiguredMarginLossPct: .8,
+		PriceTickSize: .1, QuantityStep: .01, InitialQuantity: 1,
+		CurrentEntryPrice: 100, CurrentQuantity: 1, CurrentLeverage: 10,
+		EffectiveStopPrice: 92, LastLeaderSize: 1, ConfiguredCostBPS: 10,
+	})
+	if err != nil || !created {
+		t.Fatalf("initialize v2 created=%v err=%v", created, err)
+	}
+	if changed, callErr := cs.SyncCopyGuardPositionMarginShadowV2(cycle.ID, 105, 2, 20, 2, 110); callErr != nil || !changed {
+		t.Fatalf("v2 add changed=%v err=%v", changed, callErr)
+	}
+	if changed, callErr := cs.SyncCopyGuardPositionMarginShadowV2(cycle.ID, 105, 1.5, 20, 1.5, 108); callErr != nil || !changed {
+		t.Fatalf("v2 reduction changed=%v err=%v", changed, callErr)
+	}
+	base := time.Now().UTC().Add(-3 * time.Minute).Truncate(time.Minute)
+	checkpoint := func(key string, at time.Time, low, high, last float64) bool {
+		t.Helper()
+		crossed, checkpointErr := cs.CheckpointCopyGuardPositionMarginShadowV2(cycle.ID, CopyGuardShadowMarkCheckpoint{
+			Key: key, BucketAt: at, MinimumMark: low, MaximumMark: high, LastMark: last,
+			ObservationCount: 20, CoveredSeconds: 60, ObservedAt: at.Add(time.Minute), Source: "LIVE_MARK",
+		}, 92)
+		if checkpointErr != nil {
+			t.Fatal(checkpointErr)
+		}
+		return crossed
+	}
+	if checkpoint("minute-1", base, 99, 110, 100) {
+		t.Fatal("v2 crossed above long stop")
+	}
+	if !checkpoint("minute-2", base.Add(time.Minute), 91, 95, 91) {
+		t.Fatal("v2 did not cross at authoritative mark")
+	}
+	if checkpoint("minute-2", base.Add(time.Minute), 91, 95, 91) {
+		t.Fatal("duplicate checkpoint crossed twice")
+	}
+	if checkpoint("minute-3", base.Add(2*time.Minute), 90, 101, 101) {
+		t.Fatal("terminal v2 shadow crossed twice")
+	}
+	// Once the fixed shadow has crossed, leader close is irrelevant and a
+	// missing close price must not leave the shadow lifecycle active forever.
+	if err = cs.FinalizeCopyGuardPositionMarginShadow(cycle.ID, 0); err != nil {
+		t.Fatal(err)
+	}
+	shadow, err := cs.GetCopyGuardPositionMarginShadowV2(cycle.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if shadow.Status != CopyGuardPositionMarginShadowFinalized || math.Abs(shadow.RealizedGrossPnL-(-19.5)) > 1e-9 ||
+		math.Abs(shadow.EntryTurnover-210) > 1e-9 || math.Abs(shadow.ExitTurnover-190.5) > 1e-9 {
+		t.Fatalf("v2 virtual ledger is wrong: %+v", shadow)
+	}
+	evaluations, err := cs.ListCopyGuardShadowEvaluations(cycle.ID)
+	if err != nil || len(evaluations) != 1 {
+		t.Fatalf("v2 evaluation rows=%+v err=%v", evaluations, err)
+	}
+	evaluation := evaluations[0]
+	if evaluation.EvaluationVersion != CopyGuardPositionMarginShadowEvaluationVersion || !evaluation.StopCrossed ||
+		!evaluation.CrossingVerified || !evaluation.PostStopReversed || evaluation.MarkCoverage != 1 ||
+		math.Abs(evaluation.GrossPnL-(-19.5)) > 1e-9 || math.Abs(evaluation.EstimatedCost-.20025) > 1e-9 {
+		t.Fatalf("v2 provisional evaluation is wrong: %+v", evaluation)
+	}
+	if _, err = st.DB().Exec(`INSERT INTO copy_trade_execution_intents
+		(trader_id,leader_pos_id,source_revision,canonical_key,cycle_id,action,status,filled_quantity,filled_notional)
+		VALUES(?,?,?,?,?,'open_long','FILLED',2,210),(?,?,?,?,?,'reduce_long','FILLED',1.5,190.5)`,
+		cycle.TraderID, cycle.LeaderPosID, 1, "v2-open", cycle.ID,
+		cycle.TraderID, cycle.LeaderPosID, 2, "v2-reduce", cycle.ID); err != nil {
+		t.Fatal(err)
+	}
+	cycle.AccountingStatus = CopyGuardAccountingReconciled
+	cycle.Fees, cycle.FundingFee, cycle.Slippage = 2, .5, .4
+	if err = cs.ReconcileCopyGuardPositionMarginShadowV2(cycle, -10, true); err != nil {
+		t.Fatal(err)
+	}
+	evaluations, err = cs.ListCopyGuardShadowEvaluations(cycle.ID)
+	if err != nil || len(evaluations) != 1 {
+		t.Fatalf("reconciled v2 rows=%+v err=%v", evaluations, err)
+	}
+	evaluation = evaluations[0]
+	if evaluation.DataQuality != CopyGuardShadowQualityVerified || evaluation.CostSource != "OBSERVED_PRORATED" ||
+		math.Abs(evaluation.NetPnL-(-21.4)) > 1e-9 || math.Abs(evaluation.IncrementalEffect-(-11.4)) > 1e-9 {
+		t.Fatalf("v2 observed-cost comparison is wrong: %+v", evaluation)
+	}
+}
+
+func TestPositionMarginShadowV2NoCrossClosesAtLeaderExit(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "position-margin-v2-no-cross.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cs := st.CopyTrade()
+	cycle, err := cs.EnsureCopyGuardCycle(&CopyGuardCycle{
+		TraderID: "shadow-v2-no-cross", LeaderID: "leader", LeaderPosID: "no-cross",
+		Symbol: "ETHUSDT", Side: "short", MarginMode: "cross", Status: CopyGuardFollowing,
+		PolicySnapshot: "{}",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = cs.InitializeCopyGuardPositionMarginShadowV2(&CopyGuardPositionMarginShadowV2{
+		CycleID: cycle.ID, TraderID: cycle.TraderID, Side: "short",
+		AnchorEntryPrice: 100, AnchorLeverage: 20, AnchorInitialMargin: 5,
+		AnchorStopPrice: 104, ConfiguredMarginLossPct: .8,
+		PriceTickSize: .1, QuantityStep: .01, InitialQuantity: 2,
+		CurrentEntryPrice: 100, CurrentQuantity: 2, CurrentLeverage: 20,
+		EffectiveStopPrice: 104, LastLeaderSize: 2, ConfiguredCostBPS: 20,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now().UTC().Add(-2 * time.Minute).Truncate(time.Minute)
+	for index, mark := range []float64{101, 99} {
+		if crossed, checkpointErr := cs.CheckpointCopyGuardPositionMarginShadowV2(cycle.ID, CopyGuardShadowMarkCheckpoint{
+			Key: "no-cross-" + string(rune('a'+index)), BucketAt: base.Add(time.Duration(index) * time.Minute),
+			MinimumMark: mark - .5, MaximumMark: mark + .5, LastMark: mark,
+			ObservationCount: 20, CoveredSeconds: 60, ObservedAt: base.Add(time.Duration(index+1) * time.Minute), Source: "LIVE_MARK",
+		}, 104); checkpointErr != nil || crossed {
+			t.Fatalf("no-cross checkpoint %d crossed=%v err=%v", index, crossed, checkpointErr)
+		}
+	}
+	if err = cs.FinalizeCopyGuardPositionMarginShadow(cycle.ID, 98); err != nil {
+		t.Fatal(err)
+	}
+	evaluations, err := cs.ListCopyGuardShadowEvaluations(cycle.ID)
+	if err != nil || len(evaluations) != 1 {
+		t.Fatalf("no-cross v2 evaluation rows=%+v err=%v", evaluations, err)
+	}
+	evaluation := evaluations[0]
+	if evaluation.EvaluationVersion != 2 || evaluation.StopCrossed || evaluation.ExitPrice != 98 ||
+		evaluation.MarkCoverage != 1 || math.Abs(evaluation.GrossPnL-4) > 1e-9 ||
+		math.Abs(evaluation.EstimatedCost-.396) > 1e-9 {
+		t.Fatalf("no-cross v2 leader-close result is wrong: %+v", evaluation)
+	}
+}
+
+func TestPositionMarginShadowV2IncompleteMarkPathIsUnscorable(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "position-margin-v2-gap.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cs := st.CopyTrade()
+	cycle, err := cs.EnsureCopyGuardCycle(&CopyGuardCycle{
+		TraderID: "shadow-v2-gap", LeaderID: "leader", LeaderPosID: "gap",
+		Symbol: "BTCUSDT", Side: "long", MarginMode: "cross", Status: CopyGuardFollowing,
+		PolicySnapshot: "{}",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = cs.InitializeCopyGuardPositionMarginShadowV2(&CopyGuardPositionMarginShadowV2{
+		CycleID: cycle.ID, TraderID: cycle.TraderID, Side: "long",
+		AnchorEntryPrice: 100, AnchorLeverage: 10, AnchorInitialMargin: 10,
+		AnchorStopPrice: 92, ConfiguredMarginLossPct: .8,
+		PriceTickSize: .1, QuantityStep: .01, InitialQuantity: 1,
+		CurrentEntryPrice: 100, CurrentQuantity: 1, CurrentLeverage: 10,
+		EffectiveStopPrice: 92, LastLeaderSize: 1, ConfiguredCostBPS: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now().UTC().Add(-3 * time.Minute).Truncate(time.Minute)
+	crossed, err := cs.CheckpointCopyGuardPositionMarginShadowV2(cycle.ID, CopyGuardShadowMarkCheckpoint{
+		Key: "gap-cross", BucketAt: base, MinimumMark: 91, MaximumMark: 101, LastMark: 91,
+		ObservationCount: 1, CoveredSeconds: 60, GapSeconds: 180,
+		ObservedAt: base.Add(4 * time.Minute), Source: "HISTORY_MARK_1M",
+	}, 92)
+	if err != nil || !crossed {
+		t.Fatalf("gap crossing crossed=%v err=%v", crossed, err)
+	}
+	if err = cs.FinalizeCopyGuardPositionMarginShadow(cycle.ID, 110); err != nil {
+		t.Fatal(err)
+	}
+	evaluations, err := cs.ListCopyGuardShadowEvaluations(cycle.ID)
+	if err != nil || len(evaluations) != 1 {
+		t.Fatalf("gap v2 evaluation rows=%+v err=%v", evaluations, err)
+	}
+	evaluation := evaluations[0]
+	if evaluation.Status != CopyGuardShadowUnscorable || evaluation.DataQuality != CopyGuardShadowQualityUnscorable ||
+		math.Abs(evaluation.MarkCoverage-.25) > 1e-9 || evaluation.PostStopReversed ||
+		!strings.Contains(evaluation.Reason, "below 95%") {
+		t.Fatalf("incomplete mark path remained scoreable: %+v", evaluation)
+	}
+}
+
+func TestPositionMarginShadowV2MissingLeaderCloseFinalizesUnscorable(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "position-margin-v2-missing-close.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cs := st.CopyTrade()
+	cycle, err := cs.EnsureCopyGuardCycle(&CopyGuardCycle{
+		TraderID: "shadow-v2-missing-close", LeaderID: "leader", LeaderPosID: "missing-close",
+		Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", Status: CopyGuardFollowing,
+		PolicySnapshot: "{}",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = cs.InitializeCopyGuardPositionMarginShadowV2(&CopyGuardPositionMarginShadowV2{
+		CycleID: cycle.ID, TraderID: cycle.TraderID, Side: "long",
+		AnchorEntryPrice: 100, AnchorLeverage: 10, AnchorInitialMargin: 10,
+		AnchorStopPrice: 92, ConfiguredMarginLossPct: .8,
+		PriceTickSize: .1, QuantityStep: .01, InitialQuantity: 1,
+		CurrentEntryPrice: 100, CurrentQuantity: 1, CurrentLeverage: 10,
+		EffectiveStopPrice: 92, LastLeaderSize: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now().UTC().Add(-time.Minute).Truncate(time.Minute)
+	if _, err = cs.CheckpointCopyGuardPositionMarginShadowV2(cycle.ID, CopyGuardShadowMarkCheckpoint{
+		Key: "missing-close-mark", BucketAt: base, MinimumMark: 99, MaximumMark: 101, LastMark: 100,
+		ObservationCount: 20, CoveredSeconds: 60, ObservedAt: base.Add(time.Minute), Source: "LIVE_MARK",
+	}, 92); err != nil {
+		t.Fatal(err)
+	}
+	if err = cs.FinalizeCopyGuardPositionMarginShadow(cycle.ID, 0); err != nil {
+		t.Fatal(err)
+	}
+	shadow, err := cs.GetCopyGuardPositionMarginShadowV2(cycle.ID)
+	if err != nil || shadow.Status != CopyGuardPositionMarginShadowFinalized {
+		t.Fatalf("missing-close shadow did not finalize: shadow=%+v err=%v", shadow, err)
+	}
+	evaluations, err := cs.ListCopyGuardShadowEvaluations(cycle.ID)
+	if err != nil || len(evaluations) != 1 || evaluations[0].Status != CopyGuardShadowUnscorable ||
+		!strings.Contains(evaluations[0].Reason, "close price is unavailable") {
+		t.Fatalf("missing-close shadow was not excluded: evaluations=%+v err=%v", evaluations, err)
 	}
 }

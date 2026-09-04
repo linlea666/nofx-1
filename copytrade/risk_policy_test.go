@@ -1,11 +1,57 @@
 package copytrade
 
 import (
+	"encoding/json"
 	"math"
+	"strings"
 	"testing"
 
 	"nofx/store"
 )
+
+func TestLifecyclePolicyDecodesHistoricalRuntimeCopyConfig(t *testing.T) {
+	runtime := &CopyConfig{
+		ProviderType:                 ProviderBinance,
+		LeaderID:                     "leader-private",
+		CopyRatio:                    3,
+		BinanceP20T:                  "cookie-secret",
+		BinanceCSRFToken:             "csrf-secret",
+		RiskPolicyVersion:            4,
+		RiskProtectionMode:           store.RiskProtectionModePositionMarginPct,
+		RiskPositionMarginStopPct:    0.8,
+		RiskTriggerPriceType:         "mark",
+		RiskLiquidationBufferATR:     0.75,
+		RiskReentryEnabled:           false,
+		RiskReentryDecisionMode:      "disabled",
+		RiskMaxReentries:             0,
+		RiskReentryCooldownSeconds:   777,
+		RiskReentryMaxATRExpansion:   1.8,
+		RiskUnprotectableDisposition: "warn",
+	}
+	raw, err := json.Marshal(runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cycle := &store.CopyGuardCycle{PolicySnapshot: string(raw)}
+
+	mode, pct := copyGuardProtectionSettings(cycle, nil)
+	if mode != store.RiskProtectionModePositionMarginPct || pct != 0.8 {
+		t.Fatalf("historical runtime snapshot decoded incorrectly: mode=%q pct=%v", mode, pct)
+	}
+	got := copyGuardLifecycleConfig(cycle, &CopyConfig{})
+	if got.RiskPolicyVersion != 4 || got.RiskLiquidationBufferATR != 0.75 ||
+		got.RiskReentryCooldownSeconds != 777 || got.RiskReentryMaxATRExpansion != 1.8 {
+		t.Fatalf("historical runtime snapshot lost risk fields: %+v", got)
+	}
+	canonical, err := store.CanonicalizeCopyGuardPolicySnapshot(string(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(canonical, "cookie-secret") || strings.Contains(canonical, "csrf-secret") ||
+		strings.Contains(canonical, "leader-private") || strings.Contains(canonical, "copy_ratio") {
+		t.Fatalf("canonical snapshot leaked ordinary or credential fields: %s", canonical)
+	}
+}
 
 func TestComputeRiskDistanceV4ATRGovernsWhenCapsAreWider(t *testing.T) {
 	// 账户线 0.2 → 账户距离 = 1000×0.2/1000×100 = 20，远宽于 ATR 3 → ATR 主导。

@@ -26,6 +26,28 @@ const maxCopyRatio = 10.0
 
 const manualReentryDeprecatedMessage = "risk_manual_reentry_enabled is deprecated and is always false; use ai_guarded candidates"
 
+func validateFixedModeExplicitSettings(mode, trigger string, triggerExplicit bool, reentryEnabled *bool, decisionMode *string, manualReentry *bool, maxReentries *int) error {
+	if mode != store.RiskProtectionModePositionMarginPct {
+		return nil
+	}
+	if triggerExplicit && trigger != "mark" {
+		return fmt.Errorf("position_margin_pct requires risk_trigger_price_type=mark")
+	}
+	if reentryEnabled != nil && *reentryEnabled {
+		return fmt.Errorf("position_margin_pct forbids risk_reentry_enabled=true")
+	}
+	if decisionMode != nil && *decisionMode != "disabled" {
+		return fmt.Errorf("position_margin_pct requires risk_reentry_decision_mode=disabled")
+	}
+	if manualReentry != nil && *manualReentry {
+		return fmt.Errorf("position_margin_pct forbids manual secondary entry")
+	}
+	if maxReentries != nil && *maxReentries != 0 {
+		return fmt.Errorf("position_margin_pct requires risk_max_reentries=0")
+	}
+	return nil
+}
+
 func applyRetiredCopyGuardCompatibility(config *store.CopyTradeConfig, requested *bool) bool {
 	if config == nil {
 		return false
@@ -87,8 +109,14 @@ func copyGuardAIActive(config *store.CopyTradeConfig) bool {
 // startup transaction is the authoritative race barrier; save paths call this
 // helper as an early, user-friendly conflict check.
 func validateCopyGuardAccountExclusivity(st *store.Store, traderID, exchangeID string, config *store.CopyTradeConfig) error {
-	if st == nil || config == nil || config.RiskPolicyVersion < 4 ||
-		!config.RiskStopLossEnabled || !copytrade.SupportsCopyGuard(copytrade.ProviderType(config.ProviderType)) {
+	if st == nil || config == nil || !copytrade.SupportsCopyGuard(copytrade.ProviderType(config.ProviderType)) {
+		return nil
+	}
+	hasOpen, err := st.CopyTrade().HasOpenCopyGuardCycles(traderID)
+	if err != nil {
+		return fmt.Errorf("check active Copy Guard lifecycles: %w", err)
+	}
+	if (config.RiskPolicyVersion < 4 || !config.RiskStopLossEnabled) && !hasOpen {
 		return nil
 	}
 	conflict, err := st.Trader().FindRunningCopyGuardConflict(traderID, exchangeID)
@@ -101,20 +129,13 @@ func validateCopyGuardAccountExclusivity(st *store.Store, traderID, exchangeID s
 	return nil
 }
 
-// disableReentryCandidatesAfterConfigSave closes only candidates that have not
-// reached an exchange submission, and only when the account-protection master
-// switch is turned off. Changing the trader template from ATR/AI to fixed
-// position-margin protection applies to later lifecycles; candidates belonging
-// to an already-open ATR lifecycle remain governed by its policy snapshot.
-// Submitted work remains owned by the durable intent reconciler so disabling
-// protection cannot hide an in-flight order.
+// disableReentryCandidatesAfterConfigSave intentionally preserves candidates
+// owned by active lifecycles. The master switch and template mode apply only to
+// future positions; an existing ATR lifecycle keeps its snapshotted reentry
+// contract until the leader closes. Kept as a compatibility seam for all three
+// save paths so older call sites cannot reintroduce destructive invalidation.
 func disableReentryCandidatesAfterConfigSave(st *store.Store, old, current *store.CopyTradeConfig) {
-	if st == nil || current == nil || !copyGuardAIActive(old) || current.RiskStopLossEnabled {
-		return
-	}
-	if err := st.ReentryAI().DisableReentryCandidatesForTrader(current.TraderID, "account protection or AI reentry disabled"); err != nil {
-		logger.Errorf("Failed to disable AI reentry candidates for trader %s: %v", current.TraderID, err)
-	}
+	_, _, _ = st, old, current
 }
 
 // CopyTradeHandler 跟单 API Handler
@@ -165,8 +186,18 @@ func validateLegacyReentrySelection(existing *store.CopyTradeConfig, requested s
 	if requested != "legacy_rule" {
 		return nil
 	}
-	if existing != nil && existing.RiskReentryDecisionMode == "legacy_rule" {
-		return nil
+	if existing != nil {
+		if existing.RiskReentryDecisionMode == "legacy_rule" {
+			return nil
+		}
+		// Fixed position-margin mode deliberately forces the effective reentry
+		// mode to disabled, while preserving the trader's pre-existing ATR
+		// contract in the dormant profile. Switching back is a restoration of
+		// that legacy contract, not a new selection of the retired engine.
+		if existing.RiskProtectionMode == store.RiskProtectionModePositionMarginPct &&
+			existing.RiskATRProfile != nil && existing.RiskATRProfile.ReentryDecisionMode == "legacy_rule" {
+			return nil
+		}
 	}
 	return fmt.Errorf("legacy_rule is retired for new selections; use ai_guarded or disabled")
 }
@@ -487,6 +518,202 @@ type copyGuardCycleArtifacts struct {
 	ShadowEvaluations []*store.CopyGuardShadowEvaluation   `json:"shadow_evaluations"`
 }
 
+type copyGuardPolicySummary struct {
+	SnapshotSchemaVersion int                        `json:"snapshot_schema_version"`
+	PolicyVersion         int                        `json:"policy_version"`
+	ProtectionMode        string                     `json:"protection_mode"`
+	PositionMarginStopPct float64                    `json:"position_margin_stop_pct"`
+	TriggerPriceType      string                     `json:"trigger_price_type"`
+	ReentryEnabled        bool                       `json:"reentry_enabled"`
+	ReentryDecisionMode   string                     `json:"reentry_decision_mode"`
+	MaxReentries          int                        `json:"max_reentries"`
+	DormantATRProfile     *store.CopyGuardATRProfile `json:"dormant_atr_profile,omitempty"`
+	DataQuality           string                     `json:"data_quality"`
+	Reason                string                     `json:"reason,omitempty"`
+}
+
+// positionMarginAudit is the sole detail/export contract for fixed-stop math.
+// The UI intentionally renders these backend values instead of duplicating the
+// formula and drifting from exchange-side protection semantics.
+type positionMarginAudit struct {
+	ConfiguredMarginLossPct      float64    `json:"configured_margin_loss_pct"`
+	StopAnchorEntryPrice         float64    `json:"stop_anchor_entry_price"`
+	StopAnchorLeverage           float64    `json:"stop_anchor_leverage"`
+	StopAnchorInitialMargin      float64    `json:"stop_anchor_initial_margin"`
+	StopAnchorTheoreticalRiskUSD float64    `json:"stop_anchor_theoretical_risk_usd"`
+	RawFormulaStopPrice          float64    `json:"raw_formula_stop_price"`
+	TickAlignedStopPrice         float64    `json:"tick_aligned_stop_price"`
+	EffectiveStopPrice           float64    `json:"effective_stop_price"`
+	CurrentEntryPrice            float64    `json:"current_entry_price"`
+	CurrentQuantity              float64    `json:"current_quantity"`
+	CurrentLeverage              float64    `json:"current_leverage"`
+	CurrentMargin                float64    `json:"current_margin"`
+	CurrentStopRiskUSD           float64    `json:"current_stop_risk_usd"`
+	CurrentMarginLossPct         float64    `json:"current_margin_loss_pct"`
+	CurrentAccountLossPct        float64    `json:"current_account_loss_pct"`
+	EquivalentPriceMovePct       float64    `json:"equivalent_price_move_pct"`
+	DistanceATR                  float64    `json:"distance_atr"`
+	LastMarkPrice                float64    `json:"last_mark_price"`
+	LiquidationClamped           bool       `json:"liquidation_clamped"`
+	GovernedBy                   string     `json:"governed_by"`
+	TriggerType                  string     `json:"trigger_type"`
+	HostedOrderID                string     `json:"hosted_order_id"`
+	CoverageMode                 string     `json:"coverage_mode"`
+	CoverageRatio                float64    `json:"coverage_ratio"`
+	ProtectionStatus             string     `json:"protection_status"`
+	DataTimestamp                *time.Time `json:"data_timestamp,omitempty"`
+	DataQuality                  string     `json:"data_quality"`
+	UnscorableReason             string     `json:"unscorable_reason,omitempty"`
+	CostsExcludedFromTrigger     bool       `json:"costs_excluded_from_trigger"`
+}
+
+func buildCopyGuardPolicySummary(cycle *store.CopyGuardCycle) *copyGuardPolicySummary {
+	result := &copyGuardPolicySummary{DataQuality: "INVALID"}
+	if cycle == nil {
+		result.Reason = "cycle missing"
+		return result
+	}
+	policy, err := store.DecodeCopyGuardPolicySnapshot(cycle.PolicySnapshot)
+	if err != nil {
+		result.Reason = "policy snapshot cannot be decoded"
+		return result
+	}
+	result.SnapshotSchemaVersion = policy.SnapshotSchemaVersion
+	result.PolicyVersion = policy.Version
+	result.ProtectionMode = policy.ProtectionMode
+	result.PositionMarginStopPct = policy.PositionMarginStopPct
+	result.TriggerPriceType = policy.TriggerPriceType
+	result.ReentryDecisionMode = policy.ReentryDecisionMode
+	result.MaxReentries = policy.MaxReentries
+	result.DormantATRProfile = policy.ATRProfile
+	if policy.ReentryEnabled != nil {
+		result.ReentryEnabled = *policy.ReentryEnabled
+	}
+	result.DataQuality = "VERIFIED"
+	return result
+}
+
+func buildPositionMarginAudit(cycle *store.CopyGuardCycle, artifacts *copyGuardCycleArtifacts) *positionMarginAudit {
+	if cycle == nil || artifacts == nil {
+		return nil
+	}
+	policy, err := store.DecodeCopyGuardPolicySnapshot(cycle.PolicySnapshot)
+	if err != nil || policy.ProtectionMode != store.RiskProtectionModePositionMarginPct {
+		return nil
+	}
+	audit := &positionMarginAudit{
+		ConfiguredMarginLossPct:  policy.PositionMarginStopPct,
+		CoverageRatio:            cycle.ProtectionCoverage,
+		ProtectionStatus:         cycle.ProtectionStatus,
+		DataQuality:              "UNSCORABLE",
+		CostsExcludedFromTrigger: true,
+	}
+	var attempt *store.CopyGuardAttempt
+	for _, candidate := range artifacts.Attempts {
+		if candidate != nil && candidate.AttemptNo == 0 && candidate.StopAnchorEntryPrice > 0 && candidate.StopAnchorLeverage > 0 && candidate.StopAnchorPrice > 0 {
+			attempt = candidate
+			break
+		}
+	}
+	if attempt == nil {
+		audit.UnscorableReason = "missing verified initial-fill stop anchor"
+		return audit
+	}
+	audit.ConfiguredMarginLossPct = attempt.StopConfiguredMarginLossPct
+	audit.StopAnchorEntryPrice = attempt.StopAnchorEntryPrice
+	audit.StopAnchorLeverage = attempt.StopAnchorLeverage
+	audit.StopAnchorInitialMargin = attempt.StopAnchorInitialMargin
+	audit.StopAnchorTheoreticalRiskUSD = attempt.StopAnchorInitialMargin * attempt.StopConfiguredMarginLossPct
+	audit.TickAlignedStopPrice = attempt.StopAnchorPrice
+	audit.EffectiveStopPrice = attempt.FinalStopPrice
+	if audit.EffectiveStopPrice <= 0 {
+		audit.EffectiveStopPrice = attempt.StopAnchorPrice
+	}
+	audit.CurrentEntryPrice = attempt.EntryPrice
+	audit.CurrentQuantity = attempt.Quantity
+	audit.CurrentLeverage = attempt.ActualLeverage
+	audit.LastMarkPrice = attempt.CurrentMarkPrice
+	audit.GovernedBy = attempt.GovernedBy
+	audit.LiquidationClamped = attempt.GovernedBy == "position_margin_liquidation_clamp"
+	if raw, rawErr := copytrade.PositionMarginRawStopPrice(copytrade.SideType(cycle.Side), attempt.StopAnchorEntryPrice, attempt.StopAnchorLeverage, attempt.StopConfiguredMarginLossPct); rawErr == nil {
+		audit.RawFormulaStopPrice = raw
+	}
+	if attempt.EntryPrice > 0 && attempt.Quantity > 0 && attempt.ActualLeverage > 0 {
+		audit.CurrentMargin = attempt.EntryPrice * attempt.Quantity / attempt.ActualLeverage
+		adverseDistance := 0.0
+		if cycle.Side == string(copytrade.SideLong) && audit.EffectiveStopPrice < attempt.EntryPrice {
+			adverseDistance = attempt.EntryPrice - audit.EffectiveStopPrice
+		}
+		if cycle.Side == string(copytrade.SideShort) && audit.EffectiveStopPrice > attempt.EntryPrice {
+			adverseDistance = audit.EffectiveStopPrice - attempt.EntryPrice
+		}
+		audit.CurrentStopRiskUSD = adverseDistance * attempt.Quantity
+		if audit.CurrentMargin > 0 {
+			audit.CurrentMarginLossPct = audit.CurrentStopRiskUSD / audit.CurrentMargin
+		}
+		if cycle.AccountEquity > 0 {
+			audit.CurrentAccountLossPct = audit.CurrentStopRiskUSD / cycle.AccountEquity
+		}
+		audit.EquivalentPriceMovePct = adverseDistance / attempt.EntryPrice
+		if attempt.ATR > 0 {
+			audit.DistanceATR = adverseDistance / attempt.ATR
+		}
+	}
+	if attempt.CurrentMarkAt != nil {
+		audit.DataTimestamp = attempt.CurrentMarkAt
+	}
+	if artifacts.Protection != nil {
+		audit.TriggerType = artifacts.Protection.TriggerType
+		audit.HostedOrderID = artifacts.Protection.AlgoID
+		audit.CoverageMode = artifacts.Protection.CoverageMode
+		updated := artifacts.Protection.UpdatedAt
+		if audit.DataTimestamp == nil {
+			audit.DataTimestamp = &updated
+		}
+	} else if attempt.ProtectionUpdatedAt != nil {
+		audit.DataTimestamp = attempt.ProtectionUpdatedAt
+	}
+	if audit.TriggerType == "" {
+		audit.TriggerType = policy.TriggerPriceType
+	}
+	if audit.CoverageMode == "" {
+		audit.CoverageMode = store.CopyGuardCoverageExactQuantity
+	}
+	if audit.DataTimestamp == nil {
+		updated := cycle.UpdatedAt
+		audit.DataTimestamp = &updated
+	}
+	if attempt.StopAnchorSource != store.CopyGuardAnchorSourceInitialFill {
+		audit.UnscorableReason = "stop anchor is not backed by the verified initial fill"
+		return audit
+	}
+	if audit.RawFormulaStopPrice <= 0 || audit.CurrentEntryPrice <= 0 || audit.CurrentQuantity <= 0 || audit.CurrentLeverage <= 0 {
+		audit.DataQuality = "PARTIAL"
+		audit.UnscorableReason = "current position audit fields are incomplete"
+		return audit
+	}
+	markAge := time.Duration(0)
+	if attempt.CurrentMarkAt != nil {
+		markAge = time.Since(*attempt.CurrentMarkAt)
+	}
+	if cycle.ClosedAt == nil && (audit.LastMarkPrice <= 0 || attempt.CurrentMarkAt == nil || markAge < -5*time.Second || markAge > 45*time.Second) {
+		audit.DataQuality = "PARTIAL"
+		audit.UnscorableReason = "authoritative execution mark is unavailable or stale"
+		return audit
+	}
+	if cycle.AccountingStatus == store.CopyGuardAccountingUnscorable || cycle.AccountingStatus == store.CopyGuardAccountingLegacyUnverified {
+		audit.UnscorableReason = cycle.AccountingError
+		return audit
+	}
+	if cycle.ClosedAt == nil && (artifacts.Protection == nil || (cycle.ProtectionStatus != store.CopyGuardProtectionVerified && cycle.ProtectionStatus != store.CopyGuardProtectionClamped && cycle.ProtectionStatus != store.CopyGuardProtectionTriggered)) {
+		audit.DataQuality = "DEGRADED"
+		audit.UnscorableReason = "exchange-hosted protection is not currently verified"
+		return audit
+	}
+	audit.DataQuality = "VERIFIED"
+	return audit
+}
+
 type copyGuardAttemptAttribution struct {
 	AttemptNo      int      `json:"attempt_no"`
 	PnL            float64  `json:"pnl"`
@@ -672,10 +899,15 @@ func (h *CopyTradeHandler) loadCopyGuardCycleArtifacts(cycleID int64) (*copyGuar
 }
 
 func copyGuardCycleDocument(cycle *store.CopyGuardCycle, artifacts *copyGuardCycleArtifacts) gin.H {
+	policy := buildCopyGuardPolicySummary(cycle)
+	audit := buildPositionMarginAudit(cycle, artifacts)
+	cycle = sanitizedCopyGuardCycle(cycle)
 	return gin.H{
-		"schema_version":          8,
+		"schema_version":          9,
 		"defaults_version":        store.CopyGuardDefaultsVersion(),
 		"cycle":                   cycle,
+		"policy":                  policy,
+		"position_margin_audit":   audit,
 		"attempts":                artifacts.Attempts,
 		"execution_intents":       artifacts.Intents,
 		"events":                  artifacts.Events,
@@ -688,6 +920,24 @@ func copyGuardCycleDocument(cycle *store.CopyGuardCycle, artifacts *copyGuardCyc
 		"shadow_evaluations":      artifacts.ShadowEvaluations,
 		"attribution":             buildCopyGuardAttribution(cycle, artifacts.Attempts, artifacts.Events),
 	}
+}
+
+// sanitizedCopyGuardCycle is a defense-in-depth boundary for list, detail and
+// export responses. Startup migration normally canonicalizes every row, but no
+// API path is allowed to rely on that assumption when handling restored backups
+// or fixtures produced by an older binary.
+func sanitizedCopyGuardCycle(cycle *store.CopyGuardCycle) *store.CopyGuardCycle {
+	if cycle == nil {
+		return nil
+	}
+	out := *cycle
+	canonical, err := store.CanonicalizeCopyGuardPolicySnapshot(cycle.PolicySnapshot)
+	if err != nil {
+		out.PolicySnapshot = `{"snapshot_schema_version":2,"invalid_snapshot":true}`
+		return &out
+	}
+	out.PolicySnapshot = canonical
+	return &out
 }
 
 func (h *CopyTradeHandler) GetRiskSummary(c *gin.Context) {
@@ -723,8 +973,9 @@ func (h *CopyTradeHandler) GetRiskCycles(c *gin.Context) {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
-	for _, cycle := range rows {
+	for i, cycle := range rows {
 		cycle.TraderName = names[cycle.TraderID]
+		rows[i] = sanitizedCopyGuardCycle(cycle)
 	}
 	c.JSON(200, gin.H{"cycles": rows, "count": len(rows)})
 }
@@ -1237,21 +1488,52 @@ func (h *CopyTradeHandler) accountWorstCaseRisk(userID, exchangeID string, accou
 		if t.ExchangeID != exchangeID {
 			continue
 		}
-		cfg, cfgErr := h.store.CopyTrade().GetByTraderID(t.ID)
-		if cfgErr != nil || !cfg.RiskStopLossEnabled {
-			continue
-		}
-		pct := accountPct
-		if cfg.RiskStopMaxAccountLossPct > 0 {
-			pct = cfg.RiskStopMaxAccountLossPct
-		}
 		cycles, cycleErr := h.store.CopyTrade().ListOpenCopyGuardCycles(t.ID)
 		if cycleErr != nil {
 			return 0, 0, cycleErr
 		}
 		for _, cycle := range cycles {
+			policy, policyErr := store.DecodeCopyGuardPolicySnapshot(cycle.PolicySnapshot)
+			if policyErr != nil {
+				return 0, 0, fmt.Errorf("decode Copy Guard cycle %d policy: %w", cycle.ID, policyErr)
+			}
+			if policy.ProtectionMode == store.RiskProtectionModePositionMarginPct {
+				attempts, attemptErr := h.store.CopyTrade().ListCopyGuardAttempts(cycle.ID)
+				if attemptErr != nil {
+					return 0, 0, attemptErr
+				}
+				var fixedRisk float64
+				for _, attempt := range attempts {
+					if attempt == nil || attempt.StopAnchorSource != store.CopyGuardAnchorSourceInitialFill {
+						continue
+					}
+					stopPrice := attempt.FinalStopPrice
+					if stopPrice <= 0 {
+						stopPrice = attempt.StopAnchorPrice
+					}
+					if attempt.EntryPrice <= 0 || attempt.Quantity <= 0 || stopPrice <= 0 {
+						continue
+					}
+					if cycle.Side == string(copytrade.SideLong) && stopPrice < attempt.EntryPrice {
+						fixedRisk = (attempt.EntryPrice - stopPrice) * attempt.Quantity
+					}
+					if cycle.Side == string(copytrade.SideShort) && stopPrice > attempt.EntryPrice {
+						fixedRisk = (stopPrice - attempt.EntryPrice) * attempt.Quantity
+					}
+					count++
+					worst += fixedRisk
+					break
+				}
+				continue
+			}
 			if cycle.FollowerNotional <= 0 || cycle.AccountEquity <= 0 {
 				continue
+			}
+			pct := policy.StopMaxAccountLossPct
+			if pct <= 0 {
+				// Only legacy snapshots can reach this fallback. New lifecycle
+				// snapshots resolve inheritance before opening.
+				pct = accountPct
 			}
 			count++
 			worst += cycle.AccountEquity * pct
@@ -1280,6 +1562,7 @@ func (h *CopyTradeHandler) GetAccountRiskPolicy(c *gin.Context) {
 		"policy": policy, "open_protected_positions": count,
 		"aggregate_worst_case_risk_usd": worst, "aggregate_is_warning_only": true,
 		"aggregate_risk_quality": "ESTIMATED_CONFIG_CAP",
+		"aggregate_risk_basis":   "ACTIVE_CYCLE_SNAPSHOT_OR_EFFECTIVE_FIXED_STOP",
 	})
 }
 
@@ -1496,6 +1779,19 @@ func (h *CopyTradeHandler) SaveConfig(c *gin.Context) {
 	}
 	manualDeprecated := applyRetiredCopyGuardCompatibility(config, req.RiskManualReentryEnabled)
 	applyCopyGuardV4Request(config, existing, &req)
+	trigger := ""
+	triggerExplicit := req.RiskTriggerPriceType != nil
+	if triggerExplicit {
+		trigger = *req.RiskTriggerPriceType
+	}
+	if err := validateFixedModeExplicitSettings(config.RiskProtectionMode, trigger, triggerExplicit, req.RiskReentryEnabled, req.RiskReentryDecisionMode, req.RiskManualReentryEnabled, req.RiskMaxReentries); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	profileDefaulted := store.NormalizeCopyGuardProtectionModeTransition(config, existing)
+	if profileDefaulted {
+		logger.Warnf("⚠️ Copy Guard trader %s had no dormant ATR profile; restored canonical defaults", traderID)
+	}
 	if config.RiskPolicyVersion >= 4 && !copytrade.SupportsCopyGuard(copytrade.ProviderType(config.ProviderType)) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "copy guard is only supported for OKX or Binance leader sources"})
 		return
@@ -1538,7 +1834,7 @@ func (h *CopyTradeHandler) SaveConfig(c *gin.Context) {
 	}
 
 	// 保存配置（store.Upsert 内部会调 FillRiskDefaults 做最后兜底）
-	if err := h.store.CopyTrade().Upsert(config); err != nil {
+	if err := h.store.CopyTrade().UpsertWithATRProfileDefaultMigration(config, profileDefaulted); err != nil {
 		logger.Errorf("Failed to save copy trade config: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save config"})
 		return
@@ -1848,8 +2144,15 @@ func (h *CopyTradeHandler) Start(c *gin.Context) {
 		c.JSON(http.StatusConflict, gin.H{"error": configErr.Error()})
 		return
 	}
-	copyGuardExclusive := persistedConfig.RiskPolicyVersion >= 4 && persistedConfig.RiskStopLossEnabled &&
-		copytrade.SupportsCopyGuard(copytrade.ProviderType(persistedConfig.ProviderType))
+	hasOpenCycles, openErr := h.store.CopyTrade().HasOpenCopyGuardCycles(traderID)
+	if openErr != nil {
+		_ = h.store.CopyTrade().SetEnabled(traderID, false)
+		_ = h.store.Trader().FailStart(userID, traderID, lifecycle.Generation, openErr.Error())
+		c.JSON(http.StatusConflict, gin.H{"error": openErr.Error()})
+		return
+	}
+	copyGuardExclusive := copytrade.SupportsCopyGuard(copytrade.ProviderType(persistedConfig.ProviderType)) &&
+		((persistedConfig.RiskPolicyVersion >= 4 && persistedConfig.RiskStopLossEnabled) || hasOpenCycles)
 	if copyGuardExclusive {
 		err = h.store.Trader().CompleteCopyGuardStart(userID, traderID, lifecycle.Generation, fullConfig.Trader.ExchangeID)
 	} else {

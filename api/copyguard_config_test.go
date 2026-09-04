@@ -1,14 +1,130 @@
 package api
 
 import (
+	"encoding/json"
 	"math"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"nofx/copytrade"
 	"nofx/store"
 )
+
+func TestSanitizedCopyGuardCycleStripsHistoricalCredentials(t *testing.T) {
+	raw, err := json.Marshal(&store.CopyTradeConfig{
+		TraderID:                  "trader-secret",
+		LeaderID:                  "leader-secret",
+		CopyRatio:                 2,
+		BinanceP20T:               "cookie-secret",
+		BinanceCSRFToken:          "csrf-secret",
+		RiskPolicyVersion:         4,
+		RiskProtectionMode:        store.RiskProtectionModePositionMarginPct,
+		RiskPositionMarginStopPct: 0.8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cycle := sanitizedCopyGuardCycle(&store.CopyGuardCycle{ID: 7, PolicySnapshot: string(raw)})
+	if cycle.ID != 7 {
+		t.Fatalf("sanitizer changed cycle identity: %+v", cycle)
+	}
+	for _, secret := range []string{"cookie-secret", "csrf-secret", "leader-secret", "copy_ratio"} {
+		if strings.Contains(cycle.PolicySnapshot, secret) {
+			t.Fatalf("sanitized cycle leaked %q: %s", secret, cycle.PolicySnapshot)
+		}
+	}
+	policy, err := store.DecodeCopyGuardPolicySnapshot(cycle.PolicySnapshot)
+	if err != nil || policy.SnapshotSchemaVersion != 2 || policy.PositionMarginStopPct != 0.8 {
+		t.Fatalf("sanitized policy is not canonical: policy=%+v err=%v", policy, err)
+	}
+}
+
+func TestAccountWorstCaseRiskUsesActiveSnapshotsAfterMasterSwitchOff(t *testing.T) {
+	st, err := store.New(filepath.Join(t.TempDir(), "account-risk-active.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	exchangeID, err := st.Exchange().Create(
+		"user-1", "okx", "main", true, "", "", "", false,
+		"", "", "", "", "", "", "", 0,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	createTrader := func(id string) {
+		t.Helper()
+		if createErr := st.Trader().Create(&store.Trader{
+			ID: id, UserID: "user-1", Name: id, AIModelID: "ai", ExchangeID: exchangeID,
+		}); createErr != nil {
+			t.Fatal(createErr)
+		}
+		cfg := store.NewCopyGuardDefaults()
+		cfg.TraderID, cfg.ProviderType, cfg.LeaderID = id, "okx", "leader-"+id
+		cfg.Enabled = true
+		cfg.RiskStopLossEnabled = false
+		if createErr := st.CopyTrade().Upsert(cfg); createErr != nil {
+			t.Fatal(createErr)
+		}
+	}
+	createTrader("atr-trader")
+	createTrader("fixed-trader")
+
+	atrPolicy := store.NewCopyGuardDefaults()
+	atrPolicy.RiskStopMaxAccountLossPct = 0.12
+	atrSnapshot, err := store.EncodeCopyGuardPolicySnapshot(atrPolicy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = st.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{
+		TraderID: "atr-trader", LeaderID: "leader-atr", LeaderPosID: "atr-pos",
+		Symbol: "BTCUSDT", Side: string(copytrade.SideLong), MarginMode: "cross",
+		Status: store.CopyGuardFollowing, PolicySnapshot: atrSnapshot,
+		FollowerEntryPrice: 100, FollowerNotional: 500, AccountEquity: 1000,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	fixedPolicy := store.NewCopyGuardDefaults()
+	fixedPolicy.RiskProtectionMode = store.RiskProtectionModePositionMarginPct
+	fixedSnapshot, err := store.EncodeCopyGuardPolicySnapshot(fixedPolicy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixedCycle, err := st.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{
+		TraderID: "fixed-trader", LeaderID: "leader-fixed", LeaderPosID: "fixed-pos",
+		Symbol: "ETHUSDT", Side: string(copytrade.SideLong), MarginMode: "cross",
+		Status: store.CopyGuardFollowing, PolicySnapshot: fixedSnapshot,
+		FollowerEntryPrice: 110, FollowerNotional: 220, AccountEquity: 1000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = st.CopyTrade().OpenCopyGuardAttempt(fixedCycle.ID, 0, 110, 220, 2, 5); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = st.DB().Exec(`UPDATE copy_guard_attempts SET
+		stop_anchor_entry_price=100,stop_anchor_leverage=20,stop_anchor_initial_margin=10,
+		stop_anchor_price=96,stop_configured_margin_loss_pct=.8,
+		stop_anchor_source='INITIAL_FILL',stop_anchor_source_intent_id=1,final_stop_price=96
+		WHERE cycle_id=? AND attempt_no=0`, fixedCycle.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	handler := NewCopyTradeHandler(st, nil)
+	count, worst, err := handler.accountWorstCaseRisk("user-1", exchangeID, 0.10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// ATR uses its frozen 12% account cap (120); fixed uses the actual current
+	// stop distance (110-96)*2 = 28 and never consumes the account cap.
+	if count != 2 || math.Abs(worst-148) > 1e-9 {
+		t.Fatalf("active lifecycle risk count=%d worst=%.8f, want 2 / 148", count, worst)
+	}
+}
 
 func TestValidateRiskConfirmation(t *testing.T) {
 	if err := validateRiskConfirmation(0.04, false, nil); err != nil {
@@ -261,7 +377,22 @@ func TestConfigSwitchToFixedKeepsActiveATRLifecycleCandidate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if disabled.Status != store.ReentryCandidateInvalidated {
-		t.Fatalf("master protection disable did not invalidate an unsubmitted candidate: %+v", disabled)
+	if disabled.Status == store.ReentryCandidateInvalidated {
+		t.Fatalf("future-only master switch invalidated an active lifecycle candidate: %+v", disabled)
+	}
+}
+
+func TestLegacyReentryValidationAllowsDormantProfileRestoration(t *testing.T) {
+	fixed := store.NewCopyGuardDefaults()
+	fixed.RiskProtectionMode = store.RiskProtectionModePositionMarginPct
+	fixed.RiskReentryDecisionMode = "disabled"
+	fixed.RiskATRProfile = &store.CopyGuardATRProfile{ReentryDecisionMode: "legacy_rule"}
+
+	if err := validateLegacyReentrySelection(fixed, "legacy_rule"); err != nil {
+		t.Fatalf("restoring a dormant legacy ATR contract must remain compatible: %v", err)
+	}
+	fixed.RiskATRProfile.ReentryDecisionMode = "ai_guarded"
+	if err := validateLegacyReentrySelection(fixed, "legacy_rule"); err == nil {
+		t.Fatal("fixed mode without a dormant legacy contract accepted a new legacy selection")
 	}
 }

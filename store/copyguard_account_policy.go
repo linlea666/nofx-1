@@ -97,3 +97,24 @@ func (s *CopyTradeStore) EffectiveCopyGuardStopPolicy(traderID string, traderOve
 		ExchangeID: exchangeID, MaxPositionLossPct: account.MaxPositionLossPct, Source: "account_default",
 	}, nil
 }
+
+// EncodeCopyGuardLifecyclePolicySnapshot resolves inherited account-level ATR
+// protection before a lifecycle is opened. The persisted trader template must
+// retain a zero override so future lifecycles can inherit later account-policy
+// changes; an already-open lifecycle, however, must never leak those changes
+// through its immutable snapshot. Fixed position-margin mode deliberately does
+// not consume the account cap and therefore preserves the dormant value as-is.
+func (s *CopyTradeStore) EncodeCopyGuardLifecyclePolicySnapshot(config *CopyTradeConfig) (string, error) {
+	if config == nil {
+		return "", fmt.Errorf("nil copy guard lifecycle policy config")
+	}
+	frozen := *config
+	if frozen.RiskPolicyVersion >= 4 && frozen.RiskProtectionMode != RiskProtectionModePositionMarginPct {
+		effective, err := s.EffectiveCopyGuardStopPolicy(frozen.TraderID, frozen.RiskStopMaxAccountLossPct)
+		if err != nil {
+			return "", fmt.Errorf("resolve effective Copy Guard account stop: %w", err)
+		}
+		frozen.RiskStopMaxAccountLossPct = effective.MaxPositionLossPct
+	}
+	return EncodeCopyGuardPolicySnapshot(&frozen)
+}
