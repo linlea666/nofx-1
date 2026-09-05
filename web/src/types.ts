@@ -288,6 +288,9 @@ export interface CopyTradeSourceHealth {
 
 // Copy config request (simplified version for creating traders)
 export interface CopyConfigRequest {
+  atr_profile_patch?: Partial<
+    Omit<NonNullable<CopyTradeConfig['atr_profile']>, 'manual_reentry_enabled'>
+  >
   provider_type: CopyTradeProvider
   leader_id: string
   copy_ratio: number
@@ -1040,6 +1043,8 @@ export interface CopyGuardPositionMarginAudit {
   raw_formula_stop_price: number
   tick_aligned_stop_price: number
   effective_stop_price: number
+  desired_stop_price?: number
+  protection_verified_at?: string
   current_entry_price: number
   current_quantity: number
   current_leverage: number
@@ -1152,6 +1157,7 @@ export interface CopyGuardCycle {
     | 'DEGRADED'
     | 'UNPROTECTED_WARNING'
     | 'FORCED_EXIT_PENDING'
+    | 'POSITION_ABSENT'
     | 'TRIGGERED'
     | 'CANCELED'
     | 'CLAMPED' // v5：止损价被强平缓冲夹紧（比目标更紧），保护单有效

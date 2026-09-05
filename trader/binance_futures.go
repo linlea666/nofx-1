@@ -742,9 +742,9 @@ func (t *FuturesTrader) CloseShortPreservingOrdersWithClientID(symbol string, qu
 func (t *FuturesTrader) ExecuteCopyTradeMarketOrder(request CopyTradeMarketOrderRequest) (map[string]interface{}, error) {
 	switch request.Action {
 	case "open_long":
-		return t.createCopyMarketOrder(request.Symbol, request.Quantity, request.Leverage, futures.SideTypeBuy, futures.PositionSideTypeLong, request.ClientOrderID, false, request.BeforeSubmit)
+		return t.createCopyMarketOrder(request.Symbol, request.Quantity, request.Leverage, futures.SideTypeBuy, futures.PositionSideTypeLong, request.ClientOrderID, false, request.BeforeSubmit, request.OnLeverageConfirmed)
 	case "open_short":
-		return t.createCopyMarketOrder(request.Symbol, request.Quantity, request.Leverage, futures.SideTypeSell, futures.PositionSideTypeShort, request.ClientOrderID, false, request.BeforeSubmit)
+		return t.createCopyMarketOrder(request.Symbol, request.Quantity, request.Leverage, futures.SideTypeSell, futures.PositionSideTypeShort, request.ClientOrderID, false, request.BeforeSubmit, request.OnLeverageConfirmed)
 	case "close_long", "reduce_long":
 		return t.createCopyMarketOrder(request.Symbol, request.Quantity, 0, futures.SideTypeSell, futures.PositionSideTypeLong, request.ClientOrderID, true, request.BeforeSubmit)
 	case "close_short", "reduce_short":
@@ -754,7 +754,7 @@ func (t *FuturesTrader) ExecuteCopyTradeMarketOrder(request CopyTradeMarketOrder
 	}
 }
 
-func (t *FuturesTrader) createCopyMarketOrder(symbol string, quantity float64, leverage int, side futures.SideType, positionSide futures.PositionSideType, clientOrderID string, closing bool, beforeSubmit func() error) (map[string]interface{}, error) {
+func (t *FuturesTrader) createCopyMarketOrder(symbol string, quantity float64, leverage int, side futures.SideType, positionSide futures.PositionSideType, clientOrderID string, closing bool, beforeSubmit func() error, leverageObservers ...func(int)) (map[string]interface{}, error) {
 	symbol = strings.ToUpper(strings.TrimSpace(symbol))
 	var instrument *binanceExecutionInstrument
 	var err error
@@ -806,6 +806,7 @@ func (t *FuturesTrader) createCopyMarketOrder(symbol string, quantity float64, l
 		if err := t.SetLeverage(symbol, leverage); err != nil {
 			return nil, err
 		}
+		notifyLeverageConfirmed(leverage, leverageObservers)
 	}
 	quantityStr, err := formatBinanceMarketQuantity(instrument, symbol, math.Abs(quantity))
 	if err != nil {
@@ -1438,18 +1439,16 @@ func (t *FuturesTrader) GetMarketPrice(symbol string) (float64, error) {
 	return price, nil
 }
 
-// GetMarkPrice reads Binance's public premium-index endpoint. Unlike the
-// position snapshot fallback, this remains available after the real ATR path
-// has exited and a counterfactual Copy Guard shadow still needs the execution
-// venue's mark path.
-func (t *FuturesTrader) GetMarkPrice(symbol string) (float64, error) {
+// GetMarkPriceObservation reads Binance's dedicated mark endpoint and retains
+// venue time so live fixed-stop checks can reject stale or missing quotes.
+func (t *FuturesTrader) GetMarkPriceObservation(symbol string) (MarkPriceObservation, error) {
 	symbol = strings.ToUpper(strings.TrimSpace(symbol))
 	if symbol == "" {
-		return 0, fmt.Errorf("empty Binance mark-price symbol")
+		return MarkPriceObservation{}, fmt.Errorf("empty Binance mark-price symbol")
 	}
 	rows, err := t.client.NewPremiumIndexService().Symbol(symbol).Do(context.Background())
 	if err != nil {
-		return 0, fmt.Errorf("query Binance mark price: %w", err)
+		return MarkPriceObservation{}, fmt.Errorf("query Binance mark price: %w", err)
 	}
 	for _, row := range rows {
 		if row == nil || !strings.EqualFold(row.Symbol, symbol) {
@@ -1457,11 +1456,11 @@ func (t *FuturesTrader) GetMarkPrice(symbol string) (float64, error) {
 		}
 		price, parseErr := strconv.ParseFloat(row.MarkPrice, 64)
 		if parseErr != nil || price <= 0 || math.IsNaN(price) || math.IsInf(price, 0) {
-			return 0, fmt.Errorf("invalid Binance mark price for %s", symbol)
+			return MarkPriceObservation{}, fmt.Errorf("invalid Binance mark price for %s", symbol)
 		}
-		return price, nil
+		return MarkPriceObservation{Price: price, ObservedAt: time.UnixMilli(row.Time), Source: "binance_mark_endpoint"}, nil
 	}
-	return 0, fmt.Errorf("Binance mark price not found for %s", symbol)
+	return MarkPriceObservation{}, fmt.Errorf("Binance mark price not found for %s", symbol)
 }
 
 // GetMarkPriceHistory reads completed one-minute mark klines. It is report-only
@@ -1909,7 +1908,7 @@ func (t *FuturesTrader) GetOrderStatusByClientID(symbol, clientOrderID string) (
 		return nil, fmt.Errorf("failed to get Binance order by client id: %w", err)
 	}
 	if !found {
-		return nil, fmt.Errorf("order not found")
+		return nil, ErrExecutionOrderNotFound
 	}
 	return binanceOrderResult(order), nil
 }

@@ -48,19 +48,29 @@ func copyGuardLifecycleConfig(cycle *store.CopyGuardCycle, fallback *CopyConfig)
 		return nil
 	}
 	cfg := *fallback
-	if cycle == nil || strings.TrimSpace(cycle.PolicySnapshot) == "" {
+	if cycle == nil {
 		return &cfg
 	}
 	p, err := store.DecodeCopyGuardPolicySnapshot(cycle.PolicySnapshot)
 	if err != nil {
-		return &cfg
+		logger.Errorf("Copy Guard cycle %d has invalid policy snapshot: %v", cycle.ID, err)
+		return nil
 	}
 	hasPolicy := p.Version >= 4 || p.DefaultsVersion > 0 ||
 		p.ProtectionMode == store.RiskProtectionModeATRStructure ||
 		p.ProtectionMode == store.RiskProtectionModePositionMarginPct
 	if !hasPolicy {
-		return &cfg
+		return nil
 	}
+	// Missing legacy fields use the versioned compatibility defaults, never
+	// today's mutable trader template. Current snapshots persist these fields.
+	cfg.RiskAccountPct, cfg.RiskATRMultiplier, cfg.RiskATRTimeframe = .02, 2, "1h"
+	cfg.RiskLeverageFallback, cfg.RiskLeverageMaxLoss, cfg.RiskReentryRatio = true, .5, .5
+	cfg.RiskTriggerPriceType, cfg.RiskStopMode, cfg.RiskStopPriority = "mark", "volatility_priority", "volatility_first"
+	cfg.RiskATRPeriod, cfg.RiskATRCacheMaxAgeMinutes, cfg.RiskATRFallbackPct = 14, 120, .02
+	cfg.RiskReentryEnabled, cfg.RiskManualReentryEnabled, cfg.RiskReentryDecisionMode = false, false, "disabled"
+	cfg.RiskPolicyVersion, cfg.RiskNotificationLevel = 4, "important"
+	cfg.RiskUnprotectableDisposition, cfg.RiskUnprotectableAction = "warn", "follow"
 	// A lifecycle can only have been created while protection was enabled. The
 	// current trader master switch is a template for future positions and must
 	// not disable the immutable contract of this already-open cycle.
@@ -344,10 +354,11 @@ func EvaluatePositionMarginStop(in PositionMarginStopEvaluationInput) (*Position
 		}
 	}
 	if in.LiquidationPrice > 0 {
-		if !isLiquidationPriceDirectionValid(in.Side, in.CurrentEntryPrice, in.LiquidationPrice) {
+		if in.MarkPrice <= 0 || (in.Side == SideLong && in.LiquidationPrice > in.MarkPrice) || (in.Side == SideShort && in.LiquidationPrice < in.MarkPrice) {
 			result.LiquidationPriceIgnored = true
 		} else {
-			buffer := liquidationSafetyBuffer(in.PriceTickSize, in.ATRValue, in.CurrentEntryPrice, in.LiquidationBufferATR)
+			// Fixed-mode safety does not depend on dormant ATR configuration.
+			buffer := liquidationSafetyBuffer(in.PriceTickSize, 0, in.CurrentEntryPrice, 0)
 			if in.Side == SideLong && result.StopPrice <= in.LiquidationPrice+buffer {
 				result.StopPrice = alignToTickSize(in.LiquidationPrice+buffer, in.PriceTickSize, false)
 				result.Clamped = true
@@ -363,12 +374,36 @@ func EvaluatePositionMarginStop(in PositionMarginStopEvaluationInput) (*Position
 	if invalidPositive(result.StopPrice) {
 		return nil, fmt.Errorf("position-margin liquidation clamp is not representable")
 	}
-	adverseDistance := float64(0)
-	if in.Side == SideLong && result.StopPrice < in.CurrentEntryPrice {
-		adverseDistance = in.CurrentEntryPrice - result.StopPrice
+	if err := populatePositionMarginRisk(in, result.StopPrice, result); err != nil {
+		return nil, err
 	}
-	if in.Side == SideShort && result.StopPrice > in.CurrentEntryPrice {
-		adverseDistance = result.StopPrice - in.CurrentEntryPrice
+	if in.MarkPrice > 0 {
+		result.AlreadyCrossed = (in.Side == SideLong && in.MarkPrice <= result.StopPrice) ||
+			(in.Side == SideShort && in.MarkPrice >= result.StopPrice)
+	}
+	return result, nil
+}
+
+// PositionMarginRiskAtStop computes theoretical current-position risk at an already
+// chosen price. It never changes quantity, leverage or a strategy stop.
+func PositionMarginRiskAtStop(in PositionMarginStopEvaluationInput, stop float64) (*PositionMarginStopEvaluation, error) {
+	result := &PositionMarginStopEvaluation{StopPrice: stop}
+	if err := populatePositionMarginRisk(in, stop, result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func populatePositionMarginRisk(in PositionMarginStopEvaluationInput, stop float64, result *PositionMarginStopEvaluation) error {
+	if (in.Side != SideLong && in.Side != SideShort) || invalidPositive(in.CurrentEntryPrice) || invalidPositive(in.CurrentQuantity) || invalidPositive(in.CurrentLeverage) || invalidPositive(stop) || invalidNonNegative(in.FollowerEquity) || invalidNonNegative(in.ATRValue) {
+		return fmt.Errorf("invalid position-margin risk inputs")
+	}
+	adverseDistance := float64(0)
+	if in.Side == SideLong && stop < in.CurrentEntryPrice {
+		adverseDistance = in.CurrentEntryPrice - stop
+	}
+	if in.Side == SideShort && stop > in.CurrentEntryPrice {
+		adverseDistance = stop - in.CurrentEntryPrice
 	}
 	result.CurrentRiskUSD = adverseDistance * in.CurrentQuantity
 	result.CurrentMargin = in.CurrentEntryPrice * in.CurrentQuantity / in.CurrentLeverage
@@ -380,19 +415,14 @@ func EvaluatePositionMarginStop(in PositionMarginStopEvaluationInput) (*Position
 	}
 	if invalidNonNegative(result.CurrentRiskUSD) || invalidPositive(result.CurrentMargin) ||
 		invalidNonNegative(result.CurrentEffectiveMarginLossPct) || invalidNonNegative(result.CurrentAccountLossPct) {
-		return nil, fmt.Errorf("position-margin stop evaluation overflows")
+		return fmt.Errorf("position-margin stop evaluation overflows")
 	}
 	result.EquivalentPriceMovePct = adverseDistance / in.CurrentEntryPrice
 	if in.ATRValue > 0 {
 		result.DistanceATRRatio = adverseDistance / in.ATRValue
 	}
-	if in.MarkPrice > 0 {
-		result.AlreadyCrossed = (in.Side == SideLong && in.MarkPrice <= result.StopPrice) ||
-			(in.Side == SideShort && in.MarkPrice >= result.StopPrice)
-	}
-	return result, nil
+	return nil
 }
-
 func InferPositionMarginStopAnchorEntry(side SideType, stopPrice, leverage, configuredPct float64) (float64, error) {
 	if invalidPositive(stopPrice) || invalidPositive(leverage) || invalidRange(configuredPct, 0.01, 0.99) {
 		return 0, fmt.Errorf("invalid position-margin inverse input")

@@ -10,7 +10,7 @@ func newNotionalGuardCycle(t *testing.T, cs *CopyTradeStore, equity float64) *Co
 	cycle, err := cs.EnsureCopyGuardCycle(&CopyGuardCycle{
 		TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "pos-1",
 		Symbol: "BTCUSDT", Side: "long", MarginMode: "cross",
-		Status: CopyGuardFollowing, PolicySnapshot: "{}",
+		Status: CopyGuardFollowing, PolicySnapshot: `{"version":4}`,
 		LeaderEntryPrice: 100, FollowerEntryPrice: 100, FollowerNotional: 100,
 		AccountEquity: equity, LastObservedPrice: 100,
 	})

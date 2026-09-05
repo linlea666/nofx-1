@@ -99,14 +99,14 @@ func TestRiskExitGateSerializesTriggerAgainstVenueSubmission(t *testing.T) {
 	go func() { gateDone <- ti.establishRiskExitGate(begin) }()
 	select {
 	case err := <-gateDone:
-		t.Fatalf("risk gate crossed an already-running venue call: %v", err)
-	case <-time.After(30 * time.Millisecond):
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("trusted trigger waited for an in-flight venue call instead of gating queued submissions")
 	}
 	close(executor.release)
 	if err = <-firstDone; err != nil {
-		t.Fatal(err)
-	}
-	if err = <-gateDone; err != nil {
 		t.Fatal(err)
 	}
 	if err = ti.executeDecisionUnderRiskExitGate(dec, dec); !errors.Is(err, errCopyGuardRiskExitGate) {
@@ -118,6 +118,33 @@ func TestRiskExitGateSerializesTriggerAgainstVenueSubmission(t *testing.T) {
 	mapping, err := st.CopyTrade().GetMapping("gate-trader", "leader-pos")
 	if err != nil || mapping.Status != store.MappingStatusStoppedByRisk {
 		t.Fatalf("risk gate was not persisted with mapping: mapping=%+v err=%v", mapping, err)
+	}
+}
+
+func TestRiskExitGateConcurrentEvidenceDoesNotShareMutableAuditMap(t *testing.T) {
+	st, cycle, _ := seedHardeningFill(t)
+	ti := NewTraderIntegration("t", &blockingRiskExitExecutor{}, st)
+	metadata := map[string]interface{}{"actual_order_id": "hosted-fill"}
+	begin := store.CopyGuardRiskExitBegin{CycleID: cycle.ID, TraderID: "t", LeaderPosID: "p", Quantity: 1, TriggerPrice: 92, TriggerSource: "exchange_hosted", Metadata: metadata}
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = ti.establishRiskExitGate(begin)
+		}()
+	}
+	wg.Wait()
+	if err := ti.establishRiskExitGate(begin); err != nil {
+		t.Fatal(err)
+	}
+	if len(metadata) != 1 {
+		t.Fatalf("store mutated caller evidence: %+v", metadata)
+	}
+	ti.riskExitMu.RLock()
+	defer ti.riskExitMu.RUnlock()
+	if len(ti.riskExitGates["p"].begin.Metadata) != 1 {
+		t.Fatal("store mutated shared gate evidence")
 	}
 }
 
@@ -182,6 +209,23 @@ func TestRiskExitGateAllowsOnlyDurablyPendingReentry(t *testing.T) {
 	}
 	if executor.callCount() != 0 {
 		t.Fatalf("non-pending reentry reached venue %d times", executor.callCount())
+	}
+	if err = st.CopyTrade().UpdateCopyGuardObservation(cycle.ID, store.CopyGuardReentryPending, 100, 95, 1); err != nil {
+		t.Fatal(err)
+	}
+	if !ti.riskExitGateActive(reentry) {
+		t.Fatal("observation bypassed risk-exit flat confirmation")
+	}
+	// A durable reentry contract may resume only after the original exit has
+	// settled. Observation alone must not overwrite STOP_PENDING_FLAT.
+	if _, err = st.CopyTrade().FinalizeCopyGuardRiskExit(store.CopyGuardRiskExitFinalize{
+		CopyGuardRiskExitBegin: store.CopyGuardRiskExitBegin{
+			CycleID: cycle.ID, TraderID: "gate-reentry-trader", LeaderPosID: "leader-pos",
+			AttemptNo: 0, Quantity: 1, TriggerSource: "test_flat_confirmed",
+		},
+		ExitPrice: 92,
+	}); err != nil {
+		t.Fatal(err)
 	}
 	if err = st.CopyTrade().UpdateCopyGuardObservation(cycle.ID, store.CopyGuardReentryPending, 100, 95, 1); err != nil {
 		t.Fatal(err)

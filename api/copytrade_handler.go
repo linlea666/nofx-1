@@ -544,6 +544,7 @@ type positionMarginAudit struct {
 	RawFormulaStopPrice          float64    `json:"raw_formula_stop_price"`
 	TickAlignedStopPrice         float64    `json:"tick_aligned_stop_price"`
 	EffectiveStopPrice           float64    `json:"effective_stop_price"`
+	DesiredStopPrice             float64    `json:"desired_stop_price"`
 	CurrentEntryPrice            float64    `json:"current_entry_price"`
 	CurrentQuantity              float64    `json:"current_quantity"`
 	CurrentLeverage              float64    `json:"current_leverage"`
@@ -562,6 +563,7 @@ type positionMarginAudit struct {
 	CoverageRatio                float64    `json:"coverage_ratio"`
 	ProtectionStatus             string     `json:"protection_status"`
 	DataTimestamp                *time.Time `json:"data_timestamp,omitempty"`
+	ProtectionVerifiedAt         *time.Time `json:"protection_verified_at,omitempty"`
 	DataQuality                  string     `json:"data_quality"`
 	UnscorableReason             string     `json:"unscorable_reason,omitempty"`
 	CostsExcludedFromTrigger     bool       `json:"costs_excluded_from_trigger"`
@@ -625,9 +627,12 @@ func buildPositionMarginAudit(cycle *store.CopyGuardCycle, artifacts *copyGuardC
 	audit.StopAnchorInitialMargin = attempt.StopAnchorInitialMargin
 	audit.StopAnchorTheoreticalRiskUSD = attempt.StopAnchorInitialMargin * attempt.StopConfiguredMarginLossPct
 	audit.TickAlignedStopPrice = attempt.StopAnchorPrice
-	audit.EffectiveStopPrice = attempt.FinalStopPrice
-	if audit.EffectiveStopPrice <= 0 {
-		audit.EffectiveStopPrice = attempt.StopAnchorPrice
+	audit.DesiredStopPrice = attempt.FinalStopPrice
+	if audit.DesiredStopPrice <= 0 {
+		audit.DesiredStopPrice = attempt.StopAnchorPrice
+	}
+	if artifacts.Protection != nil {
+		audit.EffectiveStopPrice = artifacts.Protection.TriggerPrice
 	}
 	audit.CurrentEntryPrice = attempt.EntryPrice
 	audit.CurrentQuantity = attempt.Quantity
@@ -640,24 +645,13 @@ func buildPositionMarginAudit(cycle *store.CopyGuardCycle, artifacts *copyGuardC
 	}
 	if attempt.EntryPrice > 0 && attempt.Quantity > 0 && attempt.ActualLeverage > 0 {
 		audit.CurrentMargin = attempt.EntryPrice * attempt.Quantity / attempt.ActualLeverage
-		adverseDistance := 0.0
-		if cycle.Side == string(copytrade.SideLong) && audit.EffectiveStopPrice < attempt.EntryPrice {
-			adverseDistance = attempt.EntryPrice - audit.EffectiveStopPrice
-		}
-		if cycle.Side == string(copytrade.SideShort) && audit.EffectiveStopPrice > attempt.EntryPrice {
-			adverseDistance = audit.EffectiveStopPrice - attempt.EntryPrice
-		}
-		audit.CurrentStopRiskUSD = adverseDistance * attempt.Quantity
-		if audit.CurrentMargin > 0 {
-			audit.CurrentMarginLossPct = audit.CurrentStopRiskUSD / audit.CurrentMargin
-		}
-		if cycle.AccountEquity > 0 {
-			audit.CurrentAccountLossPct = audit.CurrentStopRiskUSD / cycle.AccountEquity
-		}
-		audit.EquivalentPriceMovePct = adverseDistance / attempt.EntryPrice
-		if attempt.ATR > 0 {
-			audit.DistanceATR = adverseDistance / attempt.ATR
-		}
+	}
+	if risk, err := copytrade.PositionMarginRiskAtStop(copytrade.PositionMarginStopEvaluationInput{Side: copytrade.SideType(cycle.Side), CurrentEntryPrice: attempt.EntryPrice, CurrentQuantity: attempt.Quantity, CurrentLeverage: attempt.ActualLeverage, FollowerEquity: cycle.AccountEquity, ATRValue: attempt.ATR}, audit.EffectiveStopPrice); err == nil {
+		audit.CurrentStopRiskUSD = risk.CurrentRiskUSD
+		audit.CurrentMarginLossPct = risk.CurrentEffectiveMarginLossPct
+		audit.CurrentAccountLossPct = risk.CurrentAccountLossPct
+		audit.EquivalentPriceMovePct = risk.EquivalentPriceMovePct
+		audit.DistanceATR = risk.DistanceATRRatio
 	}
 	if attempt.CurrentMarkAt != nil {
 		audit.DataTimestamp = attempt.CurrentMarkAt
@@ -667,6 +661,7 @@ func buildPositionMarginAudit(cycle *store.CopyGuardCycle, artifacts *copyGuardC
 		audit.HostedOrderID = artifacts.Protection.AlgoID
 		audit.CoverageMode = artifacts.Protection.CoverageMode
 		updated := artifacts.Protection.UpdatedAt
+		audit.ProtectionVerifiedAt = &updated
 		if audit.DataTimestamp == nil {
 			audit.DataTimestamp = &updated
 		}
@@ -690,6 +685,12 @@ func buildPositionMarginAudit(cycle *store.CopyGuardCycle, artifacts *copyGuardC
 	if audit.RawFormulaStopPrice <= 0 || audit.CurrentEntryPrice <= 0 || audit.CurrentQuantity <= 0 || audit.CurrentLeverage <= 0 {
 		audit.DataQuality = "PARTIAL"
 		audit.UnscorableReason = "current position audit fields are incomplete"
+		return audit
+	}
+	if cycle.ClosedAt == nil && (artifacts.Protection == nil || !strings.EqualFold(artifacts.Protection.Status, "live") ||
+		audit.TriggerType != "mark" || audit.EffectiveStopPrice <= 0 || math.Abs(audit.EffectiveStopPrice-audit.DesiredStopPrice) > 1e-8) {
+		audit.DataQuality = "PARTIAL"
+		audit.UnscorableReason = "requested mark stop is not fully verified at the exchange; displayed price is the last observed venue order"
 		return audit
 	}
 	markAge := time.Duration(0)
@@ -1331,16 +1332,17 @@ func (h *CopyTradeHandler) DismissManualSignal(c *gin.Context) {
 
 // CopyTradeConfigRequest 跟单配置请求
 type CopyTradeConfigRequest struct {
-	ProviderType             string   `json:"provider_type" binding:"required,oneof=hyperliquid okx binance"`
-	LeaderID                 string   `json:"leader_id"`
-	CopyRatio                float64  `json:"copy_ratio" binding:"required,gt=0"`
-	SyncLeverage             bool     `json:"sync_leverage"`
-	SyncMarginMode           bool     `json:"sync_margin_mode"`
-	MinTradeWarn             float64  `json:"min_trade_warn"`
-	MaxTradeWarn             float64  `json:"max_trade_warn"`
-	CopyCatchupWindowSeconds *int     `json:"copy_catchup_window_seconds,omitempty"`
-	CopyCatchupMaxAdverseBPS *float64 `json:"copy_catchup_max_adverse_bps,omitempty"`
-	Enabled                  bool     `json:"enabled"`
+	ATRProfilePatch          *store.CopyGuardATRProfilePatch `json:"atr_profile_patch,omitempty"`
+	ProviderType             string                          `json:"provider_type" binding:"required,oneof=hyperliquid okx binance"`
+	LeaderID                 string                          `json:"leader_id"`
+	CopyRatio                float64                         `json:"copy_ratio" binding:"required,gt=0"`
+	SyncLeverage             bool                            `json:"sync_leverage"`
+	SyncMarginMode           bool                            `json:"sync_margin_mode"`
+	MinTradeWarn             float64                         `json:"min_trade_warn"`
+	MaxTradeWarn             float64                         `json:"max_trade_warn"`
+	CopyCatchupWindowSeconds *int                            `json:"copy_catchup_window_seconds,omitempty"`
+	CopyCatchupMaxAdverseBPS *float64                        `json:"copy_catchup_max_adverse_bps,omitempty"`
+	Enabled                  bool                            `json:"enabled"`
 
 	// Binance Web 凭证（仅 ProviderType=binance 时使用）
 	BinanceP20T        string `json:"binance_p20t"`
@@ -1466,6 +1468,7 @@ func sanitizeSourceHealthError(value string) string {
 func (h *CopyTradeHandler) GetRiskDefaults(c *gin.Context) {
 	d := store.NewCopyGuardDefaults()
 	c.JSON(http.StatusOK, gin.H{
+		"copy_guard_capabilities":          copyGuardRuntimeCapabilities(),
 		"defaults_version":                 store.CopyGuardDefaultsVersion(),
 		"defaults":                         d,
 		"copy_guard_max_position_loss_pct": store.DefaultCopyGuardMaxPositionLossPct,
@@ -1789,6 +1792,10 @@ func (h *CopyTradeHandler) SaveConfig(c *gin.Context) {
 		return
 	}
 	profileDefaulted := store.NormalizeCopyGuardProtectionModeTransition(config, existing)
+	if err := store.ApplyCopyGuardATRProfilePatch(config, req.ATRProfilePatch); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 	if profileDefaulted {
 		logger.Warnf("⚠️ Copy Guard trader %s had no dormant ATR profile; restored canonical defaults", traderID)
 	}
@@ -1839,6 +1846,10 @@ func (h *CopyTradeHandler) SaveConfig(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save config"})
 		return
 	}
+	if err := verifyCopyGuardConfigReadback(h.store, config); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error(), "persisted": true})
+		return
+	}
 	disableReentryCandidatesAfterConfigSave(h.store, existing, config)
 
 	// 更新 trader 的决策模式
@@ -1857,10 +1868,11 @@ func (h *CopyTradeHandler) SaveConfig(c *gin.Context) {
 		traderID, req.ProviderType, req.LeaderID, req.CopyRatio*100)
 
 	response := gin.H{
-		"message":                "config saved",
-		"config":                 maskedCopyTradeConfig(config),
-		"call_limits_deprecated": true,
-		"call_limit_semantics":   "soft_cost_warning_only",
+		"message":                 "config saved",
+		"copy_guard_capabilities": copyGuardRuntimeCapabilities(),
+		"config":                  maskedCopyTradeConfig(config),
+		"call_limits_deprecated":  true,
+		"call_limit_semantics":    "soft_cost_warning_only",
 	}
 	if manualDeprecated {
 		response["deprecated"] = manualReentryDeprecatedMessage

@@ -304,6 +304,9 @@ func (e *Engine) SetCopyGuardShadowFinalize(fn func(int64, float64) error) {
 }
 
 func (e *Engine) finalizeCopyGuardPositionMarginShadow(cycleID int64, closePrice float64) error {
+	if !store.CopyGuardShadowRuntimeEnabled {
+		return nil
+	}
 	if e.copyGuardShadowFinalize != nil {
 		return e.copyGuardShadowFinalize(cycleID, closePrice)
 	}
@@ -3163,6 +3166,10 @@ func (e *Engine) closeCopyGuardCycleAtLeaderExit(mapping *store.CopyTradePositio
 		}
 		logger.Warnf("⚠️ [%s] 查询待关闭 Copy Guard 周期失败: %v | posId=%s", e.traderID, err, mapping.LeaderPosID)
 		return false
+	}
+
+	if store.CopyGuardRiskExitPending(cycle.Status) {
+		return false // The risk monitor must finish residual exits before source retirement.
 	}
 
 	// Prefer authoritative public leader history. When it is delayed, close

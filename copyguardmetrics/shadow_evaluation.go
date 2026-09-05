@@ -112,6 +112,14 @@ func EvaluateCycleShadowPolicies(st *store.Store, cycleID int64) ([]*store.CopyG
 	if st == nil || cycleID <= 0 {
 		return nil, fmt.Errorf("invalid shadow evaluation context")
 	}
+	// Compatibility reads never recalculate historical observations.
+	return st.CopyTrade().ListCopyGuardShadowEvaluations(cycleID)
+}
+
+func evaluateArchivedCycleShadowPolicies(st *store.Store, cycleID int64) ([]*store.CopyGuardShadowEvaluation, error) {
+	if st == nil || cycleID <= 0 {
+		return nil, fmt.Errorf("invalid shadow evaluation context")
+	}
 	cycle, err := st.CopyTrade().GetCopyGuardCycle(cycleID)
 	if err != nil {
 		return nil, err
@@ -348,6 +356,10 @@ func minPositiveMetric(current, candidate float64) float64 {
 func BuildShadowPromotionReport(
 	st *store.Store, traderIDs []string, from, to time.Time,
 ) (*ShadowPromotionReport, error) {
+	return &ShadowPromotionReport{}, nil
+}
+
+func buildArchivedShadowPromotionReport(st *store.Store, traderIDs []string, from, to time.Time) (*ShadowPromotionReport, error) {
 	rows, err := st.CopyTrade().ListCopyGuardShadowEvaluationsForTraders(traderIDs, from, to)
 	if err != nil {
 		return nil, err

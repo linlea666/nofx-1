@@ -42,7 +42,7 @@ func ensureReviewableReentryCycle(t *testing.T, st *Store, id int64, traderID, l
 	}
 	if _, err := st.DB().Exec(`INSERT INTO copy_guard_cycles
 		(id,trader_id,leader_id,leader_pos_id,symbol,side,margin_mode,status,policy_snapshot)
-		VALUES(?,?,?,?,?,?,?,'AI_WAITING','{}')`,
+		VALUES(?,?,?,?,?,?,?,'AI_WAITING','{"version":4}')`,
 		id, traderID, "leader", leaderPosID, symbol, side, "cross"); err != nil {
 		t.Fatal(err)
 	}
@@ -513,7 +513,7 @@ func TestCandidateStaleLeaseRecovery(t *testing.T) {
 	}
 	defer st.Close()
 	rs := st.ReentryAI()
-	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&CopyGuardCycle{TraderID: "trader-a", LeaderPosID: "leader-pos", Symbol: "ETHUSDT", Side: "long", Status: CopyGuardAIWaiting})
+	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&CopyGuardCycle{PolicySnapshot: `{"version":4}`, TraderID: "trader-a", LeaderPosID: "leader-pos", Symbol: "ETHUSDT", Side: "long", Status: CopyGuardAIWaiting})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1325,7 +1325,7 @@ func TestCycleCloseReleasesRiskReservation(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&CopyGuardCycle{TraderID: "trader-a", LeaderPosID: "pos", Symbol: "ETHUSDT", Side: "long", Status: CopyGuardFollowing})
+	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&CopyGuardCycle{PolicySnapshot: `{"version":4}`, TraderID: "trader-a", LeaderPosID: "pos", Symbol: "ETHUSDT", Side: "long", Status: CopyGuardFollowing})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -12,7 +12,7 @@ import (
 
 func TestBuildCopyGuardAttributionSeparatesAttempts(t *testing.T) {
 	now := time.Now()
-	cycle := &store.CopyGuardCycle{Side: "long", LeaderEntryPrice: 100, LastObservedPrice: 95, ActualPnL: -7, BaselinePnL: -20, Fees: 1, Slippage: .5, AccountingStatus: store.CopyGuardAccountingReconciled, ClosedAt: &now}
+	cycle := &store.CopyGuardCycle{PolicySnapshot: `{"version":4}`, Side: "long", LeaderEntryPrice: 100, LastObservedPrice: 95, ActualPnL: -7, BaselinePnL: -20, Fees: 1, Slippage: .5, AccountingStatus: store.CopyGuardAccountingReconciled, ClosedAt: &now}
 	attempts := []*store.CopyGuardAttempt{
 		{AttemptNo: 0, PnL: -5, Reconciled: true},
 		{AttemptNo: 1, PnL: -4, Reconciled: true},

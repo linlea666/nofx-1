@@ -160,7 +160,7 @@ func TestCopyGuardPositionMarginStopAuditIsAtomicallyOneWay(t *testing.T) {
 	cs := st.CopyTrade()
 	cycle, err := cs.EnsureCopyGuardCycle(&CopyGuardCycle{
 		TraderID: "one-way-trader", LeaderID: "leader", LeaderPosID: "position",
-		Symbol: "ETHUSDT", Side: "long", Status: CopyGuardFollowing, PolicySnapshot: "{}",
+		Symbol: "ETHUSDT", Side: "long", Status: CopyGuardFollowing, PolicySnapshot: `{"version":4}`,
 		FollowerEntryPrice: 100, FollowerNotional: 100,
 	})
 	if err != nil {
@@ -379,7 +379,7 @@ func TestPositionMarginShadowV2AccountsForAddsReductionsCrossingCostsAndCoverage
 	cycle, err := cs.EnsureCopyGuardCycle(&CopyGuardCycle{
 		TraderID: "shadow-v2-trader", LeaderID: "leader", LeaderPosID: "v2-pos",
 		Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", Status: CopyGuardFollowing,
-		PolicySnapshot: "{}",
+		PolicySnapshot: `{"version":4}`,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -481,7 +481,7 @@ func TestPositionMarginShadowV2NoCrossClosesAtLeaderExit(t *testing.T) {
 	cycle, err := cs.EnsureCopyGuardCycle(&CopyGuardCycle{
 		TraderID: "shadow-v2-no-cross", LeaderID: "leader", LeaderPosID: "no-cross",
 		Symbol: "ETHUSDT", Side: "short", MarginMode: "cross", Status: CopyGuardFollowing,
-		PolicySnapshot: "{}",
+		PolicySnapshot: `{"version":4}`,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -532,7 +532,7 @@ func TestPositionMarginShadowV2IncompleteMarkPathIsUnscorable(t *testing.T) {
 	cycle, err := cs.EnsureCopyGuardCycle(&CopyGuardCycle{
 		TraderID: "shadow-v2-gap", LeaderID: "leader", LeaderPosID: "gap",
 		Symbol: "BTCUSDT", Side: "long", MarginMode: "cross", Status: CopyGuardFollowing,
-		PolicySnapshot: "{}",
+		PolicySnapshot: `{"version":4}`,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -582,7 +582,7 @@ func TestPositionMarginShadowV2MissingLeaderCloseFinalizesUnscorable(t *testing.
 	cycle, err := cs.EnsureCopyGuardCycle(&CopyGuardCycle{
 		TraderID: "shadow-v2-missing-close", LeaderID: "leader", LeaderPosID: "missing-close",
 		Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", Status: CopyGuardFollowing,
-		PolicySnapshot: "{}",
+		PolicySnapshot: `{"version":4}`,
 	})
 	if err != nil {
 		t.Fatal(err)

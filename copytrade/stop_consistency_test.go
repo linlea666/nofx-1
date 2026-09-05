@@ -19,51 +19,51 @@ func TestMigrationSkipsPositionsCopyGuardAlreadyHandles(t *testing.T) {
 	}{
 		{
 			name:     "verified stop covering the position",
-			cycle:    &store.CopyGuardCycle{ProtectionStatus: store.CopyGuardProtectionVerified, ProtectionCoverage: 1},
+			cycle:    &store.CopyGuardCycle{PolicySnapshot: `{"version":4}`, ProtectionStatus: store.CopyGuardProtectionVerified, ProtectionCoverage: 1},
 			wantSkip: true,
 		},
 		{
 			// CLAMPED is tighter than policy wants but it is a live stop.
 			name:     "clamped stop covering the position",
-			cycle:    &store.CopyGuardCycle{ProtectionStatus: store.CopyGuardProtectionClamped, ProtectionCoverage: 0.9995},
+			cycle:    &store.CopyGuardCycle{PolicySnapshot: `{"version":4}`, ProtectionStatus: store.CopyGuardProtectionClamped, ProtectionCoverage: 0.9995},
 			wantSkip: true,
 		},
 		{
 			name:     "verified stop covering only part of the position",
-			cycle:    &store.CopyGuardCycle{ProtectionStatus: store.CopyGuardProtectionVerified, ProtectionCoverage: 0.8},
+			cycle:    &store.CopyGuardCycle{PolicySnapshot: `{"version":4}`, ProtectionStatus: store.CopyGuardProtectionVerified, ProtectionCoverage: 0.8},
 			wantSkip: false,
 		},
 		{
 			// A deliberate policy outcome: keep following under an alert. The
 			// migration path must not override it.
 			name:     "unprotected warning disposition",
-			cycle:    &store.CopyGuardCycle{ProtectionStatus: store.CopyGuardProtectionUnprotectedWarning},
+			cycle:    &store.CopyGuardCycle{PolicySnapshot: `{"version":4}`, ProtectionStatus: store.CopyGuardProtectionUnprotectedWarning},
 			wantSkip: true,
 		},
 		{
 			name:     "unprotectable disposition",
-			cycle:    &store.CopyGuardCycle{ProtectionStatus: store.CopyGuardProtectionUnprotectable},
+			cycle:    &store.CopyGuardCycle{PolicySnapshot: `{"version":4}`, ProtectionStatus: store.CopyGuardProtectionUnprotectable},
 			wantSkip: true,
 		},
 		{
 			name:     "forced exit already in flight",
-			cycle:    &store.CopyGuardCycle{ProtectionStatus: store.CopyGuardProtectionForcedExitPending},
+			cycle:    &store.CopyGuardCycle{PolicySnapshot: `{"version":4}`, ProtectionStatus: store.CopyGuardProtectionForcedExitPending},
 			wantSkip: true,
 		},
 		{
 			// The genuine naked-position gap this reconciler exists for.
 			name:     "pending with no live stop",
-			cycle:    &store.CopyGuardCycle{ProtectionStatus: store.CopyGuardProtectionPending},
+			cycle:    &store.CopyGuardCycle{PolicySnapshot: `{"version":4}`, ProtectionStatus: store.CopyGuardProtectionPending},
 			wantSkip: false,
 		},
 		{
 			name:     "degraded with no live stop",
-			cycle:    &store.CopyGuardCycle{ProtectionStatus: store.CopyGuardProtectionDegraded, ProtectionCoverage: 1},
+			cycle:    &store.CopyGuardCycle{PolicySnapshot: `{"version":4}`, ProtectionStatus: store.CopyGuardProtectionDegraded, ProtectionCoverage: 1},
 			wantSkip: false,
 		},
 		{
 			name:     "unknown with no live stop",
-			cycle:    &store.CopyGuardCycle{ProtectionStatus: store.CopyGuardProtectionUnknown},
+			cycle:    &store.CopyGuardCycle{PolicySnapshot: `{"version":4}`, ProtectionStatus: store.CopyGuardProtectionUnknown},
 			wantSkip: false,
 		},
 	} {

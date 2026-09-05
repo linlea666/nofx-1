@@ -15,6 +15,10 @@ var ErrProtectiveStopNotFound = errors.New("protective stop not found")
 
 var ErrExecutionInstrumentUnsupported = errors.New("execution instrument unsupported")
 
+// Only an authoritative venue not-found response may permit a retry of the
+// same idempotent exit identity after an ambiguous submission.
+var ErrExecutionOrderNotFound = errors.New("order not found")
+
 // IsProtectiveStopAlreadyTriggerable reports that a venue refused a protective
 // stop because its trigger price is already on the wrong side of the market —
 // OKX 51280 and Binance -2021 ("Order would immediately trigger").
@@ -144,6 +148,24 @@ type ProtectiveStopRequest struct {
 	CoverageMode string
 }
 
+// CopyGuardExitRequest carries a complete scope and durable submission identity.
+// It never changes shared adapter margin-mode state or cancels unrelated orders.
+type CopyGuardExitRequest struct {
+	CycleID       int64
+	AttemptNo     int
+	Symbol        string
+	Side          string
+	MarginMode    string
+	PositionID    string
+	Quantity      float64
+	ClientOrderID string
+	BeforeSubmit  func() error
+}
+
+type CopyGuardScopedCloser interface {
+	CloseCopyGuardPosition(CopyGuardExitRequest) (map[string]interface{}, error)
+}
+
 const (
 	ProtectiveStopCoverageCloseAll      = "CLOSE_ALL"
 	ProtectiveStopCoverageExactQuantity = "EXACT_QUANTITY"
@@ -246,12 +268,13 @@ type CopyTradeIdempotentOrderExecutor interface {
 // when adopting an existing idempotent order they invoke it before returning
 // the adopted result.
 type CopyTradeMarketOrderRequest struct {
-	Action        string
-	Symbol        string
-	Quantity      float64
-	Leverage      int
-	ClientOrderID string
-	BeforeSubmit  func() error
+	Action              string
+	Symbol              string
+	Quantity            float64
+	Leverage            int
+	ClientOrderID       string
+	BeforeSubmit        func() error
+	OnLeverageConfirmed func(int)
 }
 
 type CopyTradeSubmissionBoundaryExecutor interface {

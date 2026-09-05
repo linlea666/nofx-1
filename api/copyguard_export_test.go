@@ -28,7 +28,7 @@ func TestExportRiskCycleUsesTraderNameAndOwnership(t *testing.T) {
 	if err := st.Trader().Create(&store.Trader{ID: "trader-1", UserID: "user-1", Name: "156-平凡无奇交易员", AIModelID: "model", ExchangeID: "exchange"}); err != nil {
 		t.Fatal(err)
 	}
-	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "position", Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", Status: store.CopyGuardFollowing, PolicySnapshot: "{}"})
+	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "position", Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", Status: store.CopyGuardFollowing, PolicySnapshot: `{"version":4}`})
 	if err != nil {
 		t.Fatal(err)
 	}

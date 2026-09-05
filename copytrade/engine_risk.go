@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"strings"
 	"time"
 
 	"nofx/decision"
@@ -233,7 +232,7 @@ func isLiquidationPriceDirectionValid(side SideType, entryPrice, liquidationPric
 // 的"拒单放大器"），0.15% 价格封顶保证缓冲永远不会大到让止损挂不出去。
 // ATR 不可得（fallback 距离）时直接用 0.15% 封顶值。
 func liquidationSafetyBuffer(tickSize, atrValue, entryPrice, bufferATR float64) float64 {
-	if bufferATR <= 0 {
+	if bufferATR < 0 {
 		bufferATR = 0.25
 	}
 	buffer := entryPrice * 0.0015
@@ -396,16 +395,9 @@ func (e *Engine) findLocalPositionForMapping(localPositions map[string]*Position
 	return false
 }
 
-// deferPositionAbsentRiskExitForLiveProtection keeps the position-absent
-// fallback from outrunning the venue's own stop state. A follower position can
-// also disappear because of manual/second-program activity. When the durable
-// protective order is still explicitly live, that is positive evidence that
-// the exchange has not reported a stop trigger yet: mark any reliable quantity
-// mismatch unscorable and wait for triggered/filled/invalid convergence.
-//
-// The fallback remains available as soon as the protective state is no longer
-// live, including the OKX purged-order path. This only delays attribution; it
-// never cancels protection or submits an order.
+// Position absence alone is never a stop fill. Only a persisted authoritative
+// hosted trigger permits this fallback; canceled, purged and missing orders
+// remain unverified. This check never cancels protection or submits an order.
 func (e *Engine) deferPositionAbsentRiskExitForLiveProtection(cycle *store.CopyGuardCycle) bool {
 	if e == nil || e.store == nil || cycle == nil {
 		return false
@@ -416,9 +408,9 @@ func (e *Engine) deferPositionAbsentRiskExitForLiveProtection(cycle *store.CopyG
 			logger.Warnf("⚠️ [%s] 仓位消失时保护单状态读取失败，本轮不抢先归因为止损 | cycle=%d: %v", e.traderID, cycle.ID, err)
 			return true
 		}
-		return false
+		return true
 	}
-	if !strings.EqualFold(strings.TrimSpace(protective.Status), "live") {
+	if isProtectiveStopFired(protective.Status) {
 		return false
 	}
 
@@ -437,7 +429,7 @@ func (e *Engine) deferPositionAbsentRiskExitForLiveProtection(cycle *store.CopyG
 			if markErr != nil {
 				logger.Errorf("❌ [%s] 空仓归属异常持久化失败，等待交易所保护单状态收敛 | cycle=%d: %v", e.traderID, cycle.ID, markErr)
 			} else if changed {
-				logger.Errorf("🚨 [%s] 保护单仍 live 但跟随仓位已归零，判为仓位归属异常而非可信止损 | cycle=%d %s %s",
+				logger.Errorf("🚨 [%s] 跟随仓位已归零但无保护单触发证据，判为仓位归属异常而非可信止损 | cycle=%d %s %s",
 					e.traderID, cycle.ID, cycle.Symbol, cycle.Side)
 			}
 		}
@@ -568,12 +560,18 @@ func (e *Engine) checkStoppedByRisk() {
 			continue
 		}
 		if e.deferPositionAbsentRiskExitForLiveProtection(cycle) {
-			logger.Debugf("⏳ [%s] 跟随仓位已消失但保护单仍 live，等待交易所状态收敛 | cycle=%d posId=%s",
+			logger.Debugf("⏳ [%s] 跟随仓位已消失但无保护单触发证据，不归因为止损 | cycle=%d posId=%s",
 				e.traderID, cycle.ID, mapping.LeaderPosID)
 			continue
 		}
 		cycleConfig := copyGuardLifecycleConfig(cycle, e.config)
-		atr, _ := market.GetOKXATRWithMaxAge(mapping.Symbol, cycleConfig.RiskATRTimeframe, cycleConfig.RiskATRPeriod, riskATRCacheMaxAge(cycleConfig))
+		if cycleConfig == nil {
+			continue
+		}
+		atr := float64(0)
+		if cycleConfig.RiskProtectionMode != store.RiskProtectionModePositionMarginPct {
+			atr, _ = market.GetOKXATRWithMaxAge(mapping.Symbol, cycleConfig.RiskATRTimeframe, cycleConfig.RiskATRPeriod, riskATRCacheMaxAge(cycleConfig))
+		}
 		metadata := map[string]interface{}{"confirmation": "position_absent_fallback", "leader_unrealized_pnl": leaderPnL}
 		begin := store.CopyGuardRiskExitBegin{
 			CycleID: cycle.ID, TraderID: e.traderID, LeaderPosID: mapping.LeaderPosID,
@@ -711,7 +709,7 @@ func (e *Engine) checkReentryConditions() {
 			logger.Debugf("[%s] Copy Guard 生命周期不存在: %v", e.traderID, err)
 			continue
 		}
-		if v4Cycle.Status == store.CopyGuardReentryPending {
+		if v4Cycle.Status == store.CopyGuardReentryPending || store.CopyGuardRiskExitPending(v4Cycle.Status) {
 			continue
 		}
 		cycleConfig := copyGuardLifecycleConfig(v4Cycle, e.config)

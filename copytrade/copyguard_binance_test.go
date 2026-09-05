@@ -109,7 +109,7 @@ func TestBinanceStoppedByRiskDetectedForV4(t *testing.T) {
 	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{
 		TraderID: e.traderID, LeaderID: e.config.LeaderID, LeaderPosID: posID,
 		Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", Status: store.CopyGuardFollowing,
-		PolicySnapshot: "{}", LeaderEntryPrice: 2096.58, FollowerEntryPrice: 2096.58,
+		PolicySnapshot: `{"version":4}`, LeaderEntryPrice: 2096.58, FollowerEntryPrice: 2096.58,
 		FollowerNotional: 41.9316, AccountEquity: 100,
 	})
 	if err != nil {
@@ -123,6 +123,9 @@ func TestBinanceStoppedByRiskDetectedForV4(t *testing.T) {
 	e.leaderState.Positions[posID] = binanceTestPosition(posID, 0.02)
 
 	// 跟随者本地无任何仓位（模拟止损已被执行交易所触发平掉）
+	if err = st.CopyTrade().UpsertCopyGuardProtectiveOrder(&store.CopyGuardProtectiveOrder{CycleID: cycle.ID, TraderID: e.traderID, Symbol: cycle.Symbol, Side: cycle.Side, MarginMode: cycle.MarginMode, AlgoID: "confirmed-trigger", Status: "triggered", TriggerPrice: 2000, TriggerType: "mark"}); err != nil {
+		t.Fatal(err)
+	}
 	e.getFollowerPositionsResult = func() (map[string]*Position, error) {
 		return map[string]*Position{}, nil
 	}
@@ -254,7 +257,7 @@ func TestBinancePosIDReuseCreatesFreshCycle(t *testing.T) {
 	first, err := cs.EnsureCopyGuardCycle(&store.CopyGuardCycle{
 		TraderID: "t", LeaderID: "leader", LeaderPosID: posID, Symbol: "ETHUSDT",
 		Side: "long", MarginMode: "cross", Status: store.CopyGuardFollowing,
-		PolicySnapshot: "{}", LeaderEntryPrice: 2000, FollowerEntryPrice: 2000,
+		PolicySnapshot: `{"version":4}`, LeaderEntryPrice: 2000, FollowerEntryPrice: 2000,
 		FollowerNotional: 100, AccountEquity: 1000, LastObservedPrice: 2000,
 	})
 	if err != nil {
@@ -281,7 +284,7 @@ func TestBinancePosIDReuseCreatesFreshCycle(t *testing.T) {
 	second, err := cs.EnsureCopyGuardCycle(&store.CopyGuardCycle{
 		TraderID: "t", LeaderID: "leader", LeaderPosID: posID, Symbol: "ETHUSDT",
 		Side: "long", MarginMode: "cross", Status: store.CopyGuardFollowing,
-		PolicySnapshot: "{}", LeaderEntryPrice: 2100, FollowerEntryPrice: 2100,
+		PolicySnapshot: `{"version":4}`, LeaderEntryPrice: 2100, FollowerEntryPrice: 2100,
 		FollowerNotional: 120, AccountEquity: 1000, LastObservedPrice: 2100,
 	})
 	if err != nil {

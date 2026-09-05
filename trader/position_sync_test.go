@@ -239,6 +239,7 @@ func TestStoppedReconciliationRetiresFlatCopyGuardLifecycleIdempotently(t *testi
 		TraderID: "stopped-trader", LeaderID: "leader", LeaderPosID: "leader-pos",
 		Symbol: "SNDKUSDT", Side: "short", MarginMode: "cross",
 		Status: store.CopyGuardAIAbandoned, ProtectionStatus: store.CopyGuardProtectionTriggered,
+		PolicySnapshot:     `{"version":4}`,
 		FollowerEntryPrice: 1, FollowerNotional: 10,
 	})
 	if err != nil {

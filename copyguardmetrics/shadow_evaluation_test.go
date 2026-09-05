@@ -26,7 +26,7 @@ func TestEvaluateCycleShadowPoliciesIsReportOnlyAndCostAdjusted(t *testing.T) {
 	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{
 		TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "leader-pos",
 		Symbol: "HYPEUSDT", Side: "long", MarginMode: "cross",
-		Status: store.CopyGuardFollowing, PolicySnapshot: "{}",
+		Status: store.CopyGuardFollowing, PolicySnapshot: `{"version":4}`,
 		FollowerEntryPrice: 100, FollowerNotional: 1000, BaselineNotional: 1000,
 		ATRAtStop: 5, LastObservedPrice: 110,
 	})
@@ -60,7 +60,7 @@ func TestEvaluateCycleShadowPoliciesIsReportOnlyAndCostAdjusted(t *testing.T) {
 		t.Fatal(err)
 	}
 	for pass := 0; pass < 2; pass++ {
-		results, evalErr := EvaluateCycleShadowPolicies(st, cycle.ID)
+		results, evalErr := evaluateArchivedCycleShadowPolicies(st, cycle.ID)
 		if evalErr != nil || len(results) != 4 {
 			t.Fatalf("pass %d results=%+v err=%v", pass, results, evalErr)
 		}
@@ -98,7 +98,7 @@ func TestEvaluateCycleShadowPoliciesIsReportOnlyAndCostAdjusted(t *testing.T) {
 	if intentCount != 0 {
 		t.Fatalf("shadow evaluation created live execution work: %d intents", intentCount)
 	}
-	report, err := BuildShadowPromotionReport(
+	report, err := buildArchivedShadowPromotionReport(
 		st, []string{"trader-1"}, time.Now().Add(-time.Hour), time.Now().Add(time.Hour))
 	if err != nil {
 		t.Fatal(err)
@@ -118,7 +118,7 @@ func TestShadowPromotionUsesOnlyVerifiedV2IncrementalEvidence(t *testing.T) {
 		cycle, cycleErr := st.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{
 			TraderID: "trader-v2", LeaderID: "leader", LeaderPosID: fmt.Sprintf("position-%d", i),
 			Symbol: "BTCUSDT", Side: "long", MarginMode: "cross", Status: store.CopyGuardFollowing,
-			PolicySnapshot: "{}",
+			PolicySnapshot: `{"version":4}`,
 		})
 		if cycleErr != nil {
 			t.Fatal(cycleErr)
@@ -149,7 +149,7 @@ func TestShadowPromotionUsesOnlyVerifiedV2IncrementalEvidence(t *testing.T) {
 			t.Fatal(cycleErr)
 		}
 	}
-	report, err := BuildShadowPromotionReport(st, []string{"trader-v2"}, time.Now().Add(-time.Hour), time.Now().Add(time.Hour))
+	report, err := buildArchivedShadowPromotionReport(st, []string{"trader-v2"}, time.Now().Add(-time.Hour), time.Now().Add(time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}

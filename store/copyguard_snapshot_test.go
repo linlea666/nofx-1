@@ -7,6 +7,45 @@ import (
 	"testing"
 )
 
+func TestCopyGuardSnapshotRejectsEmptyUnknownAndCredentialOnlyObjects(t *testing.T) {
+	for _, raw := range []string{"", `{}`, `null`, `{"cookie":"fake","csrf":"fake"}`, `{"risk_unknown_field":true}`} {
+		if _, err := DecodeCopyGuardPolicySnapshot(raw); err == nil {
+			t.Fatalf("unsafe snapshot accepted: %s", raw)
+		}
+	}
+	for _, raw := range []string{`{"defaults_version":8,"liquidation_buffer_atr":0}`, `{"version":4}`, `{"risk_stop_loss_enabled":true,"risk_policy_version":4}`} {
+		if _, err := DecodeCopyGuardPolicySnapshot(raw); err != nil {
+			t.Fatalf("recognized historic risk snapshot rejected: %v", err)
+		}
+	}
+}
+
+func TestATRProfileRestoreAppliesOnlyExplicitEditsAfterRestore(t *testing.T) {
+	atr := NewCopyGuardDefaults()
+	atr.RiskTriggerPriceType = "index"
+	atr.RiskReentryEnabled = true
+	atr.RiskReentryDecisionMode = "ai_guarded"
+	atr.RiskMaxReentries = 3
+	fixed := *atr
+	fixed.RiskProtectionMode = RiskProtectionModePositionMarginPct
+	NormalizeCopyGuardProtectionModeTransition(&fixed, atr)
+	restored := fixed
+	restored.RiskProtectionMode = RiskProtectionModeATRStructure
+	NormalizeCopyGuardProtectionModeTransition(&restored, &fixed)
+	zero := 0
+	last := "last"
+	patch := &CopyGuardATRProfilePatch{MaxReentries: &zero, TriggerPriceType: &last}
+	if err := ApplyCopyGuardATRProfilePatch(&restored, patch); err != nil {
+		t.Fatal(err)
+	}
+	if restored.RiskMaxReentries != 0 || restored.RiskTriggerPriceType != "last" || !restored.RiskReentryEnabled || restored.RiskReentryDecisionMode != "ai_guarded" {
+		t.Fatalf("restore overwrote explicit patch or lost dormant fields: %+v", restored)
+	}
+	if err := ApplyCopyGuardATRProfilePatch(&fixed, patch); err == nil {
+		t.Fatal("fixed policy accepted ATR effective edits")
+	}
+}
+
 func TestCopyGuardPolicySnapshotCanonicalRoundTripExcludesCredentials(t *testing.T) {
 	cfg := NewCopyGuardDefaults()
 	cfg.TraderID = "trader-1"

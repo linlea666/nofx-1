@@ -606,7 +606,7 @@ func TestResumeTraderCandidatesRequiresAuthoritativeStoppedByRiskCycle(t *testin
 	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&CopyGuardCycle{
 		TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "stopped-pos",
 		Symbol: "ETHUSDT", Side: "long", MarginMode: "cross",
-		Status: CopyGuardStoppedWatching, PolicySnapshot: "{}",
+		Status: CopyGuardStoppedWatching, PolicySnapshot: `{"version":4}`,
 		LeaderEntryPrice: 100, FollowerEntryPrice: 100, FollowerNotional: 100,
 		AccountEquity: 1000, LastObservedPrice: 95,
 	})

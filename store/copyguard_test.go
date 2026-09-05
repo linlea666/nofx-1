@@ -15,7 +15,7 @@ func TestCopyGuardCycleAndEventLedger(t *testing.T) {
 	}
 	defer st.Close()
 	cs := st.CopyTrade()
-	cycle, err := cs.EnsureCopyGuardCycle(&CopyGuardCycle{TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "pos-1", Symbol: "BTCUSDT", Side: "long", MarginMode: "cross", Status: CopyGuardFollowing, PolicySnapshot: "{}", LeaderEntryPrice: 100, FollowerEntryPrice: 101, FollowerNotional: 1000, AccountEquity: 5000, LastObservedPrice: 100})
+	cycle, err := cs.EnsureCopyGuardCycle(&CopyGuardCycle{TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "pos-1", Symbol: "BTCUSDT", Side: "long", MarginMode: "cross", Status: CopyGuardFollowing, PolicySnapshot: `{"version":4}`, LeaderEntryPrice: 100, FollowerEntryPrice: 101, FollowerNotional: 1000, AccountEquity: 5000, LastObservedPrice: 100})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,7 +114,7 @@ func TestBeginCopyGuardAccountingAndCloseMappingIsAtomic(t *testing.T) {
 		cycle, seedErr := cs.EnsureCopyGuardCycle(&CopyGuardCycle{
 			TraderID: "trader-flat", LeaderID: "leader", LeaderPosID: positionID,
 			Symbol: "BTCUSDT", Side: "long", MarginMode: "cross", Status: CopyGuardFollowing,
-			PolicySnapshot: "{}", LeaderEntryPrice: 100, FollowerEntryPrice: 100,
+			PolicySnapshot: `{"version":4}`, LeaderEntryPrice: 100, FollowerEntryPrice: 100,
 			FollowerNotional: 10, AccountEquity: 100, LastObservedPrice: 99,
 		})
 		if seedErr != nil {
@@ -182,7 +182,7 @@ func TestCopyGuardReentryFillRollsBackWithoutOwnedMapping(t *testing.T) {
 	}
 	defer st.Close()
 	cs := st.CopyTrade()
-	cycle, err := cs.EnsureCopyGuardCycle(&CopyGuardCycle{TraderID: "trader-atomic", LeaderID: "leader", LeaderPosID: "pos-atomic", Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", Status: CopyGuardReentryPending, PolicySnapshot: "{}", LeaderEntryPrice: 100, FollowerEntryPrice: 100, FollowerNotional: 100})
+	cycle, err := cs.EnsureCopyGuardCycle(&CopyGuardCycle{TraderID: "trader-atomic", LeaderID: "leader", LeaderPosID: "pos-atomic", Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", Status: CopyGuardReentryPending, PolicySnapshot: `{"version":4}`, LeaderEntryPrice: 100, FollowerEntryPrice: 100, FollowerNotional: 100})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,7 +220,7 @@ func TestCopyGuardAccountingNoStopHasZeroGuardEffect(t *testing.T) {
 	}
 	defer st.Close()
 	cs := st.CopyTrade()
-	cycle, err := cs.EnsureCopyGuardCycle(&CopyGuardCycle{TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "pos-accounting", Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", Status: CopyGuardFollowing, PolicySnapshot: "{}", LeaderEntryPrice: 1734, FollowerEntryPrice: 1735.19, FollowerNotional: 286.99, AccountEquity: 18})
+	cycle, err := cs.EnsureCopyGuardCycle(&CopyGuardCycle{TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "pos-accounting", Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", Status: CopyGuardFollowing, PolicySnapshot: `{"version":4}`, LeaderEntryPrice: 1734, FollowerEntryPrice: 1735.19, FollowerNotional: 286.99, AccountEquity: 18})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -265,7 +265,7 @@ func TestCopyGuardSummaryExcludesMissingBaselineFromEffect(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&CopyGuardCycle{
+	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&CopyGuardCycle{PolicySnapshot: `{"version":4}`,
 		TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "missing-baseline",
 		Symbol: "BTCUSDT", Side: "short", MarginMode: "cross", Status: CopyGuardFollowing,
 	})
@@ -290,7 +290,7 @@ func TestCopyGuardSummaryCountsUnscorableOwnershipRisk(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&CopyGuardCycle{
+	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&CopyGuardCycle{PolicySnapshot: `{"version":4}`,
 		TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "ownership-ambiguous",
 		Symbol: "BTCUSDT", Side: "long", MarginMode: "cross", Status: CopyGuardFollowing,
 	})
@@ -327,7 +327,7 @@ func TestCycleTerminationFailsOnlyProvablyPreSubmitAIIntent(t *testing.T) {
 	}
 	defer st.Close()
 	cs := st.CopyTrade()
-	cycle, err := cs.EnsureCopyGuardCycle(&CopyGuardCycle{
+	cycle, err := cs.EnsureCopyGuardCycle(&CopyGuardCycle{PolicySnapshot: `{"version":4}`,
 		TraderID: "trader-a", LeaderID: "leader", LeaderPosID: "position-a",
 		Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", Status: CopyGuardFollowing,
 	})
@@ -403,7 +403,7 @@ func TestCopyGuardProtectionRetryIsAtomic(t *testing.T) {
 	}
 	defer st.Close()
 	cs := st.CopyTrade()
-	cycle, err := cs.EnsureCopyGuardCycle(&CopyGuardCycle{TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "pos-retry", Symbol: "BTCUSDT", Side: "long", MarginMode: "cross", Status: CopyGuardFollowing, PolicySnapshot: "{}"})
+	cycle, err := cs.EnsureCopyGuardCycle(&CopyGuardCycle{TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "pos-retry", Symbol: "BTCUSDT", Side: "long", MarginMode: "cross", Status: CopyGuardFollowing, PolicySnapshot: `{"version":4}`})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -431,7 +431,7 @@ func TestCopyGuardProtectionRetryClaimsWithoutEvent(t *testing.T) {
 	}
 	defer st.Close()
 	cs := st.CopyTrade()
-	cycle, err := cs.EnsureCopyGuardCycle(&CopyGuardCycle{TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "pos-retry-throttled", Symbol: "BTCUSDT", Side: "long", MarginMode: "cross", Status: CopyGuardFollowing, PolicySnapshot: "{}"})
+	cycle, err := cs.EnsureCopyGuardCycle(&CopyGuardCycle{TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "pos-retry-throttled", Symbol: "BTCUSDT", Side: "long", MarginMode: "cross", Status: CopyGuardFollowing, PolicySnapshot: `{"version":4}`})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -458,7 +458,7 @@ func TestCopyGuardProtectiveOrderPersistsQuantityStep(t *testing.T) {
 	}
 	defer st.Close()
 	cs := st.CopyTrade()
-	cycle, err := cs.EnsureCopyGuardCycle(&CopyGuardCycle{TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "pos-step", Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", Status: CopyGuardFollowing, PolicySnapshot: "{}"})
+	cycle, err := cs.EnsureCopyGuardCycle(&CopyGuardCycle{TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "pos-step", Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", Status: CopyGuardFollowing, PolicySnapshot: `{"version":4}`})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -492,7 +492,7 @@ func TestExistingClosedCopyGuardCycleBecomesLegacyUnverified(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&CopyGuardCycle{TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "legacy-pos", Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", Status: CopyGuardFollowing, PolicySnapshot: "{}"})
+	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&CopyGuardCycle{TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "legacy-pos", Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", Status: CopyGuardFollowing, PolicySnapshot: `{"version":4}`})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -599,7 +599,7 @@ func TestCopyGuardProtectionHealthAndShadowLedger(t *testing.T) {
 	}
 	defer st.Close()
 	cs := st.CopyTrade()
-	cycle, err := cs.EnsureCopyGuardCycle(&CopyGuardCycle{TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "pos-1", Symbol: "BTCUSDT", Side: "long", MarginMode: "cross", Status: CopyGuardFollowing, PolicySnapshot: "{}", LeaderEntryPrice: 100, FollowerEntryPrice: 100, FollowerNotional: 1000, AccountEquity: 5000})
+	cycle, err := cs.EnsureCopyGuardCycle(&CopyGuardCycle{TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "pos-1", Symbol: "BTCUSDT", Side: "long", MarginMode: "cross", Status: CopyGuardFollowing, PolicySnapshot: `{"version":4}`, LeaderEntryPrice: 100, FollowerEntryPrice: 100, FollowerNotional: 1000, AccountEquity: 5000})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -667,7 +667,7 @@ func TestCopyGuardAttemptPersistsProtectionLifecycle(t *testing.T) {
 	cs := st.CopyTrade()
 	cycle, err := cs.EnsureCopyGuardCycle(&CopyGuardCycle{
 		TraderID: "t1", LeaderID: "leader", LeaderPosID: "p1", Symbol: "ETHUSDT",
-		Side: "long", MarginMode: "cross", Status: CopyGuardFollowing, PolicySnapshot: "{}",
+		Side: "long", MarginMode: "cross", Status: CopyGuardFollowing, PolicySnapshot: `{"version":4}`,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -705,7 +705,7 @@ func TestUnprotectedMarketExitDoesNotCreateStopOrReentryEvidence(t *testing.T) {
 	cycle, err := cs.EnsureCopyGuardCycle(&CopyGuardCycle{
 		TraderID: "t1", LeaderID: "leader", LeaderPosID: "p1", Symbol: "ETHUSDT",
 		Side: "long", MarginMode: "cross", Status: CopyGuardFollowing,
-		PolicySnapshot: "{}", FollowerEntryPrice: 100, FollowerNotional: 10,
+		PolicySnapshot: `{"version":4}`, FollowerEntryPrice: 100, FollowerNotional: 10,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -778,7 +778,7 @@ func TestObservationUpdatesGuardClosedCycle(t *testing.T) {
 	}
 	defer st.Close()
 	cs := st.CopyTrade()
-	cycle, err := cs.EnsureCopyGuardCycle(&CopyGuardCycle{TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "pos-obs", Symbol: "BTCUSDT", Side: "long", MarginMode: "cross", Status: CopyGuardFollowing, PolicySnapshot: "{}", LeaderEntryPrice: 100, FollowerEntryPrice: 100, FollowerNotional: 1000, AccountEquity: 5000, LastObservedPrice: 100})
+	cycle, err := cs.EnsureCopyGuardCycle(&CopyGuardCycle{TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "pos-obs", Symbol: "BTCUSDT", Side: "long", MarginMode: "cross", Status: CopyGuardFollowing, PolicySnapshot: `{"version":4}`, LeaderEntryPrice: 100, FollowerEntryPrice: 100, FollowerNotional: 1000, AccountEquity: 5000, LastObservedPrice: 100})
 	if err != nil {
 		t.Fatal(err)
 	}

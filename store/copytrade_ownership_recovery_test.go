@@ -61,7 +61,7 @@ func newOwnershipRecoveryFixture(t *testing.T, withPositionConflictEvent bool) o
 	cycle, err := cs.EnsureCopyGuardCycle(&CopyGuardCycle{
 		TraderID: traderID, LeaderID: "leader", LeaderPosID: leaderPosID,
 		Symbol: "BTCUSDT", Side: "long", MarginMode: "cross", Status: CopyGuardFollowing,
-		PolicySnapshot: "{}", LeaderEntryPrice: 64523.9, FollowerEntryPrice: 64130.1,
+		PolicySnapshot: `{"version":4}`, LeaderEntryPrice: 64523.9, FollowerEntryPrice: 64130.1,
 		FollowerNotional: 205.21632, BaselineLeaderSize: 0.001, AccountEquity: 140,
 	})
 	if err != nil {

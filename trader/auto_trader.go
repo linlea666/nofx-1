@@ -1345,7 +1345,7 @@ func (at *AutoTrader) openLongOrder(d *decision.Decision, copyTrade bool, symbol
 	if copyTrade {
 		hook := copyTradeSubmissionHook(d, copyTrade, clientOrderID)
 		if executor, ok := at.trader.(CopyTradeSubmissionBoundaryExecutor); ok {
-			return executeCopyTradeMarketOrderAtBoundary(executor, CopyTradeMarketOrderRequest{Action: "open_long", Symbol: symbol, Quantity: quantity, Leverage: leverage, ClientOrderID: clientOrderID}, hook)
+			return executeCopyTradeMarketOrderAtBoundary(executor, CopyTradeMarketOrderRequest{Action: "open_long", Symbol: symbol, Quantity: quantity, Leverage: leverage, ClientOrderID: clientOrderID, OnLeverageConfirmed: copyLeverageReceipt(d, clientOrderID)}, hook)
 		}
 		if err := runCopyTradeSubmissionHook(hook); err != nil {
 			return nil, err
@@ -1366,7 +1366,7 @@ func (at *AutoTrader) openShortOrder(d *decision.Decision, copyTrade bool, symbo
 	if copyTrade {
 		hook := copyTradeSubmissionHook(d, copyTrade, clientOrderID)
 		if executor, ok := at.trader.(CopyTradeSubmissionBoundaryExecutor); ok {
-			return executeCopyTradeMarketOrderAtBoundary(executor, CopyTradeMarketOrderRequest{Action: "open_short", Symbol: symbol, Quantity: quantity, Leverage: leverage, ClientOrderID: clientOrderID}, hook)
+			return executeCopyTradeMarketOrderAtBoundary(executor, CopyTradeMarketOrderRequest{Action: "open_short", Symbol: symbol, Quantity: quantity, Leverage: leverage, ClientOrderID: clientOrderID, OnLeverageConfirmed: copyLeverageReceipt(d, clientOrderID)}, hook)
 		}
 		if err := runCopyTradeSubmissionHook(hook); err != nil {
 			return nil, err

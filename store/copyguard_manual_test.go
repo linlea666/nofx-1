@@ -10,7 +10,7 @@ func newManualTestCycle(t *testing.T, cs *CopyTradeStore, traderID, posID string
 	t.Helper()
 	cycle, err := cs.EnsureCopyGuardCycle(&CopyGuardCycle{
 		TraderID: traderID, LeaderID: "leader", LeaderPosID: posID, Symbol: "BTCUSDT",
-		Side: "long", MarginMode: "cross", Status: CopyGuardAttemptsExhausted, PolicySnapshot: "{}",
+		Side: "long", MarginMode: "cross", Status: CopyGuardAttemptsExhausted, PolicySnapshot: `{"version":4}`,
 		LeaderEntryPrice: 100, FollowerEntryPrice: 101, FollowerNotional: 1000, AccountEquity: 5000, LastObservedPrice: 100,
 	})
 	if err != nil {

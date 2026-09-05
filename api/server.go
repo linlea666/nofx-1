@@ -532,11 +532,12 @@ type CreateTraderRequest struct {
 
 // CopyConfigReq Copy trading configuration request
 type CopyConfigReq struct {
-	ProviderType   string  `json:"provider_type"`    // "hyperliquid" | "okx" | "binance"
-	LeaderID       string  `json:"leader_id"`        // Leader wallet address or uniqueName / portfolioId (Binance)
-	CopyRatio      float64 `json:"copy_ratio"`       // Copy ratio (1.0 = 100%)
-	SyncLeverage   bool    `json:"sync_leverage"`    // Whether to sync leverage
-	SyncMarginMode *bool   `json:"sync_margin_mode"` // Whether to sync margin mode (OKX: cross/isolated)
+	ATRProfilePatch *store.CopyGuardATRProfilePatch `json:"atr_profile_patch,omitempty"`
+	ProviderType    string                          `json:"provider_type"`    // "hyperliquid" | "okx" | "binance"
+	LeaderID        string                          `json:"leader_id"`        // Leader wallet address or uniqueName / portfolioId (Binance)
+	CopyRatio       float64                         `json:"copy_ratio"`       // Copy ratio (1.0 = 100%)
+	SyncLeverage    bool                            `json:"sync_leverage"`    // Whether to sync leverage
+	SyncMarginMode  *bool                           `json:"sync_margin_mode"` // Whether to sync margin mode (OKX: cross/isolated)
 	// 最小/最大跟单金额阈值（USDT）。指针区分"未传"（保留存量/默认值）与
 	// 显式 0（max=0 表示不预警）。此前请求结构缺这两个字段，前端传值被
 	// JSON unmarshal 静默丢弃，配置形同虚设（M18）。
@@ -1155,6 +1156,10 @@ func (s *Server) handleCreateTrader(c *gin.Context) {
 			return
 		}
 		store.NormalizeCopyGuardProtectionModeTransition(copyConfig, nil)
+		if err := store.ApplyCopyGuardATRProfilePatch(copyConfig, req.CopyConfig.ATRProfilePatch); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
 		if err := copytrade.ValidateStoredRiskPolicy(copyConfig); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
@@ -1204,6 +1209,10 @@ func (s *Server) handleCreateTrader(c *gin.Context) {
 			// 半成品状态，启动跟单时才暴露且难以定位。Upsert 幂等，用户重试即可。
 			logger.Errorf("❌ Failed to create copy trade config: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "trader created but copy trade config save failed, please save again: " + err.Error()})
+			return
+		}
+		if err := verifyCopyGuardConfigReadback(s.store, copyConfig); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error(), "persisted": true})
 			return
 		}
 		disableReentryCandidatesAfterConfigSave(s.store, nil, copyConfig)
@@ -1461,6 +1470,10 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 				return
 			}
 			profileDefaulted := store.NormalizeCopyGuardProtectionModeTransition(copyConfig, existingCopyCfg)
+			if err := store.ApplyCopyGuardATRProfilePatch(copyConfig, req.CopyConfig.ATRProfilePatch); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
 			if profileDefaulted {
 				logger.Warnf("⚠️ Copy Guard trader %s had no dormant ATR profile; restored canonical defaults", traderID)
 			}
@@ -1521,6 +1534,10 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 				// 在用旧配置运行。Upsert 幂等，返回 500 让用户重试。
 				logger.Errorf("❌ Failed to update copy trade config: %v", err)
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "copy trade config save failed, please save again: " + err.Error()})
+				return
+			}
+			if err := verifyCopyGuardConfigReadback(s.store, copyConfig); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error(), "persisted": true})
 				return
 			}
 			disableReentryCandidatesAfterConfigSave(s.store, existingCopyCfg, copyConfig)

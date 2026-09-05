@@ -16,7 +16,7 @@ import (
 // ============================================================================
 
 func TestComputeOwnPathBaselineReproducesWLD(t *testing.T) {
-	cycle := &store.CopyGuardCycle{
+	cycle := &store.CopyGuardCycle{PolicySnapshot: `{"version":4}`,
 		Side:                "long",
 		LeaderEntryPrice:    0.4388830735558965,
 		BaselineNotional:    608.3734019857784, // 旧口径影子名义（不应被使用）
@@ -121,7 +121,7 @@ func TestMigrateCopyGuardBaselinesV2RecomputesHistoricalCycle(t *testing.T) {
 	cs := st.CopyTrade()
 
 	// 自身仓位：entry 100、名义 100，98 被止损（pnl −2）
-	cycle, err := cs.EnsureCopyGuardCycle(&store.CopyGuardCycle{TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "pos-mig", Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", Status: store.CopyGuardFollowing, PolicySnapshot: "{}", LeaderEntryPrice: 100, FollowerEntryPrice: 100, FollowerNotional: 100, AccountEquity: 500, LastObservedPrice: 100})
+	cycle, err := cs.EnsureCopyGuardCycle(&store.CopyGuardCycle{TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "pos-mig", Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", Status: store.CopyGuardFollowing, PolicySnapshot: `{"version":4}`, LeaderEntryPrice: 100, FollowerEntryPrice: 100, FollowerNotional: 100, AccountEquity: 500, LastObservedPrice: 100})
 	if err != nil {
 		t.Fatal(err)
 	}

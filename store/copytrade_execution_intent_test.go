@@ -673,7 +673,7 @@ func TestFilledExecutionLifecycleGapIsRecoverableWithoutReplayingOrder(t *testin
 	if _, err = cs.EnsureCopyGuardCycle(&CopyGuardCycle{
 		TraderID: "t1", LeaderID: "leader", LeaderPosID: "p1", Symbol: "ETHUSDT",
 		Side: "long", MarginMode: "cross", Status: CopyGuardFollowing,
-		PolicySnapshot: "{}", LeaderEntryPrice: 100, FollowerEntryPrice: 100,
+		PolicySnapshot: `{"version":4}`, LeaderEntryPrice: 100, FollowerEntryPrice: 100,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1379,7 +1379,7 @@ func TestMissingFollowerDetachesWithoutCreatingStopEvidence(t *testing.T) {
 	}
 	cycle, err := cs.EnsureCopyGuardCycle(&CopyGuardCycle{
 		TraderID: "t1", LeaderID: "leader", LeaderPosID: "p1", Symbol: "BTCUSDT",
-		Side: "short", MarginMode: "cross", Status: CopyGuardFollowing, PolicySnapshot: "{}",
+		Side: "short", MarginMode: "cross", Status: CopyGuardFollowing, PolicySnapshot: `{"version":4}`,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1684,7 +1684,7 @@ func TestApplyAIReentryFillSnapshotCommitsOnlyCumulativeDelta(t *testing.T) {
 	if _, err = st.DB().Exec(`UPDATE copy_trade_position_mappings SET status='stopped_by_risk' WHERE trader_id='t1' AND leader_pos_id='leader-pos'`); err != nil {
 		t.Fatal(err)
 	}
-	cycle, err := cs.EnsureCopyGuardCycle(&CopyGuardCycle{
+	cycle, err := cs.EnsureCopyGuardCycle(&CopyGuardCycle{PolicySnapshot: `{"version":4}`,
 		TraderID: "t1", LeaderID: "leader", LeaderPosID: "leader-pos",
 		Symbol: "ETHUSDT", Side: "long", MarginMode: "cross",
 		Status: CopyGuardReentryPending, LeaderEntryPrice: 100,
@@ -1914,7 +1914,7 @@ func TestCopyGuardBackfillBaselineUsesConfirmedInitialOpenOnly(t *testing.T) {
 	if err != nil || !available || size != 8 {
 		t.Fatalf("confirmed initial evidence not recovered: size=%v available=%v err=%v", size, available, err)
 	}
-	cycle, err := cs.EnsureCopyGuardCycle(&CopyGuardCycle{
+	cycle, err := cs.EnsureCopyGuardCycle(&CopyGuardCycle{PolicySnapshot: `{"version":4}`,
 		TraderID: "t1", LeaderID: "leader", LeaderPosID: "p1", Symbol: "ETHUSDT",
 		Side: "long", Status: CopyGuardFollowing, BaselineLeaderSize: size, ShadowLeaderSize: 6,
 	})

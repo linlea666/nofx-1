@@ -68,7 +68,7 @@ func TestPositionMarginShadowBackfillsAuthoritativeMarksAndAccountsForUnfilledTa
 	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{
 		TraderID: "history-trader", LeaderID: "leader", LeaderPosID: "history-position",
 		Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", Status: store.CopyGuardFollowing,
-		PolicySnapshot: "{}",
+		PolicySnapshot: `{"version":4}`,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -179,9 +179,9 @@ func TestWrappedPreSubmitPositionMissingUsesBenignClosePath(t *testing.T) {
 	}
 }
 
-func TestPositionMarginShadowTracksLeaderAfterATRStopWhenReentryDisabled(t *testing.T) {
+func TestRetiredShadowDoesNotTrackLeaderAfterATRStop(t *testing.T) {
 	e, st := newReentryTestEngine(t)
-	cycle := seedStoppedCycle(t, st, e.traderID, "long", 100)
+	cycle := seedStoppedCycle(t, st, e.traderID, "long", 100, e.config)
 	e.config.RiskReentryEnabled = false
 	e.config.RiskReentryDecisionMode = "disabled"
 	_, created, err := st.CopyTrade().InitializeCopyGuardPositionMarginShadow(&store.CopyGuardPositionMarginShadow{
@@ -221,15 +221,15 @@ func TestPositionMarginShadowTracksLeaderAfterATRStopWhenReentryDisabled(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if shadow.CurrentQuantity != 2 || shadow.CurrentEntryPrice != 104 || shadow.LastLeaderSize != 2 {
-		t.Fatalf("disabled reentry stopped tracking the passive shadow: %+v", shadow)
+	if shadow.CurrentQuantity != 1 || shadow.CurrentEntryPrice != 100 || shadow.LastLeaderSize != 1 {
+		t.Fatalf("retired shadow mutated historical quantity: %+v", shadow)
 	}
 	shadowV2, err := st.CopyTrade().GetCopyGuardPositionMarginShadowV2(cycle.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if shadowV2.CurrentQuantity != 2 || shadowV2.CurrentEntryPrice != 104 || shadowV2.LastLeaderSize != 2 {
-		t.Fatalf("v2 shadow did not use the execution-exchange mark: %+v", shadowV2)
+	if shadowV2.CurrentQuantity != 1 || shadowV2.CurrentEntryPrice != 100 || shadowV2.LastLeaderSize != 1 {
+		t.Fatalf("retired v2 shadow mutated historical quantity: %+v", shadowV2)
 	}
 	events, err := st.CopyTrade().ListCopyGuardEvents(cycle.ID)
 	if err != nil {
@@ -241,14 +241,14 @@ func TestPositionMarginShadowTracksLeaderAfterATRStopWhenReentryDisabled(t *test
 			syncEvents++
 		}
 	}
-	if syncEvents != 1 {
-		t.Fatalf("shadow quantity transition must be logged once, got %d events: %+v", syncEvents, events)
+	if syncEvents != 0 {
+		t.Fatalf("retired shadow must not write events, got %d: %+v", syncEvents, events)
 	}
 }
 
 func TestPositionMarginShadowRejectsLeaderPriceWhenExecutionMarkIsUnavailable(t *testing.T) {
 	e, st := newReentryTestEngine(t)
-	cycle := seedStoppedCycle(t, st, e.traderID, "long", 100)
+	cycle := seedStoppedCycle(t, st, e.traderID, "long", 100, e.config)
 	if _, _, err := st.CopyTrade().InitializeCopyGuardPositionMarginShadow(&store.CopyGuardPositionMarginShadow{
 		CycleID: cycle.ID, TraderID: e.traderID, Side: "long",
 		AnchorEntryPrice: 100, AnchorLeverage: 10, AnchorInitialMargin: 10,
@@ -291,8 +291,8 @@ func TestPositionMarginShadowRejectsLeaderPriceWhenExecutionMarkIsUnavailable(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if shadowV2.CurrentQuantity != 1 || !strings.Contains(shadowV2.UnscorableReason, "execution mark unavailable") {
-		t.Fatalf("missing execution mark was not excluded from scoring: %+v", shadowV2)
+	if shadowV2.CurrentQuantity != 1 || shadowV2.UnscorableReason != "" || shadowV2.MarkObservationCount != 0 {
+		t.Fatalf("retired shadow must preserve historical data, including its original quality: %+v", shadowV2)
 	}
 }
 
@@ -1047,7 +1047,7 @@ func TestHandleBenignCloseFailureClosesCopyGuardCycleAndMappingTogether(t *testi
 	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{
 		TraderID: traderID, LeaderID: "leader", LeaderPosID: positionID,
 		Symbol: "BTCUSDT", Side: "long", MarginMode: "cross", Status: store.CopyGuardFollowing,
-		PolicySnapshot: "{}", LeaderEntryPrice: 100, FollowerEntryPrice: 100,
+		PolicySnapshot: `{"version":4}`, LeaderEntryPrice: 100, FollowerEntryPrice: 100,
 		FollowerNotional: 10, AccountEquity: 100, LastObservedPrice: 99,
 	})
 	if err != nil {
@@ -1087,7 +1087,7 @@ func TestHandleBenignCloseFailureRollsBackCycleWhenJointTerminationFails(t *test
 	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{
 		TraderID: traderID, LeaderID: "leader", LeaderPosID: positionID,
 		Symbol: "BTCUSDT", Side: "long", MarginMode: "cross", Status: store.CopyGuardFollowing,
-		PolicySnapshot: "{}", LeaderEntryPrice: 100, FollowerEntryPrice: 100,
+		PolicySnapshot: `{"version":4}`, LeaderEntryPrice: 100, FollowerEntryPrice: 100,
 		FollowerNotional: 10, AccountEquity: 100, LastObservedPrice: 99,
 	})
 	if err != nil {

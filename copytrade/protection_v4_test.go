@@ -74,7 +74,7 @@ func TestV4AccountingWaitsForTerminalFillThenReconciles(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "leader-pos", Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", Status: store.CopyGuardFollowing, PolicySnapshot: "{}", FollowerEntryPrice: 1735.19, FollowerNotional: 286.99})
+	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "leader-pos", Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", Status: store.CopyGuardFollowing, PolicySnapshot: `{"version":4}`, FollowerEntryPrice: 1735.19, FollowerNotional: 286.99})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,7 +114,7 @@ func TestV4AccountingIgnoresPriorAttemptRecord(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "leader-pos", Symbol: "ETHUSDT", Side: "short", MarginMode: "cross", Status: store.CopyGuardFollowing, PolicySnapshot: "{}", FollowerEntryPrice: 1745.45, FollowerNotional: 143.13})
+	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "leader-pos", Symbol: "ETHUSDT", Side: "short", MarginMode: "cross", Status: store.CopyGuardFollowing, PolicySnapshot: `{"version":4}`, FollowerEntryPrice: 1745.45, FollowerNotional: 143.13})
 	if err != nil {
 		t.Fatal(err)
 	}

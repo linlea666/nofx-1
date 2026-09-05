@@ -42,7 +42,7 @@ func TestAIEnterPriceLeaseReusesExactUnsubmittedIntentUntilAuthoritativeExpiry(t
 		store.TraderLifecycleRunning); err != nil {
 		t.Fatal(err)
 	}
-	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{
+	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{PolicySnapshot: `{"version":4}`,
 		TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "leader-pos",
 		Symbol: "ETHUSDT", Side: "short", MarginMode: "cross",
 		Status: store.CopyGuardAIWaiting,

@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -349,6 +350,35 @@ func (s *CopyTradeStore) CommitLeaderExecutionFill(c LeaderExecutionCommit) erro
 	if err != nil && err != sql.ErrNoRows {
 		return err
 	}
+	if err == nil && mappingStatus == MappingStatusStoppedByRisk {
+		// The order crossed the submission boundary before the risk gate. Its
+		// real fill must be acknowledged without reactivating the mapping or
+		// requesting catch-up. The pending-flat monitor owns any residual.
+		var riskCycleID int64
+		if err = tx.QueryRow(`SELECT id FROM copy_guard_cycles WHERE trader_id=? AND leader_pos_id=? AND closed_at IS NULL AND status IN ('STOP_PENDING_FLAT','STOP_PARTIAL','STOP_TRIGGERED')`, c.TraderID, c.LeaderPosID).Scan(&riskCycleID); err != nil {
+			return fmt.Errorf("late fill has no pending risk-exit lifecycle: %w", err)
+		}
+		if intentCycleID > 0 && intentCycleID != riskCycleID {
+			return fmt.Errorf("late fill belongs to another lifecycle")
+		}
+		lateStatus := ExecutionIntentPartiallyFilled
+		if c.OrderTerminal {
+			lateStatus = ExecutionIntentFilled
+		}
+		if _, err = tx.Exec(`UPDATE copy_trade_execution_intents SET status=?,cycle_id=?,filled_quantity=?,filled_notional=?,exchange_order_id=?,exchange_state=?,reason_code='RISK_EXIT_INFLIGHT_FILL',filled_at=COALESCE(filled_at,CURRENT_TIMESTAMP),terminal_at=CASE WHEN ? THEN COALESCE(terminal_at,CURRENT_TIMESTAMP) ELSE NULL END,updated_at=CURRENT_TIMESTAMP WHERE id=?`, lateStatus, riskCycleID, cumulativeFilled, cumulativeFilledNotional, c.ExchangeOrderID, c.ExchangeState, c.OrderTerminal, c.IntentID); err != nil {
+			return err
+		}
+		if _, err = tx.Exec(`UPDATE copy_trade_source_transitions SET status=?,updated_at=CURRENT_TIMESTAMP WHERE intent_id=?`, lateStatus, c.IntentID); err != nil {
+			return err
+		}
+		if deltaFilled > epsilon {
+			metadata, _ := json.Marshal(map[string]interface{}{"intent_id": c.IntentID, "exchange_order_id": c.ExchangeOrderID, "action": c.Action, "mapping_reactivated": false})
+			if _, err = tx.Exec(`INSERT INTO copy_guard_events(cycle_id,trader_id,type,price,quantity,notional,metadata_json) VALUES(?,?,'RISK_EXIT_INFLIGHT_FILL',?,?,?,?)`, riskCycleID, c.TraderID, c.FillPrice, deltaFilled, deltaNotional, string(metadata)); err != nil {
+				return err
+			}
+		}
+		return tx.Commit()
+	}
 	if err == nil && currentRevision == c.SourceRevision {
 		stateMatches := (open && mappingStatus == MappingStatusActive && strings.EqualFold(mappingSide, c.Side)) ||
 			(reduce && mappingStatus == MappingStatusActive) ||
@@ -421,6 +451,7 @@ func (s *CopyTradeStore) CommitLeaderExecutionFill(c LeaderExecutionCommit) erro
 	initialCycleCreated := false
 	if initialOpen && c.InitialCopyGuard != nil {
 		lifecycle := *c.InitialCopyGuard
+		lifecycle.EntryClientID = c.ClientOrderID
 		lifecycle.IntentID = c.IntentID
 		lifecycle.TraderID = c.TraderID
 		lifecycle.LeaderID = c.LeaderID

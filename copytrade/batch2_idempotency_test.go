@@ -211,7 +211,7 @@ func TestStopPartialEscalatesToUnprotectableAfterRetriesExhausted(t *testing.T) 
 	}}
 	ti := NewTraderIntegration("trader-1", executor, st)
 	ti.engine = &Engine{traderID: "trader-1", config: &CopyConfig{ProviderType: ProviderOKX, RiskPolicyVersion: 4, RiskATRTimeframe: "unsupported", RiskATRPeriod: 14, RiskATRFallbackPct: .02}, store: st, leaderState: &AccountState{Positions: map[string]*Position{}}}
-	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "leader-pos", Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", Status: store.CopyGuardStopPartial, PolicySnapshot: "{}", LeaderEntryPrice: 100, FollowerEntryPrice: 100, FollowerNotional: 5, AccountEquity: 100})
+	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "leader-pos", Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", Status: store.CopyGuardStopPartial, PolicySnapshot: `{"version":4}`, LeaderEntryPrice: 100, FollowerEntryPrice: 100, FollowerNotional: 5, AccountEquity: 100})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -399,10 +399,10 @@ func TestUnprotectablePolicyMigratesOldForcedCloseButHonorsV8ExplicitClose(t *te
 	if got := ti.unprotectableDisposition(explicitV8); got != "close" {
 		t.Fatalf("v8 explicit close must remain effective: %s", got)
 	}
-	if requiresUnprotectedForcedExit(&store.CopyGuardCycle{Status: store.CopyGuardFollowing}) {
+	if requiresUnprotectedForcedExit(&store.CopyGuardCycle{PolicySnapshot: `{"version":4}`, Status: store.CopyGuardFollowing}) {
 		t.Fatal("ordinary initial copy must use the configured warn/close policy")
 	}
-	if !requiresUnprotectedForcedExit(&store.CopyGuardCycle{Status: store.CopyGuardFollowingReentry, ReentryCount: 1}) {
+	if !requiresUnprotectedForcedExit(&store.CopyGuardCycle{PolicySnapshot: `{"version":4}`, Status: store.CopyGuardFollowingReentry, ReentryCount: 1}) {
 		t.Fatal("an AI/legacy reentry must never downgrade a failed forced exit to naked warning mode")
 	}
 }

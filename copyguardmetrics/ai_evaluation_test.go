@@ -50,7 +50,7 @@ func TestClassifyDecisionOutcomeSeparatesMissedReversalAndRiskGate(t *testing.T)
 }
 
 func TestSummaryUsesEvidenceQualityNotOutcomeLabelForDenominator(t *testing.T) {
-	cycle := &store.CopyGuardCycle{ID: 9}
+	cycle := &store.CopyGuardCycle{PolicySnapshot: `{"version":4}`, ID: 9}
 	evaluations := []*store.ReentryAIDecisionEvaluation{
 		{
 			EvaluationVersion: store.ReentryDecisionEvaluationVersion,
@@ -101,7 +101,7 @@ func TestEvaluateCyclePersistsImmutableOutcomeAndEventsOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{
-		TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "position-1", Symbol: "BTCUSDT", Side: "long", MarginMode: "cross", Status: store.CopyGuardAIWaiting, PolicySnapshot: "{}", AccountEquity: 1000, LastObservedPrice: 100,
+		TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "position-1", Symbol: "BTCUSDT", Side: "long", MarginMode: "cross", Status: store.CopyGuardAIWaiting, PolicySnapshot: `{"version":4}`, AccountEquity: 1000, LastObservedPrice: 100,
 	})
 	if err != nil {
 		t.Fatal(err)

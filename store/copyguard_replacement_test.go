@@ -20,7 +20,7 @@ func TestCopyGuardProtectiveReplacementSurvivesRestartAndClearsSafely(t *testing
 		Side:           "long",
 		MarginMode:     "cross",
 		Status:         CopyGuardFollowing,
-		PolicySnapshot: "{}",
+		PolicySnapshot: `{"version":4}`,
 	})
 	if err != nil {
 		_ = st.Close()

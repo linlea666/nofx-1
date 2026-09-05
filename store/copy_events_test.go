@@ -98,7 +98,7 @@ func TestGuardEventMirroredToCopyEvents(t *testing.T) {
 	cycle, err := cs.EnsureCopyGuardCycle(&CopyGuardCycle{
 		TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "pos-1",
 		Symbol: "BTCUSDT", Side: "long", MarginMode: "cross", Status: CopyGuardFollowing,
-		PolicySnapshot: "{}", LeaderEntryPrice: 100, FollowerEntryPrice: 101, FollowerNotional: 1000,
+		PolicySnapshot: `{"version":4}`, LeaderEntryPrice: 100, FollowerEntryPrice: 101, FollowerNotional: 1000,
 		AccountEquity: 5000, LastObservedPrice: 100,
 	})
 	if err != nil {

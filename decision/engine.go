@@ -196,7 +196,8 @@ type Decision struct {
 	// They deliberately stay out of JSON and keep the trader package unaware
 	// of persistence while ensuring every actual exchange submission is
 	// durable before it leaves the process.
-	BeforeOrderSubmit func(clientOrderID string, quantity float64) error `json:"-"`
+	BeforeOrderSubmit   func(clientOrderID string, quantity float64) error `json:"-"`
+	OnLeverageConfirmed func(clientOrderID string, leverage int)           `json:"-"`
 	// BeforeExchangeSubmit advances a PREPARED attempt only at the adapter's
 	// real HTTP submission boundary. Local formatting, leverage and minimum
 	// checks happen before this callback and therefore remain safely replayable.

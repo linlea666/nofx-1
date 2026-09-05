@@ -31,6 +31,11 @@ import {
 } from 'lucide-react'
 import { httpClient } from '../lib/httpClient'
 import { api } from '../lib/api'
+import {
+  atrProfileFromForm,
+  fixedModeSupported,
+  type CopyGuardCapabilities,
+} from '../lib/copyGuardPolicy'
 import { BinanceGlobalCredsModal } from './traders/BinanceGlobalCredsModal'
 
 // 提取下划线后面的名称部分
@@ -333,13 +338,18 @@ interface TraderConfigModalProps {
   onSave?: (data: CreateTraderRequest) => Promise<void>
 }
 
+// Stable defaults keep the initialization effect from resetting the form on
+// every render when an embedding page has not supplied its option lists yet.
+const EMPTY_MODELS: AIModel[] = []
+const EMPTY_EXCHANGES: Exchange[] = []
+
 export function TraderConfigModal({
   isOpen,
   onClose,
   traderData,
   isEditMode = false,
-  availableModels = [],
-  availableExchanges = [],
+  availableModels = EMPTY_MODELS,
+  availableExchanges = EMPTY_EXCHANGES,
   onSave,
 }: TraderConfigModalProps) {
   const { language } = useLanguage()
@@ -414,6 +424,27 @@ export function TraderConfigModal({
     risk_reentry_noise_override: false,
   })
   const [isSaving, setIsSaving] = useState(false)
+  const [guardCapabilities, setGuardCapabilities] =
+    useState<CopyGuardCapabilities>()
+  useEffect(() => {
+    if (!isOpen) return
+    let cancelled = false
+    setGuardCapabilities(undefined)
+    void httpClient
+      .get<{ copy_guard_capabilities?: CopyGuardCapabilities }>(
+        '/api/copytrade/risk/defaults'
+      )
+      .then((result) => {
+        if (!cancelled)
+          setGuardCapabilities(result.data?.copy_guard_capabilities)
+      })
+      .catch(() => {
+        if (!cancelled) setGuardCapabilities(undefined)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [isOpen])
   const [loadedLegacyReentry, setLoadedLegacyReentry] = useState(false)
   const [dormantATRProfile, setDormantATRProfile] =
     useState<CopyTradeConfig['atr_profile']>()
@@ -853,6 +884,15 @@ export function TraderConfigModal({
     const isFixedPositionMargin =
       isCopyGuardEnabled &&
       formData.risk_protection_mode === 'position_margin_pct'
+    if (
+      formData.risk_protection_mode === 'position_margin_pct' &&
+      !fixedModeSupported(guardCapabilities)
+    ) {
+      window.alert(
+        '后端尚未确认支持修订版固定止损，请先核对运行程序版本。现有跟单不受影响。'
+      )
+      return
+    }
     let highRiskConfirmed = false
     let extremeRiskConfirmValue: number | undefined
     let stopExtremeRiskConfirmValue: number | undefined
@@ -934,7 +974,8 @@ export function TraderConfigModal({
     }
     if (
       isFixedPositionMargin &&
-      (formData.risk_position_margin_stop_pct < 1 ||
+      (!Number.isFinite(formData.risk_position_margin_stop_pct) ||
+        formData.risk_position_margin_stop_pct < 1 ||
         formData.risk_position_margin_stop_pct > 99)
     ) {
       window.alert('首仓保证金止损比例必须为 1%～99%')
@@ -1039,6 +1080,10 @@ export function TraderConfigModal({
         // risk_policy_version），否则后端 "v4 only for OKX/Binance" 校验会拒绝保存。
         if (copyGuardCapableProvider(formData.copy_provider_type)) {
           Object.assign(saveData.copy_config, {
+            atr_profile_patch:
+              formData.risk_protection_mode === 'atr_structure'
+                ? atrProfileFromForm(formData)
+                : undefined,
             // 前端展示百分比 → 后端存比例，× 0.01 转换
             risk_stop_loss_enabled: formData.risk_stop_loss_enabled,
             risk_protection_mode: formData.risk_protection_mode,
@@ -1128,6 +1173,19 @@ export function TraderConfigModal({
         }
       }
 
+      if (
+        saveData.copy_config?.risk_protection_mode === 'position_margin_pct'
+      ) {
+        const response = await httpClient.get<{
+          copy_guard_capabilities?: CopyGuardCapabilities
+        }>('/api/copytrade/risk/defaults')
+        if (!fixedModeSupported(response.data?.copy_guard_capabilities)) {
+          toast.error('后端当前不支持实盘固定止损，请核验运行版本后再保存。')
+          throw new Error(
+            '后端当前不支持实盘固定止损，请核验运行版本后再保存。'
+          )
+        }
+      }
       await toast.promise(onSave(saveData), {
         loading: '正在保存…',
         success: '保存成功',
@@ -1960,6 +2018,8 @@ export function TraderConfigModal({
                         </div>
                         <button
                           type="button"
+                          aria-label="启用账户保护止损"
+                          aria-pressed={formData.risk_stop_loss_enabled}
                           onClick={() =>
                             handleInputChange(
                               'risk_stop_loss_enabled',
@@ -1980,11 +2040,21 @@ export function TraderConfigModal({
                           <label className="block text-xs text-[#848E9C]">
                             止损模式
                             <select
+                              aria-label="止损模式"
                               value={formData.risk_protection_mode}
                               onChange={(e) => {
                                 const mode = e.target.value as
                                   | 'atr_structure'
                                   | 'position_margin_pct'
+                                if (
+                                  mode === 'position_margin_pct' &&
+                                  formData.risk_protection_mode ===
+                                    'atr_structure'
+                                ) {
+                                  setDormantATRProfile(
+                                    atrProfileFromForm(formData)
+                                  )
+                                }
                                 setFormData((value) => ({
                                   ...value,
                                   risk_protection_mode: mode,
@@ -2018,10 +2088,20 @@ export function TraderConfigModal({
                               <option value="atr_structure">
                                 ATR / 结构止损（现有模式）
                               </option>
-                              <option value="position_margin_pct">
+                              <option
+                                value="position_margin_pct"
+                                disabled={
+                                  !fixedModeSupported(guardCapabilities)
+                                }
+                              >
                                 首仓固化保证金比例止损
                               </option>
                             </select>
+                            {!fixedModeSupported(guardCapabilities) && (
+                              <span className="block mt-1 text-[#F0B90B]">
+                                固定止损不可提交：后端能力未确认，请核对运行版本。
+                              </span>
+                            )}
                           </label>
 
                           {formData.risk_protection_mode ===

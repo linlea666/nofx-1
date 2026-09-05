@@ -85,6 +85,7 @@ const protectionLabels: Record<string, string> = {
   UNPROTECTABLE: '无法保护·裸跑（高危）',
   UNPROTECTED_WARNING: '无保护·已警告并继续重试',
   FORCED_EXIT_PENDING: '无法保护·市价离场确认中',
+  POSITION_ABSENT: '跟随仓位消失·无止损证据·等待领航员平仓',
 }
 const accountingLabels: Record<string, string> = {
   OPEN: '交易进行中',
@@ -189,6 +190,9 @@ const eventLabels: Record<string, string> = {
   SHADOW_POSITION_MARGIN_QUANTITY_SYNCED: '80% 影子仓位数量已同步',
   SHADOW_POSITION_MARGIN_LIQUIDATION_TIGHTENED: '80% 影子止损因强平线收紧',
   SHADOW_POSITION_MARGIN_STOP_CROSSED: '80% 影子止损首次穿越',
+  FOLLOWER_POSITION_ABSENT: '跟随仓位消失·无止损证据',
+  RISK_EXIT_INFLIGHT_FILL: '止损后在途订单成交·等待残仓退出',
+  PROTECTION_IDENTITY_MISMATCH: '交易所保护单范围、触发类型或价格不匹配',
   PROTECTION_REPLACEMENT_PENDING: '保护单换单中',
   PROTECTION_REPLACEMENT_COMPLETED: '保护单换单完成',
   PROTECTION_DISABLED_CANCELED: '止损功能关闭，已撤销保护单',
@@ -2237,71 +2241,6 @@ export function CopyGuardPage() {
           {summary.mean_net_guard_effect_estimate.sample_count} 个已验证周期）
         </div>
       )}
-      {!!summary?.shadow_promotion?.policies?.length && (
-        <div className="border border-[#2B3139] bg-[#181A20] rounded-lg p-4">
-          <div className="font-semibold mb-1">影子策略人工启用门槛</div>
-          <div className="text-xs text-[#848E9C] mb-3">
-            仅做离线评测，不会改变当前止损或自动下单。需至少 50
-            个独立关闭周期、10 个已验证固定止损穿越、mark 覆盖率至少
-            95%、相对当前策略的成本后增量均值与中位数为正、95% Bootstrap
-            下界不为负，且没有未保护成交。
-          </div>
-          <div className="grid md:grid-cols-3 gap-3">
-            {summary.shadow_promotion.policies.map((policy) => (
-              <div
-                key={policy.policy}
-                className="border border-[#2B3139] rounded p-3 text-xs"
-              >
-                <div className="font-semibold text-sm mb-2">
-                  {policy.policy}
-                </div>
-                <div>
-                  周期 / 已验证止损穿越：{policy.independent_cycles} /{' '}
-                  {policy.verified_crossings}
-                </div>
-                <div>
-                  相对当前策略增量均值 / 中位数：
-                  {money(policy.mean_incremental_effect)} /{' '}
-                  {money(policy.median_incremental_effect)}
-                </div>
-                <div>
-                  95% CI：[{money(policy.bootstrap_ci95_low)},{' '}
-                  {money(policy.bootstrap_ci95_high)}]
-                </div>
-                <div>
-                  mark 覆盖 / 止损后反转：
-                  {(policy.verified_mark_coverage * 100).toFixed(2)}% /{' '}
-                  {(policy.post_stop_reversal_rate * 100).toFixed(2)}%
-                </div>
-                <div>
-                  尾部亏损 CVaR95 / 平均滑点：
-                  {money(-policy.tail_loss_cvar_95_usd)} /{' '}
-                  {policy.average_slippage_bps.toFixed(2)} bps
-                </div>
-                <div>
-                  杠杆 / 名义区间：{policy.minimum_leverage || '-'}–
-                  {policy.maximum_leverage || '-'}× /{' '}
-                  {policy.minimum_notional.toFixed(2)}–
-                  {policy.maximum_notional.toFixed(2)} USDT
-                </div>
-                <div
-                  className="mt-2 font-semibold"
-                  style={{
-                    color: policy.eligible_for_manual_enable
-                      ? '#0ECB81'
-                      : '#F0B90B',
-                  }}
-                  title={policy.blocking_reasons.join('\n')}
-                >
-                  {policy.eligible_for_manual_enable
-                    ? '可人工评审开启'
-                    : `证据不足（${policy.blocking_reasons.length} 项门槛未满足）`}
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
       {(summary?.unscorable_baseline_cycles ?? 0) > 0 && (
         <div className="border border-[#F0B90B] bg-[#F0B90B]/10 rounded-lg p-4 text-sm text-[#F0B90B]">
           有 {summary?.unscorable_baseline_cycles}{' '}
@@ -2819,8 +2758,12 @@ export function CopyGuardPage() {
                   value={`${detail.position_margin_audit.raw_formula_stop_price || '-'} / ${detail.position_margin_audit.tick_aligned_stop_price || '-'}`}
                 />
                 <Metric
-                  label="当前有效止损 / mark"
+                  label="交易所核验止损 / mark"
                   value={`${detail.position_margin_audit.effective_stop_price || '-'} / ${detail.position_margin_audit.last_mark_price || '-'}`}
+                />
+                <Metric
+                  label="策略要求价（不等于已挂单）"
+                  value={`${detail.position_margin_audit.desired_stop_price || '-'}`}
                 />
                 <Metric
                   label="当前均价 / 数量 / 杠杆"
@@ -2858,6 +2801,12 @@ export function CopyGuardPage() {
                   label="数据时间"
                   value={dateLabel(detail.position_margin_audit.data_timestamp)}
                 />
+                <Metric
+                  label="保护单核验时间"
+                  value={dateLabel(
+                    detail.position_margin_audit.protection_verified_at
+                  )}
+                />
               </div>
               {detail.position_margin_audit.unscorable_reason && (
                 <p className="mt-2 text-xs text-[#F0B90B]">
@@ -2865,7 +2814,7 @@ export function CopyGuardPage() {
                 </p>
               )}
               <p className="mt-2 text-xs text-[#F0B90B]">
-                费用、资金费、滑点和跳空不进入 80%
+                费用、资金费、滑点和跳空不进入配置比例的
                 触发公式；真实成交损失可能高于理论值。
               </p>
             </div>
@@ -3083,54 +3032,6 @@ export function CopyGuardPage() {
               <div className="mt-3 text-xs text-[#848E9C]">
                 评价只基于已保存的观察行情、执行事件和交易所对账；INSUFFICIENT_DATA
                 会明确记为不可评分，不用估算盈亏冒充真实结果。
-              </div>
-            </div>
-          )}
-          {!!detail.shadow_evaluations?.length && (
-            <div className="border border-[#2B3139] rounded p-3">
-              <div className="font-semibold mb-2">
-                本周期影子策略（不影响实盘）
-              </div>
-              <div className="grid md:grid-cols-2 gap-2">
-                {detail.shadow_evaluations.map((evaluation) => (
-                  <div
-                    key={`${evaluation.policy}-${evaluation.evaluation_version}`}
-                    className="bg-[#0B0E11] rounded p-2 text-xs"
-                    title={evaluation.reason}
-                  >
-                    <div className="font-semibold">{evaluation.policy}</div>
-                    <div>
-                      {evaluation.status} / {evaluation.data_quality}
-                    </div>
-                    {evaluation.evaluation_version >= 2 ? (
-                      <>
-                        <div>
-                          替代策略净盈亏：{money(evaluation.net_pnl)}（成本{' '}
-                          {money(evaluation.estimated_cost)} ·{' '}
-                          {evaluation.cost_source || '待对账'}）
-                        </div>
-                        <div>
-                          相对 {evaluation.baseline_policy || '当前策略'} 增量：
-                          {money(evaluation.incremental_net_effect)}
-                        </div>
-                        <div>
-                          mark 覆盖{' '}
-                          {(evaluation.mark_coverage * 100).toFixed(2)}% · 穿越{' '}
-                          {evaluation.stop_crossed
-                            ? evaluation.crossing_verified
-                              ? '已验证'
-                              : '未验证'
-                            : '未发生'}
-                        </div>
-                      </>
-                    ) : (
-                      <div>
-                        v1 估算净值：{money(evaluation.net_pnl)}（不进入 v2
-                        人工启用统计）
-                      </div>
-                    )}
-                  </div>
-                ))}
               </div>
             </div>
           )}

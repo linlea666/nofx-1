@@ -101,7 +101,7 @@ func TestProtectionRearmThrottleConvergesOscillatingCycle(t *testing.T) {
 		store:            st,
 		protectionRearms: make(map[int64]*protectionRearmTracker),
 	}
-	cycle := &store.CopyGuardCycle{ID: 425, Symbol: "BTCUSDT", Side: "long", ProtectionStatus: "DEGRADED"}
+	cycle := &store.CopyGuardCycle{PolicySnapshot: `{"version":4}`, ID: 425, Symbol: "BTCUSDT", Side: "long", ProtectionStatus: "DEGRADED"}
 
 	for i := 1; i < protectionRearmWindowMax; i++ {
 		if ti.noteProtectionRearm(cycle) {

@@ -149,6 +149,11 @@ func TestBinanceCloseAllProtectionDoesNotReplaceOnQuantityChange(t *testing.T) {
 	if stored.CoverageMode != store.CopyGuardCoverageCloseAll || stored.Quantity != 2 || stored.AlgoID != "fixed-stop" {
 		t.Fatalf("close-all audit state was not updated without replacement: %+v", stored)
 	}
+	result.SLPrice = 92.1
+	ti.upsertV4Protection(dec, "long", 2, 102, result)
+	if executor.order.TriggerPrice != 92.1 {
+		t.Fatalf("one tick tightening was incorrectly treated as quantity-only reuse: %+v", executor.order)
+	}
 }
 func (e *positionMarginLifecycleExecutor) GetProtectiveStop(algoID, _ string) (*trader.ProtectiveStopOrder, error) {
 	if e.order == nil || e.order.AlgoID != algoID {
@@ -185,7 +190,7 @@ func (e *positionMarginLifecycleExecutor) setPosition(entry, quantity float64, l
 	}}
 }
 
-func TestPositionMarginShadowPrefersDedicatedMarkOverCachedPositionMark(t *testing.T) {
+func TestRetiredShadowDoesNotQueryDedicatedMarkOrMutateHistory(t *testing.T) {
 	st, err := store.New(filepath.Join(t.TempDir(), "shadow-dedicated-mark.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -195,7 +200,7 @@ func TestPositionMarginShadowPrefersDedicatedMarkOverCachedPositionMark(t *testi
 	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{
 		TraderID: traderID, LeaderID: "leader", LeaderPosID: "leader-shadow-mark",
 		Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", Status: store.CopyGuardFollowing,
-		PolicySnapshot: "{}", FollowerEntryPrice: 100, FollowerNotional: 100,
+		PolicySnapshot: `{"version":4}`, FollowerEntryPrice: 100, FollowerNotional: 100,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -239,18 +244,18 @@ func TestPositionMarginShadowPrefersDedicatedMarkOverCachedPositionMark(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if observed.Status != store.CopyGuardPositionMarginShadowCrossed || observed.CrossedPrice != 91 {
-		t.Fatalf("cached position mark hid dedicated-mark crossing: %+v", observed)
+	if observed.Status != store.CopyGuardPositionMarginShadowActive || observed.CrossedPrice != 0 {
+		t.Fatalf("retired shadow changed history: %+v", observed)
 	}
 	observedV2, err := st.CopyTrade().GetCopyGuardPositionMarginShadowV2(cycle.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if observedV2.Status != store.CopyGuardPositionMarginShadowCrossed || observedV2.CrossingSource != "LIVE_MARK" {
-		t.Fatalf("v2 ledger did not record dedicated mark crossing: %+v", observedV2)
+	if observedV2.Status != store.CopyGuardPositionMarginShadowActive || observedV2.CrossingSource != "" {
+		t.Fatalf("retired v2 ledger changed history: %+v", observedV2)
 	}
-	if executor.markCalls != 1 {
-		t.Fatalf("dedicated mark must be queried once per symbol and pass, calls=%d", executor.markCalls)
+	if executor.markCalls != 0 {
+		t.Fatalf("retired shadow must not query mark, calls=%d", executor.markCalls)
 	}
 }
 
@@ -468,7 +473,7 @@ func TestFixedPositionMarginLifecycleKeepsPriceAndSynchronizesOnlyQuantity(t *te
 	}
 }
 
-func TestPositionMarginShadowFinalizationFlushesLifecycleCheckpoint(t *testing.T) {
+func TestRetiredShadowFinalizationDoesNotFlushOrEvaluate(t *testing.T) {
 	st, err := store.New(filepath.Join(t.TempDir(), "shadow-finalize-flush.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -477,7 +482,7 @@ func TestPositionMarginShadowFinalizationFlushesLifecycleCheckpoint(t *testing.T
 	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{
 		TraderID: "shadow-finalize", LeaderID: "leader", LeaderPosID: "shadow-pos",
 		Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", Status: store.CopyGuardFollowing,
-		PolicySnapshot: "{}",
+		PolicySnapshot: `{"version":4}`,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -506,13 +511,13 @@ func TestPositionMarginShadowFinalizationFlushesLifecycleCheckpoint(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if shadow.Status != store.CopyGuardPositionMarginShadowFinalized || shadow.MarkObservationCount != 4 ||
-		shadow.MinimumMark != 91 || shadow.MaximumMark != 101 || shadow.CrossingSource != "LIVE_MARK" {
-		t.Fatalf("lifecycle close lost the in-memory mark checkpoint: %+v", shadow)
+	if shadow.Status != store.CopyGuardPositionMarginShadowActive || shadow.MarkObservationCount != 0 ||
+		shadow.MinimumMark != 0 || shadow.MaximumMark != 0 || shadow.CrossingSource != "" {
+		t.Fatalf("retired finalizer changed historical marks: %+v", shadow)
 	}
 	evaluations, err := st.CopyTrade().ListCopyGuardShadowEvaluations(cycle.ID)
-	if err != nil || len(evaluations) != 1 || !evaluations[0].StopCrossed || !evaluations[0].CrossingVerified {
-		t.Fatalf("flushed crossing was not finalized as verified: evaluations=%+v err=%v", evaluations, err)
+	if err != nil || len(evaluations) != 0 {
+		t.Fatalf("retired finalizer generated evaluations: %+v err=%v", evaluations, err)
 	}
 }
 
@@ -525,7 +530,7 @@ func TestPositionMarginShadowCheckpointRetainsCoverageClock(t *testing.T) {
 	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{
 		TraderID: "shadow-clock", LeaderID: "leader", LeaderPosID: "clock-pos",
 		Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", Status: store.CopyGuardFollowing,
-		PolicySnapshot: "{}",
+		PolicySnapshot: `{"version":4}`,
 	})
 	if err != nil {
 		t.Fatal(err)

@@ -1,6 +1,7 @@
 package copytrade
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -40,13 +41,14 @@ func newReentryTestEngine(t *testing.T) (*Engine, *store.Store) {
 	e := &Engine{
 		traderID: "trader-1",
 		config: &CopyConfig{
-			ProviderType:       ProviderOKX,
-			LeaderID:           "leader",
-			CopyRatio:          1,
-			RiskPolicyVersion:  4,
-			RiskReentryEnabled: true,
-			RiskReentryRatio:   0.5,
-			RiskMaxReentries:   2,
+			ProviderType:            ProviderOKX,
+			LeaderID:                "leader",
+			CopyRatio:               1,
+			RiskPolicyVersion:       4,
+			RiskReentryEnabled:      true,
+			RiskReentryDecisionMode: "legacy_rule",
+			RiskReentryRatio:        0.5,
+			RiskMaxReentries:        2,
 			// 不受支持的 timeframe 让 ATR 立即失败 → 走 RiskATRFallbackPct，测试可确定
 			RiskATRTimeframe:           "5m",
 			RiskATRPeriod:              14,
@@ -91,8 +93,19 @@ func newReentryTestEngine(t *testing.T) (*Engine, *store.Store) {
 }
 
 // seedStoppedCycle: 建 mapping(stopped_by_risk) + open cycle(STOPPED_WATCHING)
-func seedStoppedCycle(t *testing.T, st *store.Store, traderID string, side string, leaderEntry float64) *store.CopyGuardCycle {
+func seedStoppedCycle(t *testing.T, st *store.Store, traderID string, side string, leaderEntry float64, configs ...*CopyConfig) *store.CopyGuardCycle {
 	t.Helper()
+	policy, err := st.CopyTrade().GetByTraderID(traderID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := store.EncodeCopyGuardPolicySnapshot(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(configs) > 0 {
+		snapshot = testRiskSnapshot(t, configs[0])
+	}
 	mapping := &store.CopyTradePositionMapping{TraderID: traderID, LeaderPosID: "leader-pos", LeaderID: "leader", Symbol: "ETHUSDT", Side: side, MarginMode: "cross", OpenedAt: time.Now(), OpenPrice: leaderEntry, OpenSizeUSD: 100, LastKnownSize: 1}
 	if err := st.CopyTrade().SavePositionMapping(mapping); err != nil {
 		t.Fatal(err)
@@ -100,7 +113,7 @@ func seedStoppedCycle(t *testing.T, st *store.Store, traderID string, side strin
 	if err := st.CopyTrade().MarkStoppedByRisk(traderID, "leader-pos", -5, 1, 0); err != nil {
 		t.Fatal(err)
 	}
-	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{TraderID: traderID, LeaderID: "leader", LeaderPosID: "leader-pos", Symbol: "ETHUSDT", Side: side, MarginMode: "cross", Status: store.CopyGuardFollowing, PolicySnapshot: "{}", LeaderEntryPrice: leaderEntry, FollowerEntryPrice: leaderEntry, FollowerNotional: 100, AccountEquity: 100})
+	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{TraderID: traderID, LeaderID: "leader", LeaderPosID: "leader-pos", Symbol: "ETHUSDT", Side: side, MarginMode: "cross", Status: store.CopyGuardFollowing, PolicySnapshot: snapshot, LeaderEntryPrice: leaderEntry, FollowerEntryPrice: leaderEntry, FollowerNotional: 100, AccountEquity: 100})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,6 +128,23 @@ func seedStoppedCycle(t *testing.T, st *store.Store, traderID string, side strin
 		t.Fatal(err)
 	}
 	return fresh
+}
+
+func testRiskSnapshot(t *testing.T, config *CopyConfig) string {
+	t.Helper()
+	raw, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := store.DecodeCopyGuardPolicySnapshot(string(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err = json.Marshal(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(raw)
 }
 
 // ============================================================================
@@ -220,7 +250,7 @@ func TestDoubleStopReentryLifecycle(t *testing.T) {
 
 func TestReentryFirstTickGuardAndConfirmation(t *testing.T) {
 	e, st := newReentryTestEngine(t)
-	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700)
+	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700, e.config)
 	// RecordCopyGuardStop 未写 last_observed_price → 首轮为 0
 	if cycle.LastObservedPrice != 0 {
 		t.Fatalf("precondition: LastObservedPrice must start at 0, got %v", cycle.LastObservedPrice)
@@ -285,7 +315,7 @@ func TestReentryFirstTickGuardAndConfirmation(t *testing.T) {
 
 func TestReentrySizeUsesStoppedAttemptNotional(t *testing.T) {
 	e, st := newReentryTestEngine(t)
-	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700) // attempt 0 notional=100 被止损
+	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700, e.config) // attempt 0 notional=100 被止损
 	_ = st.CopyTrade().UpdateCopyGuardObservation(cycle.ID, store.CopyGuardStoppedWatching, 1700, 1660, 34)
 	// 领航员当前持仓极大（加仓后）：旧公式会算出 1×0.5×(2500×1690/1000)×100 ≈ 21 万
 	e.leaderState.Positions["ETHUSDT_long"] = &Position{Symbol: "ETHUSDT", Side: SideLong, Size: 2500, EntryPrice: 1700, MarkPrice: 1690, MarginMode: "cross", PosID: "leader-pos"}
@@ -315,7 +345,7 @@ func TestReentryBlockedByCooldownAndExhaustion(t *testing.T) {
 	// 冷却期内即使满足穿越条件也不触发
 	e, st := newReentryTestEngine(t)
 	e.config.RiskReentryCooldownSeconds = 3600
-	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700)
+	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700, e.config)
 	_ = st.CopyTrade().UpdateCopyGuardObservation(cycle.ID, store.CopyGuardStoppedWatching, 1700, 1660, 34)
 	e.leaderState.Positions["ETHUSDT_long"] = &Position{Symbol: "ETHUSDT", Side: SideLong, Size: 1, EntryPrice: 1700, MarkPrice: 1690, MarginMode: "cross", PosID: "leader-pos"}
 	e.checkReentryConditions()
@@ -332,7 +362,7 @@ func TestReentryBlockedByCooldownAndExhaustion(t *testing.T) {
 	// 次数耗尽：周期转 ATTEMPTS_EXHAUSTED（保持 open 等领航员平仓），不触发决策
 	e2, st2 := newReentryTestEngine(t)
 	e2.config.RiskMaxReentries = 0
-	cycle2 := seedStoppedCycle(t, st2, "trader-1", "long", 1700)
+	cycle2 := seedStoppedCycle(t, st2, "trader-1", "long", 1700, e2.config)
 	_ = st2.CopyTrade().UpdateCopyGuardObservation(cycle2.ID, store.CopyGuardStoppedWatching, 1700, 1660, 34)
 	e2.leaderState.Positions["ETHUSDT_long"] = &Position{Symbol: "ETHUSDT", Side: SideLong, Size: 1, EntryPrice: 1700, MarkPrice: 1690, MarginMode: "cross", PosID: "leader-pos"}
 	e2.checkReentryConditions()
@@ -360,7 +390,7 @@ func TestReentryMinRecoveryRaisesBoundary(t *testing.T) {
 	// seedStoppedCycle: entry=1700, 止损成交价 = 1700×0.98 = 1666
 	// ATR fallback = 1700×0.02 = 34 → 带宽边界 1700−17=1683，
 	// 恢复下限 1666+34=1700 → 有效边界抬高到 1700
-	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700)
+	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700, e.config)
 	_ = st.CopyTrade().UpdateCopyGuardObservation(cycle.ID, store.CopyGuardStoppedWatching, 1700, 1660, 34)
 	e.leaderState.Positions["ETHUSDT_long"] = &Position{Symbol: "ETHUSDT", Side: SideLong, Size: 1, EntryPrice: 1700, MarkPrice: 1690, MarginMode: "cross", PosID: "leader-pos"}
 
@@ -392,7 +422,7 @@ func TestReentryMinRecoveryRaisesBoundary(t *testing.T) {
 
 func TestReentryConservativeAnchorIgnoresAveragedDownEntry(t *testing.T) {
 	e, st := newReentryTestEngine(t)
-	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700)
+	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700, e.config)
 	// 止损时快照领航员均价 1700；随后领航员加仓摊均价到 1650
 	if err := st.CopyTrade().SnapshotCopyGuardLeaderEntryAtStop(cycle.ID, 1700); err != nil {
 		t.Fatal(err)
@@ -430,7 +460,7 @@ func TestReentryConservativeAnchorIgnoresAveragedDownEntry(t *testing.T) {
 
 func TestReentryNoiseTierDisablesAndOverrides(t *testing.T) {
 	e, st := newReentryTestEngine(t)
-	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700)
+	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700, e.config)
 	// 把止损快照改成极窄距离：entry 1700 → exit 1693.2（distance=6.8），
 	// ATRAtStop=34 → ratio=0.2 < 0.3 → 噪音档禁入
 	if _, err := st.DB().Exec(`UPDATE copy_guard_attempts SET exit_price=1693.2, stop_fill_price=1693.2 WHERE cycle_id=? AND attempt_no=0`, cycle.ID); err != nil {
@@ -450,6 +480,11 @@ func TestReentryNoiseTierDisablesAndOverrides(t *testing.T) {
 
 	// override 后放行，但走谨慎档：确认 tick 数翻倍（6）
 	e.config.RiskReentryNoiseOverride = true
+	// Seed the second policy scenario explicitly. Editing the live template
+	// alone is intentionally not allowed to alter an already-open contract.
+	if _, err := st.DB().Exec(`UPDATE copy_guard_cycles SET policy_snapshot=? WHERE id=?`, testRiskSnapshot(t, e.config), cycle.ID); err != nil {
+		t.Fatal(err)
+	}
 	for i := 0; i < 5; i++ {
 		e.checkReentryConditions()
 	}
@@ -475,7 +510,7 @@ func TestReentryCooldownEscalationClampsInsteadOfOverflow(t *testing.T) {
 	e.config.RiskMaxReentries = 10
 	e.config.RiskReentryCooldownSeconds = 86400
 	e.config.RiskReentryCooldownEscalation = 10
-	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700) // stopped_at = 刚刚
+	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700, e.config) // stopped_at = 刚刚
 	// 86400s × 10^9 转 time.Duration 会越过 int64 纳秒上限；未钳制时溢出为
 	// 负值 → coolingDown 恒 false → 冷却被绕过
 	if _, err := st.DB().Exec(`UPDATE copy_guard_cycles SET reentry_count=9 WHERE id=?`, cycle.ID); err != nil {
@@ -502,7 +537,7 @@ func TestReentryCooldownEscalationClampsInsteadOfOverflow(t *testing.T) {
 
 func TestWatchReversalClosesCycle(t *testing.T) {
 	e, st := newReentryTestEngine(t)
-	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700)
+	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700, e.config)
 	// 领航员同 posId 反手为空单
 	e.leaderState.Positions["ETHUSDT_short"] = &Position{Symbol: "ETHUSDT", Side: SideShort, Size: 1, EntryPrice: 1700, MarkPrice: 1695, MarginMode: "cross", PosID: "leader-pos"}
 	e.checkReentryConditions()
@@ -526,7 +561,7 @@ func TestWatchReversalClosesCycle(t *testing.T) {
 
 func TestATRWatchUsesSnapshotAfterTraderSwitchesToFixed(t *testing.T) {
 	e, st := newReentryTestEngine(t)
-	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700)
+	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700, e.config)
 	if _, err := st.DB().Exec(`UPDATE copy_guard_cycles SET policy_snapshot=? WHERE id=?`, `{
 		"version":4,
 		"risk_protection_mode":"atr_structure",
@@ -574,7 +609,7 @@ func TestATRWatchUsesSnapshotAfterTraderSwitchesToFixed(t *testing.T) {
 
 func TestFixedPositionMarginStoppedReversalClosesWithoutReentryMonitor(t *testing.T) {
 	e, st := newReentryTestEngine(t)
-	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700)
+	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700, e.config)
 	e.config.RiskProtectionMode = store.RiskProtectionModePositionMarginPct
 	e.config.RiskPositionMarginStopPct = 0.80
 	e.config.RiskReentryEnabled = false
@@ -703,7 +738,7 @@ func TestBackfillV4Cycles(t *testing.T) {
 
 func TestWatchSamplesRecordGateTimeline(t *testing.T) {
 	e, st := newReentryTestEngine(t)
-	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700)
+	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700, e.config)
 
 	// tick 1：首轮观察（last=0）不判穿越 → PRICE_NOT_RETURNED，且必须记录边界/追价上限
 	// ATR fallback = 1700×0.02 = 34；boundary = 1700 − 17 = 1683；chase = 1700 + 68 = 1768
@@ -758,8 +793,8 @@ func TestWatchSamplesRecordGateTimeline(t *testing.T) {
 // ============================================================================
 
 func TestWatchSummaryPriceSavedAndBlockedGates(t *testing.T) {
-	_, st := newReentryTestEngine(t)
-	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700) // 止损成交价 1700×0.98=1666，qty=100/1700
+	e, st := newReentryTestEngine(t)
+	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700, e.config) // 止损成交价 1700×0.98=1666，qty=100/1700
 
 	// 观察期采样：一条价格已回归边界但被冷却挡住；一条未回归
 	if err := st.CopyTrade().SaveCopyGuardWatchSample(&store.CopyGuardWatchSample{CycleID: cycle.ID, TraderID: "trader-1", MarkPrice: 1690, ATR: 34, ReentryBoundary: 1683, ChaseLimit: 1768, Gate: watchGateCooldown}); err != nil {
@@ -798,7 +833,7 @@ func TestWatchSummaryPriceSavedAndBlockedGates(t *testing.T) {
 	}
 
 	// 未触发过止损的周期不产生 WATCH_SUMMARY
-	fresh, err := st.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "pos-2", Symbol: "BTCUSDT", Side: "long", MarginMode: "cross", Status: store.CopyGuardFollowing, PolicySnapshot: "{}", LeaderEntryPrice: 60000, FollowerEntryPrice: 60000, FollowerNotional: 100, AccountEquity: 100})
+	fresh, err := st.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "pos-2", Symbol: "BTCUSDT", Side: "long", MarginMode: "cross", Status: store.CopyGuardFollowing, PolicySnapshot: `{"version":4}`, LeaderEntryPrice: 60000, FollowerEntryPrice: 60000, FollowerNotional: 100, AccountEquity: 100})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -859,7 +894,7 @@ func TestProtectiveStopMustConfirmFlatBeforeWatchingOrReentry(t *testing.T) {
 	executor := &stopMgrExecutor{mockStopMgr: mock, positions: []map[string]interface{}{{"symbol": "ETHUSDT", "side": "long", "mgnMode": "cross", "positionAmt": .01, "entryPrice": 100}}}
 	ti := NewTraderIntegration("trader-1", executor, st)
 	ti.engine = &Engine{traderID: "trader-1", config: &CopyConfig{ProviderType: ProviderOKX, RiskPolicyVersion: 4, RiskATRTimeframe: "unsupported", RiskATRPeriod: 14, RiskATRFallbackPct: .02}, store: st, leaderState: &AccountState{Positions: map[string]*Position{}}}
-	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "leader-pos", Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", Status: store.CopyGuardFollowing, PolicySnapshot: "{}", LeaderEntryPrice: 100, FollowerEntryPrice: 100, FollowerNotional: 5, AccountEquity: 100})
+	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "leader-pos", Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", Status: store.CopyGuardFollowing, PolicySnapshot: `{"version":4}`, LeaderEntryPrice: 100, FollowerEntryPrice: 100, FollowerNotional: 5, AccountEquity: 100})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -962,7 +997,7 @@ func countGuardEvents(t *testing.T, st *store.Store, cycleID int64, typ string) 
 func TestReentryWindowInfeasibleLongExhausts(t *testing.T) {
 	e, st := newReentryTestEngine(t)
 	makeWindowInfeasibleConfig(e) // 默认 RiskManualReentryEnabled=false
-	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700)
+	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700, e.config)
 	_ = st.CopyTrade().UpdateCopyGuardObservation(cycle.ID, store.CopyGuardStoppedWatching, 1700, 1690, 34)
 	e.leaderState.Positions["ETHUSDT_long"] = &Position{Symbol: "ETHUSDT", Side: SideLong, Size: 1, EntryPrice: 1700, MarkPrice: 1690, MarginMode: "cross", PosID: "leader-pos"}
 
@@ -995,7 +1030,7 @@ func TestReentryWindowInfeasibleLongExhausts(t *testing.T) {
 func TestReentryWindowInfeasibleShortMirror(t *testing.T) {
 	e, st := newReentryTestEngine(t)
 	makeWindowInfeasibleConfig(e)
-	cycle := seedStoppedCycle(t, st, "trader-1", "short", 1700)
+	cycle := seedStoppedCycle(t, st, "trader-1", "short", 1700, e.config)
 	_ = st.CopyTrade().UpdateCopyGuardObservation(cycle.ID, store.CopyGuardStoppedWatching, 1700, 1710, 34)
 	e.leaderState.Positions["ETHUSDT_short"] = &Position{Symbol: "ETHUSDT", Side: SideShort, Size: 1, EntryPrice: 1700, MarkPrice: 1710, MarginMode: "cross", PosID: "leader-pos"}
 
@@ -1017,7 +1052,7 @@ func TestReentryWindowFeasibleKeepsAutoReentry(t *testing.T) {
 	e, st := newReentryTestEngine(t)
 	e.config.RiskReentryMinRecoveryATR = 0.5
 	e.config.RiskReentryMaxChaseATR = 0.5 // 窗口 [1683,1717] 非空
-	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700)
+	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700, e.config)
 	_ = st.CopyTrade().UpdateCopyGuardObservation(cycle.ID, store.CopyGuardStoppedWatching, 1700, 1690, 34)
 	e.leaderState.Positions["ETHUSDT_long"] = &Position{Symbol: "ETHUSDT", Side: SideLong, Size: 1, EntryPrice: 1700, MarkPrice: 1690, MarginMode: "cross", PosID: "leader-pos"}
 
@@ -1044,7 +1079,7 @@ func TestReentryWindowNotJudgedDuringCooldown(t *testing.T) {
 	e, st := newReentryTestEngine(t)
 	makeWindowInfeasibleConfig(e)
 	e.config.RiskReentryCooldownSeconds = 3600
-	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700)
+	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700, e.config)
 	_ = st.CopyTrade().UpdateCopyGuardObservation(cycle.ID, store.CopyGuardStoppedWatching, 1700, 1690, 34)
 	e.leaderState.Positions["ETHUSDT_long"] = &Position{Symbol: "ETHUSDT", Side: SideLong, Size: 1, EntryPrice: 1700, MarkPrice: 1690, MarginMode: "cross", PosID: "leader-pos"}
 
@@ -1067,7 +1102,7 @@ func TestRetiredManualModeDoesNotSignalOnRecovery(t *testing.T) {
 	e.config.RiskMaxReentries = 0 // ReentryCount(0)>=0 → 直接 ATTEMPTS_EXHAUSTED（终态短路）
 	e.config.RiskReentryMinRecoveryATR = 0.5
 	e.config.RiskReentryMaxChaseATR = 0.5 // 窗口 [1683,1717]
-	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700)
+	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700, e.config)
 	_ = st.CopyTrade().UpdateCopyGuardObservation(cycle.ID, store.CopyGuardAttemptsExhausted, 1700, 1690, 34)
 	// markPrice 1750：越过 chase 上限 1717，但已回归下界 1683
 	e.leaderState.Positions["ETHUSDT_long"] = &Position{Symbol: "ETHUSDT", Side: SideLong, Size: 1, EntryPrice: 1700, MarkPrice: 1750, MarginMode: "cross", PosID: "leader-pos"}
@@ -1093,7 +1128,7 @@ func TestManualModeNoSignalWhenPriceNotReturned(t *testing.T) {
 	e.config.RiskMaxReentries = 0
 	e.config.RiskReentryMinRecoveryATR = 0.5
 	e.config.RiskReentryMaxChaseATR = 0.5
-	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700)
+	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700, e.config)
 	_ = st.CopyTrade().UpdateCopyGuardObservation(cycle.ID, store.CopyGuardAttemptsExhausted, 1700, 1670, 34)
 	// markPrice 1670 < 下界 1683 → 未回归
 	e.leaderState.Positions["ETHUSDT_long"] = &Position{Symbol: "ETHUSDT", Side: SideLong, Size: 1, EntryPrice: 1700, MarkPrice: 1670, MarginMode: "cross", PosID: "leader-pos"}
@@ -1118,7 +1153,7 @@ func TestRetiredManualModeDoesNotReviveAfterMultipleStops(t *testing.T) {
 	e, st := newReentryTestEngine(t)
 	e.config.RiskManualReentryEnabled = true // RiskMaxReentries=2（脚手架默认）
 
-	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700) // attempt 0 名义 100 已止损
+	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700, e.config) // attempt 0 名义 100 已止损
 	// 重入 #1（名义 50）→ 止损；重入 #2（名义 8）→ 止损 → reentry_count=2 用尽
 	_ = st.CopyTrade().UpdateCopyGuardObservation(cycle.ID, store.CopyGuardReentryPending, cycle.LeaderEntryPrice, cycle.LastObservedPrice, 0)
 	cycle, _ = st.CopyTrade().GetCopyGuardCycle(cycle.ID)
@@ -1167,7 +1202,7 @@ func TestRetiredManualModeDoesNotCreateMinimumSizedSignal(t *testing.T) {
 	e, st := newReentryTestEngine(t)
 	e.config.RiskManualReentryEnabled = true
 	e.config.RiskMaxReentries = 0 // reentry_count(0)>=0 → 直接用尽（终态短路）
-	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700)
+	cycle := seedStoppedCycle(t, st, "trader-1", "long", 1700, e.config)
 	// 首仓名义压到 5（< 门槛 10）
 	if _, err := st.DB().Exec(`UPDATE copy_guard_attempts SET notional=5 WHERE cycle_id=? AND attempt_no=0`, cycle.ID); err != nil {
 		t.Fatal(err)
@@ -1215,7 +1250,7 @@ func TestAIReentryExecutionFailureReleasesRiskAndReturnsToWaiting(t *testing.T) 
 		t.Fatal(err)
 	}
 	defer st.Close()
-	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "leader-pos", Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", Status: store.CopyGuardReentryPending, PolicySnapshot: "{}", AccountEquity: 100, LeaderEntryPrice: 1700, LastObservedPrice: 1690})
+	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "leader-pos", Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", Status: store.CopyGuardReentryPending, PolicySnapshot: `{"version":7,"reentry_decision_mode":"ai_guarded","ai_min_review_seconds":300}`, AccountEquity: 100, LeaderEntryPrice: 1700, LastObservedPrice: 1690})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1297,7 +1332,7 @@ func TestAIReentryAmbiguousFailureKeepsLeaseAndReservation(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "leader-pos", Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", Status: store.CopyGuardReentryPending, PolicySnapshot: "{}", AccountEquity: 100, LeaderEntryPrice: 1700, LastObservedPrice: 1690})
+	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{TraderID: "trader-1", LeaderID: "leader", LeaderPosID: "leader-pos", Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", Status: store.CopyGuardReentryPending, PolicySnapshot: `{"version":4}`, AccountEquity: 100, LeaderEntryPrice: 1700, LastObservedPrice: 1690})
 	if err != nil {
 		t.Fatal(err)
 	}

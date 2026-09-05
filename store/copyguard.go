@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -420,6 +421,15 @@ func (s *CopyTradeStore) ensureUniqueActiveCopyGuardCycleIndex() error {
 
 func (s *CopyTradeStore) initCopyGuardTables() error {
 	_, err := s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS copy_guard_leverage_receipts (
+			intent_id INTEGER NOT NULL, client_order_id TEXT NOT NULL, leverage REAL NOT NULL,
+			observed_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(intent_id,client_order_id)
+		);
+		CREATE TABLE IF NOT EXISTS copy_guard_initial_fill_evidence (
+			cycle_id INTEGER PRIMARY KEY, intent_id INTEGER NOT NULL, entry_price REAL NOT NULL,
+			quantity REAL NOT NULL, leverage REAL NOT NULL DEFAULT 0, client_order_id TEXT NOT NULL,
+			exchange_order_id TEXT NOT NULL, observed_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);
 		CREATE TABLE IF NOT EXISTS copy_guard_account_policies (
 			exchange_id TEXT PRIMARY KEY,
 			max_position_loss_pct REAL NOT NULL DEFAULT 0.10,
@@ -826,7 +836,7 @@ func (s *CopyTradeStore) UpsertCopyGuardProtectiveOrder(o *CopyGuardProtectiveOr
 	if o.CoverageMode == "" {
 		o.CoverageMode = CopyGuardCoverageExactQuantity
 	}
-	_, err := s.db.Exec(`INSERT INTO copy_guard_protective_orders(cycle_id,trader_id,algo_id,algo_client_id,symbol,side,margin_mode,quantity,quantity_step,coverage_mode,trigger_price,trigger_type,status,previous_algo_id,previous_algo_client_id,replacement_pending) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(cycle_id) DO UPDATE SET algo_id=excluded.algo_id,algo_client_id=excluded.algo_client_id,quantity=excluded.quantity,quantity_step=excluded.quantity_step,coverage_mode=excluded.coverage_mode,trigger_price=excluded.trigger_price,trigger_type=excluded.trigger_type,status=excluded.status,previous_algo_id=excluded.previous_algo_id,previous_algo_client_id=excluded.previous_algo_client_id,replacement_pending=excluded.replacement_pending,updated_at=CURRENT_TIMESTAMP`, o.CycleID, o.TraderID, o.AlgoID, o.AlgoClientID, o.Symbol, o.Side, o.MarginMode, o.Quantity, o.QuantityStep, o.CoverageMode, o.TriggerPrice, o.TriggerType, o.Status, o.PreviousAlgoID, o.PreviousAlgoClientID, o.ReplacementPending)
+	_, err := s.db.Exec(`INSERT INTO copy_guard_protective_orders(cycle_id,trader_id,algo_id,algo_client_id,symbol,side,margin_mode,quantity,quantity_step,coverage_mode,trigger_price,trigger_type,status,previous_algo_id,previous_algo_client_id,replacement_pending) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(cycle_id) DO UPDATE SET symbol=excluded.symbol,side=excluded.side,margin_mode=excluded.margin_mode,algo_id=excluded.algo_id,algo_client_id=excluded.algo_client_id,quantity=excluded.quantity,quantity_step=excluded.quantity_step,coverage_mode=excluded.coverage_mode,trigger_price=excluded.trigger_price,trigger_type=excluded.trigger_type,status=excluded.status,previous_algo_id=excluded.previous_algo_id,previous_algo_client_id=excluded.previous_algo_client_id,replacement_pending=excluded.replacement_pending,updated_at=CURRENT_TIMESTAMP`, o.CycleID, o.TraderID, o.AlgoID, o.AlgoClientID, o.Symbol, o.Side, o.MarginMode, o.Quantity, o.QuantityStep, o.CoverageMode, o.TriggerPrice, o.TriggerType, o.Status, o.PreviousAlgoID, o.PreviousAlgoClientID, o.ReplacementPending)
 	return err
 }
 
@@ -999,7 +1009,7 @@ func EncodeCopyGuardPolicySnapshot(c *CopyTradeConfig) (string, error) {
 func DecodeCopyGuardPolicySnapshot(raw string) (*CopyGuardPolicy, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return &CopyGuardPolicy{}, nil
+		return nil, fmt.Errorf("copy guard policy snapshot is empty")
 	}
 	var object map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(raw), &object); err != nil {
@@ -1031,10 +1041,16 @@ func DecodeCopyGuardPolicySnapshot(raw string) (*CopyGuardPolicy, error) {
 		if err := json.Unmarshal([]byte(raw), &policy); err != nil {
 			return nil, err
 		}
+		if !hasRecognizedPolicyField(object, reflect.TypeOf(policy), false) {
+			return nil, fmt.Errorf("copy guard snapshot has no recognized policy evidence")
+		}
 		return &policy, nil
 	}
 
 	var legacy CopyTradeConfig
+	if !hasRecognizedPolicyField(object, reflect.TypeOf(legacy), true) {
+		return nil, fmt.Errorf("copy guard runtime snapshot has no recognized risk fields")
+	}
 	if err := json.Unmarshal([]byte(raw), &legacy); err != nil {
 		return nil, err
 	}
@@ -1050,6 +1066,22 @@ func DecodeCopyGuardPolicySnapshot(raw string) (*CopyGuardPolicy, error) {
 		_ = json.Unmarshal(encodedVersion, &policy.DefaultsVersion)
 	}
 	return &policy, nil
+}
+
+// Presence, not truthiness: old policies may legitimately contain explicit zero
+// values or only a subset of the versioned risk fields. Unknown keys (including
+// credentials) cannot make an otherwise empty snapshot a policy.
+func hasRecognizedPolicyField(object map[string]json.RawMessage, typ reflect.Type, riskOnly bool) bool {
+	for i := 0; i < typ.NumField(); i++ {
+		key := strings.Split(typ.Field(i).Tag.Get("json"), ",")[0]
+		if key == "" || key == "-" || (riskOnly && !strings.HasPrefix(key, "risk_")) {
+			continue
+		}
+		if value, ok := object[key]; ok && string(value) != "null" {
+			return true
+		}
+	}
+	return false
 }
 
 // CanonicalizeCopyGuardPolicySnapshot strips every non-risk field and upgrades
@@ -1484,6 +1516,7 @@ type InitialCopyGuardLifecycle struct {
 	AccountEquity    float64
 	ATRAtEntry       float64
 	EntryOrderID     string
+	EntryClientID    string
 }
 
 func ensureInitialCopyGuardLifecycleTx(tx *sql.Tx, in InitialCopyGuardLifecycle, fillCommit bool) (int64, bool, error) {
@@ -1573,6 +1606,9 @@ func ensureInitialCopyGuardLifecycleTx(tx *sql.Tx, in InitialCopyGuardLifecycle,
 		return 0, false, fmt.Errorf("execution intent %d cannot bind initial cycle %d", in.IntentID, cycleID)
 	}
 	if created {
+		if err = saveInitialFillEvidenceTx(tx, cycleID, in); err != nil {
+			return 0, false, fmt.Errorf("freeze initial fill evidence: %w", err)
+		}
 		metadata := fmt.Sprintf(`{"intent_id":%d,"entry_order_id":%q,"anchor_source":"INITIAL_FILL"}`, in.IntentID, in.EntryOrderID)
 		if _, err = tx.Exec(`INSERT INTO copy_guard_events(cycle_id,trader_id,type,price,quantity,notional,metadata_json)
 			VALUES(?,?, 'INITIAL_ENTRY_FILLED',?,?,?,?)`, cycleID, in.TraderID, in.FollowerEntry,
@@ -2032,7 +2068,7 @@ func (s *CopyTradeStore) HasOpenCopyGuardCycles(traderID string) (bool, error) {
 // 与观察轮询存在竞态（如止损触发与领航员平仓同一轮发生），已关闭的周期绝不能
 // 被观察更新改回 STOPPED_WATCHING。
 func (s *CopyTradeStore) UpdateCopyGuardObservation(id int64, status string, leaderEntry, lastPrice, atr float64) error {
-	_, err := s.db.Exec(`UPDATE copy_guard_cycles SET status=?,leader_entry_price=?,last_observed_price=?,atr_at_stop=CASE WHEN ? > 0 THEN ? ELSE atr_at_stop END,updated_at=CURRENT_TIMESTAMP WHERE id=? AND closed_at IS NULL`, status, leaderEntry, lastPrice, atr, atr, id)
+	_, err := s.db.Exec(`UPDATE copy_guard_cycles SET status=?,leader_entry_price=?,last_observed_price=?,atr_at_stop=CASE WHEN ? > 0 THEN ? ELSE atr_at_stop END,updated_at=CURRENT_TIMESTAMP WHERE id=? AND closed_at IS NULL AND status NOT IN ('STOP_PENDING_FLAT','STOP_PARTIAL','STOP_TRIGGERED')`, status, leaderEntry, lastPrice, atr, atr, id)
 	return err
 }
 
@@ -2217,9 +2253,9 @@ func (s *CopyTradeStore) BeginCopyGuardRiskExit(in CopyGuardRiskExitBegin) (bool
 	created := cycleStatus != CopyGuardStopPendingFlat && cycleStatus != CopyGuardStopPartial
 	if _, err = tx.Exec(`UPDATE copy_trade_position_mappings SET
 		status='stopped_by_risk',stopped_at=COALESCE(stopped_at,CURRENT_TIMESTAMP),
-		leader_pnl_at_stop=?,leader_size_at_stop=?,add_count_at_stop=?,updated_at=CURRENT_TIMESTAMP
+		leader_pnl_at_stop=?,leader_size_at_stop=CASE WHEN ?>0 THEN ? ELSE last_known_size END,add_count_at_stop=add_count,updated_at=CURRENT_TIMESTAMP
 		WHERE trader_id=? AND leader_pos_id=? AND status='active'`,
-		in.LeaderPnL, in.LeaderSize, in.AddCount, in.TraderID, in.LeaderPosID); err != nil {
+		in.LeaderPnL, in.LeaderSize, in.LeaderSize, in.TraderID, in.LeaderPosID); err != nil {
 		return false, err
 	}
 	var mappingStatus string
@@ -2242,9 +2278,10 @@ func (s *CopyTradeStore) BeginCopyGuardRiskExit(in CopyGuardRiskExitBegin) (bool
 	if _, err = tx.Exec(`UPDATE copy_guard_attempts SET
 		stop_trigger_price=CASE WHEN ?>0 THEN ? ELSE stop_trigger_price END,
 		stop_algo_id=CASE WHEN ?<>'' THEN ? ELSE stop_algo_id END,
+		exit_order_id=CASE WHEN ?<>'' THEN ? ELSE exit_order_id END,
 		protection_status=?,protection_coverage=0,protection_updated_at=CURRENT_TIMESTAMP
 		WHERE cycle_id=? AND attempt_no=? AND status='OPEN'`,
-		in.TriggerPrice, in.TriggerPrice, in.AlgoID, in.AlgoID, CopyGuardProtectionTriggered,
+		in.TriggerPrice, in.TriggerPrice, in.AlgoID, in.AlgoID, metadataString(in.Metadata, "actual_order_id"), metadataString(in.Metadata, "actual_order_id"), CopyGuardProtectionTriggered,
 		in.CycleID, in.AttemptNo); err != nil {
 		return false, err
 	}
@@ -2352,6 +2389,12 @@ func (s *CopyTradeStore) FinalizeCopyGuardRiskExit(in CopyGuardRiskExitFinalize)
 		return false, fmt.Errorf("Copy Guard risk exit cannot finalize from cycle=%s attempt=%s", cycleStatus, attemptStatus)
 	}
 	actualOrderID := strings.TrimSpace(in.ActualOrderID)
+	if err = assertCopyGuardLeaderOrdersSettledTx(tx, in.TraderID, in.LeaderPosID); err != nil {
+		return false, err
+	}
+	if _, err = tx.Exec(`UPDATE copy_trade_execution_intents SET status='FILLED',reason_code='RISK_EXIT_FLAT_CONFIRMED',terminal_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE cycle_id=? AND attempt_no=? AND source_kind='COPY_GUARD_RISK_EXIT'`, in.CycleID, in.AttemptNo); err != nil {
+		return false, err
+	}
 	if _, err = tx.Exec(`UPDATE copy_guard_attempts SET
 		status='STOPPED',exit_price=?,stop_fill_price=?,pnl=?,fee=?,
 		stop_algo_id=CASE WHEN ?<>'' THEN ? ELSE stop_algo_id END,
@@ -2610,6 +2653,14 @@ func (s *CopyTradeStore) RecordCopyGuardUnprotectedExit(cycleID int64, traderID,
 		"PROTECTION_EXITED: "+reason, traderID, leaderPosID); err != nil {
 		return err
 	}
+	// The caller confirmed flat. Retire the durable exit identity together with
+	// the attempt, including ATR protection-establishment exits.
+	if err = assertCopyGuardLeaderOrdersSettledTx(tx, traderID, leaderPosID); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`UPDATE copy_trade_execution_intents SET status='FILLED',reason_code='GUARD_EXIT_FLAT_CONFIRMED',terminal_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE cycle_id=? AND attempt_no=? AND source_kind='COPY_GUARD_RISK_EXIT'`, cycleID, attemptNo); err != nil {
+		return err
+	}
 	metadata := normalizeCopyGuardEventMetadata(cycleID, traderID, "GUARD_FORCED_EXIT", map[string]interface{}{
 		"confirmation": "unprotected_market_exit",
 		"reason":       reason,
@@ -2700,9 +2751,12 @@ func (s *CopyTradeStore) CloseCopyGuardCycle(id int64, status string, actual, ba
 	if err = tx.QueryRow(`SELECT COUNT(*) FROM copy_guard_attempts WHERE cycle_id=? AND (reconciled=0 OR status='OPEN')`, id).Scan(&pending); err != nil {
 		return err
 	}
-	var previousAccountingStatus, accountingError string
-	if err = tx.QueryRow(`SELECT accounting_status,COALESCE(accounting_error,'') FROM copy_guard_cycles WHERE id=?`, id).Scan(&previousAccountingStatus, &accountingError); err != nil {
+	var previousAccountingStatus, accountingError, cycleStatus string
+	if err = tx.QueryRow(`SELECT accounting_status,COALESCE(accounting_error,''),status FROM copy_guard_cycles WHERE id=?`, id).Scan(&previousAccountingStatus, &accountingError, &cycleStatus); err != nil {
 		return err
+	}
+	if CopyGuardRiskExitPending(cycleStatus) {
+		return fmt.Errorf("Copy Guard cycle %d still awaits risk-exit flat settlement", id)
 	}
 	permanentlyUnscorable := previousAccountingStatus == CopyGuardAccountingLegacyUnverified || previousAccountingStatus == CopyGuardAccountingUnscorable
 	accountingStatus := CopyGuardAccountingReconciled
@@ -2812,9 +2866,12 @@ func beginCopyGuardAccountingTx(tx *sql.Tx, id int64, status, exitOrderID string
 	if tx == nil || id <= 0 {
 		return fmt.Errorf("invalid Copy Guard accounting transaction")
 	}
-	var previousAccountingStatus, accountingError string
-	if err := tx.QueryRow(`SELECT accounting_status,COALESCE(accounting_error,'') FROM copy_guard_cycles WHERE id=?`, id).Scan(&previousAccountingStatus, &accountingError); err != nil {
+	var previousAccountingStatus, accountingError, cycleStatus string
+	if err := tx.QueryRow(`SELECT accounting_status,COALESCE(accounting_error,''),status FROM copy_guard_cycles WHERE id=?`, id).Scan(&previousAccountingStatus, &accountingError, &cycleStatus); err != nil {
 		return err
+	}
+	if CopyGuardRiskExitPending(cycleStatus) {
+		return fmt.Errorf("Copy Guard cycle %d still awaits risk-exit flat settlement", id)
 	}
 	accountingStatus := CopyGuardAccountingPending
 	if previousAccountingStatus == CopyGuardAccountingLegacyUnverified || previousAccountingStatus == CopyGuardAccountingUnscorable {
@@ -3556,6 +3613,7 @@ func (s *CopyTradeStore) TightenCopyGuardPositionMarginStopAuditWithMark(
 	side string,
 	actualLeverage, initialMargin, currentEntry, currentMark, candidateStop float64,
 	governedBy string,
+	markObservedAt ...time.Time,
 ) (float64, error) {
 	if cycleID <= 0 || attempt < 0 || (side != "long" && side != "short") ||
 		invalidPositiveNumber(actualLeverage) || invalidPositiveNumber(initialMargin) ||
@@ -3571,10 +3629,14 @@ func (s *CopyTradeStore) TightenCopyGuardPositionMarginStopAuditWithMark(
 		return 0, err
 	}
 	defer tx.Rollback()
+	observedAt := time.Now().UTC()
+	if len(markObservedAt) > 0 {
+		observedAt = markObservedAt[0].UTC()
+	}
 	res, err := tx.Exec(`UPDATE copy_guard_attempts SET
 		actual_leverage=?,initial_margin_basis=?,
 		current_mark_price=CASE WHEN ?>0 THEN ? ELSE current_mark_price END,
-		current_mark_at=CASE WHEN ?>0 THEN CURRENT_TIMESTAMP ELSE current_mark_at END,
+		current_mark_at=CASE WHEN ?>0 THEN ? ELSE current_mark_at END,
 		stop_validation_result='POST_FILL_VALIDATED',
 		governed_by=CASE
 			WHEN COALESCE(final_stop_price,0)<=0 THEN ?
@@ -3588,7 +3650,7 @@ func (s *CopyTradeStore) TightenCopyGuardPositionMarginStopAuditWithMark(
 			ELSE MIN(final_stop_price,?)
 		END
 		WHERE cycle_id=? AND attempt_no=?`,
-		actualLeverage, initialMargin, currentMark, currentMark, currentMark,
+		actualLeverage, initialMargin, currentMark, currentMark, currentMark, observedAt.Format("2006-01-02 15:04:05"),
 		governedBy, side, candidateStop, side, candidateStop, governedBy,
 		side, candidateStop, candidateStop, candidateStop,
 		cycleID, attempt)

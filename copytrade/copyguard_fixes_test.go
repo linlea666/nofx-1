@@ -111,7 +111,7 @@ func (e *posIDExecutor) GetClosedPnLByPositionID(symbol, posID string, limit int
 
 func newTestCopyGuardCycle(t *testing.T, st *store.Store, traderID string) *store.CopyGuardCycle {
 	t.Helper()
-	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{TraderID: traderID, LeaderID: "leader", LeaderPosID: "leader-pos", Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", Status: store.CopyGuardFollowing, PolicySnapshot: "{}", FollowerEntryPrice: 1717.33, FollowerNotional: 110})
+	cycle, err := st.CopyTrade().EnsureCopyGuardCycle(&store.CopyGuardCycle{TraderID: traderID, LeaderID: "leader", LeaderPosID: "leader-pos", Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", Status: store.CopyGuardFollowing, PolicySnapshot: `{"version":4}`, FollowerEntryPrice: 1717.33, FollowerNotional: 110})
 	if err != nil {
 		t.Fatal(err)
 	}
