@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -132,51 +133,81 @@ func main() {
 		logger.Warnf("⚠️ Failed to restore backtest history: %v", err)
 	}
 
-	// Load all traders and synchronously restore RUNNING copy-trading engines.
-	// Their execution intents and ownership mappings must reconcile before the
-	// position synchronizer is allowed to inspect or claim exchange positions.
-	if err := traderManager.LoadTradersFromStore(st); err != nil {
-		logger.Fatalf("❌ Failed to load traders: %v", err)
-	}
-
-	// Start position sync only after copy-trading recovery has established the
-	// authoritative ownership view (detects manual closures, TP/SL triggers).
+	// Position sync manager is created up-front (the API server keeps a
+	// reference) but only STARTED after copy-trading recovery below.
 	positionSyncManager := trader.NewPositionSyncManager(st, 0) // 0 = use default 10s interval
-	positionSyncManager.Start()
 	defer positionSyncManager.Stop()
 
-	// 重入 AI 助手插件（DB 轮询发现人工重入信号 → 生成决策数据包，零侵入跟单引擎；
-	// 可在配置 reentry_ai_config.enabled 中关闭，关闭/异常均不影响跟单）
-	reentryAdvisor := reentryadvisor.Start(st)
-	defer reentryAdvisor.Stop()
-
-	// Display loaded trader information
-	traders, err := st.Trader().List("default")
-	if err != nil {
-		logger.Fatalf("❌ Failed to get trader list: %v", err)
-	}
-
-	logger.Info("🤖 AI Trader Configurations in Database:")
-	if len(traders) == 0 {
-		logger.Info("  (No trader configurations, please create via Web interface)")
-	} else {
-		for _, t := range traders {
-			status := "❌ Stopped"
-			if t.IsRunning {
-				status = "✅ Running"
-			}
-			logger.Infof("  • %s [%s] %s - AI Model: %s, Exchange: %s",
-				t.Name, t.ID[:8], status, t.AIModelID, t.ExchangeID)
+	// Reentry advisor is started inside the background recovery chain; the
+	// holder guards the Stop call against an unfinished startup.
+	var reentryAdvisorMu sync.Mutex
+	var reentryAdvisor *reentryadvisor.Advisor
+	defer func() {
+		reentryAdvisorMu.Lock()
+		advisor := reentryAdvisor
+		reentryAdvisorMu.Unlock()
+		if advisor != nil {
+			advisor.Stop()
 		}
-	}
+	}()
 
-	// Start API server
+	// Start the API server BEFORE trader auto-start. Restoring a dozen copy
+	// trading engines performs exchange round-trips and heavy database reads
+	// and previously blocked the HTTP listener for minutes after a restart,
+	// so nginx served 502 ("Server Error" toasts) for the whole window.
+	// TraderManager is mutex-guarded, so serving requests while traders are
+	// still being loaded is safe; not-yet-loaded traders simply show up as
+	// not running until their recovery finishes.
 	server := api.NewServer(traderManager, st, cryptoService, backtestManager, cfg.APIServerPort)
 	server.SetPositionSyncManager(positionSyncManager)
 	go func() {
 		if err := server.Start(); err != nil {
 			logger.Fatalf("❌ Failed to start API server: %v", err)
 		}
+	}()
+
+	go func() {
+		// Load all traders and synchronously restore RUNNING copy-trading
+		// engines. Their execution intents and ownership mappings must
+		// reconcile before the position synchronizer is allowed to inspect
+		// or claim exchange positions, so the original ordering (load →
+		// position sync → reentry advisor) is preserved inside this chain.
+		if err := traderManager.LoadTradersFromStore(st); err != nil {
+			logger.Fatalf("❌ Failed to load traders: %v", err)
+		}
+
+		// Start position sync only after copy-trading recovery has established
+		// the authoritative ownership view (detects manual closures, TP/SL
+		// triggers).
+		positionSyncManager.Start()
+
+		// 重入 AI 助手插件（DB 轮询发现人工重入信号 → 生成决策数据包，零侵入跟单引擎；
+		// 可在配置 reentry_ai_config.enabled 中关闭，关闭/异常均不影响跟单）
+		advisor := reentryadvisor.Start(st)
+		reentryAdvisorMu.Lock()
+		reentryAdvisor = advisor
+		reentryAdvisorMu.Unlock()
+
+		// Display loaded trader information
+		traders, err := st.Trader().List("default")
+		if err != nil {
+			logger.Fatalf("❌ Failed to get trader list: %v", err)
+		}
+
+		logger.Info("🤖 AI Trader Configurations in Database:")
+		if len(traders) == 0 {
+			logger.Info("  (No trader configurations, please create via Web interface)")
+		} else {
+			for _, t := range traders {
+				status := "❌ Stopped"
+				if t.IsRunning {
+					status = "✅ Running"
+				}
+				logger.Infof("  • %s [%s] %s - AI Model: %s, Exchange: %s",
+					t.Name, t.ID[:8], status, t.AIModelID, t.ExchangeID)
+			}
+		}
+		logger.Info("✅ Trader auto-start and recovery chain completed")
 	}()
 
 	// Wait for interrupt signal

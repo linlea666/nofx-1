@@ -126,6 +126,10 @@ func (s *DecisionStore) initTables() error {
 		// Indexes
 		`CREATE INDEX IF NOT EXISTS idx_decision_records_trader_time ON decision_records(trader_id, timestamp DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_decision_records_timestamp ON decision_records(timestamp DESC)`,
+		// GetLastCycleNumber runs MAX(cycle_number) per trader during startup;
+		// without this index it scans every (large JSON) row of the trader on a
+		// multi-GB database, which stalled trader auto-start for minutes.
+		`CREATE INDEX IF NOT EXISTS idx_decision_records_trader_cycle ON decision_records(trader_id, cycle_number)`,
 	}
 
 	for _, query := range queries {

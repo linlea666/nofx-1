@@ -55,7 +55,10 @@ func New(dbPath string) (*Store, error) {
 		}
 	}()
 
-	db, err := sql.Open("sqlite", dbPath)
+	// TxSafeDriverName wraps modernc.org/sqlite so a failed COMMIT/ROLLBACK
+	// can never leak an open transaction back into the (single-connection)
+	// pool. See store/sqlite_driver.go for the incident analysis.
+	db, err := sql.Open(TxSafeDriverName, dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
