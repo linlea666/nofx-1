@@ -67,7 +67,7 @@ func (s *CopyTradeStore) InitializeSourceBaseline(traderID, leaderID, sourceMode
 		if err != nil && err != sql.ErrNoRows {
 			return err
 		}
-		if err == nil && (status == MappingStatusActive || status == MappingStatusStoppedByRisk) {
+		if err == nil && (status == MappingStatusActive || status == MappingStatusStoppedByRisk || status == MappingStatusManualStopped) {
 			return fmt.Errorf("cannot replace live mapping %s while initializing source generation %d", position.LeaderPosID, generation)
 		}
 		_, err = tx.Exec(`

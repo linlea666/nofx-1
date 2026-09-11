@@ -879,7 +879,8 @@ func (s *CopyTradeStore) SettleOrdinaryCatchupTransition(c OrdinaryCatchupSettle
 			sourceRevision, leaderTargetSize, c.TraderID, leaderPosID, sourceRevision-1)
 	case mappingErr == nil && currentRevision == sourceRevision &&
 		(mappingStatus == MappingStatusActive || mappingStatus == MappingStatusIgnored ||
-			mappingStatus == MappingStatusStoppedByRisk || mappingStatus == MappingStatusDetached):
+			mappingStatus == MappingStatusStoppedByRisk || mappingStatus == MappingStatusDetached ||
+			mappingStatus == MappingStatusManualStopped):
 		// A confirmed partial fill already advanced the mapping. Only the
 		// residual catch-up lifecycle remains to be terminalized.
 	case mappingErr == nil && mappingStatus == MappingStatusClosed &&

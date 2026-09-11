@@ -44,6 +44,22 @@ export interface Position {
   margin_used: number
 }
 
+// 跟单仓位映射（仓位级手动停止跟单）
+export interface CopyTradePositionMapping {
+  id: number
+  trader_id: string
+  leader_pos_id: string
+  leader_id: string
+  symbol: string
+  execution_symbol?: string
+  side: string // long | short
+  margin_mode: string
+  status: string // active | manual_stopped | ...
+  opened_at: string
+  open_price: number
+  last_known_size: number
+}
+
 export interface DecisionAction {
   action: string
   symbol: string

@@ -1076,6 +1076,13 @@ const (
 	// exchange read proved the mapped follower position does not. It is not a
 	// stop-loss fact and therefore must never create an AI reentry candidate.
 	MappingStatusDetached = "detached"
+	// MappingStatusManualStopped means the user manually detached this position
+	// from the leader: the follower position still exists and stays under
+	// manual management (Copy Guard keeps managing the protective stop), but no
+	// leader action (add/reduce/close) is followed anymore, and new leader
+	// positions on the same symbol+side are skipped until this lifecycle ends
+	// (leader closed the source posId AND the local position is flat).
+	MappingStatusManualStopped = "manual_stopped"
 )
 
 // CopyTradePositionMapping 仓位映射记录
@@ -1098,7 +1105,7 @@ type CopyTradePositionMapping struct {
 	SourceRevision int64  `json:"source_revision,omitempty"`
 	Side           string `json:"side"`        // long | short
 	MarginMode     string `json:"margin_mode"` // cross | isolated
-	Status         string `json:"status"`      // active | closed | ignored | stopped_by_risk | detached
+	Status         string `json:"status"`      // active | closed | ignored | stopped_by_risk | detached | manual_stopped
 
 	// 开仓信息
 	OpenedAt      time.Time `json:"opened_at"`       // 跟单开仓时间
@@ -1345,9 +1352,10 @@ func (s *CopyTradeStore) getMappingByStatus(traderID, leaderPosID, status string
 		query += " AND status = ?"
 		args = append(args, status)
 	} else {
-		// 无状态筛选时，优先级 active > stopped_by_risk > detached > ignored，忽略 closed
+		// 无状态筛选时，优先级 active > stopped_by_risk > manual_stopped > detached > ignored，忽略 closed
 		// stopped_by_risk 排在 ignored 前面：让上层 matchSignal 能及时看到熔断状态
-		query += " AND status IN ('active', 'stopped_by_risk', 'detached', 'ignored') ORDER BY CASE status WHEN 'active' THEN 1 WHEN 'stopped_by_risk' THEN 2 WHEN 'detached' THEN 3 WHEN 'ignored' THEN 4 END LIMIT 1"
+		// manual_stopped 必须在列表内：否则手动停跟的映射会被当成"无映射=新开仓"
+		query += " AND status IN ('active', 'stopped_by_risk', 'manual_stopped', 'detached', 'ignored') ORDER BY CASE status WHEN 'active' THEN 1 WHEN 'stopped_by_risk' THEN 2 WHEN 'manual_stopped' THEN 3 WHEN 'detached' THEN 4 WHEN 'ignored' THEN 5 END LIMIT 1"
 	}
 
 	row := s.db.QueryRow(query, args...)
@@ -1381,7 +1389,7 @@ func (s *CopyTradeStore) HasLiveSourceState(traderID string) (bool, error) {
 	var count int
 	err := s.db.QueryRow(`
 		SELECT
-			(SELECT COUNT(1) FROM copy_trade_position_mappings WHERE trader_id=? AND status IN ('active','stopped_by_risk','detached')) +
+			(SELECT COUNT(1) FROM copy_trade_position_mappings WHERE trader_id=? AND status IN ('active','stopped_by_risk','detached','manual_stopped')) +
 			(SELECT COUNT(1) FROM copy_guard_cycles WHERE trader_id=? AND closed_at IS NULL)
 	`, traderID, traderID).Scan(&count)
 	return count > 0, err
@@ -1721,6 +1729,64 @@ func (s *CopyTradeStore) MarkDetachedAsClosed(traderID, leaderPosID string) erro
 		WHERE trader_id=? AND leader_pos_id=? AND status='detached'
 	`, traderID, leaderPosID)
 	return err
+}
+
+// ============================================================================
+// 手动停止跟单（manual_stopped 生命周期）
+// ============================================================================
+
+// MarkManualStopped 用户手动停止某仓位的跟单。
+// 仅 active 状态可转入；幂等（重复调用不报错，影响行数为 0）。
+// 返回是否真正发生了状态转换，供调用方区分"成功停止"与"状态已变化"。
+func (s *CopyTradeStore) MarkManualStopped(traderID, leaderPosID string) (bool, error) {
+	res, err := s.db.Exec(`
+		UPDATE copy_trade_position_mappings
+		SET status = 'manual_stopped',
+		    stopped_at = CURRENT_TIMESTAMP,
+		    updated_at = CURRENT_TIMESTAMP
+		WHERE trader_id = ? AND leader_pos_id = ? AND status = 'active'
+	`, traderID, leaderPosID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// ListManualStoppedMappings 列出某 trader 所有 manual_stopped 状态的映射
+func (s *CopyTradeStore) ListManualStoppedMappings(traderID string) ([]*CopyTradePositionMapping, error) {
+	return s.listMappings(traderID, MappingStatusManualStopped, 0)
+}
+
+// MarkManualStoppedAsClosed 结束手动停跟生命周期。
+// 调用时机：领航员原 posId 已结束（消失/反手）且本地跟随仓位已平后。
+// 之后领航员再开同币种同方向新仓即恢复正常跟随。
+func (s *CopyTradeStore) MarkManualStoppedAsClosed(traderID, leaderPosID string) error {
+	_, err := s.db.Exec(`
+		UPDATE copy_trade_position_mappings
+		SET status = 'closed', closed_at = CURRENT_TIMESTAMP, last_known_size = 0,
+		    source_revision = COALESCE(source_revision, 0) + 1, updated_at = CURRENT_TIMESTAMP
+		WHERE trader_id = ? AND leader_pos_id = ? AND status = 'manual_stopped'
+	`, traderID, leaderPosID)
+	return err
+}
+
+// HasManualStoppedBySymbolSide 判断某 symbol+side 是否存在手动停跟映射。
+// 用于开仓信号屏蔽：领航员开同币种同方向的新 posId 时跳过，
+// 防止新跟单成交合并进用户手动管理的本地仓位。
+func (s *CopyTradeStore) HasManualStoppedBySymbolSide(traderID, symbol, side string) (bool, error) {
+	var count int
+	err := s.db.QueryRow(`
+		SELECT COUNT(1) FROM copy_trade_position_mappings
+		WHERE trader_id = ? AND symbol = ? AND side = ? AND status = 'manual_stopped'
+	`, traderID, symbol, side).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
 }
 
 // ============================================================================

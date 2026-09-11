@@ -25,7 +25,7 @@ import { DecisionCard } from './components/DecisionCard'
 import { PunkAvatar, getTraderAvatar } from './components/PunkAvatar'
 import { OFFICIAL_LINKS } from './constants/branding'
 import { BacktestPage } from './components/BacktestPage'
-import { LogOut, Loader2 } from 'lucide-react'
+import { LogOut, Loader2, PauseCircle } from 'lucide-react'
 import type {
   SystemStatus,
   AccountInfo,
@@ -34,6 +34,7 @@ import type {
   Statistics,
   TraderInfo,
   Exchange,
+  CopyTradePositionMapping,
 } from './types'
 
 type Page =
@@ -779,11 +780,80 @@ function TraderDetailsPage({
   exchanges?: Exchange[]
 }) {
   const [closingPosition, setClosingPosition] = useState<string | null>(null)
+  const [stoppingFollow, setStoppingFollow] = useState<string | null>(null)
   const [selectedChartSymbol, setSelectedChartSymbol] = useState<
     string | undefined
   >(undefined)
   const [chartUpdateKey, setChartUpdateKey] = useState<number>(0)
   const chartSectionRef = useRef<HTMLDivElement>(null)
+
+  // 跟单模式：拉取仓位映射（active + manual_stopped），用于按仓位渲染停跟按钮
+  const isCopyTradeMode = selectedTrader?.decision_mode === 'copy_trade'
+  const { data: copyMappings } = useSWR<CopyTradePositionMapping[]>(
+    isCopyTradeMode && selectedTraderId
+      ? `copy-mappings-${selectedTraderId}`
+      : null,
+    () => api.getCopyTradeMappings(selectedTraderId!),
+    {
+      refreshInterval: 15000,
+      revalidateOnFocus: false,
+      dedupingInterval: 10000,
+    }
+  )
+
+  // 按本地持仓（symbol+side）反查跟单映射：
+  // 执行合约优先（execution_symbol），回退源合约（symbol）
+  const findMappingForPosition = (pos: Position) =>
+    copyMappings?.find(
+      (m) =>
+        (m.execution_symbol || m.symbol) === pos.symbol &&
+        m.side.toLowerCase() === pos.side.toLowerCase()
+    )
+
+  // 手动停止某仓位的跟单
+  const handleStopFollow = async (mapping: CopyTradePositionMapping) => {
+    if (!selectedTraderId) return
+
+    const sideLabel =
+      language === 'zh'
+        ? mapping.side === 'long'
+          ? '多仓'
+          : '空仓'
+        : mapping.side.toUpperCase()
+    const confirmMsg =
+      language === 'zh'
+        ? `确定停止跟随 ${mapping.symbol} ${sideLabel} 吗？\n\n停止后：\n· 领航员对该仓位的加仓/减仓/平仓将全部不再跟随\n· 领航员再开 ${mapping.symbol} 同方向新仓也会跳过\n· Copy Guard 止损保护继续有效\n· 该仓位需要你手动平仓；其他币种跟单不受影响`
+        : `Stop following ${mapping.symbol} ${sideLabel}?\n\nAfter stopping:\n· Leader's add/reduce/close on this position will no longer be followed\n· New leader positions on ${mapping.symbol} same side will be skipped\n· Copy Guard stop-loss protection stays active\n· You must close this position manually; other symbols are unaffected`
+
+    const confirmed = await confirmToast(confirmMsg, {
+      title: language === 'zh' ? '确认停止跟单' : 'Confirm Stop Following',
+      okText: language === 'zh' ? '停止跟单' : 'Stop Following',
+      cancelText: language === 'zh' ? '取消' : 'Cancel',
+    })
+
+    if (!confirmed) return
+
+    setStoppingFollow(mapping.leader_pos_id)
+    try {
+      await api.stopFollowPosition(selectedTraderId, mapping.leader_pos_id)
+      notify.success(
+        language === 'zh'
+          ? '已停止该仓位的跟单'
+          : 'Stopped following this position'
+      )
+      await mutate(`copy-mappings-${selectedTraderId}`)
+    } catch (err: unknown) {
+      const errorMsg =
+        err instanceof Error
+          ? err.message
+          : language === 'zh'
+            ? '停止跟单失败'
+            : 'Failed to stop following'
+      notify.error(errorMsg)
+    } finally {
+      setStoppingFollow(null)
+    }
+  }
 
   // 平仓操作
   const handleClosePosition = async (symbol: string, side: string) => {
@@ -1261,28 +1331,89 @@ function TraderDetailsPage({
                           </span>
                         </td>
                         <td className="px-1 py-3 whitespace-nowrap text-center">
-                          <button
-                            type="button"
-                            onClick={(e) => {
-                              e.stopPropagation() // Prevent row click
-                              handleClosePosition(
-                                pos.symbol,
-                                pos.side.toUpperCase()
-                              )
-                            }}
-                            disabled={closingPosition === pos.symbol}
-                            className="btn-danger inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold transition-all hover:scale-105 disabled:opacity-50 disabled:cursor-not-allowed mx-auto"
-                            title={
-                              language === 'zh' ? '平仓' : 'Close Position'
-                            }
-                          >
-                            {closingPosition === pos.symbol ? (
-                              <Loader2 className="w-3 h-3 animate-spin" />
-                            ) : (
-                              <LogOut className="w-3 h-3" />
-                            )}
-                            {language === 'zh' ? '平仓' : 'Close'}
-                          </button>
+                          <div className="inline-flex items-center gap-1">
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation() // Prevent row click
+                                handleClosePosition(
+                                  pos.symbol,
+                                  pos.side.toUpperCase()
+                                )
+                              }}
+                              disabled={closingPosition === pos.symbol}
+                              className="btn-danger inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold transition-all hover:scale-105 disabled:opacity-50 disabled:cursor-not-allowed"
+                              title={
+                                language === 'zh' ? '平仓' : 'Close Position'
+                              }
+                            >
+                              {closingPosition === pos.symbol ? (
+                                <Loader2 className="w-3 h-3 animate-spin" />
+                              ) : (
+                                <LogOut className="w-3 h-3" />
+                              )}
+                              {language === 'zh' ? '平仓' : 'Close'}
+                            </button>
+                            {isCopyTradeMode &&
+                              (() => {
+                                const mapping = findMappingForPosition(pos)
+                                if (!mapping) return null
+                                if (mapping.status === 'manual_stopped') {
+                                  return (
+                                    <span
+                                      className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold"
+                                      style={{
+                                        background: 'rgba(240, 185, 11, 0.1)',
+                                        color: '#F0B90B',
+                                        border:
+                                          '1px solid rgba(240, 185, 11, 0.3)',
+                                      }}
+                                      title={
+                                        language === 'zh'
+                                          ? '已停止跟单：不再跟随领航员对该仓位的任何动作，需手动平仓'
+                                          : 'Stopped following: leader actions on this position are ignored; close manually'
+                                      }
+                                    >
+                                      <PauseCircle className="w-3 h-3" />
+                                      {language === 'zh' ? '已停跟' : 'Stopped'}
+                                    </span>
+                                  )
+                                }
+                                if (mapping.status !== 'active') return null
+                                return (
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation() // Prevent row click
+                                      handleStopFollow(mapping)
+                                    }}
+                                    disabled={
+                                      stoppingFollow === mapping.leader_pos_id
+                                    }
+                                    className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold transition-all hover:scale-105 disabled:opacity-50 disabled:cursor-not-allowed"
+                                    style={{
+                                      background: 'rgba(240, 185, 11, 0.1)',
+                                      color: '#F0B90B',
+                                      border:
+                                        '1px solid rgba(240, 185, 11, 0.3)',
+                                    }}
+                                    title={
+                                      language === 'zh'
+                                        ? '停止跟随领航员对该仓位的后续动作（不影响其他仓位）'
+                                        : 'Stop following leader actions on this position (other positions unaffected)'
+                                    }
+                                  >
+                                    {stoppingFollow ===
+                                    mapping.leader_pos_id ? (
+                                      <Loader2 className="w-3 h-3 animate-spin" />
+                                    ) : (
+                                      <PauseCircle className="w-3 h-3" />
+                                    )}
+                                    {language === 'zh' ? '停跟' : 'Unfollow'}
+                                  </button>
+                                )
+                              })()}
+                          </div>
                         </td>
                         <td
                           className="px-1 py-3 font-mono whitespace-nowrap text-right"

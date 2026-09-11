@@ -2263,7 +2263,10 @@ func (s *CopyTradeStore) BeginCopyGuardRiskExit(in CopyGuardRiskExitBegin) (bool
 		in.TraderID, in.LeaderPosID).Scan(&mappingStatus); err != nil && err != sql.ErrNoRows {
 		return false, err
 	}
-	if err == nil && mappingStatus != MappingStatusStoppedByRisk && mappingStatus != MappingStatusClosed && mappingStatus != MappingStatusDetached {
+	// manual_stopped 也是合法的风控退出来源：用户手动停跟后 Copy Guard 仍托管
+	// 保护止损，止损触发时映射保持 manual_stopped（上面的 UPDATE 仅翻转 active），
+	// 由引擎的手动停跟收尾分支在领航员结束且本地已平后关闭生命周期。
+	if err == nil && mappingStatus != MappingStatusStoppedByRisk && mappingStatus != MappingStatusClosed && mappingStatus != MappingStatusDetached && mappingStatus != MappingStatusManualStopped {
 		return false, fmt.Errorf("Copy Guard mapping cannot enter risk exit from %s", mappingStatus)
 	}
 	if _, err = tx.Exec(`UPDATE copy_guard_cycles SET

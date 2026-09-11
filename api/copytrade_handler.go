@@ -252,6 +252,10 @@ func (h *CopyTradeHandler) RegisterRoutes(group *gin.RouterGroup) {
 		copyTrade.POST("/stop/:trader_id", h.Stop)
 		copyTrade.GET("/stats/:trader_id", h.GetStats)
 		copyTrade.GET("/logs/:trader_id", h.GetLogs)
+
+		// 仓位级手动停止跟单：查询映射 + 停止某 posId 的跟随
+		copyTrade.GET("/mappings/:trader_id", h.GetMappings)
+		copyTrade.POST("/positions/:trader_id/stop-follow", h.StopFollowPosition)
 		copyTrade.GET("/risk/summary", h.GetRiskSummary)
 		copyTrade.GET("/risk/defaults", h.GetRiskDefaults)
 		copyTrade.GET("/risk/accounts/:exchange_id/policy", h.GetAccountRiskPolicy)
@@ -2322,6 +2326,132 @@ func (h *CopyTradeHandler) GetLogs(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"logs":  logs,
 		"count": len(logs),
+	})
+}
+
+// ============================================================================
+// 仓位级手动停止跟单
+// ============================================================================
+
+// GetMappings 返回某 trader 的活跃跟单映射（active + manual_stopped）
+// 供前端在当前持仓表上渲染"停跟"按钮与"已停跟"徽标
+// @Router /api/copytrade/mappings/{trader_id} [get]
+func (h *CopyTradeHandler) GetMappings(c *gin.Context) {
+	traderID := c.Param("trader_id")
+	userID := c.GetString("user_id")
+	if _, err := h.store.Trader().GetLifecycleForUser(userID, traderID); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "trader not found or access denied"})
+		return
+	}
+
+	active, err := h.store.CopyTrade().ListActiveMappings(traderID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	manual, err := h.store.CopyTrade().ListManualStoppedMappings(traderID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	mappings := make([]*store.CopyTradePositionMapping, 0, len(active)+len(manual))
+	mappings = append(mappings, active...)
+	mappings = append(mappings, manual...)
+	c.JSON(http.StatusOK, gin.H{
+		"mappings": mappings,
+		"count":    len(mappings),
+	})
+}
+
+// StopFollowPositionRequest 停止某仓位跟单的请求体
+type StopFollowPositionRequest struct {
+	LeaderPosID string `json:"leader_pos_id" binding:"required"`
+}
+
+// StopFollowPosition 手动停止某仓位的跟单（active → manual_stopped）
+// 停止后：该 posId 的加/减/平信号全部不跟随；同币种同方向的新开仓被屏蔽；
+// Copy Guard 保护止损继续托管；领航员原仓结束且本地已平后自动解除。
+// @Router /api/copytrade/positions/{trader_id}/stop-follow [post]
+func (h *CopyTradeHandler) StopFollowPosition(c *gin.Context) {
+	traderID := c.Param("trader_id")
+	userID := c.GetString("user_id")
+	if _, err := h.store.Trader().GetLifecycleForUser(userID, traderID); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "trader not found or access denied"})
+		return
+	}
+
+	var req StopFollowPositionRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "leader_pos_id is required"})
+		return
+	}
+
+	mapping, err := h.store.CopyTrade().GetMapping(traderID, req.LeaderPosID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if mapping == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "position mapping not found"})
+		return
+	}
+	if mapping.Status == store.MappingStatusManualStopped {
+		c.JSON(http.StatusOK, gin.H{
+			"message": "position already manually stopped",
+			"status":  store.MappingStatusManualStopped,
+		})
+		return
+	}
+	if mapping.Status != store.MappingStatusActive {
+		c.JSON(http.StatusConflict, gin.H{
+			"error":  "only active mappings can be manually stopped",
+			"status": mapping.Status,
+		})
+		return
+	}
+
+	changed, err := h.store.CopyTrade().MarkManualStopped(traderID, req.LeaderPosID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if !changed {
+		// 状态在校验与更新之间发生了变化（如领航员刚好平仓）
+		fresh, freshErr := h.store.CopyTrade().GetMapping(traderID, req.LeaderPosID)
+		status := "unknown"
+		if freshErr == nil && fresh != nil {
+			status = fresh.Status
+		}
+		c.JSON(http.StatusConflict, gin.H{
+			"error":  "mapping status changed during stop-follow",
+			"status": status,
+		})
+		return
+	}
+
+	// 审计事件：有 Copy Guard 周期时写入周期事件流（自动镜像到统一事件日志）
+	if cycle, cycleErr := h.store.CopyTrade().GetOpenCopyGuardCycle(traderID, req.LeaderPosID); cycleErr == nil {
+		_ = h.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{
+			CycleID: cycle.ID, TraderID: traderID, Type: "MANUAL_UNFOLLOW",
+			Metadata: map[string]interface{}{
+				"leader_pos_id": req.LeaderPosID,
+				"symbol":        mapping.Symbol,
+				"side":          mapping.Side,
+				"reason":        "user manually stopped following this position",
+			},
+		})
+	}
+
+	logger.Infof("🖐️ [%s] 用户手动停止跟单 | posId=%s %s %s → manual_stopped（保护止损继续托管，领航员结束且本地平仓后自动解除）",
+		traderID, req.LeaderPosID, mapping.Symbol, mapping.Side)
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":       "position manually stopped from copy following",
+		"leader_pos_id": req.LeaderPosID,
+		"symbol":        mapping.Symbol,
+		"side":          mapping.Side,
+		"status":        store.MappingStatusManualStopped,
 	})
 }
 

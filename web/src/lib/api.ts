@@ -197,6 +197,31 @@ export const api = {
     return result.data!
   },
 
+  // 跟单仓位映射（active + manual_stopped），供当前持仓表渲染停跟按钮
+  async getCopyTradeMappings(
+    traderId: string
+  ): Promise<import('../types').CopyTradePositionMapping[]> {
+    const result = await httpClient.get<{
+      mappings: import('../types').CopyTradePositionMapping[]
+      count: number
+    }>(`${API_BASE}/copytrade/mappings/${traderId}`)
+    if (!result.success) throw new Error(result.message || '获取跟单映射失败')
+    return result.data?.mappings ?? []
+  },
+
+  // 手动停止某仓位的跟单（后续领航员对该仓位的任何动作都不再跟随）
+  async stopFollowPosition(
+    traderId: string,
+    leaderPosId: string
+  ): Promise<{ message: string; status: string }> {
+    const result = await httpClient.post<{ message: string; status: string }>(
+      `${API_BASE}/copytrade/positions/${traderId}/stop-follow`,
+      { leader_pos_id: leaderPosId }
+    )
+    if (!result.success) throw new Error(result.message || '停止跟单失败')
+    return result.data!
+  },
+
   async updateTraderPrompt(
     traderId: string,
     customPrompt: string

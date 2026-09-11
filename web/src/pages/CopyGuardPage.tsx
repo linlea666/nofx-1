@@ -191,6 +191,7 @@ const eventLabels: Record<string, string> = {
   SHADOW_POSITION_MARGIN_LIQUIDATION_TIGHTENED: '80% 影子止损因强平线收紧',
   SHADOW_POSITION_MARGIN_STOP_CROSSED: '80% 影子止损首次穿越',
   FOLLOWER_POSITION_ABSENT: '跟随仓位消失·无止损证据',
+  MANUAL_UNFOLLOW: '用户手动停止跟单·仓位转手动管理',
   RISK_EXIT_INFLIGHT_FILL: '止损后在途订单成交·等待残仓退出',
   PROTECTION_IDENTITY_MISMATCH: '交易所保护单范围、触发类型或价格不匹配',
   PROTECTION_REPLACEMENT_PENDING: '保护单换单中',

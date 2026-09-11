@@ -119,6 +119,12 @@ type Engine struct {
 	// SupportsCopyGuard（OKX/Binance）数据源使用；checkStoppedByRisk 内部访问，与 poll 串行执行无需额外锁
 	stopRiskSuspectCount map[string]int
 
+	// 手动停跟收尾：本地仓位已平的连续确认计数（key = leaderPosID）。
+	// 领航员原仓已结束 + 本地仓位连续多轮确认为平后，才关闭 manual_stopped
+	// 生命周期（防 GetPositions API 抖动导致提前撤保护/解除屏蔽）。
+	// 与 poll 串行执行，无需额外锁；重启后从 0 重新累计（保守方向）。
+	manualStopFlatConfirm map[string]int
+
 	// v5 确认式重入：REENTRY_CANDIDATE 连续确认计数（key = leaderPosID）。
 	// 条件持续满足时逐 tick 递增，任一 tick 破坏即清零；达到确认阈值才重入。
 	// 内存态：引擎重启后从 0 重新累计（保守方向，不会导致提前重入）。
@@ -1653,6 +1659,14 @@ func (e *Engine) matchOpenAddSignal(signal *TradeSignal, leaderPosMap map[string
 			continue
 		}
 
+		// 🖐️ 用户手动停止跟单：该 posId 的任何开仓/加仓信号都不跟随，
+		// 本地仓位由用户手动管理（Copy Guard 保护止损继续托管）
+		if mapping.Status == store.MappingStatusManualStopped {
+			logger.Debugf("🖐️ [%s] 仓位已手动停跟 | posId=%s → 忽略开仓/加仓信号（等领航员结束且本地平仓后解除）",
+				e.traderID, posID)
+			continue
+		}
+
 		if mapping.Status == "ignored" {
 			// 🔑 关键区分：根据数据源（ProviderType）使用不同的判断逻辑
 			if e.config.ProviderType == ProviderOKX || e.config.ProviderType == ProviderBinance {
@@ -1683,6 +1697,26 @@ func (e *Engine) matchOpenAddSignal(signal *TradeSignal, leaderPosMap map[string
 		posID := newPosition.PosID
 		if posID == "" {
 			posID = fmt.Sprintf("%s_%s", fill.Symbol, fill.PositionSide)
+		}
+		// 🖐️ 手动停跟屏蔽（symbol+side 级）：只要该币种方向存在手动停跟的
+		// 生命周期（本地仓位仍由用户管理），领航员开的新 posId 也不跟随，
+		// 防止新跟单成交合并进用户手动管理的本地仓位。
+		// 领航员原仓结束且本地平仓后映射转 closed，屏蔽自动解除。
+		if blocked, blockErr := e.store.CopyTrade().HasManualStoppedBySymbolSide(
+			e.traderID, fill.Symbol, string(fill.PositionSide)); blockErr != nil {
+			logger.Warnf("⚠️ [%s] 查询手动停跟屏蔽失败: %v (%s %s)，本轮不跟随",
+				e.traderID, blockErr, fill.Symbol, fill.PositionSide)
+			return &SignalMatchResult{
+				ShouldFollow: false,
+				Reason:       fmt.Sprintf("手动停跟屏蔽查询失败: %v", blockErr),
+			}
+		} else if blocked {
+			logger.Infof("🖐️ [%s] 手动停跟屏蔽 | %s %s 存在手动停跟仓位 → 跳过新开仓 posId=%s",
+				e.traderID, fill.Symbol, fill.PositionSide, posID)
+			return &SignalMatchResult{
+				ShouldFollow: false,
+				Reason:       fmt.Sprintf("%s %s 已手动停止跟单，跳过新开仓(posId=%s)", fill.Symbol, fill.PositionSide, posID),
+			}
 		}
 		logger.Infof("📊 [%s] 新开仓 | posId=%s mgnMode=%s → 跟随开仓",
 			e.traderID, posID, newPosition.MarginMode)
@@ -3385,6 +3419,83 @@ func (e *Engine) checkIgnoredPositionsClosed() {
 				e.traderID, mapping.LeaderPosID, !exists,
 				exists && leader != nil && !strings.EqualFold(string(leader.Side), mapping.Side))
 		}
+	}
+
+	e.checkManualStoppedClosed(leaderPosMap)
+}
+
+// manualStopFlatConfirmThreshold 手动停跟收尾前本地空仓的连续确认轮数
+// （与 stopRiskSuspectThreshold 同级别的防 API 抖动机制）
+const manualStopFlatConfirmThreshold = 3
+
+// checkManualStoppedClosed 手动停跟生命周期收尾。
+// 关闭条件（两者同时满足，缺一不可）：
+//  1. 领航员原 posId 已结束（持仓中消失或原地反手）
+//  2. 本地跟随仓位已平（手动平仓或 Copy Guard 保护止损触发，连续多轮确认）
+//
+// 关闭后：Copy Guard 周期按领航员退出收尾（撤保护单），映射转 closed，
+// 该币种方向的新开仓屏蔽自动解除。
+// 若领航员已结束但本地仍持仓：保持 manual_stopped（屏蔽持续、保护单继续托管），
+// 绝不为用户手动管理中的仓位生成任何跟随动作。
+func (e *Engine) checkManualStoppedClosed(leaderPosMap map[string]*Position) {
+	manualMappings, err := e.store.CopyTrade().ListManualStoppedMappings(e.traderID)
+	if err != nil {
+		logger.Warnf("⚠️ [%s] 获取 manual_stopped 映射失败: %v", e.traderID, err)
+		return
+	}
+	if len(manualMappings) == 0 {
+		return
+	}
+	if e.manualStopFlatConfirm == nil {
+		e.manualStopFlatConfirm = make(map[string]int)
+	}
+
+	// 本地持仓读取失败时本轮跳过，禁止在状态不明时收尾（防误撤保护单）
+	localPositions := e.getFollowerPositions()
+	if e.getFollowerPositionsResult != nil {
+		var posErr error
+		localPositions, posErr = e.getFollowerPositionsResult()
+		if posErr != nil {
+			logger.Warnf("⚠️ [%s] 跟随者持仓查询失败，本轮跳过手动停跟收尾: %v", e.traderID, posErr)
+			return
+		}
+	}
+	if localPositions == nil {
+		return
+	}
+
+	for _, mapping := range manualMappings {
+		leader, exists := leaderPosMap[mapping.LeaderPosID]
+		leaderEnded := !exists || leader == nil || !strings.EqualFold(string(leader.Side), mapping.Side)
+		if !leaderEnded {
+			// 领航员原仓还在：无论本地状态如何都不收尾（继续屏蔽其加减仓信号）
+			delete(e.manualStopFlatConfirm, mapping.LeaderPosID)
+			continue
+		}
+		if e.findLocalPositionForMapping(localPositions, mapping) {
+			// 领航员已结束但本地仓位仍由用户持有 → 保持 manual_stopped
+			delete(e.manualStopFlatConfirm, mapping.LeaderPosID)
+			logger.Debugf("🖐️ [%s] 手动停跟仓位：领航员已结束但本地仍持仓 → 保持屏蔽 | posId=%s %s %s",
+				e.traderID, mapping.LeaderPosID, mapping.Symbol, mapping.Side)
+			continue
+		}
+		e.manualStopFlatConfirm[mapping.LeaderPosID]++
+		if e.manualStopFlatConfirm[mapping.LeaderPosID] < manualStopFlatConfirmThreshold {
+			logger.Debugf("🖐️ [%s] 手动停跟仓位本地空仓确认中 (%d/%d) | posId=%s",
+				e.traderID, e.manualStopFlatConfirm[mapping.LeaderPosID], manualStopFlatConfirmThreshold, mapping.LeaderPosID)
+			continue
+		}
+		if !e.closeCopyGuardCycleAtLeaderExit(mapping) {
+			continue
+		}
+		if err := e.store.CopyTrade().MarkManualStoppedAsClosed(e.traderID, mapping.LeaderPosID); err != nil {
+			logger.Warnf("⚠️ [%s] 更新 manual_stopped→closed 失败: %v (posId=%s)", e.traderID, err, mapping.LeaderPosID)
+			continue
+		}
+		delete(e.manualStopFlatConfirm, mapping.LeaderPosID)
+		logger.Infof("🖐️ [%s] 手动停跟生命周期结束 | posId=%s %s %s source_missing=%t side_reversed=%t 本地已平 → manual_stopped→closed（屏蔽解除）",
+			e.traderID, mapping.LeaderPosID, mapping.Symbol, mapping.Side, !exists,
+			exists && leader != nil && !strings.EqualFold(string(leader.Side), mapping.Side))
 	}
 }
 

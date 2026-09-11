@@ -207,6 +207,11 @@ type riskExitGateState struct {
 
 var errCopyGuardRiskExitGate = errors.New("Copy Guard risk exit gate is active")
 
+// errManualStopFollowGate：该仓位已被用户手动停止跟单。
+// 覆盖"点击停止时决策已在通道中排队"的竞态窗口：执行前复核映射状态，
+// 确保在途的开/加/减/平决策不会作用于用户手动管理中的仓位。
+var errManualStopFollowGate = errors.New("position manually detached from copy following")
+
 type protectionRearmTracker struct {
 	windowStart time.Time
 	count       int
@@ -411,6 +416,20 @@ func (ti *TraderIntegration) riskExitGateActive(dec *decision.Decision) bool {
 	}
 	// Database uncertainty is fail-closed once a trusted in-memory gate exists.
 	return true
+}
+
+// manualStopGateActive 执行前复核：该 posId 的映射是否已被用户手动停止跟单。
+// 命中时任何跟随动作（开/加/减/平/重入）都不得执行。
+// 查询失败按未命中处理：该门控只是竞态兜底，常态屏蔽在引擎信号匹配层完成。
+func (ti *TraderIntegration) manualStopGateActive(dec *decision.Decision) bool {
+	if ti == nil || dec == nil || ti.store == nil || dec.LeaderPosID == "" {
+		return false
+	}
+	mapping, err := ti.store.CopyTrade().GetMapping(ti.traderID, dec.LeaderPosID)
+	if err != nil || mapping == nil {
+		return false
+	}
+	return mapping.Status == store.MappingStatusManualStopped
 }
 
 // riskExitGateBlocksReentryLocked is the single exception to a risk-exit
@@ -4335,6 +4354,9 @@ func (ti *TraderIntegration) executeFullDecision(fullDec *decision.FullDecision)
 		if ti.riskExitGateActive(dec) {
 			err = errCopyGuardRiskExitGate
 		}
+		if err == nil && ti.manualStopGateActive(dec) {
+			err = errManualStopFollowGate
+		}
 		if err == nil {
 			err = ti.supersedeOlderOrdinaryCatchup(dec)
 		}
@@ -4398,6 +4420,10 @@ func (ti *TraderIntegration) executeFullDecision(fullDec *decision.FullDecision)
 				ti.transitionExecutionIntent(dec, store.ExecutionIntentSkipped, "STOPPED_BY_RISK", err.Error())
 				ti.recordRiskExitSignalIgnored(dec)
 				executionLogs = append(executionLogs, fmt.Sprintf("🛑 %s %s 已由 Copy Guard 风控退出 gate 忽略", dec.Action, dec.Symbol))
+				ti.saveSignalLog(dec, "skipped", err.Error())
+			} else if errors.Is(err, errManualStopFollowGate) {
+				ti.transitionExecutionIntent(dec, store.ExecutionIntentSkipped, "MANUAL_STOP_FOLLOW", err.Error())
+				executionLogs = append(executionLogs, fmt.Sprintf("🖐️ %s %s 该仓位已手动停止跟单，忽略在途跟随动作", dec.Action, dec.Symbol))
 				ti.saveSignalLog(dec, "skipped", err.Error())
 			} else if fixedReentryBlocked {
 				ti.transitionExecutionIntent(dec, store.ExecutionIntentSkipped, "POSITION_MARGIN_REENTRY_BLOCKED", err.Error())
