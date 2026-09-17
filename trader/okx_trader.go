@@ -12,6 +12,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"net/url"
 	"nofx/logger"
 	"sort"
 	"strconv"
@@ -382,11 +383,14 @@ func (t *OKXTrader) AmendProtectiveStop(algoID string, req ProtectiveStopRequest
 	// amend-algos takes a single JSON object (unlike cancel-algos, which takes
 	// an array); sending an array is rejected with 50002 "Incorrect json data
 	// format" and the amend never succeeds.
-	newSize, err := t.formatSizeExact(req.Quantity/inst.CtVal, inst)
-	if err != nil {
-		return err
+	body := map[string]interface{}{"instId": t.convertSymbol(req.Symbol), "algoId": algoID, "newSlTriggerPx": QuantizeAndFormatPrice(req.TriggerPrice, inst.TickSz, protectiveStopRoundsDown(req.PositionSide)), "newSlOrdPx": "-1"}
+	if req.CoverageMode != ProtectiveStopCoverageCloseAll {
+		newSize, sizeErr := t.formatSizeExact(req.Quantity/inst.CtVal, inst)
+		if sizeErr != nil {
+			return sizeErr
+		}
+		body["newSz"] = newSize
 	}
-	body := map[string]interface{}{"instId": t.convertSymbol(req.Symbol), "algoId": algoID, "newSz": newSize, "newSlTriggerPx": QuantizeAndFormatPrice(req.TriggerPrice, inst.TickSz, protectiveStopRoundsDown(req.PositionSide)), "newSlOrdPx": "-1"}
 	data, err := t.doRequest("POST", okxAmendAlgoPath, body)
 	if err != nil {
 		return err
@@ -399,24 +403,15 @@ func (t *OKXTrader) AmendProtectiveStop(algoID string, req ProtectiveStopRequest
 }
 
 func (t *OKXTrader) GetProtectiveStop(algoID, symbol string) (*ProtectiveStopOrder, error) {
-	// orders-algo-pending requires ordType; orders-algo-history requires
-	// state or algoId (algoId satisfies it here).
 	paths := []string{
-		fmt.Sprintf("%s?algoId=%s&ordType=conditional&instType=SWAP", okxAlgoPendingPath, algoID),
-		fmt.Sprintf("%s?algoId=%s&ordType=conditional&instType=SWAP", okxAlgoHistoryPath, algoID),
+		fmt.Sprintf("%s?algoId=%s", okxAlgoOrderPath, url.QueryEscape(algoID)),
 	}
 	return t.getProtectiveStopFromPaths(paths, symbol, fmt.Sprintf("protective stop %s not found", algoID))
 }
 
 func (t *OKXTrader) GetProtectiveStopByClientID(clientID, symbol string) (*ProtectiveStopOrder, error) {
-	// orders-algo-history rejects lookups by algoClOrdId alone with error
-	// 50015 ("Either parameter state or algoId is required"), so each
-	// terminal state must be enumerated explicitly.
 	paths := []string{
-		fmt.Sprintf("%s?algoClOrdId=%s&ordType=conditional&instType=SWAP", okxAlgoPendingPath, clientID),
-		fmt.Sprintf("%s?algoClOrdId=%s&ordType=conditional&instType=SWAP&state=effective", okxAlgoHistoryPath, clientID),
-		fmt.Sprintf("%s?algoClOrdId=%s&ordType=conditional&instType=SWAP&state=canceled", okxAlgoHistoryPath, clientID),
-		fmt.Sprintf("%s?algoClOrdId=%s&ordType=conditional&instType=SWAP&state=order_failed", okxAlgoHistoryPath, clientID),
+		fmt.Sprintf("%s?algoClOrdId=%s", okxAlgoOrderPath, url.QueryEscape(clientID)),
 	}
 	return t.getProtectiveStopFromPaths(paths, symbol, fmt.Sprintf("protective stop client id %s not found", clientID))
 }
@@ -457,22 +452,47 @@ func (t *OKXTrader) getProtectiveStopFromPaths(paths []string, symbol string, no
 			PosSide         string `json:"posSide"`
 			TdMode          string `json:"tdMode"`
 			Sz              string `json:"sz"`
+			CloseFraction   string `json:"closeFraction"`
 			SlTriggerPx     string `json:"slTriggerPx"`
 			SlTriggerPxType string `json:"slTriggerPxType"`
 			State           string `json:"state"`
 			OrdID           string `json:"ordId"`
+			UTime           string `json:"uTime"`
 		}
-		if json.Unmarshal(data, &rows) == nil && len(rows) > 0 {
-			contracts, parseErr := strconv.ParseFloat(rows[0].Sz, 64)
-			if parseErr != nil {
-				return nil, fmt.Errorf("parse OKX protective quantity %q: %w", rows[0].Sz, parseErr)
+		if parseErr := json.Unmarshal(data, &rows); parseErr != nil {
+			return nil, fmt.Errorf("decode protective stop: %w", parseErr)
+		}
+		if len(rows) > 0 {
+			query, _ := url.Parse(path)
+			if len(rows) != 1 || rows[0].InstID != t.convertSymbol(symbol) ||
+				(query.Query().Get("algoId") != "" && rows[0].AlgoID != query.Query().Get("algoId")) ||
+				(query.Query().Get("algoClOrdId") != "" && rows[0].AlgoClOrdID != query.Query().Get("algoClOrdId")) {
+				return nil, fmt.Errorf("protective stop detail identity mismatch")
 			}
-			q, quantityErr := t.okxContractsToBaseQuantity(symbol, contracts)
-			if quantityErr != nil {
-				return nil, fmt.Errorf("resolve OKX protective quantity: %w", quantityErr)
+			coverage, q := ProtectiveStopCoverageExactQuantity, 0.0
+			if rows[0].CloseFraction == "1" {
+				coverage = ProtectiveStopCoverageCloseAll
+			} else {
+				if rows[0].CloseFraction != "" && rows[0].CloseFraction != "0" {
+					return nil, fmt.Errorf("unsupported OKX protective fraction %q", rows[0].CloseFraction)
+				}
+				contracts, parseErr := strconv.ParseFloat(rows[0].Sz, 64)
+				if parseErr != nil {
+					return nil, fmt.Errorf("parse OKX protective quantity %q: %w", rows[0].Sz, parseErr)
+				}
+				var quantityErr error
+				q, quantityErr = t.okxContractsToBaseQuantity(symbol, contracts)
+				if quantityErr != nil {
+					return nil, fmt.Errorf("resolve OKX protective quantity: %w", quantityErr)
+				}
 			}
 			px, _ := strconv.ParseFloat(rows[0].SlTriggerPx, 64)
-			return &ProtectiveStopOrder{AlgoID: rows[0].AlgoID, ClientID: rows[0].AlgoClOrdID, Symbol: symbol, PositionSide: rows[0].PosSide, MarginMode: rows[0].TdMode, Quantity: q, TriggerPrice: px, TriggerType: rows[0].SlTriggerPxType, CoverageMode: ProtectiveStopCoverageExactQuantity, State: rows[0].State, ActualOrderID: rows[0].OrdID}, nil
+			updated, _ := strconv.ParseInt(rows[0].UTime, 10, 64)
+			order := &ProtectiveStopOrder{AlgoID: rows[0].AlgoID, ClientID: rows[0].AlgoClOrdID, Symbol: t.convertSymbolBack(rows[0].InstID), PositionSide: rows[0].PosSide, MarginMode: rows[0].TdMode, Quantity: q, TriggerPrice: px, TriggerType: rows[0].SlTriggerPxType, CoverageMode: coverage, State: rows[0].State, ActualOrderID: rows[0].OrdID}
+			if updated > 0 {
+				order.UpdatedAt = time.UnixMilli(updated)
+			}
+			return order, nil
 		}
 	}
 	if lastQueryErr != nil {
@@ -549,9 +569,10 @@ func IsOKXAlgoTerminalCancelError(err error) bool {
 
 // OKXTrader OKX futures trader
 type OKXTrader struct {
-	apiKey     string
-	secretKey  string
-	passphrase string
+	fillOrderModes sync.Map // Immutable order id -> confirmed tdMode, shared by continuity checks.
+	apiKey         string
+	secretKey      string
+	passphrase     string
 
 	// Margin mode setting
 	isCrossMargin bool
@@ -2326,6 +2347,7 @@ func (t *OKXTrader) getOrderStatus(symbol, path string) (map[string]interface{},
 
 	var orders []struct {
 		OrdId     string `json:"ordId"`
+		TdMode    string `json:"tdMode"`
 		State     string `json:"state"`
 		AvgPx     string `json:"avgPx"`
 		AccFillSz string `json:"accFillSz"`
@@ -2353,11 +2375,12 @@ func (t *OKXTrader) getOrderStatus(symbol, path string) (map[string]interface{},
 
 	// Convert contract count to base asset quantity
 	// executedQty = contracts * ctVal
-	executedQty := fillSz
-	inst, err := t.getInstrument(symbol)
-	if err == nil && inst.CtVal > 0 {
-		executedQty = fillSz * inst.CtVal
-		logger.Debugf("  📊 OKX order %s: fillSz(contracts)=%.4f, ctVal=%.6f, executedQty=%.6f", order.OrdId, fillSz, inst.CtVal, executedQty)
+	executedQty := float64(0)
+	if fillSz > 0 {
+		executedQty, err = t.okxContractsToBaseQuantity(symbol, fillSz)
+		if err != nil {
+			return nil, fmt.Errorf("resolve confirmed order fill quantity: %w", err)
+		}
 	}
 
 	// Status mapping
@@ -2375,6 +2398,7 @@ func (t *OKXTrader) getOrderStatus(symbol, path string) (map[string]interface{},
 
 	return map[string]interface{}{
 		"orderId":     order.OrdId,
+		"marginMode":  order.TdMode,
 		"symbol":      symbol,
 		"status":      status,
 		"avgPrice":    avgPrice,

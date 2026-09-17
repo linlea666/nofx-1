@@ -104,7 +104,7 @@ func (s *CopyTradeStore) ListOpenCycleOwnershipGaps(traderID string) ([]*CopyTra
 		  AND NOT EXISTS (
 			SELECT 1 FROM copy_trade_position_mappings m
 			WHERE m.trader_id=c.trader_id AND m.leader_pos_id=c.leader_pos_id
-			  AND m.status IN ('active','stopped_by_risk','detached')
+			  AND m.status IN ('active','stopped_by_risk','detached','manual_stopped')
 		  )
 		ORDER BY c.id`, traderID)
 	if err != nil {

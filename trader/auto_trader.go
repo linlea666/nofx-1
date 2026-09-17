@@ -955,6 +955,8 @@ func (at *AutoTrader) ValidateCopyGuardCapabilities() error {
 		{"client order lookup", implementsTraderCapability[ClientOrderStatusProvider](at.trader)},
 		{"idempotent preserving copy orders", implementsTraderCapability[CopyTradeIdempotentOrderExecutor](at.trader)},
 		{"exact execution instrument resolution", implementsTraderCapability[ExecutionInstrumentResolver](at.trader)},
+		{"scoped immutable fill history", implementsTraderCapability[ScopedTradeHistoryProvider](at.trader)},
+		{"protective order discovery", implementsTraderCapability[ProtectiveStopLister](at.trader)},
 	}
 	for _, check := range checks {
 		if !check.ok {
@@ -2587,6 +2589,7 @@ func (at *AutoTrader) GetPositions() ([]map[string]interface{}, error) {
 		if posID := firstStringField(pos, "posId", "positionId"); posID != "" {
 			normalized["posId"] = posID
 		}
+		normalized["position_key"] = CopyPositionKey(symbol, side, firstStringField(pos, "mgnMode", "marginMode"), firstStringField(pos, "posId", "positionId"))
 		result = append(result, normalized)
 	}
 

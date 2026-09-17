@@ -41,9 +41,10 @@ type AuthoritativeSnapshotHotPathProvider interface {
 
 // Engine 跟单引擎
 type Engine struct {
-	traderID string
-	config   *CopyConfig
-	provider LeaderProvider
+	followControlMu sync.Mutex
+	traderID        string
+	config          *CopyConfig
+	provider        LeaderProvider
 
 	// 流式 Provider（如果支持）
 	streamingProvider StreamingProvider
@@ -2063,6 +2064,8 @@ func (e *Engine) recordFixedPositionMarginSignalIgnored(mapping *store.CopyTrade
 // ============================================================================
 
 func (e *Engine) processSignal(signal *TradeSignal) {
+	e.followControlMu.Lock()
+	defer e.followControlMu.Unlock()
 	fill := signal.Fill
 
 	// ========================================
@@ -2102,6 +2105,9 @@ func (e *Engine) processSignal(signal *TradeSignal) {
 	// 回填匹配结果到 signal（供后续逻辑使用）
 	signal.LeaderPosID = matchResult.PosID
 	signal.LeaderPosition = matchResult.LeaderPosition
+	if cutoff, err := e.store.CopyTrade().PositionResumeCutoff(e.traderID, matchResult.PosID); err != nil || (cutoff != nil && !fill.Timestamp.After(*cutoff)) {
+		return // A paused-period fill must not survive a later resume/restart.
+	}
 	migrationRiskBlock := ""
 	if (matchResult.Action == ActionOpen || matchResult.Action == ActionAdd) && e.riskIncreaseBlock() != "" {
 		migrationRiskBlock = e.riskIncreaseBlock()

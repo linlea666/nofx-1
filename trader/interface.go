@@ -104,6 +104,7 @@ type TradeRecord struct {
 	Symbol       string    // Trading pair (e.g., "BTCUSDT")
 	Side         string    // "BUY" or "SELL"
 	PositionSide string    // "LONG", "SHORT", or "BOTH" (for one-way mode)
+	MarginMode   string    // Confirmed order scope when the venue supports simultaneous margin modes.
 	Price        float64   // Execution price
 	Quantity     float64   // Executed quantity
 	RealizedPnL  float64   // Realized PnL (non-zero for closing trades)
@@ -116,6 +117,10 @@ type TradeRecord struct {
 // when several local lots share one exchange position lifecycle.
 type SymbolTradeHistoryProvider interface {
 	GetTradesForSymbol(symbol string, start time.Time, limit int) ([]TradeRecord, error)
+}
+
+type ScopedTradeHistoryProvider interface {
+	GetTradesForPosition(symbol, marginMode string, start time.Time) ([]TradeRecord, error)
 }
 
 type PendingOrderSnapshot struct {
@@ -183,6 +188,13 @@ type ProtectiveStopOrder struct {
 	CoverageMode  string
 	State         string
 	ActualOrderID string
+	UpdatedAt     time.Time
+}
+
+// Lists stop-loss orders only. Take-profits and unrelated account orders must
+// never become candidates for external protective-order adoption.
+type ProtectiveStopLister interface {
+	ListProtectiveStops(symbol string) ([]ProtectiveStopOrder, error)
 }
 
 // ProtectiveStopManager is intentionally separate from Trader so non-OKX implementations remain unchanged.

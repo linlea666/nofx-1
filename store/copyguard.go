@@ -2395,7 +2395,7 @@ func (s *CopyTradeStore) FinalizeCopyGuardRiskExit(in CopyGuardRiskExitFinalize)
 	if err = assertCopyGuardLeaderOrdersSettledTx(tx, in.TraderID, in.LeaderPosID); err != nil {
 		return false, err
 	}
-	if _, err = tx.Exec(`UPDATE copy_trade_execution_intents SET status='FILLED',reason_code='RISK_EXIT_FLAT_CONFIRMED',terminal_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE cycle_id=? AND attempt_no=? AND source_kind='COPY_GUARD_RISK_EXIT'`, in.CycleID, in.AttemptNo); err != nil {
+	if err = finalizeCopyGuardExitIntentsTx(tx, in.CycleID, in.AttemptNo, "RISK_EXIT_FLAT_CONFIRMED"); err != nil {
 		return false, err
 	}
 	if _, err = tx.Exec(`UPDATE copy_guard_attempts SET
@@ -2661,7 +2661,7 @@ func (s *CopyTradeStore) RecordCopyGuardUnprotectedExit(cycleID int64, traderID,
 	if err = assertCopyGuardLeaderOrdersSettledTx(tx, traderID, leaderPosID); err != nil {
 		return err
 	}
-	if _, err = tx.Exec(`UPDATE copy_trade_execution_intents SET status='FILLED',reason_code='GUARD_EXIT_FLAT_CONFIRMED',terminal_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE cycle_id=? AND attempt_no=? AND source_kind='COPY_GUARD_RISK_EXIT'`, cycleID, attemptNo); err != nil {
+	if err = finalizeCopyGuardExitIntentsTx(tx, cycleID, attemptNo, "GUARD_EXIT_FLAT_CONFIRMED"); err != nil {
 		return err
 	}
 	metadata := normalizeCopyGuardEventMetadata(cycleID, traderID, "GUARD_FORCED_EXIT", map[string]interface{}{
@@ -2726,6 +2726,9 @@ func (s *CopyTradeStore) RecordCopyGuardReentryFilled(cycle *CopyGuardCycle, ent
 	}
 	attempt := cycle.ReentryCount + 1
 	if _, err = tx.Exec(`INSERT INTO copy_guard_attempts(cycle_id,attempt_no,status,entry_price,quantity,notional,atr,entry_order_id) VALUES(?,?,'OPEN',?,?,?,?,?) ON CONFLICT(cycle_id,attempt_no) DO UPDATE SET status='OPEN',entry_price=excluded.entry_price,quantity=excluded.quantity,notional=excluded.notional,atr=excluded.atr,entry_order_id=CASE WHEN excluded.entry_order_id<>'' THEN excluded.entry_order_id ELSE copy_guard_attempts.entry_order_id END,opened_at=CURRENT_TIMESTAMP,closed_at=NULL`, cycle.ID, attempt, entryPrice, quantity, notional, atr, exchangeOrderID); err != nil {
+		return err
+	}
+	if err = bindCopyGuardCustodyTx(tx, cycle.ID, attempt); err != nil {
 		return err
 	}
 	raw, _ := json.Marshal(metadata)

@@ -258,8 +258,8 @@ func TestApplyCopyConfigRiskFieldsMapsCanonicalAndLegacyUnprotectablePolicy(t *t
 	cfg := store.NewCopyGuardDefaults()
 	cfg.ProviderType = "okx"
 	applyCopyConfigRiskFields(cfg, &CopyConfigReq{RiskUnprotectableDisposition: "close"})
-	if cfg.RiskUnprotectableDisposition != "close" || cfg.RiskUnprotectableAction != "close" {
-		t.Fatalf("canonical close was not persisted: %+v", cfg)
+	if cfg.RiskUnprotectableDisposition != "warn" || cfg.RiskUnprotectableAction != "follow" {
+		t.Fatalf("legacy close must normalize to ordinary warning policy: %+v", cfg)
 	}
 	cfg = store.NewCopyGuardDefaults()
 	cfg.ProviderType = "okx"
@@ -278,8 +278,8 @@ func TestApplyCopyConfigRiskFieldsMapsCanonicalAndLegacyUnprotectablePolicy(t *t
 	old.RiskUnprotectableAction = "close"
 	cfg = store.NewCopyGuardDefaults()
 	applyCopyGuardV4Request(cfg, old, &CopyTradeConfigRequest{})
-	if cfg.RiskUnprotectableDisposition != "close" || cfg.RiskUnprotectableAction != "close" {
-		t.Fatalf("partial config update must preserve an existing explicit close policy: %+v", cfg)
+	if cfg.RiskUnprotectableDisposition != "warn" || cfg.RiskUnprotectableAction != "follow" {
+		t.Fatalf("partial update must normalize the retired ordinary forced-close policy: %+v", cfg)
 	}
 }
 

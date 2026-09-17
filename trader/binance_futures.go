@@ -1109,6 +1109,7 @@ func (t *FuturesTrader) binanceAlgoToProtective(order *futures.GetAlgoOrderResp,
 		PositionSide: strings.ToLower(string(order.PositionSide)), Quantity: quantity,
 		TriggerPrice: parseBinanceFloat(order.TriggerPrice), TriggerType: triggerType,
 		CoverageMode: coverageMode, State: normalizeBinanceAlgoState(order.AlgoStatus), ActualOrderID: order.ActualOrderId,
+		UpdatedAt: time.UnixMilli(order.UpdateTime),
 	}, nil
 }
 
@@ -2129,43 +2130,63 @@ func (t *FuturesTrader) GetTrades(startTime time.Time, limit int) ([]TradeRecord
 // GetTradesForSymbol retrieves trade history for a specific symbol
 // This is more reliable than using Income API which may have delays
 func (t *FuturesTrader) GetTradesForSymbol(symbol string, startTime time.Time, limit int) ([]TradeRecord, error) {
-	if limit <= 0 {
-		limit = 100
-	}
-	if limit > 1000 {
+	if limit <= 0 || limit > 1000 {
 		limit = 1000
 	}
-
-	accountTrades, err := t.client.NewListAccountTradeService().
-		Symbol(symbol).
-		StartTime(startTime.UnixMilli()).
-		Limit(limit).
-		Do(context.Background())
-	if err != nil {
-		return nil, fmt.Errorf("failed to get trade history for %s: %w", symbol, err)
+	end := time.Now()
+	if startTime.IsZero() {
+		startTime = end.Add(-7 * 24 * time.Hour)
 	}
-
-	var trades []TradeRecord
-	for _, at := range accountTrades {
-		price, _ := strconv.ParseFloat(at.Price, 64)
-		qty, _ := strconv.ParseFloat(at.Quantity, 64)
-		fee, _ := strconv.ParseFloat(at.Commission, 64)
-		pnl, _ := strconv.ParseFloat(at.RealizedPnl, 64)
-
-		trade := TradeRecord{
-			TradeID:      strconv.FormatInt(at.ID, 10),
-			OrderID:      strconv.FormatInt(at.OrderID, 10),
-			Symbol:       at.Symbol,
-			Side:         string(at.Side),
-			PositionSide: string(at.PositionSide),
-			Price:        price,
-			Quantity:     qty,
-			RealizedPnL:  pnl,
-			Fee:          fee,
-			Time:         time.UnixMilli(at.Time),
+	type window struct{ start, end int64 }
+	var pending []window
+	for start := startTime.UnixMilli(); start <= end.UnixMilli(); {
+		last := start + int64(7*24*time.Hour/time.Millisecond) - 1
+		if last > end.UnixMilli() {
+			last = end.UnixMilli()
 		}
-		trades = append(trades, trade)
+		pending = append(pending, window{start, last})
+		start = last + 1
 	}
-
+	var trades []TradeRecord
+	seen := map[int64]bool{}
+	for page := 0; len(pending) > 0; page++ {
+		if page >= 1000 {
+			return nil, fmt.Errorf("Binance fill history exceeded pagination limit")
+		}
+		w := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		rows, err := t.client.NewListAccountTradeService().Symbol(symbol).Limit(limit).StartTime(w.start).EndTime(w.end).Do(context.Background())
+		if err != nil {
+			return nil, fmt.Errorf("read complete Binance fill history: %w", err)
+		}
+		// SDK v2.8.9 writes the unsupported fromID spelling. Split saturated
+		// time windows instead: this also avoids assuming the venue's sort order.
+		// A saturated single millisecond is unprovable, never silently truncated.
+		if len(rows) >= limit {
+			if w.start == w.end {
+				return nil, fmt.Errorf("Binance fills exceed one millisecond history capacity")
+			}
+			mid := w.start + (w.end-w.start)/2
+			pending = append(pending, window{mid + 1, w.end}, window{w.start, mid})
+			continue
+		}
+		for _, at := range rows {
+			if at.Time < w.start || at.Time > w.end || at.Symbol != symbol {
+				return nil, fmt.Errorf("Binance fill outside requested scope")
+			}
+			if seen[at.ID] {
+				continue
+			}
+			price, e1 := strconv.ParseFloat(at.Price, 64)
+			qty, e2 := strconv.ParseFloat(at.Quantity, 64)
+			if e1 != nil || e2 != nil || qty <= 0 || math.IsNaN(qty) || math.IsInf(qty, 0) || math.IsNaN(price) || math.IsInf(price, 0) {
+				return nil, fmt.Errorf("invalid Binance immutable fill")
+			}
+			fee, _ := strconv.ParseFloat(at.Commission, 64)
+			pnl, _ := strconv.ParseFloat(at.RealizedPnl, 64)
+			trades = append(trades, TradeRecord{TradeID: strconv.FormatInt(at.ID, 10), OrderID: strconv.FormatInt(at.OrderID, 10), Symbol: at.Symbol, Side: string(at.Side), PositionSide: string(at.PositionSide), Price: price, Quantity: qty, RealizedPnL: pnl, Fee: fee, Time: time.UnixMilli(at.Time)})
+			seen[at.ID] = true
+		}
+	}
 	return trades, nil
 }

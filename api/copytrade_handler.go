@@ -57,10 +57,8 @@ func applyRetiredCopyGuardCompatibility(config *store.CopyTradeConfig, requested
 	return deprecatedRequested
 }
 
-// applyUnprotectableCompatibility keeps the legacy close/follow field
-// readable while giving the runtime one unambiguous warn/close policy.
-// A missing canonical field defaults to warn; an explicitly supplied legacy
-// value still maps deterministically for old clients.
+// Legacy close inputs remain readable, but ordinary copy execution always
+// keeps following while protection is retried. AI reentry has its own contract.
 func applyUnprotectableCompatibility(config *store.CopyTradeConfig, disposition, legacyAction string, legacyExplicit bool) {
 	if config == nil {
 		return
@@ -87,14 +85,8 @@ func applyUnprotectableCompatibility(config *store.CopyTradeConfig, disposition,
 		config.RiskUnprotectableDisposition != "close" {
 		return
 	}
-	if config.RiskUnprotectableDisposition == "" {
-		config.RiskUnprotectableDisposition = "warn"
-	}
-	if config.RiskUnprotectableDisposition == "close" {
-		config.RiskUnprotectableAction = "close"
-	} else {
-		config.RiskUnprotectableAction = "follow"
-	}
+	config.RiskUnprotectableDisposition = "warn"
+	config.RiskUnprotectableAction = "follow"
 }
 
 func copyGuardAIActive(config *store.CopyTradeConfig) bool {
@@ -256,6 +248,7 @@ func (h *CopyTradeHandler) RegisterRoutes(group *gin.RouterGroup) {
 		// 仓位级手动停止跟单：查询映射 + 停止某 posId 的跟随
 		copyTrade.GET("/mappings/:trader_id", h.GetMappings)
 		copyTrade.POST("/positions/:trader_id/stop-follow", h.StopFollowPosition)
+		copyTrade.POST("/positions/:trader_id/resume-follow", h.ResumeFollowPosition)
 		copyTrade.GET("/risk/summary", h.GetRiskSummary)
 		copyTrade.GET("/risk/defaults", h.GetRiskDefaults)
 		copyTrade.GET("/risk/accounts/:exchange_id/policy", h.GetAccountRiskPolicy)
@@ -511,6 +504,7 @@ func riskFilter(c *gin.Context) store.CopyGuardFilter {
 }
 
 type copyGuardCycleArtifacts struct {
+	StopControl       *store.CopyGuardStopControl          `json:"stop_control,omitempty"`
 	Attempts          []*store.CopyGuardAttempt            `json:"attempts"`
 	Events            []*store.CopyGuardEvent              `json:"events"`
 	Intents           []*store.CopyTradeExecutionIntent    `json:"execution_intents"`
@@ -870,6 +864,13 @@ func buildCopyGuardAttribution(cycle *store.CopyGuardCycle, attempts []*store.Co
 func (h *CopyTradeHandler) loadCopyGuardCycleArtifacts(cycleID int64) (*copyGuardCycleArtifacts, error) {
 	artifacts := &copyGuardCycleArtifacts{}
 	var err error
+	cycle, err := h.store.CopyTrade().GetCopyGuardCycle(cycleID)
+	if err != nil {
+		return nil, err
+	}
+	if artifacts.StopControl, err = h.store.CopyTrade().GetCopyGuardStopControl(cycleID, cycle.ReentryCount); err != nil {
+		return nil, err
+	}
 	if artifacts.Events, err = h.store.CopyTrade().ListCopyGuardEvents(cycleID); err != nil {
 		return nil, err
 	}
@@ -917,6 +918,7 @@ func copyGuardCycleDocument(cycle *store.CopyGuardCycle, artifacts *copyGuardCyc
 		"execution_intents":       artifacts.Intents,
 		"events":                  artifacts.Events,
 		"protection":              artifacts.Protection,
+		"stop_control":            artifacts.StopControl,
 		"watch_samples":           artifacts.WatchSamples,
 		"ai_candidates":           artifacts.Candidates,
 		"ai_analyses":             artifacts.AIAnalyses,
@@ -2017,6 +2019,7 @@ func applyCopyGuardV4Request(c, old *store.CopyTradeConfig, r *CopyTradeConfigRe
 	if r.RiskUnprotectableDisposition == nil && r.RiskUnprotectableAction == nil && old != nil {
 		c.RiskUnprotectableDisposition = old.RiskUnprotectableDisposition
 		c.RiskUnprotectableAction = old.RiskUnprotectableAction
+		applyUnprotectableCompatibility(c, "", "", false)
 	} else {
 		applyUnprotectableCompatibility(c, disposition, legacyAction, r.RiskUnprotectableAction != nil)
 	}
@@ -2358,8 +2361,12 @@ func (h *CopyTradeHandler) GetMappings(c *gin.Context) {
 	mappings := make([]*store.CopyTradePositionMapping, 0, len(active)+len(manual))
 	mappings = append(mappings, active...)
 	mappings = append(mappings, manual...)
+	views := make([]copytrade.FollowPositionView, 0, len(mappings))
+	for _, m := range mappings {
+		views = append(views, copytrade.InspectFollowingPosition(h.store, m))
+	}
 	c.JSON(http.StatusOK, gin.H{
-		"mappings": mappings,
+		"mappings": views,
 		"count":    len(mappings),
 	})
 }
@@ -2411,7 +2418,7 @@ func (h *CopyTradeHandler) StopFollowPosition(c *gin.Context) {
 		return
 	}
 
-	changed, err := h.store.CopyTrade().MarkManualStopped(traderID, req.LeaderPosID)
+	changed, err := copytrade.StopFollowingPosition(traderID, req.LeaderPosID, h.store)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return

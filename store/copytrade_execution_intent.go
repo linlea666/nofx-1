@@ -379,6 +379,28 @@ func (s *CopyTradeStore) CommitLeaderExecutionFill(c LeaderExecutionCommit) erro
 		}
 		return tx.Commit()
 	}
+	if err == nil && (mappingStatus == MappingStatusManualStopped || mappingStatus == MappingStatusDetached) {
+		// An order submitted before pause/detachment can still fill afterwards. Record
+		// the fact, but do not reactivate following or create a catch-up order.
+		reason := "MANUAL_PAUSE_INFLIGHT_FILL"
+		if mappingStatus == MappingStatusDetached {
+			reason = "DETACHED_INFLIGHT_FILL"
+		}
+		lateStatus := ExecutionIntentPartiallyFilled
+		if c.OrderTerminal {
+			lateStatus = ExecutionIntentFilled
+		}
+		if _, err = tx.Exec(`UPDATE copy_trade_execution_intents SET status=?,filled_quantity=?,filled_notional=?,exchange_order_id=?,exchange_state=?,reason_code=?,filled_at=COALESCE(filled_at,CURRENT_TIMESTAMP),terminal_at=CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE NULL END,updated_at=CURRENT_TIMESTAMP WHERE id=?`, lateStatus, cumulativeFilled, cumulativeFilledNotional, c.ExchangeOrderID, c.ExchangeState, reason, c.OrderTerminal, c.IntentID); err != nil {
+			return err
+		}
+		if _, err = tx.Exec(`UPDATE copy_trade_position_mappings SET source_revision=MAX(source_revision,?),last_known_size=?,updated_at=CURRENT_TIMESTAMP WHERE trader_id=? AND leader_pos_id=? AND status='manual_stopped'`, c.SourceRevision, c.LeaderTargetSize, c.TraderID, c.LeaderPosID); err != nil {
+			return err
+		}
+		if _, err = tx.Exec(`UPDATE copy_trade_source_transitions SET status=?,updated_at=CURRENT_TIMESTAMP WHERE intent_id=?`, lateStatus, c.IntentID); err != nil {
+			return err
+		}
+		return tx.Commit()
+	}
 	if err == nil && currentRevision == c.SourceRevision {
 		stateMatches := (open && mappingStatus == MappingStatusActive && strings.EqualFold(mappingSide, c.Side)) ||
 			(reduce && mappingStatus == MappingStatusActive) ||
@@ -483,6 +505,16 @@ func (s *CopyTradeStore) CommitLeaderExecutionFill(c LeaderExecutionCommit) erro
 	}
 	if intentCycleID > 0 && boundCycleID > 0 && intentCycleID != boundCycleID {
 		return fmt.Errorf("execution intent %d is bound to cycle %d, not active cycle %d", c.IntentID, intentCycleID, boundCycleID)
+	}
+	if initialOpen {
+		if _, err = tx.Exec(`INSERT INTO copy_trade_position_custody(trader_id,leader_pos_id,initial_intent_id,cycle_id,symbol,side,margin_mode)
+		 VALUES(?,?,?,?,?,?,?) ON CONFLICT(trader_id,leader_pos_id) DO UPDATE SET initial_intent_id=excluded.initial_intent_id,cycle_id=excluded.cycle_id,attempt_no=0,symbol=excluded.symbol,side=excluded.side,margin_mode=excluded.margin_mode,state='MANAGED',reason='',opened_at=CURRENT_TIMESTAMP,released_at=NULL`, c.TraderID, c.LeaderPosID, c.IntentID, boundCycleID, c.Symbol, c.Side, c.MarginMode); err != nil {
+			return err
+		}
+	} else if closeAction {
+		if _, err = tx.Exec(`UPDATE copy_trade_position_custody SET state='RELEASED',reason='LEADER_CLOSE',released_at=CURRENT_TIMESTAMP WHERE trader_id=? AND leader_pos_id=?`, c.TraderID, c.LeaderPosID); err != nil {
+			return err
+		}
 	}
 	res, err := tx.Exec(`UPDATE copy_trade_execution_intents SET status=?,filled_quantity=?,filled_notional=?,
 		cycle_id=CASE WHEN ?>0 THEN ? ELSE cycle_id END,
@@ -691,6 +723,9 @@ func (s *CopyTradeStore) ApplyAIReentryFillSnapshot(c AIReentryFillSnapshot) (AI
 				entry_order_id=CASE WHEN excluded.entry_order_id<>'' THEN excluded.entry_order_id ELSE copy_guard_attempts.entry_order_id END,
 				opened_at=CURRENT_TIMESTAMP,closed_at=NULL`,
 			cycleID, attemptNo, deltaPrice, out.DeltaQuantity, out.DeltaNotional, c.ATR, c.ExchangeOrderID); err != nil {
+			return out, err
+		}
+		if err = bindCopyGuardCustodyTx(tx, cycleID, attemptNo); err != nil {
 			return out, err
 		}
 	} else {
@@ -1570,6 +1605,11 @@ func (s *CopyTradeStore) ReserveExecutionIntent(intent *CopyTradeExecutionIntent
 		return nil, false, err
 	}
 	sourceIDs := append([]string(nil), intent.SourceFillIDs...)
+	if claimed {
+		if _, err = tx.Exec(`UPDATE copy_trade_execution_intents SET follow_control_version=COALESCE((SELECT version FROM copy_trade_follow_controls WHERE trader_id=? AND leader_pos_id=?),0) WHERE id=?`, intent.TraderID, intent.LeaderPosID, stored.ID); err != nil {
+			return nil, false, err
+		}
+	}
 	if len(sourceIDs) == 0 && intent.SourceFillID != "" {
 		sourceIDs = []string{intent.SourceFillID}
 	}
@@ -1765,6 +1805,9 @@ func (s *CopyTradeStore) MarkExecutionOrderAttemptSubmitted(intentID int64, clie
 	}
 	defer tx.Rollback()
 	var attemptStatus string
+	if err = checkFollowSubmission(tx, intentID); err != nil {
+		return nil, err
+	}
 	if err = tx.QueryRow(`SELECT status FROM copy_trade_execution_order_attempts WHERE intent_id=? AND client_order_id=?`, intentID, clientOrderID).Scan(&attemptStatus); err != nil {
 		return nil, err
 	}
@@ -1773,7 +1816,7 @@ func (s *CopyTradeStore) MarkExecutionOrderAttemptSubmitted(intentID int64, clie
 	}
 	res, err := tx.Exec(`UPDATE copy_trade_execution_intents SET status='SUBMITTED',
 		submitted_at=COALESCE(submitted_at,CURRENT_TIMESTAMP),updated_at=CURRENT_TIMESTAMP
-		WHERE id=? AND status IN ('RESERVED','SUBMITTED','PARTIALLY_FILLED')`, intentID)
+		WHERE id=? AND (status IN ('RESERVED','SUBMITTED','PARTIALLY_FILLED') OR (source_kind='COPY_GUARD_RISK_EXIT' AND status='RECONCILING'))`, intentID)
 	if err != nil {
 		return nil, err
 	}
@@ -2440,9 +2483,14 @@ func (s *CopyTradeStore) GetCopyGuardPositionOwnershipExpectation(cycleID int64)
 		out.Reason = "initial fill intent is not verified"
 		return out, nil
 	}
-	if mappingStatus != MappingStatusActive {
+	if mappingStatus != MappingStatusActive && mappingStatus != MappingStatusManualStopped {
 		out.Reason = "position mapping is not active"
 		return out, nil
+	}
+	// A newly submitted add is ahead of the acknowledged source revision.
+	// Include it in settlement detection before restricting the fill sum.
+	if err = s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM copy_trade_execution_intents WHERE trader_id=? AND leader_pos_id=? AND id>=? AND status IN ('RESERVED','SUBMITTED','RECONCILING','PARTIALLY_FILLED'))`, traderID, leaderPosID, initialIntentID).Scan(&out.InFlight); err != nil {
+		return out, err
 	}
 	rows, err := s.db.Query(`SELECT id,COALESCE(source_kind,'LEADER_TRANSITION'),action,
 		COALESCE(cycle_id,0),source_revision,COALESCE(filled_quantity,0),status,updated_at

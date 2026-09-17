@@ -327,7 +327,7 @@ func TestUnprotectableMarketExitWaitsForConfirmedFlatBeforeDetaching(t *testing.
 		t.Fatal(err)
 	}
 
-	if outcome := ti.handleUnprotectableCycle(cycle, errors.New("exchange rejected stop"), false); outcome != "close_pending" {
+	if outcome := ti.handleUnprotectableCycle(cycle, errors.New("exchange rejected stop"), true); outcome != "close_pending" {
 		t.Fatalf("submission ACK with live position must remain pending, got %q", outcome)
 	}
 	mapping, err := st.CopyTrade().GetMapping("trader-1", "leader-pos")
@@ -381,7 +381,7 @@ func TestUnprotectableMarketExitRequiresDurablePendingStateBeforeSubmission(t *t
 	if err := st.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if outcome := ti.handleUnprotectableCycle(cycle, errors.New("exchange rejected stop"), false); outcome != "state_error" {
+	if outcome := ti.handleUnprotectableCycle(cycle, errors.New("exchange rejected stop"), true); outcome != "state_error" {
 		t.Fatalf("persistence failure outcome=%q want state_error", outcome)
 	}
 	if executor.closeCalls != 0 {
@@ -389,15 +389,15 @@ func TestUnprotectableMarketExitRequiresDurablePendingStateBeforeSubmission(t *t
 	}
 }
 
-func TestUnprotectablePolicyMigratesOldForcedCloseButHonorsV8ExplicitClose(t *testing.T) {
+func TestOrdinaryUnprotectablePolicyAlwaysWarnsAndPreservesAIExit(t *testing.T) {
 	ti := &TraderIntegration{}
 	legacy := &store.CopyGuardCycle{PolicySnapshot: `{"defaults_version":7,"unprotectable_action":"close"}`}
 	if got := ti.unprotectableDisposition(legacy); got != "warn" {
 		t.Fatalf("pre-v8 forced close cannot be distinguished from the old default and must migrate to warn: %s", got)
 	}
 	explicitV8 := &store.CopyGuardCycle{PolicySnapshot: `{"defaults_version":8,"unprotectable_disposition":"close","unprotectable_action":"close"}`}
-	if got := ti.unprotectableDisposition(explicitV8); got != "close" {
-		t.Fatalf("v8 explicit close must remain effective: %s", got)
+	if got := ti.unprotectableDisposition(explicitV8); got != "warn" {
+		t.Fatalf("legacy close cannot stop ordinary copying: %s", got)
 	}
 	if requiresUnprotectedForcedExit(&store.CopyGuardCycle{PolicySnapshot: `{"version":4}`, Status: store.CopyGuardFollowing}) {
 		t.Fatal("ordinary initial copy must use the configured warn/close policy")

@@ -131,8 +131,8 @@ func TestGetProtectiveStopErrorClassification(t *testing.T) {
 	})
 	t.Run("found order is returned with state", func(t *testing.T) {
 		trader := newOKXTestServer(t, func(path string) (int, string) {
-			if strings.Contains(path, "orders-algo-pending") {
-				return 200, `{"code":"0","msg":"","data":[{"algoId":"999","algoClOrdId":"cg10a0","posSide":"long","tdMode":"cross","sz":"1","slTriggerPx":"1711.63","slTriggerPxType":"mark","state":"live","ordId":""}]}`
+			if strings.Contains(path, "order-algo?") {
+				return 200, `{"code":"0","msg":"","data":[{"algoId":"999","instId":"ETH-USDT-SWAP","algoClOrdId":"cg10a0","posSide":"long","tdMode":"cross","sz":"1","slTriggerPx":"1711.63","slTriggerPxType":"mark","state":"live","ordId":""}]}`
 			}
 			if strings.Contains(path, "instruments") {
 				return 200, `{"code":"0","msg":"","data":[{"instId":"ETH-USDT-SWAP","ctVal":"0.1"}]}`
@@ -152,8 +152,8 @@ func TestGetProtectiveStopErrorClassification(t *testing.T) {
 	})
 	t.Run("quantity conversion fails closed without instrument metadata", func(t *testing.T) {
 		trader := newOKXTestServer(t, func(path string) (int, string) {
-			if strings.Contains(path, "orders-algo-pending") {
-				return 200, `{"code":"0","msg":"","data":[{"algoId":"999","algoClOrdId":"cg10a0","posSide":"long","tdMode":"cross","sz":"1","slTriggerPx":"1711.63","state":"live"}]}`
+			if strings.Contains(path, "order-algo?") {
+				return 200, `{"code":"0","msg":"","data":[{"algoId":"999","instId":"ETH-USDT-SWAP","algoClOrdId":"cg10a0","posSide":"long","tdMode":"cross","sz":"1","slTriggerPx":"1711.63","state":"live"}]}`
 			}
 			if strings.Contains(path, "instruments") {
 				return 200, `{"code":"50011","msg":"rate limited","data":[]}`
@@ -270,74 +270,48 @@ func TestOKXPendingOrderSnapshotIncludesRegularAndConditional(t *testing.T) {
 	}
 }
 
-// TestGetProtectiveStopQueryParams reproduces the live failure where OKX
-// rejected our lookups: orders-algo-history requires state or algoId (error
-// 50015) and orders-algo-pending requires ordType. Both queries must carry
-// the required parameters or the 51068-adoption self-heal never works.
+// Detail lookups must use the endpoint that actually supports algoClOrdId.
 func TestGetProtectiveStopQueryParams(t *testing.T) {
 	var captured []string
-	trader := newOKXTestServer(t, func(path string) (int, string) {
-		if strings.Contains(path, "orders-algo") {
+	tr := newOKXTestServer(t, func(path string) (int, string) {
+		if strings.Contains(path, "order-algo?") {
 			captured = append(captured, path)
 		}
-		return 200, `{"code":"0","msg":"","data":[]}`
+		return 200, `{"code":"0","data":[]}`
 	})
-	_, _ = trader.GetProtectiveStop("algo-1", "ETHUSDT")
-	_, _ = trader.GetProtectiveStopByClientID("cg15a0", "ETHUSDT")
-	for _, path := range captured {
-		if strings.Contains(path, "orders-algo-pending") && !strings.Contains(path, "ordType=conditional") {
-			t.Fatalf("orders-algo-pending requires ordType: %s", path)
-		}
-		if strings.Contains(path, "orders-algo-history") && !strings.Contains(path, "algoId=") && !strings.Contains(path, "state=") {
-			t.Fatalf("orders-algo-history requires state or algoId (OKX 50015): %s", path)
-		}
-	}
-	// clientID history lookups must enumerate every terminal state.
-	for _, state := range []string{"effective", "canceled", "order_failed"} {
-		found := false
-		for _, path := range captured {
-			if strings.Contains(path, "orders-algo-history") && strings.Contains(path, "algoClOrdId=cg15a0") && strings.Contains(path, "state="+state) {
-				found = true
-				break
-			}
-		}
-		if !found {
-			t.Fatalf("clientID history lookup must cover state=%s, got %v", state, captured)
-		}
+	_, _ = tr.GetProtectiveStop("algo-1", "ETHUSDT")
+	_, _ = tr.GetProtectiveStopByClientID("cg15a0", "ETHUSDT")
+	if len(captured) != 2 || captured[0] != "/api/v5/trade/order-algo?algoId=algo-1" || captured[1] != "/api/v5/trade/order-algo?algoClOrdId=cg15a0" {
+		t.Fatalf("wrong detail identity queries: %v", captured)
 	}
 }
 
-// TestGetProtectiveStop51603IsConfirmedAbsence: OKX answers a missing algoId
-// with top-level error 51603 instead of an empty result set. That is a
-// confirmed absence (ErrProtectiveStopNotFound), not a transient failure —
-// otherwise cycles stay UNKNOWN forever (live incident, cycle 15).
 func TestGetProtectiveStop51603IsConfirmedAbsence(t *testing.T) {
-	trader := newOKXTestServer(t, func(path string) (int, string) {
-		if strings.Contains(path, "orders-algo") {
-			return 200, `{"code":"51603","msg":"Order does not exist","data":[]}`
-		}
-		return 200, `{"code":"0","msg":"","data":[]}`
-	})
-	_, err := trader.GetProtectiveStop("missing-algo", "ETHUSDT")
-	if !errors.Is(err, ErrProtectiveStopNotFound) {
-		t.Fatalf("51603 must be classified as confirmed absence, got: %v", err)
-	}
-	// Mixed case: one endpoint fails transiently, the other returns 51603 —
-	// the transient failure must win (state genuinely unknown).
-	calls := 0
-	trader = newOKXTestServer(t, func(path string) (int, string) {
-		if strings.Contains(path, "orders-algo") {
-			calls++
-			if calls == 1 {
-				return 200, `{"code":"50011","msg":"rate limited","data":[]}`
+	for _, code := range []string{"51603", "50011"} {
+		t.Run(code, func(t *testing.T) {
+			tr := newOKXTestServer(t, func(path string) (int, string) {
+				if strings.Contains(path, "order-algo?") {
+					return 200, `{"code":"` + code + `","msg":"Order does not exist","data":[]}`
+				}
+				return 200, `{"code":"0","data":[]}`
+			})
+			_, err := tr.GetProtectiveStop("missing", "ETHUSDT")
+			if err == nil || errors.Is(err, ErrProtectiveStopNotFound) != (code == "51603") {
+				t.Fatalf("wrong query classification: %v", err)
 			}
-			return 200, `{"code":"51603","msg":"Order does not exist","data":[]}`
+		})
+	}
+}
+
+func TestProtectiveStopDetailRejectsWrongIdentity(t *testing.T) {
+	tr := newOKXTestServer(t, func(path string) (int, string) {
+		if strings.Contains(path, "order-algo?") {
+			return 200, `{"code":"0","data":[{"algoId":"different","algoClOrdId":"another","instId":"BTC-USDT-SWAP","sz":"1"}]}`
 		}
-		return 200, `{"code":"0","msg":"","data":[]}`
+		return 200, `{"code":"0","data":[]}`
 	})
-	_, err = trader.GetProtectiveStop("missing-algo", "ETHUSDT")
-	if err == nil || errors.Is(err, ErrProtectiveStopNotFound) {
-		t.Fatalf("transient failure alongside 51603 must stay a query failure: %v", err)
+	if _, err := tr.GetProtectiveStopByClientID("cg10a0", "ETHUSDT"); err == nil || errors.Is(err, ErrProtectiveStopNotFound) {
+		t.Fatalf("wrong order was adopted: %v", err)
 	}
 }
 
@@ -415,6 +389,16 @@ func TestAlgoRequestBodyShapes(t *testing.T) {
 			t.Fatalf("amend-algos body missing %s: %s", field, amendBody)
 		}
 	}
+	if err := trader.AmendProtectiveStop("full-position", ProtectiveStopRequest{Symbol: "ETHUSDT", PositionSide: "short", Quantity: .3, TriggerPrice: 1765.77, TriggerType: "mark", CoverageMode: ProtectiveStopCoverageCloseAll}); err != nil {
+		t.Fatal(err)
+	}
+	var fullPositionBody map[string]interface{}
+	if err := json.Unmarshal(bodies["/api/v5/trade/amend-algos"], &fullPositionBody); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := fullPositionBody["newSz"]; exists {
+		t.Fatal("manual closeFraction stop was changed to a fixed-size order")
+	}
 
 	if err := trader.CancelProtectiveStop("algo-1", "ETHUSDT"); err != nil {
 		t.Fatalf("CancelProtectiveStop: %v", err)
@@ -426,6 +410,22 @@ func TestAlgoRequestBodyShapes(t *testing.T) {
 	var cancelArr []map[string]interface{}
 	if err := json.Unmarshal(cancelBody, &cancelArr); err != nil || len(cancelArr) == 0 {
 		t.Fatalf("cancel-algos body must stay a JSON array, got: %s", cancelBody)
+	}
+}
+
+func TestOKXProtectiveDetailRecognizesFullPositionManualStop(t *testing.T) {
+	ex := newOKXTestServer(t, func(path string) (int, string) {
+		if strings.Contains(path, okxPositionModePath) {
+			return 200, `{"code":"0","data":[{"sCode":"0"}]}`
+		}
+		if !strings.Contains(path, "/api/v5/trade/order-algo?") {
+			t.Fatalf("unexpected request: %s", path)
+		}
+		return 200, `{"code":"0","data":[{"algoId":"manual-all","instId":"ETH-USDT-SWAP","posSide":"long","tdMode":"cross","sz":"","closeFraction":"1","slTriggerPx":"90","slTriggerPxType":"mark","state":"live"}]}`
+	})
+	order, err := ex.GetProtectiveStop("manual-all", "ETHUSDT")
+	if err != nil || order.CoverageMode != ProtectiveStopCoverageCloseAll || order.TriggerPrice != 90 {
+		t.Fatalf("full position stop lost: %+v %v", order, err)
 	}
 }
 

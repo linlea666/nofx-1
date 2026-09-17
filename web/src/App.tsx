@@ -1,6 +1,7 @@
 import { useEffect, useState, useRef } from 'react'
 import useSWR, { mutate } from 'swr'
 import { api } from './lib/api'
+import { copyPositionControl } from './lib/copyPositionControl'
 import { ChartTabs } from './components/ChartTabs'
 import { AITradersPage } from './components/AITradersPage'
 import { LoginPage } from './components/LoginPage'
@@ -25,7 +26,7 @@ import { DecisionCard } from './components/DecisionCard'
 import { PunkAvatar, getTraderAvatar } from './components/PunkAvatar'
 import { OFFICIAL_LINKS } from './constants/branding'
 import { BacktestPage } from './components/BacktestPage'
-import { LogOut, Loader2, PauseCircle } from 'lucide-react'
+import { LogOut, Loader2, PauseCircle, PlayCircle } from 'lucide-react'
 import type {
   SystemStatus,
   AccountInfo,
@@ -801,14 +802,34 @@ function TraderDetailsPage({
     }
   )
 
-  // 按本地持仓（symbol+side）反查跟单映射：
-  // 执行合约优先（execution_symbol），回退源合约（symbol）
-  const findMappingForPosition = (pos: Position) =>
-    copyMappings?.find(
-      (m) =>
-        (m.execution_symbol || m.symbol) === pos.symbol &&
-        m.side.toLowerCase() === pos.side.toLowerCase()
+  const handleResumeFollow = async (mapping: CopyTradePositionMapping) => {
+    if (!selectedTraderId || !mapping.can_resume) return
+    const confirmed = await confirmToast(
+      language === 'zh'
+        ? `恢复跟随 ${mapping.symbol}？\n只跟随后续加仓、减仓和平仓，不补做暂停期间交易；当前止损继续有效。`
+        : `Resume ${mapping.symbol}? Only future leader actions will be followed. Paused trades will not be replayed; the current stop remains in effect.`,
+      {
+        title: language === 'zh' ? '恢复跟单' : 'Resume Following',
+        okText: language === 'zh' ? '恢复' : 'Resume',
+        cancelText: language === 'zh' ? '取消' : 'Cancel',
+      }
     )
+    if (!confirmed) return
+    setStoppingFollow(mapping.leader_pos_id)
+    try {
+      await api.resumeFollowPosition(selectedTraderId, mapping.leader_pos_id)
+      notify.success(
+        language === 'zh'
+          ? '已恢复，只跟随后续动作'
+          : 'Following resumed for future actions'
+      )
+      await mutate(`copy-mappings-${selectedTraderId}`)
+    } catch (err: unknown) {
+      notify.error(err instanceof Error ? err.message : '恢复跟单失败')
+    } finally {
+      setStoppingFollow(null)
+    }
+  }
 
   // 手动停止某仓位的跟单
   const handleStopFollow = async (mapping: CopyTradePositionMapping) => {
@@ -822,8 +843,8 @@ function TraderDetailsPage({
         : mapping.side.toUpperCase()
     const confirmMsg =
       language === 'zh'
-        ? `确定停止跟随 ${mapping.symbol} ${sideLabel} 吗？\n\n停止后：\n· 领航员对该仓位的加仓/减仓/平仓将全部不再跟随\n· 领航员再开 ${mapping.symbol} 同方向新仓也会跳过\n· Copy Guard 止损保护继续有效\n· 该仓位需要你手动平仓；其他币种跟单不受影响`
-        : `Stop following ${mapping.symbol} ${sideLabel}?\n\nAfter stopping:\n· Leader's add/reduce/close on this position will no longer be followed\n· New leader positions on ${mapping.symbol} same side will be skipped\n· Copy Guard stop-loss protection stays active\n· You must close this position manually; other symbols are unaffected`
+        ? `确定停止跟随 ${mapping.symbol} ${sideLabel} 吗？\n\n停止后：\n· 领航员对该仓位的加仓/减仓/平仓将全部不再跟随\n· 领航员再开 ${mapping.symbol} 同方向新仓也会跳过\n· Copy Guard 止损保护继续有效\n· 可恢复原仓跟单，恢复后只跟随后续动作；其他仓位不受影响`
+        : `Stop following ${mapping.symbol} ${sideLabel}?\n\nAfter stopping:\n· Leader's add/reduce/close on this position will no longer be followed\n· New leader positions on ${mapping.symbol} same side will be skipped\n· Copy Guard stop-loss protection stays active\n· You can resume the original position for future actions; other positions are unaffected`
 
     const confirmed = await confirmToast(confirmMsg, {
       title: language === 'zh' ? '确认停止跟单' : 'Confirm Stop Following',
@@ -1356,27 +1377,51 @@ function TraderDetailsPage({
                             </button>
                             {isCopyTradeMode &&
                               (() => {
-                                const mapping = findMappingForPosition(pos)
-                                if (!mapping) return null
+                                const { mapping, unknown } =
+                                  copyPositionControl(pos, copyMappings)
+                                if (!mapping) {
+                                  return (
+                                    <span className="text-[10px] text-nofx-text-muted">
+                                      {language === 'zh'
+                                        ? unknown
+                                          ? '归属待核实'
+                                          : '独立手动仓'
+                                        : unknown
+                                          ? 'Checking ownership'
+                                          : 'Manual position'}
+                                    </span>
+                                  )
+                                }
                                 if (mapping.status === 'manual_stopped') {
                                   return (
-                                    <span
-                                      className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold"
-                                      style={{
-                                        background: 'rgba(240, 185, 11, 0.1)',
-                                        color: '#F0B90B',
-                                        border:
-                                          '1px solid rgba(240, 185, 11, 0.3)',
+                                    <button
+                                      type="button"
+                                      onClick={(e) => {
+                                        e.stopPropagation()
+                                        handleResumeFollow(mapping)
                                       }}
+                                      disabled={
+                                        !mapping.can_resume ||
+                                        stoppingFollow === mapping.leader_pos_id
+                                      }
+                                      className="inline-flex items-center gap-1 rounded border border-yellow-500/30 px-1.5 py-0.5 text-[10px] font-semibold text-yellow-500 disabled:opacity-50"
                                       title={
-                                        language === 'zh'
-                                          ? '已停止跟单：不再跟随领航员对该仓位的任何动作，需手动平仓'
-                                          : 'Stopped following: leader actions on this position are ignored; close manually'
+                                        mapping.resume_reason ||
+                                        (language === 'zh'
+                                          ? '恢复后只跟随后续动作，不补做暂停期间交易'
+                                          : 'Resume future actions without replaying paused trades')
                                       }
                                     >
-                                      <PauseCircle className="w-3 h-3" />
-                                      {language === 'zh' ? '已停跟' : 'Stopped'}
-                                    </span>
+                                      {stoppingFollow ===
+                                      mapping.leader_pos_id ? (
+                                        <Loader2 className="w-3 h-3 animate-spin" />
+                                      ) : (
+                                        <PlayCircle className="w-3 h-3" />
+                                      )}
+                                      {language === 'zh'
+                                        ? '已暂停 · 恢复跟单'
+                                        : 'Paused · Resume'}
+                                    </button>
                                   )
                                 }
                                 if (mapping.status !== 'active') return null

@@ -638,12 +638,7 @@ export function TraderConfigModal({
             risk_reentry_recovery_escalation:
               cfg.risk_reentry_recovery_escalation ?? 1.5,
             // v5 可保护性状态机 / 噪音档重入
-            risk_unprotectable_action:
-              cfg.risk_unprotectable_disposition === 'close'
-                ? 'close'
-                : cfg.risk_unprotectable_disposition === 'warn'
-                  ? 'follow'
-                  : (cfg.risk_unprotectable_action ?? 'follow'),
+            risk_unprotectable_action: 'follow',
             risk_reentry_noise_override:
               cfg.risk_reentry_noise_override ?? false,
           }))
@@ -723,12 +718,7 @@ export function TraderConfigModal({
             cfg.risk_reentry_cooldown_seconds ?? 300,
           risk_watch_timeout_minutes: cfg.risk_watch_timeout_minutes ?? 4320,
           risk_addon_budget_pct: (cfg.risk_addon_budget_pct ?? 0.15) * 100,
-          risk_unprotectable_action:
-            cfg.risk_unprotectable_disposition === 'close'
-              ? 'close'
-              : cfg.risk_unprotectable_disposition === 'warn'
-                ? 'follow'
-                : (cfg.risk_unprotectable_action ?? 'follow'),
+          risk_unprotectable_action: 'follow',
         }))
       })
     return () => {
@@ -1154,9 +1144,8 @@ export function TraderConfigModal({
             risk_reentry_recovery_escalation:
               formData.risk_reentry_recovery_escalation,
             // v5 可保护性状态机 / 噪音档重入
-            risk_unprotectable_disposition:
-              formData.risk_unprotectable_action === 'close' ? 'close' : 'warn',
-            risk_unprotectable_action: formData.risk_unprotectable_action,
+            risk_unprotectable_disposition: 'warn',
+            risk_unprotectable_action: 'follow',
             risk_reentry_noise_override: formData.risk_reentry_noise_override,
           })
         }
@@ -2154,7 +2143,7 @@ export function TraderConfigModal({
                                   %。
                                 </p>
                                 <p>
-                                  加仓、减仓、均价和普通杠杆变化只同步保护数量，不重算价格；仅当强平安全线冲突时单向收紧，之后不再放宽。
+                                  加仓、减仓、均价和普通杠杆变化只同步保护数量，不重算价格。在交易所手动收紧或放宽止损后，沿用手动价；强平安全线仍可进一步收紧，同一次手动设置下不会自动放宽。
                                 </p>
                                 <p className="text-[#F0B90B]">
                                   此模式固定使用标记价格触发，并关闭
@@ -2232,7 +2221,7 @@ export function TraderConfigModal({
                                   推荐：普通跟单不缩量；AI
                                   重入单次/周期/组合风险 2% / 5% / 8%，ATR14 /
                                   1小时 / 2.0倍，AI 持续观察，最多重入 2
-                                  次；普通仓位无法保护默认告警持有，AI
+                                  次；普通仓位无法保护时告警并继续跟随，AI
                                   重入无法保护始终立即离场
                                 </span>
                                 <button
@@ -2757,25 +2746,10 @@ export function TraderConfigModal({
                               <label className="text-sm text-[#EAECEF] block mb-1">
                                 无法建立保护单时的处置
                               </label>
-                              <select
-                                value={formData.risk_unprotectable_action}
-                                onChange={(e) =>
-                                  handleInputChange(
-                                    'risk_unprotectable_action',
-                                    e.target.value
-                                  )
-                                }
-                                className="w-full px-3 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF] focus:border-[#F0B90B] focus:outline-none text-sm"
-                              >
-                                <option value="follow">
-                                  仅警告并继续持有（默认）
-                                </option>
-                                <option value="close">立即市价离场</option>
-                              </select>
                               <p className="text-xs text-[#848E9C] mt-1">
-                                默认保留普通跟单仓位、记录高危状态并持续重试保护单；
-                                选择立即离场时才会提交市价平仓。AI
-                                二次入场成交后仍执行独立的强制保护失败退出。
+                                普通跟单继续开仓、加仓、减仓和平仓；保护失败会告警并持续重试，不会因此主动平仓。
+                                真实止损触发后才停止原周期。已有 ATR 模式的 AI
+                                二次入场仍遵循独立的保护失败退出规则。
                               </p>
                             </div>
                           )}

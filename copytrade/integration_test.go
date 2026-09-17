@@ -1653,8 +1653,8 @@ func TestFixedPositionMarginOrderFailureNeverUsesForcedExitDisposition(t *testin
 		"risk_protection_mode":"atr_structure",
 		"risk_unprotectable_disposition":"close"
 	}`}
-	if got := ti.unprotectableDisposition(atrCycle); got != "close" {
-		t.Fatalf("ATR disposition compatibility changed: got=%q", got)
+	if got := ti.unprotectableDisposition(atrCycle); got != "warn" {
+		t.Fatalf("ordinary ATR protection failure must warn and retry: got=%q", got)
 	}
 	legacyRuntime := &store.CopyGuardCycle{PolicySnapshot: `{
 		"risk_policy_version":4,
@@ -1662,8 +1662,8 @@ func TestFixedPositionMarginOrderFailureNeverUsesForcedExitDisposition(t *testin
 		"risk_unprotectable_action":"close"
 	}`}
 	legacyTI := &TraderIntegration{engine: &Engine{config: &CopyConfig{RiskUnprotectableDisposition: "warn"}}}
-	if got := legacyTI.unprotectableDisposition(legacyRuntime); got != "close" {
-		t.Fatalf("legacy runtime snapshot was not decoded through the compatibility protocol: got=%q", got)
+	if got := legacyTI.unprotectableDisposition(legacyRuntime); got != "warn" {
+		t.Fatalf("legacy close snapshot must not interrupt ordinary copying: got=%q", got)
 	}
 }
 

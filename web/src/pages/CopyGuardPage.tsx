@@ -2648,6 +2648,20 @@ export function CopyGuardPage() {
               value={detail.protection?.algo_id || '尚未确认'}
             />
             <Metric
+              label="止损价格来源"
+              value={
+                detail.stop_control?.manual_price
+                  ? `交易所手动设置 · 第 ${detail.stop_control.revision} 次调整`
+                  : '周期止损策略'
+              }
+            />
+            {Boolean(detail.stop_control?.manual_price) && (
+              <Metric
+                label="手动设置的止损价"
+                value={`${detail.stop_control!.manual_price} · 强平安全线仍可收紧`}
+              />
+            )}
+            <Metric
               label="自动重试"
               value={`${detail.cycle.protection_retries} 次 · 最后 ${dateLabel(detail.cycle.protection_last_retry_at)}`}
             />

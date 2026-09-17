@@ -24,6 +24,9 @@ func (s *CopyTradeStore) MarkCopyGuardFollowerAbsent(cycleID int64, traderID, le
 	if pending > 0 {
 		return fmt.Errorf("position absence cannot be committed during execution reconciliation")
 	}
+	if _, err = tx.Exec(`UPDATE copy_trade_position_custody SET state='RELEASED',reason='FOLLOWER_POSITION_ABSENT',released_at=COALESCE(released_at,CURRENT_TIMESTAMP) WHERE trader_id=? AND leader_pos_id=? AND cycle_id=?`, traderID, leaderPosID, cycleID); err != nil {
+		return err
+	}
 	res, err := tx.Exec(`UPDATE copy_guard_cycles SET protection_status=?,protection_coverage=0,protection_error='fresh follower position absent without stop evidence',accounting_status=?,accounting_error='FOLLOWER_POSITION_ABSENT',updated_at=CURRENT_TIMESTAMP WHERE id=? AND trader_id=? AND leader_pos_id=? AND closed_at IS NULL AND status IN ('FOLLOWING','FOLLOWING_REENTRY') AND protection_status<>?`, CopyGuardProtectionPositionAbsent, CopyGuardAccountingUnscorable, cycleID, traderID, leaderPosID, CopyGuardProtectionPositionAbsent)
 	if err != nil {
 		return err
@@ -35,7 +38,7 @@ func (s *CopyTradeStore) MarkCopyGuardFollowerAbsent(cycleID int64, traderID, le
 	if n == 0 {
 		return tx.Commit()
 	}
-	if _, err = tx.Exec(`UPDATE copy_trade_position_mappings SET status='detached',last_failure_reason='FOLLOWER_POSITION_ABSENT',updated_at=CURRENT_TIMESTAMP WHERE trader_id=? AND leader_pos_id=? AND status='active'`, traderID, leaderPosID); err != nil {
+	if _, err = tx.Exec(`UPDATE copy_trade_position_mappings SET status='detached',last_failure_reason='FOLLOWER_POSITION_ABSENT',updated_at=CURRENT_TIMESTAMP WHERE trader_id=? AND leader_pos_id=? AND status IN ('active','manual_stopped')`, traderID, leaderPosID); err != nil {
 		return err
 	}
 	if _, err = tx.Exec(`INSERT INTO copy_guard_events(cycle_id,trader_id,type,metadata_json) VALUES(?,?,'FOLLOWER_POSITION_ABSENT','{"stop_evidence":false,"automatic_reopen":false}')`, cycleID, traderID); err != nil {

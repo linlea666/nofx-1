@@ -32,6 +32,9 @@ export interface AccountInfo {
 }
 
 export interface Position {
+  position_key?: string
+  marginMode?: string
+  posId?: string
   symbol: string
   side: string
   entry_price: number
@@ -46,6 +49,10 @@ export interface Position {
 
 // 跟单仓位映射（仓位级手动停止跟单）
 export interface CopyTradePositionMapping {
+  current_position_key?: string
+  custody_state?: 'MANAGED' | 'RELEASED' | 'UNKNOWN'
+  can_resume?: boolean
+  resume_reason?: string
   id: number
   trader_id: string
   leader_pos_id: string

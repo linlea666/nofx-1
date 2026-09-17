@@ -3,6 +3,12 @@ package trader
 import "testing"
 
 func TestAutoTraderCopyGuardCapabilityValidationInspectsUnderlyingExchange(t *testing.T) {
+	if (&AutoTrader{trader: &AsterTrader{}}).SupportsPositionContinuity() {
+		t.Fatal("wrapper fabricated continuity support for another exchange")
+	}
+	if !(&AutoTrader{trader: &OKXTrader{}}).SupportsPositionContinuity() || !(&AutoTrader{trader: &FuturesTrader{}}).SupportsPositionContinuity() {
+		t.Fatal("supported execution exchanges lost position continuity")
+	}
 	if err := (&AutoTrader{trader: &AsterTrader{}}).ValidateCopyGuardCapabilities(); err == nil {
 		t.Fatal("wrapper methods must not make an incapable underlying exchange look Copy Guard-capable")
 	}

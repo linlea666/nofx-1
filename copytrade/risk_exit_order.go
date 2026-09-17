@@ -3,6 +3,7 @@ package copytrade
 import (
 	"errors"
 	"fmt"
+	"math"
 	"nofx/store"
 	"nofx/trader"
 	"strings"
@@ -13,23 +14,58 @@ const copyGuardRiskExitSource = "COPY_GUARD_RISK_EXIT"
 // Called under protectionMu. Unlike ordinary leader intents, these intents
 // cannot advance mappings or re-enter a stopped lifecycle during recovery.
 func (ti *TraderIntegration) closeCopyGuardPosition(cycle *store.CopyGuardCycle) (string, error) {
-	closer, ok := ti.executor.(trader.CopyGuardScopedCloser)
-	if !ok {
-		// Compatibility for legacy in-process executors. AutoTrader always uses
-		// the scoped interface and never falls back to a venue's generic close.
-		if legacy, yes := ti.executor.(EmergencyPositionCloser); yes {
-			return legacy.ClosePositionMarket(cycle.Symbol, cycle.Side)
+	resolve := func() (float64, bool) {
+		if ti.copyGuardOwnsPosition(cycle) {
+			if err := ti.verifyCopyGuardContinuity(cycle); err != nil && !errors.Is(err, errCopyPositionEnded) {
+				return 0, false
+			}
 		}
-		return "", fmt.Errorf("scoped risk exit is unsupported")
+		return ti.copyGuardFollowerQuantity(cycle, true)
 	}
-	quantity, known := ti.followerPositionQuantity(cycle.Symbol, cycle.Side, cycle.MarginMode, cycle.FollowerPosID, true)
+	return ti.closeCopyGuardPositionWithQuantity(cycle, resolve, ti.copyGuardOwnsPosition(cycle))
+}
+
+// The acknowledgement, quantity budget and order identities are shared with
+// exceptional AI entries whose lifecycle transaction has not committed yet.
+func (ti *TraderIntegration) closeCopyGuardPositionWithQuantity(cycle *store.CopyGuardCycle, resolve func() (float64, bool), allowLegacy bool) (string, error) {
+	// Reconcile an earlier exit even when immutable fills already proved flat.
+	// Custody release prevents another close; it does not erase its accounting.
+	intents, err := ti.store.CopyTrade().ListExecutionIntentsByCycle(cycle.ID)
+	if err != nil {
+		return "", err
+	}
+	for _, intent := range intents {
+		if intent.SourceKind == copyGuardRiskExitSource && intent.AttemptNo == cycle.ReentryCount {
+			if e := ti.reconcileRiskExitIntent(intent); e != nil && !errors.Is(e, trader.ErrExecutionOrderNotFound) {
+				return "", e
+			}
+		}
+	}
+	quantity, known := resolve()
 	if !known {
 		return "", fmt.Errorf("risk exit position scope is unknown")
 	}
 	if quantity <= 0 {
 		return "", nil
 	}
+	closer, ok := ti.executor.(trader.CopyGuardScopedCloser)
+	if !ok {
+		// Compatibility for legacy in-process executors. AutoTrader always uses
+		// the scoped interface and never falls back to a venue's generic close.
+		if legacy, yes := ti.executor.(EmergencyPositionCloser); yes && allowLegacy && ti.copyGuardOwnsPosition(cycle) {
+			return legacy.ClosePositionMarket(cycle.Symbol, cycle.Side)
+		}
+		return "", fmt.Errorf("scoped risk exit is unsupported")
+	}
 	cs := ti.store.CopyTrade()
+	remaining, err := cs.RemainingCopyGuardExitQuantity(cycle.ID, cycle.ReentryCount, quantity)
+	if err != nil {
+		return "", err
+	}
+	quantity = math.Min(quantity, remaining)
+	if quantity <= 1e-12 {
+		return "", nil
+	}
 	intent, _, err := cs.ReserveExecutionIntent(&store.CopyTradeExecutionIntent{
 		TraderID: ti.traderID, LeaderPosID: cycle.LeaderPosID, SourceRevision: cycle.ID,
 		SourceKind: copyGuardRiskExitSource, CanonicalKey: fmt.Sprintf("guard-exit|%d|%d", cycle.ID, cycle.ReentryCount),
@@ -65,7 +101,10 @@ func (ti *TraderIntegration) closeCopyGuardPosition(cycle *store.CopyGuardCycle)
 				if !isTerminalExchangeOrderState(state) {
 					return getStringField(order, "orderId", "ordId"), fmt.Errorf("risk exit order is still %s", state)
 				}
-				filled := getFloatField(order, "executedQty", "filled_quantity", "accFillSz")
+				filled := getFloatField(order, "executedQty", "filled_quantity")
+				if state == "FILLED" && filled <= 0 {
+					return "", fmt.Errorf("risk exit fill quantity is not yet confirmed")
+				}
 				status := store.ExecutionOrderAttemptTerminalNoFill
 				if filled > 0 || state == "FILLED" {
 					status = store.ExecutionOrderAttemptFilled
@@ -74,16 +113,27 @@ func (ti *TraderIntegration) closeCopyGuardPosition(cycle *store.CopyGuardCycle)
 					return "", err
 				}
 				last.Status = status
+				if err = cs.ReconcileCopyGuardExitIntent(intent.ID); err != nil {
+					return "", err
+				}
 			}
 		}
 		if last.Status == store.ExecutionOrderAttemptFilled || last.Status == store.ExecutionOrderAttemptTerminalNoFill {
 			// Re-read AFTER terminal acknowledgement; the earlier snapshot may
 			// predate that fill and must not cause another full-size close.
-			quantity, known = ti.followerPositionQuantity(cycle.Symbol, cycle.Side, cycle.MarginMode, cycle.FollowerPosID, true)
+			quantity, known = resolve()
 			if !known {
 				return "", fmt.Errorf("risk exit residual is unknown")
 			}
 			if quantity <= 0 {
+				return last.ExchangeOrderID, nil
+			}
+			remaining, budgetErr := cs.RemainingCopyGuardExitQuantity(cycle.ID, cycle.ReentryCount, quantity)
+			if budgetErr != nil {
+				return "", budgetErr
+			}
+			quantity = math.Min(quantity, remaining)
+			if quantity <= 1e-12 {
 				return last.ExchangeOrderID, nil
 			}
 			if last.SubmittedAt != nil {
@@ -104,6 +154,10 @@ func (ti *TraderIntegration) closeCopyGuardPosition(cycle *store.CopyGuardCycle)
 		CycleID: cycle.ID, AttemptNo: cycle.ReentryCount, Symbol: cycle.Symbol, Side: cycle.Side,
 		MarginMode: cycle.MarginMode, PositionID: cycle.FollowerPosID, Quantity: quantity, ClientOrderID: clientID,
 		BeforeSubmit: func() error {
+			residual, proven := resolve()
+			if !proven || residual+1e-10 < quantity {
+				return fmt.Errorf("risk exit residual authority unavailable")
+			}
 			_, boundaryErr := cs.MarkExecutionOrderAttemptSubmitted(intent.ID, clientID)
 			submitted = boundaryErr == nil
 			return boundaryErr
@@ -121,8 +175,60 @@ func (ti *TraderIntegration) closeCopyGuardPosition(cycle *store.CopyGuardCycle)
 	if !submitted && !previouslySubmitted && submitErr != nil {
 		completion = store.ExecutionOrderAttemptTerminalNoFill
 	}
-	if err = cs.CompleteExecutionOrderAttempt(intent.ID, clientID, completion, orderID, state, message, 0); err != nil {
+	filled := getFloatField(order, "executedQty", "filled_quantity")
+	if isTerminalExchangeOrderState(strings.ToUpper(state)) {
+		if filled > 0 {
+			completion = store.ExecutionOrderAttemptFilled
+		} else if strings.EqualFold(state, "FILLED") {
+			// Some market-close ACKs say FILLED before supplying executions.
+			// Do not let that label mark a zero-quantity attempt terminal.
+			state = ""
+			message = "awaiting confirmed exit fill quantity"
+		} else {
+			completion = store.ExecutionOrderAttemptTerminalNoFill
+		}
+	}
+	if err = cs.CompleteExecutionOrderAttempt(intent.ID, clientID, completion, orderID, state, message, filled); err != nil {
+		return orderID, err
+	}
+	if err = cs.ReconcileCopyGuardExitIntent(intent.ID); err != nil {
 		return orderID, err
 	}
 	return orderID, submitErr
+}
+
+func (ti *TraderIntegration) reconcileRiskExitIntent(intent *store.CopyTradeExecutionIntent) error {
+	attempts, err := ti.store.CopyTrade().ListExecutionOrderAttempts(intent.ID)
+	if err != nil {
+		return err
+	}
+	for _, a := range attempts {
+		if a.SubmittedAt == nil || a.TerminalAt != nil {
+			continue
+		}
+		lookup, ok := ti.executor.(ClientOrderStatusProvider)
+		if !ok {
+			return fmt.Errorf("risk exit acknowledgement lookup unavailable")
+		}
+		order, err := lookup.GetOrderStatusByClientID(intent.Symbol, a.ClientOrderID)
+		if err != nil {
+			return err
+		}
+		state := strings.ToUpper(getStringField(order, "status", "state"))
+		filled := getFloatField(order, "executedQty", "filled_quantity")
+		if !isTerminalExchangeOrderState(state) {
+			return fmt.Errorf("risk exit order is still %s", state)
+		}
+		if state == "FILLED" && filled <= 0 {
+			return fmt.Errorf("risk exit fill quantity is not yet confirmed")
+		}
+		status := store.ExecutionOrderAttemptTerminalNoFill
+		if filled > 0 {
+			status = store.ExecutionOrderAttemptFilled
+		}
+		if err = ti.store.CopyTrade().CompleteExecutionOrderAttempt(intent.ID, a.ClientOrderID, status, getStringField(order, "orderId", "ordId"), state, "", filled); err != nil {
+			return err
+		}
+	}
+	return ti.store.CopyTrade().ReconcileCopyGuardExitIntent(intent.ID)
 }

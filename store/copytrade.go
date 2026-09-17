@@ -1739,7 +1739,12 @@ func (s *CopyTradeStore) MarkDetachedAsClosed(traderID, leaderPosID string) erro
 // 仅 active 状态可转入；幂等（重复调用不报错，影响行数为 0）。
 // 返回是否真正发生了状态转换，供调用方区分"成功停止"与"状态已变化"。
 func (s *CopyTradeStore) MarkManualStopped(traderID, leaderPosID string) (bool, error) {
-	res, err := s.db.Exec(`
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`
 		UPDATE copy_trade_position_mappings
 		SET status = 'manual_stopped',
 		    stopped_at = CURRENT_TIMESTAMP,
@@ -1753,7 +1758,12 @@ func (s *CopyTradeStore) MarkManualStopped(traderID, leaderPosID string) (bool, 
 	if err != nil {
 		return false, err
 	}
-	return n > 0, nil
+	if n > 0 {
+		if err = bumpFollowControlTx(tx, traderID, leaderPosID); err != nil {
+			return false, err
+		}
+	}
+	return n > 0, tx.Commit()
 }
 
 // ListManualStoppedMappings 列出某 trader 所有 manual_stopped 状态的映射

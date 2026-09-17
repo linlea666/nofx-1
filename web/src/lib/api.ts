@@ -222,6 +222,18 @@ export const api = {
     return result.data!
   },
 
+  async resumeFollowPosition(
+    traderId: string,
+    leaderPosId: string
+  ): Promise<{ message: string; status: string }> {
+    const result = await httpClient.post<{ message: string; status: string }>(
+      `${API_BASE}/copytrade/positions/${traderId}/resume-follow`,
+      { leader_pos_id: leaderPosId }
+    )
+    if (!result.success) throw new Error(result.message || '恢复跟单失败')
+    return result.data!
+  },
+
   async updateTraderPrompt(
     traderId: string,
     customPrompt: string
@@ -1026,6 +1038,11 @@ export const api = {
   },
   async getCopyGuardCycle(id: number) {
     const result = await httpClient.get<{
+      stop_control?: {
+        revision: number
+        manual_price: number
+        request_pending: boolean
+      } | null
       cycle: import('../types').CopyGuardCycle
       policy: import('../types').CopyGuardPolicySummary
       position_margin_audit?:

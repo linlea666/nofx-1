@@ -135,7 +135,7 @@ function executionLifecycle(action: DecisionAction): string[] {
     !['VERIFIED', 'CLAMPED'].includes(action.protection_status)
   ) {
     steps.push(
-      `当前保护：${action.protection_status}${action.copy_guard_cycle_status ? `（周期 ${action.copy_guard_cycle_status}）` : ''}`
+      `该跟单周期保护：${action.protection_status}${action.copy_guard_cycle_status ? `（周期 ${action.copy_guard_cycle_status}）` : ''}`
     )
   }
   return steps
