@@ -490,6 +490,7 @@ func (m *PositionSyncManager) ReconcileStoppedTrader(traderID string) ([]store.T
 	if !ok {
 		return nil, fmt.Errorf("exchange does not support authoritative pending-order snapshots")
 	}
+	flatSnapshot := store.StoppedTraderFlatSnapshot{ExchangeID: traderConfig.ExchangeID, TraderGeneration: lifecycle.Generation, ObservedAt: time.Now()}
 	exchangePositions, err := freshProvider.GetPositionsFresh()
 	if err != nil {
 		return nil, fmt.Errorf("fresh exchange position read failed: %w", err)
@@ -518,9 +519,10 @@ func (m *PositionSyncManager) ReconcileStoppedTrader(traderID string) ([]store.T
 	if len(blockers) > 0 {
 		return blockers, nil
 	}
+	flatSnapshot.PositionsEmpty, flatSnapshot.OrdersEmpty = true, true
 	if len(localPositions) == 0 {
-		_, err = m.store.CopyTrade().RetireStoppedTraderCopyGuardState(
-			traderID, "fresh exchange positions=0; regular/algo pending orders=0; local open positions=0",
+		_, err = m.store.CopyTrade().RetireStoppedTraderCopyGuardStateWithSnapshot(
+			traderID, "fresh exchange positions=0; regular/algo pending orders=0; local open positions=0", flatSnapshot,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("retire stopped Copy Guard state: %w", err)
@@ -596,7 +598,7 @@ func (m *PositionSyncManager) ReconcileStoppedTrader(traderID string) ([]store.T
 			return nil, err
 		}
 	}
-	if _, err = m.store.CopyTrade().RetireStoppedTraderCopyGuardState(traderID, evidence); err != nil {
+	if _, err = m.store.CopyTrade().RetireStoppedTraderCopyGuardStateWithSnapshot(traderID, evidence, flatSnapshot); err != nil {
 		return nil, fmt.Errorf("retire stopped Copy Guard state: %w", err)
 	}
 	return nil, nil

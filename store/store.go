@@ -273,6 +273,9 @@ func (s *Store) initTables() error {
 	if err := s.CopyTrade().initRuntimeHealthTables(); err != nil {
 		return fmt.Errorf("initialize copy runtime health: %w", err)
 	}
+	if err := s.CopyTrade().initVenueRetirementTable(); err != nil {
+		return fmt.Errorf("initialize historical venue retirement audit: %w", err)
+	}
 	if err := s.CopyTrade().initUnsupportedExecutionInstrumentTable(); err != nil {
 		return fmt.Errorf("failed to initialize unsupported execution instrument table: %w", err)
 	}

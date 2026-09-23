@@ -265,8 +265,8 @@ func checkAndClaimExecutionAccountTx(tx *sql.Tx, traderID string, generation int
  (c.enabled=1 AND c.provider_type IN ('okx','binance') AND (COALESCE(c.follow_exit_policy_version,0)>=2 OR (p.trader_id IS NOT NULL AND (COALESCE(c.risk_stop_loss_enabled,1)=1 OR COALESCE(c.risk_liquidation_guard_enabled,1)=1))))
  OR EXISTS(SELECT 1 FROM copy_guard_cycles x WHERE x.trader_id=t.id AND x.closed_at IS NULL)))
  OR EXISTS(SELECT 1 FROM copy_trade_execution_order_attempts o JOIN copy_trade_execution_intents oi ON oi.id=o.intent_id WHERE oi.trader_id=t.id AND o.submitted_at IS NOT NULL AND o.terminal_at IS NULL)
- OR EXISTS(SELECT 1 FROM copy_trade_execution_intents i WHERE i.trader_id=t.id AND (i.submitted_at IS NOT NULL OR COALESCE(i.exchange_order_id,'')<>'') AND (i.terminal_at IS NULL OR UPPER(COALESCE(i.exchange_state,'')) NOT IN ('FILLED','CANCELED','CANCELLED','REJECTED','EXPIRED','FAILED')) AND NOT EXISTS(SELECT 1 FROM copy_trade_execution_order_attempts o WHERE o.intent_id=i.id))
- OR EXISTS(SELECT 1 FROM copy_guard_protective_orders o WHERE o.trader_id=t.id AND (o.replacement_pending=1 OR (LOWER(COALESCE(o.status,'')) NOT IN ('canceled','cancelled','effective','filled','triggered','order_failed','failed','expired') AND (COALESCE(o.algo_id,'')<>'' OR COALESCE(o.algo_client_id,'')<>''))))
+ OR EXISTS(SELECT 1 FROM copy_trade_execution_intents i WHERE i.trader_id=t.id AND (i.submitted_at IS NOT NULL OR COALESCE(i.exchange_order_id,'')<>'') AND (i.terminal_at IS NULL OR UPPER(COALESCE(i.exchange_state,'')) NOT IN ('FILLED','CANCELED','CANCELLED','REJECTED','EXPIRED','FAILED')) AND NOT EXISTS(SELECT 1 FROM copy_trade_execution_order_attempts o WHERE o.intent_id=i.id) AND NOT `+retiredLegacyVenueObligationSQL+`)
+ OR EXISTS(SELECT 1 FROM copy_guard_protective_orders o WHERE o.trader_id=t.id AND `+unsettledAccountProtectionSQL+`)
  ) ORDER BY t.id LIMIT 1`, exchangeID, exchangeID, traderID, exclusive).Scan(&conflict)
 	if err != nil && err != sql.ErrNoRows {
 		return err
@@ -283,8 +283,8 @@ func checkAndClaimExecutionAccountTx(tx *sql.Tx, traderID string, generation int
 		var obligations int
 		if err = tx.QueryRow(`SELECT
    (SELECT COUNT(*) FROM copy_trade_execution_order_attempts o JOIN copy_trade_execution_intents i ON i.id=o.intent_id WHERE i.trader_id=? AND o.submitted_at IS NOT NULL AND o.terminal_at IS NULL)+
-   (SELECT COUNT(*) FROM copy_trade_execution_intents i WHERE trader_id=? AND (submitted_at IS NOT NULL OR COALESCE(exchange_order_id,'')<>'') AND (terminal_at IS NULL OR UPPER(COALESCE(exchange_state,'')) NOT IN ('FILLED','CANCELED','CANCELLED','REJECTED','EXPIRED','FAILED')) AND NOT EXISTS(SELECT 1 FROM copy_trade_execution_order_attempts a WHERE a.intent_id=i.id))+
- (SELECT COUNT(*) FROM copy_guard_protective_orders WHERE trader_id=? AND (replacement_pending=1 OR (LOWER(COALESCE(status,'')) NOT IN ('canceled','cancelled','effective','filled','triggered','order_failed','failed','expired') AND (COALESCE(algo_id,'')<>'' OR COALESCE(algo_client_id,'')<>''))))+
+   (SELECT COUNT(*) FROM copy_trade_execution_intents i WHERE trader_id=? AND (submitted_at IS NOT NULL OR COALESCE(exchange_order_id,'')<>'') AND (terminal_at IS NULL OR UPPER(COALESCE(exchange_state,'')) NOT IN ('FILLED','CANCELED','CANCELLED','REJECTED','EXPIRED','FAILED')) AND NOT EXISTS(SELECT 1 FROM copy_trade_execution_order_attempts a WHERE a.intent_id=i.id) AND NOT `+retiredLegacyVenueObligationSQL+`)+
+ (SELECT COUNT(*) FROM copy_guard_protective_orders o WHERE o.trader_id=? AND `+unsettledAccountProtectionSQL+`)+
  (SELECT COUNT(*) FROM copy_guard_cycles WHERE trader_id=? AND closed_at IS NULL)+
  (SELECT COUNT(*) FROM copy_trade_position_custody WHERE trader_id=? AND state='MANAGED')`, traderID, traderID, traderID, traderID, traderID).Scan(&obligations); err != nil {
 			return err

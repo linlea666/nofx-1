@@ -13,6 +13,14 @@ const StoppedTraderFlatRetirementReason = "STOPPED_TRADER_AUTHORITATIVE_FLAT"
 // has no positions and no regular/conditional orders. The transaction repeats
 // every local no-risk precondition so a concurrent submission fails closed.
 func (s *CopyTradeStore) RetireStoppedTraderCopyGuardState(traderID, evidence string) (int, error) {
+	return s.retireStoppedTraderCopyGuardState(traderID, evidence, nil)
+}
+
+func (s *CopyTradeStore) RetireStoppedTraderCopyGuardStateWithSnapshot(traderID, evidence string, snapshot StoppedTraderFlatSnapshot) (int, error) {
+	return s.retireStoppedTraderCopyGuardState(traderID, evidence, &snapshot)
+}
+
+func (s *CopyTradeStore) retireStoppedTraderCopyGuardState(traderID, evidence string, snapshot *StoppedTraderFlatSnapshot) (int, error) {
 	traderID = strings.TrimSpace(traderID)
 	if traderID == "" {
 		return 0, fmt.Errorf("invalid stopped trader retirement")
@@ -32,6 +40,11 @@ func (s *CopyTradeStore) RetireStoppedTraderCopyGuardState(traderID, evidence st
 	}
 	if openPositions > 0 {
 		return 0, fmt.Errorf("stopped trader still has %d local open positions", openPositions)
+	}
+	if snapshot != nil {
+		if err = retireLegacyVenueObligationsTx(tx, traderID, evidence, *snapshot); err != nil {
+			return 0, err
+		}
 	}
 	// PREPARED proves that no adapter crossed its HTTP boundary. It is safe to
 	// terminalize, but preserving the row keeps the exact abandoned quantity.
@@ -59,7 +72,7 @@ func (s *CopyTradeStore) RetireStoppedTraderCopyGuardState(traderID, evidence st
 
 	var uncertain int
 	if err = tx.QueryRow(`SELECT COUNT(*) FROM copy_trade_execution_intents i
-		WHERE i.trader_id=? AND i.terminal_at IS NULL AND (
+		WHERE i.trader_id=? AND NOT `+retiredLegacyVenueObligationSQL+` AND i.terminal_at IS NULL AND (
 			i.status IN ('SUBMITTED','PARTIALLY_FILLED','RECONCILING')
 			OR i.submitted_at IS NOT NULL OR COALESCE(i.exchange_order_id,'')<>'' OR COALESCE(i.filled_quantity,0)>0
 			OR EXISTS (SELECT 1 FROM copy_trade_execution_order_attempts a WHERE a.intent_id=i.id AND (
