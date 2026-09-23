@@ -70,8 +70,24 @@ func (ti *TraderIntegration) preflightCopyPositionOwnership(dec *decision.Decisi
 		return reasonError("CUSTODY_CHECK_PENDING", "read independent positions: %w", err)
 	}
 	side := strings.TrimPrefix(dec.Action, "open_")
+	managedPeer, err := ti.store.CopyTrade().FollowGroupHasManagedPeer(ti.traderID, dec.LeaderPosID, dec.Symbol, side)
+	if err != nil {
+		return reasonError("CUSTODY_CHECK_PENDING", "read follow group ownership: %w", err)
+	}
+	if managedPeer {
+		managedPeer, err = ti.verifyManagedFollowGroupPeer(dec)
+		if err != nil {
+			return reasonError("CUSTODY_CHECK_PENDING", "verify follow group continuity: %w", err)
+		}
+	}
 	for _, p := range positions {
 		if getStringField(p, "symbol") == dec.Symbol && strings.EqualFold(getStringField(p, "side"), side) && absFloat(getFloatField(p, "positionAmt", "quantity")) > 0 {
+			if managedPeer {
+				return nil
+			}
+			if err := ti.store.CopyTrade().IgnoreFollowGroup(ti.traderID, dec.LeaderPosID); err != nil {
+				return reasonError("CUSTODY_CHECK_PENDING", "record independent group baseline: %w", err)
+			}
 			return reasonError("INDEPENDENT_POSITION_CONFLICT", "该交易所持仓范围已有独立仓位，本轮不接管")
 		}
 	}
@@ -318,7 +334,7 @@ func (ti *TraderIntegration) queueProtectionRefresh(dec *decision.Decision) {
 		default:
 		}
 	}()
-	cycle, readErr := ti.store.CopyTrade().GetOpenCopyGuardCycle(ti.traderID, dec.LeaderPosID)
+	cycle, readErr := ti.protectionCycleForDecision(dec)
 	if errors.Is(readErr, sql.ErrNoRows) {
 		return
 	} // The monitor retires closed-cycle orders.
@@ -326,9 +342,12 @@ func (ti *TraderIntegration) queueProtectionRefresh(dec *decision.Decision) {
 		logger.Errorf("load protection lifecycle: %v", readErr)
 		return
 	}
-	payload, err := json.Marshal(dec)
+	copyDec := *dec
+	copyDec.LeaderPosID = cycle.LeaderPosID
+	copyDec.MarginMode = cycle.MarginMode
+	payload, err := json.Marshal(&copyDec)
 	if err == nil {
-		err = ti.store.CopyTrade().QueueCopyGuardProtection(ti.traderID, dec.LeaderPosID, cycle.ID, string(payload))
+		err = ti.store.CopyTrade().QueueCopyGuardProtection(ti.traderID, cycle.LeaderPosID, cycle.ID, string(payload))
 	}
 	if err != nil {
 		logger.Errorf("[%s] persist protection refresh: %v", ti.traderID, err)

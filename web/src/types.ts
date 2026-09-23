@@ -947,6 +947,78 @@ export interface CopyTradeConfigResponse {
   } | null
 }
 
+export interface CopyRuntimeSource {
+  last_success_at: string | null
+  last_failure_at: string | null
+  last_error: string
+}
+
+export interface CopyRuntimeIssue {
+  trader_id: string
+  area: string
+  resource_id: string
+  leader_pos_id: string
+  symbol: string
+  side: string
+  code: string
+  detail: string
+  first_seen: string
+  last_seen: string
+}
+
+export interface CopyExecutionHealthIssue {
+  intent_id: number
+  trader_id: string
+  leader_pos_id: string
+  action: string
+  symbol: string
+  side: string
+  margin_mode: string
+  revision: number
+  status: string
+  reason: string
+  submitted: boolean
+  unresolved_attempts: number
+  effect: string
+  mapping_status: string
+  mapping_revision: number
+  created_at: string
+  updated_at: string
+  issue_reason: string
+}
+
+export interface CopySettlementHealthIssue {
+  exchange_id: string
+  identity: string
+  position_id: string
+  symbol: string
+  side: string
+  margin_mode: string
+  opened_ms: number
+  stage: string
+  reason_code: string
+  detail: string
+  status: string
+  attempts: number
+  first_observed_at: string
+  last_observed_at: string
+  resolved_at?: string
+}
+
+export interface CopyTraderRuntimeHealth {
+  trader_id: string
+  trader_name: string
+  running: boolean
+  source: CopyRuntimeSource | null
+  execution_issues: CopyExecutionHealthIssue[]
+  runtime_issues: CopyRuntimeIssue[]
+  settlement_issues: CopySettlementHealthIssue[]
+}
+
+export interface CopyRuntimeHealthResponse {
+  traders: CopyTraderRuntimeHealth[]
+}
+
 export interface CopyGuardSummary {
   follower_count: number
   cycle_count: number

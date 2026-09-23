@@ -39,12 +39,20 @@ type AuthoritativeSnapshotHotPathProvider interface {
 	UseAuthoritativeSnapshotHotPath() bool
 }
 
+type unqueuedReservationFailure struct {
+	detail string
+}
+
 // Engine 跟单引擎
 type Engine struct {
-	followControlMu sync.Mutex
-	traderID        string
-	config          *CopyConfig
-	provider        LeaderProvider
+	// Only reservations that this Engine failed BEFORE decision-channel handoff
+	// enter this set. Ordinary RESERVED work remains owned by its queued consumer.
+	reservationFailureMu        sync.Mutex
+	unqueuedReservationFailures map[int64]*unqueuedReservationFailure
+	followControlMu             sync.Mutex
+	traderID                    string
+	config                      *CopyConfig
+	provider                    LeaderProvider
 
 	// 流式 Provider（如果支持）
 	streamingProvider StreamingProvider
@@ -2301,13 +2309,41 @@ func (e *Engine) reserveExecutionIntent(dec *decision.Decision) bool {
 	if dec == nil || e.store == nil || dec.LeaderPosID == "" || dec.Action == "hold" {
 		return true
 	}
+	var groupBatch *store.FollowGroupExitBatch
+	if e.sourceLifecycleStale(dec.LeaderPosID, e.buildLeaderPosMap()[dec.LeaderPosID]) {
+		e.UnmarkDecisionSources(dec)
+		return false
+	}
+	if e.usesFollowGroups() && dec.CopyTradeAction == "open" {
+		side := strings.TrimPrefix(dec.Action, "open_")
+		if _, err := e.store.CopyTrade().EnsureFollowGroupMember(e.traderID, string(e.config.ProviderType), e.config.LeaderID, dec.Symbol, side, dec.LeaderPosID, dec.SourceOpenedMS, ""); err != nil {
+			e.UnmarkDecisionSources(dec)
+			return false
+		}
+	}
+	if e.usesFollowGroups() {
+		if group, err := e.store.CopyTrade().GetFollowGroupForPosition(e.traderID, dec.LeaderPosID); err == nil && (group.ConflictReason != "" || (strings.HasPrefix(dec.Action, "open_") && group.EntryBlockReason != "")) {
+			e.UnmarkDecisionSources(dec)
+			return false
+		}
+	}
+	if e.usesFollowGroups() && dec.LeaderExitScope == leaderAccountExitScope {
+		var batchErr error
+		groupBatch, batchErr = e.followGroupReduction(dec.LeaderPosID)
+		if batchErr != nil || (groupBatch != nil && groupBatch.MainPosID != dec.LeaderPosID) {
+			e.UnmarkDecisionSources(dec)
+			return false
+		}
+	}
 	if SupportsCopyGuard(e.config.ProviderType) {
 		side := strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(dec.Action, "open_"), "reduce_"), "close_")
 		if pending, err := e.store.CopyTrade().OtherSourceTransitionPending(e.traderID, dec.Symbol, side, dec.LeaderPosID); err != nil || pending {
 			e.UnmarkDecisionSources(dec)
 			return false
 		}
-		if dec.LeaderExitScope == leaderAccountExitScope {
+		if groupBatch != nil {
+			dec.CloseRatio = groupBatch.Ratio
+		} else if dec.LeaderExitScope == leaderAccountExitScope {
 			match := &SignalMatchResult{PosID: dec.LeaderPosID, Action: ActionClose}
 			if dec.CopyTradeAction != "close" {
 				match.LeaderPosition = &Position{Size: dec.LeaderPosSize}
@@ -2335,7 +2371,37 @@ func (e *Engine) reserveExecutionIntent(dec *decision.Decision) bool {
 		side = "short"
 	}
 	canonicalKey := fmt.Sprintf("leader|%s|%s|%d", e.traderID, dec.LeaderPosID, revision)
-	dec.ClientOrderID = stableClientOrderID(e.traderID, canonicalKey, dec.Action)
+	// A changed authoritative transition gets a successor revision. Never
+	// rewrite the action or target under a previously persisted order identity.
+	var priorID int64
+	var priorClientOrderID string
+	priorErr := e.store.DB().QueryRow(`SELECT id,COALESCE(client_order_id,'') FROM copy_trade_execution_intents WHERE canonical_key=?`, canonicalKey).Scan(&priorID, &priorClientOrderID)
+	if priorErr == nil {
+		e.retryUnqueuedReservationFailure(priorID)
+		prior, inspectErr := e.store.CopyTrade().InspectLeaderTransition(priorID)
+		if inspectErr != nil {
+			e.UnmarkDecisionSources(dec)
+			return false
+		}
+		if (prior.Action != dec.Action || prior.Target != dec.LeaderPosSize) && prior.Resolution == "" && (prior.Effect == store.SourceEffectUnsubmitted || prior.Effect == store.SourceEffectZeroFill) {
+			reason := "SOURCE_SUPERSEDED"
+			if (prior.Action == "open_long" || prior.Action == "open_short") && (prior.Status == store.ExecutionIntentPartiallyFilled || prior.Status == store.ExecutionIntentReconciling || (prior.Status == store.ExecutionIntentFailed && (strings.HasPrefix(prior.Reason, "CATCHUP_") || prior.Reason == "MANUAL_REVIEW_REQUIRED"))) {
+				reason = "CATCHUP_SKIPPED_NO_FILL"
+			}
+			if finishErr := e.store.CopyTrade().FinishLeaderSourceTransition(store.FinishLeaderSourceTransitionRequest{IntentID: priorID, TraderID: e.traderID, LeaderID: e.config.LeaderID, ExpectedFingerprint: prior.Fingerprint, Disposition: store.SourceSupersedeNoFill, Reason: reason, Evidence: "complete authoritative source snapshot replaced an unexecuted action/target"}); finishErr != nil {
+				e.UnmarkDecisionSources(dec)
+				return false
+			}
+			return e.reserveExecutionIntent(dec)
+		}
+	} else if !errors.Is(priorErr, sql.ErrNoRows) {
+		e.UnmarkDecisionSources(dec)
+		return false
+	}
+	dec.ClientOrderID = priorClientOrderID
+	if dec.ClientOrderID == "" {
+		dec.ClientOrderID = stableClientOrderID(e.traderID, canonicalKey, dec.Action)
+	}
 	followerEquityAtTarget := dec.CopyFollowerEquity
 	if followerEquityAtTarget <= 0 && (dec.Action == "open_long" || dec.Action == "open_short") && e.getFollowerEquity != nil {
 		followerEquityAtTarget = e.getFollowerEquity()
@@ -2408,15 +2474,9 @@ func (e *Engine) reserveExecutionIntent(dec *decision.Decision) bool {
 				logger.Errorf("❌ [%s] 回收未提交执行意图失败 | intent=%d posId=%s rev=%d: %v",
 					e.traderID, intent.ID, dec.LeaderPosID, revision, reclaimErr)
 			} else if reclaimed {
-				dec.ExecutionIntentID = intent.ID
-				dec.SourceRevision = revision
-				dec.ExecutionStatus = store.ExecutionIntentReserved
-				if intent.ClientOrderID != "" {
-					dec.ClientOrderID = intent.ClientOrderID
-				}
 				logger.Warnf("🟡 [%s] 权威源确认过渡仍有效，已回收从未提交的意图 | intent=%d posId=%s rev=%d action=%s",
 					e.traderID, intent.ID, dec.LeaderPosID, revision, dec.Action)
-				return true
+				return e.completeReservedExecutionIntent(dec, intent, groupBatch)
 			}
 		}
 		if intent.Status == store.ExecutionIntentFailed && intent.ReasonCode == "MANUAL_REVIEW_REQUIRED" {
@@ -2438,19 +2498,108 @@ func (e *Engine) reserveExecutionIntent(dec *decision.Decision) bool {
 		}
 		return false
 	}
+	return e.completeReservedExecutionIntent(dec, intent, groupBatch)
+}
+
+// Every new or reclaimed reservation crosses the same local readiness boundary
+// before it can be put on the decision channel. Failed auxiliary writes leave a
+// replayable source intent, never a permanently stranded RESERVED instruction.
+func (e *Engine) completeReservedExecutionIntent(dec *decision.Decision, intent *store.CopyTradeExecutionIntent, groupBatch *store.FollowGroupExitBatch) bool {
+	deferPending := func(cause error) bool {
+		failed := &unqueuedReservationFailure{detail: cause.Error()}
+		e.reservationFailureMu.Lock()
+		if e.unqueuedReservationFailures == nil {
+			e.unqueuedReservationFailures = make(map[int64]*unqueuedReservationFailure)
+		}
+		e.unqueuedReservationFailures[intent.ID] = failed
+		e.reservationFailureMu.Unlock()
+		if err := e.store.CopyTrade().DeferUnsubmittedSourceReservation(intent.ID, e.traderID, cause.Error()); err != nil {
+			logger.Errorf("❌ [%s] 预留附属状态未完成且无法记录重验 | intent=%d cause=%v persist=%v", e.traderID, intent.ID, cause, err)
+		} else {
+			e.clearUnqueuedReservationFailure(intent.ID, failed)
+			logger.Warnf("⏳ [%s] 预留附属状态未完成，等待健康快照重验 | intent=%d: %v", e.traderID, intent.ID, cause)
+		}
+		e.UnmarkDecisionSources(dec)
+		return false
+	}
+	if e.usesFollowGroups() {
+		g, err := e.store.CopyTrade().GetFollowGroupForPosition(e.traderID, dec.LeaderPosID)
+		if err != nil {
+			return deferPending(fmt.Errorf("resolve follow group: %w", err))
+		}
+		if err = e.store.CopyTrade().BindFollowGroupIntent(intent.ID, g.ID); err != nil {
+			return deferPending(fmt.Errorf("bind follow group intent: %w", err))
+		}
+		if groupBatch != nil {
+			if err = e.store.CopyTrade().BindFollowGroupExitBatch(intent.ID, *groupBatch); err != nil {
+				return deferPending(fmt.Errorf("bind follow group exit budget: %w", err))
+			}
+		}
+	}
 	if dec.SourceOpenedMS > 0 && dec.CopyTradeAction == "open" {
 		if err := e.store.CopyTrade().BindSourceLifecycle(e.traderID, dec.LeaderPosID, dec.SourceOpenedMS); err != nil {
-			e.UnmarkDecisionSources(dec)
-			return false
+			return deferPending(fmt.Errorf("bind source lifecycle: %w", err))
+		}
+		if err := e.store.CopyTrade().ConfirmSourceLifecycleForIntent(intent.ID, dec.SourceOpenedMS); err != nil {
+			return deferPending(fmt.Errorf("confirm source lifecycle: %w", err))
 		}
 	}
 	dec.ExecutionIntentID = intent.ID
-	dec.SourceRevision = revision
+	dec.SourceRevision = intent.SourceRevision
 	dec.ExecutionStatus = store.ExecutionIntentReserved
 	if intent.ClientOrderID != "" {
 		dec.ClientOrderID = intent.ClientOrderID
 	}
 	return true
+}
+
+// Recovery is limited to an exact in-memory proof that no decision handoff
+// occurred. A crash uses startup reconciliation; this is not a generic lease
+// timeout or permission to duplicate another consumer's RESERVED instruction.
+func (e *Engine) clearUnqueuedReservationFailure(intentID int64, failed *unqueuedReservationFailure) {
+	e.reservationFailureMu.Lock()
+	defer e.reservationFailureMu.Unlock()
+	if e.unqueuedReservationFailures[intentID] == failed {
+		delete(e.unqueuedReservationFailures, intentID)
+	}
+}
+
+func (e *Engine) retryUnqueuedReservationFailure(intentID int64) {
+	e.reservationFailureMu.Lock()
+	failed := e.unqueuedReservationFailures[intentID]
+	e.reservationFailureMu.Unlock()
+	if failed == nil || e.store == nil {
+		return
+	}
+	facts, err := e.store.CopyTrade().InspectLeaderTransition(intentID)
+	if errors.Is(err, sql.ErrNoRows) {
+		e.clearUnqueuedReservationFailure(intentID, failed)
+		return
+	}
+	if err != nil {
+		return
+	}
+	// Any intervening source/order progress belongs to its existing durable
+	// reconciler. The old local failure must not reset it back to executable.
+	if facts.TraderID != e.traderID || facts.Status != store.ExecutionIntentReserved || facts.Effect != store.SourceEffectUnsubmitted || facts.Resolution != "" {
+		e.clearUnqueuedReservationFailure(intentID, failed)
+		return
+	}
+	if err = e.store.CopyTrade().DeferUnsubmittedSourceReservation(intentID, e.traderID, failed.detail); err == nil {
+		e.clearUnqueuedReservationFailure(intentID, failed)
+	}
+}
+
+func (e *Engine) retryUnqueuedReservationFailures() {
+	e.reservationFailureMu.Lock()
+	ids := make([]int64, 0, len(e.unqueuedReservationFailures))
+	for id := range e.unqueuedReservationFailures {
+		ids = append(ids, id)
+	}
+	e.reservationFailureMu.Unlock()
+	for _, id := range ids {
+		e.retryUnqueuedReservationFailure(id)
+	}
 }
 
 // blockInvalidSourceRiskIncrease enforces the value/unit conversion fail-closed
@@ -3145,17 +3294,17 @@ Following leader's %s action on %s.
 // 辅助方法
 // ============================================================================
 
-func (e *Engine) syncLeaderState() error {
+func (e *Engine) syncLeaderState() (syncErr error) {
+	defer func() {
+		if syncErr != nil && e.store != nil {
+			_ = e.store.CopyTrade().ObserveRuntimeSource(e.traderID, time.Now(), syncErr)
+		}
+	}()
 	state, err := e.currentSourceSnapshot()
 	if err != nil {
 		e.recordSmartMoneySourceHealth()
 		e.reportBinanceCredentialsExpired(err, "syncLeaderState")
 		return err
-	}
-	if e.config != nil && SupportsCopyGuard(e.config.ProviderType) {
-		if err := e.baselineRepairedSources(state); err != nil {
-			return fmt.Errorf("source recovery baseline: %w", err)
-		}
 	}
 	checkedAt := time.Now()
 	if state != nil && !state.Timestamp.IsZero() {
@@ -3163,6 +3312,11 @@ func (e *Engine) syncLeaderState() error {
 	}
 	if err := e.confirmSmartMoneyEmptySnapshot(state, checkedAt); err != nil {
 		return err
+	}
+	if e.config != nil && SupportsCopyGuard(e.config.ProviderType) {
+		if err := e.baselineRepairedSources(state); err != nil {
+			return fmt.Errorf("source recovery baseline: %w", err)
+		}
 	}
 	recoveryRequired, err := e.smartMoneyRecoveryRequired(checkedAt)
 	if err != nil {
@@ -3175,12 +3329,19 @@ func (e *Engine) syncLeaderState() error {
 			return err
 		}
 	}
+	if err := e.synchronizeFollowGroups(state); err != nil {
+		return fmt.Errorf("follow group source snapshot: %w", err)
+	}
 	e.recordSmartMoneySourceHealth()
 
 	e.leaderStateMu.Lock()
 	e.leaderState = state
 	e.lastStateSync = time.Now()
 	e.leaderStateMu.Unlock()
+	e.retryUnqueuedReservationFailures()
+	if e.store != nil {
+		_ = e.store.CopyTrade().ObserveRuntimeSource(e.traderID, checkedAt, nil)
+	}
 
 	logger.Debugf("👁️ [%s] 领航员状态同步 | 权益=%.2f 持仓数=%d",
 		e.traderID, state.TotalEquity, len(state.Positions))

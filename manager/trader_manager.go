@@ -922,6 +922,11 @@ func (tm *TraderManager) addTraderFromStore(traderCfg *store.Trader, aiModelCfg 
 
 		// Check decision mode to determine startup type
 		decisionMode, _ := st.CopyTrade().GetDecisionMode(traderCfg.ID)
+		// Process restoration must obey the same durable execution-account
+		// boundary as an explicit start, including old venue instructions.
+		if claimErr := claimRestoredExecutionAccount(st, traderCfg, decisionMode == "copy_trade"); claimErr != nil {
+			return fmt.Errorf("restore execution account for %s: %w", traderCfg.Name, claimErr)
+		}
 
 		if decisionMode == "copy_trade" {
 			// Start in copy trade mode
@@ -963,4 +968,19 @@ func (tm *TraderManager) GetTraderExecutor(traderID string) (debate.TraderExecut
 		return nil, err
 	}
 	return &TraderExecutorAdapter{autoTrader: at}, nil
+}
+
+// Reject restoration before any worker starts while retaining unresolved venue
+// obligations in the normal STOPPING lifecycle. UI state must reflect reality.
+func claimRestoredExecutionAccount(st *store.Store, cfg *store.Trader, exclusive bool) error {
+	err := st.Trader().ClaimRunningExecutionAccount(cfg.ID, cfg.LifecycleGeneration, cfg.ExchangeID, exclusive)
+	if err == nil {
+		_ = st.CopyTrade().ResolveRuntimeIssue(cfg.ID, "execution", "runtime-start")
+		return nil
+	}
+	if stopErr := st.Trader().UpdateStatus(cfg.UserID, cfg.ID, false); stopErr != nil {
+		logger.Errorf("record rejected runtime restore %s: %v", cfg.ID, stopErr)
+	}
+	_, _ = st.CopyTrade().RecordRuntimeIssue(store.CopyRuntimeIssue{TraderID: cfg.ID, Area: "execution", ResourceID: "runtime-start", Code: "EXECUTION_ACCOUNT_RESTORE_BLOCKED", Detail: err.Error()})
+	return err
 }

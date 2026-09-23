@@ -173,7 +173,13 @@ type RiskAlert struct {
 
 // getTimeRangeStart 获取时间范围起始时间
 func getTimeRangeStart(timeRange string) time.Time {
-	now := time.Now()
+	return getTimeRangeStartAt(timeRange, time.Now())
+}
+
+// The dashboard uses the server's local calendar. Keep that location when
+// finding midnight, then send an explicitly zoned instant to SQLite; a local
+// wall-clock string without an offset is interpreted as UTC by SQLite.
+func getTimeRangeStartAt(timeRange string, now time.Time) time.Time {
 	switch timeRange {
 	case "today":
 		return time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
@@ -195,8 +201,12 @@ func getTimeRangeStart(timeRange string) time.Time {
 
 // getDashboardSummary 获取全局汇总统计
 func (s *Server) getDashboardSummary() (*DashboardSummary, error) {
+	return s.getDashboardSummaryAt(time.Now())
+}
+
+func (s *Server) getDashboardSummaryAt(now time.Time) (*DashboardSummary, error) {
 	summary := &DashboardSummary{
-		UpdatedAt: time.Now().Format("2006-01-02 15:04:05"),
+		UpdatedAt: now.Format("2006-01-02 15:04:05"),
 	}
 
 	db := s.store.DB()
@@ -238,31 +248,31 @@ func (s *Server) getDashboardSummary() (*DashboardSummary, error) {
 	}
 
 	// 今日盈亏
-	todayStart := getTimeRangeStart("today")
+	todayStart := getTimeRangeStartAt("today", now)
 	err = db.QueryRow(`
 		SELECT COALESCE(SUM(COALESCE(s.net_pnl,f.realized_pnl)), 0) FROM position_close_fills f LEFT JOIN position_fill_settlements s ON s.fill_id=f.id
-		WHERE data_quality IN ('VERIFIED','MIGRATED_VERIFIED') AND datetime(fill_time) >= datetime(?)
-	`, todayStart.Format("2006-01-02 15:04:05")).Scan(&summary.TodayPnL)
+		WHERE data_quality IN ('VERIFIED','MIGRATED_VERIFIED') AND julianday(fill_time) >= julianday(?)
+	`, todayStart.UTC().Format(time.RFC3339Nano)).Scan(&summary.TodayPnL)
 	if err != nil && err != sql.ErrNoRows {
 		logger.Warnf("Dashboard: 查询今日盈亏失败: %v", err)
 	}
 
 	// 本周盈亏
-	weekStart := getTimeRangeStart("week")
+	weekStart := getTimeRangeStartAt("week", now)
 	err = db.QueryRow(`
 		SELECT COALESCE(SUM(COALESCE(s.net_pnl,f.realized_pnl)), 0) FROM position_close_fills f LEFT JOIN position_fill_settlements s ON s.fill_id=f.id
-		WHERE data_quality IN ('VERIFIED','MIGRATED_VERIFIED') AND datetime(fill_time) >= datetime(?)
-	`, weekStart.Format("2006-01-02 15:04:05")).Scan(&summary.WeekPnL)
+		WHERE data_quality IN ('VERIFIED','MIGRATED_VERIFIED') AND julianday(fill_time) >= julianday(?)
+	`, weekStart.UTC().Format(time.RFC3339Nano)).Scan(&summary.WeekPnL)
 	if err != nil && err != sql.ErrNoRows {
 		logger.Warnf("Dashboard: 查询本周盈亏失败: %v", err)
 	}
 
 	// 本月盈亏
-	monthStart := getTimeRangeStart("month")
+	monthStart := getTimeRangeStartAt("month", now)
 	err = db.QueryRow(`
 		SELECT COALESCE(SUM(COALESCE(s.net_pnl,f.realized_pnl)), 0) FROM position_close_fills f LEFT JOIN position_fill_settlements s ON s.fill_id=f.id
-		WHERE data_quality IN ('VERIFIED','MIGRATED_VERIFIED') AND datetime(fill_time) >= datetime(?)
-	`, monthStart.Format("2006-01-02 15:04:05")).Scan(&summary.MonthPnL)
+		WHERE data_quality IN ('VERIFIED','MIGRATED_VERIFIED') AND julianday(fill_time) >= julianday(?)
+	`, monthStart.UTC().Format(time.RFC3339Nano)).Scan(&summary.MonthPnL)
 	if err != nil && err != sql.ErrNoRows {
 		logger.Warnf("Dashboard: 查询本月盈亏失败: %v", err)
 	}
@@ -284,6 +294,10 @@ func (s *Server) getDashboardSummary() (*DashboardSummary, error) {
 
 // getTraderDashboardStats 获取单个交易员的大屏统计
 func (s *Server) getTraderDashboardStats(traderID string) (*TraderDashboardStats, error) {
+	return s.getTraderDashboardStatsAt(traderID, time.Now())
+}
+
+func (s *Server) getTraderDashboardStatsAt(traderID string, now time.Time) (*TraderDashboardStats, error) {
 	stats := &TraderDashboardStats{
 		TraderID: traderID,
 	}
@@ -352,34 +366,34 @@ func (s *Server) getTraderDashboardStats(traderID string) (*TraderDashboardStats
 	}
 
 	// 今日统计
-	todayStart := getTimeRangeStart("today")
+	todayStart := getTimeRangeStartAt("today", now)
 	err = db.QueryRow(`
 		SELECT COALESCE(SUM(realized_pnl), 0), COUNT(*)
 		FROM trusted_closed_positions
-		WHERE trader_id = ? AND exit_time >= ?
-	`, traderID, todayStart.Format("2006-01-02 15:04:05")).Scan(&stats.TodayPnL, &stats.TodayTrades)
+		WHERE trader_id = ? AND julianday(exit_time) >= julianday(?)
+	`, traderID, todayStart.UTC().Format(time.RFC3339Nano)).Scan(&stats.TodayPnL, &stats.TodayTrades)
 	if err != nil && err != sql.ErrNoRows {
 		logger.Warnf("Dashboard: 查询今日统计失败: %v", err)
 	}
 
 	// 本周统计
-	weekStart := getTimeRangeStart("week")
+	weekStart := getTimeRangeStartAt("week", now)
 	err = db.QueryRow(`
 		SELECT COALESCE(SUM(realized_pnl), 0), COUNT(*)
 		FROM trusted_closed_positions
-		WHERE trader_id = ? AND exit_time >= ?
-	`, traderID, weekStart.Format("2006-01-02 15:04:05")).Scan(&stats.WeekPnL, &stats.WeekTrades)
+		WHERE trader_id = ? AND julianday(exit_time) >= julianday(?)
+	`, traderID, weekStart.UTC().Format(time.RFC3339Nano)).Scan(&stats.WeekPnL, &stats.WeekTrades)
 	if err != nil && err != sql.ErrNoRows {
 		logger.Warnf("Dashboard: 查询本周统计失败: %v", err)
 	}
 
 	// 本月统计
-	monthStart := getTimeRangeStart("month")
+	monthStart := getTimeRangeStartAt("month", now)
 	err = db.QueryRow(`
 		SELECT COALESCE(SUM(realized_pnl), 0), COUNT(*)
 		FROM trusted_closed_positions
-		WHERE trader_id = ? AND exit_time >= ?
-	`, traderID, monthStart.Format("2006-01-02 15:04:05")).Scan(&stats.MonthPnL, &stats.MonthTrades)
+		WHERE trader_id = ? AND julianday(exit_time) >= julianday(?)
+	`, traderID, monthStart.UTC().Format(time.RFC3339Nano)).Scan(&stats.MonthPnL, &stats.MonthTrades)
 	if err != nil && err != sql.ErrNoRows {
 		logger.Warnf("Dashboard: 查询本月统计失败: %v", err)
 	}
@@ -491,30 +505,30 @@ func (s *Server) getSystemMonitor() (*SystemMonitor, error) {
 
 	db := s.store.DB()
 	todayStart := getTimeRangeStart("today")
-	todayStr := todayStart.Format("2006-01-02 15:04:05")
+	todayStr := todayStart.UTC().Format(time.RFC3339Nano)
 
 	// ========== 跟单信号统计 (今日) ==========
 	// 总信号数
 	db.QueryRow(`
-		SELECT COUNT(*) FROM copy_trade_signal_logs WHERE created_at >= ?
+		SELECT COUNT(*) FROM copy_trade_signal_logs WHERE julianday(created_at) >= julianday(?)
 	`, todayStr).Scan(&monitor.TodaySignals)
 
 	// 执行成功
 	db.QueryRow(`
 		SELECT COUNT(*) FROM copy_trade_signal_logs 
-		WHERE created_at >= ? AND status = 'executed'
+		WHERE julianday(created_at) >= julianday(?) AND status = 'executed'
 	`, todayStr).Scan(&monitor.TodayExecuted)
 
 	// 跳过
 	db.QueryRow(`
 		SELECT COUNT(*) FROM copy_trade_signal_logs 
-		WHERE created_at >= ? AND status = 'skipped'
+		WHERE julianday(created_at) >= julianday(?) AND status = 'skipped'
 	`, todayStr).Scan(&monitor.TodaySkipped)
 
 	// 失败
 	db.QueryRow(`
 		SELECT COUNT(*) FROM copy_trade_signal_logs 
-		WHERE created_at >= ? AND status = 'failed'
+		WHERE julianday(created_at) >= julianday(?) AND status = 'failed'
 	`, todayStr).Scan(&monitor.TodayFailed)
 
 	// 执行率
@@ -523,15 +537,15 @@ func (s *Server) getSystemMonitor() (*SystemMonitor, error) {
 	}
 
 	// ========== API 错误统计 (最近24小时) ==========
-	last24h := time.Now().Add(-24 * time.Hour).Format("2006-01-02 15:04:05")
+	last24h := time.Now().Add(-24 * time.Hour).UTC().Format(time.RFC3339Nano)
 
 	// 从 copy_trade_signal_logs 和 decision_records 提取错误
 	rows, err := db.Query(`
 		SELECT error_message FROM copy_trade_signal_logs 
-		WHERE created_at >= ? AND error_message != '' AND error_message IS NOT NULL
+		WHERE julianday(created_at) >= julianday(?) AND error_message != '' AND error_message IS NOT NULL
 		UNION ALL
 		SELECT error_message FROM decision_records 
-		WHERE timestamp >= ? AND error_message != '' AND error_message IS NOT NULL
+		WHERE julianday(timestamp) >= julianday(?) AND error_message != '' AND error_message IS NOT NULL
 	`, last24h, last24h)
 	if err == nil {
 		defer rows.Close()
@@ -706,10 +720,10 @@ func (s *Server) calculateRiskAlerts() []RiskAlert {
 
 	// 4. 检查 API 错误频繁
 	var recentErrors int
-	last1h := time.Now().Add(-1 * time.Hour).Format("2006-01-02 15:04:05")
+	last1h := time.Now().Add(-1 * time.Hour).UTC().Format(time.RFC3339Nano)
 	db.QueryRow(`
 		SELECT COUNT(*) FROM copy_trade_signal_logs 
-		WHERE created_at >= ? AND status = 'failed'
+		WHERE julianday(created_at) >= julianday(?) AND status = 'failed'
 	`, last1h).Scan(&recentErrors)
 
 	if recentErrors >= 5 {

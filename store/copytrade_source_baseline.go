@@ -34,6 +34,10 @@ func (s *CopyTradeStore) initSourceBaselineTable() error {
 			source_generation INTEGER NOT NULL,
 			completed_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			PRIMARY KEY(trader_id, source_generation)
+		);
+		CREATE TABLE IF NOT EXISTS copy_trade_stop_recovery_baselines (
+		 trader_id TEXT NOT NULL,lifecycle_generation INTEGER NOT NULL,completed_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		 PRIMARY KEY(trader_id,lifecycle_generation)
 		)
 	`)
 	return err
@@ -59,7 +63,7 @@ func (s *CopyTradeStore) InitializeSourceBaseline(traderID, leaderID, sourceMode
 	}
 	defer tx.Rollback()
 	for _, position := range positions {
-		if position.LeaderPosID == "" || position.Symbol == "" || position.Size < 0 {
+		if position.LeaderPosID == "" || position.Symbol == "" || !finiteNonnegative(position.Size) {
 			return fmt.Errorf("invalid source baseline position: %+v", position)
 		}
 		var status string
@@ -104,8 +108,15 @@ func (s *CopyTradeStore) RebaselineSourceRecovery(traderID, leaderID string, pos
 		return err
 	}
 	defer tx.Rollback()
+	if err = rebaselineSourceRecoveryTx(tx, traderID, leaderID, positions); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func rebaselineSourceRecoveryTx(tx *sql.Tx, traderID, leaderID string, positions []CopyTradeBaselinePosition) error {
 	for _, position := range positions {
-		if position.LeaderPosID == "" || position.Symbol == "" || position.Size <= 0 {
+		if position.LeaderPosID == "" || position.Symbol == "" || (!finiteNonnegative(position.Size) || position.Size == 0) {
 			return fmt.Errorf("invalid recovery baseline position: %+v", position)
 		}
 		var status string
@@ -135,5 +146,43 @@ func (s *CopyTradeStore) RebaselineSourceRecovery(traderID, leaderID string, pos
 			return err
 		}
 	}
-	return tx.Commit()
+	return nil
+}
+
+// ApplyStoppedSourceRecoveryBaseline is generation-scoped and runs only after
+// an explicit operator restart. A service crash that restores RUNNING has no
+// OPERATOR_START event and must not erase genuine source reductions.
+func (s *CopyTradeStore) ApplyStoppedSourceRecoveryBaseline(traderID, leaderID string, positions []CopyTradeBaselinePosition) (bool, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	var generation int64
+	err = tx.QueryRow(`SELECT t.lifecycle_generation FROM traders t JOIN trader_lifecycle_events e ON e.trader_id=t.id AND e.generation=t.lifecycle_generation
+ WHERE t.id=? AND t.lifecycle_status IN ('STARTING','RUNNING') AND e.to_status='STARTING' AND e.reason_code='OPERATOR_START'
+ AND e.from_status IN ('STOPPED','STOPPING','STOPPING_RECONCILE_REQUIRED') AND NOT EXISTS(SELECT 1 FROM copy_trade_stop_recovery_baselines b WHERE b.trader_id=t.id AND b.lifecycle_generation=t.lifecycle_generation)`, traderID).Scan(&generation)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if _, err = finishStoppedSourceTransitionsTx(tx, traderID, leaderID, true); err != nil {
+		return false, err
+	}
+	var unresolved int
+	if err = tx.QueryRow(`SELECT COUNT(*) FROM copy_trade_execution_intents i WHERE i.trader_id=? AND i.source_kind='LEADER_TRANSITION' AND (EXISTS(SELECT 1 FROM copy_trade_execution_order_attempts a WHERE a.intent_id=i.id AND a.submitted_at IS NOT NULL AND a.terminal_at IS NULL) OR (i.submitted_at IS NOT NULL AND i.terminal_at IS NULL AND NOT EXISTS(SELECT 1 FROM copy_trade_execution_order_attempts a WHERE a.intent_id=i.id)))`, traderID).Scan(&unresolved); err != nil {
+		return false, err
+	}
+	if unresolved > 0 {
+		return false, ErrSourceTransitionUnresolved
+	}
+	if err = rebaselineSourceRecoveryTx(tx, traderID, leaderID, positions); err != nil {
+		return false, err
+	}
+	if _, err = tx.Exec(`INSERT INTO copy_trade_stop_recovery_baselines(trader_id,lifecycle_generation) VALUES(?,?)`, traderID, generation); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
 }

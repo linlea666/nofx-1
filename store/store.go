@@ -267,6 +267,12 @@ func (s *Store) initTables() error {
 	if err := s.CopyTrade().initLeaderExitTables(); err != nil {
 		return fmt.Errorf("initialize leader exits: %w", err)
 	}
+	if err := s.CopyTrade().InitFollowGroupTables(); err != nil {
+		return fmt.Errorf("initialize follow groups: %w", err)
+	}
+	if err := s.CopyTrade().initRuntimeHealthTables(); err != nil {
+		return fmt.Errorf("initialize copy runtime health: %w", err)
+	}
 	if err := s.CopyTrade().initUnsupportedExecutionInstrumentTable(); err != nil {
 		return fmt.Errorf("failed to initialize unsupported execution instrument table: %w", err)
 	}

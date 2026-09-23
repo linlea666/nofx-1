@@ -244,6 +244,7 @@ func (h *CopyTradeHandler) RegisterRoutes(group *gin.RouterGroup) {
 		copyTrade.POST("/stop/:trader_id", h.Stop)
 		copyTrade.GET("/stats/:trader_id", h.GetStats)
 		copyTrade.GET("/logs/:trader_id", h.GetLogs)
+		copyTrade.GET("/runtime-health", h.RuntimeHealth)
 
 		// 仓位级手动停止跟单：查询映射 + 停止某 posId 的跟随
 		copyTrade.GET("/mappings/:trader_id", h.GetMappings)

@@ -1,10 +1,12 @@
 package copytrade
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -721,33 +723,23 @@ func TestBackfillV4Cycles(t *testing.T) {
 	}
 
 	ti.backfillV4Cycles()
-	cycle, err := st.CopyTrade().GetOpenCopyGuardCycle("trader-1", "legacy-pos")
-	if err != nil {
-		t.Fatalf("legacy position must be backfilled: %v", err)
+	if _, err := st.CopyTrade().GetOpenCopyGuardCycle("trader-1", "legacy-pos"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("legacy snapshot without initial-fill proof must not adopt protection: %v", err)
 	}
-	if cycle.ProtectionStatus != store.CopyGuardProtectionPending {
-		t.Fatalf("backfilled cycle must start PENDING so the retry channel attaches protection: %+v", cycle)
-	}
-	if cycle.FollowerEntryPrice != 1717.33 {
-		t.Fatalf("backfill must use the real position entry price: %+v", cycle)
-	}
-	if cycle.AccountingStatus != store.CopyGuardAccountingLegacyUnverified || cycle.InitialIntentID != 0 {
-		t.Fatalf("legacy mapping without a confirmed initial fill must remain unscored: %+v", cycle)
-	}
-	attempts, err := st.CopyTrade().ListCopyGuardAttempts(cycle.ID)
-	if err != nil || len(attempts) != 1 || attempts[0].Status != "OPEN" {
-		t.Fatalf("backfill must open attempt 0: %v %v", attempts, err)
-	}
-	if _, err := st.CopyTrade().GetOpenCopyGuardCycle("trader-1", "ghost-pos"); err == nil {
+	if _, err := st.CopyTrade().GetOpenCopyGuardCycle("trader-1", "ghost-pos"); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatal("a mapping without a real follower position must not be backfilled")
 	}
-
-	// 幂等：再跑一轮不得重复建周期
-	ti.lastV4Backfill = time.Time{}
-	ti.backfillV4Cycles()
-	again, err := st.CopyTrade().GetOpenCopyGuardCycle("trader-1", "legacy-pos")
-	if err != nil || again.ID != cycle.ID {
-		t.Fatalf("backfill must be idempotent: %+v %v", again, err)
+	for n := 0; n < 2; n++ {
+		ti.lastV4Backfill = time.Time{}
+		ti.backfillV4Cycles()
+	}
+	m, err := st.CopyTrade().GetMappingForReconciliation("trader-1", "legacy-pos")
+	if err != nil || m.Status != store.MappingStatusActive || m.LastKnownSize != 1 {
+		t.Fatalf("protection uncertainty changed ordinary following: %+v %v", m, err)
+	}
+	issues, err := st.CopyTrade().ListRuntimeIssues("trader-1")
+	if err != nil || len(issues) != 2 || !strings.Contains(issues[0].Detail, "confirmed initial fill") {
+		t.Fatalf("missing proof must stay visible without duplicate retries: %+v %v", issues, err)
 	}
 }
 

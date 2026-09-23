@@ -1754,6 +1754,11 @@ func (s *CopyTradeStore) MarkManualStopped(traderID, leaderPosID string) (bool, 
 		return false, err
 	}
 	defer tx.Rollback()
+	if handled, groupErr := MarkFollowGroupPausedTx(tx, traderID, leaderPosID); groupErr != nil {
+		return false, groupErr
+	} else if handled {
+		return true, tx.Commit()
+	}
 	res, err := tx.Exec(`
 		UPDATE copy_trade_position_mappings
 		SET status = 'manual_stopped',

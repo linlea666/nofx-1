@@ -11,6 +11,7 @@ import {
   YAxis,
 } from 'recharts'
 import { api } from '../lib/api'
+import { CopyRuntimeHealthPanel } from '../components/CopyRuntimeHealthPanel'
 import type {
   AIModel,
   CopyGuardAICandidate,
@@ -2145,6 +2146,7 @@ export function CopyGuardPage() {
           </button>
         </div>
       </div>
+      <CopyRuntimeHealthPanel traderID={traderID.trim() || undefined} />
       <AICandidatesPanel />
       <AdvisorSettingsCard />
       <MarketPreviewCard />

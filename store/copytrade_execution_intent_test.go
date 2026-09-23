@@ -50,13 +50,14 @@ func TestExecutionIntentReservationIsCanonicalAndKeepsClientID(t *testing.T) {
 	}
 }
 
-func TestRiskSkippedAddReclaimsOnlyForNewSourceFill(t *testing.T) {
+func TestRiskSkippedAddChangedTargetRequiresSuccessorRevision(t *testing.T) {
 	st, err := New(filepath.Join(t.TempDir(), "risk-skip-reclaim.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer st.Close()
 	cs := st.CopyTrade()
+	resolutionMapping(t, st, "t1", "p1", MappingStatusActive, 1, 1)
 	base := &CopyTradeExecutionIntent{
 		TraderID: "t1", LeaderPosID: "p1", SourceRevision: 2, SourceFillID: "size-2",
 		Action: "open_long", Symbol: "ETHUSDT", LeaderTargetSize: 2, ClientOrderID: "stable",
@@ -74,9 +75,18 @@ func TestRiskSkippedAddReclaimsOnlyForNewSourceFill(t *testing.T) {
 	next := *base
 	next.SourceFillID = "size-3"
 	next.LeaderTargetSize = 3
-	reclaimed, claimed, err := cs.ReserveExecutionIntent(&next)
-	if err != nil || !claimed || reclaimed.ID != first.ID || reclaimed.LeaderTargetSize != 3 {
-		t.Fatalf("new cumulative source transition was not reclaimed: intent=%+v claimed=%v err=%v", reclaimed, claimed, err)
+
+	if got, claimed, e := cs.ReserveExecutionIntent(&next); e != nil || claimed || got.LeaderTargetSize != 2 {
+		t.Fatalf("historical target rewritten %+v %v %v", got, claimed, e)
+	}
+	if err = cs.FinishLeaderSourceTransition(FinishLeaderSourceTransitionRequest{IntentID: first.ID, TraderID: "t1", Disposition: SourceSupersedeNoFill, Reason: "SOURCE_SUPERSEDED"}); err != nil {
+		t.Fatal(err)
+	}
+	next.SourceRevision = 3
+	next.ClientOrderID = "next-client"
+	got, claimed, err := cs.ReserveExecutionIntent(&next)
+	if err != nil || !claimed || got.ID == first.ID || got.LeaderTargetSize != 3 {
+		t.Fatalf("successor blocked %+v %v %v", got, claimed, err)
 	}
 }
 
@@ -1500,7 +1510,7 @@ func TestSourceRevalidationIntentCanOnlyBeReclaimedWithoutAttempts(t *testing.T)
 	replayed := *base
 	replayed.SourceFillID = "f2"
 	replayed.SourceFillIDs = []string{"f1", "f2"}
-	replayed.LeaderTargetSize = 2
+	replayed.LeaderTargetSize = 1 // Same business target; execution parameters alone may refresh.
 	got, claimed, err := cs.ReserveExecutionIntent(&replayed)
 	if err != nil || !claimed || got.ID != intent.ID || got.Status != ExecutionIntentReserved {
 		t.Fatalf("healthy replay must reclaim pre-submit intent: got=%+v claimed=%v err=%v", got, claimed, err)
@@ -1811,17 +1821,18 @@ func TestLegacyCloseFailureWithAmbiguousEvidenceIsNotReclaimed(t *testing.T) {
 	}
 }
 
-func TestSourceRevalidationIntentRebindsToAuthoritativeAction(t *testing.T) {
+func TestSourceRevalidationCannotRewriteAction(t *testing.T) {
 	st, err := New(filepath.Join(t.TempDir(), "source-revalidation-action.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer st.Close()
 	cs := st.CopyTrade()
+	resolutionMapping(t, st, "t1", "p1", MappingStatusActive, 1, 1)
 	base := &CopyTradeExecutionIntent{
-		TraderID: "t1", LeaderPosID: "p1", SourceRevision: 1,
-		CanonicalKey: "leader|t1|p1|1", Action: "open_long", Symbol: "ETHUSDT",
-		Side: "long", SourceFillID: "f1", LeaderTargetSize: 1, ClientOrderID: "open-order",
+		TraderID: "t1", LeaderPosID: "p1", SourceRevision: 2,
+		CanonicalKey: "leader|t1|p1|2", Action: "open_long", Symbol: "ETHUSDT",
+		Side: "long", SourceFillID: "f1", LeaderTargetSize: 2, ClientOrderID: "open-order",
 	}
 	intent, claimed, err := cs.ReserveExecutionIntent(base)
 	if err != nil || !claimed {
@@ -1836,23 +1847,36 @@ func TestSourceRevalidationIntentRebindsToAuthoritativeAction(t *testing.T) {
 	revalidated.SourceFillIDs = []string{"f2"}
 	revalidated.LeaderTargetSize = 0
 	revalidated.ClientOrderID = "close-order"
+
 	got, claimed, err := cs.ReserveExecutionIntent(&revalidated)
-	if err != nil || !claimed {
-		t.Fatalf("authoritative action rebind claimed=%v err=%v", claimed, err)
+	if err != nil || claimed || got.ID != intent.ID || got.Action != "open_long" {
+		t.Fatalf("historical action rewritten %+v %v %v", got, claimed, err)
 	}
-	if got.ID != intent.ID || got.Action != "close_long" || got.LeaderTargetSize != 0 ||
-		got.ClientOrderID != "close-order" || got.Status != ExecutionIntentReserved {
-		t.Fatalf("unexpected rebound intent: %+v", got)
+	if err = cs.FinishLeaderSourceTransition(FinishLeaderSourceTransitionRequest{IntentID: intent.ID, TraderID: "t1", Disposition: SourceSupersedeNoFill, Reason: "SOURCE_SUPERSEDED"}); err != nil {
+		t.Fatal(err)
+	}
+	revalidated.SourceRevision = 3
+	revalidated.CanonicalKey = "leader|t1|p1|3"
+	got, claimed, err = cs.ReserveExecutionIntent(&revalidated)
+	if err != nil || !claimed || got.ID == intent.ID || got.Action != "close_long" {
+		t.Fatalf("fresh close blocked %+v %v %v", got, claimed, err)
 	}
 }
 
-func TestSupersedeUnsubmittedExecutionIntentAllowsLaterReplay(t *testing.T) {
+func TestSupersededInitialIntentUsesLaterSourceRevision(t *testing.T) {
 	st, err := New(filepath.Join(t.TempDir(), "source-superseded.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer st.Close()
+	createLifecycleTestTrader(t, st, "t1", TraderLifecycleRunning, 1)
 	cs := st.CopyTrade()
+	cfg := NewCopyGuardDefaults()
+	cfg.TraderID = "t1"
+	cfg.LeaderID = "leader"
+	if err = cs.Upsert(cfg); err != nil {
+		t.Fatal(err)
+	}
 	base := &CopyTradeExecutionIntent{
 		TraderID: "t1", LeaderPosID: "p1", SourceRevision: 1,
 		CanonicalKey: "leader|t1|p1|1", Action: "open_long", Symbol: "ETHUSDT",
@@ -1875,12 +1899,18 @@ func TestSupersedeUnsubmittedExecutionIntentAllowsLaterReplay(t *testing.T) {
 	if status != ExecutionIntentSkipped || reason != "SOURCE_SUPERSEDED" {
 		t.Fatalf("unexpected superseded terminal: %s/%s", status, reason)
 	}
+
 	replayed := *base
 	replayed.SourceFillID = "f2"
 	replayed.SourceFillIDs = []string{"f2"}
+	if got, claimed, e := cs.ReserveExecutionIntent(&replayed); e != nil || claimed || got.ID != intent.ID {
+		t.Fatalf("resolved original identity reclaimed: %+v %v %v", got, claimed, e)
+	}
+	replayed.SourceRevision = 2
+	replayed.CanonicalKey = "leader|t1|p1|2"
 	got, claimed, err := cs.ReserveExecutionIntent(&replayed)
-	if err != nil || !claimed || got.ID != intent.ID || got.Status != ExecutionIntentReserved {
-		t.Fatalf("later source replay must safely reclaim zero-side-effect intent: got=%+v claimed=%v err=%v", got, claimed, err)
+	if err != nil || !claimed || got.ID == intent.ID {
+		t.Fatalf("later revision was blocked: %+v %v %v", got, claimed, err)
 	}
 }
 

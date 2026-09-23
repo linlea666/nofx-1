@@ -203,6 +203,10 @@ func (t *OKXTrader) GetMarkPriceHistory(symbol string, from, to time.Time) ([]Ma
 // requested window. tradeId (or billId fallback) is stable per fill, unlike
 // positions-history posId whose quantities and PnL are cumulative.
 func (t *OKXTrader) GetTradesForSymbol(symbol string, startTime time.Time, limit int) ([]TradeRecord, error) {
+	return t.getTradesForSymbolWindow(symbol, startTime, time.Now(), limit)
+}
+
+func (t *OKXTrader) getTradesForSymbolWindow(symbol string, startTime, endTime time.Time, limit int) ([]TradeRecord, error) {
 	pageSize := limit
 	if pageSize <= 0 || pageSize > 100 {
 		pageSize = 100
@@ -210,10 +214,9 @@ func (t *OKXTrader) GetTradesForSymbol(symbol string, startTime time.Time, limit
 	if startTime.IsZero() || startTime.Before(time.Now().Add(-90*24*time.Hour)) {
 		startTime = time.Now().Add(-90 * 24 * time.Hour)
 	}
-	endTime := time.Now()
 	after := ""
 	seenCursor := make(map[string]struct{})
-	seenFill := make(map[string]struct{})
+	seenFill := make(map[string]string)
 	trades := make([]TradeRecord, 0)
 
 	for page := 0; ; page++ {
@@ -261,7 +264,13 @@ func (t *OKXTrader) GetTradesForSymbol(symbol string, startTime time.Time, limit
 			if fillID == "" {
 				return nil, fmt.Errorf("OKX fill is missing tradeId and billId")
 			}
-			if _, exists := seenFill[fillID]; exists {
+			// Pages may overlap; an immutable identity may repeat only with the
+			// same evidence. Do not silently discard a conflicting second row.
+			evidence, _ := json.Marshal(row)
+			if previous, exists := seenFill[fillID]; exists {
+				if previous != string(evidence) {
+					return nil, fmt.Errorf("conflicting OKX fill identity %s", fillID)
+				}
 				continue
 			}
 			contracts, parseErr := strconv.ParseFloat(row.FillSz, 64)
@@ -292,13 +301,21 @@ func (t *OKXTrader) GetTradesForSymbol(symbol string, startTime time.Time, limit
 			if parseErr != nil {
 				return nil, fmt.Errorf("parse OKX fill time %q: %w", timeText, parseErr)
 			}
-			seenFill[fillID] = struct{}{}
+			var recordTime time.Time
+			if row.Ts != "" {
+				recordMillis, recordErr := strconv.ParseInt(row.Ts, 10, 64)
+				if recordErr != nil {
+					return nil, fmt.Errorf("parse OKX fill record time: %w", recordErr)
+				}
+				recordTime = time.UnixMilli(recordMillis)
+			}
+			seenFill[fillID] = string(evidence)
 			trades = append(trades, TradeRecord{
 				TradeID: fillID, OrderID: row.OrdID,
 				Symbol: t.convertSymbolBack(row.InstID),
 				Side:   strings.ToUpper(row.Side), PositionSide: strings.ToUpper(row.PosSide),
 				Price: price, Quantity: baseQuantity, RealizedPnL: pnl,
-				Fee: math.Abs(fee), Time: time.UnixMilli(fillMillis),
+				Fee: math.Abs(fee), Time: time.UnixMilli(fillMillis), RecordTime: recordTime,
 			})
 		}
 		if len(rows) < pageSize {

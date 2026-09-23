@@ -76,6 +76,10 @@ func (s *TraderStore) initLifecycleTables() error {
 		);
 		CREATE INDEX IF NOT EXISTS idx_trader_lifecycle_events_trader
 			ON trader_lifecycle_events(trader_id,generation,created_at);
+		CREATE TABLE IF NOT EXISTS copy_trade_account_claims (
+			trader_id TEXT PRIMARY KEY,exchange_id TEXT NOT NULL,generation INTEGER NOT NULL,exclusive BOOLEAN NOT NULL DEFAULT 0,
+			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);
 		CREATE TABLE IF NOT EXISTS trader_tombstones (
 			trader_id TEXT PRIMARY KEY,
 			lifecycle_status TEXT NOT NULL DEFAULT 'ARCHIVED',
@@ -83,7 +87,10 @@ func (s *TraderStore) initLifecycleTables() error {
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		);
 	`)
-	return err
+	if err != nil {
+		return err
+	}
+	return ensureSQLiteColumn(s.db, "copy_trade_account_claims", "exclusive", "BOOLEAN NOT NULL DEFAULT 0")
 }
 
 func recordTraderLifecycleEventTx(tx *sql.Tx, traderID string, generation int64, from, to, reason, detail string) error {
@@ -196,29 +203,8 @@ func (s *TraderStore) completeStart(userID, traderID string, generation int64, e
 			return err
 		}
 	}
-	if strings.TrimSpace(exchangeID) != "" {
-		var conflict string
-		err = tx.QueryRow(`SELECT t.id
-			FROM traders t
-			LEFT JOIN copy_trade_configs c ON c.trader_id=t.id
-			LEFT JOIN copy_guard_policies p ON p.trader_id=t.id
-			WHERE t.exchange_id=? AND t.id<>?
-			  AND t.lifecycle_status='RUNNING' AND t.is_running=1
-			  AND (? OR (
-				(c.enabled=1 AND c.provider_type IN ('okx','binance') AND (COALESCE(c.follow_exit_policy_version,0)>=2 OR (p.trader_id IS NOT NULL AND (COALESCE(c.risk_stop_loss_enabled,1)=1 OR COALESCE(c.risk_liquidation_guard_enabled,1)=1))))
-				OR EXISTS (SELECT 1 FROM copy_guard_cycles active_cycle
-					WHERE active_cycle.trader_id=t.id AND active_cycle.closed_at IS NULL)
-			  ))
-			ORDER BY t.id LIMIT 1`, exchangeID, traderID, copyGuardExclusive).Scan(&conflict)
-		if err != nil && err != sql.ErrNoRows {
-			return err
-		}
-		if conflict != "" {
-			if copyGuardExclusive {
-				return fmt.Errorf("execution account already has running trader %s and cannot be assigned to Copy Guard", conflict)
-			}
-			return fmt.Errorf("execution account is already controlled by Copy Guard trader %s", conflict)
-		}
+	if err = checkAndClaimExecutionAccountTx(tx, traderID, generation, exchangeID, copyGuardExclusive); err != nil {
+		return err
 	}
 	res, err := tx.Exec(`UPDATE traders SET lifecycle_status=?,is_running=1
 		WHERE id=? AND user_id=? AND lifecycle_status=? AND lifecycle_generation=?`,
@@ -233,6 +219,82 @@ func (s *TraderStore) completeStart(userID, traderID string, generation int64, e
 		return err
 	}
 	return tx.Commit()
+}
+
+// ClaimRunningCopyAccount applies the same durable account boundary during
+// automatic runtime restoration as during an explicit start. It never changes
+// lifecycle status, and stale generations cannot acquire a claim.
+func (s *TraderStore) ClaimRunningCopyAccount(traderID string, generation int64, exchangeID string) error {
+	return s.ClaimRunningExecutionAccount(traderID, generation, exchangeID, true)
+}
+
+func (s *TraderStore) ClaimRunningExecutionAccount(traderID string, generation int64, exchangeID string, exclusive bool) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var actualAccount, status string
+	var actualGeneration int64
+	if err = tx.QueryRow(`SELECT exchange_id,lifecycle_status,lifecycle_generation FROM traders WHERE id=?`, traderID).Scan(&actualAccount, &status, &actualGeneration); err != nil {
+		return err
+	}
+	if actualAccount != exchangeID || generation != actualGeneration || (status != TraderLifecycleRunning && status != TraderLifecycleStarting) {
+		return ErrTraderLifecycleConflict
+	}
+	if err = checkAndClaimExecutionAccountTx(tx, traderID, generation, exchangeID, exclusive); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// Settled fills alone do not lock a stopped account. Live or uncertain venue
+// instructions do: their risk survives both process shutdown and configuration
+// changes. A durable claim retains the account used by the previous generation.
+func checkAndClaimExecutionAccountTx(tx *sql.Tx, traderID string, generation int64, exchangeID string, exclusive bool) error {
+	if strings.TrimSpace(exchangeID) == "" {
+		return nil
+	}
+	var conflict string
+	err := tx.QueryRow(`SELECT t.id FROM traders t
+ LEFT JOIN copy_trade_account_claims a ON a.trader_id=t.id
+ LEFT JOIN copy_trade_configs c ON c.trader_id=t.id
+ LEFT JOIN copy_guard_policies p ON p.trader_id=t.id
+ WHERE (t.exchange_id=? OR a.exchange_id=?) AND t.id<>? AND (
+ (((t.lifecycle_status='RUNNING' AND t.is_running=1) OR (t.lifecycle_status='STARTING' AND a.generation=t.lifecycle_generation)) AND (? OR COALESCE(a.exclusive,0)=1 OR
+ (c.enabled=1 AND c.provider_type IN ('okx','binance') AND (COALESCE(c.follow_exit_policy_version,0)>=2 OR (p.trader_id IS NOT NULL AND (COALESCE(c.risk_stop_loss_enabled,1)=1 OR COALESCE(c.risk_liquidation_guard_enabled,1)=1))))
+ OR EXISTS(SELECT 1 FROM copy_guard_cycles x WHERE x.trader_id=t.id AND x.closed_at IS NULL)))
+ OR EXISTS(SELECT 1 FROM copy_trade_execution_order_attempts o JOIN copy_trade_execution_intents oi ON oi.id=o.intent_id WHERE oi.trader_id=t.id AND o.submitted_at IS NOT NULL AND o.terminal_at IS NULL)
+ OR EXISTS(SELECT 1 FROM copy_trade_execution_intents i WHERE i.trader_id=t.id AND (i.submitted_at IS NOT NULL OR COALESCE(i.exchange_order_id,'')<>'') AND (i.terminal_at IS NULL OR UPPER(COALESCE(i.exchange_state,'')) NOT IN ('FILLED','CANCELED','CANCELLED','REJECTED','EXPIRED','FAILED')) AND NOT EXISTS(SELECT 1 FROM copy_trade_execution_order_attempts o WHERE o.intent_id=i.id))
+ OR EXISTS(SELECT 1 FROM copy_guard_protective_orders o WHERE o.trader_id=t.id AND (o.replacement_pending=1 OR (LOWER(COALESCE(o.status,'')) NOT IN ('canceled','cancelled','effective','filled','triggered','order_failed','failed','expired') AND (COALESCE(o.algo_id,'')<>'' OR COALESCE(o.algo_client_id,'')<>''))))
+ ) ORDER BY t.id LIMIT 1`, exchangeID, exchangeID, traderID, exclusive).Scan(&conflict)
+	if err != nil && err != sql.ErrNoRows {
+		return err
+	}
+	if conflict != "" {
+		return fmt.Errorf("execution account already controlled by trader %s or its unsettled venue instructions", conflict)
+	}
+	var previous string
+	err = tx.QueryRow(`SELECT exchange_id FROM copy_trade_account_claims WHERE trader_id=?`, traderID).Scan(&previous)
+	if err != nil && err != sql.ErrNoRows {
+		return err
+	}
+	if previous != "" && previous != exchangeID {
+		var obligations int
+		if err = tx.QueryRow(`SELECT
+   (SELECT COUNT(*) FROM copy_trade_execution_order_attempts o JOIN copy_trade_execution_intents i ON i.id=o.intent_id WHERE i.trader_id=? AND o.submitted_at IS NOT NULL AND o.terminal_at IS NULL)+
+   (SELECT COUNT(*) FROM copy_trade_execution_intents i WHERE trader_id=? AND (submitted_at IS NOT NULL OR COALESCE(exchange_order_id,'')<>'') AND (terminal_at IS NULL OR UPPER(COALESCE(exchange_state,'')) NOT IN ('FILLED','CANCELED','CANCELLED','REJECTED','EXPIRED','FAILED')) AND NOT EXISTS(SELECT 1 FROM copy_trade_execution_order_attempts a WHERE a.intent_id=i.id))+
+ (SELECT COUNT(*) FROM copy_guard_protective_orders WHERE trader_id=? AND (replacement_pending=1 OR (LOWER(COALESCE(status,'')) NOT IN ('canceled','cancelled','effective','filled','triggered','order_failed','failed','expired') AND (COALESCE(algo_id,'')<>'' OR COALESCE(algo_client_id,'')<>''))))+
+ (SELECT COUNT(*) FROM copy_guard_cycles WHERE trader_id=? AND closed_at IS NULL)+
+ (SELECT COUNT(*) FROM copy_trade_position_custody WHERE trader_id=? AND state='MANAGED')`, traderID, traderID, traderID, traderID, traderID).Scan(&obligations); err != nil {
+			return err
+		}
+		if obligations > 0 {
+			return fmt.Errorf("previous execution account %s still has managed positions or unsettled instructions", previous)
+		}
+	}
+	_, err = tx.Exec(`INSERT INTO copy_trade_account_claims(trader_id,exchange_id,generation,exclusive) VALUES(?,?,?,?) ON CONFLICT(trader_id) DO UPDATE SET exchange_id=excluded.exchange_id,generation=excluded.generation,exclusive=excluded.exclusive,updated_at=CURRENT_TIMESTAMP`, traderID, exchangeID, generation, exclusive)
+	return err
 }
 
 func (s *TraderStore) FailStart(userID, traderID string, generation int64, detail string) error {
@@ -300,6 +362,10 @@ func (s *TraderStore) BeginStop(userID, traderID string) (*TraderLifecycle, erro
 }
 
 func pauseTraderRiskIncreaseTx(tx *sql.Tx, traderID string) error {
+	if _, err := finishStoppedSourceTransitionsTx(tx, traderID, "", false); err != nil {
+		return err
+	}
+
 	if _, err := tx.Exec(`UPDATE copy_guard_reentry_candidates
 		SET status=?,pending_trigger='TRADER_STOPPED',last_error='paused by trader stop',
 		    next_review_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP

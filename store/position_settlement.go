@@ -14,9 +14,12 @@ import (
 // Fills remain immutable. This ledger only supplies cumulative settlement
 // costs once, shared by every local lot allocated from those fills.
 type PositionSettlement struct {
-	FirstEntryOrderID                                               string
-	ExchangeID, PositionID, Symbol, Side, MarginMode                string
-	OpenedAt, ClosedAt                                              time.Time
+	FirstEntryOrderID                                string
+	ExchangeID, PositionID, Symbol, Side, MarginMode string
+	OpenedAt, ClosedAt                               time.Time
+	// OpenedAt remains the venue cTime used by the durable identity. These
+	// fields preserve separate record and execution clocks without changing it.
+	ExchangeClosedAt, FirstFillAt                                   time.Time
 	Quantity, GrossPnL, Fee, FundingFee, LiquidationPenalty, NetPnL float64
 	CloseType                                                       string
 	TradeIDs, EntryOrderIDs                                         []string
@@ -33,6 +36,9 @@ func (s *PositionStore) initSettlementTables() error {
  settlement_id INTEGER NOT NULL,evidence TEXT NOT NULL,created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
  UNIQUE(settlement_id,evidence));`)
 	if err != nil {
+		return err
+	}
+	if err = s.initSettlementDiagnosticTable(); err != nil {
 		return err
 	}
 	for _, c := range []struct{ name, def string }{
@@ -62,7 +68,14 @@ func (s *PositionStore) ApplyPositionSettlement(v PositionSettlement) error {
 	if !closeEnough(v.NetPnL, v.GrossPnL-v.Fee+v.FundingFee-v.LiquidationPenalty) {
 		return fmt.Errorf("settlement net amount does not reconcile")
 	}
-	identity := fmt.Sprintf("%s|%s|%s|%s|%d", v.PositionID, v.Symbol, v.Side, v.MarginMode, v.OpenedAt.UnixMilli())
+	firstFillAt := v.FirstFillAt
+	if firstFillAt.IsZero() {
+		firstFillAt = v.OpenedAt // Compatible with previously stored evidence.
+	}
+	if firstFillAt.Sub(v.OpenedAt).Abs() > time.Second || firstFillAt.After(v.ClosedAt) || (!v.ExchangeClosedAt.IsZero() && v.ExchangeClosedAt.Sub(v.ClosedAt).Abs() > time.Second) {
+		return fmt.Errorf("settlement execution clocks outside bounded venue lifecycle")
+	}
+	identity := settlementLifecycleIdentity(v.PositionID, v.Symbol, v.Side, v.MarginMode, v.OpenedAt)
 	raw, err := json.Marshal(v)
 	if err != nil {
 		return err
@@ -91,7 +104,7 @@ func (s *PositionStore) ApplyPositionSettlement(v PositionSettlement) error {
 			return err
 		}
 		ts, e := parseDBTime(f.time)
-		if e != nil || ts.Before(v.OpenedAt) || ts.After(v.ClosedAt) || symbol != v.Symbol || !strings.EqualFold(side, v.Side) || quality != "VERIFIED" {
+		if e != nil || ts.Before(firstFillAt) || ts.After(v.ClosedAt) || symbol != v.Symbol || !strings.EqualFold(side, v.Side) || quality != "VERIFIED" {
 			return fmt.Errorf("fill outside verified settlement lifecycle")
 		}
 		qty += f.qty

@@ -43,16 +43,39 @@ func (at *AutoTrader) GetTradesForPosition(symbol, mode string, start time.Time)
 	return nil, fmt.Errorf("exchange cannot prove scoped fill history")
 }
 
+func (at *AutoTrader) GetTradesForPositionWindow(symbol, mode string, start, end time.Time) ([]TradeRecord, error) {
+	if p, ok := at.trader.(ScopedTradeHistoryWindowProvider); ok {
+		return p.GetTradesForPositionWindow(symbol, mode, start, end)
+	}
+	// Preserve other venues' existing evidence adapter. Only OKX performs the
+	// per-order margin lookups that must be bounded before scope verification.
+	fills, err := at.GetTradesForPosition(symbol, mode, start)
+	if err != nil {
+		return nil, err
+	}
+	return fillsWithinWindow(fills, start, end), nil
+}
+
 func (t *OKXTrader) GetTradesForPosition(symbol, mode string, start time.Time) ([]TradeRecord, error) {
+	return t.GetTradesForPositionWindow(symbol, mode, start, time.Now())
+}
+
+func (t *OKXTrader) GetTradesForPositionWindow(symbol, mode string, start, end time.Time) ([]TradeRecord, error) {
 	if start.Before(time.Now().Add(-90 * 24 * time.Hour)) {
 		return nil, fmt.Errorf("position continuity exceeds available OKX history; prior durable observations required")
 	}
-	fills, err := t.GetTradesForSymbol(symbol, start, 100)
+	if start.IsZero() || end.IsZero() || end.Before(start) {
+		return nil, fmt.Errorf("invalid scoped fill history window")
+	}
+	fills, err := t.getTradesForSymbolWindow(symbol, start, end, 100)
 	if err != nil {
 		return nil, err
 	}
 	var result []TradeRecord
-	for _, f := range fills {
+	for _, f := range fillsWithinWindow(fills, start, end) {
+		if f.OrderID == "" {
+			return nil, fmt.Errorf("fill order identity unavailable")
+		}
 		key := symbol + "|" + f.OrderID
 		cached, ok := t.fillOrderModes.Load(key)
 		if !ok {

@@ -16,7 +16,20 @@ func (e *Engine) sourceLifecycleChanged(posID string, pos *Position) bool {
 		return false
 	}
 	previous, err := e.store.CopyTrade().SourceLifecycleOpenedMS(e.traderID, posID)
+	if confirmed, proofErr := e.store.CopyTrade().ConfirmedSourceLifecycleOpenedMS(e.traderID, posID); proofErr == nil && confirmed > 0 {
+		previous = confirmed
+	}
 	return err == nil && previous > 0 && pos.OpenedMS > previous
+}
+
+// A delayed image of an older incarnation cannot reduce, reopen, or replace
+// the newer acknowledged source. This blocks only that direction's decisions.
+func (e *Engine) sourceLifecycleStale(posID string, pos *Position) bool {
+	if pos == nil || pos.OpenedMS <= 0 || e.store == nil {
+		return false
+	}
+	confirmed, err := e.store.CopyTrade().ConfirmedSourceLifecycleOpenedMS(e.traderID, posID)
+	return err == nil && confirmed > 0 && pos.OpenedMS < confirmed
 }
 
 func (e *Engine) baselineRepairedSources(state *AccountState) error {
@@ -29,6 +42,9 @@ func (e *Engine) baselineRepairedSources(state *AccountState) error {
 	current := make(map[string]*store.CopyTradePositionMapping)
 	opened := make(map[string]int64)
 	for key, pos := range state.Positions {
+		if pos == nil || pos.Size <= 0 {
+			continue
+		}
 		id := pos.PosID
 		if id == "" {
 			id = key
@@ -39,17 +55,28 @@ func (e *Engine) baselineRepairedSources(state *AccountState) error {
 	if err := e.store.CopyTrade().BaselineRepairedSource(e.traderID, current, opened, e.config.FollowExitPolicyVersion >= 2); err != nil {
 		return err
 	}
-	for id, ms := range opened {
-		old, err := e.store.CopyTrade().SourceLifecycleOpenedMS(e.traderID, id)
-		if err != nil {
-			return err
+	var restartBaseline []store.CopyTradeBaselinePosition
+	for id, p := range state.Positions {
+		if p == nil || p.Size <= 0 {
+			continue
 		}
-		if old == 0 {
-			if err = e.store.CopyTrade().BindSourceLifecycle(e.traderID, id, ms); err != nil {
-				return err
-			}
+		posID := p.PosID
+		if posID == "" {
+			posID = id
 		}
+		// A replacement cycle must first settle the old source identity. It
+		// is not an increase of the old paused/restarted source quantity.
+		if e.sourceLifecycleChanged(posID, p) {
+			continue
+		}
+		restartBaseline = append(restartBaseline, store.CopyTradeBaselinePosition{LeaderPosID: posID, Symbol: p.Symbol, Side: string(p.Side), MarginMode: p.MarginMode, Size: p.Size})
 	}
+	if _, err := e.store.CopyTrade().ApplyStoppedSourceRecoveryBaseline(e.traderID, e.config.LeaderID, restartBaseline); err != nil {
+		return err
+	}
+	// A current candidate cTime is not proof of a historical mapping's
+	// incarnation. Only a newly reserved open binds that identity; historical
+	// repairs establish their explicit no-chase baseline transactionally.
 	return nil
 }
 

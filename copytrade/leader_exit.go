@@ -137,6 +137,12 @@ func (ti *TraderIntegration) runLeaderExitOrders(dec *decision.Decision, plan *s
 		return fmt.Errorf("scoped leader exits unsupported")
 	}
 	cs := ti.store.CopyTrade()
+	fullDrain := plan.Ratio == 1
+	if batch, batchErr := cs.GetFollowGroupExitBatch(plan.IntentID); batchErr == nil {
+		fullDrain = batch.FullGroupExit
+	} else if !errors.Is(batchErr, sql.ErrNoRows) {
+		return batchErr
+	}
 	attempts, err := cs.ListExecutionOrderAttempts(plan.IntentID)
 	if err != nil {
 		return err
@@ -158,7 +164,7 @@ func (ti *TraderIntegration) runLeaderExitOrders(dec *decision.Decision, plan *s
 	}
 	// A full exit also drains newly visible scopes from in-flight entries. A
 	// partial exit never expands its frozen target set after preparation.
-	if plan.Ratio == 1 {
+	if fullDrain {
 		known := make(map[string]bool)
 		for _, t := range plan.Targets {
 			known[t.Key] = true
@@ -199,7 +205,7 @@ func (ti *TraderIntegration) runLeaderExitOrders(dec *decision.Decision, plan *s
 			}
 		}
 		quantity := math.Min(live.Quantity, math.Max(0, target.Quantity-filled))
-		if plan.Ratio == 1 {
+		if fullDrain {
 			quantity = live.Quantity
 		}
 		if quantity <= 1e-12 {
@@ -268,7 +274,7 @@ func (ti *TraderIntegration) runLeaderExitOrders(dec *decision.Decision, plan *s
 	if err != nil {
 		return err
 	}
-	if plan.Ratio == 1 {
+	if fullDrain {
 		pending, err := cs.HasUnsettledScopeEntries(ti.traderID, plan.Symbol, plan.Side)
 		if err != nil {
 			return err
@@ -277,7 +283,7 @@ func (ti *TraderIntegration) runLeaderExitOrders(dec *decision.Decision, plan *s
 			return fmt.Errorf("leader exit waiting for in-flight entry reconciliation")
 		}
 	}
-	if plan.Ratio == 1 && len(positions) > 0 {
+	if fullDrain && len(positions) > 0 {
 		return fmt.Errorf("leader full exit residual remains")
 	}
 	attempts, err = cs.ListExecutionOrderAttempts(plan.IntentID)
@@ -298,7 +304,7 @@ func (ti *TraderIntegration) runLeaderExitOrders(dec *decision.Decision, plan *s
 				filled += a.FilledQuantity
 			}
 		}
-		if plan.Ratio < 1 && filled+math.Max(1e-12, target.Quantity*1e-8) < target.Quantity {
+		if !fullDrain && filled+math.Max(1e-12, target.Quantity*1e-8) < target.Quantity {
 			return fmt.Errorf("partial leader exit residual remains")
 		}
 	}
@@ -376,6 +382,48 @@ func (ti *TraderIntegration) finishLeaderExit(dec *decision.Decision, plan *stor
 	if plan.Cancelled {
 		return nil
 	}
+	// Exchange/source completion is final. A failed protective cleanup cannot
+	// turn it back into a business order waiting to execute.
+	ti.transitionExecutionIntent(dec, store.ExecutionIntentFilled, "LEADER_EXIT_CONFIRMED", "")
+	// Protective callbacks carry no business intent authority.
+	protectionDec := *dec
+	protectionDec.ExecutionIntentID = 0
+	if err := ti.finishLeaderExitProtection(&protectionDec, plan); err != nil {
+		_, _ = ti.store.CopyTrade().RecordRuntimeIssue(store.CopyRuntimeIssue{TraderID: ti.traderID, Area: "protection", ResourceID: fmt.Sprintf("leader_exit:%d", plan.IntentID), LeaderPosID: dec.LeaderPosID, Symbol: dec.Symbol, Code: "EXIT_PROTECTION_PENDING", Detail: err.Error()})
+	} else {
+		_ = ti.store.CopyTrade().ResolveRuntimeIssue(ti.traderID, "protection", fmt.Sprintf("leader_exit:%d", plan.IntentID))
+	}
+	return nil
+}
+
+func (ti *TraderIntegration) finishLeaderExitProtection(dec *decision.Decision, plan *store.LeaderExitPlan) error {
+	if plan.Cancelled {
+		return nil
+	}
+	if batch, err := ti.store.CopyTrade().GetFollowGroupExitBatch(plan.IntentID); err == nil {
+		if !batch.FullGroupExit {
+			return ti.queueFollowGroupProtections(batch.GroupID)
+		}
+		cycles, err := ti.store.CopyTrade().FollowGroupGuardCycles(batch.GroupID)
+		if err != nil {
+			return err
+		}
+		for _, c := range cycles {
+			if c.ClosedAt != nil {
+				continue
+			}
+			copyDec := *dec
+			copyDec.LeaderPosID = c.LeaderPosID
+			copyDec.MarginMode = c.MarginMode
+			copyDec.Symbol = c.Symbol
+			if _, err = ti.finalizeCopyGuardCycleState(&copyDec, false); err != nil {
+				return err
+			}
+		}
+		return nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
 	if plan.SourceClosed && plan.CycleID > 0 {
 		c, err := ti.store.CopyTrade().GetCopyGuardCycle(plan.CycleID)
 		if err != nil {
@@ -392,7 +440,6 @@ func (ti *TraderIntegration) finishLeaderExit(dec *decision.Decision, plan *stor
 	} else if !plan.SourceClosed {
 		ti.queueProtectionRefresh(dec)
 	}
-	ti.transitionExecutionIntent(dec, store.ExecutionIntentFilled, "LEADER_EXIT_CONFIRMED", "")
 	return nil
 }
 

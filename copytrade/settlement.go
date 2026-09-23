@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"nofx/store"
 	"nofx/trader"
-	"time"
 )
 
 // Reuse the ordinary position ledger's exact flat-to-flat evidence check.
@@ -25,7 +24,7 @@ func (ti *TraderIntegration) verifyCopyGuardSettlement(cycle *store.CopyGuardCyc
 	if !ok {
 		return fmt.Errorf("settlement scoped fills unavailable")
 	}
-	fills, err := history.GetTradesForPosition(record.Symbol, record.MarginMode, record.EntryTime.Add(-time.Second))
+	fills, err := trader.ReadPositionSettlementTrades(history, *record)
 	if err != nil {
 		return err
 	}

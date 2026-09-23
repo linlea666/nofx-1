@@ -477,6 +477,12 @@ func (s *CopyTradeStore) CommitLeaderExecutionFill(c LeaderExecutionCommit) erro
 	var initialCycleID int64
 	initialCycleCreated := false
 	if initialOpen && c.InitialCopyGuard != nil {
+		initialCycleID, err = followGroupProtectionCycleIDTx(tx, c.TraderID, c.LeaderPosID, c.MarginMode)
+		if err != nil {
+			return err
+		}
+	}
+	if initialOpen && c.InitialCopyGuard != nil && initialCycleID == 0 {
 		lifecycle := *c.InitialCopyGuard
 		lifecycle.EntryClientID = c.ClientOrderID
 		lifecycle.IntentID = c.IntentID
@@ -497,6 +503,11 @@ func (s *CopyTradeStore) CommitLeaderExecutionFill(c LeaderExecutionCommit) erro
 		initialCycleID, initialCycleCreated, err = ensureInitialCopyGuardLifecycleTx(tx, lifecycle, true)
 		if err != nil {
 			return fmt.Errorf("commit initial Copy Guard lifecycle: %w", err)
+		}
+	}
+	if initialCycleID > 0 {
+		if err = bindFollowGroupGuardTx(tx, initialCycleID); err != nil {
+			return err
 		}
 	}
 	boundCycleID := initialCycleID
@@ -1069,6 +1080,7 @@ type ExecutionReconciliationReport struct {
 	ActiveMappingsWithoutCycle int `json:"active_mappings_without_cycle"`
 	UnprotectedOpenCycles      int `json:"unprotected_open_cycles"`
 	PendingIntentRisk          int `json:"pending_intent_risk"`
+	SourceResolutionIssues     int `json:"source_resolution_issues"`
 }
 
 // GetExecutionReconciliationReport is intentionally read-only. Startup uses it
@@ -1082,8 +1094,8 @@ func (s *CopyTradeStore) GetExecutionReconciliationReport(traderID string) (*Exe
 	}{
 		{&report.UnfinishedIntents, `SELECT COUNT(*) FROM copy_trade_execution_intents WHERE trader_id=? AND status IN ('RESERVED','SUBMITTED','RECONCILING','PARTIALLY_FILLED')`},
 		{&report.ManualReviewIntents, `SELECT COUNT(*) FROM copy_trade_execution_intents WHERE trader_id=? AND status='FAILED' AND reason_code='MANUAL_REVIEW_REQUIRED'`},
-		{&report.OpenCyclesWithoutMapping, `SELECT COUNT(*) FROM copy_guard_cycles c WHERE c.trader_id=? AND c.closed_at IS NULL AND NOT EXISTS (SELECT 1 FROM copy_trade_position_mappings m WHERE m.trader_id=c.trader_id AND m.leader_pos_id=c.leader_pos_id AND m.status IN ('active','stopped_by_risk','detached'))`},
-		{&report.ActiveMappingsWithoutCycle, `SELECT COUNT(*) FROM copy_trade_position_mappings m WHERE m.trader_id=? AND m.status='active' AND NOT EXISTS (SELECT 1 FROM copy_guard_cycles c WHERE c.trader_id=m.trader_id AND c.leader_pos_id=m.leader_pos_id AND c.closed_at IS NULL)`},
+		{&report.OpenCyclesWithoutMapping, `SELECT COUNT(*) FROM copy_guard_cycles c WHERE c.trader_id=? AND c.closed_at IS NULL AND NOT EXISTS (SELECT 1 FROM copy_trade_position_mappings m WHERE m.trader_id=c.trader_id AND m.leader_pos_id=c.leader_pos_id AND m.status IN ('active','stopped_by_risk','detached','manual_stopped')) AND NOT EXISTS(SELECT 1 FROM copy_trade_follow_group_guards gg JOIN copy_trade_follow_groups g ON g.id=gg.group_id JOIN copy_trade_follow_group_members gm ON gm.group_id=g.id JOIN copy_trade_position_mappings mm ON mm.trader_id=g.trader_id AND mm.leader_pos_id=gm.leader_pos_id WHERE gg.cycle_id=c.id AND g.source_ended=0 AND mm.status IN ('active','stopped_by_risk','detached','manual_stopped'))`},
+		{&report.ActiveMappingsWithoutCycle, `SELECT COUNT(*) FROM copy_trade_position_mappings m WHERE m.trader_id=? AND m.status='active' AND EXISTS (SELECT 1 FROM copy_trade_configs cfg WHERE cfg.trader_id=m.trader_id AND (cfg.risk_stop_loss_enabled=1 OR cfg.risk_liquidation_guard_enabled=1)) AND NOT EXISTS (SELECT 1 FROM copy_guard_cycles c WHERE c.trader_id=m.trader_id AND c.leader_pos_id=m.leader_pos_id AND c.closed_at IS NULL) AND NOT EXISTS(SELECT 1 FROM copy_trade_follow_group_members gm JOIN copy_trade_follow_groups g ON g.id=gm.group_id JOIN copy_trade_follow_group_guards gg ON gg.group_id=g.id JOIN copy_guard_cycles gc ON gc.id=gg.cycle_id WHERE g.trader_id=m.trader_id AND gm.leader_pos_id=m.leader_pos_id AND g.source_ended=0 AND gc.closed_at IS NULL)`},
 		{&report.UnprotectedOpenCycles, `SELECT COUNT(*) FROM copy_guard_cycles WHERE trader_id=? AND closed_at IS NULL AND status IN ('FOLLOWING','FOLLOWING_REENTRY') AND (protection_status NOT IN ('VERIFIED','CLAMPED') OR protection_coverage<0.999)`},
 		{&report.PendingIntentRisk, `SELECT COUNT(*) FROM copy_guard_risk_reservations WHERE trader_id=? AND intent_id>0 AND status='ACTIVE'`},
 	}
@@ -1097,12 +1109,25 @@ func (s *CopyTradeStore) GetExecutionReconciliationReport(traderID string) (*Exe
 		return report, err
 	}
 	for _, gap := range gaps {
+		var managed bool
+		checkErr := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM copy_trade_follow_group_guards gg JOIN copy_trade_follow_groups g ON g.id=gg.group_id JOIN copy_trade_follow_group_members gm ON gm.group_id=g.id JOIN copy_trade_position_mappings m ON m.trader_id=g.trader_id AND m.leader_pos_id=gm.leader_pos_id WHERE gg.cycle_id=? AND g.source_ended=0 AND m.status IN ('active','stopped_by_risk','detached','manual_stopped'))`, gap.CycleID).Scan(&managed)
+		if checkErr != nil {
+			return report, checkErr
+		}
+		if managed {
+			continue
+		}
 		if gap.Recoverable {
 			report.RecoverableOwnershipGaps++
 		} else {
 			report.AmbiguousOwnershipGaps++
 		}
 	}
+	issues, err := s.ListLeaderTransitionIssues(traderID)
+	if err != nil {
+		return report, err
+	}
+	report.SourceResolutionIssues = len(issues)
 	return report, nil
 }
 
@@ -1538,12 +1563,10 @@ func (s *CopyTradeStore) ReserveExecutionIntent(intent *CopyTradeExecutionIntent
 	affected, _ := res.RowsAffected()
 	claimed := affected == 1
 	if !claimed {
-		// A crash can leave a pre-submit source transition reserved while the
-		// leader changes direction/target before the first healthy snapshot
-		// after restart. With no submitted attempt there is no exchange side effect,
-		// so the same canonical revision may be safely rebound to the current
-		// authoritative transition instead of being blocked forever by its old
-		// action identity.
+		// A local reservation can refresh execution parameters after restart,
+		// but a leader action/target is immutable. A changed authoritative
+		// transition must first be superseded through the source finisher and
+		// receive a successor revision. Other intent kinds retain their own contract.
 		res, err = tx.Exec(`
 			UPDATE copy_trade_execution_intents SET
 				source_fill_id=?,action=?,cycle_id=?,candidate_id=?,analysis_id=?,attempt_no=?,decision_generation=?,
@@ -1553,14 +1576,16 @@ func (s *CopyTradeStore) ReserveExecutionIntent(intent *CopyTradeExecutionIntent
 				status='RESERVED',reason_code='',last_error='',failure_counted=0,
 				reconciliation_attempts=0,first_reconciling_at=NULL,terminal_at=NULL,updated_at=CURRENT_TIMESTAMP
 			WHERE canonical_key=? AND canonical_key<>''
+ AND (source_kind<>'LEADER_TRANSITION' OR (action=? AND leader_target_size=?))
 			  AND status='RECONCILING' AND reason_code IN ('SOURCE_REVALIDATION_REQUIRED','SOURCE_DATA_UNAVAILABLE','SOURCE_VALUE_UNAVAILABLE','MIGRATION_RECONCILING')
 			  AND submitted_at IS NULL AND COALESCE(exchange_order_id,'')=''
+			  AND NOT EXISTS(SELECT 1 FROM copy_trade_source_resolutions r WHERE r.intent_id=copy_trade_execution_intents.id)
 			  AND `+noUnsafeExecutionAttemptSQL+`
 		`, intent.SourceFillID, intent.Action, intent.CycleID, intent.CandidateID, intent.AnalysisID,
 			intent.AttemptNo, intent.DecisionGeneration, intent.Symbol, intent.Side, intent.MarginMode,
 			intent.LeaderTargetSize, intent.RequestedNotional, intent.TargetQuantity, intent.RequestedQuantity,
 			intent.QuantizedQuantity, intent.FollowerEquityAtTarget, intent.TargetAccountPct,
-			intent.ClientOrderID, intent.CanonicalKey)
+			intent.ClientOrderID, intent.CanonicalKey, intent.Action, intent.LeaderTargetSize)
 		if err != nil {
 			return nil, false, err
 		}
@@ -1578,7 +1603,9 @@ func (s *CopyTradeStore) ReserveExecutionIntent(intent *CopyTradeExecutionIntent
 				reconciliation_attempts=0,first_reconciling_at=NULL,
 				submitted_at=NULL,filled_at=NULL,protected_at=NULL,terminal_at=NULL,updated_at=CURRENT_TIMESTAMP
 			WHERE trader_id=? AND leader_pos_id=? AND source_revision=? AND action=?
+ AND (source_kind<>'LEADER_TRANSITION' OR leader_target_size=?)
 			  AND COALESCE(exchange_order_id,'')=''
+			  AND NOT EXISTS(SELECT 1 FROM copy_trade_source_resolutions r WHERE r.intent_id=copy_trade_execution_intents.id)
 			  AND `+noUnsafeExecutionAttemptSQL+`
 			  AND (
 			    (submitted_at IS NULL AND (
@@ -1601,7 +1628,7 @@ func (s *CopyTradeStore) ReserveExecutionIntent(intent *CopyTradeExecutionIntent
 			intent.Symbol, intent.Side, intent.MarginMode, intent.LeaderTargetSize,
 			intent.RequestedNotional, intent.TargetQuantity, intent.RequestedQuantity, intent.QuantizedQuantity,
 			intent.FollowerEquityAtTarget, intent.TargetAccountPct, intent.ClientOrderID,
-			intent.TraderID, intent.LeaderPosID, intent.SourceRevision, intent.Action, intent.SourceFillID, intent.SourceFillID)
+			intent.TraderID, intent.LeaderPosID, intent.SourceRevision, intent.Action, intent.LeaderTargetSize, intent.SourceFillID, intent.SourceFillID)
 		if err != nil {
 			return nil, false, err
 		}
@@ -2064,7 +2091,12 @@ func (s *CopyTradeStore) UpdateExecutionIntent(id int64, status, reasonCode, las
 	if id <= 0 || status == "" {
 		return fmt.Errorf("invalid execution intent transition")
 	}
-	res, err := s.db.Exec(`UPDATE copy_trade_execution_intents SET status=?,
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`UPDATE copy_trade_execution_intents SET status=?,
 		reason_code=CASE WHEN ?<>'' THEN ? ELSE reason_code END,last_error=?,
 		last_catchup_reason=CASE WHEN ? LIKE 'CATCHUP_%' THEN ? ELSE last_catchup_reason END,
 		exchange_order_id=CASE WHEN ?<>'' THEN ? ELSE exchange_order_id END,
@@ -2087,15 +2119,17 @@ func (s *CopyTradeStore) UpdateExecutionIntent(id int64, status, reasonCode, las
 		return err
 	}
 	if updated == 1 {
-		_, _ = s.db.Exec(`UPDATE copy_trade_source_transitions SET status=?,updated_at=CURRENT_TIMESTAMP WHERE intent_id=?`, status, id)
-		return nil
+		if _, err = tx.Exec(`UPDATE copy_trade_source_transitions SET status=?,updated_at=CURRENT_TIMESTAMP WHERE intent_id=? AND status<>'SOURCE_REPLAY_PENDING'`, status, id); err != nil {
+			return err
+		}
+		return tx.Commit()
 	}
 	var current string
-	if err := s.db.QueryRow(`SELECT status FROM copy_trade_execution_intents WHERE id=?`, id).Scan(&current); err != nil {
+	if err := tx.QueryRow(`SELECT status FROM copy_trade_execution_intents WHERE id=?`, id).Scan(&current); err != nil {
 		return err
 	}
 	if current == status {
-		return nil
+		return tx.Commit()
 	}
 	return fmt.Errorf("invalid execution intent transition %s -> %s for intent %d", current, status, id)
 }
@@ -2193,38 +2227,30 @@ func (s *CopyTradeStore) RecordExecutionReconciliationFailure(id int64, reasonCo
 	return status == ExecutionIntentFailed, nil
 }
 
-// SupersedeUnsubmittedExecutionIntent closes a pre-submit restart reservation
-// after a healthy source snapshot proves that the leader position no longer
-// exists. No mapping revision is advanced because no follower relationship was
-// ever created; a later new source fill may safely reclaim this zero-side-effect
-// intent identity.
+// SupersedeUnsubmittedExecutionIntent consumes an obsolete local reservation
+// without consuming a later reduction. Its original action/identity is retained
+// and the mapping revision advances so a subsequent close gets a fresh identity.
 func (s *CopyTradeStore) SupersedeUnsubmittedExecutionIntent(id int64, traderID, leaderPosID string) error {
-	if id <= 0 || strings.TrimSpace(traderID) == "" || strings.TrimSpace(leaderPosID) == "" {
-		return fmt.Errorf("invalid superseded execution intent")
-	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	res, err := tx.Exec(`UPDATE copy_trade_execution_intents SET
-		status='SKIPPED',reason_code='SOURCE_SUPERSEDED',
-		last_error='healthy source snapshot no longer contains the reserved position',
-		terminal_at=COALESCE(terminal_at,CURRENT_TIMESTAMP),updated_at=CURRENT_TIMESTAMP
-		WHERE id=? AND trader_id=? AND leader_pos_id=?
-		  AND status='RECONCILING'
-		  AND reason_code IN ('SOURCE_REVALIDATION_REQUIRED','SOURCE_DATA_UNAVAILABLE','SOURCE_VALUE_UNAVAILABLE','MIGRATION_RECONCILING')
-		  AND submitted_at IS NULL AND COALESCE(exchange_order_id,'')=''
-		  AND NOT EXISTS (SELECT 1 FROM copy_trade_execution_order_attempts a WHERE a.intent_id=copy_trade_execution_intents.id)`,
-		id, traderID, leaderPosID)
+	f, err := inspectLeaderTransitionTx(tx, id)
 	if err != nil {
 		return err
 	}
-	if n, _ := res.RowsAffected(); n != 1 {
-		return fmt.Errorf("execution intent %d is not safely supersedable", id)
+	if f.TraderID != traderID || f.LeaderPosID != leaderPosID {
+		return fmt.Errorf("invalid superseded execution identity")
 	}
-	if _, err = tx.Exec(`UPDATE copy_trade_source_transitions
-		SET status='SOURCE_SUPERSEDED',updated_at=CURRENT_TIMESTAMP WHERE intent_id=?`, id); err != nil {
+	var leaderID string
+	if !f.MappingExists {
+		err = tx.QueryRow(`SELECT leader_id FROM copy_trade_configs WHERE trader_id=?`, traderID).Scan(&leaderID)
+		if err != nil {
+			return err
+		}
+	}
+	if err = finishLeaderSourceTransitionTx(tx, f, FinishLeaderSourceTransitionRequest{IntentID: id, TraderID: traderID, LeaderID: leaderID, Disposition: SourceSupersedeNoFill, Reason: "SOURCE_SUPERSEDED", Evidence: "fresh complete source snapshot no longer contains reserved source; no order sent"}); err != nil {
 		return err
 	}
 	return tx.Commit()

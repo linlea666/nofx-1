@@ -34,6 +34,7 @@ import type {
   BinanceCredentialsTestResponse,
   BinanceCredentialsAffectedResponse,
   CopyGuardAccountRiskPolicyResponse,
+  CopyRuntimeHealthResponse,
 } from '../types'
 import { CryptoService } from './crypto'
 import { httpClient } from './httpClient'
@@ -1013,6 +1014,37 @@ export const api = {
     if (!result.success)
       throw new Error(result.message || '获取受影响交易员失败')
     return result.data?.trader_ids ?? []
+  },
+
+  async getCopyRuntimeHealth(
+    traderID?: string
+  ): Promise<CopyRuntimeHealthResponse> {
+    const query = traderID
+      ? `?${new URLSearchParams({ trader_id: traderID })}`
+      : ''
+    const result = await httpClient.get<CopyRuntimeHealthResponse>(
+      `${API_BASE}/copytrade/runtime-health${query}`
+    )
+    if (!result.success) {
+      throw new Error(result.message || '读取跟单运行状态失败')
+    }
+    if (
+      !result.data ||
+      !Array.isArray(result.data.traders) ||
+      result.data.traders.some(
+        (trader) =>
+          !trader ||
+          typeof trader.trader_id !== 'string' ||
+          typeof trader.running !== 'boolean' ||
+          (trader.source !== null && typeof trader.source !== 'object') ||
+          !Array.isArray(trader.execution_issues) ||
+          !Array.isArray(trader.runtime_issues) ||
+          !Array.isArray(trader.settlement_issues)
+      )
+    ) {
+      throw new Error('跟单运行状态响应不完整')
+    }
+    return result.data
   },
 
   async getCopyGuardSummary(params = '') {

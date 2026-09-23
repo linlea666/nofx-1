@@ -51,6 +51,65 @@ func InspectFollowingPosition(st *store.Store, m *store.CopyTradePositionMapping
 	if c, err := st.CopyTrade().GetOpenCopyGuardCycle(m.TraderID, m.LeaderPosID); err == nil {
 		view.ProtectionStatus = c.ProtectionStatus
 	}
+	if g, groupErr := st.CopyTrade().GetFollowGroupForPosition(m.TraderID, m.LeaderPosID); groupErr == nil {
+		if view.ProtectionStatus == "" {
+			if c, err := st.CopyTrade().GetFollowGroupProtectionCycle(m.TraderID, m.LeaderPosID, m.MarginMode); err == nil {
+				view.ProtectionStatus = c.ProtectionStatus
+			}
+		}
+		if g.ConflictReason != "" {
+			view.FollowState = "reconciliation_required"
+			view.FollowReason = "同方向源成员的历史参与状态冲突，待核实"
+			view.LeaderExitEnabled = false
+			view.ResumeReason = view.FollowReason
+			return view
+		}
+		if g.EntryBlockReason != "" {
+			view.FollowReason = "源方向组换轮边界待核实；停止开仓加仓，原退出与保护继续"
+			view.ResumeReason = "源周期边界待核实"
+		}
+		if g.Paused {
+			view.LeaderExitEnabled = false
+			if g.SourceEnded {
+				view.ResumeReason = "领航员原方向组已结束，不能恢复；原仓保护继续"
+				return view
+			}
+			if g.EntryBlockReason != "" {
+				return view
+			}
+			ti, ok := runningIntegration(m.TraderID)
+			if !ok || !ti.IsRunning() {
+				view.ResumeReason = "交易员未运行"
+				return view
+			}
+			ids, err := st.CopyTrade().FollowGroupMemberIDs(g.ID)
+			if err != nil {
+				view.ResumeReason = err.Error()
+				return view
+			}
+			for _, id := range ids {
+				custody, err := st.CopyTrade().GetPositionCustody(m.TraderID, id)
+				if err != nil || custody.State != "MANAGED" {
+					continue
+				}
+				member, err := st.CopyTrade().GetMappingForReconciliation(m.TraderID, id)
+				if err != nil || member == nil {
+					continue
+				}
+				key, err := ti.verifyFollowingPosition(member, custody)
+				if err != nil {
+					view.ResumeReason = err.Error()
+					continue
+				}
+				view.CustodyState = "MANAGED"
+				view.CurrentPositionKey = key
+				view.CanResume = true
+				view.ResumeReason = ""
+				return view
+			}
+			return view
+		}
+	}
 	p, err := st.CopyTrade().GetPositionCustody(m.TraderID, m.LeaderPosID)
 	if err != nil {
 		return view
@@ -183,6 +242,11 @@ func ResumeFollowingPosition(traderID, leaderPosID string) error {
 	}
 	if m.Status != store.MappingStatusManualStopped {
 		return fmt.Errorf("只有手动暂停的原仓位可以恢复")
+	}
+	if g, groupErr := ti.store.CopyTrade().GetFollowGroupForPosition(traderID, leaderPosID); groupErr == nil {
+		return ti.resumeFollowGroup(g)
+	} else if !errors.Is(groupErr, sql.ErrNoRows) {
+		return groupErr
 	}
 	p, err := ti.store.CopyTrade().GetPositionCustody(traderID, leaderPosID)
 	if errors.Is(err, sql.ErrNoRows) {

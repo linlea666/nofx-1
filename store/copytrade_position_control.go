@@ -116,6 +116,9 @@ func (s *CopyTradeStore) CheckFollowSubmission(intentID int64) error {
 func checkFollowSubmission(q interface {
 	QueryRow(string, ...interface{}) *sql.Row
 }, intentID int64) error {
+	if err := checkFollowGroupSubmission(q, intentID); err != nil {
+		return err
+	}
 	var allowed bool
 	err := q.QueryRow(`SELECT CASE WHEN i.source_kind='LEADER_TRANSITION' THEN
 	 (i.follow_control_version=COALESCE(f.version,0) AND (

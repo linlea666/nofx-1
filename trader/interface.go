@@ -111,6 +111,7 @@ type TradeRecord struct {
 	RealizedPnL  float64   // Realized PnL (non-zero for closing trades)
 	Fee          float64   // Trading fee/commission
 	Time         time.Time // Trade execution time
+	RecordTime   time.Time // Venue record-generation time; never substitutes for a present execution time.
 }
 
 // SymbolTradeHistoryProvider exposes immutable per-fill history. Position
@@ -122,6 +123,12 @@ type SymbolTradeHistoryProvider interface {
 
 type ScopedTradeHistoryProvider interface {
 	GetTradesForPosition(symbol, marginMode string, start time.Time) ([]TradeRecord, error)
+}
+
+// ScopedTradeHistoryWindowProvider limits historical settlement evidence before
+// looking up order scope. Continuity callers keep the open-ended interface.
+type ScopedTradeHistoryWindowProvider interface {
+	GetTradesForPositionWindow(symbol, marginMode string, start, end time.Time) ([]TradeRecord, error)
 }
 
 type PendingOrderSnapshot struct {
