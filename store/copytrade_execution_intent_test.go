@@ -795,7 +795,7 @@ func TestCommitIgnoredLeaderTransitionAtomicallyCreatesBaseline(t *testing.T) {
 		t.Fatal(err)
 	}
 	mapping, err := cs.GetMapping("t1", "p1")
-	if err != nil || mapping.Status != MappingStatusIgnored || mapping.SourceRevision != 1 || mapping.LastKnownSize != 4 {
+	if err != nil || mapping.Status != MappingStatusIgnored || mapping.SourceRevision != 1 || mapping.LastKnownSize != 4 || mapping.LastFailureReason != "RISK_CAP" {
 		t.Fatalf("ignored mapping mismatch: mapping=%+v err=%v", mapping, err)
 	}
 	stored, _, err := cs.ReserveExecutionIntent(&CopyTradeExecutionIntent{TraderID: "t1", LeaderPosID: "p1", SourceRevision: 1, Action: "open_short"})

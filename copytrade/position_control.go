@@ -71,7 +71,7 @@ func (ti *TraderIntegration) preflightCopyPositionOwnership(dec *decision.Decisi
 	}
 	side := strings.TrimPrefix(dec.Action, "open_")
 	for _, p := range positions {
-		if getStringField(p, "symbol") == dec.Symbol && strings.EqualFold(getStringField(p, "side"), side) && absFloat(getFloatField(p, "positionAmt", "quantity")) > 0 && (dec.MarginMode == "" || getStringField(p, "marginMode", "mgnMode") == dec.MarginMode) {
+		if getStringField(p, "symbol") == dec.Symbol && strings.EqualFold(getStringField(p, "side"), side) && absFloat(getFloatField(p, "positionAmt", "quantity")) > 0 {
 			return reasonError("INDEPENDENT_POSITION_CONFLICT", "该交易所持仓范围已有独立仓位，本轮不接管")
 		}
 	}

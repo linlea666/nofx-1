@@ -91,7 +91,7 @@ func applyUnprotectableCompatibility(config *store.CopyTradeConfig, disposition,
 
 func copyGuardAIActive(config *store.CopyTradeConfig) bool {
 	return config != nil &&
-		config.RiskStopLossEnabled &&
+		config.FollowExitPolicyVersion < 2 && config.RiskStopLossEnabled &&
 		config.RiskReentryEnabled &&
 		config.RiskReentryDecisionMode == "ai_guarded"
 }
@@ -108,7 +108,7 @@ func validateCopyGuardAccountExclusivity(st *store.Store, traderID, exchangeID s
 	if err != nil {
 		return fmt.Errorf("check active Copy Guard lifecycles: %w", err)
 	}
-	if (config.RiskPolicyVersion < 4 || !config.RiskStopLossEnabled) && !hasOpen {
+	if (config.FollowExitPolicyVersion < 2 && (config.RiskPolicyVersion < 4 || !(config.RiskStopLossEnabled || config.RiskLiquidationGuardEnabled))) && !hasOpen {
 		return nil
 	}
 	conflict, err := st.Trader().FindRunningCopyGuardConflict(traderID, exchangeID)
@@ -1363,27 +1363,28 @@ type CopyTradeConfigRequest struct {
 	// risk_stop_noise_floor_atr / risk_cycle_max_loss_pct）已随 v5 下线，
 	// 前端传入将被忽略。
 	// ============================================================
-	RiskStopLossEnabled        *bool    `json:"risk_stop_loss_enabled,omitempty"`
-	RiskProtectionMode         *string  `json:"risk_protection_mode,omitempty"`
-	RiskPositionMarginStopPct  *float64 `json:"risk_position_margin_stop_pct,omitempty"`
-	RiskStopMaxAccountLossPct  *float64 `json:"risk_stop_max_account_loss_pct,omitempty"`
-	RiskAccountPct             *float64 `json:"risk_account_pct,omitempty"`
-	RiskATRMultiplier          *float64 `json:"risk_atr_multiplier,omitempty"`
-	RiskATRTimeframe           *string  `json:"risk_atr_timeframe,omitempty"`
-	RiskLeverageFallback       *bool    `json:"risk_leverage_fallback,omitempty"`
-	RiskLeverageMaxLoss        *float64 `json:"risk_leverage_max_loss,omitempty"`
-	RiskReentryEnabled         *bool    `json:"risk_reentry_enabled,omitempty"`
-	RiskReentryRatio           *float64 `json:"risk_reentry_ratio,omitempty"`
-	RiskReentryDecisionMode    *string  `json:"risk_reentry_decision_mode,omitempty"`
-	RiskReentryMinNotional     *float64 `json:"risk_reentry_min_notional,omitempty"`
-	RiskCycleLossBudgetPct     *float64 `json:"risk_cycle_loss_budget_pct,omitempty"`
-	RiskPortfolioLossBudgetPct *float64 `json:"risk_portfolio_loss_budget_pct,omitempty"`
-	RiskRoundTripFeeBPS        *float64 `json:"risk_round_trip_fee_bps,omitempty"`
-	RiskAIConfidenceThreshold  *float64 `json:"risk_ai_confidence_threshold,omitempty"`
-	RiskAIMinReviewSeconds     *int     `json:"risk_ai_min_review_seconds,omitempty"`
-	RiskAIDailyCallLimit       *int     `json:"risk_ai_daily_call_limit,omitempty"`
-	RiskAILifecycleCallLimit   *int     `json:"risk_ai_lifecycle_call_limit,omitempty"`
-	RiskNotificationLevel      *string  `json:"risk_notification_level,omitempty"`
+	RiskStopLossEnabled         *bool    `json:"risk_stop_loss_enabled,omitempty"`
+	RiskLiquidationGuardEnabled *bool    `json:"risk_liquidation_guard_enabled,omitempty"`
+	RiskProtectionMode          *string  `json:"risk_protection_mode,omitempty"`
+	RiskPositionMarginStopPct   *float64 `json:"risk_position_margin_stop_pct,omitempty"`
+	RiskStopMaxAccountLossPct   *float64 `json:"risk_stop_max_account_loss_pct,omitempty"`
+	RiskAccountPct              *float64 `json:"risk_account_pct,omitempty"`
+	RiskATRMultiplier           *float64 `json:"risk_atr_multiplier,omitempty"`
+	RiskATRTimeframe            *string  `json:"risk_atr_timeframe,omitempty"`
+	RiskLeverageFallback        *bool    `json:"risk_leverage_fallback,omitempty"`
+	RiskLeverageMaxLoss         *float64 `json:"risk_leverage_max_loss,omitempty"`
+	RiskReentryEnabled          *bool    `json:"risk_reentry_enabled,omitempty"`
+	RiskReentryRatio            *float64 `json:"risk_reentry_ratio,omitempty"`
+	RiskReentryDecisionMode     *string  `json:"risk_reentry_decision_mode,omitempty"`
+	RiskReentryMinNotional      *float64 `json:"risk_reentry_min_notional,omitempty"`
+	RiskCycleLossBudgetPct      *float64 `json:"risk_cycle_loss_budget_pct,omitempty"`
+	RiskPortfolioLossBudgetPct  *float64 `json:"risk_portfolio_loss_budget_pct,omitempty"`
+	RiskRoundTripFeeBPS         *float64 `json:"risk_round_trip_fee_bps,omitempty"`
+	RiskAIConfidenceThreshold   *float64 `json:"risk_ai_confidence_threshold,omitempty"`
+	RiskAIMinReviewSeconds      *int     `json:"risk_ai_min_review_seconds,omitempty"`
+	RiskAIDailyCallLimit        *int     `json:"risk_ai_daily_call_limit,omitempty"`
+	RiskAILifecycleCallLimit    *int     `json:"risk_ai_lifecycle_call_limit,omitempty"`
+	RiskNotificationLevel       *string  `json:"risk_notification_level,omitempty"`
 	// 历史人工重入兼容字段；v7 固定 false
 	RiskManualReentryEnabled *bool `json:"risk_manual_reentry_enabled,omitempty"`
 
@@ -1685,6 +1686,13 @@ func (h *CopyTradeHandler) SaveConfig(c *gin.Context) {
 	}
 
 	// 风控字段透传（指针类型，未传则使用旧值或默认值）
+	config.RiskLiquidationGuardEnabled = true
+	if existing != nil {
+		config.RiskLiquidationGuardEnabled = existing.RiskLiquidationGuardEnabled
+	}
+	if req.RiskLiquidationGuardEnabled != nil {
+		config.RiskLiquidationGuardEnabled = *req.RiskLiquidationGuardEnabled
+	}
 	if req.RiskStopLossEnabled != nil {
 		config.RiskStopLossEnabled = *req.RiskStopLossEnabled
 	} else if existing != nil {
@@ -2171,7 +2179,7 @@ func (h *CopyTradeHandler) Start(c *gin.Context) {
 		return
 	}
 	copyGuardExclusive := copytrade.SupportsCopyGuard(copytrade.ProviderType(persistedConfig.ProviderType)) &&
-		((persistedConfig.RiskPolicyVersion >= 4 && persistedConfig.RiskStopLossEnabled) || hasOpenCycles)
+		(persistedConfig.FollowExitPolicyVersion >= 2 || (persistedConfig.RiskPolicyVersion >= 4 && (persistedConfig.RiskStopLossEnabled || persistedConfig.RiskLiquidationGuardEnabled)) || hasOpenCycles)
 	if copyGuardExclusive {
 		err = h.store.Trader().CompleteCopyGuardStart(userID, traderID, lifecycle.Generation, fullConfig.Trader.ExchangeID)
 	} else {
@@ -2347,7 +2355,7 @@ func (h *CopyTradeHandler) GetMappings(c *gin.Context) {
 		return
 	}
 
-	active, err := h.store.CopyTrade().ListActiveMappings(traderID)
+	active, err := h.store.CopyTrade().ListExitFollowingMappings(traderID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -2361,6 +2369,12 @@ func (h *CopyTradeHandler) GetMappings(c *gin.Context) {
 	mappings := make([]*store.CopyTradePositionMapping, 0, len(active)+len(manual))
 	mappings = append(mappings, active...)
 	mappings = append(mappings, manual...)
+	ignored, err := h.store.CopyTrade().ListIgnoredMappings(traderID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	mappings = append(mappings, ignored...)
 	views := make([]copytrade.FollowPositionView, 0, len(mappings))
 	for _, m := range mappings {
 		views = append(views, copytrade.InspectFollowingPosition(h.store, m))
@@ -2410,9 +2424,9 @@ func (h *CopyTradeHandler) StopFollowPosition(c *gin.Context) {
 		})
 		return
 	}
-	if mapping.Status != store.MappingStatusActive {
+	if mapping.Status != store.MappingStatusActive && mapping.Status != store.MappingStatusStoppedByRisk && mapping.Status != store.MappingStatusDetached {
 		c.JSON(http.StatusConflict, gin.H{
-			"error":  "only active mappings can be manually stopped",
+			"error":  "only following source cycles can be manually stopped",
 			"status": mapping.Status,
 		})
 		return

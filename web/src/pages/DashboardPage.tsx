@@ -48,6 +48,9 @@ interface TraderStats {
 }
 
 interface GlobalStats {
+  settlement_pending?: number
+  gross_pnl?: number
+  verified_net_pnl?: number
   total_pnl: number
   total_trades: number
   avg_win_rate: number
@@ -554,7 +557,7 @@ export function DashboardPage() {
 
           <div className="flex items-center gap-3">
             <StatCard
-              label={`${periodLabel}盈亏`}
+              label={`${periodLabel}盈亏${globalStats.settlement_pending ? '（部分费用待核实）' : '（净额）'}`}
               value={getPeriodPnL(globalStats)}
               color={getPeriodPnL(globalStats) >= 0 ? '#00ff9d' : '#ff0055'}
               trend={getPeriodPnL(globalStats) >= 0 ? 'up' : 'down'}

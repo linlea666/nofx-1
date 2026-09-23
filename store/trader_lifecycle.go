@@ -205,9 +205,7 @@ func (s *TraderStore) completeStart(userID, traderID string, generation int64, e
 			WHERE t.exchange_id=? AND t.id<>?
 			  AND t.lifecycle_status='RUNNING' AND t.is_running=1
 			  AND (? OR (
-				(p.trader_id IS NOT NULL AND c.enabled=1
-				 AND COALESCE(c.risk_stop_loss_enabled,1)=1
-				 AND c.provider_type IN ('okx','binance'))
+				(c.enabled=1 AND c.provider_type IN ('okx','binance') AND (COALESCE(c.follow_exit_policy_version,0)>=2 OR (p.trader_id IS NOT NULL AND (COALESCE(c.risk_stop_loss_enabled,1)=1 OR COALESCE(c.risk_liquidation_guard_enabled,1)=1))))
 				OR EXISTS (SELECT 1 FROM copy_guard_cycles active_cycle
 					WHERE active_cycle.trader_id=t.id AND active_cycle.closed_at IS NULL)
 			  ))

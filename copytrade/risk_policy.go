@@ -75,6 +75,15 @@ func copyGuardLifecycleConfig(cycle *store.CopyGuardCycle, fallback *CopyConfig)
 	// current trader master switch is a template for future positions and must
 	// not disable the immutable contract of this already-open cycle.
 	cfg.RiskStopLossEnabled = true
+	// Legacy snapshots keep their trigger semantics and existing strategy
+	// clamp. Only a new explicit field enables the independent mark guard.
+	cfg.RiskLiquidationGuardEnabled = false
+	if p.StrategyStopEnabled != nil {
+		cfg.RiskStopLossEnabled = *p.StrategyStopEnabled
+	}
+	if p.LiquidationGuardEnabled != nil {
+		cfg.RiskLiquidationGuardEnabled = *p.LiquidationGuardEnabled
+	}
 
 	if p.Version > 0 {
 		cfg.RiskPolicyVersion = p.Version
@@ -175,6 +184,13 @@ func copyGuardLifecycleConfig(cycle *store.CopyGuardCycle, fallback *CopyConfig)
 		cfg.RiskManualReentryEnabled = false
 		cfg.RiskReentryDecisionMode = "disabled"
 		cfg.RiskMaxReentries = 0
+	}
+	if cfg.RiskLiquidationGuardEnabled {
+		cfg.RiskTriggerPriceType = "mark"
+	}
+	if cfg.FollowExitPolicyVersion >= 2 {
+		cfg.RiskReentryEnabled, cfg.RiskManualReentryEnabled = false, false
+		cfg.RiskReentryDecisionMode, cfg.RiskMaxReentries = "disabled", 0
 	}
 	return &cfg
 }

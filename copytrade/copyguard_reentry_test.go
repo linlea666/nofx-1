@@ -632,14 +632,33 @@ func TestFixedPositionMarginStoppedReversalClosesWithoutReentryMonitor(t *testin
 		t.Fatal(err)
 	}
 
-	// Fixed mode never enters the AI/reentry monitor. The ordinary lifecycle
-	// sweep must still recognize a same-id side reversal and release the old
-	// stopped mapping for the new short lifecycle.
+	// Fixed mode never enters the reentry monitor. Source exit must still
+	// execute against all current same-side positions before retiring the cycle.
 	e.leaderState.Positions["ETHUSDT_short"] = &Position{
 		Symbol: "ETHUSDT", Side: SideShort, Size: 1, EntryPrice: 1700,
 		MarkPrice: 1695, MarginMode: "cross", PosID: "leader-pos",
 	}
 	e.checkIgnoredPositionsClosed()
+	old, err := st.CopyTrade().GetCopyGuardCycle(cycle.ID)
+	if err != nil || old.ClosedAt != nil {
+		t.Fatal("source sweep bypassed the exit queue")
+	}
+	fills := e.detectBinancePositionSnapshotFills()
+	if len(fills) != 1 || fills[0].Action != ActionClose {
+		t.Fatalf("missing source exit: %+v", fills)
+	}
+	signal := e.buildSignal(&fills[0])
+	match := e.matchSignalWithMapping(signal)
+	dec := e.buildDecisionV2(signal, match, 0)
+	if !e.reserveExecutionIntent(&dec) {
+		t.Fatal("exit not reserved")
+	}
+	ex := &leaderExitExecutor{positionMarginLifecycleExecutor: &positionMarginLifecycleExecutor{}}
+	ti := NewTraderIntegration(e.traderID, ex, st)
+	ti.engine = e
+	if err = ti.executeAccountLeaderExit(&dec, true); err != nil {
+		t.Fatal(err)
+	}
 
 	got, err := st.CopyTrade().GetCopyGuardCycle(cycle.ID)
 	if err != nil {

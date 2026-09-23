@@ -299,3 +299,20 @@ func formatOKXSwapInstrumentID(symbol string) (string, error) {
 	}
 	return "", fmt.Errorf("cannot determine exact OKX settlement asset for %q", symbol)
 }
+
+// CachedOKXATR reads only previously fetched market data. Order acknowledgement
+// commits must not block a queued leader exit on a candle HTTP request.
+func CachedOKXATR(symbol, timeframe string, period int, maxAge time.Duration) (float64, bool) {
+	bar := map[string]string{"15m": "15m", "1h": "1H", "4h": "4H"}[strings.ToLower(timeframe)]
+	if bar == "" || maxAge <= 0 {
+		return 0, false
+	}
+	key := fmt.Sprintf("okx|%s|%s|%d", symbol, bar, period)
+	atrCacheMu.RLock()
+	cached, ok := atrCache[key]
+	atrCacheMu.RUnlock()
+	if !ok || time.Since(cached.ts) > maxAge || cached.value <= 0 {
+		return 0, false
+	}
+	return cached.value, true
+}

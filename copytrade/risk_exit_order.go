@@ -28,6 +28,8 @@ func (ti *TraderIntegration) closeCopyGuardPosition(cycle *store.CopyGuardCycle)
 // The acknowledgement, quantity budget and order identities are shared with
 // exceptional AI entries whose lifecycle transaction has not committed yet.
 func (ti *TraderIntegration) closeCopyGuardPositionWithQuantity(cycle *store.CopyGuardCycle, resolve func() (float64, bool), allowLegacy bool) (string, error) {
+	ti.exitExecutionMu.Lock()
+	defer ti.exitExecutionMu.Unlock()
 	// Reconcile an earlier exit even when immutable fills already proved flat.
 	// Custody release prevents another close; it does not erase its accounting.
 	intents, err := ti.store.CopyTrade().ListExecutionIntentsByCycle(cycle.ID)

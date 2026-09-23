@@ -56,6 +56,7 @@ type Engine struct {
 	// 跟随者账户信息（由外部注入）
 	getFollowerBalance         func() float64
 	getFollowerEquity          func() float64
+	leaderEquityForSizing      func() (float64, error)
 	getFollowerPositions       func() map[string]*Position
 	getFollowerPositionsResult func() (map[string]*Position, error)
 
@@ -819,13 +820,19 @@ func (e *Engine) startStreamingMode(ctx context.Context) error {
 
 // startPollingMode 启动轮询模式（REST 定时轮询）
 func (e *Engine) startPollingMode(ctx context.Context) error {
+	if e.config.ProviderType == ProviderOKX {
+		e.startOKXAccountSampler(ctx)
+		go e.sourceMaintenanceLoop(ctx)
+	}
 	// 初始同步领航员状态
 	if err := e.syncLeaderState(); err != nil {
 		logger.Warnf("⚠️ [%s] 初始状态同步失败: %v", e.traderID, err)
 	}
 
 	// 获取历史成交作为去重基线
-	e.initSeenFills()
+	if e.config.ProviderType != ProviderOKX {
+		e.initSeenFills()
+	}
 
 	// 启动轮询协程
 	go e.pollLoop(ctx)
@@ -1001,7 +1008,7 @@ func (e *Engine) poll() {
 		}
 	} else {
 		// 无新成交时，保持原有的定时同步作为兜底（防止长时间无交易时数据过旧）
-		if (e.config.ProviderType == ProviderOKX && e.config.RiskPolicyVersion >= 4) || time.Since(e.lastStateSync) > e.stateSyncInterval {
+		if e.config.ProviderType == ProviderOKX || time.Since(e.lastStateSync) > e.stateSyncInterval {
 			if err := e.syncLeaderState(); err != nil {
 				logger.Warnf("⚠️ [%s] 定时状态同步失败: %v", e.traderID, err)
 				if e.config.ProviderType == ProviderOKX {
@@ -1104,6 +1111,9 @@ func (e *Engine) buildSignal(fill *Fill) *TradeSignal {
 
 	if e.leaderState != nil {
 		signal.LeaderEquity = e.leaderState.TotalEquity
+		if !e.leaderState.Timestamp.IsZero() {
+			signal.SnapshotMS = e.leaderState.Timestamp.UnixMilli()
+		}
 	}
 
 	return signal
@@ -1155,7 +1165,7 @@ func (e *Engine) detectBinancePositionSnapshotFills() []Fill {
 			continue
 		}
 		if mapping.Status == "ignored" {
-			if SideType(mapping.Side) != pos.Side {
+			if SideType(mapping.Side) != pos.Side || e.sourceLifecycleChanged(posID, pos) {
 				// ignored 代表旧方向从未在跟随账户执行。领航员复用同一
 				// posId 原地反向时，旧生命周期已经确定结束，可以原子地
 				// 关闭 ignored 记录并在本轮生成新方向开仓；无需制造虚假
@@ -1173,19 +1183,19 @@ func (e *Engine) detectBinancePositionSnapshotFills() []Fill {
 			logger.Debugf("📊 [%s] %s 历史仓位仍在持仓中 | posId=%s → 持仓兜底跳过", e.traderID, e.config.ProviderType, posID)
 			continue
 		}
-		if mapping.Status != "active" {
+		if mapping.Status != "active" && mapping.Status != store.MappingStatusStoppedByRisk && mapping.Status != store.MappingStatusDetached {
 			continue
 		}
 
 		lastKnownSize := mapping.LastKnownSize
-		if SideType(mapping.Side) != pos.Side {
+		if SideType(mapping.Side) != pos.Side || e.sourceLifecycleChanged(posID, pos) {
 			// 相同 leader_pos_id 的方向变化不是加减仓，而是旧生命周期
 			// 全平后建立新生命周期。这里只生成旧方向 close，等待交易所
 			// 成交、保护撤销、cycle/mapping 提交完成；下一轮 mapping 已
 			// closed 后才会生成新方向 open，从而保证严格串行。
 			fill := e.buildBinanceSnapshotFill(
 				posID,
-				mapping.Symbol,
+				sourceMappingSymbol(mapping),
 				SideType(mapping.Side),
 				ActionClose,
 				lastKnownSize,
@@ -1198,24 +1208,29 @@ func (e *Engine) detectBinancePositionSnapshotFills() []Fill {
 			// identity. Execution-intent reconciliation can then retain
 			// LEADER_REVERSED across a restart without overloading mutable
 			// failure reason codes or adding a schema field.
-			fill.ID += leaderReversalFillIDSuffix
+			if SideType(mapping.Side) != pos.Side {
+				fill.ID += leaderReversalFillIDSuffix
+			}
 			fills = append(fills, fill)
 			continue
 		}
-		if pos.Size > lastKnownSize+binancePositionSizeEpsilon {
+		if pos.Size > lastKnownSize+binancePositionSizeEpsilon && mapping.Status != store.MappingStatusActive {
+			if err := e.store.CopyTrade().ObserveReleasedSourceIncrease(e.traderID, posID, mapping.SourceRevision, lastKnownSize, pos.Size); err != nil {
+				logger.Warnf("source increase baseline pending %s: %v", posID, err)
+			}
+			continue
+		}
+		if pos.Size > lastKnownSize+binancePositionSizeEpsilon && mapping.Status == store.MappingStatusActive {
 			sizeDelta := pos.Size - lastKnownSize
 			fills = append(fills, e.buildBinanceSnapshotFillForPosition(pos, posID, ActionAdd, sizeDelta, lastKnownSize, pos.Size, mapping.SourceRevision))
 		} else if lastKnownSize > pos.Size+binancePositionSizeEpsilon {
 			sizeDelta := lastKnownSize - pos.Size
 			action := ActionReduce
-			if pos.Size < lastKnownSize*NearZeroThreshold {
-				action = ActionClose
-			}
 			fills = append(fills, e.buildBinanceSnapshotFillForPosition(pos, posID, action, sizeDelta, lastKnownSize, pos.Size, mapping.SourceRevision))
 		}
 	}
 
-	activeMappings, err := e.store.CopyTrade().ListActiveMappings(e.traderID)
+	activeMappings, err := e.store.CopyTrade().ListExitFollowingMappings(e.traderID)
 	if err != nil {
 		logger.Warnf("⚠️ [%s] %s 持仓兜底读取 active 映射失败: %v", e.traderID, e.config.ProviderType, err)
 		return fills
@@ -1229,7 +1244,7 @@ func (e *Engine) detectBinancePositionSnapshotFills() []Fill {
 		}
 		fills = append(fills, e.buildBinanceSnapshotFill(
 			mapping.LeaderPosID,
-			mapping.Symbol,
+			sourceMappingSymbol(mapping),
 			SideType(mapping.Side),
 			ActionClose,
 			mapping.LastKnownSize,
@@ -1350,6 +1365,7 @@ func (e *Engine) buildBinanceSnapshotFill(posID, symbol string, side SideType, a
 	}
 
 	return Fill{
+		LeaderPosID:  posID,
 		ID:           fillID,
 		Symbol:       symbol,
 		Side:         tradeSide,
@@ -1879,6 +1895,9 @@ func (e *Engine) matchOpenAddSignal(signal *TradeSignal, leaderPosMap map[string
 // matchCloseReduceSignal 匹配减仓/平仓信号（反向查找法 + posId 精确匹配）
 // 核心思想：从本地 active 映射出发，通过 size 变化精确确定是哪个 posId 被操作
 func (e *Engine) matchCloseReduceSignal(signal *TradeSignal, leaderPosMap map[string]*Position) *SignalMatchResult {
+	if e.config != nil && SupportsCopyGuard(e.config.ProviderType) {
+		return e.matchAccountLeaderReduction(signal, leaderPosMap)
+	}
 	fill := signal.Fill
 
 	// 1. 查本地所有 active 映射
@@ -2282,6 +2301,25 @@ func (e *Engine) reserveExecutionIntent(dec *decision.Decision) bool {
 	if dec == nil || e.store == nil || dec.LeaderPosID == "" || dec.Action == "hold" {
 		return true
 	}
+	if SupportsCopyGuard(e.config.ProviderType) {
+		side := strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(dec.Action, "open_"), "reduce_"), "close_")
+		if pending, err := e.store.CopyTrade().OtherSourceTransitionPending(e.traderID, dec.Symbol, side, dec.LeaderPosID); err != nil || pending {
+			e.UnmarkDecisionSources(dec)
+			return false
+		}
+		if dec.LeaderExitScope == leaderAccountExitScope {
+			match := &SignalMatchResult{PosID: dec.LeaderPosID, Action: ActionClose}
+			if dec.CopyTradeAction != "close" {
+				match.LeaderPosition = &Position{Size: dec.LeaderPosSize}
+				match.Action = ActionReduce
+			}
+			dec.CloseRatio = e.accountLeaderReductionRatio(nil, match)
+		}
+		if dec.LeaderExitScope == leaderAccountExitScope && (dec.CloseRatio <= 0 || math.IsNaN(dec.CloseRatio)) {
+			e.UnmarkDecisionSources(dec)
+			return false
+		}
+	}
 	lastRevision, err := e.store.CopyTrade().GetSourceSnapshotRevision(e.traderID, dec.LeaderPosID)
 	if err != nil {
 		logger.Errorf("❌ [%s] 查询执行意图修订号失败 | posId=%s: %v", e.traderID, dec.LeaderPosID, err)
@@ -2298,10 +2336,10 @@ func (e *Engine) reserveExecutionIntent(dec *decision.Decision) bool {
 	}
 	canonicalKey := fmt.Sprintf("leader|%s|%s|%d", e.traderID, dec.LeaderPosID, revision)
 	dec.ClientOrderID = stableClientOrderID(e.traderID, canonicalKey, dec.Action)
-	followerEquityAtTarget := 0.0
-	if e.getFollowerEquity != nil {
+	followerEquityAtTarget := dec.CopyFollowerEquity
+	if followerEquityAtTarget <= 0 && (dec.Action == "open_long" || dec.Action == "open_short") && e.getFollowerEquity != nil {
 		followerEquityAtTarget = e.getFollowerEquity()
-	} else if e.getFollowerBalance != nil {
+	} else if followerEquityAtTarget <= 0 && (dec.Action == "open_long" || dec.Action == "open_short") && e.getFollowerBalance != nil {
 		followerEquityAtTarget = e.getFollowerBalance()
 	}
 	targetAccountPct := 0.0
@@ -2315,7 +2353,8 @@ func (e *Engine) reserveExecutionIntent(dec *decision.Decision) bool {
 		MarginMode: dec.MarginMode, LeaderTargetSize: dec.LeaderPosSize,
 		RequestedNotional: dec.PositionSizeUSD, ClientOrderID: dec.ClientOrderID,
 		FollowerEquityAtTarget: followerEquityAtTarget, TargetAccountPct: targetAccountPct,
-		SourceFillIDs: dec.SourceFillIDs,
+		SourceFillIDs:   dec.SourceFillIDs,
+		LeaderExitScope: dec.LeaderExitScope, LeaderExitRatio: dec.CloseRatio, SourceOpenedMS: dec.SourceOpenedMS, SourceSnapshotMS: dec.SourceSnapshotMS, SignalObservedMS: dec.SignalObservedMS,
 	})
 	if err != nil {
 		logger.Errorf("❌ [%s] 预留执行意图失败 | posId=%s action=%s: %v", e.traderID, dec.LeaderPosID, dec.Action, err)
@@ -2399,6 +2438,12 @@ func (e *Engine) reserveExecutionIntent(dec *decision.Decision) bool {
 		}
 		return false
 	}
+	if dec.SourceOpenedMS > 0 && dec.CopyTradeAction == "open" {
+		if err := e.store.CopyTrade().BindSourceLifecycle(e.traderID, dec.LeaderPosID, dec.SourceOpenedMS); err != nil {
+			e.UnmarkDecisionSources(dec)
+			return false
+		}
+	}
 	dec.ExecutionIntentID = intent.ID
 	dec.SourceRevision = revision
 	dec.ExecutionStatus = store.ExecutionIntentReserved
@@ -2471,6 +2516,7 @@ func (e *Engine) buildDecisionV2(signal *TradeSignal, match *SignalMatchResult, 
 	}
 
 	dec := decision.Decision{
+		CopyLeaderEquity: signal.LeaderEquity, CopyFollowerEquity: signal.SizingFollowerEquity, CopyCoefficient: e.config.CopyRatio, SourceNotional: signal.SizingSourceNotional, SourceSnapshotMS: signal.SnapshotMS, SignalObservedMS: time.Now().UnixMilli(),
 		Symbol:          fill.Symbol,
 		Action:          e.mapAction(match.Action, fill.PositionSide),
 		IsCopyTrade:     true,
@@ -2486,10 +2532,19 @@ func (e *Engine) buildDecisionV2(signal *TradeSignal, match *SignalMatchResult, 
 		ValueCurrency:   fill.ValueCurrency,
 		LeaderReversed:  match.LeaderReversed,
 	}
+	if match.LeaderPosition != nil {
+		dec.SourceOpenedMS = match.LeaderPosition.OpenedMS
+	}
+	if SupportsCopyGuard(e.config.ProviderType) && (match.Action == ActionClose || match.Action == ActionReduce) {
+		dec.LeaderExitScope = leaderAccountExitScope
+	}
 	if match.SourceSymbol != "" {
 		dec.SourceSymbol = match.SourceSymbol
 	}
 	dec.ExecutionSymbol = match.ExecutionSymbol
+	if dec.LeaderExitScope == leaderAccountExitScope && match.ExecutionSymbol != "" {
+		dec.Symbol = match.ExecutionSymbol
+	}
 	dec.ExecutionSettleAsset = match.ExecutionSettleAsset
 	if dec.ValueCurrency == "" {
 		dec.ValueCurrency = match.SourceQuoteAsset
@@ -2521,12 +2576,13 @@ func (e *Engine) buildDecisionV2(signal *TradeSignal, match *SignalMatchResult, 
 	if match.Action == ActionReduce {
 		ratio := e.calculateReduceRatioV2(signal, match)
 
-		if e.config.ProviderType == ProviderBinance {
-			dec.CloseRatio = ratio
+		if SupportsCopyGuard(e.config.ProviderType) {
+			dec.CloseRatio = e.accountLeaderReductionRatio(signal, match)
 			dec.Reasoning = fmt.Sprintf("Copy trading: reduce %.0f%% following %s leader %s",
 				ratio*100, e.config.ProviderType, e.config.LeaderID)
 			logger.Infof("📊 [%s] Binance 部分平仓 %.1f%% marginMode=%s（以实时持仓快照为准，不使用累计减仓触发全平）",
 				e.traderID, ratio*100, dec.MarginMode)
+			dec.ClientOrderID = stableClientOrderID(e.traderID, fill.ID, dec.Action)
 			return dec
 		}
 
@@ -2558,6 +2614,9 @@ func (e *Engine) buildDecisionV2(signal *TradeSignal, match *SignalMatchResult, 
 	if match.Action == ActionClose {
 		dec.CloseRatio = 0 // 0 = 全量平仓
 		logger.Infof("📊 [%s] 全量平仓 marginMode=%s", e.traderID, dec.MarginMode)
+	}
+	if dec.LeaderExitScope == leaderAccountExitScope {
+		dec.CloseRatio = e.accountLeaderReductionRatio(signal, match)
 	}
 
 	// 🔐 决策级稳定 clOrdId（重试/重放幂等的最后一道硬闸）：
@@ -2634,6 +2693,19 @@ func (e *Engine) calculateReduceRatioV2(signal *TradeSignal, match *SignalMatchR
 func (e *Engine) calculateCopySizeByPositionChange(signal *TradeSignal, match *SignalMatchResult) (float64, []Warning) {
 	var warnings []Warning
 	fill := signal.Fill
+	if equityProvider, ok := e.provider.(interface{ GetLeaderEquity(string) (float64, error) }); ok {
+		var equity float64
+		var err error
+		if e.leaderEquityForSizing != nil {
+			equity, err = e.leaderEquityForSizing()
+		} else {
+			equity, err = equityProvider.GetLeaderEquity(e.config.LeaderID)
+		}
+		if err != nil {
+			return 0, []Warning{{Type: WarnLeaderEquityUnavailable, Message: err.Error()}}
+		}
+		signal.LeaderEquity = equity
+	}
 
 	// 领航员的账户权益（用作比例计算分母）
 	//
@@ -2769,6 +2841,7 @@ func (e *Engine) calculateCopySizeByPositionChange(signal *TradeSignal, match *S
 	}
 
 	// 领航员该笔交易占其账户的比例
+	signal.LeaderEquity, signal.SizingFollowerEquity, signal.SizingSourceNotional = leaderEquity, followerEquity, leaderTradeValue
 	leaderTradeRatio := leaderTradeValue / leaderEquity
 
 	// 计算跟单金额
@@ -3073,11 +3146,16 @@ Following leader's %s action on %s.
 // ============================================================================
 
 func (e *Engine) syncLeaderState() error {
-	state, err := e.provider.GetAccountState(e.config.LeaderID)
+	state, err := e.currentSourceSnapshot()
 	if err != nil {
 		e.recordSmartMoneySourceHealth()
 		e.reportBinanceCredentialsExpired(err, "syncLeaderState")
 		return err
+	}
+	if e.config != nil && SupportsCopyGuard(e.config.ProviderType) {
+		if err := e.baselineRepairedSources(state); err != nil {
+			return fmt.Errorf("source recovery baseline: %w", err)
+		}
 	}
 	checkedAt := time.Now()
 	if state != nil && !state.Timestamp.IsZero() {
@@ -3124,6 +3202,10 @@ func (e *Engine) syncLeaderState() error {
 	// 如果是，标记为 closed，这样后续重新开仓可以跟随
 	// 同时处理 stopped_by_risk → closed（v3 风控恢复机制）
 	e.checkIgnoredPositionsClosed()
+
+	if e.config.ProviderType == ProviderOKX {
+		return nil
+	}
 
 	// 🔑 风控：SL 触发对账 + 二次进场监控（SupportsCopyGuard 数据源）
 	// 调用时机：领航员状态刚同步完，本地持仓由 getFollowerPositions() 实时取
@@ -3380,6 +3462,12 @@ func (e *Engine) checkIgnoredPositionsClosed() {
 	// 处理 stopped_by_risk 状态（v3 风控恢复机制）
 	// 当领航员完全平掉旧 posId 后，把熔断映射也置为 closed，下次新 posId 可以正常跟随
 	// ============================================================
+	if e.config != nil && SupportsCopyGuard(e.config.ProviderType) {
+		if e.config.ProviderType != ProviderOKX {
+			e.checkManualStoppedClosed(leaderPosMap)
+		}
+		return // reductions of risk-stopped/detached sources use the exit queue
+	}
 	stoppedMappings, err := e.store.CopyTrade().ListStoppedByRiskMappings(e.traderID)
 	if err != nil {
 		logger.Warnf("⚠️ [%s] 获取 stopped_by_risk 映射失败: %v", e.traderID, err)
@@ -3472,7 +3560,7 @@ func (e *Engine) checkManualStoppedClosed(leaderPosMap map[string]*Position) {
 
 	for _, mapping := range manualMappings {
 		leader, exists := leaderPosMap[mapping.LeaderPosID]
-		leaderEnded := !exists || leader == nil || !strings.EqualFold(string(leader.Side), mapping.Side)
+		leaderEnded := !exists || leader == nil || e.sourceLifecycleChanged(mapping.LeaderPosID, leader) || !strings.EqualFold(string(leader.Side), mapping.Side)
 		if !leaderEnded {
 			// 领航员原仓还在：无论本地状态如何都不收尾（继续屏蔽其加减仓信号）
 			delete(e.manualStopFlatConfirm, mapping.LeaderPosID)

@@ -264,6 +264,9 @@ func (s *Store) initTables() error {
 	if err := s.CopyTrade().initPositionControlTables(); err != nil {
 		return fmt.Errorf("initialize position controls: %w", err)
 	}
+	if err := s.CopyTrade().initLeaderExitTables(); err != nil {
+		return fmt.Errorf("initialize leader exits: %w", err)
+	}
 	if err := s.CopyTrade().initUnsupportedExecutionInstrumentTable(); err != nil {
 		return fmt.Errorf("failed to initialize unsupported execution instrument table: %w", err)
 	}

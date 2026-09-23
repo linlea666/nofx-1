@@ -657,6 +657,9 @@ const (
 // checkReentryConditions 检查所有 stopped_by_risk 映射是否满足二次进场条件
 // 满足时通过 e.decisionCh 推一个 Open 决策出去
 func (e *Engine) checkReentryConditions() {
+	if e.config.FollowExitPolicyVersion >= 2 {
+		return
+	}
 	if e.store == nil || e.config == nil {
 		return
 	}

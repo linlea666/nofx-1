@@ -280,6 +280,7 @@ interface FormState {
   // stop_noise_floor / cycle_max_loss）已随 v5 下线。
   // ============================================================
   risk_stop_loss_enabled: boolean // 默认 true：启用账户保护硬止损
+  risk_liquidation_guard_enabled: boolean // 独立强平保护
   risk_protection_mode: 'atr_structure' | 'position_margin_pct'
   risk_position_margin_stop_pct: number // 前端百分比，默认80
   risk_stop_max_account_loss_pct: number // 0=继承账户默认值；否则为交易员覆盖百分比
@@ -377,6 +378,7 @@ export function TraderConfigModal({
     copy_binance_csrf_token: '',
     // 账户保护 v5 风控默认值（与后端 store.FillRiskDefaults 保持一致）
     risk_stop_loss_enabled: true,
+    risk_liquidation_guard_enabled: true,
     risk_protection_mode: 'atr_structure',
     risk_position_margin_stop_pct: 80,
     risk_stop_max_account_loss_pct: 0,
@@ -567,6 +569,8 @@ export function TraderConfigModal({
             copy_binance_csrf_token: cfg.binance_csrf_token ?? '',
             // 风控字段回填（× 100 转百分比展示，与 store.FillRiskDefaults 保持一致）
             risk_stop_loss_enabled: cfg.risk_stop_loss_enabled ?? true,
+            risk_liquidation_guard_enabled:
+              cfg.risk_liquidation_guard_enabled ?? true,
             risk_protection_mode: cfg.risk_protection_mode ?? 'atr_structure',
             risk_position_margin_stop_pct:
               (cfg.risk_position_margin_stop_pct ?? 0.8) * 100,
@@ -681,6 +685,8 @@ export function TraderConfigModal({
         setFormData((prev) => ({
           ...prev,
           risk_stop_loss_enabled: cfg.risk_stop_loss_enabled ?? true,
+          risk_liquidation_guard_enabled:
+            cfg.risk_liquidation_guard_enabled ?? true,
           risk_protection_mode: cfg.risk_protection_mode ?? 'atr_structure',
           risk_position_margin_stop_pct:
             (cfg.risk_position_margin_stop_pct ?? 0.8) * 100,
@@ -770,6 +776,7 @@ export function TraderConfigModal({
         copy_binance_csrf_token: '',
         // 风控默认值（与 useState 初始值保持一致）
         risk_stop_loss_enabled: true,
+        risk_liquidation_guard_enabled: true,
         risk_protection_mode: 'atr_structure',
         risk_position_margin_stop_pct: 80,
         risk_stop_max_account_loss_pct: 0,
@@ -1076,6 +1083,8 @@ export function TraderConfigModal({
                 : undefined,
             // 前端展示百分比 → 后端存比例，× 0.01 转换
             risk_stop_loss_enabled: formData.risk_stop_loss_enabled,
+            risk_liquidation_guard_enabled:
+              formData.risk_liquidation_guard_enabled,
             risk_protection_mode: formData.risk_protection_mode,
             risk_position_margin_stop_pct:
               formData.risk_position_margin_stop_pct / 100,
@@ -1198,6 +1207,7 @@ export function TraderConfigModal({
   const showAtrStructureRiskControls =
     formData.risk_policy_version >= 4 &&
     formData.risk_protection_mode === 'atr_structure'
+  const reentryControlsEnabled = false
   const atrStructureVisibilityClass =
     formData.risk_protection_mode === 'position_margin_pct' ? 'hidden' : ''
 
@@ -2023,6 +2033,38 @@ export function TraderConfigModal({
                         </button>
                       </div>
 
+                      <div className="flex items-center justify-between mt-3">
+                        <div>
+                          <label className="text-sm text-[#EAECEF]">
+                            独立强平保护
+                          </label>
+                          <p className="text-xs text-[#848E9C]">
+                            默认开启；关闭策略止损后仍可兜底。使用标记价，不改变跟单比例或杠杆。
+                          </p>
+                        </div>
+                        <button
+                          type="button"
+                          aria-label="独立强平保护"
+                          aria-pressed={formData.risk_liquidation_guard_enabled}
+                          onClick={() =>
+                            handleInputChange(
+                              'risk_liquidation_guard_enabled',
+                              !formData.risk_liquidation_guard_enabled
+                            )
+                          }
+                          className={`w-12 h-6 shrink-0 rounded-full transition-colors ${formData.risk_liquidation_guard_enabled ? 'bg-[#F0B90B]' : 'bg-[#2B3139]'}`}
+                        >
+                          <div
+                            className={`w-5 h-5 rounded-full bg-white shadow transition-transform ${formData.risk_liquidation_guard_enabled ? 'translate-x-6' : 'translate-x-0.5'}`}
+                          />
+                        </button>
+                      </div>
+                      <p className="mt-3 text-xs text-[#848E9C]">
+                        已跟随的周期：减仓和平仓覆盖同币种同方向总仓（包含手动加仓）。新周期前已有独立手动仓则整轮跳过。
+                        主动停跟后不跟随领航员任何动作，已有保护继续生效；恢复只跟随后续动作。
+                        风险退出后本轮不自动再入场，等待领航员下一轮开仓。
+                      </p>
+
                       {/* 风控参数（开关打开时显示） */}
                       {formData.risk_stop_loss_enabled && (
                         <>
@@ -2395,8 +2437,8 @@ export function TraderConfigModal({
                                 <span className="mt-1 block leading-relaxed">
                                   止损距离被强平缓冲压到不足该 ATR
                                   倍数时，说明这个仓位没有既躲得开正常波动、
-                                  又落在强平之内的止损价。此时不挂止损，转为无保护高危告警并继续跟随领航员，
-                                  由 AI 接管观察。填 0
+                                  又落在强平之内的策略止损价。独立强平保护开启时仍保留强平安全线；策略保护异常会告警并重试。填
+                                  0
                                   关闭该判定（恢复旧行为：仍会挂出噪音区内的极紧止损）。
                                 </span>
                               </label>
@@ -2410,7 +2452,10 @@ export function TraderConfigModal({
                           <div
                             className={`grid grid-cols-2 gap-3 border-t border-[#2B3139] pt-3 ${atrStructureVisibilityClass}`}
                           >
-                            <label className="text-xs text-[#848E9C] col-span-2">
+                            <label
+                              hidden
+                              className="text-xs text-[#848E9C] col-span-2"
+                            >
                               重入决策模式
                               <select
                                 value={formData.risk_reentry_decision_mode}
@@ -2534,73 +2579,76 @@ export function TraderConfigModal({
                             </div>
                           )}
 
-                          {formData.risk_reentry_decision_mode ===
-                            'ai_guarded' && (
-                            <div
-                              className={`grid grid-cols-2 gap-3 border border-[#2B3139] rounded p-3 ${atrStructureVisibilityClass}`}
-                            >
-                              {[
-                                [
-                                  'risk_ai_confidence_threshold',
-                                  'AI 入场置信度 %',
-                                  70,
-                                  95,
-                                ],
-                                [
-                                  'risk_ai_min_review_seconds',
-                                  '最短复查间隔（秒）',
-                                  300,
-                                  7200,
-                                ],
-                                [
-                                  'risk_ai_daily_call_limit',
-                                  '24 小时 AI 调用上限',
-                                  1,
-                                  null,
-                                ],
-                                [
-                                  'risk_ai_lifecycle_call_limit',
-                                  '单候选 AI 调用上限',
-                                  1,
-                                  null,
-                                ],
-                              ].map(([field, label, min, max]) => (
-                                <label
-                                  key={String(field)}
-                                  className="text-xs text-[#848E9C]"
-                                >
-                                  {label}
-                                  <input
-                                    type="number"
-                                    min={Number(min)}
-                                    max={max == null ? undefined : Number(max)}
-                                    value={
-                                      formData[
-                                        field as keyof FormState
-                                      ] as number
-                                    }
-                                    onChange={(e) =>
-                                      handleInputChange(
-                                        field as keyof FormState,
-                                        Number(e.target.value)
-                                      )
-                                    }
-                                    className="mt-1 w-full px-2 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF]"
-                                  />
-                                </label>
-                              ))}
-                              <div className="col-span-2 text-[11px] text-[#F0B90B]">
-                                两个上限按「单个候选」统计并真实生效：达到上限后不再发起付费模型调用，并记录
-                                AI_BUDGET_SUSPENDED
-                                事件。24小时上限为滚动窗口，会自动恢复；单候选上限达到后该候选不再复查。已建立的止损保护与领航员平仓跟随不受影响。
+                          {reentryControlsEnabled &&
+                            formData.risk_reentry_decision_mode ===
+                              'ai_guarded' && (
+                              <div
+                                className={`grid grid-cols-2 gap-3 border border-[#2B3139] rounded p-3 ${atrStructureVisibilityClass}`}
+                              >
+                                {[
+                                  [
+                                    'risk_ai_confidence_threshold',
+                                    'AI 入场置信度 %',
+                                    70,
+                                    95,
+                                  ],
+                                  [
+                                    'risk_ai_min_review_seconds',
+                                    '最短复查间隔（秒）',
+                                    300,
+                                    7200,
+                                  ],
+                                  [
+                                    'risk_ai_daily_call_limit',
+                                    '24 小时 AI 调用上限',
+                                    1,
+                                    null,
+                                  ],
+                                  [
+                                    'risk_ai_lifecycle_call_limit',
+                                    '单候选 AI 调用上限',
+                                    1,
+                                    null,
+                                  ],
+                                ].map(([field, label, min, max]) => (
+                                  <label
+                                    key={String(field)}
+                                    className="text-xs text-[#848E9C]"
+                                  >
+                                    {label}
+                                    <input
+                                      type="number"
+                                      min={Number(min)}
+                                      max={
+                                        max == null ? undefined : Number(max)
+                                      }
+                                      value={
+                                        formData[
+                                          field as keyof FormState
+                                        ] as number
+                                      }
+                                      onChange={(e) =>
+                                        handleInputChange(
+                                          field as keyof FormState,
+                                          Number(e.target.value)
+                                        )
+                                      }
+                                      className="mt-1 w-full px-2 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF]"
+                                    />
+                                  </label>
+                                ))}
+                                <div className="col-span-2 text-[11px] text-[#F0B90B]">
+                                  两个上限按「单个候选」统计并真实生效：达到上限后不再发起付费模型调用，并记录
+                                  AI_BUDGET_SUSPENDED
+                                  事件。24小时上限为滚动窗口，会自动恢复；单候选上限达到后该候选不再复查。已建立的止损保护与领航员平仓跟随不受影响。
+                                </div>
+                                <p className="col-span-2 text-xs text-[#848E9C]">
+                                  WAIT
+                                  不发邮件；事件、心跳退避和关注区间会持续触发复查，AI
+                                  不可绕过仓位、预算和保护预检。
+                                </p>
                               </div>
-                              <p className="col-span-2 text-xs text-[#848E9C]">
-                                WAIT
-                                不发邮件；事件、心跳退避和关注区间会持续触发复查，AI
-                                不可绕过仓位、预算和保护预检。
-                              </p>
-                            </div>
-                          )}
+                            )}
 
                           {/* ATR 波动参数 */}
                           <div
@@ -2748,14 +2796,15 @@ export function TraderConfigModal({
                               </label>
                               <p className="text-xs text-[#848E9C] mt-1">
                                 普通跟单继续开仓、加仓、减仓和平仓；保护失败会告警并持续重试，不会因此主动平仓。
-                                真实止损触发后才停止原周期。已有 ATR 模式的 AI
-                                二次入场仍遵循独立的保护失败退出规则。
+                                真实止损触发后停止本轮开仓和加仓，等待领航员下一轮；本轮不自动买回。
                               </p>
                             </div>
                           )}
 
-                          {/* 二次进场（高级） */}
+                          {/* Dormant legacy reentry values remain saved for compatibility. */}
                           <div
+                            hidden
+                            style={{ display: 'none' }}
                             className={`border-t border-[#2B3139] pt-3 ${atrStructureVisibilityClass}`}
                           >
                             <div className="flex items-center justify-between mb-2">
@@ -3133,7 +3182,7 @@ export function TraderConfigModal({
                               微量加仓、部分减仓不足门槛时直接记录跳过。保护单按关键位、
                               ATR
                               与账户/交易员单仓亏损上限计算并由执行交易所托管，
-                              无法确认完整保护时受控退出。
+                              普通保护失败只告警重试；真实止损或强平安全线触发才退出，本轮不再入场。
                             </span>
                           </div>
                         </>

@@ -19,3 +19,14 @@ func TestAutoTraderCopyGuardCapabilityValidationInspectsUnderlyingExchange(t *te
 		t.Fatalf("OKX should expose the complete Copy Guard contract: %v", err)
 	}
 }
+
+func TestLeaderExitContractChecksVenueEvenWithoutCopyGuard(t *testing.T) {
+	if err := (&AutoTrader{trader: &AsterTrader{}}).ValidateLeaderExitCapabilities(); err == nil {
+		t.Fatal("unsupported exchange would open positions but fail every leader exit")
+	}
+	for _, venue := range []Trader{&OKXTrader{}, &FuturesTrader{}} {
+		if err := (&AutoTrader{trader: venue}).ValidateLeaderExitCapabilities(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}

@@ -111,46 +111,48 @@ type CopyGuardATRProfile struct {
 // provider credentials and ordinary copy-trading settings must never enter a
 // lifecycle row or a cycle API response.
 type CopyGuardPolicy struct {
-	SnapshotSchemaVersion  int                  `json:"snapshot_schema_version"`
-	Version                int                  `json:"version"`
-	ProtectionMode         string               `json:"risk_protection_mode,omitempty"`
-	PositionMarginStopPct  float64              `json:"risk_position_margin_stop_pct,omitempty"`
-	ATRProfile             *CopyGuardATRProfile `json:"atr_profile,omitempty"`
-	AccountPct             *float64             `json:"account_pct,omitempty"`
-	ATRMultiplier          *float64             `json:"atr_multiplier,omitempty"`
-	ATRTimeframe           *string              `json:"atr_timeframe,omitempty"`
-	LeverageFallback       *bool                `json:"leverage_fallback,omitempty"`
-	LeverageMaxLoss        *float64             `json:"leverage_max_loss,omitempty"`
-	StopMode               string               `json:"stop_mode"`
-	StopPriority           string               `json:"stop_priority"`
-	StopMaxAccountLossPct  float64              `json:"stop_max_account_loss_pct,omitempty"`
-	ATRPeriod              int                  `json:"atr_period"`
-	ATRCacheMaxAgeMinutes  int                  `json:"atr_cache_max_age_minutes"`
-	ATRFallbackPct         float64              `json:"atr_fallback_pct"`
-	TriggerPriceType       string               `json:"trigger_price_type"`
-	SlippageBufferBPS      float64              `json:"slippage_buffer_bps"`
-	RoundTripFeeBPS        float64              `json:"round_trip_fee_bps"`
-	LiquidationBufferATR   float64              `json:"liquidation_buffer_atr"`
-	ReentryEnabled         *bool                `json:"reentry_enabled,omitempty"`
-	ManualReentryEnabled   *bool                `json:"manual_reentry_enabled,omitempty"`
-	ReentryRatio           *float64             `json:"reentry_ratio,omitempty"`
-	MaxReentries           int                  `json:"max_reentries"`
-	ReentryBandATR         float64              `json:"reentry_band_atr"`
-	ReentryCooldownSec     int                  `json:"reentry_cooldown_seconds"`
-	ReentryMaxChaseATR     float64              `json:"reentry_max_chase_atr"`
-	MaxATRExpansion        float64              `json:"max_atr_expansion"`
-	WatchTimeoutMinutes    int                  `json:"watch_timeout_minutes"`
-	MigrationConfirmed     bool                 `json:"migration_confirmed"`
-	AddonBudgetPct         float64              `json:"addon_budget_pct"`
-	CycleLossBudgetPct     float64              `json:"cycle_loss_budget_pct"`
-	PortfolioLossBudgetPct float64              `json:"portfolio_loss_budget_pct"`
-	ReentryDecisionMode    string               `json:"reentry_decision_mode"`
-	ReentryMinNotional     float64              `json:"reentry_min_notional"`
-	AIConfidenceThreshold  float64              `json:"ai_confidence_threshold"`
-	AIMinReviewSeconds     int                  `json:"ai_min_review_seconds"`
-	AIDailyCallLimit       int                  `json:"ai_daily_call_limit"`
-	AILifecycleCallLimit   int                  `json:"ai_lifecycle_call_limit"`
-	NotificationLevel      string               `json:"notification_level"`
+	StrategyStopEnabled     *bool                `json:"strategy_stop_enabled,omitempty"`
+	LiquidationGuardEnabled *bool                `json:"liquidation_guard_enabled,omitempty"`
+	SnapshotSchemaVersion   int                  `json:"snapshot_schema_version"`
+	Version                 int                  `json:"version"`
+	ProtectionMode          string               `json:"risk_protection_mode,omitempty"`
+	PositionMarginStopPct   float64              `json:"risk_position_margin_stop_pct,omitempty"`
+	ATRProfile              *CopyGuardATRProfile `json:"atr_profile,omitempty"`
+	AccountPct              *float64             `json:"account_pct,omitempty"`
+	ATRMultiplier           *float64             `json:"atr_multiplier,omitempty"`
+	ATRTimeframe            *string              `json:"atr_timeframe,omitempty"`
+	LeverageFallback        *bool                `json:"leverage_fallback,omitempty"`
+	LeverageMaxLoss         *float64             `json:"leverage_max_loss,omitempty"`
+	StopMode                string               `json:"stop_mode"`
+	StopPriority            string               `json:"stop_priority"`
+	StopMaxAccountLossPct   float64              `json:"stop_max_account_loss_pct,omitempty"`
+	ATRPeriod               int                  `json:"atr_period"`
+	ATRCacheMaxAgeMinutes   int                  `json:"atr_cache_max_age_minutes"`
+	ATRFallbackPct          float64              `json:"atr_fallback_pct"`
+	TriggerPriceType        string               `json:"trigger_price_type"`
+	SlippageBufferBPS       float64              `json:"slippage_buffer_bps"`
+	RoundTripFeeBPS         float64              `json:"round_trip_fee_bps"`
+	LiquidationBufferATR    float64              `json:"liquidation_buffer_atr"`
+	ReentryEnabled          *bool                `json:"reentry_enabled,omitempty"`
+	ManualReentryEnabled    *bool                `json:"manual_reentry_enabled,omitempty"`
+	ReentryRatio            *float64             `json:"reentry_ratio,omitempty"`
+	MaxReentries            int                  `json:"max_reentries"`
+	ReentryBandATR          float64              `json:"reentry_band_atr"`
+	ReentryCooldownSec      int                  `json:"reentry_cooldown_seconds"`
+	ReentryMaxChaseATR      float64              `json:"reentry_max_chase_atr"`
+	MaxATRExpansion         float64              `json:"max_atr_expansion"`
+	WatchTimeoutMinutes     int                  `json:"watch_timeout_minutes"`
+	MigrationConfirmed      bool                 `json:"migration_confirmed"`
+	AddonBudgetPct          float64              `json:"addon_budget_pct"`
+	CycleLossBudgetPct      float64              `json:"cycle_loss_budget_pct"`
+	PortfolioLossBudgetPct  float64              `json:"portfolio_loss_budget_pct"`
+	ReentryDecisionMode     string               `json:"reentry_decision_mode"`
+	ReentryMinNotional      float64              `json:"reentry_min_notional"`
+	AIConfidenceThreshold   float64              `json:"ai_confidence_threshold"`
+	AIMinReviewSeconds      int                  `json:"ai_min_review_seconds"`
+	AIDailyCallLimit        int                  `json:"ai_daily_call_limit"`
+	AILifecycleCallLimit    int                  `json:"ai_lifecycle_call_limit"`
+	NotificationLevel       string               `json:"notification_level"`
 	// v4.1 重入加严（字段含义见 store.CopyTradeConfig 同名注释）
 	// v5 注：stop_noise_floor_atr / cycle_max_loss_pct 已下线，旧 JSON 中的
 	// 存量值在反序列化时被忽略。
@@ -936,6 +938,7 @@ func scanCopyGuardWatchSample(scan func(dest ...interface{}) error) (*CopyGuardW
 }
 
 func policyFromConfig(c *CopyTradeConfig) CopyGuardPolicy {
+	strategyStop, liquidationGuard := c.RiskStopLossEnabled, c.RiskLiquidationGuardEnabled
 	accountPct := c.RiskAccountPct
 	atrMultiplier := c.RiskATRMultiplier
 	atrTimeframe := c.RiskATRTimeframe
@@ -945,6 +948,7 @@ func policyFromConfig(c *CopyTradeConfig) CopyGuardPolicy {
 	manualReentryEnabled := c.RiskManualReentryEnabled
 	reentryRatio := c.RiskReentryRatio
 	return CopyGuardPolicy{
+		StrategyStopEnabled: &strategyStop, LiquidationGuardEnabled: &liquidationGuard,
 		SnapshotSchemaVersion: copyGuardSnapshotSchemaVersion,
 		Version:               c.RiskPolicyVersion, ProtectionMode: c.RiskProtectionMode,
 		PositionMarginStopPct: c.RiskPositionMarginStopPct,
@@ -1246,6 +1250,12 @@ type sqlExecer interface {
 func saveCopyGuardPolicyWithExecutor(exec sqlExecer, c *CopyTradeConfig) error {
 	if c == nil {
 		return nil
+	}
+	if c.FollowExitPolicyVersion < 2 {
+		c.FollowExitPolicyVersion = 2
+	}
+	if _, err := exec.Exec(`UPDATE copy_trade_configs SET risk_liquidation_guard_enabled=?, follow_exit_policy_version=? WHERE trader_id=?`, c.RiskLiquidationGuardEnabled, c.FollowExitPolicyVersion, c.TraderID); err != nil {
+		return err
 	}
 	if c.RiskPolicyVersion < 4 {
 		// A stale v4 JSON row would otherwise override the downgraded base
@@ -3122,7 +3132,7 @@ func (s *CopyTradeStore) FinishCopyGuardBaselineMigration() error {
 // can retry calibrating them from the leader's public position history.
 func (s *CopyTradeStore) ListCopyGuardCyclesWithEstimatedBaseline(traderID string, maxAge time.Duration) ([]*CopyGuardCycle, error) {
 	cutoff := time.Now().Add(-maxAge).UTC().Format("2006-01-02 15:04:05")
-	rows, err := s.db.Query(copyGuardCycleSelect+` WHERE trader_id=? AND baseline_source='last_observed' AND closed_at IS NOT NULL AND closed_at>=? ORDER BY closed_at,id`, traderID, cutoff)
+	rows, err := s.db.Query(copyGuardCycleSelect+` WHERE trader_id=? AND baseline_source IN ('last_observed','source_snapshot_mark','leader_reversal_mark') AND closed_at IS NOT NULL AND closed_at>=? ORDER BY closed_at,id`, traderID, cutoff)
 	if err != nil {
 		return nil, err
 	}
@@ -4009,16 +4019,16 @@ func (s *CopyTradeStore) CopyGuardSummary(traderIDs []string, from, to time.Time
 	// 单列，避免估算值混入 headline 后误导（实测口径 = 总值 − 估算部分）。
 	// 计数与求和口径一致：只统计发生过真实 Guard 干预的周期（保护止损
 	// 或因无法建立保护而按配置退出），避免把纯跟随周期混入效果归因。
-	if err := s.db.QueryRow(`SELECT COUNT(*),COALESCE(SUM(net_guard_effect),0) FROM copy_guard_cycles WHERE id IN (`+filteredCycleQuery+`) AND accounting_status='RECONCILED' AND baseline_source='last_observed' AND `+copyGuardInterventionPredicate, rateArgs...).Scan(&x.EstimatedBaselineCycles, &x.EstimatedNetGuardEffect); err != nil {
+	if err := s.db.QueryRow(`SELECT COUNT(*),COALESCE(SUM(net_guard_effect),0) FROM copy_guard_cycles WHERE id IN (`+filteredCycleQuery+`) AND accounting_status='RECONCILED' AND baseline_source IN ('last_observed','source_snapshot_mark','leader_reversal_mark') AND `+copyGuardInterventionPredicate, rateArgs...).Scan(&x.EstimatedBaselineCycles, &x.EstimatedNetGuardEffect); err != nil {
 		return &x, err
 	}
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM copy_guard_cycles WHERE id IN (`+filteredCycleQuery+`) AND accounting_status='RECONCILED' AND baseline_source='missing' AND `+copyGuardInterventionPredicate, rateArgs...).Scan(&x.UnscorableBaselineCycles); err != nil {
 		return &x, err
 	}
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM copy_guard_cycles WHERE id IN (`+filteredCycleQuery+`) AND accounting_status='RECONCILED' AND COALESCE(baseline_source,'') NOT IN ('missing','last_observed') AND `+copyGuardInterventionPredicate, rateArgs...).Scan(&x.VerifiedBaselineCycles); err != nil {
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM copy_guard_cycles WHERE id IN (`+filteredCycleQuery+`) AND accounting_status='RECONCILED' AND COALESCE(baseline_source,'') NOT IN ('missing','last_observed','source_snapshot_mark','leader_reversal_mark') AND `+copyGuardInterventionPredicate, rateArgs...).Scan(&x.VerifiedBaselineCycles); err != nil {
 		return &x, err
 	}
-	verifiedRows, verifiedErr := s.db.Query(`SELECT net_guard_effect FROM copy_guard_cycles WHERE id IN (`+filteredCycleQuery+`) AND accounting_status='RECONCILED' AND COALESCE(baseline_source,'') NOT IN ('missing','last_observed') AND `+copyGuardInterventionPredicate+` ORDER BY id`, rateArgs...)
+	verifiedRows, verifiedErr := s.db.Query(`SELECT net_guard_effect FROM copy_guard_cycles WHERE id IN (`+filteredCycleQuery+`) AND accounting_status='RECONCILED' AND COALESCE(baseline_source,'') NOT IN ('missing','last_observed','source_snapshot_mark','leader_reversal_mark') AND `+copyGuardInterventionPredicate+` ORDER BY id`, rateArgs...)
 	if verifiedErr != nil {
 		return &x, verifiedErr
 	}

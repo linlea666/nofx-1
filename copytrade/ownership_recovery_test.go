@@ -181,7 +181,7 @@ func TestOwnershipRecoveryReentersNormalRevisionedCloseChain(t *testing.T) {
 		t.Fatalf("normal close matcher rejected restored mapping: %+v", match)
 	}
 	dec := f.engine.buildDecisionV2(signal, match, 0)
-	if dec.Action != "close_long" || dec.CloseRatio != 0 || !f.engine.reserveExecutionIntent(&dec) {
+	if dec.Action != "close_long" || dec.CloseRatio != 1 || !f.engine.reserveExecutionIntent(&dec) {
 		t.Fatalf("normal full-close decision was not reserved: %+v", dec)
 	}
 	if dec.SourceRevision != 4 || dec.ExecutionIntentID <= 0 {
@@ -448,12 +448,26 @@ func TestDetachedOwnershipLifecycleClosesOnLeaderReversal(t *testing.T) {
 	f.engine.leaderState.Positions[posID] = &Position{PosID: posID, Symbol: "BTCUSDT", Side: SideShort, Size: 0.002, MarginMode: "cross"}
 	f.engine.checkIgnoredPositionsClosed()
 	mapping, err := f.store.CopyTrade().GetMappingForReconciliation(f.traderID, f.leaderPosID)
-	if err != nil || mapping.Status != store.MappingStatusClosed {
-		t.Fatalf("leader reversal did not end detached lifecycle: mapping=%+v err=%v", mapping, err)
+	if err != nil || mapping.Status != store.MappingStatusDetached {
+		t.Fatalf("leader reversal prematurely ended detached lifecycle: mapping=%+v err=%v", mapping, err)
 	}
 	fills := f.engine.detectBinancePositionSnapshotFills()
+	if len(fills) != 1 || fills[0].Action != ActionClose || fills[0].PositionSide != SideLong {
+		t.Fatalf("old source must exit before reversed lifecycle opens: %+v", fills)
+	}
+	signal := f.engine.buildSignal(&fills[0])
+	match := f.engine.matchSignalWithMapping(signal)
+	dec := f.engine.buildDecisionV2(signal, match, 0)
+	if !f.engine.reserveExecutionIntent(&dec) {
+		t.Fatal("exit not reserved")
+	}
+	f.integration.executor = &leaderExitExecutor{positionMarginLifecycleExecutor: &positionMarginLifecycleExecutor{}}
+	if err := f.integration.executeAccountLeaderExit(&dec, true); err != nil {
+		t.Fatal(err)
+	}
+	fills = f.engine.detectBinancePositionSnapshotFills()
 	if len(fills) != 1 || fills[0].Action != ActionOpen || fills[0].PositionSide != SideShort {
-		t.Fatalf("new reversed lifecycle was not exposed after detached close: %+v", fills)
+		t.Fatalf("new cycle not exposed after confirmed exit: %+v", fills)
 	}
 }
 

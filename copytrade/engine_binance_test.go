@@ -213,7 +213,7 @@ func TestBinancePositionSnapshotDetectsOpenAddReduceCloseAndIgnoresHistorical(t 
 		}
 	})
 
-	t.Run("close when remaining size is near zero", func(t *testing.T) {
+	t.Run("reduce while leader still holds a small remainder", func(t *testing.T) {
 		e, st := newTestCopyTradeEngine(t, ProviderBinance)
 		saveActiveMapping(t, st, posID, 0.02)
 		e.leaderState.Positions[posID] = binanceTestPosition(posID, 0.0009)
@@ -222,8 +222,8 @@ func TestBinancePositionSnapshotDetectsOpenAddReduceCloseAndIgnoresHistorical(t 
 		if len(fills) != 1 {
 			t.Fatalf("fills len=%d want 1", len(fills))
 		}
-		if fills[0].Action != ActionClose || math.Abs(fills[0].Size-0.0191) > 1e-12 {
-			t.Fatalf("unexpected near-zero close fill: %+v", fills[0])
+		if fills[0].Action != ActionReduce || math.Abs(fills[0].Size-0.0191) > 1e-12 {
+			t.Fatalf("unexpected small-remainder reduce fill: %+v", fills[0])
 		}
 	})
 
@@ -591,7 +591,7 @@ func TestBinanceLateTradeHistoryDoesNotDuplicateSnapshotReduce(t *testing.T) {
 	if result.ShouldFollow {
 		t.Fatalf("expected Binance duplicate reduce/close to be skipped: %+v", result)
 	}
-	if !strings.Contains(result.Reason, "size 未减少") {
+	if !strings.Contains(result.Reason, "无新的领航员减仓变化") {
 		t.Fatalf("unexpected reason: %s", result.Reason)
 	}
 }

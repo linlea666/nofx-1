@@ -25,6 +25,11 @@ type TraderStats struct {
 
 // TraderPosition position record (complete open/close position tracking)
 type TraderPosition struct {
+	GrossPnL           *float64   `json:"gross_pnl"`
+	NetPnL             *float64   `json:"net_pnl"`
+	FundingFee         float64    `json:"funding_fee"`
+	LiquidationPenalty float64    `json:"liquidation_penalty"`
+	SettlementVerified bool       `json:"settlement_verified"`
 	ID                 int64      `json:"id"`
 	TraderID           string     `json:"trader_id"`
 	ExchangeID         string     `json:"exchange_id"`          // Exchange account UUID (for multi-account support)
@@ -231,6 +236,9 @@ func (s *PositionStore) InitTables() error {
 		return err
 	}
 
+	if err := s.initSettlementTables(); err != nil {
+		return err
+	}
 	// Create indexes (after migration)
 	indices := []string{
 		`CREATE INDEX IF NOT EXISTS idx_positions_trader ON trader_positions(trader_id)`,
@@ -494,10 +502,12 @@ func (s *PositionStore) ClosePositionWithAllocations(id int64, exchangeID string
 	for _, lot := range lots {
 		var allocatedQuantity, allocatedPnL, allocatedFee, weightedExit float64
 		var exitOrderID string
+		var fillExitTime sql.NullString
 		if err = tx.QueryRow(`SELECT COALESCE(SUM(quantity),0),COALESCE(SUM(realized_pnl),0),COALESCE(SUM(fee),0),
-			COALESCE(SUM(exit_price*quantity),0),COALESCE(MAX(exchange_trade_id),'')
+			COALESCE(SUM(exit_price*quantity),0),COALESCE(MAX(exchange_trade_id),''),
+			(SELECT f.fill_time FROM position_close_fills f JOIN position_close_allocations a ON a.fill_id=f.id WHERE a.position_id=position_close_allocations.position_id ORDER BY julianday(f.fill_time) DESC,f.id DESC LIMIT 1)
 			FROM position_close_allocations WHERE exchange_id=? AND position_id=?`,
-			exchangeID, lot.id).Scan(&allocatedQuantity, &allocatedPnL, &allocatedFee, &weightedExit, &exitOrderID); err != nil {
+			exchangeID, lot.id).Scan(&allocatedQuantity, &allocatedPnL, &allocatedFee, &weightedExit, &exitOrderID, &fillExitTime); err != nil {
 			return false, err
 		}
 		if allocatedQuantity <= math.Max(1e-12, lot.quantity*1e-8) {
@@ -535,9 +545,13 @@ func (s *PositionStore) ClosePositionWithAllocations(id int64, exchangeID string
 			}
 		}
 		exitPrice := weightedExit / allocatedQuantity
-		if _, err = tx.Exec(`UPDATE trader_positions SET quantity=?,exit_price=?,exit_order_id=?,exit_time=COALESCE(exit_time,?),
-			realized_pnl=?,fee=?,status='CLOSED',close_reason=?,accounting_quality=?,updated_at=? WHERE id=?`,
-			lot.quantity, exitPrice, exitOrderID, now, allocatedPnL, allocatedFee, closeReason, quality, now, lot.id); err != nil {
+		exitAt := now
+		if fillExitTime.Valid {
+			exitAt = fillExitTime.String
+		}
+		if _, err = tx.Exec(`UPDATE trader_positions SET quantity=?,exit_price=?,exit_order_id=?,exit_time=?,
+			gross_pnl=?,realized_pnl=CASE WHEN settlement_verified=1 THEN realized_pnl ELSE ? END,fee=CASE WHEN settlement_verified=1 THEN fee ELSE ? END,status='CLOSED',close_reason=CASE WHEN settlement_verified=1 THEN close_reason ELSE ? END,accounting_quality=?,updated_at=? WHERE id=?`,
+			lot.quantity, exitPrice, exitOrderID, exitAt, allocatedPnL, allocatedPnL, allocatedFee, closeReason, quality, now, lot.id); err != nil {
 			return false, err
 		}
 	}
@@ -984,6 +998,17 @@ func (s *PositionStore) scanPositions(rows *sql.Rows) ([]*TraderPosition, error)
 		positions = append(positions, &pos)
 	}
 
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	for _, p := range positions {
+		if err := s.hydrateSettlement(p); err != nil {
+			return nil, err
+		}
+	}
 	return positions, nil
 }
 

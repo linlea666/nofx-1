@@ -52,7 +52,9 @@ type CopyTradeConfig struct {
 	// ============================================================
 
 	// 主开关
-	RiskStopLossEnabled bool `json:"risk_stop_loss_enabled"` // 默认 true
+	RiskStopLossEnabled         bool `json:"risk_stop_loss_enabled"` // 默认 true
+	RiskLiquidationGuardEnabled bool `json:"risk_liquidation_guard_enabled"`
+	FollowExitPolicyVersion     int  `json:"follow_exit_policy_version"`
 	// RiskProtectionMode selects the independent stop-price policy. Historical
 	// policies default to atr_structure; position_margin_pct must be explicitly
 	// selected per trader and snapshots into each new Copy Guard lifecycle.
@@ -313,6 +315,8 @@ func NewCopyGuardDefaults() *CopyTradeConfig {
 		CopyCatchupWindowSeconds:       60,
 		CopyCatchupMaxAdverseBPS:       20,
 		RiskStopLossEnabled:            true,
+		RiskLiquidationGuardEnabled:    true,
+		FollowExitPolicyVersion:        2,
 		RiskProtectionMode:             RiskProtectionModeATRStructure,
 		RiskPositionMarginStopPct:      DefaultRiskPositionMarginStopPct,
 		RiskAccountPct:                 0.02,
@@ -437,7 +441,7 @@ func NormalizeCopyGuardProtectionModeTransition(current, previous *CopyTradeConf
 // （RiskAccountPct=0.02 / RiskLeverageMaxLoss=0.50）；用户显式改过的其他值保留。
 // 只改内存值，下次保存时随 saveCopyGuardPolicy 持久化。
 func upgradeLegacyRiskPolicy(c *CopyTradeConfig) {
-	if c == nil || !RiskPolicyUpgradeSupported(c.ProviderType) || !c.RiskStopLossEnabled || c.RiskPolicyVersion >= 4 {
+	if c == nil || !RiskPolicyUpgradeSupported(c.ProviderType) || !(c.RiskStopLossEnabled || c.RiskLiquidationGuardEnabled) || c.RiskPolicyVersion >= 4 {
 		return
 	}
 	c.RiskPolicyVersion = 4
@@ -508,6 +512,8 @@ func (s *CopyTradeStore) initTables() error {
 		{"copy_trade_configs", "copy_catchup_window_seconds", "INTEGER DEFAULT 60"},
 		{"copy_trade_configs", "copy_catchup_max_adverse_bps", "REAL DEFAULT 20"},
 		{"copy_trade_configs", "risk_stop_loss_enabled", "INTEGER DEFAULT 1"},
+		{"copy_trade_configs", "risk_liquidation_guard_enabled", "INTEGER NOT NULL DEFAULT 1"},
+		{"copy_trade_configs", "follow_exit_policy_version", "INTEGER NOT NULL DEFAULT 2"},
 		{"copy_trade_configs", "risk_account_pct", "REAL DEFAULT 0"},
 		{"copy_trade_configs", "risk_atr_multiplier", "REAL DEFAULT 2.0"},
 		{"copy_trade_configs", "risk_atr_timeframe", "TEXT DEFAULT '1h'"},
@@ -796,6 +802,9 @@ func scanCopyTradeConfig(scanner interface {
 func (s *CopyTradeStore) hydrateCopyTradeConfig(config *CopyTradeConfig) error {
 	if config == nil {
 		return nil
+	}
+	if err := s.db.QueryRow(`SELECT risk_liquidation_guard_enabled, follow_exit_policy_version FROM copy_trade_configs WHERE trader_id=?`, config.TraderID).Scan(&config.RiskLiquidationGuardEnabled, &config.FollowExitPolicyVersion); err != nil {
+		return err
 	}
 	if err := s.loadCopyGuardPolicy(config); err != nil && err != sql.ErrNoRows {
 		return err
@@ -1257,7 +1266,8 @@ const mappingSelectColumns = `
 	COALESCE(leader_pnl_at_stop, 0) AS leader_pnl_at_stop,
 	COALESCE(leader_size_at_stop, 0) AS leader_size_at_stop,
 	COALESCE(add_count_at_stop, 0) AS add_count_at_stop,
-	COALESCE(reentry_used, 0) AS reentry_used`
+	COALESCE(reentry_used, 0) AS reentry_used,
+	COALESCE(last_failure_reason, '') AS last_failure_reason`
 
 // scanMapping 共用 mapping Scan 逻辑
 // 参数顺序与 mappingSelectColumns 一致
@@ -1276,7 +1286,7 @@ func scanMapping(scanner interface {
 		&openedAt, &mapping.OpenPrice, &mapping.OpenSizeUSD, &mapping.LastKnownSize, &closedAt, &mapping.ClosePrice,
 		&mapping.AddCount, &mapping.ReduceCount, &updatedAt,
 		&stoppedAt, &mapping.LeaderPnLAtStop, &mapping.LeaderSizeAtStop,
-		&mapping.AddCountAtStop, &mapping.ReentryUsed,
+		&mapping.AddCountAtStop, &mapping.ReentryUsed, &mapping.LastFailureReason,
 	)
 	if err != nil {
 		return nil, err
@@ -1749,7 +1759,7 @@ func (s *CopyTradeStore) MarkManualStopped(traderID, leaderPosID string) (bool, 
 		SET status = 'manual_stopped',
 		    stopped_at = CURRENT_TIMESTAMP,
 		    updated_at = CURRENT_TIMESTAMP
-		WHERE trader_id = ? AND leader_pos_id = ? AND status = 'active'
+		WHERE trader_id = ? AND leader_pos_id = ? AND status IN ('active','stopped_by_risk','detached')
 	`, traderID, leaderPosID)
 	if err != nil {
 		return false, err

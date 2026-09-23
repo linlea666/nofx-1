@@ -101,6 +101,11 @@ type CopyTradeExecutionOrderAttempt struct {
 // relationship; intents describe the individual exchange mutation that moves
 // that relationship forward.
 type CopyTradeExecutionIntent struct {
+	SourceSnapshotMS          int64
+	SignalObservedMS          int64
+	LeaderExitScope           string     `json:"leader_exit_scope,omitempty"`
+	LeaderExitRatio           float64    `json:"leader_exit_ratio,omitempty"`
+	SourceOpenedMS            int64      `json:"source_opened_ms,omitempty"`
 	ID                        int64      `json:"id"`
 	TraderID                  string     `json:"trader_id"`
 	LeaderPosID               string     `json:"leader_pos_id"`
@@ -1140,6 +1145,9 @@ func (s *CopyTradeStore) CommitIgnoredLeaderTransition(c IgnoredLeaderTransition
 	if err != nil {
 		return err
 	}
+	if _, err = tx.Exec(`UPDATE copy_trade_position_mappings SET last_failure_reason=? WHERE trader_id=? AND leader_pos_id=? AND status='ignored' AND source_revision=?`, c.ReasonCode, c.TraderID, c.LeaderPosID, c.SourceRevision); err != nil {
+		return err
+	}
 	res, err := tx.Exec(`UPDATE copy_trade_execution_intents SET status='SKIPPED',reason_code=?,last_error='',terminal_at=COALESCE(terminal_at,CURRENT_TIMESTAMP),updated_at=CURRENT_TIMESTAMP WHERE id=? AND trader_id=? AND leader_pos_id=? AND source_revision=? AND status IN ('RESERVED','SUBMITTED','RECONCILING')`,
 		c.ReasonCode, c.IntentID, c.TraderID, c.LeaderPosID, c.SourceRevision)
 	if err != nil {
@@ -1606,6 +1614,19 @@ func (s *CopyTradeStore) ReserveExecutionIntent(intent *CopyTradeExecutionIntent
 	}
 	sourceIDs := append([]string(nil), intent.SourceFillIDs...)
 	if claimed {
+		if _, err = tx.Exec(`INSERT INTO copy_trade_execution_timings(intent_id,source_snapshot_ms,signal_observed_ms) VALUES(?,?,?) ON CONFLICT(intent_id) DO NOTHING`, stored.ID, intent.SourceSnapshotMS, intent.SignalObservedMS); err != nil {
+			return nil, false, err
+		}
+		if intent.LeaderExitScope != "" {
+			if _, err = tx.Exec(`INSERT INTO copy_trade_leader_exit_requests(intent_id,scope,ratio) VALUES(?,?,?) ON CONFLICT(intent_id) DO UPDATE SET scope=excluded.scope,ratio=excluded.ratio`, stored.ID, intent.LeaderExitScope, intent.LeaderExitRatio); err != nil {
+				return nil, false, err
+			}
+		}
+		if intent.SourceOpenedMS > 0 && (intent.Action == "open_long" || intent.Action == "open_short") {
+			if _, err = tx.Exec(`INSERT INTO copy_trade_source_lifecycles(trader_id,leader_pos_id,opened_ms) VALUES(?,?,?) ON CONFLICT(trader_id,leader_pos_id) DO UPDATE SET opened_ms=excluded.opened_ms`, intent.TraderID, intent.LeaderPosID, intent.SourceOpenedMS); err != nil {
+				return nil, false, err
+			}
+		}
 		if _, err = tx.Exec(`UPDATE copy_trade_execution_intents SET follow_control_version=COALESCE((SELECT version FROM copy_trade_follow_controls WHERE trader_id=? AND leader_pos_id=?),0) WHERE id=?`, intent.TraderID, intent.LeaderPosID, stored.ID); err != nil {
 			return nil, false, err
 		}
@@ -1831,6 +1852,9 @@ func (s *CopyTradeStore) MarkExecutionOrderAttemptSubmitted(intentID int64, clie
 		return nil, err
 	}
 	if _, err = tx.Exec(`UPDATE copy_trade_source_transitions SET status='SUBMITTED',updated_at=CURRENT_TIMESTAMP WHERE intent_id=?`, intentID); err != nil {
+		return nil, err
+	}
+	if _, err = tx.Exec(`INSERT INTO copy_trade_execution_timings(intent_id,first_submitted_ms) VALUES(?,?) ON CONFLICT(intent_id) DO UPDATE SET first_submitted_ms=CASE WHEN first_submitted_ms=0 THEN excluded.first_submitted_ms ELSE first_submitted_ms END`, intentID, time.Now().UnixMilli()); err != nil {
 		return nil, err
 	}
 	attempt, err := scanExecutionOrderAttempt(tx.QueryRow(`SELECT id,intent_id,attempt_no,client_order_id,COALESCE(quantity_kind,''),requested_quantity,quantized_quantity,filled_quantity,exchange_order_id,exchange_state,status,last_error,created_at,updated_at,submitted_at,filled_at,terminal_at FROM copy_trade_execution_order_attempts WHERE intent_id=? AND client_order_id=?`, intentID, clientOrderID))

@@ -31,7 +31,10 @@ func TestManualFixedStopSurvivesAddsReductionsAndRestart(t *testing.T) {
 				}
 			}
 			ex := &positionMarginLifecycleExecutor{}
-			ex.setPosition(100, 1, 10, 100, 0)
+			ex.setPosition(100, 1, 10, 100, 80)
+			if side == "short" {
+				ex.positions[0]["liquidationPrice"] = 120.0
+			}
 			ex.positions[0]["side"] = side
 			ti := controlIntegration(st, ex)
 			d := &decision.Decision{LeaderPosID: "p", Symbol: "ETHUSDT", Action: "open_" + side, MarginMode: "cross", Leverage: 10}

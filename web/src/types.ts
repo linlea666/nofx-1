@@ -51,6 +51,10 @@ export interface Position {
 export interface CopyTradePositionMapping {
   current_position_key?: string
   custody_state?: 'MANAGED' | 'RELEASED' | 'UNKNOWN'
+  follow_state?: string
+  follow_reason?: string
+  leader_exit_enabled?: boolean
+  protection_status?: string
   can_resume?: boolean
   resume_reason?: string
   id: number
@@ -335,6 +339,8 @@ export interface CopyConfigRequest {
   // v3 遗留字段（risk_atr_enabled / risk_reentry_tolerance / 反加仓铁律 /
   // risk_stop_noise_floor_atr / risk_cycle_max_loss_pct）已随 v5 下线。
   // ============================================================
+  risk_liquidation_guard_enabled?: boolean
+  follow_exit_policy_version?: number
   risk_stop_loss_enabled?: boolean // 默认 true：启用账户保护硬止损
   risk_protection_mode?: 'atr_structure' | 'position_margin_pct'
   risk_position_margin_stop_pct?: number // 0.80 = 首仓保证金亏损80%
@@ -866,6 +872,8 @@ export interface CopyTradeConfig {
   binance_top_trader_id?: string
   source_generation?: number
   // Copy Guard v7，详见 CopyConfigRequest
+  risk_liquidation_guard_enabled?: boolean
+  follow_exit_policy_version?: number
   risk_stop_loss_enabled?: boolean
   risk_protection_mode?: 'atr_structure' | 'position_margin_pct'
   risk_position_margin_stop_pct?: number

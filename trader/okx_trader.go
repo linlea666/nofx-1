@@ -2489,7 +2489,7 @@ func (t *OKXTrader) getClosedPnLFromPath(path string) ([]ClosedPnLRecord, error)
 	records := make([]ClosedPnLRecord, 0, len(positions))
 
 	for _, pos := range positions {
-		record := ClosedPnLRecord{}
+		record := ClosedPnLRecord{RequiresScopedSettlementProof: true}
 
 		// Convert instrument ID to standard format (BTC-USDT-SWAP -> BTCUSDT)
 		parts := strings.Split(pos.InstID, "-")
@@ -2520,7 +2520,7 @@ func (t *OKXTrader) getClosedPnLFromPath(path string) ([]ClosedPnLRecord, error)
 		// Fee
 		fee, _ := strconv.ParseFloat(pos.Fee, 64)
 		fundingFee, _ := strconv.ParseFloat(pos.FundingFee, 64)
-		record.Fee = math.Abs(fee) // display as a positive cost; RealizedPnL already includes it
+		record.Fee = -fee // charged fee is a positive cost; a rebate remains negative
 		record.FundingFee = fundingFee
 		penalty, _ := strconv.ParseFloat(pos.LiqPenalty, 64)
 		record.LiquidationPenalty = math.Abs(penalty)

@@ -118,6 +118,8 @@ const statusLabels: Record<string, string> = {
   success: '成功',
   failed: '失败',
   skipped: '跳过',
+  reconciling: '对账中',
+  pending: '等待中',
 }
 
 const severityStyle: Record<CopyEventSeverity, { color: string; bg: string }> =
@@ -436,6 +438,48 @@ export function CopyEventLogPage() {
                     <div className={isOpen ? '' : 'truncate'}>
                       {e.summary || '-'}
                     </div>
+                    {isOpen &&
+                      e.detail &&
+                      typeof e.detail.leader_equity === 'number' && (
+                        <div className="mt-2 text-xs text-[#B7BDC6] leading-6">
+                          <div>
+                            领航员权益：{fmtNum(Number(e.detail.leader_equity))}{' '}
+                            · 跟随权益：
+                            {fmtNum(Number(e.detail.follower_equity))} USDT
+                          </div>
+                          <div>
+                            跟单系数：
+                            {fmtNum(Number(e.detail.copy_coefficient))} ·
+                            源名义金额：
+                            {fmtNum(Number(e.detail.source_notional))} USDT
+                          </div>
+                          <div>
+                            目标金额：{fmtNum(Number(e.detail.target_notional))}{' '}
+                            USDT · 实际成交金额：
+                            {fmtNum(Number(e.detail.filled_notional || 0))} USDT
+                          </div>
+                          <div>
+                            原始数量：
+                            {fmtNum(Number(e.detail.requested_quantity || 0))} ·
+                            量化数量：
+                            {fmtNum(Number(e.detail.quantized_quantity || 0))} ·
+                            成交数量：
+                            {fmtNum(Number(e.detail.filled_quantity || 0))}
+                          </div>
+                          <div>
+                            金额差额：
+                            {fmtNum(Number(e.detail.notional_gap || 0))} USDT ·
+                            剩余未成交数量：
+                            {fmtNum(Number(e.detail.residual_quantity || 0))} ·
+                            原因：
+                            {String(
+                              e.detail.catchup_reason ||
+                                e.detail.reason_code ||
+                                '—'
+                            )}
+                          </div>
+                        </div>
+                      )}
                     {isOpen && e.detail && (
                       <pre className="mt-2 p-2 rounded bg-[#0B0E11] text-[11px] text-[#848E9C] overflow-x-auto whitespace-pre-wrap">
                         {JSON.stringify(e.detail, null, 2)}

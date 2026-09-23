@@ -559,27 +559,28 @@ type CopyConfigReq struct {
 	// 参数保留值类型并由统一默认工厂兜底。
 	// v3 遗留字段（risk_atr_enabled / risk_reentry_tolerance / 反加仓铁律 /
 	// risk_stop_noise_floor_atr / risk_cycle_max_loss_pct）已随 v5 下线
-	RiskStopLossEnabled        *bool    `json:"risk_stop_loss_enabled,omitempty"`
-	RiskProtectionMode         *string  `json:"risk_protection_mode,omitempty"`
-	RiskPositionMarginStopPct  *float64 `json:"risk_position_margin_stop_pct,omitempty"`
-	RiskStopMaxAccountLossPct  *float64 `json:"risk_stop_max_account_loss_pct,omitempty"`
-	RiskAccountPct             float64  `json:"risk_account_pct,omitempty"`
-	RiskATRMultiplier          float64  `json:"risk_atr_multiplier,omitempty"`
-	RiskATRTimeframe           string   `json:"risk_atr_timeframe,omitempty"`
-	RiskLeverageFallback       *bool    `json:"risk_leverage_fallback,omitempty"`
-	RiskLeverageMaxLoss        float64  `json:"risk_leverage_max_loss,omitempty"`
-	RiskReentryEnabled         *bool    `json:"risk_reentry_enabled,omitempty"`
-	RiskReentryRatio           float64  `json:"risk_reentry_ratio,omitempty"`
-	RiskReentryDecisionMode    *string  `json:"risk_reentry_decision_mode,omitempty"`
-	RiskReentryMinNotional     *float64 `json:"risk_reentry_min_notional,omitempty"`
-	RiskCycleLossBudgetPct     *float64 `json:"risk_cycle_loss_budget_pct,omitempty"`
-	RiskPortfolioLossBudgetPct *float64 `json:"risk_portfolio_loss_budget_pct,omitempty"`
-	RiskRoundTripFeeBPS        *float64 `json:"risk_round_trip_fee_bps,omitempty"`
-	RiskAIConfidenceThreshold  *float64 `json:"risk_ai_confidence_threshold,omitempty"`
-	RiskAIMinReviewSeconds     *int     `json:"risk_ai_min_review_seconds,omitempty"`
-	RiskAIDailyCallLimit       *int     `json:"risk_ai_daily_call_limit,omitempty"`
-	RiskAILifecycleCallLimit   *int     `json:"risk_ai_lifecycle_call_limit,omitempty"`
-	RiskNotificationLevel      *string  `json:"risk_notification_level,omitempty"`
+	RiskStopLossEnabled         *bool    `json:"risk_stop_loss_enabled,omitempty"`
+	RiskLiquidationGuardEnabled *bool    `json:"risk_liquidation_guard_enabled,omitempty"`
+	RiskProtectionMode          *string  `json:"risk_protection_mode,omitempty"`
+	RiskPositionMarginStopPct   *float64 `json:"risk_position_margin_stop_pct,omitempty"`
+	RiskStopMaxAccountLossPct   *float64 `json:"risk_stop_max_account_loss_pct,omitempty"`
+	RiskAccountPct              float64  `json:"risk_account_pct,omitempty"`
+	RiskATRMultiplier           float64  `json:"risk_atr_multiplier,omitempty"`
+	RiskATRTimeframe            string   `json:"risk_atr_timeframe,omitempty"`
+	RiskLeverageFallback        *bool    `json:"risk_leverage_fallback,omitempty"`
+	RiskLeverageMaxLoss         float64  `json:"risk_leverage_max_loss,omitempty"`
+	RiskReentryEnabled          *bool    `json:"risk_reentry_enabled,omitempty"`
+	RiskReentryRatio            float64  `json:"risk_reentry_ratio,omitempty"`
+	RiskReentryDecisionMode     *string  `json:"risk_reentry_decision_mode,omitempty"`
+	RiskReentryMinNotional      *float64 `json:"risk_reentry_min_notional,omitempty"`
+	RiskCycleLossBudgetPct      *float64 `json:"risk_cycle_loss_budget_pct,omitempty"`
+	RiskPortfolioLossBudgetPct  *float64 `json:"risk_portfolio_loss_budget_pct,omitempty"`
+	RiskRoundTripFeeBPS         *float64 `json:"risk_round_trip_fee_bps,omitempty"`
+	RiskAIConfidenceThreshold   *float64 `json:"risk_ai_confidence_threshold,omitempty"`
+	RiskAIMinReviewSeconds      *int     `json:"risk_ai_min_review_seconds,omitempty"`
+	RiskAIDailyCallLimit        *int     `json:"risk_ai_daily_call_limit,omitempty"`
+	RiskAILifecycleCallLimit    *int     `json:"risk_ai_lifecycle_call_limit,omitempty"`
+	RiskNotificationLevel       *string  `json:"risk_notification_level,omitempty"`
 	// 历史人工重入兼容字段；v7 固定 false
 	RiskManualReentryEnabled *bool `json:"risk_manual_reentry_enabled,omitempty"`
 
@@ -643,6 +644,7 @@ func applyCopyConfigRiskFields(copyConfig *store.CopyTradeConfig, req *CopyConfi
 	}
 	// 开关：nil 用合理默认；非 nil 用 *值
 	copyConfig.RiskStopLossEnabled = derefBoolDefault(req.RiskStopLossEnabled, copyConfig.RiskStopLossEnabled)
+	copyConfig.RiskLiquidationGuardEnabled = derefBoolDefault(req.RiskLiquidationGuardEnabled, copyConfig.RiskLiquidationGuardEnabled)
 	if req.RiskProtectionMode != nil {
 		copyConfig.RiskProtectionMode = *req.RiskProtectionMode
 	}
@@ -1771,7 +1773,7 @@ func (s *Server) handleStartTrader(c *gin.Context) {
 			return
 		}
 		copyGuardExclusive = copytrade.SupportsCopyGuard(copytrade.ProviderType(persistedConfig.ProviderType)) &&
-			((persistedConfig.RiskPolicyVersion >= 4 && persistedConfig.RiskStopLossEnabled) || hasOpenCycles)
+			(persistedConfig.FollowExitPolicyVersion >= 2 || (persistedConfig.RiskPolicyVersion >= 4 && (persistedConfig.RiskStopLossEnabled || persistedConfig.RiskLiquidationGuardEnabled)) || hasOpenCycles)
 	}
 	if copyGuardExclusive {
 		err = s.store.Trader().CompleteCopyGuardStart(userID, traderID, lifecycle.Generation, fullConfig.Trader.ExchangeID)

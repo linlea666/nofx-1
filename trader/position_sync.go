@@ -168,9 +168,9 @@ func (m *PositionSyncManager) syncTraderPositions(traderID string, localPosition
 		return
 	}
 
-	// Build exchange position map: symbol_side -> position
+	// Aggregate all margin modes before comparing account-level local lots.
 	// Note: Exchange returns side as "long"/"short" (lowercase), database stores "LONG"/"SHORT" (uppercase)
-	exchangeMap := make(map[string]map[string]interface{})
+	exchangeMap := make(map[string]float64)
 	for _, pos := range exchangePositions {
 		symbol, _ := pos["symbol"].(string)
 		side, _ := pos["side"].(string) // Note: use "side" not "positionSide"
@@ -180,7 +180,7 @@ func (m *PositionSyncManager) syncTraderPositions(traderID string, localPosition
 		// Normalize side to uppercase for matching with database
 		normalizedSide := strings.ToUpper(side)
 		key := fmt.Sprintf("%s_%s", symbol, normalizedSide)
-		exchangeMap[key] = pos
+		exchangeMap[key] += math.Abs(getFloatFromMap(pos, "positionAmt"))
 	}
 
 	localByMarket := make(map[string][]*store.TraderPosition)
@@ -193,7 +193,7 @@ func (m *PositionSyncManager) syncTraderPositions(traderID string, localPosition
 		exchangePos, exists := exchangeMap[key]
 		exchangeQty := 0.0
 		if exists {
-			exchangeQty = math.Abs(getFloatFromMap(exchangePos, "positionAmt"))
+			exchangeQty = exchangePos
 		}
 		localQty := 0.0
 		var oldest *store.TraderPosition
@@ -1250,6 +1250,9 @@ func (m *PositionSyncManager) maybeRunHistorySync(traderID, exchangeID, exchange
 	if !exists || time.Since(lastSync) >= m.historySyncInterval {
 		m.syncClosedPositionsHistory(traderID, exchangeID, exchangeType, trader)
 		m.reconcilePendingClosedPositions(traderID, exchangeID, trader)
+		if okx, ok := trader.(*OKXTrader); ok {
+			m.reconcileOKXSettlements(exchangeID, okx)
+		}
 		m.lastHistorySyncMutex.Lock()
 		m.lastHistorySync[traderID] = time.Now()
 		m.lastHistorySyncMutex.Unlock()

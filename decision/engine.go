@@ -141,7 +141,9 @@ type Decision struct {
 	MarginMode            string  `json:"margin_mode,omitempty"` // "cross" | "isolated"，跟单时同步领航员的保证金模式
 
 	// Closing position parameters (for partial close/reduce)
-	CloseRatio float64 `json:"close_ratio,omitempty"` // 0 = close all, 0.5 = close 50%, etc.
+	CloseRatio      float64 `json:"close_ratio,omitempty"` // 0 = close all, 0.5 = close 50%, etc.
+	LeaderExitScope string  `json:"leader_exit_scope,omitempty"`
+	SourceOpenedMS  int64   `json:"source_opened_ms,omitempty"`
 
 	// Common parameters
 	Confidence int     `json:"confidence,omitempty"` // Confidence level (0-100)
@@ -159,6 +161,12 @@ type Decision struct {
 	// CopyTradeAction is the normalized source transition ("open", "add",
 	// "reduce", "close", "ai_reentry"). It replaces fragile Reasoning text
 	// parsing at execution and quantity-policy boundaries.
+	CopyLeaderEquity      float64 `json:"copy_leader_equity,omitempty"`
+	CopyFollowerEquity    float64 `json:"copy_follower_equity,omitempty"`
+	CopyCoefficient       float64 `json:"copy_coefficient,omitempty"`
+	SourceNotional        float64 `json:"source_notional,omitempty"`
+	SourceSnapshotMS      int64   `json:"source_snapshot_ms,omitempty"`
+	SignalObservedMS      int64   `json:"signal_observed_ms,omitempty"`
 	CopyTradeAction       string  `json:"copy_trade_action,omitempty"`
 	LeaderPosID           string  `json:"leader_pos_id,omitempty"`   // 领航员仓位 ID（用于映射追踪）
 	LeaderPosSize         float64 `json:"leader_pos_size,omitempty"` // 领航员当前持仓数量（用于 lastKnownSize 追踪）

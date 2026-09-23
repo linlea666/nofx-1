@@ -843,7 +843,7 @@ function TraderDetailsPage({
         : mapping.side.toUpperCase()
     const confirmMsg =
       language === 'zh'
-        ? `确定停止跟随 ${mapping.symbol} ${sideLabel} 吗？\n\n停止后：\n· 领航员对该仓位的加仓/减仓/平仓将全部不再跟随\n· 领航员再开 ${mapping.symbol} 同方向新仓也会跳过\n· Copy Guard 止损保护继续有效\n· 可恢复原仓跟单，恢复后只跟随后续动作；其他仓位不受影响`
+        ? `确定停止跟随 ${mapping.symbol} ${sideLabel} 吗？\n\n停止后：\n· 领航员对该仓位的加仓/减仓/平仓将全部不再跟随\n· 领航员再开 ${mapping.symbol} 同方向新仓也会跳过\n· Copy Guard 止损保护继续有效\n· 原仓仍连续且领航员原周期有效时才可恢复；恢复只跟随后续动作`
         : `Stop following ${mapping.symbol} ${sideLabel}?\n\nAfter stopping:\n· Leader's add/reduce/close on this position will no longer be followed\n· New leader positions on ${mapping.symbol} same side will be skipped\n· Copy Guard stop-loss protection stays active\n· You can resume the original position for future actions; other positions are unaffected`
 
     const confirmed = await confirmToast(confirmMsg, {
@@ -1377,15 +1377,46 @@ function TraderDetailsPage({
                             </button>
                             {isCopyTradeMode &&
                               (() => {
-                                const { mapping, unknown } =
-                                  copyPositionControl(pos, copyMappings)
+                                const {
+                                  mapping,
+                                  unknown,
+                                  exitMapping,
+                                  followReason,
+                                  followLabel,
+                                } = copyPositionControl(pos, copyMappings)
+                                if (!mapping && exitMapping) {
+                                  return (
+                                    <button
+                                      type="button"
+                                      className="text-[10px] text-yellow-500"
+                                      title={followReason}
+                                      disabled={
+                                        stoppingFollow ===
+                                        exitMapping.leader_pos_id
+                                      }
+                                      onClick={(e) => {
+                                        e.stopPropagation()
+                                        handleStopFollow(exitMapping)
+                                      }}
+                                    >
+                                      {language === 'zh'
+                                        ? '跟随减/平 · 停跟'
+                                        : 'Following exits · Pause'}
+                                    </button>
+                                  )
+                                }
                                 if (!mapping) {
                                   return (
-                                    <span className="text-[10px] text-nofx-text-muted">
+                                    <span
+                                      title={followReason}
+                                      className="text-[10px] text-nofx-text-muted"
+                                    >
                                       {language === 'zh'
-                                        ? unknown
-                                          ? '归属待核实'
-                                          : '独立手动仓'
+                                        ? followReason
+                                          ? followLabel
+                                          : unknown
+                                            ? '归属待核实'
+                                            : '独立手动仓'
                                         : unknown
                                           ? 'Checking ownership'
                                           : 'Manual position'}

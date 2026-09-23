@@ -24,5 +24,22 @@ export function copyPositionControl(
         (m.execution_symbol || m.symbol) === position.symbol &&
         m.side.toLowerCase() === position.side.toLowerCase()
     )
-  return { mapping, unknown }
+  const related =
+    mappings?.filter(
+      (m) =>
+        (m.execution_symbol || m.symbol) === position.symbol &&
+        m.side.toLowerCase() === position.side.toLowerCase()
+    ) ?? []
+  const exits = related.filter((m) => m.leader_exit_enabled)
+  const exitMapping = exits.length === 1 ? exits[0] : undefined
+  const followReason = related
+    .map((m) => m.follow_reason)
+    .filter(Boolean)
+    .join('；')
+  const followLabel = related.some((m) => m.status === 'manual_stopped')
+    ? '已暂停'
+    : related.some((m) => m.status === 'ignored')
+      ? '本轮跳过'
+      : '跟随状态待核实'
+  return { mapping, unknown, exitMapping, followReason, followLabel }
 }

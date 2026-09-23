@@ -12,6 +12,10 @@ import (
 )
 
 type FollowPositionView struct {
+	FollowState       string `json:"follow_state"`
+	FollowReason      string `json:"follow_reason"`
+	LeaderExitEnabled bool   `json:"leader_exit_enabled"`
+	ProtectionStatus  string `json:"protection_status"`
 	*store.CopyTradePositionMapping
 	CustodyState       string `json:"custody_state"`
 	CurrentPositionKey string `json:"current_position_key,omitempty"`
@@ -21,6 +25,32 @@ type FollowPositionView struct {
 
 func InspectFollowingPosition(st *store.Store, m *store.CopyTradePositionMapping) FollowPositionView {
 	view := FollowPositionView{CopyTradePositionMapping: m, CustodyState: "UNKNOWN", ResumeReason: "仓位归属待核实"}
+	view.FollowState = m.Status
+	view.LeaderExitEnabled = m.Status == store.MappingStatusActive || m.Status == store.MappingStatusStoppedByRisk || m.Status == store.MappingStatusDetached
+	switch m.Status {
+	case store.MappingStatusManualStopped:
+		view.FollowReason = "已主动暂停；不跟随领航员任何动作，已有保护继续生效"
+	case store.MappingStatusIgnored:
+		switch m.LastFailureReason {
+		case "ROLLOUT_NO_CHASE":
+			view.FollowReason = "上线恢复时已存在的源仓；本轮不补开，等待领航员下一轮"
+		case "INDEPENDENT_POSITION_CONFLICT":
+			view.FollowReason = "新周期前已有同币种同方向独立手动仓；整轮不跟随、不接管保护"
+		case "":
+			view.FollowReason = "启动基线中已有的源仓；整轮不跟随"
+		default:
+			view.FollowReason = "本轮跳过：" + m.LastFailureReason
+		}
+	case store.MappingStatusStoppedByRisk:
+		view.FollowReason = "本轮风险退出；不再开仓加仓，继续跟随领航员减仓和平仓"
+	case store.MappingStatusDetached:
+		view.FollowReason = "原跟单仓已结束；仍跟随本轮领航员减仓和平仓"
+	default:
+		view.FollowReason = "跟随开仓、加仓；减仓和平仓覆盖同币种同方向总仓"
+	}
+	if c, err := st.CopyTrade().GetOpenCopyGuardCycle(m.TraderID, m.LeaderPosID); err == nil {
+		view.ProtectionStatus = c.ProtectionStatus
+	}
 	p, err := st.CopyTrade().GetPositionCustody(m.TraderID, m.LeaderPosID)
 	if err != nil {
 		return view
@@ -168,7 +198,7 @@ func ResumeFollowingPosition(traderID, leaderPosID string) error {
 		return fmt.Errorf("领航员当前仓位不可用: %w", err)
 	}
 	leader := ti.engine.buildLeaderPosMap()[leaderPosID]
-	if leader == nil || leader.Size <= 0 || !strings.EqualFold(string(leader.Side), m.Side) || (ti.engine.config.SyncMarginMode && leader.MarginMode != m.MarginMode) {
+	if leader == nil || leader.Size <= 0 || ti.engine.sourceLifecycleChanged(leaderPosID, leader) || !strings.EqualFold(string(leader.Side), m.Side) || (ti.engine.config.SyncMarginMode && leader.MarginMode != m.MarginMode) {
 		return fmt.Errorf("领航员原仓已经结束或身份变化")
 	}
 	ti.riskExitMu.Lock()

@@ -494,27 +494,49 @@ func convertOKXPositionHistory(rows []OKXPositionHistoryRawEntry) []OKXLeaderPos
 
 // GetAccountState 获取账户状态
 func (p *OKXProvider) GetAccountState(uniqueName string) (*AccountState, error) {
-	now := time.Now().UnixMilli()
-
-	// 1. 获取资产
-	assetURL := fmt.Sprintf("%s?uniqueName=%s&t=%d", OKXAssetAPI, neturl.QueryEscape(uniqueName), now)
-	var assetResp OKXAssetResp
-	if err := p.get(assetURL, &assetResp); err != nil {
+	// Full account callers retain the legacy request order. The signal path
+	// calls GetPositionSnapshot directly and never waits for this asset read.
+	equity, equityErr := p.GetLeaderEquity(uniqueName)
+	state, err := p.GetPositionSnapshot(uniqueName)
+	if err != nil {
 		return nil, err
 	}
-	// 业务码校验：OKX 限频/uniqueName 无效等场景 HTTP 仍是 200，但 code != "0"
-	// 且 data 为空。若不校验，TotalEquity 会静默保持 0，下游比例计算分母失真。
-	if assetResp.Code != "0" {
-		return nil, fmt.Errorf("OKX asset API error: code=%s msg=%s", assetResp.Code, assetResp.Msg)
+	if equityErr == nil {
+		state.TotalEquity, state.AvailableBalance = equity, equity
 	}
+	return state, nil
+}
 
+func (p *OKXProvider) GetLeaderEquity(uniqueName string) (float64, error) {
+	var response OKXAssetResp
+	url := fmt.Sprintf("%s?uniqueName=%s&t=%d", OKXAssetAPI, neturl.QueryEscape(uniqueName), time.Now().UnixMilli())
+	if err := p.get(url, &response); err != nil {
+		return 0, err
+	}
+	if response.Code != "0" {
+		return 0, fmt.Errorf("OKX asset API error: code=%s msg=%s", response.Code, response.Msg)
+	}
+	for _, asset := range response.Data {
+		if asset.Currency == "USDT" {
+			value, err := strconv.ParseFloat(asset.Amount, 64)
+			if err != nil || value <= 0 || math.IsNaN(value) || math.IsInf(value, 0) {
+				return 0, fmt.Errorf("OKX equity is invalid")
+			}
+			return value, nil
+		}
+	}
+	return 0, fmt.Errorf("OKX equity is unavailable")
+}
+
+func (p *OKXProvider) readPositionSnapshot(uniqueName string) (*AccountState, error) {
+	now := time.Now().UnixMilli()
 	// 2. 获取持仓
 	posURL := fmt.Sprintf("%s?uniqueName=%s&t=%d", OKXPositionAPI, neturl.QueryEscape(uniqueName), now)
 	var posResp OKXPositionResp
 	if err := p.get(posURL, &posResp); err != nil {
 		return nil, err
 	}
-	if posResp.Code != "0" {
+	if posResp.Code != "0" || posResp.Data == nil {
 		return nil, fmt.Errorf("OKX position API error: code=%s msg=%s", posResp.Code, posResp.Msg)
 	}
 
@@ -523,21 +545,18 @@ func (p *OKXProvider) GetAccountState(uniqueName string) (*AccountState, error) 
 		Timestamp: time.Now(),
 	}
 
-	// 解析资产（USDT 为总权益）
-	for _, asset := range assetResp.Data {
-		if asset.Currency == "USDT" {
-			state.TotalEquity = parseFloat(asset.Amount)
-			state.AvailableBalance = state.TotalEquity
-			break
-		}
-	}
-
 	// 解析持仓 (OKX: 使用 posId 作为唯一标识，精确区分每个仓位)
 	for _, pd := range posResp.Data {
+		if pd.PosData == nil {
+			return nil, fmt.Errorf("OKX snapshot position list missing")
+		}
 		for _, pos := range pd.PosData {
 			symbol := normalizeOKXSymbol(pos.InstId)
 			side := SideType(pos.PosSide)
-			size := parseFloat(pos.Pos)
+			size, parseErr := strconv.ParseFloat(pos.Pos, 64)
+			if parseErr != nil || math.IsNaN(size) || math.IsInf(size, 0) {
+				return nil, fmt.Errorf("invalid OKX source position size")
+			}
 			mgnMode := pos.MgnMode // "cross" | "isolated"
 			posId := pos.PosId     // 仓位唯一标识
 
@@ -559,6 +578,9 @@ func (p *OKXProvider) GetAccountState(uniqueName string) (*AccountState, error) 
 				continue
 			}
 
+			if (side != SideLong && side != SideShort) || size < 0 || pos.InstId == "" || (mgnMode != "cross" && mgnMode != "isolated") {
+				return nil, fmt.Errorf("incomplete OKX source position")
+			}
 			var key string
 			if posId != "" {
 				key = posId
@@ -566,6 +588,9 @@ func (p *OKXProvider) GetAccountState(uniqueName string) (*AccountState, error) 
 				key = PositionKeyWithMode(symbol, side, mgnMode)
 			}
 
+			if _, duplicate := state.Positions[key]; duplicate {
+				return nil, fmt.Errorf("duplicate OKX position identity")
+			}
 			state.Positions[key] = &Position{
 				Symbol:        symbol,
 				Side:          side,
@@ -577,6 +602,7 @@ func (p *OKXProvider) GetAccountState(uniqueName string) (*AccountState, error) 
 				UnrealizedPnL: parseFloat(pos.Upl),
 				PositionValue: parseFloat(pos.NotionalUsd),
 				PosID:         posId,
+				OpenedMS:      parseInt64(pos.CTime),
 			}
 		}
 	}
@@ -593,7 +619,7 @@ func (p *OKXProvider) get(url string, result interface{}) error {
 
 	if resp.StatusCode != http.StatusOK {
 		bodyBytes, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(bodyBytes))
+		return &OKXSourceHTTPError{Status: resp.StatusCode, RetryAfter: resp.Header.Get("Retry-After"), Message: string(bodyBytes)}
 	}
 
 	return json.NewDecoder(resp.Body).Decode(result)
@@ -742,6 +768,7 @@ type OKXPositionData struct {
 }
 
 type OKXPosition struct {
+	CTime       string `json:"cTime"`
 	AvgPx       string `json:"avgPx"`
 	InstId      string `json:"instId"`
 	Lever       string `json:"lever"`

@@ -32,7 +32,7 @@ describe('position following controls', () => {
           current_position_key: undefined,
         },
       ])
-    ).toEqual({ mapping: undefined, unknown: false })
+    ).toMatchObject({ mapping: undefined, unknown: false })
   })
   it('waits for ownership evidence instead of claiming a position is manual', () => {
     expect(copyPositionControl(position, undefined).unknown).toBe(true)
@@ -52,6 +52,36 @@ describe('position following controls', () => {
         paused,
         { ...paused, leader_pos_id: 'another' },
       ])
-    ).toEqual({ mapping: undefined, unknown: true })
+    ).toMatchObject({ mapping: undefined, unknown: true })
   })
+})
+
+it('exposes leader exit without claiming protection custody of a later manual position', () => {
+  const c = copyPositionControl(position, [
+    {
+      ...paused,
+      status: 'stopped_by_risk',
+      custody_state: 'RELEASED',
+      current_position_key: undefined,
+      can_resume: false,
+      leader_exit_enabled: true,
+    },
+  ])
+  expect(c.mapping).toBeUndefined()
+  expect(c.exitMapping?.leader_pos_id).toBe('original')
+})
+it('does not authorize exits for a whole-cycle skipped independent manual position', () => {
+  const c = copyPositionControl(position, [
+    {
+      ...paused,
+      status: 'ignored',
+      custody_state: 'RELEASED',
+      current_position_key: undefined,
+      can_resume: false,
+      leader_exit_enabled: false,
+      follow_reason: '已有独立仓位，本轮跳过',
+    },
+  ])
+  expect(c.exitMapping).toBeUndefined()
+  expect(c.followLabel).toBe('本轮跳过')
 })

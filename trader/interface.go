@@ -75,25 +75,26 @@ type ExecutionInstrumentResolver interface {
 
 // ClosedPnLRecord represents a single closed position record from exchange
 type ClosedPnLRecord struct {
-	Symbol             string  // Trading pair (e.g., "BTCUSDT")
-	Side               string  // "long" or "short"
-	EntryPrice         float64 // Entry price
-	ExitPrice          float64 // Exit/close price
-	Quantity           float64 // Position size in the exchange's native unit (OKX: contracts)
-	QuantityCoins      float64 // Position size in coins (OKX: contracts × ctVal); 0 when the exchange already reports coins or ctVal is unavailable
-	RealizedPnL        float64 // Realized profit/loss
-	Fee                float64 // Trading fee/commission
-	FundingFee         float64
-	LiquidationPenalty float64
-	GrossPnL           float64
-	Leverage           int       // Leverage used
-	MarginMode         string    // "cross" or "isolated"
-	EntryTime          time.Time // Position open time
-	ExitTime           time.Time // Position close time
-	OrderID            string    // Close order ID
-	CloseType          string    // "manual", "stop_loss", "take_profit", "liquidation", "unknown"
-	ExchangeID         string    // Exchange-specific position ID
-	Fills              []ClosedPnLRecord
+	RequiresScopedSettlementProof bool    // Native cumulative history requires fill evidence even if unit conversion failed.
+	Symbol                        string  // Trading pair (e.g., "BTCUSDT")
+	Side                          string  // "long" or "short"
+	EntryPrice                    float64 // Entry price
+	ExitPrice                     float64 // Exit/close price
+	Quantity                      float64 // Position size in the exchange's native unit (OKX: contracts)
+	QuantityCoins                 float64 // Position size in coins (OKX: contracts × ctVal); 0 when the exchange already reports coins or ctVal is unavailable
+	RealizedPnL                   float64 // Realized profit/loss
+	Fee                           float64 // Trading fee/commission
+	FundingFee                    float64
+	LiquidationPenalty            float64
+	GrossPnL                      float64
+	Leverage                      int       // Leverage used
+	MarginMode                    string    // "cross" or "isolated"
+	EntryTime                     time.Time // Position open time
+	ExitTime                      time.Time // Position close time
+	OrderID                       string    // Close order ID
+	CloseType                     string    // "manual", "stop_loss", "take_profit", "liquidation", "unknown"
+	ExchangeID                    string    // Exchange-specific position ID
+	Fills                         []ClosedPnLRecord
 }
 
 // TradeRecord represents a single trade/fill from exchange
@@ -156,15 +157,24 @@ type ProtectiveStopRequest struct {
 // CopyGuardExitRequest carries a complete scope and durable submission identity.
 // It never changes shared adapter margin-mode state or cancels unrelated orders.
 type CopyGuardExitRequest struct {
-	CycleID       int64
-	AttemptNo     int
-	Symbol        string
-	Side          string
-	MarginMode    string
-	PositionID    string
-	Quantity      float64
-	ClientOrderID string
-	BeforeSubmit  func() error
+	CycleID int64
+	// ExecutionIntentID identifies an ordinary leader exit without inventing a
+	// protective lifecycle. Both callers use the same scoped venue primitive.
+	ExecutionIntentID int64
+	AttemptNo         int
+	Symbol            string
+	Side              string
+	MarginMode        string
+	PositionID        string
+	Quantity          float64
+	ClientOrderID     string
+	BeforeSubmit      func() error
+}
+
+type ScopedPositionCloseRequest = CopyGuardExitRequest
+
+type ScopedPositionCloser interface {
+	CloseScopedPosition(ScopedPositionCloseRequest) (map[string]interface{}, error)
 }
 
 type CopyGuardScopedCloser interface {

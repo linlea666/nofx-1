@@ -74,6 +74,25 @@ func TestPositionShortfallRequiresStableVisibilityGrace(t *testing.T) {
 	}
 }
 
+func TestPositionSyncAggregatesSameSideAcrossMarginModes(t *testing.T) {
+	st, err := store.New(filepath.Join(t.TempDir(), "margin-modes.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	insertPositionSyncTrader(t, st, "t", "t", "e", true)
+	m := NewPositionSyncManager(st, time.Second)
+	m.traderCache["t"] = &positionSyncFakeTrader{positions: []map[string]interface{}{
+		{"symbol": "ZECUSDT", "side": "long", "positionAmt": 3.0, "marginMode": "cross"},
+		{"symbol": "ZECUSDT", "side": "long", "positionAmt": 2.0, "marginMode": "isolated"},
+		{"symbol": "ZECUSDT", "side": "short", "positionAmt": 9.0, "marginMode": "isolated"},
+	}}
+	m.syncTraderPositions("t", []*store.TraderPosition{{Symbol: "ZECUSDT", Side: "LONG", Quantity: 5, EntryTime: time.Now().Add(-time.Hour)}})
+	if len(m.shortfallObserved) != 0 {
+		t.Fatal("one margin mode overwrote another and fabricated an account position shortage")
+	}
+}
+
 func TestExternalPositionSyncDoesNotLetStoppedSharedTraderClaim(t *testing.T) {
 	st, err := store.New(filepath.Join(t.TempDir(), "position-sync-owner.db"))
 	if err != nil {

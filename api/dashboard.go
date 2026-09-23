@@ -76,16 +76,21 @@ func (c *dashboardCache) setTraders(t []TraderDashboardStats) {
 
 // DashboardSummary 全局汇总统计
 type DashboardSummary struct {
-	TotalPnL      float64 `json:"total_pnl"`      // 总盈亏
-	TotalTrades   int     `json:"total_trades"`   // 总交易数
-	AvgWinRate    float64 `json:"avg_win_rate"`   // 平均胜率
-	ActiveTraders int     `json:"active_traders"` // 活跃交易员数
-	TotalEquity   float64 `json:"total_equity"`   // 总净值
-	TotalFees     float64 `json:"total_fees"`     // 总手续费
-	TodayPnL      float64 `json:"today_pnl"`      // 今日盈亏
-	WeekPnL       float64 `json:"week_pnl"`       // 本周盈亏
-	MonthPnL      float64 `json:"month_pnl"`      // 本月盈亏
-	UpdatedAt     string  `json:"updated_at"`     // 更新时间
+	GrossPnL           float64 `json:"gross_pnl"`
+	VerifiedNetPnL     float64 `json:"verified_net_pnl"`
+	SettlementPending  int     `json:"settlement_pending"`
+	FundingFee         float64 `json:"funding_fee"`
+	LiquidationPenalty float64 `json:"liquidation_penalty"`
+	TotalPnL           float64 `json:"total_pnl"`      // 总盈亏
+	TotalTrades        int     `json:"total_trades"`   // 总交易数
+	AvgWinRate         float64 `json:"avg_win_rate"`   // 平均胜率
+	ActiveTraders      int     `json:"active_traders"` // 活跃交易员数
+	TotalEquity        float64 `json:"total_equity"`   // 总净值
+	TotalFees          float64 `json:"total_fees"`     // 总手续费
+	TodayPnL           float64 `json:"today_pnl"`      // 今日盈亏
+	WeekPnL            float64 `json:"week_pnl"`       // 本周盈亏
+	MonthPnL           float64 `json:"month_pnl"`      // 本月盈亏
+	UpdatedAt          string  `json:"updated_at"`     // 更新时间
 }
 
 // TraderDashboardStats 交易员大屏统计
@@ -201,11 +206,14 @@ func (s *Server) getDashboardSummary() (*DashboardSummary, error) {
 	// view, because a single exchange fill may close several local lots.
 	err := db.QueryRow(`
 		SELECT 
-			COALESCE(SUM(realized_pnl), 0),
-			COALESCE(SUM(fee), 0)
-		FROM position_close_fills
+			COALESCE(SUM(COALESCE(s.net_pnl,f.realized_pnl)), 0),
+			COALESCE(SUM(COALESCE(s.fee,f.fee)), 0),
+			COALESCE(SUM(f.realized_pnl),0),COALESCE(SUM(s.net_pnl),0),
+			COUNT(CASE WHEN s.fill_id IS NULL THEN 1 END),
+			COALESCE(SUM(s.funding_fee),0),COALESCE(SUM(s.liquidation_penalty),0)
+		FROM position_close_fills f LEFT JOIN position_fill_settlements s ON s.fill_id=f.id
 		WHERE data_quality IN ('VERIFIED','MIGRATED_VERIFIED')
-	`).Scan(&summary.TotalPnL, &summary.TotalFees)
+	`).Scan(&summary.TotalPnL, &summary.TotalFees, &summary.GrossPnL, &summary.VerifiedNetPnL, &summary.SettlementPending, &summary.FundingFee, &summary.LiquidationPenalty)
 	if err != nil && err != sql.ErrNoRows {
 		logger.Warnf("Dashboard: 查询全局统计失败: %v", err)
 	}
@@ -232,7 +240,7 @@ func (s *Server) getDashboardSummary() (*DashboardSummary, error) {
 	// 今日盈亏
 	todayStart := getTimeRangeStart("today")
 	err = db.QueryRow(`
-		SELECT COALESCE(SUM(realized_pnl), 0) FROM position_close_fills
+		SELECT COALESCE(SUM(COALESCE(s.net_pnl,f.realized_pnl)), 0) FROM position_close_fills f LEFT JOIN position_fill_settlements s ON s.fill_id=f.id
 		WHERE data_quality IN ('VERIFIED','MIGRATED_VERIFIED') AND datetime(fill_time) >= datetime(?)
 	`, todayStart.Format("2006-01-02 15:04:05")).Scan(&summary.TodayPnL)
 	if err != nil && err != sql.ErrNoRows {
@@ -242,7 +250,7 @@ func (s *Server) getDashboardSummary() (*DashboardSummary, error) {
 	// 本周盈亏
 	weekStart := getTimeRangeStart("week")
 	err = db.QueryRow(`
-		SELECT COALESCE(SUM(realized_pnl), 0) FROM position_close_fills
+		SELECT COALESCE(SUM(COALESCE(s.net_pnl,f.realized_pnl)), 0) FROM position_close_fills f LEFT JOIN position_fill_settlements s ON s.fill_id=f.id
 		WHERE data_quality IN ('VERIFIED','MIGRATED_VERIFIED') AND datetime(fill_time) >= datetime(?)
 	`, weekStart.Format("2006-01-02 15:04:05")).Scan(&summary.WeekPnL)
 	if err != nil && err != sql.ErrNoRows {
@@ -252,7 +260,7 @@ func (s *Server) getDashboardSummary() (*DashboardSummary, error) {
 	// 本月盈亏
 	monthStart := getTimeRangeStart("month")
 	err = db.QueryRow(`
-		SELECT COALESCE(SUM(realized_pnl), 0) FROM position_close_fills
+		SELECT COALESCE(SUM(COALESCE(s.net_pnl,f.realized_pnl)), 0) FROM position_close_fills f LEFT JOIN position_fill_settlements s ON s.fill_id=f.id
 		WHERE data_quality IN ('VERIFIED','MIGRATED_VERIFIED') AND datetime(fill_time) >= datetime(?)
 	`, monthStart.Format("2006-01-02 15:04:05")).Scan(&summary.MonthPnL)
 	if err != nil && err != sql.ErrNoRows {

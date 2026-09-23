@@ -85,6 +85,24 @@ afterEach(() => {
 })
 
 describe('Copy Guard trader configuration', () => {
+  it.each([true, false])(
+    'saves independent liquidation protection as %s when strategy stops are off',
+    async (enabled) => {
+      const onSave = mount()
+      await screen.findByLabelText('止损模式')
+      const guard = screen.getByRole('button', { name: '独立强平保护' })
+      expect(guard).toHaveAttribute('aria-pressed', 'true')
+      fireEvent.click(screen.getByRole('button', { name: '启用账户保护止损' }))
+      if (!enabled) fireEvent.click(guard)
+      fireEvent.click(screen.getByRole('button', { name: '保存修改' }))
+      await waitFor(() => expect(onSave).toHaveBeenCalledOnce())
+      expect(onSave.mock.calls[0][0].copy_config).toMatchObject({
+        risk_stop_loss_enabled: false,
+        risk_liquidation_guard_enabled: enabled,
+        copy_ratio: 1,
+      })
+    }
+  )
   it.each([1, 80, 99])(
     'saves valid %s%% as a fraction and forbids fixed reentry even with the new-position switch off',
     async (pct) => {

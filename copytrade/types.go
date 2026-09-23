@@ -81,7 +81,7 @@ func minTradeNotionalOrDefault(configured float64) float64 {
 }
 
 func usesV4CopyGuardRisk(config *CopyConfig) bool {
-	return config != nil && config.RiskPolicyVersion >= 4 && config.RiskStopLossEnabled
+	return config != nil && config.RiskPolicyVersion >= 4 && (config.RiskStopLossEnabled || config.RiskLiquidationGuardEnabled)
 }
 
 // SideType 持仓方向
@@ -95,6 +95,7 @@ const (
 
 // Fill 成交记录（标准化结构）
 type Fill struct {
+	LeaderPosID   string     // Populated by authoritative position snapshots.
 	ID            string     // 唯一标识 (HL: tid, OKX: ordId)
 	Symbol        string     // 交易对 (BTCUSDT 格式)
 	Side          string     // "buy" | "sell"
@@ -134,6 +135,7 @@ type Position struct {
 	ValueError       string         // 价值归一或合约目录校验失败原因
 	Instrument       *InstrumentRef // 精确的源合约身份
 	PosID            string         // OKX 仓位唯一标识（用于精确匹配）
+	OpenedMS         int64          // Source creation time; posId alone may be reused.
 }
 
 // InstrumentRef is the source-of-truth contract identity. Symbol formatting
@@ -164,9 +166,12 @@ type AccountState struct {
 
 // TradeSignal 交易信号（经过处理的成交事件）
 type TradeSignal struct {
-	LeaderID     string       // 领航员 ID
-	ProviderType ProviderType // "hyperliquid" | "okx"
-	Fill         *Fill        // 成交记录
+	SizingFollowerEquity float64
+	SizingSourceNotional float64
+	SnapshotMS           int64
+	LeaderID             string       // 领航员 ID
+	ProviderType         ProviderType // "hyperliquid" | "okx"
+	Fill                 *Fill        // 成交记录
 
 	// 领航员账户快照（用于比例计算）
 	LeaderEquity   float64   // 领航员总权益
@@ -206,6 +211,8 @@ type CopyConfig struct {
 	// v3 旧策略与噪音下限/周期熔断/反加仓铁律等参数已于 v5 下线
 	// ============================================================
 	RiskStopLossEnabled            bool    `json:"risk_stop_loss_enabled"`
+	RiskLiquidationGuardEnabled    bool    `json:"risk_liquidation_guard_enabled"`
+	FollowExitPolicyVersion        int     `json:"follow_exit_policy_version"`
 	RiskProtectionMode             string  `json:"risk_protection_mode"`
 	RiskPositionMarginStopPct      float64 `json:"risk_position_margin_stop_pct"`
 	RiskStopMaxAccountLossPct      float64 `json:"risk_stop_max_account_loss_pct,omitempty"`
