@@ -87,6 +87,7 @@ const protectionLabels: Record<string, string> = {
   UNPROTECTED_WARNING: '无保护·已警告并继续重试',
   FORCED_EXIT_PENDING: '无法保护·市价离场确认中',
   POSITION_ABSENT: '跟随仓位消失·无止损证据·等待领航员平仓',
+  FLAT_RECONCILING: '已空仓·退出对账中',
 }
 const accountingLabels: Record<string, string> = {
   OPEN: '交易进行中',

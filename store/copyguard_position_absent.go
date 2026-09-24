@@ -3,6 +3,40 @@ package store
 import "fmt"
 
 const CopyGuardProtectionPositionAbsent = "POSITION_ABSENT"
+const CopyGuardProtectionFlatReconciling = "FLAT_RECONCILING"
+
+// Flatness and order settlement are independent facts. This deliberately leaves
+// the source mapping, custody and accounting untouched while exits reconcile.
+func (s *CopyTradeStore) MarkCopyGuardFlatReconciling(cycleID int64) (bool, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`UPDATE copy_guard_cycles SET protection_status=?,protection_coverage=0,
+ protection_error='已空仓，退出对账中；等待原订单成交证据',protection_missing_at=NULL,updated_at=CURRENT_TIMESTAMP
+ WHERE id=? AND closed_at IS NULL AND status IN ('FOLLOWING','FOLLOWING_REENTRY')
+ AND EXISTS(SELECT 1 FROM copy_trade_execution_intents i WHERE i.trader_id=copy_guard_cycles.trader_id
+ AND (i.leader_pos_id=copy_guard_cycles.leader_pos_id OR i.cycle_id=copy_guard_cycles.id)
+ AND (i.source_kind='COPY_GUARD_RISK_EXIT' OR i.action IN ('reduce_long','reduce_short','close_long','close_short'))
+ AND ((i.terminal_at IS NULL AND i.status IN ('RESERVED','SUBMITTED','PARTIALLY_FILLED','RECONCILING'))
+ OR EXISTS(SELECT 1 FROM copy_trade_execution_order_attempts a WHERE a.intent_id=i.id AND `+unsettledExecutionAttemptSQL("a")+`)))
+ AND NOT EXISTS(SELECT 1 FROM copy_trade_execution_intents i WHERE i.trader_id=copy_guard_cycles.trader_id
+ AND i.symbol=copy_guard_cycles.symbol AND i.side=copy_guard_cycles.side AND i.action IN ('open_long','open_short')
+ AND ((i.terminal_at IS NULL AND i.status IN ('RESERVED','SUBMITTED','PARTIALLY_FILLED','RECONCILING'))
+ OR EXISTS(SELECT 1 FROM copy_trade_execution_order_attempts a WHERE a.intent_id=i.id AND `+unsettledExecutionAttemptSQL("a")+`)))`, CopyGuardProtectionFlatReconciling, cycleID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if err = tx.Commit(); err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
 
 // MarkCopyGuardFollowerAbsent is NOT a risk exit. The caller must freshly
 // confirm the exact position is flat, outside any fill-settlement window.

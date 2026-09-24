@@ -14,7 +14,7 @@ func (ti *TraderIntegration) confirmCopyGuardFollowerAbsent(cycle *store.CopyGua
 		return false
 	}
 	expected, err := ti.store.CopyTrade().GetCopyGuardPositionOwnershipExpectation(cycle.ID)
-	if err != nil || expected.InFlight || (!expected.LastIntentUpdated.IsZero() && time.Since(expected.LastIntentUpdated) < 15*time.Second) {
+	if err != nil {
 		return false
 	}
 	quantity, known := ti.followerPositionQuantity(cycle.Symbol, cycle.Side, cycle.MarginMode, cycle.FollowerPosID, true)
@@ -26,6 +26,19 @@ func (ti *TraderIntegration) confirmCopyGuardFollowerAbsent(cycle *store.CopyGua
 			return false
 		}
 	} else if isProtectiveStopFired(order.Status) {
+		return false
+	}
+	// This also covers old cycles whose initial fill identity was never bound;
+	// their ownership estimate alone cannot classify in-flight exit work.
+	flat, flatErr := ti.store.CopyTrade().MarkCopyGuardFlatReconciling(cycle.ID)
+	if flatErr != nil {
+		return false
+	}
+	if flat {
+		_ = ti.store.CopyTrade().ResolveInactiveProtectionIncidents(ti.traderID, time.Now())
+		return true
+	}
+	if expected.InFlight || (!expected.LastIntentUpdated.IsZero() && time.Since(expected.LastIntentUpdated) < 15*time.Second) {
 		return false
 	}
 	if err = ti.store.CopyTrade().MarkCopyGuardFollowerAbsent(cycle.ID, ti.traderID, cycle.LeaderPosID); err != nil {

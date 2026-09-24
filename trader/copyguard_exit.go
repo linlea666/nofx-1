@@ -58,10 +58,21 @@ func (t *OKXTrader) CloseCopyGuardPosition(req CopyGuardExitRequest) (map[string
 	if err := validateCopyGuardExit(req); err != nil {
 		return nil, err
 	}
+	var order map[string]interface{}
+	var err error
 	if req.Side == "long" {
-		return t.closeLong(req.Symbol, req.Quantity, false, req.ClientOrderID, req.BeforeSubmit, &req)
+		order, err = t.closeLong(req.Symbol, req.Quantity, false, req.ClientOrderID, req.BeforeSubmit, &req)
+	} else {
+		order, err = t.closeShort(req.Symbol, req.Quantity, false, req.ClientOrderID, req.BeforeSubmit, &req)
 	}
-	return t.closeShort(req.Symbol, req.Quantity, false, req.ClientOrderID, req.BeforeSubmit, &req)
+	// The legacy close API labels its POST acknowledgement FILLED. Scoped
+	// durable exits must query the order before claiming any execution.
+	if order != nil && order["status"] == "FILLED" {
+		if _, confirmed := order["executedQty"]; !confirmed {
+			order["status"] = "NEW"
+		}
+	}
+	return order, err
 }
 
 func (t *FuturesTrader) CloseCopyGuardPosition(req CopyGuardExitRequest) (map[string]interface{}, error) {

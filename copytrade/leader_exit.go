@@ -28,7 +28,11 @@ func (ti *TraderIntegration) leaderExitPositions(symbol, side string) (map[strin
 		if getStringField(p, "symbol") != symbol || !strings.EqualFold(getStringField(p, "side"), side) {
 			continue
 		}
-		qty := math.Abs(getFloatField(p, "positionAmt", "quantity"))
+		amount, known := knownQuantityField(p, "positionAmt", "quantity")
+		if !known {
+			return nil, fmt.Errorf("current position quantity is unavailable")
+		}
+		qty := math.Abs(amount)
 		if qty == 0 {
 			continue
 		}
@@ -103,28 +107,7 @@ func (ti *TraderIntegration) prepareLeaderExit(dec *decision.Decision) (*store.L
 }
 
 func (ti *TraderIntegration) reconcileLeaderExitAttempt(intentID int64, a *store.CopyTradeExecutionOrderAttempt, symbol string) error {
-	if a.SubmittedAt == nil || a.TerminalAt != nil {
-		return nil
-	}
-	lookup, ok := ti.executor.(ClientOrderStatusProvider)
-	if !ok {
-		return fmt.Errorf("leader exit order lookup unavailable")
-	}
-	order, err := lookup.GetOrderStatusByClientID(symbol, a.ClientOrderID)
-	if err != nil {
-		return fmt.Errorf("leader exit acknowledgement pending: %w", err)
-	}
-	ti.observeExecutionFillTime(intentID, order)
-	state := strings.ToUpper(getStringField(order, "status", "state"))
-	filled := getFloatField(order, "executedQty", "filled_quantity")
-	if !isTerminalExchangeOrderState(state) || (state == "FILLED" && filled <= 0) {
-		return fmt.Errorf("leader exit order acknowledgement pending (%s)", state)
-	}
-	status := store.ExecutionOrderAttemptTerminalNoFill
-	if filled > 0 {
-		status = store.ExecutionOrderAttemptFilled
-	}
-	return ti.store.CopyTrade().CompleteExecutionOrderAttempt(intentID, a.ClientOrderID, status, getStringField(order, "orderId", "ordId"), state, "", filled)
+	return ti.reconcileExitOrderEvidence(intentID, a, symbol)
 }
 
 // runLeaderExitOrders uses a separate execution lock shared with real risk
@@ -137,6 +120,12 @@ func (ti *TraderIntegration) runLeaderExitOrders(dec *decision.Decision, plan *s
 		return fmt.Errorf("scoped leader exits unsupported")
 	}
 	cs := ti.store.CopyTrade()
+	// Another caller may have completed this plan while we waited for the lock.
+	if current, err := cs.GetLeaderExitPlan(plan.IntentID); err != nil {
+		return err
+	} else if current.Completed {
+		return nil
+	}
 	fullDrain := plan.Ratio == 1
 	if batch, batchErr := cs.GetFollowGroupExitBatch(plan.IntentID); batchErr == nil {
 		fullDrain = batch.FullGroupExit
@@ -234,8 +223,7 @@ func (ti *TraderIntegration) runLeaderExitOrders(dec *decision.Decision, plan *s
 			return nil
 		}})
 		ti.observeExecutionFillTime(plan.IntentID, order)
-		state := strings.ToUpper(getStringField(order, "status", "state"))
-		fill := getFloatField(order, "executedQty", "filled_quantity")
+		state, fill := exitReceipt(order)
 		orderID := getStringField(order, "orderId", "ordId")
 		attemptState := store.ExecutionOrderAttemptSubmitted
 		message := ""
@@ -298,7 +286,7 @@ func (ti *TraderIntegration) runLeaderExitOrders(dec *decision.Decision, plan *s
 		filled := 0.0
 		for _, a := range attempts {
 			if a.QuantityKind == kind {
-				if a.SubmittedAt != nil && a.TerminalAt == nil {
+				if store.ExecutionOrderAttemptNeedsReconciliation(a) {
 					return fmt.Errorf("leader exit order remains unsettled")
 				}
 				filled += a.FilledQuantity
@@ -308,7 +296,7 @@ func (ti *TraderIntegration) runLeaderExitOrders(dec *decision.Decision, plan *s
 			return fmt.Errorf("partial leader exit residual remains")
 		}
 	}
-	return nil
+	return cs.CompleteLeaderExit(plan.IntentID)
 }
 
 func (ti *TraderIntegration) executeAccountLeaderExit(dec *decision.Decision, submit bool) error {

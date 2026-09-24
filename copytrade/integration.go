@@ -128,11 +128,13 @@ const mappingFailureCircuitThreshold = 5
 
 // TraderIntegration 跟单与交易执行的集成
 type TraderIntegration struct {
-	traderID            string
-	lifecycleGeneration int64
-	executor            DecisionExecutor
-	engine              *Engine
-	store               *store.Store
+	lastExitEvidenceRecovery time.Time // execution reconciliation goroutine only
+	lastExitEvidenceID       int64
+	traderID                 string
+	lifecycleGeneration      int64
+	executor                 DecisionExecutor
+	engine                   *Engine
+	store                    *store.Store
 	// policySnapshot is the credential-free canonical policy template loaded
 	// from store. New cycles copy this immutable string; runtime CopyConfig is
 	// never serialized into lifecycle storage.
@@ -867,6 +869,10 @@ func (ti *TraderIntegration) reconcileExecutionIntents(startup bool) {
 	if ti.store == nil {
 		return
 	}
+	if startup || time.Since(ti.lastExitEvidenceRecovery) >= time.Minute {
+		ti.lastExitEvidenceRecovery = time.Now()
+		ti.recoverExitOrderEvidence()
+	}
 	intents, err := ti.store.CopyTrade().ListUnfinishedExecutionIntents(ti.traderID)
 	if err != nil {
 		logger.Warnf("⚠️ [%s] 读取未完成执行意图失败: %v", ti.traderID, err)
@@ -955,7 +961,7 @@ func (ti *TraderIntegration) reconcileExecutionIntents(startup bool) {
 				ti.recordExecutionReconciliationFailure(intent, "ATTEMPT_READ_FAILED", attemptsErr.Error())
 				continue
 			}
-			if len(attempts) == 0 || attempts[len(attempts)-1].TerminalAt != nil {
+			if len(attempts) == 0 || (attempts[len(attempts)-1].TerminalAt != nil && !store.ExecutionOrderAttemptNeedsReconciliation(attempts[len(attempts)-1])) {
 				if !startup {
 					ti.executeOrdinaryCatchup(intent)
 				} else {
@@ -1618,6 +1624,7 @@ func (ti *TraderIntegration) monitorV4ProtectiveStops() {
 		ti.recheckPositionMarginSafety()
 		ti.reconcilePositionMarginStopPendingExits()
 		ti.observePositionMarginStopShadows()
+		_ = ti.store.CopyTrade().ResolveInactiveProtectionIncidents(ti.traderID, time.Now())
 		ti.retryDegradedV4Protections()
 		ti.recoverV4PendingStates()
 		ti.reconcileStoppedV4Attempts()
@@ -2126,7 +2133,7 @@ func (ti *TraderIntegration) ensureV4CycleForMapping(mapping *store.CopyTradePos
 		expected := map[string]float64{}
 		entryID, expectedTotal := "", float64(0)
 		for _, attempt := range attempts {
-			if attempt.SubmittedAt != nil && attempt.TerminalAt == nil {
+			if store.ExecutionOrderAttemptNeedsReconciliation(attempt) {
 				return nil, false, fmt.Errorf("initial follower order remains unresolved")
 			}
 			if attempt.FilledQuantity <= 0 {
@@ -2813,7 +2820,16 @@ func (ti *TraderIntegration) pollV4ProtectiveStops() {
 		// 每 3s 例行覆盖率基准：缓存读即可（fresh=false），避免击穿持仓缓存
 		baseQty := stored.Quantity
 		posQty, posAttributed := ti.copyGuardFollowerQuantity(cycle, false)
+		if known {
+			posQty, posAttributed = qty, true
+		}
 		if posAttributed && posQty <= 0 && !isProtectiveStopFired(state) && ti.confirmCopyGuardFollowerAbsent(cycle) {
+			// Even while the exit's accounting is pending, a flat position no
+			// longer needs this stop. Retire its exact identity; failures leave
+			// the live order visible for the next poll and the new-entry fence.
+			if err := ti.cancelProtectiveOrderForCycle(mgr, cycle, stored); err != nil {
+				logger.Warnf("[%s] flat position protective order cleanup pending: cycle=%d err=%v", ti.traderID, cycle.ID, err)
+			}
 			continue
 		}
 		if posAttributed && (posQty > 0 || state == "live") {
@@ -2872,6 +2888,8 @@ func (ti *TraderIntegration) pollV4ProtectiveStops() {
 				// 触发 PROTECTION_RECOVERED 邮件。
 				_ = ti.store.CopyTrade().UpdateCopyGuardProtectionHealth(cycle.ID, store.CopyGuardProtectionVerified, coverage, "", cycle.FollowerPosID, cycle.EntryOrderID, false)
 				_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: cycle.ID, TraderID: ti.traderID, Type: "PROTECTION_RECOVERED", Price: live.TriggerPrice, Quantity: live.Quantity, Metadata: map[string]interface{}{"algo_id": live.AlgoID, "coverage": coverage}})
+			}
+			if protectiveOrderQuantityMatches(liveCoverageMode, live.Quantity, baseQty, stored.QuantityStep) {
 				ti.notifyProtectionForEvent(cycle, "Copy Guard 保护已恢复", "保护单已经重新验证有效。", "recovered", "PROTECTION_RECOVERED")
 			}
 			// If the exchange protection succeeded but the one-shot candidate
@@ -3236,7 +3254,7 @@ func (ti *TraderIntegration) noteProtectionRearm(cycle *store.CopyGuardCycle) bo
 		logger.Warnf("⚠️ [%s] Copy Guard 保护单重挂震荡，转入慢速重试 | cycle=%d rearms=%d/%.0fmin status=%s err=%s",
 			ti.traderID, cycle.ID, tracker.count, protectionRearmWindow.Minutes(), cycle.ProtectionStatus, cycle.ProtectionError)
 		ti.notifyProtectionForEvent(cycle, "Copy Guard 保护单反复重挂",
-			fmt.Sprintf("该仓位的止损保护在 %.0f 分钟内重挂了 %d 次仍未稳定验证，系统已转为每 %.0f 分钟重试一次以停止刷屏。\n保护单本身仍在交易所生效，但覆盖率校验持续不通过，建议人工核对交易所仓位与止损单数量。\n当前状态: %s\n最近错误: %s",
+			fmt.Sprintf("该仓位的止损保护在 %.0f 分钟内重挂了 %d 次仍未稳定验证，系统已转为每 %.0f 分钟重试一次以停止刷屏。\n保护状态尚未稳定验证，建议人工核对交易所仓位、止损单及其数量。\n当前状态: %s\n最近错误: %s",
 				protectionRearmWindow.Minutes(), tracker.count, protectionRearmThrottleDelay.Minutes(), cycle.ProtectionStatus, cycle.ProtectionError),
 			"rearm_throttled", "PROTECTION_RETRY_THROTTLED")
 	}
@@ -3266,7 +3284,7 @@ func (ti *TraderIntegration) retryDegradedV4Protections() {
 			continue
 		}
 		switch cycle.ProtectionStatus {
-		case store.CopyGuardProtectionPending, store.CopyGuardProtectionUnknown, store.CopyGuardProtectionDegraded, store.CopyGuardProtectionUnprotectable, store.CopyGuardProtectionUnprotectedWarning, store.CopyGuardProtectionForcedExitPending:
+		case store.CopyGuardProtectionPending, store.CopyGuardProtectionUnknown, store.CopyGuardProtectionDegraded, store.CopyGuardProtectionUnprotectable, store.CopyGuardProtectionUnprotectedWarning, store.CopyGuardProtectionForcedExitPending, store.CopyGuardProtectionFlatReconciling:
 		default:
 			continue
 		}
@@ -4278,7 +4296,7 @@ func (ti *TraderIntegration) handleUnprotectableCycle(cycle *store.CopyGuardCycl
 			"error": message, "leader_pos_id": cycle.LeaderPosID, "retries": cycle.ProtectionRetries,
 		}})
 		logger.Warnf("⚠️ [%s] Copy Guard 无保护继续跟随 | cycle=%d %s %s（系统继续重试保护单）", ti.traderID, cycle.ID, cycle.Symbol, cycle.Side)
-		ti.notifyProtection(cycle, "Copy Guard 无法建立保护单", fmt.Sprintf("当前普通跟单仓位按配置继续持有，系统将持续重试建立保护并保留高危告警。\n原因: %s\n如不接受裸仓风险，请在交易所手动挂止损或将处置改为立即市价离场。", message), "unprotected_warning")
+		ti.notifyProtection(cycle, "Copy Guard 无法建立保护单", fmt.Sprintf("当前普通跟单仓位按配置继续持有，系统将持续重试建立保护并保留高危告警。\n原因: %s\n可在交易所核对实际仓位，手动设置止损或平仓。普通保护挂单失败不会改变跟单成交结果。", message), "unprotected_warning")
 		return "warn"
 	}
 	if err := ti.store.CopyTrade().UpdateCopyGuardProtectionHealth(cycle.ID, store.CopyGuardProtectionForcedExitPending, 0, message, cycle.FollowerPosID, cycle.EntryOrderID, false); err != nil {
@@ -7847,6 +7865,14 @@ func (ti *TraderIntegration) refreshStopLossAfterExecuteLocked(dec *decision.Dec
 		}
 		return
 	}
+	if cycle.ProtectionStatus == store.CopyGuardProtectionFlatReconciling {
+		// A real, continuous residual has appeared. Protection is needed again;
+		// errors/empty snapshots alone must never undo a confirmed flat fact.
+		if err := ti.store.CopyTrade().UpdateCopyGuardProtectionHealth(cycle.ID, store.CopyGuardProtectionPending, 0, "continuous residual position observed", cycle.FollowerPosID, cycle.EntryOrderID, false); err != nil {
+			return
+		}
+		cycle.ProtectionStatus = store.CopyGuardProtectionPending
+	}
 	if err := ti.reconcileManualStop(cycle, quantity, 0); err != nil {
 		if !errors.Is(err, errCopyGuardRiskExitGate) {
 			ti.markProtectionIssue(cycle, store.CopyGuardProtectionUnknown, "MANUAL_STOP_RECONCILING", err, cycle.ProtectionCoverage, false)
@@ -9281,7 +9307,11 @@ func (ti *TraderIntegration) followerPositionQuantity(symbol, side, marginMode, 
 		if !strings.EqualFold(getStringField(pos, "side"), side) {
 			continue
 		}
-		qty := absFloat(getFloatField(pos, "positionAmt", "quantity"))
+		amount, known := knownQuantityField(pos, "positionAmt", "quantity")
+		if !known {
+			return 0, false
+		}
+		qty := absFloat(amount)
 		if posID != "" && getStringField(pos, "posId", "positionId") == posID {
 			scopedQty, scopedFound = qty, true
 		}
@@ -9432,6 +9462,10 @@ func (ti *TraderIntegration) markProtectionIssueForDecision(dec *decision.Decisi
 }
 
 func (ti *TraderIntegration) markProtectionIssue(cycle *store.CopyGuardCycle, status, eventType string, cause error, coverage float64, incrementRetry bool) {
+	current, err := ti.store.CopyTrade().GetCopyGuardCycle(cycle.ID)
+	if err != nil || current.ClosedAt != nil || current.ReentryCount != cycle.ReentryCount || current.ProtectionStatus == store.CopyGuardProtectionFlatReconciling {
+		return
+	}
 	message := "unknown protection error"
 	if cause != nil {
 		message = cause.Error()
@@ -9610,7 +9644,10 @@ func (ti *TraderIntegration) notifyProtectionForEvent(cycle *store.CopyGuardCycl
 	// 标题与字段带交易员显示名：保护类邮件此前只有 TraderID，多交易员场景
 	// 下用户无法直接判断是哪个账户出的问题（小白可读性缺陷，全局修复）
 	traderName := ti.traderDisplayName()
-	notifier.Notify(notifier.Alert{Category: "copy_trade", TraderID: ti.traderID, TraderName: traderName, Title: fmt.Sprintf("%s | %s | %s %s", traderName, title, cycle.Symbol, cycle.Side), Body: fmt.Sprintf("Trader Name: %s\nTrader ID:   %s\n\n%s", traderName, ti.traderID, body), RateKey: key, DedupKey: dedupKey, Fields: map[string]string{"TraderName": traderName, "CycleID": fmt.Sprint(cycle.ID), "LeaderPosID": cycle.LeaderPosID, "Symbol": cycle.Symbol, "Side": cycle.Side, "MarginMode": cycle.MarginMode}})
+	alert := notifier.Alert{Category: "copy_trade", TraderID: ti.traderID, TraderName: traderName, Title: fmt.Sprintf("%s | %s | %s %s", traderName, title, cycle.Symbol, cycle.Side), Body: fmt.Sprintf("Trader Name: %s\nTrader ID:   %s\n\n%s", traderName, ti.traderID, body), RateKey: key, DedupKey: dedupKey, Fields: map[string]string{"TraderName": traderName, "CycleID": fmt.Sprint(cycle.ID), "LeaderPosID": cycle.LeaderPosID, "Symbol": cycle.Symbol, "Side": cycle.Side, "MarginMode": cycle.MarginMode}}
+	if ti.attachProtectionIncident(&alert, cycle, kind) {
+		notifier.Notify(alert)
+	}
 }
 
 // ============================================================================

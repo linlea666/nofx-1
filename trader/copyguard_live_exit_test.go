@@ -40,8 +40,12 @@ func TestOKXCopyGuardExitUsesImmutableScopeAndFreshResidual(t *testing.T) {
 			_ = tr.SetMarginMode("BTCUSDT", true) // Mutable ordinary-order setting must be irrelevant.
 			before := 0
 			req := CopyGuardExitRequest{CycleID: 1, Symbol: "BTCUSDT", Side: side, MarginMode: "isolated", PositionID: "target", Quantity: .5, ClientOrderID: "exit1", BeforeSubmit: func() error { before++; return nil }}
-			if _, err := tr.CloseCopyGuardPosition(req); err != nil {
+			receipt, err := tr.CloseCopyGuardPosition(req)
+			if err != nil {
 				t.Fatal(err)
+			}
+			if receipt["status"] != "NEW" || receipt["orderId"] != "exit1" {
+				t.Fatalf("POST acceptance was promoted to a filled close: %+v", receipt)
 			}
 			mu.Lock()
 			if len(bodies) != 1 || bodies[0]["tdMode"] != "isolated" || bodies[0]["posSide"] != side || bodies[0]["sz"] != "2" || bodies[0]["clOrdId"] != "exit1" || before != 1 {

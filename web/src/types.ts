@@ -1261,6 +1261,7 @@ export interface CopyGuardCycle {
     | 'UNPROTECTED_WARNING'
     | 'FORCED_EXIT_PENDING'
     | 'POSITION_ABSENT'
+    | 'FLAT_RECONCILING'
     | 'TRIGGERED'
     | 'CANCELED'
     | 'CLAMPED' // v5：止损价被强平缓冲夹紧（比目标更紧），保护单有效

@@ -136,6 +136,9 @@ type Alert struct {
 	// StatusHook 用于需要审计邮件状态的业务。回调不影响入队/发送
 	// 结果；普通告警留空即保持旧行为。
 	StatusHook func(status DeliveryStatus, err error)
+	// BeforeSend can invalidate a queued state alert after the business state
+	// changed. Ordinary notifications retain their current behavior.
+	BeforeSend func() bool
 }
 
 type DeliveryStatus string
@@ -148,6 +151,7 @@ const (
 	DeliveryDropped     DeliveryStatus = "dropped"
 	DeliverySent        DeliveryStatus = "sent"
 	DeliveryFailed      DeliveryStatus = "failed"
+	DeliveryCanceled    DeliveryStatus = "canceled"
 )
 
 func reportDelivery(a Alert, status DeliveryStatus, err error) {
@@ -409,6 +413,14 @@ func (n *emailNotifier) worker() {
 
 // send 真实发送一封邮件
 func (n *emailNotifier) send(a Alert) {
+	if a.BeforeSend != nil && !alertStillRelevant(a) {
+		if a.DedupKey != "" {
+			n.deduped.Delete(a.DedupKey)
+		}
+		n.lastSent.Delete(alertRateKey(a))
+		reportDelivery(a, DeliveryCanceled, nil)
+		return
+	}
 	subject := buildSubject(a)
 	body := buildBody(a)
 	parent := n.ctx
@@ -436,6 +448,15 @@ func (n *emailNotifier) send(a Alert) {
 	}
 	logger.Infof("📧 邮件已发送 | %s → %s", subject, strings.Join(n.cfg.To, ","))
 	reportDelivery(a, DeliverySent, nil)
+}
+
+func alertStillRelevant(a Alert) (ok bool) {
+	defer func() {
+		if recover() != nil {
+			ok = false
+		}
+	}()
+	return a.BeforeSend()
 }
 
 func alertRateKey(a Alert) string {

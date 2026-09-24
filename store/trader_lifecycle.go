@@ -264,7 +264,7 @@ func checkAndClaimExecutionAccountTx(tx *sql.Tx, traderID string, generation int
  (((t.lifecycle_status='RUNNING' AND t.is_running=1) OR (t.lifecycle_status='STARTING' AND a.generation=t.lifecycle_generation)) AND (? OR COALESCE(a.exclusive,0)=1 OR
  (c.enabled=1 AND c.provider_type IN ('okx','binance') AND (COALESCE(c.follow_exit_policy_version,0)>=2 OR (p.trader_id IS NOT NULL AND (COALESCE(c.risk_stop_loss_enabled,1)=1 OR COALESCE(c.risk_liquidation_guard_enabled,1)=1))))
  OR EXISTS(SELECT 1 FROM copy_guard_cycles x WHERE x.trader_id=t.id AND x.closed_at IS NULL)))
- OR EXISTS(SELECT 1 FROM copy_trade_execution_order_attempts o JOIN copy_trade_execution_intents oi ON oi.id=o.intent_id WHERE oi.trader_id=t.id AND o.submitted_at IS NOT NULL AND o.terminal_at IS NULL)
+ OR EXISTS(SELECT 1 FROM copy_trade_execution_order_attempts o JOIN copy_trade_execution_intents oi ON oi.id=o.intent_id WHERE oi.trader_id=t.id AND `+unsettledExecutionAttemptSQL("o")+`)
  OR EXISTS(SELECT 1 FROM copy_trade_execution_intents i WHERE i.trader_id=t.id AND (i.submitted_at IS NOT NULL OR COALESCE(i.exchange_order_id,'')<>'') AND (i.terminal_at IS NULL OR UPPER(COALESCE(i.exchange_state,'')) NOT IN ('FILLED','CANCELED','CANCELLED','REJECTED','EXPIRED','FAILED')) AND NOT EXISTS(SELECT 1 FROM copy_trade_execution_order_attempts o WHERE o.intent_id=i.id) AND NOT `+retiredLegacyVenueObligationSQL+`)
  OR EXISTS(SELECT 1 FROM copy_guard_protective_orders o WHERE o.trader_id=t.id AND `+unsettledAccountProtectionSQL+`)
  ) ORDER BY t.id LIMIT 1`, exchangeID, exchangeID, traderID, exclusive).Scan(&conflict)
@@ -282,7 +282,7 @@ func checkAndClaimExecutionAccountTx(tx *sql.Tx, traderID string, generation int
 	if previous != "" && previous != exchangeID {
 		var obligations int
 		if err = tx.QueryRow(`SELECT
-   (SELECT COUNT(*) FROM copy_trade_execution_order_attempts o JOIN copy_trade_execution_intents i ON i.id=o.intent_id WHERE i.trader_id=? AND o.submitted_at IS NOT NULL AND o.terminal_at IS NULL)+
+   (SELECT COUNT(*) FROM copy_trade_execution_order_attempts o JOIN copy_trade_execution_intents i ON i.id=o.intent_id WHERE i.trader_id=? AND `+unsettledExecutionAttemptSQL("o")+`)+
    (SELECT COUNT(*) FROM copy_trade_execution_intents i WHERE trader_id=? AND (submitted_at IS NOT NULL OR COALESCE(exchange_order_id,'')<>'') AND (terminal_at IS NULL OR UPPER(COALESCE(exchange_state,'')) NOT IN ('FILLED','CANCELED','CANCELLED','REJECTED','EXPIRED','FAILED')) AND NOT EXISTS(SELECT 1 FROM copy_trade_execution_order_attempts a WHERE a.intent_id=i.id) AND NOT `+retiredLegacyVenueObligationSQL+`)+
  (SELECT COUNT(*) FROM copy_guard_protective_orders o WHERE o.trader_id=? AND `+unsettledAccountProtectionSQL+`)+
  (SELECT COUNT(*) FROM copy_guard_cycles WHERE trader_id=? AND closed_at IS NULL)+
@@ -474,7 +474,7 @@ func (s *TraderStore) GetStopBlockers(traderID string) ([]TraderLifecycleBlocker
 	rows, err := s.db.Query(`SELECT CAST(i.id AS TEXT),COALESCE(i.symbol,''),i.status
 		FROM copy_trade_execution_intents i
 		WHERE i.trader_id=?
-		  AND i.terminal_at IS NULL AND (
+		  AND ((i.terminal_at IS NULL AND (
 			i.status IN ('SUBMITTED','PARTIALLY_FILLED')
 			OR (
 				-- RECONCILING is grouped with RESERVED/FAILED rather than treated
@@ -497,7 +497,7 @@ func (s *TraderStore) GetStopBlockers(traderID string) ([]TraderLifecycleBlocker
 					)
 				)
 			)
-		)
+		)) OR EXISTS(SELECT 1 FROM copy_trade_execution_order_attempts a WHERE a.intent_id=i.id AND `+unsettledExecutionAttemptSQL("a")+`))
 		ORDER BY i.id`, traderID)
 	if err != nil {
 		return nil, err

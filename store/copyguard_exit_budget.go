@@ -49,7 +49,7 @@ func (s *CopyTradeStore) FinalizeUncommittedReentryExit(cycleID int64, attempt i
 	}
 	defer tx.Rollback()
 	var pending int
-	if err = tx.QueryRow(`SELECT COUNT(*) FROM copy_trade_execution_order_attempts a JOIN copy_trade_execution_intents i ON i.id=a.intent_id WHERE i.cycle_id=? AND i.attempt_no=? AND i.source_kind='AI_REENTRY' AND a.submitted_at IS NOT NULL AND a.terminal_at IS NULL`, cycleID, attempt).Scan(&pending); err != nil {
+	if err = tx.QueryRow(`SELECT COUNT(*) FROM copy_trade_execution_order_attempts a JOIN copy_trade_execution_intents i ON i.id=a.intent_id WHERE i.cycle_id=? AND i.attempt_no=? AND i.source_kind='AI_REENTRY' AND `+unsettledExecutionAttemptSQL("a"), cycleID, attempt).Scan(&pending); err != nil {
 		return err
 	}
 	if pending > 0 {
@@ -65,7 +65,7 @@ func (s *CopyTradeStore) ReconcileCopyGuardExitIntent(intentID int64) error {
 	_, err := s.db.Exec(`UPDATE copy_trade_execution_intents SET
 	 filled_quantity=(SELECT COALESCE(SUM(filled_quantity),0) FROM copy_trade_execution_order_attempts WHERE intent_id=?),
 	 exchange_order_id=COALESCE((SELECT exchange_order_id FROM copy_trade_execution_order_attempts WHERE intent_id=? AND exchange_order_id<>'' ORDER BY attempt_no DESC LIMIT 1),exchange_order_id),
-	 status=CASE WHEN EXISTS(SELECT 1 FROM copy_trade_execution_order_attempts WHERE intent_id=? AND submitted_at IS NOT NULL AND terminal_at IS NULL) THEN 'RECONCILING'
+	 status=CASE WHEN EXISTS(SELECT 1 FROM copy_trade_execution_order_attempts a WHERE a.intent_id=? AND `+unsettledExecutionAttemptSQL("a")+`) THEN 'RECONCILING'
 	 WHEN EXISTS(SELECT 1 FROM copy_trade_execution_order_attempts WHERE intent_id=? AND filled_quantity>0) THEN 'PARTIALLY_FILLED' ELSE 'RESERVED' END,
 	 filled_at=CASE WHEN EXISTS(SELECT 1 FROM copy_trade_execution_order_attempts WHERE intent_id=? AND filled_quantity>0) THEN COALESCE(filled_at,CURRENT_TIMESTAMP) ELSE filled_at END,
 	 updated_at=CURRENT_TIMESTAMP WHERE id=? AND source_kind='COPY_GUARD_RISK_EXIT' AND terminal_at IS NULL`, intentID, intentID, intentID, intentID, intentID, intentID)
@@ -79,7 +79,7 @@ func finalizeCopyGuardExitIntentsTx(tx interface {
 	QueryRow(string, ...interface{}) *sql.Row
 }, cycleID int64, attempt int, reason string) error {
 	var pending int
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM copy_trade_execution_order_attempts a JOIN copy_trade_execution_intents i ON i.id=a.intent_id WHERE i.cycle_id=? AND i.attempt_no=? AND i.source_kind='COPY_GUARD_RISK_EXIT' AND a.submitted_at IS NOT NULL AND a.terminal_at IS NULL`, cycleID, attempt).Scan(&pending); err != nil {
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM copy_trade_execution_order_attempts a JOIN copy_trade_execution_intents i ON i.id=a.intent_id WHERE i.cycle_id=? AND i.attempt_no=? AND i.source_kind='COPY_GUARD_RISK_EXIT' AND `+unsettledExecutionAttemptSQL("a"), cycleID, attempt).Scan(&pending); err != nil {
 		return err
 	}
 	if pending > 0 {

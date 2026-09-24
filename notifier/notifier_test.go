@@ -269,3 +269,19 @@ func TestEmailNotifierShutdownCancelsInFlightSMTP(t *testing.T) {
 		t.Fatal("shutdown did not cancel in-flight SMTP")
 	}
 }
+
+func TestQueuedAlertRechecksBusinessRelevanceBeforeSMTP(t *testing.T) {
+	// A nil mail client would panic if SMTP were reached for this stale alert.
+	n := &emailNotifier{cfg: Config{QueueSize: 1}, queue: make(chan Alert, 1), stopCh: make(chan struct{})}
+	relevant := true
+	var status DeliveryStatus
+	n.Notify(Alert{Title: "old position warning", DedupKey: "incident", BeforeSend: func() bool { return relevant }, StatusHook: func(s DeliveryStatus, _ error) { status = s }})
+	relevant = false
+	n.send(<-n.queue)
+	if status != DeliveryCanceled {
+		t.Fatalf("stale warning status=%s", status)
+	}
+	if _, ok := n.deduped.Load("incident"); ok {
+		t.Fatal("canceled queue item retained transport reservation")
+	}
+}

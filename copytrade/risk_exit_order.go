@@ -38,7 +38,7 @@ func (ti *TraderIntegration) closeCopyGuardPositionWithQuantity(cycle *store.Cop
 	}
 	for _, intent := range intents {
 		if intent.SourceKind == copyGuardRiskExitSource && intent.AttemptNo == cycle.ReentryCount {
-			if e := ti.reconcileRiskExitIntent(intent); e != nil && !errors.Is(e, trader.ErrExecutionOrderNotFound) {
+			if e := ti.reconcileRiskExitIntent(intent); e != nil {
 				return "", e
 			}
 		}
@@ -89,36 +89,8 @@ func (ti *TraderIntegration) closeCopyGuardPositionWithQuantity(cycle *store.Cop
 		sequence = last.AttemptNo
 		clientID = last.ClientOrderID
 		previouslySubmitted = last.SubmittedAt != nil
-		if last.SubmittedAt != nil && last.Status != store.ExecutionOrderAttemptFilled && last.Status != store.ExecutionOrderAttemptTerminalNoFill {
-			lookup, yes := ti.executor.(ClientOrderStatusProvider)
-			if !yes {
-				return "", fmt.Errorf("risk exit acknowledgement lookup unavailable")
-			}
-			order, lookupErr := lookup.GetOrderStatusByClientID(cycle.Symbol, clientID)
-			if lookupErr != nil && !errors.Is(lookupErr, trader.ErrExecutionOrderNotFound) {
-				return "", fmt.Errorf("risk exit acknowledgement pending: %w", lookupErr)
-			}
-			if lookupErr == nil {
-				state := strings.ToUpper(getStringField(order, "status", "state"))
-				if !isTerminalExchangeOrderState(state) {
-					return getStringField(order, "orderId", "ordId"), fmt.Errorf("risk exit order is still %s", state)
-				}
-				filled := getFloatField(order, "executedQty", "filled_quantity")
-				if state == "FILLED" && filled <= 0 {
-					return "", fmt.Errorf("risk exit fill quantity is not yet confirmed")
-				}
-				status := store.ExecutionOrderAttemptTerminalNoFill
-				if filled > 0 || state == "FILLED" {
-					status = store.ExecutionOrderAttemptFilled
-				}
-				if err = cs.CompleteExecutionOrderAttempt(intent.ID, clientID, status, getStringField(order, "orderId", "ordId"), state, "", filled); err != nil {
-					return "", err
-				}
-				last.Status = status
-				if err = cs.ReconcileCopyGuardExitIntent(intent.ID); err != nil {
-					return "", err
-				}
-			}
+		if store.ExecutionOrderAttemptNeedsReconciliation(last) {
+			return "", fmt.Errorf("risk exit acknowledgement is unresolved")
 		}
 		if last.Status == store.ExecutionOrderAttemptFilled || last.Status == store.ExecutionOrderAttemptTerminalNoFill {
 			// Re-read AFTER terminal acknowledgement; the earlier snapshot may
@@ -166,7 +138,7 @@ func (ti *TraderIntegration) closeCopyGuardPositionWithQuantity(cycle *store.Cop
 		},
 	})
 	orderID := getStringField(order, "orderId", "ordId")
-	state := getStringField(order, "status", "state")
+	state, filled := exitReceipt(order)
 	message := ""
 	if submitErr != nil {
 		message = submitErr.Error()
@@ -177,7 +149,6 @@ func (ti *TraderIntegration) closeCopyGuardPositionWithQuantity(cycle *store.Cop
 	if !submitted && !previouslySubmitted && submitErr != nil {
 		completion = store.ExecutionOrderAttemptTerminalNoFill
 	}
-	filled := getFloatField(order, "executedQty", "filled_quantity")
 	if isTerminalExchangeOrderState(strings.ToUpper(state)) {
 		if filled > 0 {
 			completion = store.ExecutionOrderAttemptFilled
@@ -205,30 +176,7 @@ func (ti *TraderIntegration) reconcileRiskExitIntent(intent *store.CopyTradeExec
 		return err
 	}
 	for _, a := range attempts {
-		if a.SubmittedAt == nil || a.TerminalAt != nil {
-			continue
-		}
-		lookup, ok := ti.executor.(ClientOrderStatusProvider)
-		if !ok {
-			return fmt.Errorf("risk exit acknowledgement lookup unavailable")
-		}
-		order, err := lookup.GetOrderStatusByClientID(intent.Symbol, a.ClientOrderID)
-		if err != nil {
-			return err
-		}
-		state := strings.ToUpper(getStringField(order, "status", "state"))
-		filled := getFloatField(order, "executedQty", "filled_quantity")
-		if !isTerminalExchangeOrderState(state) {
-			return fmt.Errorf("risk exit order is still %s", state)
-		}
-		if state == "FILLED" && filled <= 0 {
-			return fmt.Errorf("risk exit fill quantity is not yet confirmed")
-		}
-		status := store.ExecutionOrderAttemptTerminalNoFill
-		if filled > 0 {
-			status = store.ExecutionOrderAttemptFilled
-		}
-		if err = ti.store.CopyTrade().CompleteExecutionOrderAttempt(intent.ID, a.ClientOrderID, status, getStringField(order, "orderId", "ordId"), state, "", filled); err != nil {
+		if err = ti.reconcileExitOrderEvidence(intent.ID, a, intent.Symbol); err != nil {
 			return err
 		}
 	}

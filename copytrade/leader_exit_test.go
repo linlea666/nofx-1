@@ -14,10 +14,13 @@ import (
 
 type leaderExitExecutor struct {
 	*positionMarginLifecycleExecutor
-	requests  []trader.ScopedPositionCloseRequest
-	orders    map[string]map[string]interface{}
-	firstFill float64
-	before    func()
+	requests    []trader.ScopedPositionCloseRequest
+	orders      map[string]map[string]interface{}
+	firstFill   float64
+	before      func()
+	ackOnly     bool
+	lookupErr   error
+	lookupReply map[string]interface{}
 }
 
 func (e *leaderExitExecutor) CloseScopedPosition(r trader.ScopedPositionCloseRequest) (map[string]interface{}, error) {
@@ -46,9 +49,18 @@ func (e *leaderExitExecutor) CloseScopedPosition(r trader.ScopedPositionCloseReq
 		e.orders = map[string]map[string]interface{}{}
 	}
 	e.orders[r.ClientOrderID] = order
+	if e.ackOnly {
+		return map[string]interface{}{"orderId": order["orderId"], "status": "FILLED"}, nil
+	}
 	return order, nil
 }
 func (e *leaderExitExecutor) GetOrderStatusByClientID(_, id string) (map[string]interface{}, error) {
+	if e.lookupErr != nil {
+		return nil, e.lookupErr
+	}
+	if e.lookupReply != nil {
+		return e.lookupReply, nil
+	}
 	o, ok := e.orders[id]
 	if !ok {
 		return nil, fmt.Errorf("unknown order")

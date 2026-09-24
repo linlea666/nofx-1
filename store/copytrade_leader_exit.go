@@ -153,7 +153,7 @@ func (s *CopyTradeStore) CompleteLeaderExit(intentID int64) error {
 		return groupErr
 	}
 	var pending int
-	if err = tx.QueryRow(`SELECT COUNT(*) FROM copy_trade_execution_order_attempts WHERE intent_id=? AND submitted_at IS NOT NULL AND terminal_at IS NULL`, intentID).Scan(&pending); err != nil {
+	if err = tx.QueryRow(`SELECT COUNT(*) FROM copy_trade_execution_order_attempts o WHERE intent_id=? AND `+unsettledExecutionAttemptSQL("o"), intentID).Scan(&pending); err != nil {
 		return err
 	}
 	if pending > 0 {
@@ -187,7 +187,7 @@ func (s *CopyTradeStore) CompleteLeaderExit(intentID int64) error {
 	if _, err = tx.Exec(`UPDATE copy_trade_execution_intents SET status='FILLED',reason_code='LEADER_EXIT_CONFIRMED',filled_quantity=(SELECT COALESCE(SUM(filled_quantity),0) FROM copy_trade_execution_order_attempts WHERE intent_id=?),terminal_at=CURRENT_TIMESTAMP,last_error='',updated_at=CURRENT_TIMESTAMP WHERE id=?`, intentID, intentID); err != nil {
 		return err
 	}
-	if _, err = tx.Exec(`UPDATE copy_trade_source_transitions SET status='FILLED',updated_at=CURRENT_TIMESTAMP WHERE intent_id=?`, intentID); err != nil {
+	if _, err = tx.Exec(`UPDATE copy_trade_source_transitions SET status='FILLED',updated_at=CURRENT_TIMESTAMP WHERE intent_id=? AND status<>'SOURCE_REPLAY_PENDING'`, intentID); err != nil {
 		return err
 	}
 	if _, err = tx.Exec(`UPDATE copy_trade_leader_exits SET completed=1,completed_at=CURRENT_TIMESTAMP WHERE intent_id=?`, intentID); err != nil {
@@ -532,7 +532,7 @@ func (s *CopyTradeStore) ResumeLeaderExitSubmission(intentID int64) error {
 		return err
 	}
 	var pending int
-	if err = tx.QueryRow(`SELECT COUNT(*) FROM copy_trade_execution_order_attempts WHERE intent_id=? AND submitted_at IS NOT NULL AND terminal_at IS NULL`, intentID).Scan(&pending); err != nil {
+	if err = tx.QueryRow(`SELECT COUNT(*) FROM copy_trade_execution_order_attempts o WHERE intent_id=? AND `+unsettledExecutionAttemptSQL("o"), intentID).Scan(&pending); err != nil {
 		return err
 	}
 	if pending > 0 {
@@ -570,6 +570,6 @@ func (s *CopyTradeStore) ObserveReleasedSourceIncrease(traderID, posID string, r
 // enough; a late entry fill would otherwise survive the source full close.
 func (s *CopyTradeStore) HasUnsettledScopeEntries(traderID, symbol, side string) (bool, error) {
 	var n int
-	err := s.db.QueryRow(`SELECT COUNT(*) FROM copy_trade_execution_intents i JOIN copy_trade_execution_order_attempts a ON a.intent_id=i.id WHERE i.trader_id=? AND i.symbol=? AND i.side=? AND i.action IN ('open_long','open_short') AND a.submitted_at IS NOT NULL AND a.terminal_at IS NULL`, traderID, symbol, side).Scan(&n)
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM copy_trade_execution_intents i JOIN copy_trade_execution_order_attempts a ON a.intent_id=i.id WHERE i.trader_id=? AND i.symbol=? AND i.side=? AND i.action IN ('open_long','open_short') AND `+unsettledExecutionAttemptSQL("a"), traderID, symbol, side).Scan(&n)
 	return n > 0, err
 }

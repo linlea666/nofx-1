@@ -894,9 +894,9 @@ func (s *CopyTradeStore) SettleOrdinaryCatchupTransition(c OrdinaryCatchupSettle
 	var attemptCount, unresolvedAttempts int
 	var attemptFilled float64
 	if err = tx.QueryRow(`SELECT COUNT(*),
-		COALESCE(SUM(CASE WHEN terminal_at IS NULL OR status NOT IN ('FILLED','FAILED','TERMINAL_NO_FILL') THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN terminal_at IS NULL OR status NOT IN ('FILLED','FAILED','TERMINAL_NO_FILL') OR `+unsettledExecutionAttemptSQL("a")+` THEN 1 ELSE 0 END),0),
 		COALESCE(SUM(filled_quantity),0)
-		FROM copy_trade_execution_order_attempts WHERE intent_id=?`, c.IntentID).
+		FROM copy_trade_execution_order_attempts a WHERE intent_id=?`, c.IntentID).
 		Scan(&attemptCount, &unresolvedAttempts, &attemptFilled); err != nil {
 		return "", err
 	}
@@ -1895,44 +1895,7 @@ func (s *CopyTradeStore) MarkExecutionOrderAttemptSubmitted(intentID int64, clie
 }
 
 func (s *CopyTradeStore) CompleteExecutionOrderAttempt(intentID int64, clientOrderID, status, exchangeOrderID, exchangeState, lastError string, filledQuantity float64) error {
-	if intentID <= 0 || strings.TrimSpace(clientOrderID) == "" || status == "" {
-		return fmt.Errorf("invalid execution order attempt update")
-	}
-	orderTerminal := executionOrderAttemptTerminal(status, exchangeState)
-	res, err := s.db.Exec(`UPDATE copy_trade_execution_order_attempts SET status=?,
-		exchange_order_id=CASE WHEN ?<>'' THEN ? ELSE exchange_order_id END,
-		exchange_state=CASE WHEN ?<>'' THEN ? ELSE exchange_state END,
-		filled_quantity=CASE WHEN ?>filled_quantity THEN ? ELSE filled_quantity END,last_error=?,
-		submitted_at=CASE WHEN ? IN ('SUBMITTED','PARTIALLY_FILLED','FILLED') THEN COALESCE(submitted_at,CURRENT_TIMESTAMP) ELSE submitted_at END,
-		filled_at=CASE WHEN ? IN ('PARTIALLY_FILLED','FILLED') THEN COALESCE(filled_at,CURRENT_TIMESTAMP) ELSE filled_at END,
-		terminal_at=CASE WHEN ? THEN COALESCE(terminal_at,CURRENT_TIMESTAMP) ELSE terminal_at END,
-		updated_at=CURRENT_TIMESTAMP WHERE intent_id=? AND client_order_id=?`,
-		status, exchangeOrderID, exchangeOrderID, exchangeState, exchangeState, filledQuantity, filledQuantity, lastError,
-		status, status, orderTerminal, intentID, clientOrderID)
-	if err != nil {
-		return err
-	}
-	updated, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if updated != 1 {
-		return fmt.Errorf("execution order attempt not found: intent=%d client_order_id=%s", intentID, clientOrderID)
-	}
-	return nil
-}
-
-func executionOrderAttemptTerminal(status, exchangeState string) bool {
-	switch strings.ToUpper(strings.TrimSpace(status)) {
-	case ExecutionOrderAttemptFilled, ExecutionOrderAttemptFailed, ExecutionOrderAttemptTerminalNoFill:
-		return true
-	}
-	switch strings.ToUpper(strings.TrimSpace(exchangeState)) {
-	case "FILLED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED", "FAILED":
-		return true
-	default:
-		return false
-	}
+	return s.CompleteExecutionOrderAttemptWithEvidence(intentID, clientOrderID, status, exchangeOrderID, exchangeState, lastError, filledQuantity, time.Time{})
 }
 
 func (s *CopyTradeStore) ListExecutionOrderAttempts(intentID int64) ([]*CopyTradeExecutionOrderAttempt, error) {

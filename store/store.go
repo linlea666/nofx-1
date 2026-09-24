@@ -273,6 +273,12 @@ func (s *Store) initTables() error {
 	if err := s.CopyTrade().initRuntimeHealthTables(); err != nil {
 		return fmt.Errorf("initialize copy runtime health: %w", err)
 	}
+	if err := s.CopyTrade().initOrderEvidenceRepairTable(); err != nil {
+		return fmt.Errorf("initialize order evidence audit: %w", err)
+	}
+	if err := s.CopyTrade().initProtectionIncidentTable(); err != nil {
+		return fmt.Errorf("initialize protection incidents: %w", err)
+	}
 	if err := s.CopyTrade().initVenueRetirementTable(); err != nil {
 		return fmt.Errorf("initialize historical venue retirement audit: %w", err)
 	}

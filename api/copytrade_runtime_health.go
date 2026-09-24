@@ -86,7 +86,7 @@ func (h *CopyTradeHandler) RuntimeHealth(c *gin.Context) {
 		for _, cycle := range cycles {
 			switch cycle.ProtectionStatus {
 			case store.CopyGuardProtectionPending, store.CopyGuardProtectionUnknown, store.CopyGuardProtectionDegraded,
-				store.CopyGuardProtectionUnprotectedWarning, store.CopyGuardProtectionForcedExitPending, store.CopyGuardProtectionUnprotectable:
+				store.CopyGuardProtectionUnprotectedWarning, store.CopyGuardProtectionForcedExitPending, store.CopyGuardProtectionUnprotectable, store.CopyGuardProtectionFlatReconciling:
 			default:
 				continue
 			}
