@@ -13,7 +13,20 @@ import type { TraderConfigData } from '../types'
 vi.mock('../contexts/LanguageContext', () => ({
   useLanguage: () => ({ language: 'zh' }),
 }))
-vi.mock('../lib/httpClient', () => ({ httpClient: { get: vi.fn() } }))
+vi.mock('../lib/httpClient', () => ({
+  httpClient: {
+    get: vi.fn(),
+    post: vi.fn().mockResolvedValue({
+      success: true,
+      data: {
+        positions: [],
+        snapshot_at: '2026-09-29T10:00:00Z',
+        leader_equity: 1000,
+        follower_equity: 100,
+      },
+    }),
+  },
+}))
 vi.mock('sonner', () => ({
   toast: { promise: (p: Promise<void>) => p, error: vi.fn() },
 }))
@@ -180,4 +193,23 @@ describe('Copy Guard trader configuration', () => {
       expect(onSave).not.toHaveBeenCalled()
     }
   )
+})
+
+it('registers one idempotent current-position request on save without starting a trader', async () => {
+  const onSave = mount()
+  const toggle = await screen.findByRole('checkbox', {
+    name: /下次启动时复制领航员当前仓位/,
+  })
+  expect(toggle).not.toBeChecked()
+  fireEvent.click(toggle)
+  fireEvent.click(screen.getByRole('button', { name: '保存修改' }))
+  await waitFor(() => expect(onSave).toHaveBeenCalledOnce())
+  const request = onSave.mock.calls[0][0].copy_config
+  expect(request.copy_current_positions_once).toBe(true)
+  expect(request.copy_current_positions_request_id).toMatch(/^[a-f\d-]{36}$/)
+  fireEvent.click(screen.getByRole('button', { name: '保存修改' }))
+  await waitFor(() => expect(onSave).toHaveBeenCalledTimes(2))
+  expect(
+    onSave.mock.calls[1][0].copy_config.copy_current_positions_request_id
+  ).toBe(request.copy_current_positions_request_id)
 })

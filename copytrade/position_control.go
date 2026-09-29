@@ -70,6 +70,27 @@ func (ti *TraderIntegration) preflightCopyPositionOwnership(dec *decision.Decisi
 		return reasonError("CUSTODY_CHECK_PENDING", "read independent positions: %w", err)
 	}
 	side := strings.TrimPrefix(dec.Action, "open_")
+	if dec.CurrentPositionTaskID > 0 {
+		dec.AllowManagedPositionMerge = false
+		for _, actual := range positions {
+			if getStringField(actual, "symbol") != dec.Symbol || !strings.EqualFold(getStringField(actual, "side"), side) || absFloat(getFloatField(actual, "positionAmt", "quantity")) <= 0 {
+				continue
+			}
+			mode := getStringField(actual, "marginMode", "mgnMode")
+			if mode == "" {
+				return reasonError("CUSTODY_CHECK_PENDING", "执行仓位保证金模式不可核实")
+			}
+			managed, err := ti.verifyManagedFollowGroupPeer(dec, mode)
+			if err != nil {
+				return reasonError("CUSTODY_CHECK_PENDING", "verify copy entry group continuity: %w", err)
+			}
+			if !managed {
+				return reasonError("INDEPENDENT_POSITION_CONFLICT", "账户同方向存在独立手动仓，本轮不接管")
+			}
+			dec.AllowManagedPositionMerge = true
+		}
+		return nil
+	}
 	managedPeer, err := ti.store.CopyTrade().FollowGroupHasManagedPeer(ti.traderID, dec.LeaderPosID, dec.Symbol, side)
 	if err != nil {
 		return reasonError("CUSTODY_CHECK_PENDING", "read follow group ownership: %w", err)

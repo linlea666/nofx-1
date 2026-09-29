@@ -1,3 +1,5 @@
+import { CurrentPositionCopyControl } from './CurrentPositionCopyControl'
+import { newCurrentPositionCopyRequestId } from '../lib/currentPositionCopy'
 import { useState, useEffect } from 'react'
 import type {
   AIModel,
@@ -261,6 +263,9 @@ interface FormState {
   decision_mode: DecisionMode
   copy_provider_type: CopyTradeProvider
   copy_leader_id: string
+  copy_current_positions_once: boolean
+  copy_current_positions_request_id: string
+  current_position_copy?: CopyTradeConfig['current_position_copy']
   copy_ratio: number
   copy_sync_leverage: boolean
   copy_sync_margin_mode: boolean // 同步保证金模式（OKX 区分全仓/逐仓）
@@ -366,6 +371,9 @@ export function TraderConfigModal({
     copy_provider_type: 'hyperliquid',
     copy_leader_id: '',
     copy_ratio: 1.0,
+    copy_current_positions_once: false,
+    copy_current_positions_request_id: '',
+    current_position_copy: undefined,
     copy_sync_leverage: true,
     copy_sync_margin_mode: true, // 默认同步保证金模式
     copy_min_trade_warn: 12, // 纯运营预警，不参与交易所最小量判断
@@ -558,6 +566,11 @@ export function TraderConfigModal({
               cfg.binance_top_trader_id ||
               (cfg.binance_source_mode === 'smart_money' ? cfg.leader_id : ''),
             copy_ratio: cfg.copy_ratio,
+            copy_current_positions_once:
+              cfg.copy_current_positions_once ?? false,
+            copy_current_positions_request_id:
+              cfg.copy_current_positions_request_id ?? '',
+            current_position_copy: cfg.current_position_copy,
             copy_sync_leverage: cfg.sync_leverage,
             copy_sync_margin_mode: cfg.sync_margin_mode ?? true, // 默认 true
             copy_min_trade_warn: cfg.min_trade_warn ?? 12,
@@ -764,6 +777,9 @@ export function TraderConfigModal({
         copy_provider_type: 'hyperliquid',
         copy_leader_id: '',
         copy_ratio: 1.0,
+        copy_current_positions_once: false,
+        copy_current_positions_request_id: '',
+        current_position_copy: undefined,
         copy_sync_leverage: true,
         copy_sync_margin_mode: true, // 默认同步保证金模式
         copy_min_trade_warn: 12,
@@ -835,7 +851,21 @@ export function TraderConfigModal({
       // 表单中的来源身份已偏离已加载配置，避免继续展示旧来源的健康状态。
       setSourceHealth(null)
     }
-    setFormData((prev) => ({ ...prev, [field]: value }))
+    setFormData((prev) => ({
+      ...prev,
+      [field]: value,
+      ...([
+        'copy_provider_type',
+        'copy_leader_id',
+        'exchange_id',
+        'decision_mode',
+      ].includes(field) && prev[field] !== value
+        ? {
+            copy_current_positions_once: false,
+            copy_current_positions_request_id: '',
+          }
+        : {}),
+    }))
   }
 
   const handleFetchCurrentBalance = async () => {
@@ -1065,6 +1095,11 @@ export function TraderConfigModal({
           provider_type: formData.copy_provider_type,
           leader_id: leaderID,
           copy_ratio: formData.copy_ratio,
+          copy_current_positions_once:
+            formData.copy_provider_type === 'okx' &&
+            formData.copy_current_positions_once,
+          copy_current_positions_request_id:
+            formData.copy_current_positions_request_id,
           sync_leverage: formData.copy_sync_leverage,
           sync_margin_mode: formData.copy_sync_margin_mode, // 同步保证金模式（仅 OKX 生效）
           min_trade_warn: formData.copy_min_trade_warn,
@@ -1957,6 +1992,27 @@ export function TraderConfigModal({
                     </div>
                   )}
 
+                  {formData.copy_provider_type === 'okx' && (
+                    <CurrentPositionCopyControl
+                      enabled={formData.copy_current_positions_once}
+                      disabled={sourceSwitchLocked}
+                      traderId={isEditMode ? traderData?.trader_id : undefined}
+                      exchangeId={formData.exchange_id}
+                      leaderId={formData.copy_leader_id}
+                      ratio={formData.copy_ratio}
+                      result={formData.current_position_copy}
+                      onChange={(enabled) =>
+                        setFormData((prev) => ({
+                          ...prev,
+                          copy_current_positions_once: enabled,
+                          copy_current_positions_request_id: enabled
+                            ? newCurrentPositionCopyRequestId()
+                            : prev.copy_current_positions_request_id,
+                        }))
+                      }
+                    />
+                  )}
+
                   {/* Info Box */}
                   <div className="p-3 bg-[#0B0E11] border border-[#2B3139] rounded flex items-start gap-2">
                     <svg
@@ -1972,9 +2028,11 @@ export function TraderConfigModal({
                       <line x1="12" x2="12.01" y1="16" y2="16" />
                     </svg>
                     <span className="text-xs text-[#848E9C]">
-                      跟单模式将监听领航员的交易操作，只跟随新开仓（不跟历史仓位）。
-                      跟单金额 = 跟单系数 × (领航员交易金额÷领航员账户余额) ×
-                      你的账户余额
+                      {formData.copy_current_positions_once
+                        ? '下次手动启动将复制符合条件的当前仓位，之后监听领航员操作。'
+                        : '跟单模式只跟随新开仓；未开启一次性复制时不追历史仓位。'}
+                      跟单金额 = 跟单系数 × (领航员交易名义金额÷领航员总权益) ×
+                      你的账户总权益
                     </span>
                   </div>
 

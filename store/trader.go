@@ -364,6 +364,9 @@ func (s *TraderStore) Update(trader *Trader) error {
 		if err = checkExecutionAccountChangeTx(tx, trader.ID, trader.ExchangeID); err != nil {
 			return err
 		}
+		if err = cancelCurrentPositionCopyTx(tx, trader.ID, "EXECUTION_ACCOUNT_CHANGED"); err != nil {
+			return err
+		}
 	}
 	_, err = tx.Exec(`
 		UPDATE traders SET

@@ -679,6 +679,29 @@ func (ti *TraderIntegration) StartCopyTrading() error {
 
 	// 设置数据库存储（用于仓位映射）
 	engine.SetStore(ti.store)
+	engine.currentCopyPreview = func(state *AccountState) ([]store.CurrentPositionCopyTask, error) {
+		fresh, ok := ti.executor.(trader.FreshPositionProvider)
+		if !ok {
+			return nil, fmt.Errorf("fresh follower positions unavailable")
+		}
+		positions, err := fresh.GetPositionsFresh()
+		if err != nil {
+			return nil, err
+		}
+		snapshot := *state
+		if source, ok := engine.provider.(interface{ GetLeaderEquity(string) (float64, error) }); ok && len(state.Positions) > 0 {
+			snapshot.TotalEquity, err = source.GetLeaderEquity(engineConfig.LeaderID)
+			if err != nil {
+				return nil, err
+			}
+		}
+		prices, ok := ti.executor.(interface{ GetMarketPrice(string) (float64, error) })
+		if !ok {
+			return nil, fmt.Errorf("market query unavailable")
+		}
+		resolver, _ := ti.executor.(trader.ExecutionInstrumentResolver)
+		return BuildCurrentPositionPreview(ti.store, ti.traderID, engineConfig.LeaderID, engineConfig.CopyRatio, &snapshot, ti.getEquityFunc()(), positions, prices.GetMarketPrice, resolver)
+	}
 	ti.engine = engine
 	engine.SetCopyGuardRiskExitBegin(ti.establishRiskExitGate)
 	engine.SetCopyGuardShadowFinalize(ti.finalizeCopyGuardPositionMarginShadow)
@@ -1275,6 +1298,12 @@ func (ti *TraderIntegration) executeOrdinaryCatchup(intent *store.CopyTradeExecu
 	if mapping != nil {
 		dec.SourceSymbol, dec.ExecutionSymbol = mapping.SourceSymbol, mapping.ExecutionSymbol
 		dec.ValueCurrency, dec.ExecutionSettleAsset = mapping.SourceQuoteAsset, mapping.ExecutionSettleAsset
+	}
+	if err = ti.validateCurrentPositionCopy(dec); err != nil {
+		if ReasonCodeOf(err) == "SOURCE_SUPERSEDED" {
+			ti.terminateOrdinaryCatchup(intent, "CATCHUP_SUPERSEDED", err.Error())
+		}
+		return
 	}
 	ti.bindExecutionAttemptRecorder(dec)
 	if err = ti.executeDecisionWithRetry(dec); err != nil {
@@ -4615,6 +4644,9 @@ func (ti *TraderIntegration) executeFullDecision(fullDec *decision.FullDecision)
 			err = ti.validateAIReentryImmediatelyBeforeOrder(dec)
 		}
 		if err == nil {
+			err = ti.validateCurrentPositionCopy(dec)
+		}
+		if err == nil {
 			err = ti.preflightSmartMoneyExecutionInstrument(dec)
 		}
 		if err == nil {
@@ -5528,6 +5560,11 @@ func (ti *TraderIntegration) bindExecutionAttemptRecorder(dec *decision.Decision
 		return nil
 	}
 	dec.BeforeExchangeSubmit = func(clientOrderID string) error {
+		if dec.CurrentPositionTaskID > 0 {
+			if err := ti.validateCurrentPositionCopy(dec); err != nil {
+				return err
+			}
+		}
 		ti.riskExitMu.RLock()
 		defer ti.riskExitMu.RUnlock()
 		if gate := ti.matchingRiskExitGateLocked(dec); gate != nil && (!isAIReentryDecision(dec) || ti.riskExitGateBlocksReentryLocked(dec, gate)) {

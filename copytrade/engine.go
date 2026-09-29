@@ -45,6 +45,7 @@ type unqueuedReservationFailure struct {
 
 // Engine 跟单引擎
 type Engine struct {
+	currentCopyPreview func(*AccountState) ([]store.CurrentPositionCopyTask, error)
 	// Only reservations that this Engine failed BEFORE decision-channel handoff
 	// enter this set. Ordinary RESERVED work remains owned by its queued consumer.
 	reservationFailureMu        sync.Mutex
@@ -828,15 +829,24 @@ func (e *Engine) startStreamingMode(ctx context.Context) error {
 
 // startPollingMode 启动轮询模式（REST 定时轮询）
 func (e *Engine) startPollingMode(ctx context.Context) error {
+	// 初始同步领航员状态
+	if err := e.syncLeaderState(); err != nil {
+		if e.store != nil {
+			request, _ := e.store.CopyTrade().CurrentPositionCopy(e.traderID)
+			if request != nil && request.Status == "PENDING" {
+				e.mu.Lock()
+				e.running = false
+				e.mu.Unlock()
+				return err
+			}
+		}
+		logger.Warnf("⚠️ [%s] 初始状态同步失败: %v", e.traderID, err)
+	}
+
 	if e.config.ProviderType == ProviderOKX {
 		e.startOKXAccountSampler(ctx)
 		go e.sourceMaintenanceLoop(ctx)
 	}
-	// 初始同步领航员状态
-	if err := e.syncLeaderState(); err != nil {
-		logger.Warnf("⚠️ [%s] 初始状态同步失败: %v", e.traderID, err)
-	}
-
 	// 获取历史成交作为去重基线
 	if e.config.ProviderType != ProviderOKX {
 		e.initSeenFills()
@@ -1170,6 +1180,12 @@ func (e *Engine) detectBinancePositionSnapshotFills() []Fill {
 			fills = append(fills, e.buildBinanceSnapshotFillForPosition(
 				pos, posID, ActionOpen, pos.Size, 0, pos.Size, mapping.SourceRevision,
 			))
+			continue
+		}
+		if mapping.Status == store.MappingStatusCopyPending {
+			if fill := e.currentPositionCopyFill(pos, mapping); fill != nil {
+				fills = append(fills, *fill)
+			}
 			continue
 		}
 		if mapping.Status == "ignored" {
@@ -1620,10 +1636,19 @@ func (e *Engine) riskIncreaseBlock() string {
 func (e *Engine) matchOpenAddSignal(signal *TradeSignal, leaderPosMap map[string]*Position) *SignalMatchResult {
 	fill := signal.Fill
 
+	if fill.CurrentPositionTaskID > 0 {
+		pos := leaderPosMap[fill.LeaderPosID]
+		task, err := e.store.CopyTrade().CurrentPositionCopyTask(e.traderID, fill.LeaderPosID)
+		if err != nil || task == nil || task.ID != fill.CurrentPositionTaskID || pos == nil || pos.OpenedMS != task.OpenedMS || string(pos.Side) != task.Side || pos.MarginMode != task.MarginMode {
+			return &SignalMatchResult{Reason: "当前仓位复制授权或源周期已改变"}
+		}
+		return &SignalMatchResult{ShouldFollow: true, Reason: "当前仓位复制（一次性授权）", Action: ActionOpen, PosID: fill.LeaderPosID, MarginMode: pos.MarginMode, LeaderPosition: pos}
+	}
+
 	// 收集所有 symbol+side 匹配的仓位
 	var matchedPositions []*Position
 	for _, pos := range leaderPosMap {
-		if pos.Symbol == fill.Symbol && pos.Side == fill.PositionSide {
+		if pos.Symbol == fill.Symbol && pos.Side == fill.PositionSide && (fill.LeaderPosID == "" || pos.PosID == fill.LeaderPosID) {
 			matchedPositions = append(matchedPositions, pos)
 		}
 	}
@@ -2413,7 +2438,8 @@ func (e *Engine) reserveExecutionIntent(dec *decision.Decision) bool {
 		targetAccountPct = dec.PositionSizeUSD / followerEquityAtTarget * 100
 	}
 	intent, claimed, err := e.store.CopyTrade().ReserveExecutionIntent(&store.CopyTradeExecutionIntent{
-		TraderID: e.traderID, LeaderPosID: dec.LeaderPosID, SourceRevision: revision,
+		CurrentPositionTaskID: dec.CurrentPositionTaskID,
+		TraderID:              e.traderID, LeaderPosID: dec.LeaderPosID, SourceRevision: revision,
 		SourceFillID: dec.SourceFillID, SourceKind: "LEADER_TRANSITION", CanonicalKey: canonicalKey,
 		Action: dec.Action, Symbol: dec.Symbol, Side: side,
 		MarginMode: dec.MarginMode, LeaderTargetSize: dec.LeaderPosSize,
@@ -2665,7 +2691,8 @@ func (e *Engine) buildDecisionV2(signal *TradeSignal, match *SignalMatchResult, 
 	}
 
 	dec := decision.Decision{
-		CopyLeaderEquity: signal.LeaderEquity, CopyFollowerEquity: signal.SizingFollowerEquity, CopyCoefficient: e.config.CopyRatio, SourceNotional: signal.SizingSourceNotional, SourceSnapshotMS: signal.SnapshotMS, SignalObservedMS: time.Now().UnixMilli(),
+		CurrentPositionTaskID: fill.CurrentPositionTaskID,
+		CopyLeaderEquity:      signal.LeaderEquity, CopyFollowerEquity: signal.SizingFollowerEquity, CopyCoefficient: e.config.CopyRatio, SourceNotional: signal.SizingSourceNotional, SourceSnapshotMS: signal.SnapshotMS, SignalObservedMS: time.Now().UnixMilli(),
 		Symbol:          fill.Symbol,
 		Action:          e.mapAction(match.Action, fill.PositionSide),
 		IsCopyTrade:     true,
@@ -2680,6 +2707,9 @@ func (e *Engine) buildDecisionV2(signal *TradeSignal, match *SignalMatchResult, 
 		SourceSymbol:    fill.Symbol,
 		ValueCurrency:   fill.ValueCurrency,
 		LeaderReversed:  match.LeaderReversed,
+	}
+	if fill.CurrentPositionTaskID > 0 {
+		dec.Reasoning = fmt.Sprintf("Copy trading: open current position once (task %d) following %s leader %s", fill.CurrentPositionTaskID, e.config.ProviderType, e.config.LeaderID)
 	}
 	if match.LeaderPosition != nil {
 		dec.SourceOpenedMS = match.LeaderPosition.OpenedMS
@@ -2994,7 +3024,7 @@ func (e *Engine) calculateCopySizeByPositionChange(signal *TradeSignal, match *S
 	leaderTradeRatio := leaderTradeValue / leaderEquity
 
 	// 计算跟单金额
-	copySize := e.config.CopyRatio * leaderTradeRatio * followerEquity
+	copySize := proportionalCopyNotional(leaderTradeValue, leaderEquity, followerEquity, e.config.CopyRatio)
 
 	logger.Infof("📊 [%s] 比例计算 | %s | 领航员: 交易=%.2f 权益=%.2f(锚定=%s) 占比=%.2f%% | 跟随者: 权益=%.2f 系数=%.0f%% → 跟单=%.2f",
 		e.traderID, fill.Symbol,
@@ -3328,6 +3358,9 @@ func (e *Engine) syncLeaderState() (syncErr error) {
 			// snapshot until every no-chase baseline write succeeds atomically.
 			return err
 		}
+	}
+	if err := e.prepareCurrentPositionCopy(state); err != nil {
+		return fmt.Errorf("复制当前仓位: %w", err)
 	}
 	if err := e.synchronizeFollowGroups(state); err != nil {
 		return fmt.Errorf("follow group source snapshot: %w", err)

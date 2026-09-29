@@ -1477,7 +1477,7 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 	// Explicit CopyTradeAction is the canonical action identity. The helper
 	// retains Reasoning parsing only for decisions persisted by old clients.
 	quantityKind := copyOpenQuantityKind(decision)
-	isAddPosition := isCopyTrade && (quantityKind == QuantityAdd || quantityKind == QuantityCatchup)
+	isAddPosition := isCopyTrade && (quantityKind == QuantityAdd || quantityKind == QuantityCatchup || decision.AllowManagedPositionMerge)
 
 	// 跟单开仓 MarginMode 为空（SyncMarginMode=false 或数据源未提供）：
 	// 回填为交易员自身配置的模式，让后续的重复仓位检查、mapping 记录、
@@ -1759,7 +1759,7 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 	// Keep duplicate-position gating on the same canonical action classifier
 	// used by quantity policy so UI/log wording cannot turn an add into an open.
 	quantityKind := copyOpenQuantityKind(decision)
-	isAddPosition := isCopyTrade && (quantityKind == QuantityAdd || quantityKind == QuantityCatchup)
+	isAddPosition := isCopyTrade && (quantityKind == QuantityAdd || quantityKind == QuantityCatchup || decision.AllowManagedPositionMerge)
 
 	// 跟单开仓 MarginMode 回填（与 executeOpenLongWithRecord 对称，见其注释）
 	at.fillCopyTradeMarginMode(isCopyTrade, decision)

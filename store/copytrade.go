@@ -23,17 +23,20 @@ const (
 
 // CopyTradeConfig 跟单配置（存储在数据库中）
 type CopyTradeConfig struct {
-	TraderID                 string  `json:"trader_id"`
-	ProviderType             string  `json:"provider_type"`    // "hyperliquid" | "okx" | "binance"
-	LeaderID                 string  `json:"leader_id"`        // 领航员地址/uniqueName，Binance 模式下复用为 portfolioId
-	CopyRatio                float64 `json:"copy_ratio"`       // 跟单系数 (1.0 = 100%)
-	SyncLeverage             bool    `json:"sync_leverage"`    // 同步杠杆
-	SyncMarginMode           bool    `json:"sync_margin_mode"` // 同步保证金模式
-	MinTradeWarn             float64 `json:"min_trade_warn"`   // 纯运营小额预警，不参与交易所可执行性判断
-	MaxTradeWarn             float64 `json:"max_trade_warn"`   // 大额预警阈值 (0=不预警)
-	CopyCatchupWindowSeconds int     `json:"copy_catchup_window_seconds"`
-	CopyCatchupMaxAdverseBPS float64 `json:"copy_catchup_max_adverse_bps"`
-	Enabled                  bool    `json:"enabled"` // 是否启用
+	CopyCurrentPositionsOnce      *bool                `json:"copy_current_positions_once,omitempty"`
+	CopyCurrentPositionsRequestID string               `json:"copy_current_positions_request_id,omitempty"`
+	CurrentPositionCopy           *CurrentPositionCopy `json:"current_position_copy,omitempty"`
+	TraderID                      string               `json:"trader_id"`
+	ProviderType                  string               `json:"provider_type"`    // "hyperliquid" | "okx" | "binance"
+	LeaderID                      string               `json:"leader_id"`        // 领航员地址/uniqueName，Binance 模式下复用为 portfolioId
+	CopyRatio                     float64              `json:"copy_ratio"`       // 跟单系数 (1.0 = 100%)
+	SyncLeverage                  bool                 `json:"sync_leverage"`    // 同步杠杆
+	SyncMarginMode                bool                 `json:"sync_margin_mode"` // 同步保证金模式
+	MinTradeWarn                  float64              `json:"min_trade_warn"`   // 纯运营小额预警，不参与交易所可执行性判断
+	MaxTradeWarn                  float64              `json:"max_trade_warn"`   // 大额预警阈值 (0=不预警)
+	CopyCatchupWindowSeconds      int                  `json:"copy_catchup_window_seconds"`
+	CopyCatchupMaxAdverseBPS      float64              `json:"copy_catchup_max_adverse_bps"`
+	Enabled                       bool                 `json:"enabled"` // 是否启用
 
 	// Binance Web 私有接口凭证（仅 ProviderType=binance 时使用，明文存储）
 	BinanceP20T        string `json:"binance_p20t,omitempty"`       // 登录 cookie p20t
@@ -568,6 +571,9 @@ func (s *CopyTradeStore) Create(config *CopyTradeConfig) error {
 	if err != nil {
 		return err
 	}
+	if err = saveCurrentPositionCopyTx(tx, config); err != nil {
+		return err
+	}
 	if err = saveCopyGuardPolicyWithExecutor(tx, config); err != nil {
 		return err
 	}
@@ -621,6 +627,9 @@ func (s *CopyTradeStore) Update(config *CopyTradeConfig) error {
 		config.RiskReentryEnabled, config.RiskReentryRatio, config.RiskManualReentryEnabled,
 		config.TraderID)
 	if err != nil {
+		return err
+	}
+	if err = saveCurrentPositionCopyTx(tx, config); err != nil {
 		return err
 	}
 	if err = saveCopyGuardPolicyWithExecutor(tx, config); err != nil {
@@ -698,6 +707,9 @@ func (s *CopyTradeStore) upsert(config *CopyTradeConfig, profileDefaulted bool) 
 	if err != nil {
 		return err
 	}
+	if err = saveCurrentPositionCopyTx(tx, config); err != nil {
+		return err
+	}
 	if err = saveCopyGuardPolicyWithExecutor(tx, config); err != nil {
 		return err
 	}
@@ -716,6 +728,9 @@ func (s *CopyTradeStore) Delete(traderID string) error {
 		return err
 	}
 	defer tx.Rollback()
+	if err := cancelCurrentPositionCopyTx(tx, traderID, "CONFIGURATION_CHANGED"); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(`DELETE FROM copy_trade_source_health WHERE trader_id = ?`, traderID); err != nil {
 		return err
 	}
@@ -808,6 +823,16 @@ func (s *CopyTradeStore) hydrateCopyTradeConfig(config *CopyTradeConfig) error {
 	}
 	if err := s.loadCopyGuardPolicy(config); err != nil && err != sql.ErrNoRows {
 		return err
+	}
+	var err error
+	config.CurrentPositionCopy, err = s.CurrentPositionCopy(config.TraderID)
+	if err != nil {
+		return err
+	}
+	if config.CurrentPositionCopy != nil {
+		pending := config.CurrentPositionCopy.Status == "PENDING"
+		config.CopyCurrentPositionsOnce = &pending
+		config.CopyCurrentPositionsRequestID = config.CurrentPositionCopy.RequestID
 	}
 	upgradeLegacyRiskPolicy(config)
 	config.FillRiskDefaults()
@@ -941,8 +966,20 @@ func (s *CopyTradeStore) SetEnabled(traderID string, enabled bool) error {
 
 // UpdateDecisionMode 更新 trader 的决策模式
 func (s *CopyTradeStore) UpdateDecisionMode(traderID, mode string) error {
-	_, err := s.db.Exec(`UPDATE traders SET decision_mode = ? WHERE id = ?`, mode, traderID)
-	return err
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.Exec(`UPDATE traders SET decision_mode=? WHERE id=?`, mode, traderID); err != nil {
+		return err
+	}
+	if mode != "copy_trade" {
+		if err = cancelCurrentPositionCopyTx(tx, traderID, "DECISION_MODE_CHANGED"); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // GetDecisionMode 获取 trader 的决策模式
@@ -1365,7 +1402,7 @@ func (s *CopyTradeStore) getMappingByStatus(traderID, leaderPosID, status string
 		// 无状态筛选时，优先级 active > stopped_by_risk > manual_stopped > detached > ignored，忽略 closed
 		// stopped_by_risk 排在 ignored 前面：让上层 matchSignal 能及时看到熔断状态
 		// manual_stopped 必须在列表内：否则手动停跟的映射会被当成"无映射=新开仓"
-		query += " AND status IN ('active', 'stopped_by_risk', 'manual_stopped', 'detached', 'ignored') ORDER BY CASE status WHEN 'active' THEN 1 WHEN 'stopped_by_risk' THEN 2 WHEN 'manual_stopped' THEN 3 WHEN 'detached' THEN 4 WHEN 'ignored' THEN 5 END LIMIT 1"
+		query += " AND status IN ('active', 'stopped_by_risk', 'manual_stopped', 'detached', 'ignored', 'copy_pending') ORDER BY CASE status WHEN 'active' THEN 1 WHEN 'stopped_by_risk' THEN 2 WHEN 'manual_stopped' THEN 3 WHEN 'detached' THEN 4 WHEN 'ignored' THEN 5 WHEN 'copy_pending' THEN 6 END LIMIT 1"
 	}
 
 	row := s.db.QueryRow(query, args...)

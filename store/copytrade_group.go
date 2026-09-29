@@ -154,7 +154,7 @@ func (s *CopyTradeStore) EnsureFollowGroupMember(traderID, provider, leaderID, s
 	// Legacy per-leg participation may disagree. Do not silently promote an
 	// ignored/manual leg, or suppress an existing participating one by row order.
 	var ignored, paused, participating int
-	if err = tx.QueryRow(`SELECT COALESCE(SUM(m.status='ignored'),0),COALESCE(SUM(m.status='manual_stopped'),0),COALESCE(SUM(m.status IN('active','detached','stopped_by_risk')),0) FROM copy_trade_position_mappings m JOIN copy_trade_follow_group_members gm ON gm.leader_pos_id=m.leader_pos_id WHERE m.trader_id=? AND gm.group_id=?`, traderID, g.ID).Scan(&ignored, &paused, &participating); err != nil {
+	if err = tx.QueryRow(`SELECT COALESCE(SUM(m.status='ignored'),0),COALESCE(SUM(m.status='manual_stopped'),0),COALESCE(SUM(m.status IN('active','detached','stopped_by_risk','copy_pending')),0) FROM copy_trade_position_mappings m JOIN copy_trade_follow_group_members gm ON gm.leader_pos_id=m.leader_pos_id WHERE m.trader_id=? AND gm.group_id=?`, traderID, g.ID).Scan(&ignored, &paused, &participating); err != nil {
 		return nil, err
 	}
 	if (ignored > 0 && (paused > 0 || participating > 0)) || (paused > 0 && participating > 0) {

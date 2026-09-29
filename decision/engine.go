@@ -127,8 +127,12 @@ type Context struct {
 
 // Decision AI trading decision
 type Decision struct {
-	Symbol string `json:"symbol"`
-	Action string `json:"action"` // "open_long", "open_short", "close_long", "close_short", "hold", "wait"
+	CurrentPositionTaskID int64 `json:"current_position_task_id,omitempty"`
+	// Runtime-only authorization from fresh managed group continuity. It never
+	// changes initial-entry quantity rounding or promotes an independent position.
+	AllowManagedPositionMerge bool   `json:"-"`
+	Symbol                    string `json:"symbol"`
+	Action                    string `json:"action"` // "open_long", "open_short", "close_long", "close_short", "hold", "wait"
 
 	// Opening position parameters
 	Leverage        int     `json:"leverage,omitempty"`

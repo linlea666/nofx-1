@@ -315,6 +315,10 @@ export interface CopyTradeSourceHealth {
 
 // Copy config request (simplified version for creating traders)
 export interface CopyConfigRequest {
+  copy_current_positions_once?: boolean
+  copy_current_positions_request_id?: string
+  current_position_copy?: CurrentPositionCopyResult
+
   atr_profile_patch?: Partial<
     Omit<NonNullable<CopyTradeConfig['atr_profile']>, 'manual_reentry_enabled'>
   >
@@ -854,6 +858,10 @@ export interface DebatePersonalityInfo {
 
 // Copy Trading Types
 export interface CopyTradeConfig {
+  copy_current_positions_once?: boolean
+  copy_current_positions_request_id?: string
+  current_position_copy?: CurrentPositionCopyResult
+
   trader_id: string
   provider_type: CopyTradeProvider
   leader_id: string
@@ -1764,4 +1772,33 @@ export interface BinanceCredentialsTestResponse {
 export interface BinanceCredentialsAffectedResponse {
   trader_ids: string[]
   count: number
+}
+
+export interface CurrentPositionCopyRow {
+  id: number
+  leader_pos_id: string
+  symbol: string
+  side: string
+  margin_mode: string
+  leader_entry_price: number
+  reference_price: number
+  estimated_notional: number
+  leverage: number
+  status: string
+  reason: string
+  intent_id: number
+  filled_quantity: number
+}
+export interface CurrentPositionCopyResult {
+  request_id: string
+  status: string
+  reason: string
+  snapshot_at: string
+  tasks: CurrentPositionCopyRow[]
+}
+export interface CurrentPositionCopyPreview {
+  snapshot_at: string
+  leader_equity: number
+  follower_equity: number
+  positions: CurrentPositionCopyRow[]
 }

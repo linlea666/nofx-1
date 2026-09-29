@@ -343,6 +343,19 @@ func (s *TraderStore) FailStart(userID, traderID string, generation int64, detai
 }
 
 func (s *TraderStore) BeginStop(userID, traderID string) (*TraderLifecycle, error) {
+	return s.beginStop(userID, traderID, 0, "")
+}
+
+// BeginFailedStartStop fences only this failed runtime generation. A request
+// still awaiting its first complete snapshot survives for the next manual start.
+func (s *TraderStore) BeginFailedStartStop(userID, traderID string, generation int64, detail string) (*TraderLifecycle, error) {
+	if generation <= 0 {
+		return nil, ErrTraderLifecycleConflict
+	}
+	return s.beginStop(userID, traderID, generation, detail)
+}
+
+func (s *TraderStore) beginStop(userID, traderID string, failedGeneration int64, detail string) (*TraderLifecycle, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return nil, err
@@ -353,6 +366,9 @@ func (s *TraderStore) BeginStop(userID, traderID string) (*TraderLifecycle, erro
 	if err = tx.QueryRow(`SELECT lifecycle_status,lifecycle_generation FROM traders
 		WHERE id=? AND user_id=?`, traderID, userID).Scan(&from, &generation); err != nil {
 		return nil, err
+	}
+	if failedGeneration > 0 && (from != TraderLifecycleRunning || generation != failedGeneration) {
+		return nil, ErrTraderLifecycleConflict
 	}
 	switch from {
 	case TraderLifecycleArchived, TraderLifecycleArchiving:
@@ -373,7 +389,16 @@ func (s *TraderStore) BeginStop(userID, traderID string) (*TraderLifecycle, erro
 	if n, _ := res.RowsAffected(); n != 1 {
 		return nil, ErrTraderLifecycleConflict
 	}
-	if err = recordTraderLifecycleEventTx(tx, traderID, generation, from, TraderLifecycleStopping, "OPERATOR_STOP", "new risk disabled; submitted work must reconcile"); err != nil {
+	reason := "OPERATOR_STOP"
+	if failedGeneration > 0 {
+		reason = "START_FAILED"
+	} else {
+		detail = "new risk disabled; submitted work must reconcile"
+		if _, err = tx.Exec(`UPDATE copy_trade_current_position_requests SET status='CANCELLED',reason='TRADER_STOPPED' WHERE trader_id=? AND status='PENDING'`, traderID); err != nil {
+			return nil, err
+		}
+	}
+	if err = recordTraderLifecycleEventTx(tx, traderID, generation, from, TraderLifecycleStopping, reason, detail); err != nil {
 		return nil, err
 	}
 	if err = pauseTraderRiskIncreaseTx(tx, traderID); err != nil {
@@ -387,6 +412,9 @@ func (s *TraderStore) BeginStop(userID, traderID string) (*TraderLifecycle, erro
 
 func pauseTraderRiskIncreaseTx(tx *sql.Tx, traderID string) error {
 	if _, err := finishStoppedSourceTransitionsTx(tx, traderID, "", false); err != nil {
+		return err
+	}
+	if err := cancelCurrentPositionCopyTasksTx(tx, traderID, "TRADER_STOPPED"); err != nil {
 		return err
 	}
 

@@ -95,21 +95,22 @@ const (
 
 // Fill 成交记录（标准化结构）
 type Fill struct {
-	LeaderPosID   string     // Populated by authoritative position snapshots.
-	ID            string     // 唯一标识 (HL: tid, OKX: ordId)
-	Symbol        string     // 交易对 (BTCUSDT 格式)
-	Side          string     // "buy" | "sell"
-	PositionSide  SideType   // "long" | "short"
-	Action        ActionType // "open" | "close" | "add" | "reduce"
-	Price         float64    // 成交价格
-	Size          float64    // 成交数量
-	Value         float64    // USD 归一价值；旧数据源保持原 USDT 语义
-	RawValue      float64    // 源合约报价币种名义价值
-	ValueCurrency string     // RawValue 币种（USDT/USDC/USD1）；空表示旧数据源 USDT
-	ValueUSDValid bool       // Value 是否完成显式 USD 归一；旧数据源通过 ValueCurrency=="" 兼容
-	ValueError    string     // 归一失败原因（开仓/加仓必须 fail closed）
-	Timestamp     time.Time  // 成交时间
-	ClosedPnL     float64    // 平仓盈亏 (如有)
+	CurrentPositionTaskID int64
+	LeaderPosID           string     // Populated by authoritative position snapshots.
+	ID                    string     // 唯一标识 (HL: tid, OKX: ordId)
+	Symbol                string     // 交易对 (BTCUSDT 格式)
+	Side                  string     // "buy" | "sell"
+	PositionSide          SideType   // "long" | "short"
+	Action                ActionType // "open" | "close" | "add" | "reduce"
+	Price                 float64    // 成交价格
+	Size                  float64    // 成交数量
+	Value                 float64    // USD 归一价值；旧数据源保持原 USDT 语义
+	RawValue              float64    // 源合约报价币种名义价值
+	ValueCurrency         string     // RawValue 币种（USDT/USDC/USD1）；空表示旧数据源 USDT
+	ValueUSDValid         bool       // Value 是否完成显式 USD 归一；旧数据源通过 ValueCurrency=="" 兼容
+	ValueError            string     // 归一失败原因（开仓/加仓必须 fail closed）
+	Timestamp             time.Time  // 成交时间
+	ClosedPnL             float64    // 平仓盈亏 (如有)
 	// SourceFillIDs records raw fills collapsed into a snapshot transition.
 	// For non-snapshot providers it is empty and ID remains the sole source id.
 	SourceFillIDs []string

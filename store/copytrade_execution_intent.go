@@ -101,6 +101,7 @@ type CopyTradeExecutionOrderAttempt struct {
 // relationship; intents describe the individual exchange mutation that moves
 // that relationship forward.
 type CopyTradeExecutionIntent struct {
+	CurrentPositionTaskID     int64 `json:"current_position_task_id,omitempty"`
 	SourceSnapshotMS          int64
 	SignalObservedMS          int64
 	LeaderExitScope           string     `json:"leader_exit_scope,omitempty"`
@@ -444,14 +445,14 @@ func (s *CopyTradeStore) CommitLeaderExecutionFill(c LeaderExecutionCommit) erro
 	if currentRevision != c.SourceRevision-1 {
 		return fmt.Errorf("mapping revision conflict for %s: current=%d expected=%d", c.LeaderPosID, currentRevision, c.SourceRevision-1)
 	}
-	initialOpen := open && !c.IsAdd && (err == sql.ErrNoRows || mappingStatus == MappingStatusClosed || mappingStatus == MappingStatusIgnored)
+	initialOpen := open && !c.IsAdd && (err == sql.ErrNoRows || mappingStatus == MappingStatusClosed || mappingStatus == MappingStatusIgnored || mappingStatus == MappingStatusCopyPending)
 	switch {
 	case open && err == sql.ErrNoRows:
 		_, err = tx.Exec(`INSERT INTO copy_trade_position_mappings
 			(trader_id,leader_pos_id,leader_id,symbol,source_symbol,execution_symbol,source_quote_asset,execution_settle_asset,source_revision,side,margin_mode,status,opened_at,open_price,open_size_usd,last_known_size,add_count,reduce_count,updated_at)
 			VALUES(?,?,?,?,?,?,?,?,?,?,?,'active',CURRENT_TIMESTAMP,?,?,?,0,0,CURRENT_TIMESTAMP)`,
 			c.TraderID, c.LeaderPosID, c.LeaderID, c.Symbol, c.SourceSymbol, c.ExecutionSymbol, c.SourceQuoteAsset, c.ExecutionSettleAsset, c.SourceRevision, c.Side, c.MarginMode, c.FillPrice, deltaNotional, c.LeaderTargetSize)
-	case open && (mappingStatus == MappingStatusClosed || mappingStatus == MappingStatusIgnored):
+	case open && (mappingStatus == MappingStatusClosed || mappingStatus == MappingStatusIgnored || mappingStatus == MappingStatusCopyPending):
 		_, err = tx.Exec(`UPDATE copy_trade_position_mappings SET leader_id=?,symbol=?,source_symbol=?,execution_symbol=?,source_quote_asset=?,execution_settle_asset=?,source_revision=?,side=?,margin_mode=?,status='active',opened_at=CURRENT_TIMESTAMP,closed_at=NULL,close_price=0,open_price=?,open_size_usd=?,last_known_size=?,add_count=0,reduce_count=0,updated_at=CURRENT_TIMESTAMP WHERE trader_id=? AND leader_pos_id=?`,
 			c.LeaderID, c.Symbol, c.SourceSymbol, c.ExecutionSymbol, c.SourceQuoteAsset, c.ExecutionSettleAsset, c.SourceRevision, c.Side, c.MarginMode, c.FillPrice, deltaNotional, c.LeaderTargetSize, c.TraderID, c.LeaderPosID)
 	case open && mappingStatus == MappingStatusActive && strings.EqualFold(mappingSide, c.Side):
@@ -923,13 +924,15 @@ func (s *CopyTradeStore) SettleOrdinaryCatchupTransition(c OrdinaryCatchupSettle
 			 opened_at,open_price,open_size_usd,last_known_size,add_count,reduce_count,updated_at)
 			VALUES(?,?,?,?,?,?,?,'ignored',CURRENT_TIMESTAMP,0,0,?,0,0,CURRENT_TIMESTAMP)`,
 			c.TraderID, leaderPosID, c.LeaderID, symbol, sourceRevision, side, marginMode, leaderTargetSize)
+	case mappingErr == nil && mappingStatus == MappingStatusCopyPending && currentRevision == sourceRevision-1 && filledQuantity <= tolerance:
+		_, err = tx.Exec(`UPDATE copy_trade_position_mappings SET source_revision=?,last_known_size=?,updated_at=CURRENT_TIMESTAMP WHERE trader_id=? AND leader_pos_id=? AND status='copy_pending' AND source_revision=?`, sourceRevision, leaderTargetSize, c.TraderID, leaderPosID, sourceRevision-1)
 	case mappingErr == nil && mappingStatus == MappingStatusActive && currentRevision == sourceRevision-1 && filledQuantity <= tolerance:
 		_, err = tx.Exec(`UPDATE copy_trade_position_mappings
 			SET source_revision=?,last_known_size=?,updated_at=CURRENT_TIMESTAMP
 			WHERE trader_id=? AND leader_pos_id=? AND status='active' AND COALESCE(source_revision,0)=?`,
 			sourceRevision, leaderTargetSize, c.TraderID, leaderPosID, sourceRevision-1)
 	case mappingErr == nil && currentRevision == sourceRevision &&
-		(mappingStatus == MappingStatusActive || mappingStatus == MappingStatusIgnored ||
+		(mappingStatus == MappingStatusActive || mappingStatus == MappingStatusIgnored || mappingStatus == MappingStatusCopyPending ||
 			mappingStatus == MappingStatusStoppedByRisk || mappingStatus == MappingStatusDetached ||
 			mappingStatus == MappingStatusManualStopped):
 		// A confirmed partial fill already advanced the mapping. Only the
@@ -1160,6 +1163,9 @@ func (s *CopyTradeStore) CommitIgnoredLeaderTransition(c IgnoredLeaderTransition
 	case mappingErr == nil && mappingStatus == MappingStatusClosed && currentRevision == c.SourceRevision-1:
 		_, err = tx.Exec(`UPDATE copy_trade_position_mappings SET leader_id=?,symbol=?,source_revision=?,side=?,margin_mode=?,status='ignored',opened_at=CURRENT_TIMESTAMP,closed_at=NULL,close_price=0,open_price=0,open_size_usd=0,last_known_size=?,add_count=0,reduce_count=0,updated_at=CURRENT_TIMESTAMP WHERE trader_id=? AND leader_pos_id=? AND status='closed' AND COALESCE(source_revision,0)=?`,
 			c.LeaderID, c.Symbol, c.SourceRevision, c.Side, c.MarginMode, c.LeaderTargetSize, c.TraderID, c.LeaderPosID, c.SourceRevision-1)
+	case mappingErr == nil && mappingStatus == MappingStatusCopyPending && currentRevision == c.SourceRevision-1:
+		_, err = tx.Exec(`UPDATE copy_trade_position_mappings SET source_revision=?,last_known_size=?,last_failure_reason=? WHERE trader_id=? AND leader_pos_id=? AND status='copy_pending'`, c.SourceRevision, c.LeaderTargetSize, c.ReasonCode, c.TraderID, c.LeaderPosID)
+	case mappingErr == nil && mappingStatus == MappingStatusCopyPending && currentRevision == c.SourceRevision:
 	case mappingErr == nil && mappingStatus == MappingStatusIgnored && currentRevision == c.SourceRevision:
 		// Idempotent retry after the mapping commit but before the caller saw it.
 	case mappingErr != nil:
@@ -1708,6 +1714,9 @@ func (s *CopyTradeStore) ReserveExecutionIntent(intent *CopyTradeExecutionIntent
 				return nil, false, err
 			}
 		}
+	}
+	if err = bindCurrentPositionCopyTx(tx, intent, stored.ID); err != nil {
+		return nil, false, err
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, false, err
@@ -2327,8 +2336,8 @@ func (s *CopyTradeStore) ListRecoverableOrdinaryCatchupIntents(traderID string) 
 				SELECT 1 FROM copy_trade_position_mappings m
 					WHERE m.trader_id=i.trader_id AND m.leader_pos_id=i.leader_pos_id
 					  AND (
-						(m.status='active' AND COALESCE(m.source_revision,0)=i.source_revision-1)
-						OR (m.status IN ('active','ignored','stopped_by_risk','detached')
+						(m.status IN ('active','copy_pending') AND COALESCE(m.source_revision,0)=i.source_revision-1)
+						OR (m.status IN ('active','ignored','stopped_by_risk','detached','copy_pending')
 							AND COALESCE(m.source_revision,0)=i.source_revision)
 						OR (m.status='closed' AND (
 							COALESCE(m.source_revision,0)>=i.source_revision

@@ -124,6 +124,7 @@ func checkFollowSubmission(q interface {
 	 (i.follow_control_version=COALESCE(f.version,0) AND (
 	 (i.action IN ('close_long','close_short','reduce_long','reduce_short') AND (COALESCE(m.status,'') IN ('active','detached','stopped_by_risk') OR (m.trader_id IS NULL AND NOT EXISTS(SELECT 1 FROM copy_trade_leader_exit_requests r WHERE r.intent_id=i.id))))
 	 OR (i.action NOT IN ('close_long','close_short','reduce_long','reduce_short') AND COALESCE(m.status,'') NOT IN ('manual_stopped','detached','stopped_by_risk','ignored')
+	 AND (COALESCE(m.status,'')<>'copy_pending' OR EXISTS(SELECT 1 FROM copy_trade_current_position_tasks cp JOIN copy_trade_current_position_requests cr ON cr.request_id=cp.request_id JOIN traders owner ON owner.id=cp.trader_id JOIN copy_trade_configs cfg ON cfg.trader_id=owner.id WHERE cp.intent_id=i.id AND cp.status='READY' AND cr.status='SEALED' AND cr.start_generation=owner.lifecycle_generation AND cr.exchange_id=owner.exchange_id AND owner.lifecycle_status='RUNNING' AND owner.decision_mode='copy_trade' AND cfg.provider_type=cr.provider AND cfg.leader_id=cr.leader_id AND cfg.source_generation=cr.source_generation))
 	 AND NOT EXISTS(SELECT 1 FROM copy_trade_position_custody p WHERE p.trader_id=i.trader_id AND p.leader_pos_id=i.leader_pos_id AND p.state='RELEASED' AND COALESCE(m.status,'')='active'))))
 	 WHEN i.source_kind='AI_REENTRY' THEN COALESCE(m.status,'')<>'manual_stopped' ELSE 1 END
 	 FROM copy_trade_execution_intents i LEFT JOIN copy_trade_follow_controls f ON f.trader_id=i.trader_id AND f.leader_pos_id=i.leader_pos_id

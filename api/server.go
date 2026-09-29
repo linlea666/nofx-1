@@ -532,12 +532,14 @@ type CreateTraderRequest struct {
 
 // CopyConfigReq Copy trading configuration request
 type CopyConfigReq struct {
-	ATRProfilePatch *store.CopyGuardATRProfilePatch `json:"atr_profile_patch,omitempty"`
-	ProviderType    string                          `json:"provider_type"`    // "hyperliquid" | "okx" | "binance"
-	LeaderID        string                          `json:"leader_id"`        // Leader wallet address or uniqueName / portfolioId (Binance)
-	CopyRatio       float64                         `json:"copy_ratio"`       // Copy ratio (1.0 = 100%)
-	SyncLeverage    bool                            `json:"sync_leverage"`    // Whether to sync leverage
-	SyncMarginMode  *bool                           `json:"sync_margin_mode"` // Whether to sync margin mode (OKX: cross/isolated)
+	CopyCurrentPositionsOnce      *bool                           `json:"copy_current_positions_once,omitempty"`
+	CopyCurrentPositionsRequestID string                          `json:"copy_current_positions_request_id,omitempty"`
+	ATRProfilePatch               *store.CopyGuardATRProfilePatch `json:"atr_profile_patch,omitempty"`
+	ProviderType                  string                          `json:"provider_type"`    // "hyperliquid" | "okx" | "binance"
+	LeaderID                      string                          `json:"leader_id"`        // Leader wallet address or uniqueName / portfolioId (Binance)
+	CopyRatio                     float64                         `json:"copy_ratio"`       // Copy ratio (1.0 = 100%)
+	SyncLeverage                  bool                            `json:"sync_leverage"`    // Whether to sync leverage
+	SyncMarginMode                *bool                           `json:"sync_margin_mode"` // Whether to sync margin mode (OKX: cross/isolated)
 	// 最小/最大跟单金额阈值（USDT）。指针区分"未传"（保留存量/默认值）与
 	// 显式 0（max=0 表示不预警）。此前请求结构缺这两个字段，前端传值被
 	// JSON unmarshal 静默丢弃，配置形同虚设（M18）。
@@ -896,6 +898,13 @@ func (s *Server) handleCreateTrader(c *gin.Context) {
 		req.CopyConfig.BinanceTopTraderID = candidate.BinanceTopTraderID
 	}
 
+	if req.CopyConfig != nil {
+		if err := validateCurrentCopyRegistration(s.store, "", req.ExchangeID, req.DecisionMode, req.CopyConfig.ProviderType, req.CopyConfig.LeaderID, req.CopyConfig.CopyCurrentPositionsRequestID, req.CopyConfig.CopyCurrentPositionsOnce); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
+
 	// Validate leverage values
 	if req.BTCETHLeverage < 0 || req.BTCETHLeverage > 50 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "BTC/ETH leverage must be between 1-50x"})
@@ -1127,6 +1136,8 @@ func (s *Server) handleCreateTrader(c *gin.Context) {
 		copyConfig.ProviderType = req.CopyConfig.ProviderType
 		copyConfig.LeaderID = req.CopyConfig.LeaderID
 		copyConfig.CopyRatio = req.CopyConfig.CopyRatio
+		copyConfig.CopyCurrentPositionsOnce = req.CopyConfig.CopyCurrentPositionsOnce
+		copyConfig.CopyCurrentPositionsRequestID = req.CopyConfig.CopyCurrentPositionsRequestID
 		copyConfig.SyncLeverage = req.CopyConfig.SyncLeverage
 		copyConfig.SyncMarginMode = syncMarginMode
 		if req.CopyConfig.MinTradeWarn != nil {
@@ -1338,6 +1349,17 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 		req.CopyConfig.BinanceTopTraderID = candidate.BinanceTopTraderID
 	}
 
+	if req.CopyConfig != nil {
+		account := req.ExchangeID
+		if account == "" {
+			account = existingTrader.ExchangeID
+		}
+		if err := validateCurrentCopyRegistration(s.store, traderID, account, req.DecisionMode, req.CopyConfig.ProviderType, req.CopyConfig.LeaderID, req.CopyConfig.CopyCurrentPositionsRequestID, req.CopyConfig.CopyCurrentPositionsOnce); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
+
 	// Set default values
 	isCrossMargin := existingTrader.IsCrossMargin // Keep original value
 	if req.IsCrossMargin != nil {
@@ -1446,6 +1468,8 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 			copyConfig.ProviderType = req.CopyConfig.ProviderType
 			copyConfig.LeaderID = req.CopyConfig.LeaderID
 			copyConfig.CopyRatio = req.CopyConfig.CopyRatio
+			copyConfig.CopyCurrentPositionsOnce = req.CopyConfig.CopyCurrentPositionsOnce
+			copyConfig.CopyCurrentPositionsRequestID = req.CopyConfig.CopyCurrentPositionsRequestID
 			copyConfig.SyncLeverage = req.CopyConfig.SyncLeverage
 			copyConfig.SyncMarginMode = syncMarginMode
 			if req.CopyConfig.MinTradeWarn != nil {
@@ -1787,7 +1811,7 @@ func (s *Server) handleStartTrader(c *gin.Context) {
 		return
 	}
 	rollbackCommittedStart := func(cause error) {
-		if stopped, stopErr := s.store.Trader().BeginStop(userID, traderID); stopErr == nil {
+		if stopped, stopErr := s.store.Trader().BeginFailedStartStop(userID, traderID, lifecycle.Generation, cause.Error()); stopErr == nil {
 			_ = s.store.Trader().CompleteStop(userID, traderID, stopped.Generation)
 		}
 		trader.Stop()
@@ -2814,14 +2838,17 @@ func (s *Server) handleGetTraderConfig(c *gin.Context) {
 	if decisionMode == "copy_trade" {
 		if cfg, err := s.store.CopyTrade().GetByTraderID(traderID); err == nil && cfg != nil {
 			copyConfig = map[string]interface{}{
-				"enabled":          cfg.Enabled,
-				"provider_type":    cfg.ProviderType,
-				"leader_id":        cfg.LeaderID,
-				"copy_ratio":       cfg.CopyRatio,
-				"sync_leverage":    cfg.SyncLeverage,
-				"sync_margin_mode": cfg.SyncMarginMode,
-				"min_trade_warn":   cfg.MinTradeWarn,
-				"max_trade_warn":   cfg.MaxTradeWarn,
+				"enabled":                           cfg.Enabled,
+				"copy_current_positions_once":       cfg.CopyCurrentPositionsOnce,
+				"copy_current_positions_request_id": cfg.CopyCurrentPositionsRequestID,
+				"current_position_copy":             cfg.CurrentPositionCopy,
+				"provider_type":                     cfg.ProviderType,
+				"leader_id":                         cfg.LeaderID,
+				"copy_ratio":                        cfg.CopyRatio,
+				"sync_leverage":                     cfg.SyncLeverage,
+				"sync_margin_mode":                  cfg.SyncMarginMode,
+				"min_trade_warn":                    cfg.MinTradeWarn,
+				"max_trade_warn":                    cfg.MaxTradeWarn,
 				// 凭证脱敏返回（保存路径识别掩码值为"未修改"，见 resolveCredentialUpdate）
 				"binance_p20t":          store.MaskSecret(cfg.BinanceP20T),
 				"binance_csrf_token":    store.MaskSecret(cfg.BinanceCSRFToken),

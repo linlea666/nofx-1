@@ -239,6 +239,7 @@ func (h *CopyTradeHandler) RegisterRoutes(group *gin.RouterGroup) {
 	{
 		copyTrade.GET("/config/:trader_id", h.GetConfig)
 		copyTrade.POST("/config/:trader_id", h.SaveConfig)
+		copyTrade.POST("/current-positions/preview", h.PreviewCurrentPositions)
 		copyTrade.DELETE("/config/:trader_id", h.DeleteConfig)
 		copyTrade.POST("/start/:trader_id", h.Start)
 		copyTrade.POST("/stop/:trader_id", h.Stop)
@@ -1339,17 +1340,19 @@ func (h *CopyTradeHandler) DismissManualSignal(c *gin.Context) {
 
 // CopyTradeConfigRequest 跟单配置请求
 type CopyTradeConfigRequest struct {
-	ATRProfilePatch          *store.CopyGuardATRProfilePatch `json:"atr_profile_patch,omitempty"`
-	ProviderType             string                          `json:"provider_type" binding:"required,oneof=hyperliquid okx binance"`
-	LeaderID                 string                          `json:"leader_id"`
-	CopyRatio                float64                         `json:"copy_ratio" binding:"required,gt=0"`
-	SyncLeverage             bool                            `json:"sync_leverage"`
-	SyncMarginMode           bool                            `json:"sync_margin_mode"`
-	MinTradeWarn             float64                         `json:"min_trade_warn"`
-	MaxTradeWarn             float64                         `json:"max_trade_warn"`
-	CopyCatchupWindowSeconds *int                            `json:"copy_catchup_window_seconds,omitempty"`
-	CopyCatchupMaxAdverseBPS *float64                        `json:"copy_catchup_max_adverse_bps,omitempty"`
-	Enabled                  bool                            `json:"enabled"`
+	CopyCurrentPositionsOnce      *bool                           `json:"copy_current_positions_once,omitempty"`
+	CopyCurrentPositionsRequestID string                          `json:"copy_current_positions_request_id,omitempty"`
+	ATRProfilePatch               *store.CopyGuardATRProfilePatch `json:"atr_profile_patch,omitempty"`
+	ProviderType                  string                          `json:"provider_type" binding:"required,oneof=hyperliquid okx binance"`
+	LeaderID                      string                          `json:"leader_id"`
+	CopyRatio                     float64                         `json:"copy_ratio" binding:"required,gt=0"`
+	SyncLeverage                  bool                            `json:"sync_leverage"`
+	SyncMarginMode                bool                            `json:"sync_margin_mode"`
+	MinTradeWarn                  float64                         `json:"min_trade_warn"`
+	MaxTradeWarn                  float64                         `json:"max_trade_warn"`
+	CopyCatchupWindowSeconds      *int                            `json:"copy_catchup_window_seconds,omitempty"`
+	CopyCatchupMaxAdverseBPS      *float64                        `json:"copy_catchup_max_adverse_bps,omitempty"`
+	Enabled                       bool                            `json:"enabled"`
 
 	// Binance Web 凭证（仅 ProviderType=binance 时使用）
 	BinanceP20T        string `json:"binance_p20t"`
@@ -1643,6 +1646,10 @@ func (h *CopyTradeHandler) SaveConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	if err := validateCurrentCopyRegistration(h.store, traderID, ownedTrader.ExchangeID, "copy_trade", req.ProviderType, req.LeaderID, req.CopyCurrentPositionsRequestID, req.CopyCurrentPositionsOnce); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 	// 跟单系数上限校验（与前端滑杆上限 3 保持数量级一致，留出直连 API 余量）：
 	// 无上限时误传 100 会以百倍杠杆化仓位跟单，属于资金安全隐患
 	if req.CopyRatio > maxCopyRatio {
@@ -1665,6 +1672,8 @@ func (h *CopyTradeHandler) SaveConfig(c *gin.Context) {
 	config.ProviderType = req.ProviderType
 	config.LeaderID = req.LeaderID
 	config.CopyRatio = req.CopyRatio
+	config.CopyCurrentPositionsOnce = req.CopyCurrentPositionsOnce
+	config.CopyCurrentPositionsRequestID = req.CopyCurrentPositionsRequestID
 	config.SyncLeverage = req.SyncLeverage
 	config.SyncMarginMode = req.SyncMarginMode
 	config.MinTradeWarn = req.MinTradeWarn
@@ -1858,7 +1867,7 @@ func (h *CopyTradeHandler) SaveConfig(c *gin.Context) {
 	// 保存配置（store.Upsert 内部会调 FillRiskDefaults 做最后兜底）
 	if err := h.store.CopyTrade().UpsertWithATRProfileDefaultMigration(config, profileDefaulted); err != nil {
 		logger.Errorf("Failed to save copy trade config: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save config"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	if err := verifyCopyGuardConfigReadback(h.store, config); err != nil {
@@ -2198,7 +2207,7 @@ func (h *CopyTradeHandler) Start(c *gin.Context) {
 		traderID, lifecycle.Generation, autoTrader, h.store); err != nil {
 		logger.Errorf("Failed to start copy trading: %v", err)
 		_ = h.store.CopyTrade().SetEnabled(traderID, false)
-		if stopping, stopErr := h.store.Trader().BeginStop(userID, traderID); stopErr == nil {
+		if stopping, stopErr := h.store.Trader().BeginFailedStartStop(userID, traderID, lifecycle.Generation, err.Error()); stopErr == nil {
 			_ = h.store.Trader().CompleteStop(userID, traderID, stopping.Generation)
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -2207,7 +2216,7 @@ func (h *CopyTradeHandler) Start(c *gin.Context) {
 	if err = h.store.ReentryAI().ResumeTraderCandidatesForStart(traderID); err != nil {
 		_ = copytrade.StopCopyTradingForTrader(traderID)
 		_ = h.store.CopyTrade().SetEnabled(traderID, false)
-		if stopping, stopErr := h.store.Trader().BeginStop(userID, traderID); stopErr == nil {
+		if stopping, stopErr := h.store.Trader().BeginFailedStartStop(userID, traderID, lifecycle.Generation, err.Error()); stopErr == nil {
 			_ = h.store.Trader().CompleteStop(userID, traderID, stopping.Generation)
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})

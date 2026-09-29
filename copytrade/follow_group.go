@@ -199,7 +199,7 @@ func (ti *TraderIntegration) queueFollowGroupProtections(groupID int64) error {
 	return nil
 }
 
-func (ti *TraderIntegration) verifyManagedFollowGroupPeer(dec *decision.Decision) (bool, error) {
+func (ti *TraderIntegration) verifyManagedFollowGroupPeer(dec *decision.Decision, physicalMarginMode ...string) (bool, error) {
 	g, err := ti.store.CopyTrade().GetFollowGroupForPosition(ti.traderID, dec.LeaderPosID)
 	if err != nil {
 		return false, err
@@ -226,7 +226,7 @@ func (ti *TraderIntegration) verifyManagedFollowGroupPeer(dec *decision.Decision
 		if err != nil {
 			return false, err
 		}
-		if m == nil {
+		if m == nil || (len(physicalMarginMode) > 0 && m.MarginMode != physicalMarginMode[0]) {
 			continue
 		}
 		if _, err = ti.verifyFollowingPosition(m, p); err == nil {

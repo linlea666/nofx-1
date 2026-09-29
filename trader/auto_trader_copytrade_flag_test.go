@@ -182,3 +182,22 @@ func TestDeriveHalvedRetryClientOrderIDRespectsLengthCap(t *testing.T) {
 		t.Fatal("empty base id must stay empty")
 	}
 }
+
+func TestCurrentPositionCopyMergeNeedsProvenManagedPeer(t *testing.T) {
+	for _, authorized := range []bool{false, true} {
+		fake := &copyFlowFakeTrader{positions: []map[string]interface{}{{"symbol": "ETHUSDT", "side": "long", "mgnMode": "cross", "positionAmt": 1.0}}}
+		at := newCopyFlowAutoTrader(fake)
+		d := &decision.Decision{Symbol: "ETHUSDT", Action: "open_long", IsCopyTrade: true, CopyTradeAction: "open", CurrentPositionTaskID: 1, AllowManagedPositionMerge: authorized, PositionSizeUSD: 100, Leverage: 5, EntryPrice: 100, MarginMode: "cross", ClientOrderID: "currentcopy1"}
+		err := at.executeOpenLongWithRecord(d, &store.DecisionAction{})
+		if authorized {
+			if err != nil || len(fake.openLongClientIDs) != 1 {
+				t.Fatalf("proven managed merge failed: %v %v", err, fake.openLongClientIDs)
+			}
+			if copyOpenQuantityKind(d) != QuantityInitialOpen {
+				t.Fatal("merge changed initial-entry rounding")
+			}
+		} else if err == nil || len(fake.openLongClientIDs) != 0 {
+			t.Fatal("copy request alone bypassed independent position gate")
+		}
+	}
+}
