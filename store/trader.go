@@ -348,7 +348,24 @@ func (s *TraderStore) UpdateShowInCompetition(userID, id string, showInCompetiti
 func (s *TraderStore) Update(trader *Trader) error {
 	fmt.Printf("📝 TraderStore.Update: ID=%s, Name=%s, AIModelID=%s, StrategyID=%s\n",
 		trader.ID, trader.Name, trader.AIModelID, trader.StrategyID)
-	_, err := s.db.Exec(`
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var current, status string
+	if err = tx.QueryRow(`SELECT exchange_id,lifecycle_status FROM traders WHERE id=? AND user_id=?`, trader.ID, trader.UserID).Scan(&current, &status); err != nil {
+		return err
+	}
+	if current != trader.ExchangeID {
+		if status != TraderLifecycleStopped {
+			return fmt.Errorf("stop the trader before changing its execution account")
+		}
+		if err = checkExecutionAccountChangeTx(tx, trader.ID, trader.ExchangeID); err != nil {
+			return err
+		}
+	}
+	_, err = tx.Exec(`
 		UPDATE traders SET
 			name = ?,
 			ai_model_id = ?,
@@ -365,7 +382,10 @@ func (s *TraderStore) Update(trader *Trader) error {
 		trader.ScanIntervalMinutes, trader.ScanIntervalMinutes,
 		trader.IsCrossMargin, trader.ShowInCompetition,
 		trader.ID, trader.UserID)
-	return err
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // UpdateInitialBalance updates initial balance

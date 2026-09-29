@@ -86,6 +86,24 @@ func (s *CopyTradeStore) retireStoppedTraderCopyGuardState(traderID, evidence st
 		return 0, fmt.Errorf("stopped trader still has %d uncertain exchange execution intents", uncertain)
 	}
 
+	// A terminal timestamp alone is not proof (historical FILLED/0 receipts).
+	if err = tx.QueryRow(`SELECT COUNT(*) FROM copy_trade_execution_order_attempts a JOIN copy_trade_execution_intents i ON i.id=a.intent_id WHERE i.trader_id=? AND `+unsettledExecutionAttemptSQL("a"), traderID).Scan(&uncertain); err != nil {
+		return 0, err
+	}
+	if uncertain > 0 {
+		return 0, fmt.Errorf("stopped trader still has %d unresolved order receipts", uncertain)
+	}
+	if snapshot != nil {
+		result, e := tx.Exec(`UPDATE copy_trade_position_custody SET state='RELEASED',reason=?,released_at=COALESCE(released_at,CURRENT_TIMESTAMP) WHERE trader_id=? AND state='MANAGED'`, StoppedTraderFlatRetirementReason, traderID)
+		if e != nil {
+			return 0, e
+		}
+		if n, _ := result.RowsAffected(); n > 0 {
+			if e = recordTraderLifecycleEventTx(tx, traderID, snapshot.TraderGeneration, TraderLifecycleStopped, TraderLifecycleStopped, StoppedTraderFlatRetirementReason, fmt.Sprintf("released %d custody records; account=%s; %s", n, snapshot.ExchangeID, evidence)); e != nil {
+				return 0, e
+			}
+		}
+	}
 	rows, err := tx.Query(`SELECT id FROM copy_guard_cycles WHERE trader_id=? AND closed_at IS NULL ORDER BY id`, traderID)
 	if err != nil {
 		return 0, err

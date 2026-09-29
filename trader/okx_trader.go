@@ -664,6 +664,16 @@ func genOkxClOrdID() string {
 
 // NewOKXTrader creates OKX trader
 func NewOKXTrader(apiKey, secretKey, passphrase string) *OKXTrader {
+	trader := NewOKXQueryTrader(apiKey, secretKey, passphrase)
+	// Preserve normal trading initialization; queries must not change venue settings.
+	if err := trader.setPositionMode(); err != nil {
+		logger.Infof("⚠️ Failed to set OKX position mode: %v (ignore if already in dual mode)", err)
+	}
+	return trader
+}
+
+// NewOKXQueryTrader constructs an adapter without making any venue mutations.
+func NewOKXQueryTrader(apiKey, secretKey, passphrase string) *OKXTrader {
 	// Use default transport which respects system proxy settings
 	// OKX requires proxy in China due to DNS pollution
 	httpClient := &http.Client{
@@ -679,11 +689,6 @@ func NewOKXTrader(apiKey, secretKey, passphrase string) *OKXTrader {
 		cacheDuration:    15 * time.Second,
 		instrumentsCache: make(map[string]*OKXInstrument),
 		symbolMgnModes:   make(map[string]string), // 按 symbol 缓存保证金模式
-	}
-
-	// Set dual position mode
-	if err := trader.setPositionMode(); err != nil {
-		logger.Infof("⚠️ Failed to set OKX position mode: %v (ignore if already in dual mode)", err)
 	}
 
 	return trader

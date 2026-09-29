@@ -10,11 +10,12 @@ import (
 // StoppedTraderFlatSnapshot describes successful, uncached account-wide reads.
 // It proves current risk is absent, not how a historical order was executed.
 type StoppedTraderFlatSnapshot struct {
-	ExchangeID       string
-	TraderGeneration int64
-	ObservedAt       time.Time // Before either exchange request starts.
-	PositionsEmpty   bool
-	OrdersEmpty      bool // Both ordinary and conditional orders were read.
+	ExchangeID           string
+	ConfiguredExchangeID string // Captured before venue reads; detects concurrent configuration edits.
+	TraderGeneration     int64
+	ObservedAt           time.Time // Before either exchange request starts.
+	PositionsEmpty       bool
+	OrdersEmpty          bool // Both ordinary and conditional orders were read.
 }
 
 func (s *CopyTradeStore) initVenueRetirementTable() error {
@@ -61,13 +62,30 @@ func retireLegacyVenueObligationsTx(tx *sql.Tx, traderID, evidence string, snaps
 	var account, status string
 	var generation int64
 	var running bool
-	if err := tx.QueryRow(`SELECT exchange_id,lifecycle_status,lifecycle_generation,is_running FROM traders WHERE id=?`, traderID).
+	if err := tx.QueryRow(`SELECT COALESCE((SELECT NULLIF(exchange_id,'') FROM copy_trade_account_claims WHERE trader_id=traders.id),exchange_id),lifecycle_status,lifecycle_generation,is_running FROM traders WHERE id=?`, traderID).
 		Scan(&account, &status, &generation, &running); err != nil {
 		return err
 	}
 	if account != snapshot.ExchangeID || generation != snapshot.TraderGeneration || running ||
 		(status != TraderLifecycleStopped && status != TraderLifecycleStopping && status != TraderLifecycleStoppingReconcileRequired) {
 		return ErrTraderLifecycleConflict
+	}
+	if snapshot.ConfiguredExchangeID != "" {
+		var configured string
+		if err := tx.QueryRow(`SELECT exchange_id FROM traders WHERE id=?`, traderID).Scan(&configured); err != nil {
+			return err
+		}
+		if configured != snapshot.ConfiguredExchangeID {
+			return ErrTraderLifecycleConflict
+		}
+	}
+	var active int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM traders t LEFT JOIN copy_trade_account_claims a ON a.trader_id=t.id
+ WHERE t.id<>? AND (t.exchange_id=? OR a.exchange_id=?) AND (t.is_running=1 OR t.lifecycle_status IN ('STARTING','RUNNING','STOPPING','STOPPING_RECONCILE_REQUIRED'))`, traderID, account, account).Scan(&active); err != nil {
+		return err
+	}
+	if active > 0 {
+		return fmt.Errorf("execution account has another active or stopping trader; retirement deferred")
 	}
 	rows, err := tx.Query(`SELECT i.id,i.leader_pos_id,i.source_revision,i.action,COALESCE(i.canonical_key,''),CAST(i.updated_at AS TEXT)
  FROM copy_trade_execution_intents i WHERE i.trader_id=? AND `+legacyAcknowledgedCloseSQL+`
@@ -107,15 +125,6 @@ func retireLegacyVenueObligationsTx(tx *sql.Tx, traderID, evidence string, snaps
 	}
 	if claimedAccount != "" && claimedAccount != account {
 		return fmt.Errorf("legacy retirement requires evidence from the previously claimed execution account")
-	}
-	var active int
-	if err = tx.QueryRow(`SELECT COUNT(*) FROM traders t LEFT JOIN copy_trade_account_claims a ON a.trader_id=t.id
- WHERE t.id<>? AND (t.exchange_id=? OR a.exchange_id=?)
- AND (t.is_running=1 OR t.lifecycle_status IN ('STARTING','RUNNING','STOPPING','STOPPING_RECONCILE_REQUIRED'))`, traderID, account, account).Scan(&active); err != nil {
-		return err
-	}
-	if active > 0 {
-		return fmt.Errorf("execution account has another active or stopping trader; legacy retirement deferred")
 	}
 	for _, c := range candidates {
 		intent, err := getExecutionIntentTx(tx, traderID, c.position, c.revision, c.action, c.key)

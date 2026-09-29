@@ -14,6 +14,7 @@ import (
 // Responsible for periodically synchronizing exchange positions, detecting manual closures and other changes
 type PositionSyncManager struct {
 	store                *store.Store
+	queryTraderFactory   func(string, string, string) (Trader, error)
 	interval             time.Duration
 	historySyncInterval  time.Duration // Interval for full history sync
 	stopCh               chan struct{}
@@ -462,59 +463,72 @@ func (m *PositionSyncManager) ReconcileStoppedTrader(traderID string) ([]store.T
 	default:
 		return nil, fmt.Errorf("trader lifecycle %s does not allow stopped reconciliation", lifecycle.Status)
 	}
-	executor, err := m.getOrCreateTrader(traderID)
-	if err != nil {
-		return nil, err
-	}
 	traderConfig, err := m.store.Trader().GetByID(traderID)
 	if err != nil {
 		return nil, err
 	}
+	accountID, err := m.store.Trader().ExecutionAccount(traderID)
+	if err != nil {
+		return nil, err
+	}
+	executor, err := m.stoppedQueryTrader(traderID, traderConfig.UserID, accountID, traderConfig.ExchangeID)
+	if err != nil {
+		return nil, fmt.Errorf("execution account %s: %w", accountID, err)
+	}
+	if err = RecoverStoppedExitEvidence(m.store.CopyTrade(), traderID, executor); err != nil {
+		return nil, fmt.Errorf("execution account %s: %w", accountID, err)
+	}
+	blockers, err := m.reconcileStoppedAccount(traderID, traderConfig.ExchangeID, accountID, lifecycle, executor)
+	if err != nil || len(blockers) > 0 || accountID == traderConfig.ExchangeID {
+		return blockers, err
+	}
+	// Old responsibility and the newly configured account are separate proofs.
+	current, err := m.stoppedQueryTrader(traderID, traderConfig.UserID, traderConfig.ExchangeID, traderConfig.ExchangeID)
+	if err != nil {
+		return nil, err
+	}
+	_, _, blockers, err = readStoppedAccountSnapshot(current)
+	return blockers, err
+}
+
+func (m *PositionSyncManager) stoppedQueryTrader(traderID, userID, accountID, configuredID string) (Trader, error) {
+	if m.queryTraderFactory != nil {
+		return m.queryTraderFactory(traderID, userID, accountID)
+	}
+	// Existing adapters can be queried without construction side effects. API
+	// reconciliation invalidates caches first; tests may inject a read-only fake.
+	if accountID == configuredID {
+		m.cacheMutex.RLock()
+		cached := m.traderCache[traderID]
+		m.cacheMutex.RUnlock()
+		if cached != nil {
+			return cached, nil
+		}
+	}
+	exchange, err := m.store.Exchange().GetByID(userID, accountID)
+	if err != nil {
+		return nil, fmt.Errorf("execution account %s credentials unavailable: %w", accountID, err)
+	}
+	return NewAccountQueryTrader(exchange, userID)
+}
+
+func (m *PositionSyncManager) reconcileStoppedAccount(traderID, configuredID, accountID string, lifecycle *store.TraderLifecycle, executor Trader) ([]store.TraderLifecycleBlocker, error) {
 	localPositions, err := m.store.Position().GetOpenPositions(traderID)
 	if err != nil {
 		return nil, err
 	}
 	for _, position := range localPositions {
-		if position.ExchangeID != "" && position.ExchangeID != traderConfig.ExchangeID {
+		if position.ExchangeID != "" && position.ExchangeID != accountID {
 			return nil, fmt.Errorf(
 				"local position %d belongs to exchange %s, current trader exchange is %s",
-				position.ID, position.ExchangeID, traderConfig.ExchangeID,
+				position.ID, position.ExchangeID, accountID,
 			)
 		}
 	}
-	freshProvider, ok := executor.(FreshPositionProvider)
-	if !ok {
-		return nil, fmt.Errorf("exchange does not support authoritative fresh position snapshots")
-	}
-	pendingProvider, ok := executor.(PendingOrderProvider)
-	if !ok {
-		return nil, fmt.Errorf("exchange does not support authoritative pending-order snapshots")
-	}
-	flatSnapshot := store.StoppedTraderFlatSnapshot{ExchangeID: traderConfig.ExchangeID, TraderGeneration: lifecycle.Generation, ObservedAt: time.Now()}
-	exchangePositions, err := freshProvider.GetPositionsFresh()
+	flatSnapshot := store.StoppedTraderFlatSnapshot{ExchangeID: accountID, ConfiguredExchangeID: configuredID, TraderGeneration: lifecycle.Generation, ObservedAt: time.Now()}
+	_, _, blockers, err := readStoppedAccountSnapshot(executor)
 	if err != nil {
-		return nil, fmt.Errorf("fresh exchange position read failed: %w", err)
-	}
-	pendingOrders, err := pendingProvider.GetPendingOrdersFresh()
-	if err != nil {
-		return nil, fmt.Errorf("fresh exchange pending-order read failed: %w", err)
-	}
-	blockers := make([]store.TraderLifecycleBlocker, 0, len(exchangePositions)+len(pendingOrders))
-	for index, position := range exchangePositions {
-		symbol, _ := position["symbol"].(string)
-		blockers = append(blockers, store.TraderLifecycleBlocker{
-			Code: "EXCHANGE_POSITION_PRESENT", ResourceID: fmt.Sprintf("position:%d", index),
-			Symbol: symbol, Status: "OPEN",
-		})
-	}
-	for _, order := range pendingOrders {
-		code := "EXCHANGE_ORDER_PENDING"
-		if order.Protective {
-			code = "EXCHANGE_PROTECTIVE_ORDER_PENDING"
-		}
-		blockers = append(blockers, store.TraderLifecycleBlocker{
-			Code: code, ResourceID: order.ID, Symbol: order.Symbol, Status: order.Status,
-		})
+		return nil, err
 	}
 	if len(blockers) > 0 {
 		return blockers, nil
@@ -536,7 +550,7 @@ func (m *PositionSyncManager) ReconcileStoppedTrader(traderID string) ([]store.T
 			oldestByMarket[key] = position
 		}
 	}
-	accountUsers, err := m.store.Trader().CountNonArchivedByExchange(traderConfig.ExchangeID)
+	accountUsers, err := m.store.Trader().CountNonArchivedByExchange(accountID)
 	if err != nil {
 		return nil, err
 	}
@@ -602,6 +616,43 @@ func (m *PositionSyncManager) ReconcileStoppedTrader(traderID string) ([]store.T
 		return nil, fmt.Errorf("retire stopped Copy Guard state: %w", err)
 	}
 	return nil, nil
+}
+
+func readStoppedAccountSnapshot(executor Trader) ([]map[string]interface{}, []PendingOrderSnapshot, []store.TraderLifecycleBlocker, error) {
+	freshProvider, ok := executor.(FreshPositionProvider)
+	if !ok {
+		return nil, nil, nil, fmt.Errorf("exchange does not support authoritative fresh position snapshots")
+	}
+	pendingProvider, ok := executor.(PendingOrderProvider)
+	if !ok {
+		return nil, nil, nil, fmt.Errorf("exchange does not support authoritative pending-order snapshots")
+	}
+	exchangePositions, err := freshProvider.GetPositionsFresh()
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("fresh exchange position read failed: %w", err)
+	}
+	pendingOrders, err := pendingProvider.GetPendingOrdersFresh()
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("fresh exchange pending-order read failed: %w", err)
+	}
+	blockers := make([]store.TraderLifecycleBlocker, 0, len(exchangePositions)+len(pendingOrders))
+	for index, position := range exchangePositions {
+		symbol, _ := position["symbol"].(string)
+		blockers = append(blockers, store.TraderLifecycleBlocker{
+			Code: "EXCHANGE_POSITION_PRESENT", ResourceID: fmt.Sprintf("position:%d", index),
+			Symbol: symbol, Status: "OPEN",
+		})
+	}
+	for _, order := range pendingOrders {
+		code := "EXCHANGE_ORDER_PENDING"
+		if order.Protective {
+			code = "EXCHANGE_PROTECTIVE_ORDER_PENDING"
+		}
+		blockers = append(blockers, store.TraderLifecycleBlocker{
+			Code: code, ResourceID: order.ID, Symbol: order.Symbol, Status: order.Status,
+		})
+	}
+	return exchangePositions, pendingOrders, blockers, nil
 }
 
 func isClosingTradeForPosition(trade TradeRecord, positionSide string) bool {

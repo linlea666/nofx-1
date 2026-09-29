@@ -272,12 +272,28 @@ func checkAndClaimExecutionAccountTx(tx *sql.Tx, traderID string, generation int
 		return err
 	}
 	if conflict != "" {
-		return fmt.Errorf("execution account already controlled by trader %s or its unsettled venue instructions", conflict)
+		var name string
+		_ = tx.QueryRow(`SELECT name FROM traders WHERE id=?`, conflict).Scan(&name)
+		return fmt.Errorf("execution account %s already controlled by trader %s (%s) or its unsettled venue instructions; 对停止的交易员执行“核对归档条件”以核实历史订单", exchangeID, name, conflict)
 	}
+	if err = checkExecutionAccountChangeTx(tx, traderID, exchangeID); err != nil {
+		return err
+	}
+	_, err = tx.Exec(`INSERT INTO copy_trade_account_claims(trader_id,exchange_id,generation,exclusive) VALUES(?,?,?,?) ON CONFLICT(trader_id) DO UPDATE SET exchange_id=excluded.exchange_id,generation=excluded.generation,exclusive=excluded.exclusive,updated_at=CURRENT_TIMESTAMP`, traderID, exchangeID, generation, exclusive)
+	return err
+}
+
+// Shared by configuration save and startup, inside their respective write transactions.
+func checkExecutionAccountChangeTx(tx *sql.Tx, traderID, exchangeID string) error {
 	var previous string
-	err = tx.QueryRow(`SELECT exchange_id FROM copy_trade_account_claims WHERE trader_id=?`, traderID).Scan(&previous)
+	err := tx.QueryRow(`SELECT exchange_id FROM copy_trade_account_claims WHERE trader_id=?`, traderID).Scan(&previous)
 	if err != nil && err != sql.ErrNoRows {
 		return err
+	}
+	if previous == "" {
+		if err = tx.QueryRow(`SELECT exchange_id FROM traders WHERE id=?`, traderID).Scan(&previous); err != nil {
+			return err
+		}
 	}
 	if previous != "" && previous != exchangeID {
 		var obligations int
@@ -286,15 +302,23 @@ func checkAndClaimExecutionAccountTx(tx *sql.Tx, traderID string, generation int
    (SELECT COUNT(*) FROM copy_trade_execution_intents i WHERE trader_id=? AND (submitted_at IS NOT NULL OR COALESCE(exchange_order_id,'')<>'') AND (terminal_at IS NULL OR UPPER(COALESCE(exchange_state,'')) NOT IN ('FILLED','CANCELED','CANCELLED','REJECTED','EXPIRED','FAILED')) AND NOT EXISTS(SELECT 1 FROM copy_trade_execution_order_attempts a WHERE a.intent_id=i.id) AND NOT `+retiredLegacyVenueObligationSQL+`)+
  (SELECT COUNT(*) FROM copy_guard_protective_orders o WHERE o.trader_id=? AND `+unsettledAccountProtectionSQL+`)+
  (SELECT COUNT(*) FROM copy_guard_cycles WHERE trader_id=? AND closed_at IS NULL)+
- (SELECT COUNT(*) FROM copy_trade_position_custody WHERE trader_id=? AND state='MANAGED')`, traderID, traderID, traderID, traderID, traderID).Scan(&obligations); err != nil {
+ (SELECT COUNT(*) FROM copy_trade_position_custody WHERE trader_id=? AND state='MANAGED')+
+ (SELECT COUNT(*) FROM trader_positions WHERE trader_id=? AND status='OPEN' AND ABS(quantity)>0)`, traderID, traderID, traderID, traderID, traderID, traderID).Scan(&obligations); err != nil {
 			return err
 		}
 		if obligations > 0 {
 			return fmt.Errorf("previous execution account %s still has managed positions or unsettled instructions", previous)
 		}
 	}
-	_, err = tx.Exec(`INSERT INTO copy_trade_account_claims(trader_id,exchange_id,generation,exclusive) VALUES(?,?,?,?) ON CONFLICT(trader_id) DO UPDATE SET exchange_id=excluded.exchange_id,generation=excluded.generation,exclusive=excluded.exclusive,updated_at=CURRENT_TIMESTAMP`, traderID, exchangeID, generation, exclusive)
-	return err
+	return nil
+}
+
+// ExecutionAccount returns the durable venue identity of historical instructions.
+func (s *TraderStore) ExecutionAccount(traderID string) (string, error) {
+	var id string
+	err := s.db.QueryRow(`SELECT COALESCE(NULLIF(a.exchange_id,''),t.exchange_id) FROM traders t
+ LEFT JOIN copy_trade_account_claims a ON a.trader_id=t.id WHERE t.id=?`, traderID).Scan(&id)
+	return id, err
 }
 
 func (s *TraderStore) FailStart(userID, traderID string, generation int64, detail string) error {

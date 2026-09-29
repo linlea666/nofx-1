@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"math"
 	"strings"
-	"time"
 
 	"nofx/store"
+	"nofx/trader"
 )
 
 // Missing/malformed quantities are not zero fills or flat positions. Keep the
@@ -40,40 +40,12 @@ func exitReceipt(order map[string]interface{}) (string, float64) {
 // Shared by leader and risk exits. Even a legacy terminal timestamp cannot
 // suppress lookup when the persisted receipt lacks executed quantity.
 func (ti *TraderIntegration) reconcileExitOrderEvidence(intentID int64, a *store.CopyTradeExecutionOrderAttempt, symbol string) error {
-	if !store.ExecutionOrderAttemptNeedsReconciliation(a) {
-		return nil
+	lookup, _ := ti.executor.(ClientOrderStatusProvider)
+	order, err := trader.ReconcileExitOrderEvidence(ti.store.CopyTrade(), lookup, intentID, a, symbol)
+	if err == nil && order != nil {
+		ti.observeExecutionFillTime(intentID, order)
 	}
-	lookup, ok := ti.executor.(ClientOrderStatusProvider)
-	if !ok {
-		return fmt.Errorf("exit acknowledgement lookup unavailable")
-	}
-	order, err := lookup.GetOrderStatusByClientID(symbol, a.ClientOrderID)
-	if err != nil {
-		return fmt.Errorf("exit acknowledgement pending: %w", err)
-	}
-	if a.ExchangeOrderID != "" && getStringField(order, "orderId", "ordId") != a.ExchangeOrderID {
-		return fmt.Errorf("exit lookup did not confirm the original exchange order identity")
-	}
-	state := strings.ToUpper(getStringField(order, "status", "state"))
-	filled, quantityKnown := knownQuantityField(order, "executedQty", "filled_quantity")
-	if !isTerminalExchangeOrderState(state) || !quantityKnown || filled < 0 || (state == "FILLED" && filled <= 0) {
-		return fmt.Errorf("exit order outcome or fill quantity is not confirmed (%s)", state)
-	}
-	status := store.ExecutionOrderAttemptTerminalNoFill
-	if filled > 0 {
-		status = store.ExecutionOrderAttemptFilled
-	}
-	var filledAt time.Time
-	if state == "FILLED" {
-		if ms := int64(getFloatField(order, "fillTime", "fill_time", "updateTime")); ms > 0 {
-			filledAt = time.UnixMilli(ms)
-		}
-	}
-	if err = ti.store.CopyTrade().CompleteExecutionOrderAttemptWithEvidence(intentID, a.ClientOrderID, status, getStringField(order, "orderId", "ordId"), state, "", filled, filledAt); err != nil {
-		return err
-	}
-	ti.observeExecutionFillTime(intentID, order)
-	return nil
+	return err
 }
 
 // Evidence-only repair: never executes a close, changes source progress, or

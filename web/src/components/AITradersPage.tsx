@@ -411,18 +411,19 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
           )
         }
       } else {
-        await toast.promise(api.startTrader(trader.trader_id), {
-          loading: '正在启动…',
-          success: '已启动',
-          error: '启动失败',
-        })
+        toast.loading('正在启动…', { id: `start-${trader.trader_id}` })
+        await api.startTrader(trader.trader_id)
+        toast.success('已启动', { id: `start-${trader.trader_id}` })
       }
 
       // Immediately refresh traders list to update running status
       await mutateTraders()
     } catch (error) {
       console.error('Failed to toggle trader:', error)
-      toast.error(t('operationFailed', language))
+      toast.error(
+        error instanceof Error ? error.message : t('operationFailed', language),
+        { id: `start-${trader.trader_id}` }
+      )
     }
   }
 

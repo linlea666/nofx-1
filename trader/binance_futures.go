@@ -95,6 +95,14 @@ type binanceExecutionInstrument struct {
 
 // NewFuturesTrader creates futures trader
 func NewFuturesTrader(apiKey, secretKey string, userId string) *FuturesTrader {
+	trader := newFuturesQueryTrader(apiKey, secretKey, userId)
+	if err := trader.setDualSidePosition(); err != nil {
+		logger.Infof("⚠️ Failed to set dual-side position mode: %v (ignore this warning if already in dual-side mode)", err)
+	}
+	return trader
+}
+
+func newFuturesQueryTrader(apiKey, secretKey string, userId string) *FuturesTrader {
 	client := futures.NewClient(apiKey, secretKey)
 
 	hookRes := hook.HookExec[hook.NewBinanceTraderResult](hook.NEW_BINANCE_TRADER, userId, client)
@@ -112,12 +120,6 @@ func NewFuturesTrader(apiKey, secretKey string, userId string) *FuturesTrader {
 	// the offset is kept fresh from the signed read paths (see binanceClock),
 	// because a one-shot sync cannot survive a later NTP step correction.
 	trader.syncClockLocked("startup")
-
-	// Set dual-side position mode (Hedge Mode)
-	// This is required because the code uses PositionSide (LONG/SHORT)
-	if err := trader.setDualSidePosition(); err != nil {
-		logger.Infof("⚠️ Failed to set dual-side position mode: %v (ignore this warning if already in dual-side mode)", err)
-	}
 
 	return trader
 }
