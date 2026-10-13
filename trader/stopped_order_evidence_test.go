@@ -114,7 +114,7 @@ func TestStoppedEvidenceRepairUsesOriginalAccountAndReleasesCustody(t *testing.T
 	if err != nil || c.State != "RELEASED" {
 		t.Fatalf("custody=%+v err=%v", c, err)
 	}
-	b, err := st.Trader().Archive("user-1", "old-trader")
+	b, err := m.ArchiveTrader("user-1", "old-trader")
 	if err != nil || len(b) > 0 {
 		t.Fatalf("archive=%v %v", b, err)
 	}

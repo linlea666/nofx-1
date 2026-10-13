@@ -80,6 +80,11 @@ func (s *TraderStore) initLifecycleTables() error {
 			trader_id TEXT PRIMARY KEY,exchange_id TEXT NOT NULL,generation INTEGER NOT NULL,exclusive BOOLEAN NOT NULL DEFAULT 0,
 			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 		);
+		CREATE TABLE IF NOT EXISTS trader_account_releases (
+			trader_id TEXT NOT NULL,exchange_id TEXT NOT NULL,archive_generation INTEGER NOT NULL,
+			observed_at DATETIME NOT NULL,released_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			evidence TEXT NOT NULL,PRIMARY KEY(trader_id,exchange_id,archive_generation)
+		);
 		CREATE TABLE IF NOT EXISTS trader_tombstones (
 			trader_id TEXT PRIMARY KEY,
 			lifecycle_status TEXT NOT NULL DEFAULT 'ARCHIVED',
@@ -260,21 +265,19 @@ func checkAndClaimExecutionAccountTx(tx *sql.Tx, traderID string, generation int
  LEFT JOIN copy_trade_account_claims a ON a.trader_id=t.id
  LEFT JOIN copy_trade_configs c ON c.trader_id=t.id
  LEFT JOIN copy_guard_policies p ON p.trader_id=t.id
- WHERE (t.exchange_id=? OR a.exchange_id=?) AND t.id<>? AND (
+ WHERE (t.exchange_id=? OR a.exchange_id=?) AND t.id<>? AND NOT `+releasedTraderAccountSQL("?")+` AND (
  (((t.lifecycle_status='RUNNING' AND t.is_running=1) OR (t.lifecycle_status='STARTING' AND a.generation=t.lifecycle_generation)) AND (? OR COALESCE(a.exclusive,0)=1 OR
  (c.enabled=1 AND c.provider_type IN ('okx','binance') AND (COALESCE(c.follow_exit_policy_version,0)>=2 OR (p.trader_id IS NOT NULL AND (COALESCE(c.risk_stop_loss_enabled,1)=1 OR COALESCE(c.risk_liquidation_guard_enabled,1)=1))))
  OR EXISTS(SELECT 1 FROM copy_guard_cycles x WHERE x.trader_id=t.id AND x.closed_at IS NULL)))
- OR EXISTS(SELECT 1 FROM copy_trade_execution_order_attempts o JOIN copy_trade_execution_intents oi ON oi.id=o.intent_id WHERE oi.trader_id=t.id AND `+unsettledExecutionAttemptSQL("o")+`)
- OR EXISTS(SELECT 1 FROM copy_trade_execution_intents i WHERE i.trader_id=t.id AND (i.submitted_at IS NOT NULL OR COALESCE(i.exchange_order_id,'')<>'') AND (i.terminal_at IS NULL OR UPPER(COALESCE(i.exchange_state,'')) NOT IN ('FILLED','CANCELED','CANCELLED','REJECTED','EXPIRED','FAILED')) AND NOT EXISTS(SELECT 1 FROM copy_trade_execution_order_attempts o WHERE o.intent_id=i.id) AND NOT `+retiredLegacyVenueObligationSQL+`)
- OR EXISTS(SELECT 1 FROM copy_guard_protective_orders o WHERE o.trader_id=t.id AND `+unsettledAccountProtectionSQL+`)
- ) ORDER BY t.id LIMIT 1`, exchangeID, exchangeID, traderID, exclusive).Scan(&conflict)
+ OR `+unsettledTraderVenueInstructionsSQL()+`
+ ) ORDER BY t.id LIMIT 1`, exchangeID, exchangeID, traderID, exchangeID, exclusive).Scan(&conflict)
 	if err != nil && err != sql.ErrNoRows {
 		return err
 	}
 	if conflict != "" {
 		var name string
 		_ = tx.QueryRow(`SELECT name FROM traders WHERE id=?`, conflict).Scan(&name)
-		return fmt.Errorf("execution account %s already controlled by trader %s (%s) or its unsettled venue instructions; 对停止的交易员执行“核对归档条件”以核实历史订单", exchangeID, name, conflict)
+		return fmt.Errorf("execution account %s already controlled by trader %s (%s) or its unsettled venue instructions; 保留该交易员时请核对历史订单；放弃该交易员时请删除，系统将核实当前仓位和挂单后释放账户", exchangeID, name, conflict)
 	}
 	if err = checkExecutionAccountChangeTx(tx, traderID, exchangeID); err != nil {
 		return err
@@ -713,39 +716,46 @@ func (s *TraderStore) GetArchiveBlockers(traderID string) ([]TraderLifecycleBloc
 	return blockers, rows.Err()
 }
 
-func (s *TraderStore) Archive(userID, traderID string) ([]TraderLifecycleBlocker, error) {
-	blockers, err := s.GetArchiveBlockers(traderID)
+// Archive relinquishes execution authority atomically with hiding the trader.
+// Local accounting is retained as history, not used as evidence of current risk.
+// The variadic form keeps old callers safe: without venue proof they cannot
+// silently perform a local-only deletion.
+func (s *TraderStore) Archive(userID, traderID string, proofs ...TraderAccountReleaseProof) ([]TraderLifecycleBlocker, error) {
+	complete, err := s.AccountReleaseComplete(userID, traderID)
 	if err != nil {
 		return nil, err
 	}
-	if len(blockers) > 0 {
-		return blockers, nil
+	if complete {
+		return nil, nil
+	}
+	if len(proofs) != 1 {
+		return nil, fmt.Errorf("%w: archive requires fresh account verification", ErrTraderLifecycleConflict)
 	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
+	if err = validateAccountReleaseTx(tx, userID, traderID, proofs[0]); err != nil {
+		return nil, err
+	}
 	var from string
 	var generation int64
 	if err = tx.QueryRow(`SELECT lifecycle_status,lifecycle_generation FROM traders
 		WHERE id=? AND user_id=?`, traderID, userID).Scan(&from, &generation); err != nil {
 		return nil, err
 	}
-	if from == TraderLifecycleArchived {
-		return nil, tx.Commit()
-	}
-	if from != TraderLifecycleStopped {
-		return nil, fmt.Errorf("%w: archive requires STOPPED, current=%s", ErrTraderLifecycleConflict, from)
-	}
 	generation++
 	if err = recordTraderLifecycleEventTx(tx, traderID, generation, from, TraderLifecycleArchiving, "OPERATOR_ARCHIVE", "archive safety checks passed"); err != nil {
+		return nil, err
+	}
+	if err = cancelArchivedWorkTx(tx, traderID); err != nil {
 		return nil, err
 	}
 	if _, err = tx.Exec(`UPDATE copy_guard_reentry_candidates SET status=?,
 		last_error='trader archived',pending_trigger='TRADER_ARCHIVED',
 		closed_at=COALESCE(closed_at,CURRENT_TIMESTAMP),updated_at=CURRENT_TIMESTAMP
-		WHERE trader_id=? AND status IN ('WATCHING','WAITING','DORMANT_REARM','REVIEWING','PAUSED','PAUSED_BY_TRADER')`,
+		WHERE trader_id=? AND status IN ('WATCHING','WAITING','DORMANT_REARM','REVIEWING','PAUSED','PAUSED_BY_TRADER','ENTRY_PENDING')`,
 		ReentryCandidateInvalidatedTraderArchived, traderID); err != nil {
 		return nil, err
 	}
@@ -762,7 +772,7 @@ func (s *TraderStore) Archive(userID, traderID string) ([]TraderLifecycleBlocker
 		return nil, err
 	}
 	res, err := tx.Exec(`UPDATE traders SET lifecycle_status=?,lifecycle_generation=?,
-		is_running=0,archived_at=CURRENT_TIMESTAMP WHERE id=? AND user_id=? AND lifecycle_status=?`,
+		is_running=0,archived_at=COALESCE(archived_at,CURRENT_TIMESTAMP) WHERE id=? AND user_id=? AND lifecycle_status=?`,
 		TraderLifecycleArchived, generation, traderID, userID, from)
 	if err != nil {
 		return nil, err
@@ -770,7 +780,14 @@ func (s *TraderStore) Archive(userID, traderID string) ([]TraderLifecycleBlocker
 	if n, _ := res.RowsAffected(); n != 1 {
 		return nil, ErrTraderLifecycleConflict
 	}
-	if err = recordTraderLifecycleEventTx(tx, traderID, generation, TraderLifecycleArchiving, TraderLifecycleArchived, "ARCHIVE_COMPLETE", "history retained; trader hidden"); err != nil {
+	for _, snapshot := range proofs[0].Snapshots {
+		if _, err = tx.Exec(`INSERT INTO trader_account_releases(trader_id,exchange_id,archive_generation,observed_at,evidence)
+ VALUES(?,?,?,?,?)`, traderID, snapshot.ExchangeID, generation, snapshot.ObservedAt.UTC(),
+			"runtime drained; fresh positions=0; ordinary and conditional pending orders=0; historical accounting abandoned"); err != nil {
+			return nil, err
+		}
+	}
+	if err = recordTraderLifecycleEventTx(tx, traderID, generation, TraderLifecycleArchiving, TraderLifecycleArchived, "ARCHIVE_ACCOUNT_RELEASED", "history retained as passive records; execution authority permanently released"); err != nil {
 		return nil, err
 	}
 	if err = tx.Commit(); err != nil {

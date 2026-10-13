@@ -4191,7 +4191,7 @@ func (ti *TraderIntegration) finalizePositionMarginStopExit(cycle *store.CopyGua
 	}
 	if _, err := ti.store.CopyTrade().FinalizeCopyGuardRiskExit(store.CopyGuardRiskExitFinalize{
 		CopyGuardRiskExitBegin: begin, ExitPrice: fillPrice, Fee: fee,
-		ActualOrderID: attempt.ExitOrderID, Observed: true, VenueState: "mark_crossed_exit",
+		ActualOrderID: attempt.ExitOrderID, Observed: true, PreserveProtectiveOrderState: true,
 	}); err != nil {
 		ti.markProtectionIssue(cycle, store.CopyGuardProtectionForcedExitPending, "POSITION_MARGIN_STOP_PERSIST_FAILED", err, 0, false)
 		return false
@@ -9444,8 +9444,17 @@ func (ti *TraderIntegration) cancelProtectiveOrderForCycle(mgr ProtectiveStopMan
 		return err
 	}
 	var currentErr error
-	if order.Status == "" || order.Status == "live" {
-		currentErr = terminalCancel(order.AlgoID, true)
+	switch strings.ToLower(strings.TrimSpace(order.Status)) {
+	case "canceled", "cancelled", "order_failed", "failed", "expired", "filled", "triggered", "effective":
+		// Already verified venue outcomes need no new cancellation.
+	default:
+		// Legacy internal reasons (e.g. mark_crossed_exit) are not venue
+		// outcomes. Never turn an unknown state into a cancellation locally.
+		if strings.TrimSpace(order.AlgoID) == "" && strings.TrimSpace(order.AlgoClientID) != "" {
+			currentErr = fmt.Errorf("protective stop %s has no confirmed venue identity", order.AlgoClientID)
+		} else {
+			currentErr = terminalCancel(order.AlgoID, true)
+		}
 	}
 	var retiringErr error
 	if order.ReplacementPending && order.PreviousAlgoID != "" {

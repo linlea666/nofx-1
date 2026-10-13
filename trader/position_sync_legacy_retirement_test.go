@@ -111,7 +111,8 @@ func TestStoppedLegacyRetirementArchivesWithoutRewritingHistoricalExecution(t *t
 	if fake.positionReads != 2 || fake.orderReads != 2 {
 		t.Fatalf("each reconciliation must refresh the full venue snapshot: positions=%d orders=%d", fake.positionReads, fake.orderReads)
 	}
-	blockers, err := st.Trader().Archive("user-1", "old-trader")
+	manager.queryTraderFactory = func(_, _, _ string) (Trader, error) { return fake, nil }
+	blockers, err := manager.ArchiveTrader("user-1", "old-trader")
 	if err != nil || len(blockers) != 0 {
 		t.Fatalf("explicit flat retirement did not unblock archive: blockers=%+v err=%v", blockers, err)
 	}

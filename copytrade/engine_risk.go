@@ -591,7 +591,7 @@ func (e *Engine) checkStoppedByRisk() {
 		}
 		if _, finalizeErr := e.store.CopyTrade().FinalizeCopyGuardRiskExit(store.CopyGuardRiskExitFinalize{
 			CopyGuardRiskExitBegin: begin, ATR: atr, ExitPrice: leaderPos.MarkPrice,
-			Observed: true, VenueState: "position_absent",
+			Observed: true, PreserveProtectiveOrderState: true,
 		}); finalizeErr != nil {
 			logger.Errorf("[CopyGuard] trader=%s cycle=%d attempt=%d event=STOP_FINALIZE_FAILED reason=%v", e.traderID, cycle.ID, cycle.ReentryCount, finalizeErr)
 			continue

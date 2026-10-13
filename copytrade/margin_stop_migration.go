@@ -385,7 +385,7 @@ func (ti *TraderIntegration) finalizeMigrationMarginStopIntent(intent *store.Cop
 	}
 	if _, err = ti.store.CopyTrade().FinalizeCopyGuardRiskExit(store.CopyGuardRiskExitFinalize{
 		CopyGuardRiskExitBegin: begin, ExitPrice: exitPrice, ActualOrderID: intent.ExchangeOrderID,
-		Observed: true, VenueState: "migration_flat_confirmed",
+		Observed: true, PreserveProtectiveOrderState: true,
 	}); err != nil {
 		return err
 	}

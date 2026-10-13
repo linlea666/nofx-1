@@ -666,13 +666,13 @@ func TestArchiveBlocksRiskThenSoftDeletesAndPreservesHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 	blockers, err := st.Trader().Archive("user-1", "trader-1")
-	if err != nil || len(blockers) != 1 || blockers[0].Code != "OPEN_POSITION" {
-		t.Fatalf("unsafe archive was not blocked: %+v err=%v", blockers, err)
+	if !errors.Is(err, ErrTraderLifecycleConflict) {
+		t.Fatalf("archive without current venue evidence was not blocked: %+v err=%v", blockers, err)
 	}
 	if err = st.Position().ClosePosition(position.ID, 60100, "close-1", 10, 0.1, "exchange_confirmed"); err != nil {
 		t.Fatal(err)
 	}
-	blockers, err = st.Trader().Archive("user-1", "trader-1")
+	blockers, err = st.Trader().Archive("user-1", "trader-1", flatAccountReleaseProof(t, st, "trader-1"))
 	if err != nil || len(blockers) != 0 {
 		t.Fatalf("safe archive failed: %+v err=%v", blockers, err)
 	}

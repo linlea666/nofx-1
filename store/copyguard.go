@@ -378,6 +378,9 @@ type CopyGuardRiskExitFinalize struct {
 	ActualOrderID string
 	Observed      bool
 	VenueState    string
+	// Locally executed exits have their own reason/confirmation metadata. They
+	// must not overwrite the protective order's separately verified venue state.
+	PreserveProtectiveOrderState bool
 }
 
 const (
@@ -2434,13 +2437,15 @@ func (s *CopyTradeStore) FinalizeCopyGuardRiskExit(in CopyGuardRiskExitFinalize)
 		in.LeaderPnL, in.LeaderSize, in.AddCount, in.TraderID, in.LeaderPosID); err != nil {
 		return false, err
 	}
-	venueState := strings.TrimSpace(in.VenueState)
-	if venueState == "" {
-		venueState = "triggered"
-	}
-	if _, err = tx.Exec(`UPDATE copy_guard_protective_orders SET status=?,updated_at=CURRENT_TIMESTAMP WHERE cycle_id=?`,
-		venueState, in.CycleID); err != nil {
-		return false, err
+	if !in.PreserveProtectiveOrderState {
+		venueState := strings.TrimSpace(in.VenueState)
+		if venueState == "" {
+			venueState = "triggered"
+		}
+		if _, err = tx.Exec(`UPDATE copy_guard_protective_orders SET status=?,updated_at=CURRENT_TIMESTAMP WHERE cycle_id=?`,
+			venueState, in.CycleID); err != nil {
+			return false, err
+		}
 	}
 	eventType := "STOP_TRIGGERED"
 	if in.Observed {

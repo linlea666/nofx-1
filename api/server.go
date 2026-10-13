@@ -1618,11 +1618,7 @@ func (s *Server) handleDeleteTrader(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Trader does not exist or no access permission"})
 		return
 	}
-	if state.Status == store.TraderLifecycleArchived {
-		c.JSON(http.StatusOK, gin.H{"status": store.TraderLifecycleArchived, "message": "Trader already archived"})
-		return
-	}
-	if state.Status != store.TraderLifecycleStopped {
+	if state.Status != store.TraderLifecycleStopped && state.Status != store.TraderLifecycleStoppingReconcileRequired && state.Status != store.TraderLifecycleArchived {
 		c.JSON(http.StatusConflict, gin.H{
 			"error":            "Trader must be fully stopped before archive",
 			"lifecycle_status": state.Status,
@@ -1632,58 +1628,45 @@ func (s *Server) handleDeleteTrader(c *gin.Context) {
 		})
 		return
 	}
-	// Archive is one operator action: first refresh authoritative exchange
-	// positions, regular/algo orders and local Copy Guard retirement, then repeat
-	// both local and exchange checks before the irreversible archive transition.
+	// Permanent deletion drains the old runtime, verifies present venue risk,
+	// then atomically archives and releases authority. Historical accounting is
+	// deliberately not a precondition for abandoning a trader.
 	if s.positionSyncManager == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Position reconciliation service unavailable"})
 		return
 	}
-	s.positionSyncManager.InvalidateCache(traderID)
-	if exchangeBlockers, reconcileErr := s.positionSyncManager.ReconcileStoppedTrader(traderID); reconcileErr != nil {
-		c.JSON(http.StatusBadGateway, gin.H{
-			"error":            "Authoritative exchange reconciliation failed: " + reconcileErr.Error(),
-			"lifecycle_status": state.Status,
-		})
-		return
-	} else if len(exchangeBlockers) > 0 {
-		c.JSON(http.StatusConflict, gin.H{
-			"error":            "Trader has unresolved exchange risk and cannot be archived",
-			"lifecycle_status": state.Status,
-			"pending_blockers": exchangeBlockers,
-		})
+	if err = s.drainTraderForDeletion(traderID); err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": "交易员运行时尚未停止完成：" + err.Error()})
 		return
 	}
-	archiveBlockers, err := s.store.Trader().GetArchiveBlockers(traderID)
+	blockers, err := s.positionSyncManager.ArchiveTrader(userID, traderID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to verify archive safety: %v", err)})
-		return
-	}
-	archiveBlockers = append(archiveBlockers, s.getExchangeArchiveBlockers(traderID)...)
-	if len(archiveBlockers) > 0 {
-		c.JSON(http.StatusConflict, gin.H{
-			"error":            "Trader has unresolved exchange risk and cannot be archived",
-			"lifecycle_status": state.Status,
-			"pending_blockers": archiveBlockers,
-		})
-		return
-	}
-	blockers, err := s.store.Trader().Archive(userID, traderID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to archive trader: %v", err)})
+		c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("删除未完成，账户未释放：%v", err)})
 		return
 	}
 	if len(blockers) > 0 {
 		c.JSON(http.StatusConflict, gin.H{
-			"error":            "Trader has unresolved exchange risk and cannot be archived",
+			"error":            "账户仍有真实仓位或挂单，未删除交易员：" + store.FormatLifecycleBlockers(blockers),
 			"lifecycle_status": state.Status,
 			"pending_blockers": blockers,
 		})
 		return
 	}
 	s.traderManager.RemoveTrader(traderID)
-	logger.Infof("✓ Trader archived with audit history retained: %s", traderID)
-	c.JSON(http.StatusOK, gin.H{"status": store.TraderLifecycleArchived, "message": "Trader archived"})
+	logger.Infof("✓ Trader archived and execution accounts released: %s", traderID)
+	c.JSON(http.StatusOK, gin.H{"status": store.TraderLifecycleArchived, "message": "Trader deleted; execution accounts released"})
+}
+
+func (s *Server) drainTraderForDeletion(traderID string) error {
+	if err := copytrade.StopCopyTradingForTrader(traderID); err != nil {
+		return err
+	}
+	if s.traderManager != nil {
+		if runtime, err := s.traderManager.GetTrader(traderID); err == nil {
+			runtime.StopAndWait()
+		}
+	}
+	return nil
 }
 
 // handleStartTrader Start trader
@@ -1701,6 +1684,18 @@ func (s *Server) handleStartTrader(c *gin.Context) {
 	if fullConfig.Trader.LifecycleStatus == store.TraderLifecycleArchived {
 		c.JSON(http.StatusConflict, gin.H{"error": "Archived trader cannot be started"})
 		return
+	}
+	// Legacy archives did not release account ownership. Upgrade them before
+	// STARTING or constructing trading clients; only read-only adapters are used.
+	if fullConfig.Trader.LifecycleStatus != store.TraderLifecycleRunning {
+		if s.positionSyncManager == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Account verification service unavailable"})
+			return
+		}
+		if err = s.positionSyncManager.ReleaseArchivedAccounts(userID, fullConfig.Trader.ExchangeID, s.drainTraderForDeletion); err != nil {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
 	}
 	lifecycle, err := s.store.Trader().BeginStart(userID, traderID)
 	if err != nil {

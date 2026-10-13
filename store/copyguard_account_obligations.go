@@ -15,3 +15,11 @@ const unsettledAccountProtectionSQL = `(o.replacement_pending=1
    WHERE retired.id=o.cycle_id AND retired.trader_id=o.trader_id AND retired.closed_at IS NOT NULL)
   )
  ))`
+
+// Both startup and legacy-archive recovery must agree on which historical
+// records still claim an account. Expects trader alias t.
+func unsettledTraderVenueInstructionsSQL() string {
+	return `(EXISTS(SELECT 1 FROM copy_trade_execution_order_attempts o JOIN copy_trade_execution_intents oi ON oi.id=o.intent_id WHERE oi.trader_id=t.id AND ` + unsettledExecutionAttemptSQL("o") + `)
+ OR EXISTS(SELECT 1 FROM copy_trade_execution_intents i WHERE i.trader_id=t.id AND (i.submitted_at IS NOT NULL OR COALESCE(i.exchange_order_id,'')<>'') AND (i.terminal_at IS NULL OR UPPER(COALESCE(i.exchange_state,'')) NOT IN ('FILLED','CANCELED','CANCELLED','REJECTED','EXPIRED','FAILED')) AND NOT EXISTS(SELECT 1 FROM copy_trade_execution_order_attempts o WHERE o.intent_id=i.id) AND NOT ` + retiredLegacyVenueObligationSQL + `)
+ OR EXISTS(SELECT 1 FROM copy_guard_protective_orders o WHERE o.trader_id=t.id AND ` + unsettledAccountProtectionSQL + `))`
+}

@@ -399,6 +399,13 @@ func (at *AutoTrader) Stop() {
 	logger.Info("⏹ Automatic trading system stopped")
 }
 
+// StopAndWait also waits when another stop caller has already cleared
+// isRunning. Deletion must not query flat-account evidence before that drain.
+func (at *AutoTrader) StopAndWait() {
+	at.Stop()
+	at.monitorWg.Wait()
+}
+
 // runCycle runs one trading cycle (using AI full decision-making)
 func (at *AutoTrader) runCycle() error {
 	if !at.lifecycleRunning() {

@@ -123,6 +123,7 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
   const { user, token } = useAuth()
   const navigate = useNavigate()
   const [showCreateModal, setShowCreateModal] = useState(false)
+  const [deletingTraderId, setDeletingTraderId] = useState<string | null>(null)
   // Binance 全局共享凭证管理弹窗（v2 凭证全局化入口）
   const [showBinanceCredsModal, setShowBinanceCredsModal] = useState(false)
   const [showEditModal, setShowEditModal] = useState(false)
@@ -359,17 +360,18 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
   const handleDeleteTrader = async (traderId: string) => {
     {
       const ok = await confirmToast(
-        '归档后将从列表隐藏，但会永久保留盈亏、订单意图、映射、周期与事件审计。存在真实仓位、未决订单或未核实保护单时系统会拒绝归档。确认继续？',
-        { title: '安全归档交易员', okText: '确认归档' }
+        '删除后不可恢复运行。系统会核实原执行账户及当前账户均无真实仓位、普通挂单和条件挂单，再永久释放账户。历史记录保留为只读数据，不再要求补齐历史成交，也不会继续阻塞新交易员。确认继续？',
+        { title: '删除交易员并释放账户', okText: '核验并删除' }
       )
       if (!ok) return
     }
 
     try {
+      setDeletingTraderId(traderId)
       const archivePromise = api.deleteTrader(traderId)
-      toast.loading('正在归档…', { id: `archive-${traderId}` })
+      toast.loading('正在核实当前仓位和挂单…', { id: `archive-${traderId}` })
       await archivePromise
-      toast.success('归档成功', { id: `archive-${traderId}` })
+      toast.success('交易员已删除，账户已释放', { id: `archive-${traderId}` })
 
       // Immediately refresh traders list for better UX
       await mutateTraders()
@@ -381,6 +383,8 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
           : t('deleteTraderFailed', language),
         { id: `archive-${traderId}` }
       )
+    } finally {
+      setDeletingTraderId(null)
     }
   }
 
@@ -393,8 +397,8 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
         if (result.status === 'STOPPED') {
           toast.success(
             result.pending_blockers?.length
-              ? `已停止，仍有 ${result.pending_blockers.length} 项归档阻塞`
-              : '已完成权威对账，可以归档'
+              ? `已停止，仍有 ${result.pending_blockers.length} 项状态待核对；删除时会单独核验当前风险`
+              : '已完成权威对账'
           )
         } else {
           toast.warning(
@@ -438,7 +442,9 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
       })
       const result = await reconcilePromise
       if (result.pending_blockers?.length) {
-        toast.warning(`仍有 ${result.pending_blockers.length} 项归档阻塞`)
+        toast.warning(
+          `仍有 ${result.pending_blockers.length} 项状态待核对；放弃该交易员可直接点击删除进行当前风险核验`
+        )
       }
       await mutateTraders()
     } catch (error) {
@@ -1210,7 +1216,7 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
                           )
                           .join('\n')}
                       >
-                        阻塞 {trader.pending_blockers.length}
+                        待核对 {trader.pending_blockers.length}
                       </div>
                     )}
                   </div>
@@ -1246,9 +1252,9 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
                             background: 'rgba(255, 193, 7, 0.1)',
                             color: '#FFC107',
                           }}
-                          title="重新读取交易所仓位、普通挂单、条件单和不可变成交记录；只有权威空仓且无挂单才会清理本地残留"
+                          title="保留交易员时核对历史成交与当前状态；放弃交易员可直接点击删除，系统会单独核验当前仓位和挂单"
                         >
-                          核对归档条件
+                          核对历史状态
                         </button>
                       )}
 
@@ -1348,20 +1354,22 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
 
                     <button
                       onClick={() => handleDeleteTrader(trader.trader_id)}
+                      aria-label={`删除交易员 ${trader.trader_name}`}
                       disabled={
-                        (trader.lifecycle_status ||
-                          (trader.is_running ? 'RUNNING' : 'STOPPED')) !==
-                          'STOPPED' || !!trader.pending_blockers?.length
+                        deletingTraderId !== null ||
+                        !['STOPPED', 'STOPPING_RECONCILE_REQUIRED'].includes(
+                          trader.lifecycle_status ||
+                            (trader.is_running ? 'RUNNING' : 'STOPPED')
+                        )
                       }
                       className="px-2 md:px-3 py-1.5 md:py-2 rounded text-xs md:text-sm font-semibold transition-all hover:scale-105 disabled:opacity-40 disabled:cursor-not-allowed"
                       title={
-                        (trader.lifecycle_status ||
-                          (trader.is_running ? 'RUNNING' : 'STOPPED')) !==
-                        'STOPPED'
-                          ? '需先完成对账：点击「继续对账」向交易所核实仓位与挂单，状态变为 STOPPED 后即可归档'
-                          : trader.pending_blockers?.length
-                            ? `存在 ${trader.pending_blockers.length} 项阻塞，不能归档。点击「核对归档条件」重新向交易所核实；若确认已空仓且无挂单，阻塞会自动清除`
-                            : '仅 STOPPED 且无仓位、未决订单、未核实保护单时可归档'
+                        !['STOPPED', 'STOPPING_RECONCILE_REQUIRED'].includes(
+                          trader.lifecycle_status ||
+                            (trader.is_running ? 'RUNNING' : 'STOPPED')
+                        )
+                          ? '请先停止交易员'
+                          : '核实当前仓位和挂单后删除并释放账户，无需补齐历史订单'
                       }
                       style={{
                         background: 'rgba(246, 70, 93, 0.1)',
