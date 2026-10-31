@@ -793,6 +793,10 @@ func (ti *TraderIntegration) StartCopyTrading() error {
 	// 启动风控事件消费协程（v3 风控：SL 触发 / 二次进场告警邮件）
 	ti.launch(ti.consumeRiskEvents)
 	ti.launch(ti.monitorExecutionIntents)
+	// 仓位亏损告警（仅邮件通知）：邮件启用且配置了 NOTIFY_POSITION_LOSS_PCT 时运行。
+	if notifier.PositionLossAlertPct() > 0 {
+		ti.launch(ti.monitorPositionLossAlerts)
+	}
 	if migrationPending {
 		ti.launch(ti.monitorMigrationMarginStopReconciliation)
 	}
