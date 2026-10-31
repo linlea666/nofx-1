@@ -285,3 +285,41 @@ func TestQueuedAlertRechecksBusinessRelevanceBeforeSMTP(t *testing.T) {
 		t.Fatal("canceled queue item retained transport reservation")
 	}
 }
+
+func TestParsePositionLossAlertPct(t *testing.T) {
+	cases := map[string]float64{"50": 50, " 60% ": 60, "-55.5": 55.5, "0": 0}
+	for in, want := range cases {
+		got, err := parsePositionLossAlertPct(in)
+		if err != nil || got != want {
+			t.Fatalf("parse %q = %v, %v; want %v", in, got, err, want)
+		}
+	}
+	for _, in := range []string{"abc", "NaN", "1001", "inf"} {
+		if _, err := parsePositionLossAlertPct(in); err == nil {
+			t.Fatalf("parse %q should fail", in)
+		}
+	}
+}
+
+func TestPositionLossAlertPctRequiresEnabledEmail(t *testing.T) {
+	t.Setenv("NOTIFY_POSITION_LOSS_PCT", "50")
+	cfg := LoadFromEnv()
+	if cfg.PositionLossAlertPct != 50 {
+		t.Fatalf("env not loaded: %v", cfg.PositionLossAlertPct)
+	}
+	restore := SetGlobalForTesting(&CaptureNotifier{}, false)
+	defer restore()
+	globalMu.Lock()
+	globalCfg = cfg
+	globalMu.Unlock()
+	if got := PositionLossAlertPct(); got != 0 {
+		t.Fatalf("non-email notifier must disable position loss alerts, got %v", got)
+	}
+	n := &emailNotifier{cfg: cfg, queue: make(chan Alert, 1), stopCh: make(chan struct{})}
+	globalMu.Lock()
+	global = n
+	globalMu.Unlock()
+	if got := PositionLossAlertPct(); got != 50 {
+		t.Fatalf("enabled email notifier should expose threshold, got %v", got)
+	}
+}

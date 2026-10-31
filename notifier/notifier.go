@@ -3,6 +3,7 @@ package notifier
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -37,7 +38,18 @@ type Config struct {
 	// 仅对跟单数据源 = Binance 的 trader 生效；OKX / Hyperliquid 永不触发。
 	// 限流粒度由全局 MinInterval 控制；限流键 = <traderID>|<symbol>|<action>。
 	NotifyBinanceCopyActionEnabled bool
+
+	// PositionLossAlertPct 跟单仓位亏损告警阈值（百分比，例如 50 表示 -50%）。
+	// 0 表示关闭。全局生效：对所有跟单交易员账户上的全部仓位适用。
+	// 亏损比例口径与页面持仓列表 unrealized_pnl_pct 一致：
+	// 未实现盈亏 / (数量 × 标记价 / 杠杆) × 100。
+	// 通过 env NOTIFY_POSITION_LOSS_PCT 配置。
+	PositionLossAlertPct float64
 }
+
+// maxPositionLossAlertPct 全仓模式下保证金收益率可以低于 -100%，
+// 因此上限放宽；超出该范围视为配置错误。
+const maxPositionLossAlertPct = 1000
 
 // LoadFromEnv 从环境变量加载配置
 //
@@ -56,6 +68,7 @@ type Config struct {
 //	NOTIFY_SEND_TIMEOUT_SECONDS = 15              (默认 15，必须 >0)
 //	NOTIFY_SEND_ON_STARTUP = true                 (默认 true)
 //	NOTIFY_BINANCE_COPY_ACTION_ENABLED = false    (默认 false，仅 Binance 跟单数据源生效)
+//	NOTIFY_POSITION_LOSS_PCT = 50                 (默认 0=关闭，跟单仓位亏损达到该百分比时告警一次)
 func LoadFromEnv() Config {
 	cfg := Config{
 		SMTPPort:      465,
@@ -113,7 +126,31 @@ func LoadFromEnv() Config {
 	cfg.NotifyBinanceCopyActionEnabled = parseBool(
 		os.Getenv("NOTIFY_BINANCE_COPY_ACTION_ENABLED"), false)
 
+	if v := strings.TrimSpace(os.Getenv("NOTIFY_POSITION_LOSS_PCT")); v != "" {
+		pct, err := parsePositionLossAlertPct(v)
+		if err != nil {
+			logger.Warnf("⚠️ NOTIFY_POSITION_LOSS_PCT=%q 无效，仓位亏损告警已关闭: %v", v, err)
+		} else {
+			cfg.PositionLossAlertPct = pct
+		}
+	}
+
 	return cfg
+}
+
+// parsePositionLossAlertPct 解析仓位亏损告警阈值。
+// 接受 "50" / "50%" / "-50"（取绝对值）；"0" 表示关闭。
+func parsePositionLossAlertPct(s string) (float64, error) {
+	s = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(s), "%"))
+	pct, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0, fmt.Errorf("not a number")
+	}
+	pct = math.Abs(pct)
+	if math.IsNaN(pct) || math.IsInf(pct, 0) || pct > maxPositionLossAlertPct {
+		return 0, fmt.Errorf("must be between 0 and %d", maxPositionLossAlertPct)
+	}
+	return pct, nil
 }
 
 // ============================================================================
@@ -220,6 +257,9 @@ func Init(cfg Config) error {
 
 	logger.Infof("📧 邮件通知已启用 | %s:%d → %s",
 		cfg.SMTPHost, cfg.SMTPPort, strings.Join(cfg.To, ", "))
+	if cfg.PositionLossAlertPct > 0 {
+		logger.Infof("📧 跟单仓位亏损告警已启用 | 阈值=-%.2f%%", cfg.PositionLossAlertPct)
+	}
 
 	// 启动测试邮件（可关闭）
 	if cfg.SendOnStartup {
@@ -301,6 +341,19 @@ func CopyTradeActionEnabled() bool {
 	globalMu.RLock()
 	defer globalMu.RUnlock()
 	return globalInited && globalCfg.NotifyBinanceCopyActionEnabled
+}
+
+// PositionLossAlertPct 返回跟单仓位亏损告警阈值（百分比，>0 表示启用）。
+//
+// 仅当全局 notifier 真正启用（非 noop）时返回配置值；邮件未启用或配置
+// 不完整时返回 0，调用方据此整条路径短路。
+func PositionLossAlertPct() float64 {
+	globalMu.RLock()
+	defer globalMu.RUnlock()
+	if _, isEmail := global.(*emailNotifier); !isEmail {
+		return 0
+	}
+	return globalCfg.PositionLossAlertPct
 }
 
 // ============================================================================
