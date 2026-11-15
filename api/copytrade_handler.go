@@ -145,7 +145,10 @@ func NewCopyTradeHandler(st *store.Store, tm *manager.TraderManager) *CopyTradeH
 }
 
 func validateAIGuardedPrerequisites(st *store.Store, cfg *store.CopyTradeConfig) error {
-	if cfg == nil || !cfg.RiskStopLossEnabled || !cfg.RiskReentryEnabled || cfg.RiskReentryDecisionMode != "ai_guarded" {
+	// AI reentry is part of Copy Guard. Sources that cannot run Copy Guard
+	// (Hyperliquid) keep the inert factory defaults and never reach it.
+	if cfg == nil || !copytrade.SupportsCopyGuard(copytrade.ProviderType(cfg.ProviderType)) ||
+		!cfg.RiskStopLossEnabled || !cfg.RiskReentryEnabled || cfg.RiskReentryDecisionMode != "ai_guarded" {
 		return nil
 	}
 	aiCfg, err := st.ReentryAI().GetReentryAIConfig()

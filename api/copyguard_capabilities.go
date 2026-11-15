@@ -2,6 +2,7 @@ package api
 
 import (
 	"fmt"
+	"nofx/copytrade"
 	"nofx/store"
 	"runtime/debug"
 )
@@ -12,6 +13,12 @@ func verifyCopyGuardConfigReadback(st *store.Store, expected *store.CopyTradeCon
 	actual, err := st.CopyTrade().GetByTraderID(expected.TraderID)
 	if err != nil {
 		return fmt.Errorf("configuration persisted but readback failed: %w", err)
+	}
+	// The store persists no Copy Guard policy for sources that cannot run it
+	// (it deletes the policy row below v4), so the in-memory factory defaults
+	// can never round-trip. Reading the row back is the whole contract here.
+	if !copytrade.SupportsCopyGuard(copytrade.ProviderType(expected.ProviderType)) {
+		return nil
 	}
 	want, err := store.EncodeCopyGuardPolicySnapshot(expected)
 	if err != nil {
