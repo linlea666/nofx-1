@@ -288,6 +288,16 @@ func (h *CopyTradeHandler) RegisterRoutes(group *gin.RouterGroup) {
 			creds.GET("/affected", h.ListBinanceCredentialsAffectedTraders)
 			creds.DELETE("/:label", h.DeleteBinanceCredentials)
 		}
+
+		// FollowCoin 全局 token（所有 FollowCoin 跟单交易员共用）与实盘账户查询
+		fcCreds := copyTrade.Group("/followcoin-credentials")
+		{
+			fcCreds.GET("", h.GetFollowCoinCredentials)
+			fcCreds.POST("", h.SetFollowCoinCredentials)
+			fcCreds.POST("/test", h.TestFollowCoinCredentials)
+			fcCreds.DELETE("", h.DeleteFollowCoinCredentials)
+		}
+		copyTrade.GET("/followcoin/accounts", h.ListFollowCoinAccounts)
 	}
 }
 
@@ -1346,7 +1356,7 @@ type CopyTradeConfigRequest struct {
 	CopyCurrentPositionsOnce      *bool                           `json:"copy_current_positions_once,omitempty"`
 	CopyCurrentPositionsRequestID string                          `json:"copy_current_positions_request_id,omitempty"`
 	ATRProfilePatch               *store.CopyGuardATRProfilePatch `json:"atr_profile_patch,omitempty"`
-	ProviderType                  string                          `json:"provider_type" binding:"required,oneof=hyperliquid okx binance"`
+	ProviderType                  string                          `json:"provider_type" binding:"required,oneof=hyperliquid okx binance followcoin"`
 	LeaderID                      string                          `json:"leader_id"`
 	CopyRatio                     float64                         `json:"copy_ratio" binding:"required,gt=0"`
 	SyncLeverage                  bool                            `json:"sync_leverage"`

@@ -78,6 +78,10 @@ func NewProviderWithLoader(config *CopyConfig, loader BinanceCredentialsLoader) 
 		return NewHyperliquidProvider(), nil
 	case ProviderOKX:
 		return NewOKXProvider(), nil
+	case ProviderFollowCoin:
+		// 生产路径由 NewEngine 注入全局 token loader；此处无 loader 时
+		// 每次请求都会以"token 未配置"失败（fail-closed）。
+		return NewFollowCoinProviderWithLoader(nil), nil
 	case ProviderBinance:
 		mode := config.BinanceSourceMode
 		if mode == "" {

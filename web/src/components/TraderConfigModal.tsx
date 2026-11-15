@@ -14,6 +14,8 @@ import type {
   CopyTradeSourceHealthStatus,
   BinanceSourceMode,
   BinanceCredentialsView,
+  FollowCoinCredentialsView,
+  FollowCoinAccount,
 } from '../types'
 import { useLanguage } from '../contexts/LanguageContext'
 import { t } from '../i18n/translations'
@@ -39,6 +41,7 @@ import {
   type CopyGuardCapabilities,
 } from '../lib/copyGuardPolicy'
 import { BinanceGlobalCredsModal } from './traders/BinanceGlobalCredsModal'
+import { FollowCoinCredsModal } from './traders/FollowCoinCredsModal'
 
 // 提取下划线后面的名称部分
 function getShortName(fullName: string): string {
@@ -489,6 +492,59 @@ export function TraderConfigModal({
       cancelled = true
     }
   }, [isOpen, formData.copy_provider_type, refreshGlobalCredsTick])
+
+  // FollowCoin 全局 token 状态与实盘账户查询（仅 provider=followcoin 时使用）
+  const [followCoinCreds, setFollowCoinCreds] =
+    useState<FollowCoinCredentialsView | null>(null)
+  const [followCoinCredsLoaded, setFollowCoinCredsLoaded] = useState(false)
+  const [showFollowCoinCredsModal, setShowFollowCoinCredsModal] =
+    useState(false)
+  const [followCoinUserId, setFollowCoinUserId] = useState('')
+  const [followCoinAccounts, setFollowCoinAccounts] = useState<
+    FollowCoinAccount[]
+  >([])
+  const [followCoinQuerying, setFollowCoinQuerying] = useState(false)
+
+  useEffect(() => {
+    if (!isOpen || formData.copy_provider_type !== 'followcoin') return
+    let cancelled = false
+    api
+      .getFollowCoinCredentials()
+      .then((c) => {
+        if (!cancelled) setFollowCoinCreds(c)
+      })
+      .catch(() => {
+        /* 状态卡仅展示用 */
+      })
+      .finally(() => {
+        if (!cancelled) setFollowCoinCredsLoaded(true)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [isOpen, formData.copy_provider_type, refreshGlobalCredsTick])
+
+  const queryFollowCoinAccounts = async () => {
+    const uid = followCoinUserId.trim()
+    if (!/^\d+$/.test(uid)) {
+      toast.error('请输入交易员主页 ID（纯数字，如 31535）')
+      return
+    }
+    setFollowCoinQuerying(true)
+    try {
+      const accounts = await api.listFollowCoinAccounts(uid)
+      setFollowCoinAccounts(accounts)
+      if (accounts.length === 0) {
+        toast.warning('该交易员没有公开的实盘账户')
+      } else if (accounts.length === 1) {
+        handleInputChange('copy_leader_id', String(accounts[0].api_id))
+      }
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : '查询失败')
+    } finally {
+      setFollowCoinQuerying(false)
+    }
+  }
 
   // 获取用户的策略列表
   useEffect(() => {
@@ -1026,7 +1082,11 @@ export function TraderConfigModal({
         }
       } else if (!formData.copy_leader_id.trim()) {
         // 旧逻辑在 leader_id 为空时静默不带 copy_config，会保存出半成品配置。
-        window.alert('跟单模式必须填写领航员 ID / 地址')
+        window.alert(
+          formData.copy_provider_type === 'followcoin'
+            ? '请先输入交易员主页 ID 并查询，然后选择要跟的实盘账户'
+            : '跟单模式必须填写领航员 ID / 地址'
+        )
         return
       }
       // M19：Binance 数据源必须至少有一份可用凭证（全局共享凭证，或本交易员
@@ -1041,6 +1101,13 @@ export function TraderConfigModal({
       ) {
         window.alert(
           'Binance 数据源缺少登录凭证：请先在「Binance 共享凭证」中配置全局凭证后再保存'
+        )
+        return
+      }
+      // FollowCoin 必须先配置全局 token，否则后端无法校验所选实盘账户。
+      if (formData.copy_provider_type === 'followcoin' && !followCoinCreds) {
+        window.alert(
+          'FollowCoin 数据源缺少 token：请先点击「管理凭证」配置 FollowCoin token 后再保存'
         )
         return
       }
@@ -1580,6 +1647,20 @@ export function TraderConfigModal({
                       >
                         Binance
                       </button>
+                      <button
+                        type="button"
+                        disabled={sourceSwitchLocked}
+                        onClick={() =>
+                          handleInputChange('copy_provider_type', 'followcoin')
+                        }
+                        className={`flex-1 px-3 py-2 rounded text-sm disabled:cursor-not-allowed disabled:opacity-50 ${
+                          formData.copy_provider_type === 'followcoin'
+                            ? 'bg-[#F0B90B] text-black'
+                            : 'bg-[#0B0E11] text-[#848E9C] border border-[#2B3139]'
+                        }`}
+                      >
+                        FollowCoin
+                      </button>
                     </div>
                     {sourceSwitchLocked && (
                       <p className="mt-1 text-xs text-[#F0B90B]">
@@ -1657,58 +1738,175 @@ export function TraderConfigModal({
                     </div>
                   )}
 
+                  {formData.copy_provider_type === 'followcoin' && (
+                    <div className="space-y-3">
+                      <div
+                        className={`flex items-start gap-2 rounded border p-3 ${
+                          followCoinCreds?.last_status === 'valid'
+                            ? 'border-[#0ECB8144] bg-[#0ECB810D]'
+                            : 'border-[#F0B90B44] bg-[#F0B90B0D]'
+                        }`}
+                      >
+                        {followCoinCreds?.last_status === 'valid' ? (
+                          <CheckCircle2 className="mt-0.5 h-4 w-4 flex-shrink-0 text-[#0ECB81]" />
+                        ) : (
+                          <AlertCircle className="mt-0.5 h-4 w-4 flex-shrink-0 text-[#F0B90B]" />
+                        )}
+                        <div className="flex-1 text-[11px] leading-relaxed text-[#B7BDC6]">
+                          {!followCoinCredsLoaded
+                            ? '正在读取 FollowCoin 凭证状态…'
+                            : !followCoinCreds
+                              ? '尚未配置 FollowCoin token，无法查询实盘和跟单。'
+                              : followCoinCreds.last_status === 'valid'
+                                ? 'FollowCoin token 有效。'
+                                : followCoinCreds.last_status === 'expired'
+                                  ? 'FollowCoin token 已失效，跟单已暂停，请更新。'
+                                  : 'FollowCoin token 尚未校验成功。'}{' '}
+                          平台约 5～10
+                          分钟刷新一次实盘持仓，跟单会比领航员实际操作晚几分钟。
+                          <button
+                            type="button"
+                            onClick={() => setShowFollowCoinCredsModal(true)}
+                            className="ml-1 text-[#F0B90B] underline"
+                          >
+                            管理凭证 →
+                          </button>
+                        </div>
+                      </div>
+
+                      <div>
+                        <label className="text-sm text-[#EAECEF] block mb-2">
+                          交易员主页 ID
+                        </label>
+                        <div className="flex gap-2">
+                          <input
+                            type="text"
+                            inputMode="numeric"
+                            value={followCoinUserId}
+                            onChange={(e) =>
+                              setFollowCoinUserId(e.target.value)
+                            }
+                            disabled={sourceSwitchLocked}
+                            placeholder="主页链接末尾的数字，如 31535"
+                            className="flex-1 px-3 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF] focus:border-[#F0B90B] focus:outline-none font-mono text-sm disabled:opacity-50"
+                          />
+                          <button
+                            type="button"
+                            onClick={queryFollowCoinAccounts}
+                            disabled={followCoinQuerying || sourceSwitchLocked}
+                            className="px-3 py-2 rounded text-sm bg-[#F0B90B22] text-[#F0B90B] hover:bg-[#F0B90B44] disabled:opacity-50"
+                          >
+                            {followCoinQuerying ? '查询中…' : '查询实盘'}
+                          </button>
+                        </div>
+                        <p className="text-xs text-[#848E9C] mt-1">
+                          主页链接形如 h5.followcoin.ai/h5/u?i=31535，取 i=
+                          后面的数字
+                        </p>
+                      </div>
+
+                      {followCoinAccounts.length > 0 && (
+                        <div className="space-y-2">
+                          <label className="text-sm text-[#EAECEF] block">
+                            选择要跟的实盘账户
+                          </label>
+                          {followCoinAccounts.map((a) => {
+                            const selected =
+                              formData.copy_leader_id === String(a.api_id)
+                            return (
+                              <button
+                                type="button"
+                                key={a.api_id}
+                                disabled={sourceSwitchLocked}
+                                onClick={() =>
+                                  handleInputChange(
+                                    'copy_leader_id',
+                                    String(a.api_id)
+                                  )
+                                }
+                                className={`w-full text-left px-3 py-2 rounded border text-sm disabled:opacity-50 ${
+                                  selected
+                                    ? 'border-[#F0B90B] bg-[#F0B90B1A] text-[#EAECEF]'
+                                    : 'border-[#2B3139] bg-[#0B0E11] text-[#B7BDC6]'
+                                }`}
+                              >
+                                <span className="font-medium">
+                                  {a.alias || '实盘'}
+                                </span>
+                                <span className="ml-2 text-xs text-[#848E9C]">
+                                  {a.exchange_name} · apiId {a.api_id}
+                                </span>
+                              </button>
+                            )
+                          })}
+                        </div>
+                      )}
+
+                      <p className="text-xs text-[#848E9C]">
+                        当前跟随的实盘账户 apiId：
+                        <span className="font-mono text-[#EAECEF]">
+                          {formData.copy_leader_id || '未选择'}
+                        </span>
+                      </p>
+                    </div>
+                  )}
+
                   {/* Leader source identity */}
-                  <div>
-                    <label className="text-sm text-[#EAECEF] block mb-2">
-                      {formData.copy_provider_type === 'binance' &&
-                      formData.copy_binance_source_mode === 'smart_money'
-                        ? 'Smart Money 主页 / TopTraderId'
-                        : formData.copy_provider_type === 'binance'
-                          ? '领航员 PortfolioId'
-                          : '领航员地址'}
-                      <span className="text-red-500"> *</span>
-                    </label>
-                    <input
-                      type="text"
-                      value={
-                        formData.copy_provider_type === 'binance' &&
+                  {formData.copy_provider_type !== 'followcoin' && (
+                    <div>
+                      <label className="text-sm text-[#EAECEF] block mb-2">
+                        {formData.copy_provider_type === 'binance' &&
                         formData.copy_binance_source_mode === 'smart_money'
-                          ? formData.copy_binance_top_trader_id
-                          : formData.copy_leader_id
-                      }
-                      onChange={(e) =>
-                        handleInputChange(
+                          ? 'Smart Money 主页 / TopTraderId'
+                          : formData.copy_provider_type === 'binance'
+                            ? '领航员 PortfolioId'
+                            : '领航员地址'}
+                        <span className="text-red-500"> *</span>
+                      </label>
+                      <input
+                        type="text"
+                        value={
                           formData.copy_provider_type === 'binance' &&
-                            formData.copy_binance_source_mode === 'smart_money'
-                            ? 'copy_binance_top_trader_id'
-                            : 'copy_leader_id',
-                          e.target.value
-                        )
-                      }
-                      className="w-full px-3 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF] focus:border-[#F0B90B] focus:outline-none font-mono text-sm"
-                      placeholder={
-                        formData.copy_provider_type === 'hyperliquid'
-                          ? '0x...'
+                          formData.copy_binance_source_mode === 'smart_money'
+                            ? formData.copy_binance_top_trader_id
+                            : formData.copy_leader_id
+                        }
+                        onChange={(e) =>
+                          handleInputChange(
+                            formData.copy_provider_type === 'binance' &&
+                              formData.copy_binance_source_mode ===
+                                'smart_money'
+                              ? 'copy_binance_top_trader_id'
+                              : 'copy_leader_id',
+                            e.target.value
+                          )
+                        }
+                        className="w-full px-3 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF] focus:border-[#F0B90B] focus:outline-none font-mono text-sm"
+                        placeholder={
+                          formData.copy_provider_type === 'hyperliquid'
+                            ? '0x...'
+                            : formData.copy_provider_type === 'binance' &&
+                                formData.copy_binance_source_mode ===
+                                  'smart_money'
+                              ? 'https://www.binance.com/zh-CN/smart-money/profile/5082050984257986817'
+                              : formData.copy_provider_type === 'binance'
+                                ? '领航员主页 portfolioId (如 5008318166959365632)'
+                                : 'UniqueName (如 F2BCA22ABBB69F57)'
+                        }
+                      />
+                      <p className="text-xs text-[#848E9C] mt-1">
+                        {formData.copy_provider_type === 'hyperliquid'
+                          ? 'Hyperliquid 钱包地址 (0x开头)'
                           : formData.copy_provider_type === 'binance' &&
                               formData.copy_binance_source_mode ===
                                 'smart_money'
-                            ? 'https://www.binance.com/zh-CN/smart-money/profile/5082050984257986817'
+                            ? '可粘贴 Smart Money 主页完整 URL 或纯数字 topTraderId。系统以公开的当前仓位完整快照为实时权威数据。'
                             : formData.copy_provider_type === 'binance'
-                              ? '领航员主页 portfolioId (如 5008318166959365632)'
-                              : 'UniqueName (如 F2BCA22ABBB69F57)'
-                      }
-                    />
-                    <p className="text-xs text-[#848E9C] mt-1">
-                      {formData.copy_provider_type === 'hyperliquid'
-                        ? 'Hyperliquid 钱包地址 (0x开头)'
-                        : formData.copy_provider_type === 'binance' &&
-                            formData.copy_binance_source_mode === 'smart_money'
-                          ? '可粘贴 Smart Money 主页完整 URL 或纯数字 topTraderId。系统以公开的当前仓位完整快照为实时权威数据。'
-                          : formData.copy_provider_type === 'binance'
-                            ? '填领航员主页 URL 末尾的 portfolioId（不是跟单订单里的关系 ID）。前提：你的账户已经在 Binance 上跟单了该领航员'
-                            : 'OKX 交易员 uniqueName (交易员页面 URL 中的参数)'}
-                    </p>
-                  </div>
+                              ? '填领航员主页 URL 末尾的 portfolioId（不是跟单订单里的关系 ID）。前提：你的账户已经在 Binance 上跟单了该领航员'
+                              : 'OKX 交易员 uniqueName (交易员页面 URL 中的参数)'}
+                      </p>
+                    </div>
+                  )}
 
                   {formData.copy_provider_type === 'binance' &&
                     formData.copy_binance_source_mode === 'smart_money' && (
@@ -3451,6 +3649,13 @@ export function TraderConfigModal({
         onClose={() => {
           setShowBinanceCredsModal(false)
           // 关闭后刷新一次凭证状态，立即反映新值
+          setRefreshGlobalCredsTick((n) => n + 1)
+        }}
+      />
+      <FollowCoinCredsModal
+        isOpen={showFollowCoinCredsModal}
+        onClose={() => {
+          setShowFollowCoinCredsModal(false)
           setRefreshGlobalCredsTick((n) => n + 1)
         }}
       />

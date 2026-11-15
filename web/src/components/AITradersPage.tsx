@@ -16,6 +16,7 @@ import { getModelIcon } from './ModelIcons'
 import { TraderConfigModal } from './TraderConfigModal'
 import { ExchangeConfigModal } from './traders/ExchangeConfigModal'
 import { BinanceGlobalCredsModal } from './traders/BinanceGlobalCredsModal'
+import { FollowCoinCredsModal } from './traders/FollowCoinCredsModal'
 import { PunkAvatar, getTraderAvatar } from './PunkAvatar'
 import {
   Bot,
@@ -126,6 +127,9 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
   const [deletingTraderId, setDeletingTraderId] = useState<string | null>(null)
   // Binance 全局共享凭证管理弹窗（v2 凭证全局化入口）
   const [showBinanceCredsModal, setShowBinanceCredsModal] = useState(false)
+  // FollowCoin 全局 token 管理弹窗
+  const [showFollowCoinCredsModal, setShowFollowCoinCredsModal] =
+    useState(false)
   const [showEditModal, setShowEditModal] = useState(false)
   const [showModelModal, setShowModelModal] = useState(false)
   const [showExchangeModal, setShowExchangeModal] = useState(false)
@@ -894,6 +898,21 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
             Binance 凭证
           </button>
 
+          {/* FollowCoin 全局 token：所有 FollowCoin 跟单交易员共用 */}
+          <button
+            onClick={() => setShowFollowCoinCredsModal(true)}
+            title="FollowCoin 跟单 token（所有 FollowCoin 跟单交易员共用）"
+            className="px-3 md:px-4 py-2 rounded text-xs md:text-sm font-semibold transition-all hover:scale-105 flex items-center gap-1 md:gap-2 whitespace-nowrap"
+            style={{
+              background: '#2B3139',
+              color: '#F0B90B',
+              border: '1px solid #F0B90B66',
+            }}
+          >
+            <KeyRound className="w-3 h-3 md:w-4 md:h-4" />
+            FollowCoin 凭证
+          </button>
+
           <button
             onClick={() => setShowCreateModal(true)}
             disabled={
@@ -1426,6 +1445,12 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
       <BinanceGlobalCredsModal
         isOpen={showBinanceCredsModal}
         onClose={() => setShowBinanceCredsModal(false)}
+      />
+
+      {/* FollowCoin 全局 token 管理 Modal */}
+      <FollowCoinCredsModal
+        isOpen={showFollowCoinCredsModal}
+        onClose={() => setShowFollowCoinCredsModal(false)}
       />
 
       {/* Edit Trader Modal */}

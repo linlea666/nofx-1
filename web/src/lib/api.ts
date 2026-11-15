@@ -33,6 +33,9 @@ import type {
   BinanceCredentialsSetRequest,
   BinanceCredentialsTestResponse,
   BinanceCredentialsAffectedResponse,
+  FollowCoinCredentialsView,
+  FollowCoinCredentialsTestResponse,
+  FollowCoinAccount,
   CopyGuardAccountRiskPolicyResponse,
   CopyRuntimeHealthResponse,
 } from '../types'
@@ -1014,6 +1017,61 @@ export const api = {
     if (!result.success)
       throw new Error(result.message || '获取受影响交易员失败')
     return result.data?.trader_ids ?? []
+  },
+
+  // ==========================================================================
+  // FollowCoin 全局 token 与实盘账户查询
+  // ==========================================================================
+
+  async getFollowCoinCredentials(): Promise<FollowCoinCredentialsView | null> {
+    const result = await httpClient.get<{
+      credentials: FollowCoinCredentialsView | null
+    }>(`${API_BASE}/copytrade/followcoin-credentials`)
+    if (!result.success)
+      throw new Error(result.message || '获取 FollowCoin 凭证失败')
+    return result.data?.credentials ?? null
+  },
+
+  async setFollowCoinCredentials(token: string): Promise<{
+    credentials: FollowCoinCredentialsView | null
+    nick_name: string
+  }> {
+    const result = await httpClient.post<{
+      credentials: FollowCoinCredentialsView | null
+      nick_name: string
+    }>(`${API_BASE}/copytrade/followcoin-credentials`, { token })
+    if (!result.success)
+      throw new Error(result.message || '保存 FollowCoin 凭证失败')
+    return {
+      credentials: result.data?.credentials ?? null,
+      nick_name: result.data?.nick_name ?? '',
+    }
+  },
+
+  async testFollowCoinCredentials(): Promise<FollowCoinCredentialsTestResponse> {
+    const result = await httpClient.post<FollowCoinCredentialsTestResponse>(
+      `${API_BASE}/copytrade/followcoin-credentials/test`
+    )
+    if (!result.success)
+      throw new Error(result.message || '测试 FollowCoin 凭证失败')
+    return result.data!
+  },
+
+  async deleteFollowCoinCredentials(): Promise<void> {
+    const result = await httpClient.delete(
+      `${API_BASE}/copytrade/followcoin-credentials`
+    )
+    if (!result.success)
+      throw new Error(result.message || '删除 FollowCoin 凭证失败')
+  },
+
+  async listFollowCoinAccounts(userId: string): Promise<FollowCoinAccount[]> {
+    const result = await httpClient.get<{ accounts: FollowCoinAccount[] }>(
+      `${API_BASE}/copytrade/followcoin/accounts?userId=${encodeURIComponent(userId)}`
+    )
+    if (!result.success)
+      throw new Error(result.message || '查询 FollowCoin 实盘账户失败')
+    return result.data?.accounts ?? []
   },
 
   async getCopyRuntimeHealth(

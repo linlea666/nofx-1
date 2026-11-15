@@ -62,6 +62,9 @@ type Engine struct {
 	// Binance 全局凭证加载器（仅 ProviderType=binance 时生效；nil 时走旧的 config 字段路径）
 	binanceCredLoader BinanceCredentialsLoader
 
+	// FollowCoin 全局 token 加载器（仅 ProviderType=followcoin 时生效）
+	followCoinTokenLoader FollowCoinTokenLoader
+
 	// 跟随者账户信息（由外部注入）
 	getFollowerBalance         func() float64
 	getFollowerEquity          func() float64
@@ -179,6 +182,14 @@ func WithBinanceCredentialsLoader(loader BinanceCredentialsLoader) EngineOption 
 	}
 }
 
+// WithFollowCoinTokenLoader 注入 FollowCoin 全局 token 加载器（热更新）。
+// 仅 ProviderType=followcoin 生效，其他数据源不读取。
+func WithFollowCoinTokenLoader(loader FollowCoinTokenLoader) EngineOption {
+	return func(e *Engine) {
+		e.followCoinTokenLoader = loader
+	}
+}
+
 // NewEngine 创建跟单引擎
 func NewEngine(
 	traderID string,
@@ -237,9 +248,15 @@ func NewEngine(
 
 	// 轮询模式（默认，或流式模式不可用时回退）
 	// 仅 Binance 路径会消费 binanceCredLoader；OKX/HL 完全不读，零影响。
-	provider, err := NewProviderWithLoader(config, e.binanceCredLoader)
-	if err != nil {
-		return nil, err
+	var provider LeaderProvider
+	var err error
+	if config != nil && config.ProviderType == ProviderFollowCoin {
+		provider = NewFollowCoinProviderWithLoader(e.followCoinTokenLoader)
+	} else {
+		provider, err = NewProviderWithLoader(config, e.binanceCredLoader)
+		if err != nil {
+			return nil, err
+		}
 	}
 	e.provider = provider
 	logger.Infof("✅ [%s] 使用轮询模式 (REST)", traderID)
@@ -727,9 +744,17 @@ func (e *Engine) smartMoneyRecoveryRequired(checkedAt time.Time) (bool, error) {
 }
 
 func (e *Engine) confirmSmartMoneyEmptySnapshot(state *AccountState, now time.Time) error {
-	if !e.isSmartMoneyMode() || e.store == nil || state == nil || len(state.Positions) > 0 {
+	followCoin := e.config != nil && e.config.ProviderType == ProviderFollowCoin
+	if (!e.isSmartMoneyMode() && !followCoin) || e.store == nil || state == nil || len(state.Positions) > 0 {
 		e.smartEmptySnapshotCandidateAt = time.Time{}
 		return nil
+	}
+	// FollowCoin returns an authoritative snapshot only every 5-10 minutes;
+	// a transient empty list from the platform must not close every follower
+	// position. Require the empty view to persist across several polls.
+	unconfirmed, confirmDelay := ErrBinanceSmartMoneyEmptyUnconfirmed, smartMoneyEmptyConfirmDelay
+	if followCoin {
+		unconfirmed, confirmDelay = ErrFollowCoinEmptyUnconfirmed, followCoinEmptyConfirmDelay
 	}
 	if state.EmptySnapshotConfirmed {
 		e.smartEmptySnapshotCandidateAt = time.Time{}
@@ -745,10 +770,10 @@ func (e *Engine) confirmSmartMoneyEmptySnapshot(state *AccountState, now time.Ti
 	}
 	if e.smartEmptySnapshotCandidateAt.IsZero() {
 		e.smartEmptySnapshotCandidateAt = now
-		return ErrBinanceSmartMoneyEmptyUnconfirmed
+		return unconfirmed
 	}
-	if now.Sub(e.smartEmptySnapshotCandidateAt) < smartMoneyEmptyConfirmDelay {
-		return ErrBinanceSmartMoneyEmptyUnconfirmed
+	if now.Sub(e.smartEmptySnapshotCandidateAt) < confirmDelay {
+		return unconfirmed
 	}
 	e.smartEmptySnapshotCandidateAt = time.Time{}
 	return nil
@@ -850,7 +875,7 @@ func (e *Engine) startPollingMode(ctx context.Context) error {
 	// 获取历史成交作为去重基线
 	// Hyperliquid 走快照权威热路径，从不消费原始成交；5 分钟 userFills 基线
 	// 只是一次无用的重接口调用（快照 fill ID 与 tid 永不冲突）。
-	if e.config.ProviderType != ProviderOKX && e.config.ProviderType != ProviderHyperliquid {
+	if !snapshotPolledProvider(e.config.ProviderType) {
 		e.initSeenFills()
 	}
 
@@ -1030,7 +1055,7 @@ func (e *Engine) poll() {
 		// 无新成交时，保持原有的定时同步作为兜底（防止长时间无交易时数据过旧）
 		// OKX/Hyperliquid 的快照是唯一信号源，必须每轮同步；同步失败本轮
 		// fail-closed 跳过，绝不对过期缓存做差分。
-		snapshotDriven := e.config.ProviderType == ProviderOKX || e.config.ProviderType == ProviderHyperliquid
+		snapshotDriven := snapshotPolledProvider(e.config.ProviderType)
 		if snapshotDriven || time.Since(e.lastStateSync) > e.stateSyncInterval {
 			if err := e.syncLeaderState(); err != nil {
 				logger.Warnf("⚠️ [%s] 定时状态同步失败: %v", e.traderID, err)
@@ -1050,7 +1075,7 @@ func (e *Engine) poll() {
 	// into one final target transition.
 	// Hyperliquid shares this path: clearinghouseState is an authoritative
 	// account snapshot, so WS gaps or NOFX downtime are caught up by the diff.
-	if e.config.ProviderType == ProviderOKX || e.config.ProviderType == ProviderHyperliquid {
+	if snapshotPolledProvider(e.config.ProviderType) {
 		snapshotFills := e.detectBinancePositionSnapshotFills()
 		freshSnapshotFills := make([]Fill, 0, len(snapshotFills))
 		for _, fill := range snapshotFills {
@@ -1090,8 +1115,7 @@ func (e *Engine) poll() {
 		// authoritative state needed to skip processSignal's historical second
 		// read. Preserve the existing revalidation behavior for every other provider.
 		signal.AuthoritativeSnapshot = authoritativeStateInstalled &&
-			(e.config.ProviderType == ProviderBinance || e.config.ProviderType == ProviderOKX ||
-				e.config.ProviderType == ProviderHyperliquid)
+			(e.config.ProviderType == ProviderBinance || snapshotPolledProvider(e.config.ProviderType))
 
 		logger.Infof("📡 [%s] 收到信号 | %s %s %s | 价格=%.4f 数量=%.4f 价值=%.2f",
 			e.traderID, fill.Symbol, fill.Action, fill.PositionSide,
@@ -1154,7 +1178,7 @@ func (e *Engine) buildSignal(fill *Fill) *TradeSignal {
 // 跨轮询的平仓→重开由 closed 映射 + 持久化 revision 正常跟进。
 func (e *Engine) detectBinancePositionSnapshotFills() []Fill {
 	if e.store == nil || e.config == nil || (e.config.ProviderType != ProviderBinance &&
-		e.config.ProviderType != ProviderOKX && e.config.ProviderType != ProviderHyperliquid) {
+		!snapshotPolledProvider(e.config.ProviderType)) {
 		return nil
 	}
 
@@ -1343,6 +1367,22 @@ func (e *Engine) buildBinanceSnapshotFillForPosition(pos *Position, posID string
 		}
 		return fill
 	}
+	if e.config != nil && e.config.ProviderType == ProviderFollowCoin {
+		// FollowCoin sizes are coin quantities on USDT-margined swaps; the
+		// provider derives PositionValue from the authoritative mark price.
+		// Without it the transition carries no USD value and risk-increasing
+		// actions fail closed in blockInvalidSourceRiskIncrease.
+		fill.RawValue = math.Abs(size * fill.Price)
+		fill.ValueCurrency = "USD"
+		if pos != nil && pos.Size > 0 && pos.PositionValue > 0 {
+			fill.Value = math.Abs(size/pos.Size) * math.Abs(pos.PositionValue)
+			fill.ValueUSDValid = fill.Value > 0
+		} else {
+			fill.Value, fill.ValueUSDValid = 0, false
+			fill.ValueError = "FollowCoin position mark price is unavailable"
+		}
+		return fill
+	}
 	if e.config != nil && e.config.ProviderType == ProviderHyperliquid {
 		// HL perps are USD-linear and size is in coin units. Scale the
 		// authoritative positionValue by the size delta; fall back to
@@ -1392,7 +1432,7 @@ func (e *Engine) buildBinanceSnapshotFill(posID, symbol string, side SideType, a
 		tradeSide = "sell"
 	}
 
-	sourcePrefix := strings.ToLower(string(e.config.ProviderType)) + "_snapshot"
+	sourcePrefix := snapshotFillIDPrefix(e.config.ProviderType)
 	fillID := fmt.Sprintf("%s|%s|%s|%.8f|%.8f", sourcePrefix, posID, action, previousSize, currentSize)
 	if e.isSmartMoneyMode() {
 		// Smart Money synthesizes signals from current-position snapshots, so
@@ -1402,20 +1442,14 @@ func (e *Engine) buildBinanceSnapshotFill(posID, symbol string, side SideType, a
 		// also prevents identity reuse after a configured source change.
 		fillID = fmt.Sprintf("binance_snapshot|smart|g%d|r%d|%s|%s|%.8f|%.8f",
 			e.config.SourceGeneration, sourceRevision, posID, action, previousSize, currentSize)
-	} else if e.config != nil && e.config.ProviderType == ProviderOKX {
-		// OKX can reuse a posId after a complete close. Persisted source
-		// revision therefore belongs to the canonical identity just as it does
-		// for Smart Money snapshots; otherwise 0->same-size reopens inside the
+	} else if e.config != nil && snapshotPolledProvider(e.config.ProviderType) {
+		// OKX, Hyperliquid and FollowCoin reuse a posId after a complete close
+		// (HL's posId is always symbol_side). Persisted source revision
+		// therefore belongs to the canonical identity just as it does for
+		// Smart Money snapshots; otherwise 0->same-size reopens inside the
 		// seen-fill TTL are indistinguishable from the previous lifecycle.
-		fillID = fmt.Sprintf("okx_snapshot|r%d|%s|%s|%.8f|%.8f",
-			sourceRevision, posID, action, previousSize, currentSize)
-	} else if e.config != nil && e.config.ProviderType == ProviderHyperliquid {
-		// HL posId is always symbol_side and therefore reused by every
-		// lifecycle of that coin/side. Without the persisted revision a
-		// close -> same-size reopen inside the seen-fill TTL would collide
-		// with the previous open and be silently dropped.
-		fillID = fmt.Sprintf("hyperliquid_snapshot|r%d|%s|%s|%.8f|%.8f",
-			sourceRevision, posID, action, previousSize, currentSize)
+		fillID = fmt.Sprintf("%s|r%d|%s|%s|%.8f|%.8f",
+			sourcePrefix, sourceRevision, posID, action, previousSize, currentSize)
 	} else if e.config != nil && e.config.ProviderType == ProviderBinance &&
 		action == ActionOpen && sourceRevision > 0 {
 		// Preserve the historical Copy Management identity for all active
@@ -1757,8 +1791,9 @@ func (e *Engine) matchOpenAddSignal(signal *TradeSignal, leaderPosMap map[string
 
 		if mapping.Status == "ignored" {
 			// 🔑 关键区分：根据数据源（ProviderType）使用不同的判断逻辑
-			if e.config.ProviderType == ProviderOKX || e.config.ProviderType == ProviderBinance {
-				// OKX/Binance: ignored 表示启动前已存在的历史仓位，当前仍在持仓中时不跟随。
+			if e.config.ProviderType == ProviderOKX || e.config.ProviderType == ProviderBinance ||
+				e.config.ProviderType == ProviderFollowCoin {
+				// OKX/Binance/FollowCoin: ignored 表示启动前已存在的历史仓位，当前仍在持仓中时不跟随。
 				// Binance 如果该仓位先消失，checkIgnoredPositionsClosed 会标记 closed，后续重新开仓可按新仓处理。
 				logger.Debugf("📊 [%s] 历史仓位 | posId=%s status=ignored → 不跟随（%s）",
 					e.traderID, posID, e.config.ProviderType)
@@ -1919,8 +1954,7 @@ func (e *Engine) matchOpenAddSignal(signal *TradeSignal, leaderPosMap map[string
 		// size 增加的仓位，lastKnownSize 有值时几乎必然是迟到/重复/部分成交
 		// 的残余信号，盲目加仓会造成重复建仓。lastKnownSize=0（旧数据）时
 		// 保留原兜底加仓行为。
-		if (e.config.ProviderType == ProviderBinance || e.config.ProviderType == ProviderOKX ||
-			e.config.ProviderType == ProviderHyperliquid) &&
+		if (e.config.ProviderType == ProviderBinance || snapshotPolledProvider(e.config.ProviderType)) &&
 			singleActiveMapping != nil &&
 			singleActiveMapping.LastKnownSize > 0 &&
 			singleActivePos.Size <= singleActiveMapping.LastKnownSize+binancePositionSizeEpsilon {
@@ -2069,16 +2103,13 @@ func (e *Engine) matchCloseReduceSignal(signal *TradeSignal, leaderPosMap map[st
 		}
 	}
 
-	if (e.config.ProviderType == ProviderBinance || e.config.ProviderType == ProviderHyperliquid) && len(activeMappings) == 1 {
+	if (e.config.ProviderType == ProviderBinance || snapshotPolledProvider(e.config.ProviderType)) && len(activeMappings) == 1 {
 		mapping := activeMappings[0]
 		leaderPos := leaderPosMap[mapping.LeaderPosID]
 		if leaderPos != nil &&
 			mapping.LastKnownSize > 0 &&
 			mapping.LastKnownSize <= leaderPos.Size+binancePositionSizeEpsilon {
-			providerName := "Binance"
-			if e.config.ProviderType == ProviderHyperliquid {
-				providerName = "Hyperliquid"
-			}
+			providerName := providerDisplayName(e.config.ProviderType)
 			logger.Debugf("📊 [%s] %s 未检测到 size 减少 | posId=%s 上次=%.4f 当前=%.4f → 跳过迟到/重复成交",
 				e.traderID, providerName, mapping.LeaderPosID, mapping.LastKnownSize, leaderPos.Size)
 			return &SignalMatchResult{
@@ -2682,8 +2713,8 @@ func (e *Engine) blockInvalidSourceRiskIncrease(signal *TradeSignal, match *Sign
 	}
 	fill := signal.Fill
 	requiresValidatedValue := e.isSmartMoneyMode() ||
-		(e.config != nil && e.config.ProviderType == ProviderOKX && strings.HasPrefix(fill.ID, "okx_snapshot|")) ||
-		(e.config != nil && e.config.ProviderType == ProviderHyperliquid && strings.HasPrefix(fill.ID, "hyperliquid_snapshot|"))
+		(e.config != nil && snapshotPolledProvider(e.config.ProviderType) &&
+			strings.HasPrefix(fill.ID, snapshotFillIDPrefix(e.config.ProviderType)+"|"))
 	if !requiresValidatedValue {
 		return false
 	}
@@ -3016,7 +3047,8 @@ func (e *Engine) calculateCopySizeByPositionChange(signal *TradeSignal, match *S
 
 	// 🔑 OKX/Binance: 直接使用 fill.Value（API 返回完整订单价值，不存在拆分问题）
 	// 🔑 Hyperliquid: 使用持仓变化量计算（解决大订单拆分导致金额偏小的问题）
-	if e.config.ProviderType == ProviderOKX || e.config.ProviderType == ProviderBinance {
+	if e.config.ProviderType == ProviderOKX || e.config.ProviderType == ProviderBinance ||
+		e.config.ProviderType == ProviderFollowCoin {
 		leaderTradeValue = fill.Value
 		logger.Infof("📊 [%s] %s计算 | 使用 fill.Value=%.2f", e.traderID, e.config.ProviderType, fill.Value)
 	} else if match.Action == ActionOpen {
@@ -3375,6 +3407,7 @@ func (e *Engine) syncLeaderState() (syncErr error) {
 		}
 	}()
 	state, err := e.currentSourceSnapshot()
+	e.observeFollowCoinCredential(err)
 	if err != nil {
 		e.recordSmartMoneySourceHealth()
 		e.reportBinanceCredentialsExpired(err, "syncLeaderState")
