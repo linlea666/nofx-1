@@ -848,7 +848,9 @@ func (e *Engine) startPollingMode(ctx context.Context) error {
 		go e.sourceMaintenanceLoop(ctx)
 	}
 	// 获取历史成交作为去重基线
-	if e.config.ProviderType != ProviderOKX {
+	// Hyperliquid 走快照权威热路径，从不消费原始成交；5 分钟 userFills 基线
+	// 只是一次无用的重接口调用（快照 fill ID 与 tid 永不冲突）。
+	if e.config.ProviderType != ProviderOKX && e.config.ProviderType != ProviderHyperliquid {
 		e.initSeenFills()
 	}
 
@@ -1026,10 +1028,13 @@ func (e *Engine) poll() {
 		}
 	} else {
 		// 无新成交时，保持原有的定时同步作为兜底（防止长时间无交易时数据过旧）
-		if e.config.ProviderType == ProviderOKX || time.Since(e.lastStateSync) > e.stateSyncInterval {
+		// OKX/Hyperliquid 的快照是唯一信号源，必须每轮同步；同步失败本轮
+		// fail-closed 跳过，绝不对过期缓存做差分。
+		snapshotDriven := e.config.ProviderType == ProviderOKX || e.config.ProviderType == ProviderHyperliquid
+		if snapshotDriven || time.Since(e.lastStateSync) > e.stateSyncInterval {
 			if err := e.syncLeaderState(); err != nil {
 				logger.Warnf("⚠️ [%s] 定时状态同步失败: %v", e.traderID, err)
-				if e.config.ProviderType == ProviderOKX {
+				if snapshotDriven {
 					return
 				}
 			} else {
@@ -1043,7 +1048,9 @@ func (e *Engine) poll() {
 	// minutes of fills as seen and permanently lost changes made while NOFX was
 	// down. The current snapshot collapses every same-position fill in this poll
 	// into one final target transition.
-	if e.config.ProviderType == ProviderOKX {
+	// Hyperliquid shares this path: clearinghouseState is an authoritative
+	// account snapshot, so WS gaps or NOFX downtime are caught up by the diff.
+	if e.config.ProviderType == ProviderOKX || e.config.ProviderType == ProviderHyperliquid {
 		snapshotFills := e.detectBinancePositionSnapshotFills()
 		freshSnapshotFills := make([]Fill, 0, len(snapshotFills))
 		for _, fill := range snapshotFills {
@@ -1057,7 +1064,7 @@ func (e *Engine) poll() {
 				e.markSeen(fill.ID)
 			}
 			newFills = freshSnapshotFills
-			logger.Infof("📡 [%s] OKX 持仓快照合并为 %d 条最终状态变化", e.traderID, len(newFills))
+			logger.Infof("📡 [%s] %s 持仓快照合并为 %d 条最终状态变化", e.traderID, strings.ToUpper(string(e.config.ProviderType)), len(newFills))
 		} else if len(snapshotFills) > 0 {
 			for _, fill := range newFills {
 				e.markSeen(fill.ID)
@@ -1079,11 +1086,12 @@ func (e *Engine) poll() {
 		e.normalizeNetModeFill(fill)
 
 		signal := e.buildSignal(fill)
-		// Only Binance/OKX position-snapshot paths have the complete authoritative
-		// state needed to skip processSignal's historical second read. Preserve the
-		// existing revalidation behavior for every other provider.
+		// Only Binance/OKX/Hyperliquid position-snapshot paths have the complete
+		// authoritative state needed to skip processSignal's historical second
+		// read. Preserve the existing revalidation behavior for every other provider.
 		signal.AuthoritativeSnapshot = authoritativeStateInstalled &&
-			(e.config.ProviderType == ProviderBinance || e.config.ProviderType == ProviderOKX)
+			(e.config.ProviderType == ProviderBinance || e.config.ProviderType == ProviderOKX ||
+				e.config.ProviderType == ProviderHyperliquid)
 
 		logger.Infof("📡 [%s] 收到信号 | %s %s %s | 价格=%.4f 数量=%.4f 价值=%.2f",
 			e.traderID, fill.Symbol, fill.Action, fill.PositionSide,
@@ -1138,9 +1146,15 @@ func (e *Engine) buildSignal(fill *Fill) *TradeSignal {
 }
 
 // detectBinancePositionSnapshotFills 基于当前领航员持仓和本地 mapping 生成
-// 权威状态变化。函数名为历史兼容保留；当前支持 Binance 和 OKX。
+// 权威状态变化。函数名为历史兼容保留；当前支持 Binance、OKX 和 Hyperliquid。
+//
+// Hyperliquid 快照无仓位开仓时间（OpenedMS=0），sourceLifecycleChanged 对其
+// 恒为 false：同一轮询间隔内"同向全平+重开"无法区分——尺寸不同时按
+// add/reduce 跟到正确目标，尺寸相同时不产生动作（跟随者持仓与领航员一致）。
+// 跨轮询的平仓→重开由 closed 映射 + 持久化 revision 正常跟进。
 func (e *Engine) detectBinancePositionSnapshotFills() []Fill {
-	if e.store == nil || e.config == nil || (e.config.ProviderType != ProviderBinance && e.config.ProviderType != ProviderOKX) {
+	if e.store == nil || e.config == nil || (e.config.ProviderType != ProviderBinance &&
+		e.config.ProviderType != ProviderOKX && e.config.ProviderType != ProviderHyperliquid) {
 		return nil
 	}
 
@@ -1329,6 +1343,23 @@ func (e *Engine) buildBinanceSnapshotFillForPosition(pos *Position, posID string
 		}
 		return fill
 	}
+	if e.config != nil && e.config.ProviderType == ProviderHyperliquid {
+		// HL perps are USD-linear and size is in coin units. Scale the
+		// authoritative positionValue by the size delta; fall back to
+		// size × derived mark when the snapshot lacks a usable notional.
+		fill.RawValue = math.Abs(size * fill.Price)
+		fill.ValueCurrency = "USD"
+		if pos != nil && pos.Size > 0 && pos.PositionValue > 0 {
+			fill.Value = math.Abs(size/pos.Size) * math.Abs(pos.PositionValue)
+		} else {
+			fill.Value = fill.RawValue
+		}
+		fill.ValueUSDValid = fill.Value > 0
+		if !fill.ValueUSDValid {
+			fill.ValueError = "Hyperliquid position value is unavailable"
+		}
+		return fill
+	}
 	if !e.isSmartMoneyMode() || pos == nil {
 		return fill
 	}
@@ -1377,6 +1408,13 @@ func (e *Engine) buildBinanceSnapshotFill(posID, symbol string, side SideType, a
 		// for Smart Money snapshots; otherwise 0->same-size reopens inside the
 		// seen-fill TTL are indistinguishable from the previous lifecycle.
 		fillID = fmt.Sprintf("okx_snapshot|r%d|%s|%s|%.8f|%.8f",
+			sourceRevision, posID, action, previousSize, currentSize)
+	} else if e.config != nil && e.config.ProviderType == ProviderHyperliquid {
+		// HL posId is always symbol_side and therefore reused by every
+		// lifecycle of that coin/side. Without the persisted revision a
+		// close -> same-size reopen inside the seen-fill TTL would collide
+		// with the previous open and be silently dropped.
+		fillID = fmt.Sprintf("hyperliquid_snapshot|r%d|%s|%s|%.8f|%.8f",
 			sourceRevision, posID, action, previousSize, currentSize)
 	} else if e.config != nil && e.config.ProviderType == ProviderBinance &&
 		action == ActionOpen && sourceRevision > 0 {
@@ -1877,11 +1915,12 @@ func (e *Engine) matchOpenAddSignal(signal *TradeSignal, leaderPosMap map[string
 		if posID == "" {
 			posID = fmt.Sprintf("%s_%s", fill.Symbol, fill.PositionSide)
 		}
-		// size 增量守卫（OKX/Binance 共用）：到达兜底分支说明第二轮没找到
+		// size 增量守卫（OKX/Binance/Hyperliquid 快照源共用）：到达兜底分支说明第二轮没找到
 		// size 增加的仓位，lastKnownSize 有值时几乎必然是迟到/重复/部分成交
 		// 的残余信号，盲目加仓会造成重复建仓。lastKnownSize=0（旧数据）时
 		// 保留原兜底加仓行为。
-		if (e.config.ProviderType == ProviderBinance || e.config.ProviderType == ProviderOKX) &&
+		if (e.config.ProviderType == ProviderBinance || e.config.ProviderType == ProviderOKX ||
+			e.config.ProviderType == ProviderHyperliquid) &&
 			singleActiveMapping != nil &&
 			singleActiveMapping.LastKnownSize > 0 &&
 			singleActivePos.Size <= singleActiveMapping.LastKnownSize+binancePositionSizeEpsilon {
@@ -2030,17 +2069,21 @@ func (e *Engine) matchCloseReduceSignal(signal *TradeSignal, leaderPosMap map[st
 		}
 	}
 
-	if e.config.ProviderType == ProviderBinance && len(activeMappings) == 1 {
+	if (e.config.ProviderType == ProviderBinance || e.config.ProviderType == ProviderHyperliquid) && len(activeMappings) == 1 {
 		mapping := activeMappings[0]
 		leaderPos := leaderPosMap[mapping.LeaderPosID]
 		if leaderPos != nil &&
 			mapping.LastKnownSize > 0 &&
 			mapping.LastKnownSize <= leaderPos.Size+binancePositionSizeEpsilon {
-			logger.Debugf("📊 [%s] Binance 未检测到 size 减少 | posId=%s 上次=%.4f 当前=%.4f → 跳过迟到/重复成交",
-				e.traderID, mapping.LeaderPosID, mapping.LastKnownSize, leaderPos.Size)
+			providerName := "Binance"
+			if e.config.ProviderType == ProviderHyperliquid {
+				providerName = "Hyperliquid"
+			}
+			logger.Debugf("📊 [%s] %s 未检测到 size 减少 | posId=%s 上次=%.4f 当前=%.4f → 跳过迟到/重复成交",
+				e.traderID, providerName, mapping.LeaderPosID, mapping.LastKnownSize, leaderPos.Size)
 			return &SignalMatchResult{
 				ShouldFollow: false,
-				Reason:       "Binance 持仓 size 未减少，可能是迟到/重复成交",
+				Reason:       providerName + " 持仓 size 未减少，可能是迟到/重复成交",
 			}
 		}
 	}
@@ -2639,7 +2682,8 @@ func (e *Engine) blockInvalidSourceRiskIncrease(signal *TradeSignal, match *Sign
 	}
 	fill := signal.Fill
 	requiresValidatedValue := e.isSmartMoneyMode() ||
-		(e.config != nil && e.config.ProviderType == ProviderOKX && strings.HasPrefix(fill.ID, "okx_snapshot|"))
+		(e.config != nil && e.config.ProviderType == ProviderOKX && strings.HasPrefix(fill.ID, "okx_snapshot|")) ||
+		(e.config != nil && e.config.ProviderType == ProviderHyperliquid && strings.HasPrefix(fill.ID, "hyperliquid_snapshot|"))
 	if !requiresValidatedValue {
 		return false
 	}
