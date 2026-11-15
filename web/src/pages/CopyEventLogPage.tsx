@@ -143,6 +143,7 @@ const providerLabels: Record<string, string> = {
   okx: 'OKX',
   hyperliquid: 'Hyperliquid',
   binance: 'Binance',
+  followcoin: 'FollowCoin',
 }
 
 const fmtNum = (v: number) =>

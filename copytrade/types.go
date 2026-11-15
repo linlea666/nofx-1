@@ -3,6 +3,7 @@
 package copytrade
 
 import (
+	"strings"
 	"time"
 
 	"nofx/store"
@@ -19,6 +20,7 @@ const (
 	ProviderHyperliquid ProviderType = "hyperliquid"
 	ProviderOKX         ProviderType = "okx"
 	ProviderBinance     ProviderType = "binance"
+	ProviderFollowCoin  ProviderType = "followcoin"
 
 	BinanceSourceCopyManagement BinanceSourceMode = "copy_management"
 	BinanceSourceSmartMoney     BinanceSourceMode = "smart_money"
@@ -39,6 +41,36 @@ const (
 // stops fails loudly at start rather than running unprotected.
 func SupportsCopyGuard(p ProviderType) bool {
 	return p == ProviderOKX || p == ProviderBinance
+}
+
+// snapshotPolledProvider reports sources whose signals come solely from
+// diffing an authoritative position snapshot that is re-read every poll. A
+// failed read fails the whole round closed instead of diffing a stale cache.
+// Binance has its own snapshot block in poll() and is deliberately excluded.
+func snapshotPolledProvider(p ProviderType) bool {
+	return p == ProviderOKX || p == ProviderHyperliquid || p == ProviderFollowCoin
+}
+
+// snapshotFillIDPrefix is the canonical prefix of synthesized snapshot fill
+// IDs, e.g. "okx_snapshot". Persisted intents reference these IDs, so the
+// format must stay stable.
+func snapshotFillIDPrefix(p ProviderType) string {
+	return strings.ToLower(string(p)) + "_snapshot"
+}
+
+func providerDisplayName(p ProviderType) string {
+	switch p {
+	case ProviderBinance:
+		return "Binance"
+	case ProviderHyperliquid:
+		return "Hyperliquid"
+	case ProviderOKX:
+		return "OKX"
+	case ProviderFollowCoin:
+		return "FollowCoin"
+	default:
+		return string(p)
+	}
 }
 
 // ActionType 交易动作类型

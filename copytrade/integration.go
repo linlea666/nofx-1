@@ -664,6 +664,9 @@ func (ti *TraderIntegration) StartCopyTrading() error {
 	if engineConfig.ProviderType == ProviderBinance && ti.store != nil {
 		engineOpts = append(engineOpts, WithBinanceCredentialsLoader(ti.store.BinanceCreds()))
 	}
+	if engineConfig.ProviderType == ProviderFollowCoin && ti.store != nil {
+		engineOpts = append(engineOpts, WithFollowCoinTokenLoader(ti.store.FollowCoinCreds()))
+	}
 
 	engine, err := NewEngine(
 		ti.traderID,

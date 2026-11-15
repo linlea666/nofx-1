@@ -22,18 +22,19 @@ type Store struct {
 	instanceLock *processLock
 
 	// Sub-stores (lazy initialization)
-	user         *UserStore
-	aiModel      *AIModelStore
-	exchange     *ExchangeStore
-	trader       *TraderStore
-	decision     *DecisionStore
-	backtest     *BacktestStore
-	position     *PositionStore
-	strategy     *StrategyStore
-	equity       *EquityStore
-	copyTrade    *CopyTradeStore
-	binanceCreds *BinanceCredentialsStore
-	reentryAI    *ReentryAIStore
+	user            *UserStore
+	aiModel         *AIModelStore
+	exchange        *ExchangeStore
+	trader          *TraderStore
+	decision        *DecisionStore
+	backtest        *BacktestStore
+	position        *PositionStore
+	strategy        *StrategyStore
+	equity          *EquityStore
+	copyTrade       *CopyTradeStore
+	binanceCreds    *BinanceCredentialsStore
+	followCoinCreds *FollowCoinCredentialsStore
+	reentryAI       *ReentryAIStore
 
 	// Encryption functions
 	encryptFunc func(string) string
@@ -291,6 +292,9 @@ func (s *Store) initTables() error {
 	if err := s.BinanceCreds().initTables(); err != nil {
 		return fmt.Errorf("failed to initialize binance credentials tables: %w", err)
 	}
+	if err := s.FollowCoinCreds().initTables(); err != nil {
+		return fmt.Errorf("failed to initialize followcoin credentials tables: %w", err)
+	}
 	if err := s.ReentryAI().initTables(); err != nil {
 		return fmt.Errorf("failed to initialize reentry ai tables: %w", err)
 	}
@@ -445,6 +449,16 @@ func (s *Store) BinanceCreds() *BinanceCredentialsStore {
 		s.binanceCreds = &BinanceCredentialsStore{db: s.db}
 	}
 	return s.binanceCreds
+}
+
+// FollowCoinCreds gets FollowCoin global token storage
+func (s *Store) FollowCoinCreds() *FollowCoinCredentialsStore {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.followCoinCreds == nil {
+		s.followCoinCreds = &FollowCoinCredentialsStore{db: s.db}
+	}
+	return s.followCoinCreds
 }
 
 // ReentryAI gets reentry advisor storage

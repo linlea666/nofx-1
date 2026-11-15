@@ -1,6 +1,6 @@
 // Decision mode types (defined early for use throughout the file)
 export type DecisionMode = 'ai' | 'copy_trade'
-export type CopyTradeProvider = 'hyperliquid' | 'okx' | 'binance'
+export type CopyTradeProvider = 'hyperliquid' | 'okx' | 'binance' | 'followcoin'
 
 export interface SystemStatus {
   trader_id: string
@@ -1772,6 +1772,37 @@ export interface BinanceCredentialsTestResponse {
 export interface BinanceCredentialsAffectedResponse {
   trader_ids: string[]
   count: number
+}
+
+// ============================================================================
+// FollowCoin 全局 token（所有 FollowCoin 跟单交易员共用）
+// ============================================================================
+
+export type FollowCoinCredsStatus = 'valid' | 'expired' | 'unknown' | 'error'
+
+export interface FollowCoinCredentialsView {
+  label: string
+  masked_token: string
+  expires_at: string
+  last_validated_at: string
+  last_status: FollowCoinCredsStatus
+  last_error: string
+  updated_at: string
+}
+
+export interface FollowCoinCredentialsTestResponse {
+  status: FollowCoinCredsStatus
+  error: string
+  nick_name: string
+}
+
+// 交易员名下的一个实盘账户（跟单时只选其中一个）
+export interface FollowCoinAccount {
+  api_id: number
+  alias: string
+  exchange_id: number
+  exchange_name: string
+  status: number
 }
 
 export interface CurrentPositionCopyRow {

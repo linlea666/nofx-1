@@ -2,6 +2,7 @@ package api
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"nofx/copytrade"
@@ -25,7 +26,7 @@ func prepareCopyTradeSourceWithRuntime(st *store.Store, cfg, existing *store.Cop
 	cfg.ProviderType = strings.TrimSpace(cfg.ProviderType)
 	cfg.LeaderID = strings.TrimSpace(cfg.LeaderID)
 	switch copytrade.ProviderType(cfg.ProviderType) {
-	case copytrade.ProviderHyperliquid, copytrade.ProviderOKX, copytrade.ProviderBinance:
+	case copytrade.ProviderHyperliquid, copytrade.ProviderOKX, copytrade.ProviderBinance, copytrade.ProviderFollowCoin:
 	default:
 		return fmt.Errorf("unsupported copy trade provider %q", cfg.ProviderType)
 	}
@@ -74,11 +75,24 @@ func prepareCopyTradeSourceWithRuntime(st *store.Store, cfg, existing *store.Cop
 		if cfg.LeaderID == "" {
 			return fmt.Errorf("copy trade config requires leader_id")
 		}
+		if cfg.ProviderType == string(copytrade.ProviderFollowCoin) {
+			apiID, err := copytrade.ParseFollowCoinAPIID(cfg.LeaderID)
+			if err != nil {
+				return err
+			}
+			cfg.LeaderID = strconv.FormatInt(apiID, 10)
+		}
 		mode = string(copytrade.BinanceSourceCopyManagement)
 		cfg.BinanceTopTraderID = ""
 	}
 	cfg.BinanceSourceMode = mode
 
+	if cfg.ProviderType == string(copytrade.ProviderFollowCoin) && st != nil &&
+		(existing == nil || copyTradeSourceIdentityChanged(existing, cfg)) {
+		if err := validateFollowCoinSource(st, cfg.LeaderID); err != nil {
+			return err
+		}
+	}
 	if existing == nil {
 		cfg.SourceGeneration = 1
 		return nil
