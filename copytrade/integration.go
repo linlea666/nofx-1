@@ -654,11 +654,10 @@ func (ti *TraderIntegration) StartCopyTrading() error {
 		return fmt.Errorf("invalid copy guard v4 policy: %w", err)
 	}
 
-	// 创建引擎（Hyperliquid 使用流式模式，OKX 使用轮询模式）
+	// 创建引擎：所有数据源均走快照权威轮询模式。
+	// Hyperliquid 不再使用 WebSocket 流式模式（WithStreamingMode 保留供回滚）：
+	// 流式路径断线漏推时没有快照差分兜底，且无法追赶 NOFX 停机期间的仓位变化。
 	var engineOpts []EngineOption
-	if engineConfig.ProviderType == ProviderHyperliquid {
-		engineOpts = append(engineOpts, WithStreamingMode())
-	}
 	engineOpts = append(engineOpts, WithFollowerEquity(ti.getEquityFunc()), WithFollowerPositionsResult(ti.getPositionsResultFunc()))
 	// Binance 启用全局凭证热加载（store.BinanceCreds 实现了 BinanceCredentialsLoader 接口）
 	// OKX/HL 路径下 NewProviderWithLoader 不会消费 loader，零影响。

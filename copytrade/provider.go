@@ -185,54 +185,11 @@ func (p *HyperliquidProvider) GetFills(leaderID string, since time.Time) ([]Fill
 }
 
 // GetAccountState 获取账户状态
+// 与 GetPositionSnapshot 共用 readClearinghouseSnapshot（hl_snapshot.go），
+// 保证 InitIgnoredPositions 与轮询差分看到一致的 PosID/MarkPrice 补全，
+// 并继承 fail-closed 校验（残缺响应不再被当作空仓快照）。
 func (p *HyperliquidProvider) GetAccountState(leaderID string) (*AccountState, error) {
-	req := map[string]string{
-		"type": "clearinghouseState",
-		"user": leaderID,
-	}
-
-	var raw HLClearinghouseState
-	if err := p.post(req, &raw); err != nil {
-		return nil, fmt.Errorf("get account state failed: %w", err)
-	}
-
-	state := &AccountState{
-		TotalEquity:      parseFloat(raw.MarginSummary.AccountValue),
-		AvailableBalance: parseFloat(raw.Withdrawable),
-		Positions:        make(map[string]*Position),
-		Timestamp:        time.UnixMilli(raw.Time),
-	}
-
-	// 解析持仓
-	for _, ap := range raw.AssetPositions {
-		pos := ap.Position
-		symbol := normalizeSymbol(pos.Coin)
-
-		size := parseFloat(pos.Szi)
-		side := SideLong
-		if size < 0 {
-			side = SideShort
-			size = -size
-		}
-
-		if size == 0 {
-			continue // 跳过空仓位
-		}
-
-		key := PositionKey(symbol, side)
-		state.Positions[key] = &Position{
-			Symbol:        symbol,
-			Side:          side,
-			Size:          size,
-			EntryPrice:    parseFloat(pos.EntryPx),
-			Leverage:      pos.Leverage.Value,
-			MarginMode:    pos.Leverage.Type,
-			UnrealizedPnL: parseFloat(pos.UnrealizedPnl),
-			PositionValue: parseFloat(pos.PositionValue),
-		}
-	}
-
-	return state, nil
+	return p.readClearinghouseSnapshot(leaderID)
 }
 
 func (p *HyperliquidProvider) post(req interface{}, result interface{}) error {
