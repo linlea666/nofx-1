@@ -1101,16 +1101,6 @@ func (s *Server) handleCreateTrader(c *gin.Context) {
 		IsRunning:            false,
 	}
 
-	// Save to database
-	logger.Infof("🔧 DEBUG: Preparing to call CreateTrader")
-	err = s.store.Trader().Create(traderRecord)
-	if err != nil {
-		logger.Infof("❌ Failed to create trader: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to create trader: %v", err)})
-		return
-	}
-	logger.Infof("🔧 DEBUG: CreateTrader succeeded")
-
 	// Handle copy trading configuration
 	decisionMode := req.DecisionMode
 	if decisionMode == "" {
@@ -1118,12 +1108,10 @@ func (s *Server) handleCreateTrader(c *gin.Context) {
 	}
 	manualReentryDeprecated := false
 
-	// Update decision_mode in database
-	if err := s.store.CopyTrade().UpdateDecisionMode(traderID, decisionMode); err != nil {
-		logger.Infof("⚠️ Failed to update decision mode: %v", err)
-	}
-
-	// If copy_trade mode, create copy trade config
+	// Build and validate the copy trade config before anything is persisted.
+	// A rejected config must not leave a copy_trade trader without its config:
+	// startup would then fail with "sql: no rows in result set".
+	var copyConfig *store.CopyTradeConfig
 	if decisionMode == "copy_trade" && req.CopyConfig != nil {
 		// SyncMarginMode 默认为 true（同步领航员的全仓/逐仓模式）
 		syncMarginMode := true
@@ -1131,7 +1119,7 @@ func (s *Server) handleCreateTrader(c *gin.Context) {
 			syncMarginMode = *req.CopyConfig.SyncMarginMode
 		}
 
-		copyConfig := store.NewCopyGuardDefaults()
+		copyConfig = store.NewCopyGuardDefaults()
 		copyConfig.TraderID = traderID
 		copyConfig.ProviderType = req.CopyConfig.ProviderType
 		copyConfig.LeaderID = req.CopyConfig.LeaderID
@@ -1216,7 +1204,24 @@ func (s *Server) handleCreateTrader(c *gin.Context) {
 			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 			return
 		}
+	}
 
+	// Save to database
+	logger.Infof("🔧 DEBUG: Preparing to call CreateTrader")
+	err = s.store.Trader().Create(traderRecord)
+	if err != nil {
+		logger.Infof("❌ Failed to create trader: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to create trader: %v", err)})
+		return
+	}
+	logger.Infof("🔧 DEBUG: CreateTrader succeeded")
+
+	// Update decision_mode in database
+	if err := s.store.CopyTrade().UpdateDecisionMode(traderID, decisionMode); err != nil {
+		logger.Infof("⚠️ Failed to update decision mode: %v", err)
+	}
+
+	if copyConfig != nil {
 		if err := s.store.CopyTrade().Upsert(copyConfig); err != nil {
 			// 必须显式失败：静默吞掉会造成"交易员已创建但跟单配置缺失"的
 			// 半成品状态，启动跟单时才暴露且难以定位。Upsert 幂等，用户重试即可。
@@ -1426,6 +1431,125 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 		IsRunning:            existingTrader.IsRunning, // Keep original value
 	}
 
+	// Handle copy trading configuration update
+	decisionMode := req.DecisionMode
+	manualReentryDeprecated := false
+
+	// Build and validate the copy trade config before the trader record or
+	// decision_mode is touched, so a rejected config leaves everything unchanged.
+	var copyConfig, existingCopyCfg *store.CopyTradeConfig
+	profileDefaulted := false
+	if decisionMode == "copy_trade" && req.CopyConfig != nil {
+		// SyncMarginMode 默认为 true（同步领航员的全仓/逐仓模式）
+		syncMarginMode := true
+		if req.CopyConfig.SyncMarginMode != nil {
+			syncMarginMode = *req.CopyConfig.SyncMarginMode
+		}
+
+		// 读取已有配置：凭证"空/掩码=不修改"语义 + 保留 Enabled 状态都需要旧值
+		existingCopyCfg, _ = s.store.CopyTrade().GetByTraderID(traderID)
+		existingP20T, existingCSRF := "", ""
+		if existingCopyCfg != nil {
+			existingP20T, existingCSRF = existingCopyCfg.BinanceP20T, existingCopyCfg.BinanceCSRFToken
+		}
+
+		copyConfig = store.NewCopyGuardDefaults()
+		if existingCopyCfg != nil {
+			clone := *existingCopyCfg
+			copyConfig = &clone
+		}
+		copyConfig.TraderID = traderID
+		copyConfig.ProviderType = req.CopyConfig.ProviderType
+		copyConfig.LeaderID = req.CopyConfig.LeaderID
+		copyConfig.CopyRatio = req.CopyConfig.CopyRatio
+		copyConfig.CopyCurrentPositionsOnce = req.CopyConfig.CopyCurrentPositionsOnce
+		copyConfig.CopyCurrentPositionsRequestID = req.CopyConfig.CopyCurrentPositionsRequestID
+		copyConfig.SyncLeverage = req.CopyConfig.SyncLeverage
+		copyConfig.SyncMarginMode = syncMarginMode
+		if req.CopyConfig.MinTradeWarn != nil {
+			copyConfig.MinTradeWarn = *req.CopyConfig.MinTradeWarn
+		}
+		if req.CopyConfig.MaxTradeWarn != nil {
+			copyConfig.MaxTradeWarn = *req.CopyConfig.MaxTradeWarn
+		}
+		if req.CopyConfig.CopyCatchupWindowSeconds != nil {
+			copyConfig.CopyCatchupWindowSeconds = *req.CopyConfig.CopyCatchupWindowSeconds
+		}
+		if req.CopyConfig.CopyCatchupMaxAdverseBPS != nil {
+			copyConfig.CopyCatchupMaxAdverseBPS = *req.CopyConfig.CopyCatchupMaxAdverseBPS
+		}
+		copyConfig.BinanceP20T = resolveCredentialUpdate(req.CopyConfig.BinanceP20T, existingP20T)
+		copyConfig.BinanceCSRFToken = resolveCredentialUpdate(req.CopyConfig.BinanceCSRFToken, existingCSRF)
+		copyConfig.BinanceSourceMode = req.CopyConfig.BinanceSourceMode
+		copyConfig.BinanceTopTraderID = req.CopyConfig.BinanceTopTraderID
+
+		// v3 风控字段透传（修复 bug：之前 CopyConfigReq 无 risk_* 字段，前端传值被 JSON unmarshal 静默丢弃）
+		manualReentryDeprecated = applyCopyConfigRiskFields(copyConfig, req.CopyConfig)
+		if err := validateFixedModeExplicitSettings(copyConfig.RiskProtectionMode, req.CopyConfig.RiskTriggerPriceType, req.CopyConfig.RiskTriggerPriceType != "", req.CopyConfig.RiskReentryEnabled, req.CopyConfig.RiskReentryDecisionMode, req.CopyConfig.RiskManualReentryEnabled, req.CopyConfig.RiskMaxReentries); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		profileDefaulted = store.NormalizeCopyGuardProtectionModeTransition(copyConfig, existingCopyCfg)
+		if err := store.ApplyCopyGuardATRProfilePatch(copyConfig, req.CopyConfig.ATRProfilePatch); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		if profileDefaulted {
+			logger.Warnf("⚠️ Copy Guard trader %s had no dormant ATR profile; restored canonical defaults", traderID)
+		}
+		if err := validateLegacyReentrySelection(existingCopyCfg, copyConfig.RiskReentryDecisionMode); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		if err := copytrade.ValidateStoredRiskPolicy(copyConfig); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		if copyConfig.RiskPolicyVersion >= 4 && !copytrade.SupportsCopyGuard(copytrade.ProviderType(copyConfig.ProviderType)) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "copy guard v4 is only supported for OKX or Binance leader sources"})
+			return
+		}
+		if copyConfig.RiskPolicyVersion >= 4 && copyConfig.RiskProtectionMode != store.RiskProtectionModePositionMarginPct {
+			if err := validateRiskConfirmation(copyConfig.RiskAccountPct, req.CopyConfig.RiskHighRiskConfirmed, req.CopyConfig.RiskExtremeConfirmValue); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+			if copyConfig.RiskStopPriority == "account_cap" {
+				if err := validateStopLossPctConfirmation(copyConfig.RiskStopMaxAccountLossPct, req.CopyConfig.RiskHighRiskConfirmed, req.CopyConfig.RiskStopExtremeConfirmValue); err != nil {
+					c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+					return
+				}
+			}
+		}
+		if err := validateAIGuardedPrerequisites(s.store, copyConfig); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		if err := prepareCopyTradeSource(s.store, copyConfig, existingCopyCfg); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+
+		// Update 路径需要保留 Enabled 状态（与 Create 不同：Create 总是 false 等显式启动）
+		// 复用前面读出的已有配置，避免被 Upsert 误覆盖为 false
+		if existingCopyCfg != nil {
+			copyConfig.Enabled = existingCopyCfg.Enabled
+		}
+
+		// Default copy ratio to 1.0 (100%)
+		if copyConfig.CopyRatio <= 0 {
+			copyConfig.CopyRatio = 1.0
+		}
+		if copyConfig.CopyRatio > maxCopyRatio {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("copy_ratio %.2f exceeds max %.0f", copyConfig.CopyRatio, maxCopyRatio)})
+			return
+		}
+		if err := validateCopyGuardAccountExclusivity(s.store, traderID, traderRecord.ExchangeID, copyConfig); err != nil {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
+	}
+
 	// Update database
 	logger.Infof("🔄 Updating trader: ID=%s, Name=%s, AIModelID=%s, StrategyID=%s, req.StrategyID=%s",
 		traderRecord.ID, traderRecord.Name, traderRecord.AIModelID, traderRecord.StrategyID, req.StrategyID)
@@ -1435,126 +1559,13 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 		return
 	}
 
-	// Handle copy trading configuration update
-	decisionMode := req.DecisionMode
-	manualReentryDeprecated := false
 	if decisionMode != "" {
 		// Update decision_mode in database
 		if err := s.store.CopyTrade().UpdateDecisionMode(traderID, decisionMode); err != nil {
 			logger.Infof("⚠️ Failed to update decision mode: %v", err)
 		}
 
-		// If copy_trade mode, update copy trade config
-		if decisionMode == "copy_trade" && req.CopyConfig != nil {
-			// SyncMarginMode 默认为 true（同步领航员的全仓/逐仓模式）
-			syncMarginMode := true
-			if req.CopyConfig.SyncMarginMode != nil {
-				syncMarginMode = *req.CopyConfig.SyncMarginMode
-			}
-
-			// 读取已有配置：凭证"空/掩码=不修改"语义 + 保留 Enabled 状态都需要旧值
-			existingCopyCfg, _ := s.store.CopyTrade().GetByTraderID(traderID)
-			existingP20T, existingCSRF := "", ""
-			if existingCopyCfg != nil {
-				existingP20T, existingCSRF = existingCopyCfg.BinanceP20T, existingCopyCfg.BinanceCSRFToken
-			}
-
-			copyConfig := store.NewCopyGuardDefaults()
-			if existingCopyCfg != nil {
-				clone := *existingCopyCfg
-				copyConfig = &clone
-			}
-			copyConfig.TraderID = traderID
-			copyConfig.ProviderType = req.CopyConfig.ProviderType
-			copyConfig.LeaderID = req.CopyConfig.LeaderID
-			copyConfig.CopyRatio = req.CopyConfig.CopyRatio
-			copyConfig.CopyCurrentPositionsOnce = req.CopyConfig.CopyCurrentPositionsOnce
-			copyConfig.CopyCurrentPositionsRequestID = req.CopyConfig.CopyCurrentPositionsRequestID
-			copyConfig.SyncLeverage = req.CopyConfig.SyncLeverage
-			copyConfig.SyncMarginMode = syncMarginMode
-			if req.CopyConfig.MinTradeWarn != nil {
-				copyConfig.MinTradeWarn = *req.CopyConfig.MinTradeWarn
-			}
-			if req.CopyConfig.MaxTradeWarn != nil {
-				copyConfig.MaxTradeWarn = *req.CopyConfig.MaxTradeWarn
-			}
-			if req.CopyConfig.CopyCatchupWindowSeconds != nil {
-				copyConfig.CopyCatchupWindowSeconds = *req.CopyConfig.CopyCatchupWindowSeconds
-			}
-			if req.CopyConfig.CopyCatchupMaxAdverseBPS != nil {
-				copyConfig.CopyCatchupMaxAdverseBPS = *req.CopyConfig.CopyCatchupMaxAdverseBPS
-			}
-			copyConfig.BinanceP20T = resolveCredentialUpdate(req.CopyConfig.BinanceP20T, existingP20T)
-			copyConfig.BinanceCSRFToken = resolveCredentialUpdate(req.CopyConfig.BinanceCSRFToken, existingCSRF)
-			copyConfig.BinanceSourceMode = req.CopyConfig.BinanceSourceMode
-			copyConfig.BinanceTopTraderID = req.CopyConfig.BinanceTopTraderID
-
-			// v3 风控字段透传（修复 bug：之前 CopyConfigReq 无 risk_* 字段，前端传值被 JSON unmarshal 静默丢弃）
-			manualReentryDeprecated = applyCopyConfigRiskFields(copyConfig, req.CopyConfig)
-			if err := validateFixedModeExplicitSettings(copyConfig.RiskProtectionMode, req.CopyConfig.RiskTriggerPriceType, req.CopyConfig.RiskTriggerPriceType != "", req.CopyConfig.RiskReentryEnabled, req.CopyConfig.RiskReentryDecisionMode, req.CopyConfig.RiskManualReentryEnabled, req.CopyConfig.RiskMaxReentries); err != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-				return
-			}
-			profileDefaulted := store.NormalizeCopyGuardProtectionModeTransition(copyConfig, existingCopyCfg)
-			if err := store.ApplyCopyGuardATRProfilePatch(copyConfig, req.CopyConfig.ATRProfilePatch); err != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-				return
-			}
-			if profileDefaulted {
-				logger.Warnf("⚠️ Copy Guard trader %s had no dormant ATR profile; restored canonical defaults", traderID)
-			}
-			if err := validateLegacyReentrySelection(existingCopyCfg, copyConfig.RiskReentryDecisionMode); err != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-				return
-			}
-			if err := copytrade.ValidateStoredRiskPolicy(copyConfig); err != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-				return
-			}
-			if copyConfig.RiskPolicyVersion >= 4 && !copytrade.SupportsCopyGuard(copytrade.ProviderType(copyConfig.ProviderType)) {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "copy guard v4 is only supported for OKX or Binance leader sources"})
-				return
-			}
-			if copyConfig.RiskPolicyVersion >= 4 && copyConfig.RiskProtectionMode != store.RiskProtectionModePositionMarginPct {
-				if err := validateRiskConfirmation(copyConfig.RiskAccountPct, req.CopyConfig.RiskHighRiskConfirmed, req.CopyConfig.RiskExtremeConfirmValue); err != nil {
-					c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-					return
-				}
-				if copyConfig.RiskStopPriority == "account_cap" {
-					if err := validateStopLossPctConfirmation(copyConfig.RiskStopMaxAccountLossPct, req.CopyConfig.RiskHighRiskConfirmed, req.CopyConfig.RiskStopExtremeConfirmValue); err != nil {
-						c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-						return
-					}
-				}
-			}
-			if err := validateAIGuardedPrerequisites(s.store, copyConfig); err != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-				return
-			}
-			if err := prepareCopyTradeSource(s.store, copyConfig, existingCopyCfg); err != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-				return
-			}
-
-			// Update 路径需要保留 Enabled 状态（与 Create 不同：Create 总是 false 等显式启动）
-			// 复用前面读出的已有配置，避免被 Upsert 误覆盖为 false
-			if existingCopyCfg != nil {
-				copyConfig.Enabled = existingCopyCfg.Enabled
-			}
-
-			// Default copy ratio to 1.0 (100%)
-			if copyConfig.CopyRatio <= 0 {
-				copyConfig.CopyRatio = 1.0
-			}
-			if copyConfig.CopyRatio > maxCopyRatio {
-				c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("copy_ratio %.2f exceeds max %.0f", copyConfig.CopyRatio, maxCopyRatio)})
-				return
-			}
-			if err := validateCopyGuardAccountExclusivity(s.store, traderID, traderRecord.ExchangeID, copyConfig); err != nil {
-				c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
-				return
-			}
-
+		if copyConfig != nil {
 			if err := s.store.CopyTrade().UpsertWithATRProfileDefaultMigration(copyConfig, profileDefaulted); err != nil {
 				// 同 Create 路径：静默吞掉会让用户以为已保存，实际引擎仍
 				// 在用旧配置运行。Upsert 幂等，返回 500 让用户重试。
