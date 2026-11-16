@@ -91,6 +91,12 @@ type Engine struct {
 	// lastSizingLeaderEquity is the denominator of the previous risk
 	// increase; a large jump is confirmed on the next poll before use.
 	lastSizingLeaderEquity float64
+	// Price-aware execution of opens/adds (copy_pricing.go).
+	getFollowerMarketPrice func(symbol string) (float64, error)
+	pricingMu              sync.Mutex
+	leaderEntries          map[string]leaderEntryObservation
+	leaderAdds             map[string]*leaderAddAccumulator
+	priceWaitLoggedAt      map[int64]time.Time
 	// smartEmptySnapshotCandidateAt is an engine-level confirmation guard that
 	// survives provider-cache uncertainty within a running process. It is used
 	// when persisted follower state exists, including the first poll after a
@@ -2245,6 +2251,7 @@ func (e *Engine) processSignal(signal *TradeSignal) {
 	}
 	logger.Infof("🎯 [%s] ✅ 跟随 | %s | 原因: %s", e.traderID, fill.Symbol, matchResult.Reason)
 	e.stats.SignalsFollowed++
+	defer e.observeLeaderPosition(matchResult)
 
 	// 回填匹配结果到 signal（供后续逻辑使用）
 	signal.LeaderPosID = matchResult.PosID
@@ -2319,6 +2326,17 @@ func (e *Engine) processSignal(signal *TradeSignal) {
 		return
 	}
 
+	if wait, note := e.riskIncreasePriceGate(fill, matchResult, &dec, copySize); wait {
+		// Soft limit at the leader's price: re-checked on every poll.
+		e.deferReservedIntentForSourceData(&dec, "SOURCE_REVALIDATION_REQUIRED", "PRICE_WAIT: "+note)
+		e.logPriceWait(&dec, note)
+		e.stats.SignalsSkipped++
+		return
+	} else if note != "" {
+		dec.Reasoning += " | " + note
+		logger.Infof("🎯 [%s] 💲 %s %s | %s", e.traderID, dec.Action, dec.Symbol, note)
+	}
+
 	// Ordinary leader opens/adds preserve the proportional source transition.
 	// Exchange minimums and action-specific rounding are resolved immediately
 	// before submission by the execution venue. Copy Guard only manages the
@@ -2379,16 +2397,19 @@ func (e *Engine) recordSmartMoneyProcessingDelay() {
 	}
 }
 
-func (e *Engine) deferReservedIntentForSourceData(dec *decision.Decision, reasonCode string) {
+func (e *Engine) deferReservedIntentForSourceData(dec *decision.Decision, reasonCode string, detail ...string) {
 	if dec == nil || dec.ExecutionIntentID <= 0 || e.store == nil {
 		return
 	}
 	if reasonCode == "" {
 		reasonCode = "SOURCE_DATA_UNAVAILABLE"
 	}
+	message := "authoritative source value or total equity is temporarily unavailable"
+	if len(detail) > 0 && detail[0] != "" {
+		message = detail[0]
+	}
 	if err := e.store.CopyTrade().UpdateExecutionIntent(dec.ExecutionIntentID,
-		store.ExecutionIntentReconciling, reasonCode,
-		"authoritative source value or total equity is temporarily unavailable", "", 0, 0, 0); err != nil {
+		store.ExecutionIntentReconciling, reasonCode, message, "", 0, 0, 0); err != nil {
 		logger.Errorf("❌ [%s] 保存权威数据暂停状态失败 | intent=%d: %v", e.traderID, dec.ExecutionIntentID, err)
 	}
 	e.UnmarkDecisionSources(dec)
@@ -3137,7 +3158,7 @@ func (e *Engine) calculateCopySizeByPositionChange(signal *TradeSignal, match *S
 		followerEquity, e.config.CopyRatio*100, copySize)
 
 	var targetWarning *Warning
-	if copySize, targetWarning = e.capAddToProportionalTarget(match, fill.Symbol, leaderEquity, followerEquity, copySize); targetWarning != nil {
+	if copySize, targetWarning = e.sizeAddByProportionalTarget(match, fill.Symbol, leaderEquity, followerEquity, copySize); targetWarning != nil {
 		return 0, append(warnings, *targetWarning)
 	}
 
