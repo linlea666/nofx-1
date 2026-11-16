@@ -136,7 +136,9 @@ func (e *Engine) planTargetReduce(match *SignalMatchResult) {
 		return
 	}
 	groupNotional, known := e.followedLeaderGroupNotional(mapping, match.PosID)
-	if !known {
+	if !known || groupNotional <= 0 {
+		// The leader still holds after a reduce; an empty aggregate is an
+		// inconsistency and must never become a full close.
 		return
 	}
 	follower, err := e.readFollowerGroupPosition(mapping.Symbol, mapping.Side, mapping.MarginMode)

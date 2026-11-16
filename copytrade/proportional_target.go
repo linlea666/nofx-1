@@ -168,8 +168,10 @@ func (e *Engine) sizeAddByProportionalTarget(match *SignalMatchResult, symbol st
 }
 
 // followedLeaderGroupNotional sums the leader positions this follower copies
-// in the mapping's symbol/side/margin-mode group. known=false when a value is
-// missing, so callers fall back to the previous behaviour.
+// into the mapping's follower scope (symbol/side and the follower's margin
+// mode). The leader's own margin mode is not compared: the follower may hold
+// the copy in another mode (e.g. Binance Multi-Assets forces cross).
+// known=false when a value is missing, so callers keep their old behaviour.
 func (e *Engine) followedLeaderGroupNotional(mapping *store.CopyTradePositionMapping, posID string) (float64, bool) {
 	e.leaderStateMu.RLock()
 	defer e.leaderStateMu.RUnlock()
@@ -179,13 +181,16 @@ func (e *Engine) followedLeaderGroupNotional(mapping *store.CopyTradePositionMap
 	}
 	total := 0.0
 	for _, p := range state.Positions {
-		if p == nil || p.Symbol != mapping.Symbol || string(p.Side) != mapping.Side ||
-			(mapping.MarginMode != "" && p.MarginMode != "" && p.MarginMode != mapping.MarginMode) {
+		if p == nil || p.Symbol != mapping.Symbol || string(p.Side) != mapping.Side {
 			continue
 		}
 		if p.PosID != posID {
-			if m, err := e.store.CopyTrade().GetActiveMapping(e.traderID, p.PosID); err != nil || m == nil {
+			m, err := e.store.CopyTrade().GetActiveMapping(e.traderID, p.PosID)
+			if err != nil || m == nil {
 				continue // only followed leader positions define the target
+			}
+			if mapping.MarginMode != "" && m.MarginMode != "" && m.MarginMode != mapping.MarginMode {
+				continue // copied into another follower margin scope
 			}
 		}
 		if p.PositionValue <= 0 {

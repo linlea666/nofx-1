@@ -7,6 +7,8 @@ import (
 	"strings"
 	"time"
 
+	"nofx/decision"
+	"nofx/logger"
 	"nofx/store"
 	"nofx/trader"
 )
@@ -277,4 +279,49 @@ func ResumeFollowingPosition(traderID, leaderPosID string) error {
 		_ = ti.store.CopyTrade().SaveCopyGuardEvent(&store.CopyGuardEvent{CycleID: p.CycleID, TraderID: traderID, Type: "MANUAL_FOLLOW_RESUMED", Metadata: map[string]interface{}{"leader_size_baseline": leader.Size, "replay_paused_trades": false}})
 	}
 	return nil
+}
+
+// adoptVenueMarginMode records the margin mode the venue actually used for a
+// copied open/add. A Binance Multi-Assets account opens an isolated request in
+// cross without an error; recording the requested mode then hides the copy
+// from verifyFollowingPosition and blocks every later exit. Only a single,
+// unambiguous same-side position is adopted; otherwise nothing changes.
+func (ti *TraderIntegration) adoptVenueMarginMode(dec *decision.Decision) {
+	if dec == nil || dec.MarginMode == "" || isAIReentryDecision(dec) ||
+		(dec.Action != "open_long" && dec.Action != "open_short") {
+		return
+	}
+	positions, err := ti.getFreshPositions()
+	if err != nil {
+		return
+	}
+	side := strings.TrimPrefix(dec.Action, "open_")
+	actual, count := "", 0
+	for _, pos := range positions {
+		if getStringField(pos, "symbol") != dec.Symbol || !strings.EqualFold(getStringField(pos, "side"), side) ||
+			absFloat(getFloatField(pos, "positionAmt", "quantity")) <= 0 {
+			continue
+		}
+		mode := strings.ToLower(getStringField(pos, "marginMode", "mgnMode"))
+		if mode == dec.MarginMode {
+			return // the requested scope exists; nothing to correct
+		}
+		actual = mode
+		count++
+	}
+	if count != 1 || (actual != "cross" && actual != "isolated") {
+		return
+	}
+	logger.Warnf("⚠️ [%s] 交易所实际保证金模式与请求不一致，按实际记账 | %s %s | 请求=%s 实际=%s",
+		ti.traderID, dec.Symbol, side, dec.MarginMode, actual)
+	if ti.store != nil && ti.engine != nil && ti.engine.config != nil {
+		_ = ti.store.CopyTrade().LogCopyEvent(&store.CopyTradeEvent{
+			TraderID: ti.traderID, LeaderID: ti.engine.config.LeaderID, ProviderType: string(ti.engine.config.ProviderType),
+			Category: store.CopyEventCategoryReconcile, EventType: "VENUE_MARGIN_MODE_ADOPTED", Severity: store.CopyEventSeverityWarn,
+			Symbol: dec.Symbol, Side: side, LeaderPosID: dec.LeaderPosID, Status: "executed",
+			Summary: fmt.Sprintf("交易所以%s模式成交（请求%s，例如币安联合保证金会强制全仓），已按实际模式记账", actual, dec.MarginMode),
+			Detail:  map[string]interface{}{"requested_margin_mode": dec.MarginMode, "venue_margin_mode": actual},
+		})
+	}
+	dec.MarginMode = actual
 }
