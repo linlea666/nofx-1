@@ -183,3 +183,76 @@ func TestFollowCoinCurrentPositionCopyFullChain(t *testing.T) {
 		}
 	}
 }
+
+// Leader entry 110, follower price 100 (+9.09%), minimum 10%, tolerance 1%:
+// the rows miss the minimum but sit inside the manual band. The preview keeps
+// them selectable without preselecting; only an explicit pick copies them, and
+// the pre-submit recheck then allows at most the tolerated disadvantage.
+func TestCurrentPositionCopyManualPickWithinTolerance(t *testing.T) {
+	manualRule := func(accept bool) func(*store.CopyTradeConfig) {
+		return func(cfg *store.CopyTradeConfig) {
+			currentCopyPriceRule(10, "p0", "p1")(cfg)
+			tolerance := 1.0
+			cfg.CopyCurrentManualMaxDisadvantagePct = &tolerance
+			for i := range cfg.CopyCurrentPositionsSelection {
+				cfg.CopyCurrentPositionsSelection[i].AcceptUnfavorable = accept
+			}
+		}
+	}
+	t.Run("preview", func(t *testing.T) {
+		e, s, p := currentCopyEngineWith(t, false, nil)
+		tasks, err := e.currentCopyPreview(p.state)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tasks, err = ApplyCurrentCopyPriceFilter(s, e.traderID, "leader", tasks, true, 10, 1, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, task := range tasks {
+			if task.Status != "READY" || task.Reason != "" || !task.PriceManualOnly {
+				t.Fatalf("manual-band row must stay selectable and flagged: %+v", task)
+			}
+		}
+		tasks, _ = e.currentCopyPreview(p.state)
+		tasks, _ = ApplyCurrentCopyPriceFilter(s, e.traderID, "leader", tasks, true, 10, 0, nil)
+		for _, task := range tasks {
+			if task.Reason != "PRICE_NOT_FAVORABLE" || task.PriceManualOnly {
+				t.Fatalf("zero tolerance keeps the strict rule: %+v", task)
+			}
+		}
+	})
+	for _, accept := range []bool{false, true} {
+		t.Run(map[bool]string{false: "not-accepted", true: "accepted"}[accept], func(t *testing.T) {
+			e, s, _ := currentCopyEngineWith(t, true, manualRule(accept))
+			if err := e.InitIgnoredPositions(); err != nil {
+				t.Fatal(err)
+			}
+			if err := e.syncLeaderState(); err != nil {
+				t.Fatal(err)
+			}
+			fills := e.detectBinancePositionSnapshotFills()
+			if !accept {
+				if len(fills) != 0 {
+					t.Fatalf("selection without acceptance copied an unfavourable price: %+v", fills)
+				}
+				return
+			}
+			if len(fills) != 2 {
+				r, _ := s.CopyTrade().CurrentPositionCopy(e.traderID)
+				t.Fatalf("accepted manual picks not copied: %+v %+v", fills, r)
+			}
+			d := copyDecision(t, e, fills[0])
+			d.MarginMode = "cross"
+			exec := &positionMarginLifecycleExecutor{marketPrice: 110.5} // -0.45%
+			ti := &TraderIntegration{traderID: e.traderID, store: s, engine: e, executor: exec}
+			if err := ti.validateCurrentPositionCopy(d); err != nil {
+				t.Fatalf("tolerated disadvantage rejected: %v", err)
+			}
+			exec.marketPrice = 112 // -1.82%
+			if err := ti.validateCurrentPositionCopy(d); err == nil || !strings.Contains(err.Error(), "价格优势") {
+				t.Fatalf("disadvantage beyond tolerance crossed the boundary: %v", err)
+			}
+		})
+	}
+}

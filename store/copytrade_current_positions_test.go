@@ -442,3 +442,57 @@ func TestCurrentPositionCopyDecisionModeSwitchConsumesQueuedWork(t *testing.T) {
 		t.Fatalf("mode change stranded source revision: %+v %v", facts, err)
 	}
 }
+
+func TestCurrentPositionCopyWindowAnchorFollowsFillsOnly(t *testing.T) {
+	s, _ := currentCopyFixture(t)
+	currentCopyStart(t, s)
+	sealed := time.Now().Add(-90 * time.Second).UTC().Truncate(time.Second)
+	if err := s.CopyTrade().SealCurrentPositionCopy("t", "leader", 1, []CurrentPositionCopyTask{currentCopyCandidate("a"), currentCopyCandidate("b"), currentCopyCandidate("c")}, sealed); err != nil {
+		t.Fatal(err)
+	}
+	anchor := func() time.Time {
+		t.Helper()
+		task, err := s.CopyTrade().CurrentPositionCopyTask("t", "c")
+		if err != nil || task == nil {
+			t.Fatalf("task=%v err=%v", task, err)
+		}
+		r, err := s.CopyTrade().CurrentPositionCopy("t")
+		if err != nil || !r.WindowAnchorAt.Equal(task.WindowAnchorAt) {
+			t.Fatalf("request and task anchors differ: %v vs %v (%v)", r, task.WindowAnchorAt, err)
+		}
+		return task.WindowAnchorAt
+	}
+	if got := anchor(); !got.Equal(sealed) {
+		t.Fatalf("unprogressed anchor=%v want seal %v", got, sealed)
+	}
+	a := currentCopyReserve(t, s, "a")
+	b := currentCopyReserve(t, s, "b")
+	// A rejection/expiry stamps terminal_at without a fill: no progress.
+	rejected := time.Now().UTC().Format("2006-01-02 15:04:05")
+	if _, err := s.DB().Exec(`UPDATE copy_trade_execution_intents SET status='SKIPPED',terminal_at=? WHERE id=?`, rejected, b.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := anchor(); !got.Equal(sealed) {
+		t.Fatalf("rejection extended the window: %v", got)
+	}
+	filled := time.Now().Add(-10 * time.Second).UTC().Truncate(time.Second)
+	if _, err := s.DB().Exec(`UPDATE copy_trade_execution_intents SET filled_quantity=1,filled_at=?,terminal_at=? WHERE id=?`, filled.Format("2006-01-02 15:04:05"), filled.Format("2006-01-02 15:04:05"), a.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := anchor(); !got.Equal(filled) {
+		t.Fatalf("fill did not restart the window: %v want %v", got, filled)
+	}
+	// A late booking can never stretch the batch beyond one window per task.
+	if _, err := s.DB().Exec(`UPDATE copy_trade_execution_intents SET filled_at=? WHERE id=?`, sealed.Add(time.Hour).Format("2006-01-02 15:04:05"), a.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got, limit := anchor(), sealed.Add(3*60*time.Second); !got.Equal(limit) {
+		t.Fatalf("anchor=%v want cap %v", got, limit)
+	}
+	if _, err := s.DB().Exec(`UPDATE copy_trade_current_position_requests SET snapshot_at='garbage'`); err != nil {
+		t.Fatal(err)
+	}
+	if got := anchor(); !got.IsZero() {
+		t.Fatalf("unparsable seal must fail closed, got %v", got)
+	}
+}

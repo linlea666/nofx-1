@@ -195,3 +195,50 @@ func TestFlatFollowerDuringExitReconciliationDoesNotRearmOrSettle(t *testing.T) 
 		t.Fatal("API error was interpreted as flat")
 	}
 }
+
+// An entry parked as HISTORICAL_FILL_EVIDENCE_PENDING is finished by a
+// read-only lookup of its contradictory receipt; nothing is submitted and the
+// advanced source is left alone. An unanswered lookup keeps it pending.
+func TestHistoricalEntryEvidenceSweepFinishesParkedEntry(t *testing.T) {
+	for _, answered := range []bool{false, true} {
+		t.Run(fmt.Sprint(answered), func(t *testing.T) {
+			ti, ex, _ := leaderExitFixture(t, 1)
+			db := ti.store.DB()
+			if err := ti.store.CopyTrade().SavePositionMapping(&store.CopyTradePositionMapping{TraderID: ti.traderID, LeaderID: "leader", LeaderPosID: "q", Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", LastKnownSize: 50, OpenedAt: time.Now()}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(`UPDATE copy_trade_position_mappings SET source_revision=48,status='stopped_by_risk' WHERE trader_id=? AND leader_pos_id='q'`, ti.traderID); err != nil {
+				t.Fatal(err)
+			}
+			i, _, err := ti.store.CopyTrade().ReserveExecutionIntent(&store.CopyTradeExecutionIntent{TraderID: ti.traderID, LeaderPosID: "q", SourceRevision: 40, SourceKind: "LEADER_TRANSITION", Action: "open_long", Symbol: "ETHUSDT", Side: "long", MarginMode: "cross", LeaderTargetSize: 38, TargetQuantity: 0.042, SourceFillID: "hist", ClientOrderID: "ct-1"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, q := range []string{
+				`UPDATE copy_trade_execution_intents SET status='RECONCILING',reason_code='HISTORICAL_FILL_EVIDENCE_PENDING',filled_quantity=0.041,submitted_at=CURRENT_TIMESTAMP WHERE id=?`,
+				`INSERT INTO copy_trade_execution_order_attempts(intent_id,attempt_no,client_order_id,exchange_order_id,status,exchange_state,filled_quantity,submitted_at,terminal_at) VALUES(?,1,'ct-1','o-1','FILLED','FILLED',0.041,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)`,
+				`INSERT INTO copy_trade_execution_fill_commits(intent_id,fill_key,filled_quantity,filled_notional) VALUES(?,'ct-1',0.041,75)`,
+				`INSERT INTO copy_trade_execution_order_attempts(intent_id,attempt_no,client_order_id,exchange_order_id,status,exchange_state,filled_quantity,submitted_at) VALUES(?,2,'ct-2','o-2','SUBMITTED','FILLED',0,CURRENT_TIMESTAMP)`,
+			} {
+				if _, err = db.Exec(q, i.ID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if answered {
+				ex.orders = map[string]map[string]interface{}{"ct-2": {"orderId": "o-2", "clientOrderId": "ct-2", "status": "FILLED", "executedQty": 0.001}}
+			}
+			ti.recoverHistoricalEntryEvidence()
+			got, _ := ti.store.CopyTrade().GetExecutionIntentByID(i.ID)
+			if answered != (got.TerminalAt != nil) {
+				t.Fatalf("answered=%v intent=%+v", answered, got)
+			}
+			if len(ex.requests) != 0 {
+				t.Fatal("evidence repair submitted an order")
+			}
+			m, _ := ti.store.CopyTrade().GetMapping(ti.traderID, "q")
+			if m.SourceRevision != 48 || m.Status != "stopped_by_risk" {
+				t.Fatalf("source changed: %+v", m)
+			}
+		})
+	}
+}

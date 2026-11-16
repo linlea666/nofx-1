@@ -5,6 +5,7 @@ import (
 	"math"
 	"strings"
 
+	"nofx/logger"
 	"nofx/store"
 	"nofx/trader"
 )
@@ -46,6 +47,40 @@ func (ti *TraderIntegration) reconcileExitOrderEvidence(intentID int64, a *store
 		ti.observeExecutionFillTime(intentID, order)
 	}
 	return err
+}
+
+// recoverHistoricalEntryEvidence finishes entry intents the reconciler parks
+// as HISTORICAL_FILL_EVIDENCE_PENDING. It only reads the venue receipt and
+// books it; mapping, custody and protection are never touched.
+func (ti *TraderIntegration) recoverHistoricalEntryEvidence() {
+	intents, err := ti.store.CopyTrade().ListHistoricalEntryEvidenceGaps(ti.traderID, ti.lastEntryEvidenceID)
+	if err != nil {
+		return
+	}
+	if len(intents) == 0 {
+		ti.lastEntryEvidenceID = 0
+	}
+	for _, intent := range intents {
+		ti.lastEntryEvidenceID = intent.ID
+		attempts, e := ti.store.CopyTrade().ListExecutionOrderAttempts(intent.ID)
+		if e == nil {
+			for _, a := range attempts {
+				if e = ti.reconcileExitOrderEvidence(intent.ID, a, intent.Symbol); e != nil {
+					break
+				}
+			}
+		}
+		if e == nil {
+			e = ti.store.CopyTrade().BookRecoveredHistoricalEntry(intent.ID)
+		}
+		key := fmt.Sprintf("entry-evidence:%d", intent.ID)
+		if e != nil {
+			_, _ = ti.store.CopyTrade().RecordRuntimeIssue(store.CopyRuntimeIssue{TraderID: ti.traderID, Area: "execution", ResourceID: key, LeaderPosID: intent.LeaderPosID, Symbol: intent.Symbol, Side: intent.Side, Code: "ENTRY_EVIDENCE_PENDING", Detail: e.Error()})
+		} else {
+			_ = ti.store.CopyTrade().ResolveRuntimeIssue(ti.traderID, "execution", key)
+			logger.Infof("✅ [%s] 已补齐历史开仓的成交证据并结束意图 | intent=%d %s %s", ti.traderID, intent.ID, intent.Symbol, intent.Action)
+		}
+	}
 }
 
 // Evidence-only repair: never executes a close, changes source progress, or

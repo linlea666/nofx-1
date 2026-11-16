@@ -25,11 +25,15 @@ export function currentPositionCopySupported(
 
 // Restores the selection/price options of a request that has not run yet, so
 // re-saving the trader keeps what the operator chose. Finished or cancelled
-// requests fall back to the defaults (filter on, not worse than leader entry).
+// requests fall back to the defaults (filter on, not worse than leader entry,
+// positions up to 1% worse may be picked by hand).
+export const DEFAULT_MANUAL_MAX_DISADVANTAGE_PCT = 1
+
 export function pendingCurrentCopyOptions(cfg: CopyTradeConfig): {
   copy_current_positions_selection?: CurrentPositionCopySelection[]
   copy_current_price_filter_enabled: boolean
   copy_current_min_advantage_pct: number
+  copy_current_manual_max_disadvantage_pct: number
 } {
   const pending = cfg.current_position_copy
   if (
@@ -42,6 +46,8 @@ export function pendingCurrentCopyOptions(cfg: CopyTradeConfig): {
       copy_current_positions_selection: undefined,
       copy_current_price_filter_enabled: true,
       copy_current_min_advantage_pct: 0,
+      copy_current_manual_max_disadvantage_pct:
+        DEFAULT_MANUAL_MAX_DISADVANTAGE_PCT,
     }
   }
   return {
@@ -49,5 +55,7 @@ export function pendingCurrentCopyOptions(cfg: CopyTradeConfig): {
       pending.selection_mode === 'SELECTED' ? pending.selection : undefined,
     copy_current_price_filter_enabled: pending.price_filter_enabled ?? false,
     copy_current_min_advantage_pct: pending.min_advantage_pct ?? 0,
+    copy_current_manual_max_disadvantage_pct:
+      pending.manual_max_disadvantage_pct ?? 0,
   }
 }

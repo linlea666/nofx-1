@@ -498,3 +498,37 @@ func TestGetBrOrderID(t *testing.T) {
 		ids[id] = true
 	}
 }
+
+func TestBinanceSetLeverageSkipsChangeWhenSymbolConfigMatches(t *testing.T) {
+	changed := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/fapi/v2/positionRisk":
+			_, _ = w.Write([]byte(`[]`))
+		case "/fapi/v1/symbolConfig":
+			if r.URL.Query().Get("symbol") != "ZAMAUSDT" {
+				t.Fatalf("unexpected symbol config request: %s", r.URL.String())
+			}
+			_, _ = w.Write([]byte(`[{"symbol":"ZAMAUSDT","marginType":"CROSSED","isAutoAddMargin":false,"leverage":20,"maxNotionalValue":"1000000"}]`))
+		case "/fapi/v1/leverage":
+			changed++
+			_, _ = w.Write([]byte(`{"leverage":20,"maxNotionalValue":"1000000","symbol":"ZAMAUSDT"}`))
+		default:
+			_, _ = w.Write([]byte(`{}`))
+		}
+	}))
+	defer server.Close()
+	client := futures.NewClient("k", "s")
+	client.BaseURL = server.URL
+	ft := &FuturesTrader{client: client}
+	started := time.Now()
+	if err := ft.SetLeverage("ZAMAUSDT", 20); err != nil {
+		t.Fatal(err)
+	}
+	if changed != 0 {
+		t.Fatalf("leverage already matched; expected no change call, got %d", changed)
+	}
+	if time.Since(started) > 2*time.Second {
+		t.Fatalf("matching leverage must not wait for the change cooldown")
+	}
+}

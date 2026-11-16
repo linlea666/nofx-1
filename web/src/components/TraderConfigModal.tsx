@@ -3,6 +3,7 @@ import {
   currentPositionCopySupported,
   newCurrentPositionCopyRequestId,
   pendingCurrentCopyOptions,
+  DEFAULT_MANUAL_MAX_DISADVANTAGE_PCT,
 } from '../lib/currentPositionCopy'
 import { useState, useEffect } from 'react'
 import type {
@@ -276,6 +277,7 @@ interface FormState {
   copy_current_positions_selection?: CurrentPositionCopySelection[]
   copy_current_price_filter_enabled: boolean
   copy_current_min_advantage_pct: number
+  copy_current_manual_max_disadvantage_pct: number
   current_position_copy?: CopyTradeConfig['current_position_copy']
   copy_ratio: number
   copy_sync_leverage: boolean
@@ -387,6 +389,8 @@ export function TraderConfigModal({
     copy_current_positions_selection: undefined,
     copy_current_price_filter_enabled: true,
     copy_current_min_advantage_pct: 0,
+    copy_current_manual_max_disadvantage_pct:
+      DEFAULT_MANUAL_MAX_DISADVANTAGE_PCT,
     current_position_copy: undefined,
     copy_sync_leverage: true,
     copy_sync_margin_mode: true, // 默认同步保证金模式
@@ -850,6 +854,8 @@ export function TraderConfigModal({
         copy_current_positions_selection: undefined,
         copy_current_price_filter_enabled: true,
         copy_current_min_advantage_pct: 0,
+        copy_current_manual_max_disadvantage_pct:
+          DEFAULT_MANUAL_MAX_DISADVANTAGE_PCT,
         current_position_copy: undefined,
         copy_sync_leverage: true,
         copy_sync_margin_mode: true, // 默认同步保证金模式
@@ -1142,6 +1148,11 @@ export function TraderConfigModal({
           window.alert('最低价格优势须在 -20% 到 50% 之间')
           return
         }
+        const manualPct = formData.copy_current_manual_max_disadvantage_pct
+        if (!Number.isFinite(manualPct) || manualPct < 0 || manualPct > 20) {
+          window.alert('手选最大劣势须在 0% 到 20% 之间')
+          return
+        }
       }
       // M18：跟单金额阈值合法性（max=0 表示不预警，允许）
       if (
@@ -1208,6 +1219,8 @@ export function TraderConfigModal({
                   formData.copy_current_price_filter_enabled,
                 copy_current_min_advantage_pct:
                   formData.copy_current_min_advantage_pct,
+                copy_current_manual_max_disadvantage_pct:
+                  formData.copy_current_manual_max_disadvantage_pct,
               }
             : {}),
           sync_leverage: formData.copy_sync_leverage,
@@ -2243,11 +2256,15 @@ export function TraderConfigModal({
                         formData.copy_current_price_filter_enabled
                       }
                       minAdvantagePct={formData.copy_current_min_advantage_pct}
+                      manualMaxDisadvantagePct={
+                        formData.copy_current_manual_max_disadvantage_pct
+                      }
                       onOptionsChange={(options) =>
                         setFormData((prev) => {
                           const priceChanged =
                             options.priceFilterEnabled !== undefined ||
-                            options.minAdvantagePct !== undefined
+                            options.minAdvantagePct !== undefined ||
+                            options.manualMaxDisadvantagePct !== undefined
                           return {
                             ...prev,
                             copy_current_price_filter_enabled:
@@ -2256,6 +2273,9 @@ export function TraderConfigModal({
                             copy_current_min_advantage_pct:
                               options.minAdvantagePct ??
                               prev.copy_current_min_advantage_pct,
+                            copy_current_manual_max_disadvantage_pct:
+                              options.manualMaxDisadvantagePct ??
+                              prev.copy_current_manual_max_disadvantage_pct,
                             // A price-rule change re-defaults the ticks to the
                             // positions that qualify under the new rule.
                             copy_current_positions_selection: priceChanged

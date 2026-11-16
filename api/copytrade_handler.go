@@ -1369,6 +1369,8 @@ type CopyTradeConfigRequest struct {
 	CopyCatchupWindowSeconds      *int                                 `json:"copy_catchup_window_seconds,omitempty"`
 	CopyCatchupMaxAdverseBPS      *float64                             `json:"copy_catchup_max_adverse_bps,omitempty"`
 	Enabled                       bool                                 `json:"enabled"`
+	// 复制当前仓位：手选仓位可接受的最大价格劣势（%）
+	CopyCurrentManualMaxDisadvantagePct *float64 `json:"copy_current_manual_max_disadvantage_pct,omitempty"`
 
 	// Binance Web 凭证（仅 ProviderType=binance 时使用）
 	BinanceP20T        string `json:"binance_p20t"`
@@ -1666,7 +1668,7 @@ func (h *CopyTradeHandler) SaveConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if err := validateCurrentCopyOptionsRequest(req.CopyCurrentPositionsOnce, req.CopyCurrentPositionsSelection, req.CopyCurrentMinAdvantagePct); err != nil {
+	if err := validateCurrentCopyOptionsRequest(req.CopyCurrentPositionsOnce, req.CopyCurrentPositionsSelection, req.CopyCurrentMinAdvantagePct, req.CopyCurrentManualMaxDisadvantagePct); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -1697,6 +1699,7 @@ func (h *CopyTradeHandler) SaveConfig(c *gin.Context) {
 	config.CopyCurrentPositionsSelection = req.CopyCurrentPositionsSelection
 	config.CopyCurrentPriceFilterEnabled = req.CopyCurrentPriceFilterEnabled
 	config.CopyCurrentMinAdvantagePct = req.CopyCurrentMinAdvantagePct
+	config.CopyCurrentManualMaxDisadvantagePct = req.CopyCurrentManualMaxDisadvantagePct
 	config.SyncLeverage = req.SyncLeverage
 	config.SyncMarginMode = req.SyncMarginMode
 	config.MinTradeWarn = req.MinTradeWarn

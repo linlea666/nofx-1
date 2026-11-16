@@ -61,19 +61,28 @@ func TestCurrentCopyOptionsRequestValidation(t *testing.T) {
 	on, off := true, false
 	ok, high := 0.5, 60.0
 	sel := []store.CurrentPositionCopySelection{{LeaderPosID: "p", OpenedMS: 1}}
-	if err := validateCurrentCopyOptionsRequest(&on, sel, &ok); err != nil {
+	if err := validateCurrentCopyOptionsRequest(&on, sel, &ok, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := validateCurrentCopyOptionsRequest(&on, nil, nil); err != nil {
+	if err := validateCurrentCopyOptionsRequest(&on, nil, nil, nil); err != nil {
 		t.Fatalf("older clients without options must still register: %v", err)
 	}
-	if err := validateCurrentCopyOptionsRequest(&on, []store.CurrentPositionCopySelection{}, nil); err == nil {
+	if err := validateCurrentCopyOptionsRequest(&on, []store.CurrentPositionCopySelection{}, nil, nil); err == nil {
 		t.Fatal("empty selection accepted")
 	}
-	if err := validateCurrentCopyOptionsRequest(&on, sel, &high); err == nil {
+	if err := validateCurrentCopyOptionsRequest(&on, sel, &high, nil); err == nil {
 		t.Fatal("out-of-range advantage accepted")
 	}
-	if err := validateCurrentCopyOptionsRequest(&off, []store.CurrentPositionCopySelection{}, &high); err != nil {
+	if err := validateCurrentCopyOptionsRequest(&off, []store.CurrentPositionCopySelection{}, &high, &high); err != nil {
 		t.Fatalf("disabled request must ignore options: %v", err)
+	}
+	tolerance, negative := 1.0, -1.0
+	if err := validateCurrentCopyOptionsRequest(&on, sel, &ok, &tolerance); err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []*float64{&negative, &high} {
+		if err := validateCurrentCopyOptionsRequest(&on, sel, &ok, bad); err == nil {
+			t.Fatalf("out-of-range manual tolerance %v accepted", *bad)
+		}
 	}
 }
