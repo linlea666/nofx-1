@@ -189,6 +189,9 @@ type TraderIntegration struct {
 	// Overweight correction state (overweight_correction.go); monitor goroutine only.
 	lastOverweightCheck time.Time
 	overweightStrikes   map[string]int
+	// Last decision record of each blocked (custody-pending) intent.
+	pendingRecordMu sync.Mutex
+	pendingRecordAt map[int64]time.Time
 	// protectionRearms counts protective-stop re-arms per cycle inside a rolling
 	// window. protection_retries cannot detect an oscillation, because it is reset
 	// as soon as the cycle reports healthy again — so a "re-arm succeeds, then
@@ -1199,6 +1202,7 @@ func (ti *TraderIntegration) reconcileExecutionIntents(startup bool) {
 			dec.PositionSizeUSD = intent.RequestedNotional
 		}
 		dec.TargetPositionSizeUSD = targetExecutionNotional(intent, entry)
+		ti.adoptVenueMarginMode(dec)
 		if commitErr := ti.commitAcknowledgedLeaderExecution(dec); commitErr != nil {
 			_ = ti.store.CopyTrade().UpdateExecutionIntent(intent.ID, store.ExecutionIntentReconciling, "LOCAL_COMMIT_PENDING", commitErr.Error(), orderID, 0, 0, filled)
 			continue
@@ -4645,6 +4649,9 @@ func (ti *TraderIntegration) executeFullDecision(fullDec *decision.FullDecision)
 	// 构建决策记录
 	decisionActions := make([]store.DecisionAction, 0, len(fullDec.Decisions))
 	executionLogs := make([]string, 0)
+	// A blocked instruction replays every poll; only its first record (per
+	// pendingRecordInterval) is kept so the dashboard is not flooded.
+	repeatedPending := false
 
 	for i := range fullDec.Decisions {
 		dec := &fullDec.Decisions[i]
@@ -4752,6 +4759,7 @@ func (ti *TraderIntegration) executeFullDecision(fullDec *decision.FullDecision)
 				ti.deferSourceTransitionRevalidation(dec, ReasonCodeOf(err), err)
 				ti.saveSignalLog(dec, "reconciling", err.Error())
 				executionLogs = append(executionLogs, "⏳ 原仓归属待核实，保留跟单指令等待重试")
+				repeatedPending = ti.pendingRecordedRecently(dec.ExecutionIntentID)
 			} else if ReasonCodeOf(err) == "INDEPENDENT_POSITION_CONFLICT" {
 				if commitErr := ti.commitIgnoredOpenLeaderTransition(dec, "INDEPENDENT_POSITION_CONFLICT"); commitErr != nil {
 					ti.deferSourceTransitionRevalidation(dec, "INDEPENDENT_POSITION_CONFLICT", commitErr)
@@ -5032,6 +5040,7 @@ func (ti *TraderIntegration) executeFullDecision(fullDec *decision.FullDecision)
 					ti.handleReentryLifecycleCommitFailure(dec, commitErr)
 				}
 			} else if dec.ExecutionIntentID > 0 {
+				ti.adoptVenueMarginMode(dec)
 				if commitErr := ti.commitAcknowledgedLeaderExecution(dec); commitErr != nil {
 					postFillCommitted = false
 					action.Success = false
@@ -5149,8 +5158,37 @@ func (ti *TraderIntegration) executeFullDecision(fullDec *decision.FullDecision)
 		decisionActions = append(decisionActions, action)
 	}
 
+	if repeatedPending && len(fullDec.Decisions) == 1 {
+		logger.Debugf("📝 [%s] 待核实指令重放，%s 内已记录过，跳过重复决策记录", ti.traderID, pendingRecordInterval)
+		return
+	}
 	// 保存到 decision_records 表，复用现有日志系统
 	ti.saveDecisionRecord(fullDec, decisionActions, executionLogs)
+}
+
+const pendingRecordInterval = 10 * time.Minute
+
+// pendingRecordedRecently reports whether this blocked intent already had a
+// decision record within pendingRecordInterval, and remembers this one if not.
+func (ti *TraderIntegration) pendingRecordedRecently(intentID int64) bool {
+	if intentID <= 0 {
+		return false
+	}
+	ti.pendingRecordMu.Lock()
+	defer ti.pendingRecordMu.Unlock()
+	if ti.pendingRecordAt == nil {
+		ti.pendingRecordAt = make(map[int64]time.Time)
+	}
+	if last, ok := ti.pendingRecordAt[intentID]; ok && time.Since(last) < pendingRecordInterval {
+		return true
+	}
+	for id, at := range ti.pendingRecordAt {
+		if time.Since(at) > time.Hour {
+			delete(ti.pendingRecordAt, id)
+		}
+	}
+	ti.pendingRecordAt[intentID] = time.Now()
+	return false
 }
 
 // preservePreSubmitExecutionFailure adds durable phase evidence to errors

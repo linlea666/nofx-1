@@ -131,6 +131,8 @@ type Engine struct {
 	// 预警日志
 	warnings   []Warning
 	warningsMu sync.Mutex
+	// warningLoggedAt throttles repeated warning logs (guarded by warningsMu).
+	warningLoggedAt map[string]time.Time
 
 	// 运行状态
 	running bool
@@ -2938,7 +2940,7 @@ func (e *Engine) buildDecisionV2(signal *TradeSignal, match *SignalMatchResult, 
 			dec.CloseRatio = ratio
 			dec.Reasoning = fmt.Sprintf("Copy trading: reduce %.0f%% following %s leader %s",
 				ratio*100, e.config.ProviderType, e.config.LeaderID)
-			logger.Infof("📊 [%s] 部分平仓 %.3f%% marginMode=%s（不累积微量减仓）",
+			logger.Infof("📊 [%s] 部分平仓 %.3f%% marginMode=%s（未达一手的差额累积到后续减仓）",
 				e.traderID, ratio*100, dec.MarginMode)
 		}
 	}
@@ -4059,11 +4061,36 @@ func (e *Engine) cleanExpiredFills() {
 	logger.Debugf("🧹 [%s] 清理过期去重记录，剩余 %d 条", e.traderID, len(e.seenFills))
 }
 
+// Repeated equity-unavailable warnings come from every poll while an account
+// cannot be read; they are logged at most once per interval per symbol.
+const (
+	repeatedWarningLogInterval = time.Minute
+	maxRetainedWarnings        = 200
+)
+
 func (e *Engine) logWarning(w Warning) {
 	e.warningsMu.Lock()
+	// Only recent warnings are kept; the list used to grow without bound.
+	if len(e.warnings) >= maxRetainedWarnings {
+		e.warnings = append(e.warnings[:0], e.warnings[len(e.warnings)-maxRetainedWarnings+1:]...)
+	}
 	e.warnings = append(e.warnings, w)
 	e.stats.WarningsCount++
+	throttled := false
+	if w.Type == WarnFollowerEquityUnavailable || w.Type == WarnLeaderEquityUnavailable {
+		if e.warningLoggedAt == nil {
+			e.warningLoggedAt = make(map[string]time.Time)
+		}
+		key := w.Type + "|" + w.Symbol
+		if last, ok := e.warningLoggedAt[key]; ok && time.Since(last) < repeatedWarningLogInterval {
+			throttled = true
+		} else {
+			e.warningLoggedAt[key] = time.Now()
+		}
+	}
 	e.warningsMu.Unlock()
 
-	logger.Warnf("⚠️ [%s] 预警:%s | %s | %s", e.traderID, w.Type, w.Symbol, w.Message)
+	if !throttled {
+		logger.Warnf("⚠️ [%s] 预警:%s | %s | %s", e.traderID, w.Type, w.Symbol, w.Message)
+	}
 }
