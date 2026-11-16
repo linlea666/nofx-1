@@ -178,6 +178,11 @@ type CopyTradeConfig struct {
 	UpdatedAt time.Time `json:"updated_at"`
 	// 价格未达最低优势、但劣势不超过该百分比的仓位可被逐仓手动勾选复制。
 	CopyCurrentManualMaxDisadvantagePct *float64 `json:"copy_current_manual_max_disadvantage_pct,omitempty"`
+	// 按领航员价格择价执行与超额纠偏（copy_trade_execution_prefs 表）。nil = 未提供。
+	CopyPriceToleranceMajorPct   *float64 `json:"copy_price_tolerance_major_pct,omitempty"`
+	CopyPriceToleranceAltPct     *float64 `json:"copy_price_tolerance_alt_pct,omitempty"`
+	CopyTakeProfitMaxWaitSeconds *int     `json:"copy_take_profit_max_wait_seconds,omitempty"`
+	CopyAutoCorrectOverweight    *bool    `json:"copy_auto_correct_overweight,omitempty"`
 }
 
 // DefaultMinStopATRRatio 结构性可保护下限的默认值。
@@ -579,6 +584,9 @@ func (s *CopyTradeStore) Create(config *CopyTradeConfig) error {
 	if err != nil {
 		return err
 	}
+	if err = saveExecutionPrefsTx(tx, config); err != nil {
+		return err
+	}
 	if err = saveCurrentPositionCopyTx(tx, config); err != nil {
 		return err
 	}
@@ -635,6 +643,9 @@ func (s *CopyTradeStore) Update(config *CopyTradeConfig) error {
 		config.RiskReentryEnabled, config.RiskReentryRatio, config.RiskManualReentryEnabled,
 		config.TraderID)
 	if err != nil {
+		return err
+	}
+	if err = saveExecutionPrefsTx(tx, config); err != nil {
 		return err
 	}
 	if err = saveCurrentPositionCopyTx(tx, config); err != nil {
@@ -713,6 +724,9 @@ func (s *CopyTradeStore) upsert(config *CopyTradeConfig, profileDefaulted bool) 
 		config.RiskMarginStopMigrationVersion,
 		config.RiskReentryEnabled, config.RiskReentryRatio, config.RiskManualReentryEnabled)
 	if err != nil {
+		return err
+	}
+	if err = saveExecutionPrefsTx(tx, config); err != nil {
 		return err
 	}
 	if err = saveCurrentPositionCopyTx(tx, config); err != nil {
@@ -833,6 +847,9 @@ func (s *CopyTradeStore) hydrateCopyTradeConfig(config *CopyTradeConfig) error {
 		return err
 	}
 	var err error
+	if err = s.loadExecutionPrefs(config); err != nil {
+		return err
+	}
 	config.CurrentPositionCopy, err = s.CurrentPositionCopy(config.TraderID)
 	if err != nil {
 		return err

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"nofx/logger"
+	"nofx/store"
 )
 
 // WarnProportionalTargetReached marks an add that was not copied because the
@@ -22,6 +23,10 @@ const (
 	maxLeaderEquityJump = 0.5
 	// An add never starts once the follower holds this multiple of its target.
 	proportionalTargetHardCap = 1.2
+	// The follower's account leverage may exceed the leader's by this factor,
+	// with accountLeverageFloor as the minimum allowance.
+	accountLeverageCapMultiple = 1.5
+	accountLeverageFloor       = 3.0
 )
 
 // proportionalGuardsApply limits the guards to sources whose position values
@@ -77,6 +82,10 @@ func (e *Engine) checkLeaderEquityPlausible(symbol string, leaderEquity float64)
 // symbol/side/margin-mode group.
 type followerGroupPosition struct {
 	Quantity, Notional, AvgEntry float64
+	// AccountNotional is the follower's exposure across all positions.
+	AccountNotional float64
+	// Positions counts live follower positions in the group (margin modes).
+	Positions int
 }
 
 func (e *Engine) readFollowerGroupPosition(symbol, side, marginMode string) (followerGroupPosition, error) {
@@ -92,10 +101,14 @@ func (e *Engine) readFollowerGroupPosition(symbol, side, marginMode string) (fol
 	var g followerGroupPosition
 	entryWeight := 0.0
 	for _, pos := range positions {
+		if pos != nil && pos.Size > 0 {
+			g.AccountNotional += pos.PositionValue
+		}
 		if pos == nil || pos.Size <= 0 || pos.Symbol != symbol || string(pos.Side) != side ||
 			(marginMode != "" && pos.MarginMode != "" && pos.MarginMode != marginMode) {
 			continue
 		}
+		g.Positions++
 		g.Quantity += pos.Size
 		g.Notional += pos.PositionValue
 		if pos.EntryPrice > 0 {
@@ -124,29 +137,7 @@ func (e *Engine) sizeAddByProportionalTarget(match *SignalMatchResult, symbol st
 		return copySize, nil
 	}
 
-	e.leaderStateMu.RLock()
-	state := e.leaderState
-	groupNotional := 0.0
-	known := state != nil
-	if state != nil {
-		for _, p := range state.Positions {
-			if p == nil || p.Symbol != mapping.Symbol || string(p.Side) != mapping.Side ||
-				(mapping.MarginMode != "" && p.MarginMode != "" && p.MarginMode != mapping.MarginMode) {
-				continue
-			}
-			if p.PosID != match.PosID {
-				if m, mErr := e.store.CopyTrade().GetActiveMapping(e.traderID, p.PosID); mErr != nil || m == nil {
-					continue // only followed leader positions define the target
-				}
-			}
-			if p.PositionValue <= 0 {
-				known = false
-				break
-			}
-			groupNotional += p.PositionValue
-		}
-	}
-	e.leaderStateMu.RUnlock()
+	groupNotional, known := e.followedLeaderGroupNotional(mapping, match.PosID)
 	if !known || groupNotional <= 0 {
 		return copySize, nil
 	}
@@ -165,13 +156,80 @@ func (e *Engine) sizeAddByProportionalTarget(match *SignalMatchResult, symbol st
 		return 0, &Warning{Timestamp: time.Now(), Symbol: symbol, Type: WarnProportionalTargetReached,
 			Message: fmt.Sprintf("跟随仓位已达比例目标（目标 %.2f，实际 %.2f），本次加仓不跟", target, actual), Executed: false}
 	}
+	size := headroom
 	if actual <= 0 {
 		// A followed mapping without a live follower position is reconciled by
 		// the lifecycle checks; an add never rebuilds the whole position.
-		return math.Min(copySize, headroom), nil
-	}
-	if math.Abs(headroom-copySize) > 1e-9 {
+		size = math.Min(copySize, headroom)
+	} else if math.Abs(headroom-copySize) > 1e-9 {
 		logger.Infof("📊 [%s] 加仓按比例目标补差 | %s | 本次变化对应=%.2f → 补差=%.2f（目标=%.2f 实际=%.2f）", e.traderID, symbol, copySize, headroom, target, actual)
 	}
-	return headroom, nil
+	return e.capByAccountLeverage(symbol, leaderEquity, followerEquity, follower.AccountNotional, size)
+}
+
+// followedLeaderGroupNotional sums the leader positions this follower copies
+// in the mapping's symbol/side/margin-mode group. known=false when a value is
+// missing, so callers fall back to the previous behaviour.
+func (e *Engine) followedLeaderGroupNotional(mapping *store.CopyTradePositionMapping, posID string) (float64, bool) {
+	e.leaderStateMu.RLock()
+	defer e.leaderStateMu.RUnlock()
+	state := e.leaderState
+	if state == nil {
+		return 0, false
+	}
+	total := 0.0
+	for _, p := range state.Positions {
+		if p == nil || p.Symbol != mapping.Symbol || string(p.Side) != mapping.Side ||
+			(mapping.MarginMode != "" && p.MarginMode != "" && p.MarginMode != mapping.MarginMode) {
+			continue
+		}
+		if p.PosID != posID {
+			if m, err := e.store.CopyTrade().GetActiveMapping(e.traderID, p.PosID); err != nil || m == nil {
+				continue // only followed leader positions define the target
+			}
+		}
+		if p.PositionValue <= 0 {
+			return 0, false
+		}
+		total += p.PositionValue
+	}
+	return total, true
+}
+
+// leaderAccountLeverage is the leader's total notional over its equity.
+func (e *Engine) leaderAccountLeverage(leaderEquity float64) float64 {
+	if leaderEquity <= 0 {
+		return 0
+	}
+	e.leaderStateMu.RLock()
+	defer e.leaderStateMu.RUnlock()
+	total := 0.0
+	if e.leaderState != nil {
+		for _, p := range e.leaderState.Positions {
+			if p != nil && p.PositionValue > 0 {
+				total += p.PositionValue
+			}
+		}
+	}
+	return total / leaderEquity
+}
+
+// capByAccountLeverage keeps the follower's whole-account leverage within
+// max(leader account leverage x 1.5, 3x) after this add.
+func (e *Engine) capByAccountLeverage(symbol string, leaderEquity, followerEquity, followerNotional, size float64) (float64, *Warning) {
+	if followerEquity <= 0 {
+		return size, nil
+	}
+	limit := math.Max(e.leaderAccountLeverage(leaderEquity)*accountLeverageCapMultiple, accountLeverageFloor)
+	allowed := followerEquity*limit - followerNotional
+	if allowed <= 0 {
+		logger.Infof("📊 [%s] 账户杠杆已达上限，跳过加仓 | %s | 上限=%.2fx 当前名义=%.2f 权益=%.2f", e.traderID, symbol, limit, followerNotional, followerEquity)
+		return 0, &Warning{Timestamp: time.Now(), Symbol: symbol, Type: WarnProportionalTargetReached,
+			Message: fmt.Sprintf("跟随账户杠杆已达上限 %.2fx，本次加仓不跟", limit), Executed: false}
+	}
+	if size > allowed {
+		logger.Infof("📊 [%s] 加仓受账户杠杆上限收敛 | %s | %.2f → %.2f（上限=%.2fx）", e.traderID, symbol, size, allowed, limit)
+		return allowed, nil
+	}
+	return size, nil
 }

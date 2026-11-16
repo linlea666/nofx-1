@@ -335,6 +335,10 @@ export interface CopyConfigRequest {
   max_trade_warn?: number // 最大跟单金额预警阈值（USDT），0=不预警；未传保留存量值
   copy_catchup_window_seconds?: number
   copy_catchup_max_adverse_bps?: number
+  copy_price_tolerance_major_pct?: number
+  copy_price_tolerance_alt_pct?: number
+  copy_take_profit_max_wait_seconds?: number
+  copy_auto_correct_overweight?: boolean
   // Binance Web 凭证（仅 provider_type=binance 时使用）
   binance_p20t?: string // 登录 cookie p20t
   binance_csrf_token?: string // CSRF header csrftoken
@@ -880,6 +884,10 @@ export interface CopyTradeConfig {
   max_trade_warn: number
   copy_catchup_window_seconds?: number
   copy_catchup_max_adverse_bps?: number
+  copy_price_tolerance_major_pct?: number
+  copy_price_tolerance_alt_pct?: number
+  copy_take_profit_max_wait_seconds?: number
+  copy_auto_correct_overweight?: boolean
   enabled: boolean
   // Binance Web 凭证（仅 provider_type=binance 时使用，明文返回，用于编辑表单回填）
   binance_p20t?: string

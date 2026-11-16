@@ -2798,6 +2798,20 @@ func (at *AutoTrader) emergencyClosePosition(symbol, side string) error {
 // ClosePositionMarket exposes the same reduce-only close-all primitive to
 // Copy Guard for residual positions after a partially filled protective stop.
 func (at *AutoTrader) ClosePositionMarket(symbol, side string) (string, error) {
+	return at.closePositionMarketQuantity(symbol, side, 0)
+}
+
+// ReducePositionMarket reduces a position by quantity at market (reduce-only),
+// with the same order-preserving primitive as ClosePositionMarket.
+func (at *AutoTrader) ReducePositionMarket(symbol, side string, quantity float64) (string, error) {
+	if quantity <= 0 {
+		return "", fmt.Errorf("reduce quantity must be positive")
+	}
+	return at.closePositionMarketQuantity(symbol, side, quantity)
+}
+
+// closePositionMarketQuantity closes quantity (0 = the whole position).
+func (at *AutoTrader) closePositionMarketQuantity(symbol, side string, quantity float64) (string, error) {
 	var order map[string]interface{}
 	var err error
 	// Copy Guard must not use the normal Binance close path because that path
@@ -2808,15 +2822,15 @@ func (at *AutoTrader) ClosePositionMarket(symbol, side string) (string, error) {
 	switch side {
 	case "long":
 		if preservesOrders {
-			order, err = copyExecutor.CloseLongPreservingOrders(symbol, 0)
+			order, err = copyExecutor.CloseLongPreservingOrders(symbol, quantity)
 		} else {
-			order, err = at.trader.CloseLong(symbol, 0)
+			order, err = at.trader.CloseLong(symbol, quantity)
 		}
 	case "short":
 		if preservesOrders {
-			order, err = copyExecutor.CloseShortPreservingOrders(symbol, 0)
+			order, err = copyExecutor.CloseShortPreservingOrders(symbol, quantity)
 		} else {
-			order, err = at.trader.CloseShort(symbol, 0)
+			order, err = at.trader.CloseShort(symbol, quantity)
 		}
 	default:
 		return "", fmt.Errorf("unknown position direction: %s", side)

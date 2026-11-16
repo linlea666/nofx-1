@@ -277,6 +277,9 @@ func (s *Store) initTables() error {
 	if err := s.CopyTrade().initRuntimeHealthTables(); err != nil {
 		return fmt.Errorf("initialize copy runtime health: %w", err)
 	}
+	if err := s.CopyTrade().initExecutionPrefsTable(); err != nil {
+		return fmt.Errorf("failed to initialize copy trade execution prefs table: %w", err)
+	}
 	if err := s.CopyTrade().initOrderEvidenceRepairTable(); err != nil {
 		return fmt.Errorf("initialize order evidence audit: %w", err)
 	}

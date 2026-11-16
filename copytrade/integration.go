@@ -186,6 +186,9 @@ type TraderIntegration struct {
 	stopRiskAlerts     map[string]*stopRiskAlertState
 	residualCloseLast  map[int64]time.Time
 	residualCloseTries map[int64]int
+	// Overweight correction state (overweight_correction.go); monitor goroutine only.
+	lastOverweightCheck time.Time
+	overweightStrikes   map[string]int
 	// protectionRearms counts protective-stop re-arms per cycle inside a rolling
 	// window. protection_retries cannot detect an oscillation, because it is reset
 	// as soon as the cycle reports healthy again — so a "re-arm succeeds, then
@@ -650,6 +653,12 @@ func (ti *TraderIntegration) StartCopyTrading() error {
 		RiskUnprotectableAction:           copyConfig.RiskUnprotectableAction,
 		RiskReentryNoiseOverride:          copyConfig.RiskReentryNoiseOverride,
 	}
+	engineConfig.PriceToleranceMajorPct = copyConfig.CopyPriceToleranceMajorPct
+	engineConfig.PriceToleranceAltPct = copyConfig.CopyPriceToleranceAltPct
+	if copyConfig.CopyTakeProfitMaxWaitSeconds != nil {
+		engineConfig.TakeProfitMaxWaitSeconds = *copyConfig.CopyTakeProfitMaxWaitSeconds
+	}
+	engineConfig.DisableAutoCorrect = copyConfig.CopyAutoCorrectOverweight != nil && !*copyConfig.CopyAutoCorrectOverweight
 	engineConfig.FillRiskDefaults() // 兜底默认值（旧库迁移 / 前端未传时）
 	if err := ValidateRiskPolicyV4(engineConfig); err != nil {
 		return fmt.Errorf("invalid copy guard v4 policy: %w", err)
@@ -664,6 +673,23 @@ func (ti *TraderIntegration) StartCopyTrading() error {
 		GetMarketPrice(string) (float64, error)
 	}); ok {
 		engineOpts = append(engineOpts, WithFollowerMarketPrice(prices.GetMarketPrice))
+		if resolver, ok := ti.executor.(trader.ExecutionInstrumentResolver); ok {
+			engineOpts = append(engineOpts, WithFollowerMinNotional(func(symbol string) (float64, error) {
+				inst, err := resolver.ResolveExecutionInstrument(symbol)
+				if err != nil || inst == nil {
+					return 0, fmt.Errorf("execution instrument unavailable: %v", err)
+				}
+				price, err := prices.GetMarketPrice(symbol)
+				if err != nil || price <= 0 {
+					return 0, fmt.Errorf("execution price unavailable: %v", err)
+				}
+				minimum, err := trader.MinimumExecutableQuantity(inst, price)
+				if err != nil {
+					return 0, err
+				}
+				return minimum * price, nil
+			}))
+		}
 	}
 	// Binance 启用全局凭证热加载（store.BinanceCreds 实现了 BinanceCredentialsLoader 接口）
 	// OKX/HL 路径下 NewProviderWithLoader 不会消费 loader，零影响。
@@ -1836,6 +1862,7 @@ func (ti *TraderIntegration) monitorExecutionIntents() {
 		case <-ticker.C:
 			ti.reconcileMappingOwnershipGaps(false)
 			ti.reconcileExecutionIntents(false)
+			ti.correctProportionalOverweight()
 		}
 	}
 }

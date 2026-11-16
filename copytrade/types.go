@@ -237,6 +237,16 @@ type CopyConfig struct {
 	CopyCatchupWindowSeconds int     `json:"copy_catchup_window_seconds"`
 	CopyCatchupMaxAdverseBPS float64 `json:"copy_catchup_max_adverse_bps"`
 
+	// Leader-relative execution (copy_pricing.go / copy_reduce.go). A nil
+	// tolerance uses the default (BTC/ETH 0.2%, others 0.5%); 0 accepts no
+	// adverse price. TakeProfitMaxWaitSeconds 0 means the default 300 s.
+	PriceToleranceMajorPct   *float64 `json:"price_tolerance_major_pct,omitempty"`
+	PriceToleranceAltPct     *float64 `json:"price_tolerance_alt_pct,omitempty"`
+	TakeProfitMaxWaitSeconds int      `json:"take_profit_max_wait_seconds,omitempty"`
+	// DisableAutoCorrect turns off the automatic reduction of an overweight
+	// follower position (on by default).
+	DisableAutoCorrect bool `json:"disable_auto_correct,omitempty"`
+
 	// Binance Web 私有接口凭证（仅 ProviderType=binance 时使用）
 	// 由用户从浏览器开发者工具中抓取，会过期，过期时通过邮件告警
 	BinanceP20T        string            `json:"binance_p20t,omitempty"`       // 登录 cookie p20t
