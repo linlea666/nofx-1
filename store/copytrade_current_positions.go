@@ -27,12 +27,18 @@ const (
 
 	currentCopyMinAdvantagePctFloor   = -20.0
 	currentCopyMinAdvantagePctCeiling = 50.0
+	// Upper bound of the price disadvantage an operator may accept per position.
+	currentCopyManualMaxDisadvantagePctCeiling = 20.0
 )
 
 // CurrentPositionCopySelection is one operator-chosen leader lifecycle.
 type CurrentPositionCopySelection struct {
 	LeaderPosID string `json:"leader_pos_id"`
 	OpenedMS    int64  `json:"opened_ms"`
+	// AcceptUnfavorable marks a position the operator picked although its
+	// price misses the minimum advantage; it only needs to stay within the
+	// request's manual disadvantage tolerance.
+	AcceptUnfavorable bool `json:"accept_unfavorable,omitempty"`
 }
 
 type CurrentPositionCopy struct {
@@ -46,6 +52,9 @@ type CurrentPositionCopy struct {
 	MinAdvantagePct    float64                        `json:"min_advantage_pct"`
 	Selection          []CurrentPositionCopySelection `json:"selection"`
 	Tasks              []CurrentPositionCopyTask      `json:"tasks"`
+	// Copy-window progress anchor, see currentCopyWindowAnchor.
+	WindowAnchorAt           time.Time `json:"-"`
+	ManualMaxDisadvantagePct float64   `json:"manual_max_disadvantage_pct"`
 }
 type CurrentPositionCopyTask struct {
 	SnapshotAt     string  `json:"-"`
@@ -67,6 +76,14 @@ type CurrentPositionCopyTask struct {
 	// Request-level price rule, carried for the pre-submission recheck.
 	PriceFilterEnabled bool    `json:"-"`
 	MinAdvantagePct    float64 `json:"-"`
+	// Copy-window progress anchor, see currentCopyWindowAnchor.
+	WindowAnchorAt time.Time `json:"-"`
+	// PriceManualOnly (preview) marks a position below the minimum advantage
+	// but within the manual tolerance: selectable, never preselected.
+	PriceManualOnly bool `json:"price_manual_only,omitempty"`
+	// Operator acceptance and its tolerance, for the pre-submission recheck.
+	AcceptUnfavorable        bool    `json:"-"`
+	ManualMaxDisadvantagePct float64 `json:"-"`
 }
 
 func (s *CopyTradeStore) initCurrentPositionCopyTables() error {
@@ -96,10 +113,14 @@ func (s *CopyTradeStore) initCurrentPositionCopyTables() error {
 		{"selection_mode", "TEXT NOT NULL DEFAULT 'ALL'"},
 		{"price_filter_enabled", "INTEGER NOT NULL DEFAULT 0"},
 		{"min_advantage_pct", "REAL NOT NULL DEFAULT 0"},
+		{"manual_max_disadvantage_pct", "REAL NOT NULL DEFAULT 0"},
 	} {
 		if err = ensureSQLiteColumn(s.db, "copy_trade_current_position_requests", m.column, m.definition); err != nil {
 			return fmt.Errorf("migrate copy_trade_current_position_requests.%s: %w", m.column, err)
 		}
+	}
+	if err = ensureSQLiteColumn(s.db, "copy_trade_current_position_selections", "accept_unfavorable", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return fmt.Errorf("migrate copy_trade_current_position_selections.accept_unfavorable: %w", err)
 	}
 	return nil
 }
@@ -113,6 +134,12 @@ func validateCurrentCopyOptions(c *CopyTradeConfig) error {
 		v := *c.CopyCurrentMinAdvantagePct
 		if math.IsNaN(v) || math.IsInf(v, 0) || v < currentCopyMinAdvantagePctFloor || v > currentCopyMinAdvantagePctCeiling {
 			return fmt.Errorf("复制仓位的最低价格优势需在 %.0f%% 到 %.0f%% 之间", currentCopyMinAdvantagePctFloor, currentCopyMinAdvantagePctCeiling)
+		}
+	}
+	if c.CopyCurrentManualMaxDisadvantagePct != nil {
+		v := *c.CopyCurrentManualMaxDisadvantagePct
+		if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 || v > currentCopyManualMaxDisadvantagePctCeiling {
+			return fmt.Errorf("手选仓位的最大价格劣势需在 0%% 到 %.0f%% 之间", currentCopyManualMaxDisadvantagePctCeiling)
 		}
 	}
 	if c.CopyCurrentPositionsSelection != nil {
@@ -144,6 +171,11 @@ func writeCurrentCopyOptionsTx(tx *sql.Tx, requestID string, c *CopyTradeConfig)
 			return err
 		}
 	}
+	if c.CopyCurrentManualMaxDisadvantagePct != nil {
+		if _, err := tx.Exec(`UPDATE copy_trade_current_position_requests SET manual_max_disadvantage_pct=? WHERE request_id=?`, *c.CopyCurrentManualMaxDisadvantagePct, requestID); err != nil {
+			return err
+		}
+	}
 	if c.CopyCurrentPositionsSelection == nil {
 		return nil
 	}
@@ -154,7 +186,7 @@ func writeCurrentCopyOptionsTx(tx *sql.Tx, requestID string, c *CopyTradeConfig)
 		return err
 	}
 	for _, sel := range c.CopyCurrentPositionsSelection {
-		if _, err := tx.Exec(`INSERT INTO copy_trade_current_position_selections(request_id,leader_pos_id,opened_ms) VALUES(?,?,?)`, requestID, strings.TrimSpace(sel.LeaderPosID), sel.OpenedMS); err != nil {
+		if _, err := tx.Exec(`INSERT INTO copy_trade_current_position_selections(request_id,leader_pos_id,opened_ms,accept_unfavorable) VALUES(?,?,?,?)`, requestID, strings.TrimSpace(sel.LeaderPosID), sel.OpenedMS, sel.AcceptUnfavorable); err != nil {
 			return err
 		}
 	}
@@ -231,12 +263,12 @@ func (s *CopyTradeStore) ActiveCurrentPositionCopy(traderID string) (*CurrentPos
 }
 func (s *CopyTradeStore) currentPositionCopy(traderID string, activeOnly bool) (*CurrentPositionCopy, error) {
 	r := &CurrentPositionCopy{Tasks: []CurrentPositionCopyTask{}}
-	query := `SELECT request_id,status,reason,created_at,snapshot_at,selection_mode,price_filter_enabled,min_advantage_pct FROM copy_trade_current_position_requests WHERE trader_id=?`
+	query := `SELECT request_id,status,reason,created_at,snapshot_at,selection_mode,price_filter_enabled,min_advantage_pct,manual_max_disadvantage_pct FROM copy_trade_current_position_requests WHERE trader_id=?`
 	if activeOnly {
 		query += ` AND status IN ('PENDING','SEALED')`
 	}
 	query += ` ORDER BY rowid DESC LIMIT 1`
-	err := s.db.QueryRow(query, traderID).Scan(&r.RequestID, &r.Status, &r.Reason, &r.CreatedAt, &r.SnapshotAt, &r.SelectionMode, &r.PriceFilterEnabled, &r.MinAdvantagePct)
+	err := s.db.QueryRow(query, traderID).Scan(&r.RequestID, &r.Status, &r.Reason, &r.CreatedAt, &r.SnapshotAt, &r.SelectionMode, &r.PriceFilterEnabled, &r.MinAdvantagePct, &r.ManualMaxDisadvantagePct)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -244,6 +276,9 @@ func (s *CopyTradeStore) currentPositionCopy(traderID string, activeOnly bool) (
 		return nil, err
 	}
 	if r.Selection, err = currentCopySelection(s.db, r.RequestID); err != nil {
+		return nil, err
+	}
+	if r.WindowAnchorAt, err = currentCopyWindowAnchor(s.db, r.RequestID, r.SnapshotAt); err != nil {
 		return nil, err
 	}
 	rows, err := s.db.Query(`SELECT t.id,t.leader_pos_id,t.symbol,t.side,t.margin_mode,t.opened_ms,t.source_size,t.entry_price,t.reference_price,t.notional,t.leverage,
@@ -490,14 +525,68 @@ func bindCurrentPositionCopyTx(tx *sql.Tx, intent *CopyTradeExecutionIntent, id 
 }
 func (s *CopyTradeStore) CurrentPositionCopyTask(traderID, posID string) (*CurrentPositionCopyTask, error) {
 	t := &CurrentPositionCopyTask{}
-	err := s.db.QueryRow(`SELECT t.id,t.opened_ms,t.side,t.margin_mode,t.source_size,t.intent_id,r.snapshot_at,t.entry_price,r.price_filter_enabled,r.min_advantage_pct FROM copy_trade_current_position_tasks t
+	var requestID string
+	err := s.db.QueryRow(`SELECT t.request_id,t.id,t.opened_ms,t.side,t.margin_mode,t.source_size,t.intent_id,r.snapshot_at,t.entry_price,r.price_filter_enabled,r.min_advantage_pct,r.manual_max_disadvantage_pct,
+ COALESCE((SELECT sel.accept_unfavorable FROM copy_trade_current_position_selections sel WHERE sel.request_id=t.request_id AND sel.leader_pos_id=t.leader_pos_id),0) FROM copy_trade_current_position_tasks t
  JOIN copy_trade_current_position_requests r ON r.request_id=t.request_id JOIN traders owner ON owner.id=t.trader_id JOIN copy_trade_configs cfg ON cfg.trader_id=owner.id
- WHERE t.trader_id=? AND t.leader_pos_id=? AND t.status='READY' AND r.status='SEALED' AND r.start_generation=owner.lifecycle_generation AND owner.lifecycle_status='RUNNING' AND owner.exchange_id=r.exchange_id AND owner.decision_mode='copy_trade' AND cfg.provider_type=r.provider AND cfg.leader_id=r.leader_id AND cfg.source_generation=r.source_generation ORDER BY t.id DESC LIMIT 1`, traderID, posID).Scan(&t.ID, &t.OpenedMS, &t.Side, &t.MarginMode, &t.Size, &t.IntentID, &t.SnapshotAt, &t.EntryPrice, &t.PriceFilterEnabled, &t.MinAdvantagePct)
+ WHERE t.trader_id=? AND t.leader_pos_id=? AND t.status='READY' AND r.status='SEALED' AND r.start_generation=owner.lifecycle_generation AND owner.lifecycle_status='RUNNING' AND owner.exchange_id=r.exchange_id AND owner.decision_mode='copy_trade' AND cfg.provider_type=r.provider AND cfg.leader_id=r.leader_id AND cfg.source_generation=r.source_generation ORDER BY t.id DESC LIMIT 1`, traderID, posID).Scan(&requestID, &t.ID, &t.OpenedMS, &t.Side, &t.MarginMode, &t.Size, &t.IntentID, &t.SnapshotAt, &t.EntryPrice, &t.PriceFilterEnabled, &t.MinAdvantagePct, &t.ManualMaxDisadvantagePct, &t.AcceptUnfavorable)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
-	return t, err
+	if err != nil {
+		return nil, err
+	}
+	if t.WindowAnchorAt, err = currentCopyWindowAnchor(s.db, requestID, t.SnapshotAt); err != nil {
+		return nil, err
+	}
+	return t, nil
 }
+
+// currentCopyWindowAnchor lets one serial batch keep its authorization while
+// it progresses: each real fill of the same request restarts the copy window,
+// so a stalled batch still expires. Only filled_at counts; rejections and
+// expiries also stamp terminal_at and must never extend the window. The anchor
+// is capped at one window per executable task. A missing or unparsable seal
+// time returns the zero time, which callers treat as expired.
+func currentCopyWindowAnchor(db *sql.DB, requestID, snapshotAt string) (time.Time, error) {
+	sealed, err := parseDBTime(snapshotAt)
+	if err != nil {
+		return time.Time{}, nil
+	}
+	rows, err := db.Query(`SELECT CAST(i.filled_at AS TEXT) FROM copy_trade_current_position_tasks t JOIN copy_trade_execution_intents i ON i.id=t.intent_id
+ WHERE t.request_id=? AND i.filled_at IS NOT NULL AND i.filled_quantity>0`, requestID)
+	if err != nil {
+		return time.Time{}, err
+	}
+	defer rows.Close()
+	anchor := sealed
+	for rows.Next() {
+		var raw string
+		if err = rows.Scan(&raw); err != nil {
+			return time.Time{}, err
+		}
+		if at, parseErr := parseDBTime(raw); parseErr == nil && at.After(anchor) {
+			anchor = at
+		}
+	}
+	if err = rows.Err(); err != nil || anchor.Equal(sealed) {
+		return anchor, err
+	}
+	var executable, window int
+	if err = db.QueryRow(`SELECT (SELECT COUNT(*) FROM copy_trade_current_position_tasks WHERE request_id=r.request_id AND status<>'SKIPPED'),
+ COALESCE((SELECT copy_catchup_window_seconds FROM copy_trade_configs WHERE trader_id=r.trader_id),0)
+ FROM copy_trade_current_position_requests r WHERE r.request_id=?`, requestID).Scan(&executable, &window); err != nil {
+		return time.Time{}, err
+	}
+	if window <= 0 {
+		window = 60
+	}
+	if limit := sealed.Add(time.Duration(executable*window) * time.Second); anchor.After(limit) {
+		anchor = limit
+	}
+	return anchor, nil
+}
+
 func (s *CopyTradeStore) RefreshCurrentPositionCopy(traderID string) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -678,7 +767,7 @@ func (s *CopyTradeStore) RefreshUnsubmittedCurrentCopyTarget(taskID, intentID in
 func currentCopySelection(q interface {
 	Query(string, ...interface{}) (*sql.Rows, error)
 }, requestID string) ([]CurrentPositionCopySelection, error) {
-	rows, err := q.Query(`SELECT leader_pos_id,opened_ms FROM copy_trade_current_position_selections WHERE request_id=? ORDER BY leader_pos_id`, requestID)
+	rows, err := q.Query(`SELECT leader_pos_id,opened_ms,accept_unfavorable FROM copy_trade_current_position_selections WHERE request_id=? ORDER BY leader_pos_id`, requestID)
 	if err != nil {
 		return nil, err
 	}
@@ -686,7 +775,7 @@ func currentCopySelection(q interface {
 	out := []CurrentPositionCopySelection{}
 	for rows.Next() {
 		var sel CurrentPositionCopySelection
-		if err = rows.Scan(&sel.LeaderPosID, &sel.OpenedMS); err != nil {
+		if err = rows.Scan(&sel.LeaderPosID, &sel.OpenedMS, &sel.AcceptUnfavorable); err != nil {
 			return nil, err
 		}
 		out = append(out, sel)

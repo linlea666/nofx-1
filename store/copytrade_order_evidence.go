@@ -192,3 +192,86 @@ func (s *CopyTradeStore) BookRecoveredCompletedExit(intentID int64) error {
 	}
 	return tx.Commit()
 }
+
+// ListHistoricalEntryEvidenceGaps lists entry intents whose source mapping
+// already moved past them while a venue receipt is still unsettled or its
+// fill is not booked. The reconciler parks these as
+// HISTORICAL_FILL_EVIDENCE_PENDING and never looks the order up again, so
+// only the evidence-only repair below can finish them.
+func (s *CopyTradeStore) ListHistoricalEntryEvidenceGaps(traderID string, afterID int64) ([]*CopyTradeExecutionIntent, error) {
+	rows, err := s.db.Query(`SELECT DISTINCT i.id FROM copy_trade_execution_intents i
+ JOIN copy_trade_position_mappings m ON m.trader_id=i.trader_id AND m.leader_pos_id=i.leader_pos_id
+ JOIN copy_trade_execution_order_attempts a ON a.intent_id=i.id
+ WHERE i.trader_id=? AND i.id>? AND i.source_kind='LEADER_TRANSITION' AND i.action IN ('open_long','open_short')
+ AND i.status IN ('RECONCILING','PARTIALLY_FILLED') AND i.terminal_at IS NULL AND m.source_revision>i.source_revision
+ AND NOT EXISTS(SELECT 1 FROM copy_trade_source_resolutions r WHERE r.intent_id=i.id)
+ AND (`+unsettledExecutionAttemptSQL("a")+` OR (a.filled_quantity>0 AND NOT EXISTS(SELECT 1 FROM copy_trade_execution_fill_commits c WHERE c.intent_id=i.id AND c.fill_key IN (a.client_order_id,COALESCE(a.exchange_order_id,'')))))
+ ORDER BY i.id LIMIT 25`, traderID, afterID)
+	if err != nil {
+		return nil, err
+	}
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err = rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return nil, err
+	}
+	var result []*CopyTradeExecutionIntent
+	for _, id := range ids {
+		i, e := s.GetExecutionIntentByID(id)
+		if e != nil {
+			return nil, e
+		}
+		result = append(result, i)
+	}
+	return result, nil
+}
+
+// BookRecoveredHistoricalEntry books venue-confirmed fills of an entry intent
+// whose source mapping already advanced, then acknowledges it. Mapping,
+// custody and protection are never changed; anything still unproven returns
+// ErrSourceTransitionUnresolved and stays pending for the next sweep.
+func (s *CopyTradeStore) BookRecoveredHistoricalEntry(intentID int64) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	f, err := inspectLeaderTransitionTx(tx, intentID)
+	if err != nil {
+		return err
+	}
+	if f.SourceKind != "LEADER_TRANSITION" || (f.Action != "open_long" && f.Action != "open_short") || f.Resolution != "" || !f.MappingExists || f.MappingRevision <= f.Revision {
+		return nil
+	}
+	// Generic per-order booking shared with leader and risk exits.
+	qty, err := bookTerminalLeaderExitAttemptsTx(tx, intentID)
+	if err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`UPDATE copy_trade_execution_intents SET filled_quantity=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND filled_quantity<=?`, qty, intentID, qty); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`UPDATE copy_trade_order_evidence_repairs SET booked_at=COALESCE(booked_at,CURRENT_TIMESTAMP) WHERE intent_id=?`, intentID); err != nil {
+		return err
+	}
+	if f, err = inspectLeaderTransitionTx(tx, intentID); err != nil {
+		return err
+	}
+	if f.Effect != SourceEffectBookedFill {
+		return ErrSourceTransitionUnresolved
+	}
+	if err = finishLeaderSourceTransitionTx(tx, f, FinishLeaderSourceTransitionRequest{IntentID: intentID, TraderID: f.TraderID, Disposition: SourceAcknowledgeFill,
+		Reason: "HISTORICAL_FILL_EVIDENCE_RECOVERED", Evidence: "venue lookup settled every entry receipt; booked per order without changing the advanced source mapping"}); err != nil {
+		return err
+	}
+	return tx.Commit()
+}

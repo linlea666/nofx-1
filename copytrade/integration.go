@@ -130,6 +130,7 @@ const mappingFailureCircuitThreshold = 5
 type TraderIntegration struct {
 	lastExitEvidenceRecovery time.Time // execution reconciliation goroutine only
 	lastExitEvidenceID       int64
+	lastEntryEvidenceID      int64
 	traderID                 string
 	lifecycleGeneration      int64
 	executor                 DecisionExecutor
@@ -904,6 +905,7 @@ func (ti *TraderIntegration) reconcileExecutionIntents(startup bool) {
 	if startup || time.Since(ti.lastExitEvidenceRecovery) >= time.Minute {
 		ti.lastExitEvidenceRecovery = time.Now()
 		ti.recoverExitOrderEvidence()
+		ti.recoverHistoricalEntryEvidence()
 	}
 	intents, err := ti.store.CopyTrade().ListUnfinishedExecutionIntents(ti.traderID)
 	if err != nil {
@@ -4874,7 +4876,12 @@ func (ti *TraderIntegration) executeFullDecision(fullDec *decision.FullDecision)
 				if ti.engine != nil {
 					ti.engine.UnmarkDecisionSources(dec)
 				}
-				executionLogs = append(executionLogs, fmt.Sprintf("⏳ %s %s 下单前置条件暂不可用，保留源变化等待重放: %v", dec.Action, dec.Symbol, err))
+				if dec.CurrentPositionTaskID > 0 && reasonCode == "SOURCE_SUPERSEDED" {
+					// A one-shot current-position authorization is never replayed.
+					executionLogs = append(executionLogs, fmt.Sprintf("⏹ %s %s 本次复制授权已结束，未下单（该仓位下次可重新勾选）: %v", dec.Action, dec.Symbol, err))
+				} else {
+					executionLogs = append(executionLogs, fmt.Sprintf("⏳ %s %s 下单前置条件暂不可用，保留源变化等待重放: %v", dec.Action, dec.Symbol, err))
+				}
 				ti.saveSignalLog(dec, "reconciling", err.Error())
 			} else if ti.shouldReplayPreSubmitFailure(dec, err) {
 				// The adapter was never called because durable attempt

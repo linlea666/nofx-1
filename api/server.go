@@ -550,6 +550,8 @@ type CopyConfigReq struct {
 	MaxTradeWarn             *float64 `json:"max_trade_warn,omitempty"`
 	CopyCatchupWindowSeconds *int     `json:"copy_catchup_window_seconds,omitempty"`
 	CopyCatchupMaxAdverseBPS *float64 `json:"copy_catchup_max_adverse_bps,omitempty"`
+	// 复制当前仓位：手选仓位可接受的最大价格劣势（%）
+	CopyCurrentManualMaxDisadvantagePct *float64 `json:"copy_current_manual_max_disadvantage_pct,omitempty"`
 
 	// Binance Web 凭证（仅 ProviderType=binance 时使用，明文存储）
 	BinanceP20T        string `json:"binance_p20t,omitempty"`       // 登录 cookie p20t
@@ -906,7 +908,7 @@ func (s *Server) handleCreateTrader(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
-		if err := validateCurrentCopyOptionsRequest(req.CopyConfig.CopyCurrentPositionsOnce, req.CopyConfig.CopyCurrentPositionsSelection, req.CopyConfig.CopyCurrentMinAdvantagePct); err != nil {
+		if err := validateCurrentCopyOptionsRequest(req.CopyConfig.CopyCurrentPositionsOnce, req.CopyConfig.CopyCurrentPositionsSelection, req.CopyConfig.CopyCurrentMinAdvantagePct, req.CopyConfig.CopyCurrentManualMaxDisadvantagePct); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
@@ -1136,6 +1138,7 @@ func (s *Server) handleCreateTrader(c *gin.Context) {
 		copyConfig.CopyCurrentPositionsSelection = req.CopyConfig.CopyCurrentPositionsSelection
 		copyConfig.CopyCurrentPriceFilterEnabled = req.CopyConfig.CopyCurrentPriceFilterEnabled
 		copyConfig.CopyCurrentMinAdvantagePct = req.CopyConfig.CopyCurrentMinAdvantagePct
+		copyConfig.CopyCurrentManualMaxDisadvantagePct = req.CopyConfig.CopyCurrentManualMaxDisadvantagePct
 		copyConfig.SyncLeverage = req.CopyConfig.SyncLeverage
 		copyConfig.SyncMarginMode = syncMarginMode
 		if req.CopyConfig.MinTradeWarn != nil {
@@ -1373,7 +1376,7 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
-		if err := validateCurrentCopyOptionsRequest(req.CopyConfig.CopyCurrentPositionsOnce, req.CopyConfig.CopyCurrentPositionsSelection, req.CopyConfig.CopyCurrentMinAdvantagePct); err != nil {
+		if err := validateCurrentCopyOptionsRequest(req.CopyConfig.CopyCurrentPositionsOnce, req.CopyConfig.CopyCurrentPositionsSelection, req.CopyConfig.CopyCurrentMinAdvantagePct, req.CopyConfig.CopyCurrentManualMaxDisadvantagePct); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
@@ -1481,6 +1484,7 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 		copyConfig.CopyCurrentPositionsSelection = req.CopyConfig.CopyCurrentPositionsSelection
 		copyConfig.CopyCurrentPriceFilterEnabled = req.CopyConfig.CopyCurrentPriceFilterEnabled
 		copyConfig.CopyCurrentMinAdvantagePct = req.CopyConfig.CopyCurrentMinAdvantagePct
+		copyConfig.CopyCurrentManualMaxDisadvantagePct = req.CopyConfig.CopyCurrentManualMaxDisadvantagePct
 		copyConfig.SyncLeverage = req.CopyConfig.SyncLeverage
 		copyConfig.SyncMarginMode = syncMarginMode
 		if req.CopyConfig.MinTradeWarn != nil {

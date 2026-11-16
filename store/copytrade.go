@@ -176,6 +176,8 @@ type CopyTradeConfig struct {
 
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
+	// 价格未达最低优势、但劣势不超过该百分比的仓位可被逐仓手动勾选复制。
+	CopyCurrentManualMaxDisadvantagePct *float64 `json:"copy_current_manual_max_disadvantage_pct,omitempty"`
 }
 
 // DefaultMinStopATRRatio 结构性可保护下限的默认值。

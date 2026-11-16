@@ -49,6 +49,8 @@ func (h *CopyTradeHandler) PreviewCurrentPositions(c *gin.Context) {
 		Ratio              float64 `json:"copy_ratio"`
 		PriceFilterEnabled bool    `json:"price_filter_enabled"`
 		MinAdvantagePct    float64 `json:"min_advantage_pct"`
+		// Manual tolerance: rows within it are selectable but not preselected.
+		ManualMaxDisadvantagePct float64 `json:"manual_max_disadvantage_pct"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -58,7 +60,7 @@ func (h *CopyTradeHandler) PreviewCurrentPositions(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "需要 OKX 或 FollowCoin 领航员、执行账户及有效跟单系数"})
 		return
 	}
-	if math.IsNaN(req.MinAdvantagePct) || math.IsInf(req.MinAdvantagePct, 0) {
+	if math.IsNaN(req.MinAdvantagePct) || math.IsInf(req.MinAdvantagePct, 0) || math.IsNaN(req.ManualMaxDisadvantagePct) || math.IsInf(req.ManualMaxDisadvantagePct, 0) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "价格优势阈值无效"})
 		return
 	}
@@ -115,7 +117,7 @@ func (h *CopyTradeHandler) PreviewCurrentPositions(c *gin.Context) {
 		if err != nil {
 			return nil, err
 		}
-		if tasks, err = copytrade.ApplyCurrentCopyPriceFilter(h.store, req.TraderID, req.LeaderID, tasks, req.PriceFilterEnabled, req.MinAdvantagePct); err != nil {
+		if tasks, err = copytrade.ApplyCurrentCopyPriceFilter(h.store, req.TraderID, req.LeaderID, tasks, req.PriceFilterEnabled, req.MinAdvantagePct, req.ManualMaxDisadvantagePct, nil); err != nil {
 			return nil, err
 		}
 		return gin.H{"positions": tasks, "snapshot_at": state.Timestamp, "leader_equity": state.TotalEquity, "follower_equity": equity}, nil
@@ -129,11 +131,11 @@ func (h *CopyTradeHandler) PreviewCurrentPositions(c *gin.Context) {
 
 // validateCurrentCopyOptionsRequest checks the selection and price rule of an
 // enabled registration before the trader endpoint persists anything.
-func validateCurrentCopyOptionsRequest(enabled *bool, selection []store.CurrentPositionCopySelection, minPct *float64) error {
+func validateCurrentCopyOptionsRequest(enabled *bool, selection []store.CurrentPositionCopySelection, minPct, manualPct *float64) error {
 	if enabled == nil || !*enabled {
 		return nil
 	}
-	return store.ValidateCurrentCopyOptions(&store.CopyTradeConfig{CopyCurrentPositionsSelection: selection, CopyCurrentMinAdvantagePct: minPct})
+	return store.ValidateCurrentCopyOptions(&store.CopyTradeConfig{CopyCurrentPositionsSelection: selection, CopyCurrentMinAdvantagePct: minPct, CopyCurrentManualMaxDisadvantagePct: manualPct})
 }
 
 // Validate before the general trader endpoint saves unrelated trader fields.

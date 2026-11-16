@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"math"
 	"path/filepath"
 	"testing"
@@ -95,5 +96,65 @@ func TestUnsettledAttemptSQLMatchesReceiptProof(t *testing.T) {
 		if err != nil || pending != ExecutionOrderAttemptNeedsReconciliation(a[0]) {
 			t.Fatalf("receipt fence disagreement %+v pending=%v err=%v", tc, pending, err)
 		}
+	}
+}
+
+// Production shape (trader 788e3e43, intent 4664223): a catch-up receipt said
+// FILLED without a quantity after the mapping had moved on, so the reconciler
+// parked the entry forever and the leader exit waited on it.
+func TestHistoricalEntryEvidenceRepairBooksWithoutTouchingSource(t *testing.T) {
+	s := resolutionStore(t)
+	resolutionMapping(t, s, "t", "p", MappingStatusStoppedByRisk, 48, 5000)
+	i := resolutionIntent(t, s, "t", "p", "open_long", ExecutionIntentReconciling, 40, 3885)
+	resolutionExec(t, s, `UPDATE copy_trade_execution_intents SET filled_quantity=0.041,quantized_quantity=0.042,target_quantity=0.042,submitted_at=CURRENT_TIMESTAMP,reason_code='HISTORICAL_FILL_EVIDENCE_PENDING' WHERE id=?`, i.ID)
+	resolutionExec(t, s, `INSERT INTO copy_trade_execution_order_attempts(intent_id,attempt_no,client_order_id,exchange_order_id,status,exchange_state,filled_quantity,submitted_at,terminal_at) VALUES(?,1,'ct-1','o-1','FILLED','FILLED',0.041,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)`, i.ID)
+	resolutionExec(t, s, `INSERT INTO copy_trade_execution_fill_commits(intent_id,fill_key,filled_quantity,filled_notional) VALUES(?,'ct-1',0.041,75)`, i.ID)
+	resolutionExec(t, s, `INSERT INTO copy_trade_execution_order_attempts(intent_id,attempt_no,client_order_id,exchange_order_id,status,exchange_state,filled_quantity,submitted_at) VALUES(?,2,'ct-2','o-2','SUBMITTED','FILLED',0,CURRENT_TIMESTAMP)`, i.ID)
+
+	gaps, err := s.CopyTrade().ListHistoricalEntryEvidenceGaps("t", 0)
+	if err != nil || len(gaps) != 1 || gaps[0].ID != i.ID {
+		t.Fatalf("gap not listed: %+v %v", gaps, err)
+	}
+	if err = s.CopyTrade().BookRecoveredHistoricalEntry(i.ID); !errors.Is(err, ErrSourceTransitionUnresolved) {
+		t.Fatalf("unproven receipt must stay pending, got %v", err)
+	}
+	if err = s.CopyTrade().CompleteExecutionOrderAttemptWithEvidence(i.ID, "ct-2", ExecutionOrderAttemptFilled, "o-2", "FILLED", "", 0.001, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.CopyTrade().BookRecoveredHistoricalEntry(i.ID); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.CopyTrade().GetExecutionIntentByID(i.ID)
+	if err != nil || got.Status != ExecutionIntentFilled || got.TerminalAt == nil || !sameSourceQuantity(got.FilledQuantity, 0.042) {
+		t.Fatalf("intent not finished: %+v %v", got, err)
+	}
+	m, _ := s.CopyTrade().GetMapping("t", "p")
+	if m.SourceRevision != 48 || m.Status != MappingStatusStoppedByRisk {
+		t.Fatalf("repair rewound the advanced source: %+v", m)
+	}
+	if gaps, err = s.CopyTrade().ListHistoricalEntryEvidenceGaps("t", 0); err != nil || len(gaps) != 0 {
+		t.Fatalf("gap still listed: %+v %v", gaps, err)
+	}
+	var pending int
+	if err = s.DB().QueryRow(`SELECT COUNT(*) FROM copy_trade_execution_order_attempts a WHERE a.intent_id=? AND `+unsettledExecutionAttemptSQL("a"), i.ID).Scan(&pending); err != nil || pending != 0 {
+		t.Fatalf("exit barrier still sees %d unsettled receipts (%v)", pending, err)
+	}
+}
+
+func TestHistoricalEntryEvidenceRepairIgnoresCurrentRevision(t *testing.T) {
+	s := resolutionStore(t)
+	resolutionMapping(t, s, "t", "p", "active", 40, 10)
+	i := resolutionIntent(t, s, "t", "p", "open_long", ExecutionIntentReconciling, 40, 10)
+	resolutionExec(t, s, `INSERT INTO copy_trade_execution_order_attempts(intent_id,attempt_no,client_order_id,exchange_order_id,status,exchange_state,filled_quantity,submitted_at) VALUES(?,1,'ct-1','o-1','SUBMITTED','FILLED',0,CURRENT_TIMESTAMP)`, i.ID)
+	gaps, err := s.CopyTrade().ListHistoricalEntryEvidenceGaps("t", 0)
+	if err != nil || len(gaps) != 0 {
+		t.Fatalf("current revision belongs to normal reconciliation: %+v %v", gaps, err)
+	}
+	if err = s.CopyTrade().BookRecoveredHistoricalEntry(i.ID); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := s.CopyTrade().GetExecutionIntentByID(i.ID)
+	if got.Status != ExecutionIntentReconciling || got.TerminalAt != nil {
+		t.Fatalf("current-revision intent was finished: %+v", got)
 	}
 }

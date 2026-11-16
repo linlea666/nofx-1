@@ -131,7 +131,12 @@ func currentCopyAdvantagePct(side string, entry, price float64) (float64, bool) 
 // least minAdvantagePct better than the leader's entry, then re-applies the
 // direction-group rule so a direction is copied completely or not at all.
 // Skipped positions stay ignored and remain selectable next time.
-func ApplyCurrentCopyPriceFilter(st *store.Store, traderID, leaderID string, tasks []store.CurrentPositionCopyTask, enabled bool, minAdvantagePct float64) ([]store.CurrentPositionCopyTask, error) {
+//
+// A position that misses the minimum but is at most manualMaxDisadvantagePct
+// worse may still be copied when the operator picks it explicitly. accepted
+// nil is the preview: such rows stay READY and are flagged PriceManualOnly.
+// Otherwise only rows in accepted are kept.
+func ApplyCurrentCopyPriceFilter(st *store.Store, traderID, leaderID string, tasks []store.CurrentPositionCopyTask, enabled bool, minAdvantagePct, manualMaxDisadvantagePct float64, accepted map[string]bool) ([]store.CurrentPositionCopyTask, error) {
 	if !enabled || len(tasks) == 0 {
 		return tasks, nil
 	}
@@ -144,7 +149,14 @@ func ApplyCurrentCopyPriceFilter(st *store.Store, traderID, leaderID string, tas
 		if !ok {
 			t.Reason = "LEADER_ENTRY_PRICE_UNAVAILABLE"
 		} else if advantage < minAdvantagePct {
-			t.Reason = "PRICE_NOT_FAVORABLE"
+			switch {
+			case manualMaxDisadvantagePct <= 0 || advantage < -manualMaxDisadvantagePct:
+				t.Reason = "PRICE_NOT_FAVORABLE"
+			case accepted == nil:
+				t.PriceManualOnly = true
+			case !accepted[t.LeaderPosID]:
+				t.Reason = "PRICE_NOT_FAVORABLE"
+			}
 		}
 	}
 	if err := st.CopyTrade().ValidateCurrentCopyCandidates(traderID, leaderID, tasks); err != nil {
@@ -178,7 +190,15 @@ func (e *Engine) prepareCurrentPositionCopy(state *AccountState) error {
 		if err != nil {
 			return err
 		}
-		positions, err = ApplyCurrentCopyPriceFilter(e.store, e.traderID, e.config.LeaderID, positions, request.PriceFilterEnabled, request.MinAdvantagePct)
+		accepted := map[string]bool{}
+		if request.SelectionMode == store.CurrentCopySelectionSelected {
+			for _, sel := range request.Selection {
+				if sel.AcceptUnfavorable {
+					accepted[sel.LeaderPosID] = true
+				}
+			}
+		}
+		positions, err = ApplyCurrentCopyPriceFilter(e.store, e.traderID, e.config.LeaderID, positions, request.PriceFilterEnabled, request.MinAdvantagePct, request.ManualMaxDisadvantagePct, accepted)
 		if err != nil {
 			return err
 		}
@@ -200,8 +220,7 @@ func (e *Engine) prepareCurrentPositionCopy(state *AccountState) error {
 			positions[p.PosID] = p
 		}
 	}
-	snapshotAt, _ := time.Parse(time.RFC3339Nano, request.SnapshotAt)
-	expired := !snapshotAt.IsZero() && time.Since(snapshotAt) > time.Duration(e.config.CopyCatchupWindowSeconds)*time.Second
+	expired := !request.WindowAnchorAt.IsZero() && currentCopyWindowExpired(request.WindowAnchorAt, e.config.CopyCatchupWindowSeconds)
 	for _, task := range request.Tasks {
 		p := positions[task.LeaderPosID]
 		changed := p == nil || !positiveFinite(p.Size) || p.OpenedMS != task.OpenedMS || string(p.Side) != task.Side || p.MarginMode != task.MarginMode
@@ -239,6 +258,13 @@ func (e *Engine) prepareCurrentPositionCopy(state *AccountState) error {
 	return e.store.CopyTrade().RefreshCurrentPositionCopy(e.traderID)
 }
 
+// currentCopyWindowExpired measures the copy window from the request's last
+// progress (seal or latest fill), so a serial batch is not cut off midway.
+// An unknown anchor fails closed.
+func currentCopyWindowExpired(anchor time.Time, windowSeconds int) bool {
+	return anchor.IsZero() || time.Since(anchor) > time.Duration(windowSeconds)*time.Second
+}
+
 func (e *Engine) currentPositionCopyFill(pos *Position, m *store.CopyTradePositionMapping) *Fill {
 	task, err := e.store.CopyTrade().CurrentPositionCopyTask(e.traderID, m.LeaderPosID)
 	if err != nil || task == nil || pos.PosID != m.LeaderPosID || pos.OpenedMS != task.OpenedMS || string(pos.Side) != task.Side || pos.MarginMode != task.MarginMode {
@@ -273,7 +299,7 @@ func (ti *TraderIntegration) validateCurrentPositionCopy(dec *decision.Decision)
 	if task == nil || task.ID != dec.CurrentPositionTaskID {
 		return leaderCopyPreflightError("SOURCE_SUPERSEDED", "current-position copy authorization changed")
 	}
-	if snapshot, err := time.Parse(time.RFC3339Nano, task.SnapshotAt); err != nil || time.Since(snapshot) > time.Duration(ti.engine.config.CopyCatchupWindowSeconds)*time.Second {
+	if currentCopyWindowExpired(task.WindowAnchorAt, ti.engine.config.CopyCatchupWindowSeconds) {
 		return leaderCopyPreflightError("SOURCE_SUPERSEDED", "本次复制窗口已结束")
 	}
 	state, err := ti.engine.currentSourceSnapshot()
@@ -303,9 +329,14 @@ func (ti *TraderIntegration) recheckCurrentCopyPrice(dec *decision.Decision, tas
 	if err != nil {
 		return leaderCopyPreflightError("SOURCE_DATA_UNAVAILABLE", "current-position price query: %v", err)
 	}
+	required := task.MinAdvantagePct
+	if task.AcceptUnfavorable && task.ManualMaxDisadvantagePct > 0 && -task.ManualMaxDisadvantagePct < required {
+		// The operator accepted this position at a bounded disadvantage.
+		required = -task.ManualMaxDisadvantagePct
+	}
 	advantage, ok := currentCopyAdvantagePct(task.Side, task.EntryPrice, price)
-	if !ok || advantage < task.MinAdvantagePct {
-		return leaderCopyPreflightError("SOURCE_SUPERSEDED", "当前价格不满足价格优势条件（优势 %.3f%% < 要求 %.3f%%），本次复制放弃，下次可重新勾选", advantage, task.MinAdvantagePct)
+	if !ok || advantage < required {
+		return leaderCopyPreflightError("SOURCE_SUPERSEDED", "当前价格不满足价格优势条件（优势 %.3f%% < 要求 %.3f%%），本次复制放弃，下次可重新勾选", advantage, required)
 	}
 	return nil
 }

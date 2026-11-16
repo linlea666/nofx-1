@@ -454,6 +454,22 @@ func (t *FuturesTrader) SetLeverage(symbol string, leverage int) error {
 			}
 		}
 	}
+	// Open positions omit symbols the account does not hold, so a fresh copy
+	// open used to change leverage and sleep on every call. The symbol config
+	// is authoritative without a position; on failure keep the old behaviour.
+	if currentLeverage == 0 {
+		configs, cfgErr := binanceCallWithClockRetry(t, "get_symbol_config", func() ([]*futures.SymbolConfig, error) {
+			return t.client.NewGetSymbolConfigService().Symbol(symbol).Do(context.Background())
+		})
+		if cfgErr == nil {
+			for _, cfg := range configs {
+				if cfg != nil && cfg.Symbol == symbol {
+					currentLeverage = cfg.Leverage
+					break
+				}
+			}
+		}
+	}
 
 	// If current leverage is already the target leverage, skip
 	if currentLeverage == leverage && currentLeverage > 0 {

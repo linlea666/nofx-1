@@ -320,6 +320,7 @@ export interface CopyConfigRequest {
   copy_current_positions_selection?: CurrentPositionCopySelection[]
   copy_current_price_filter_enabled?: boolean
   copy_current_min_advantage_pct?: number
+  copy_current_manual_max_disadvantage_pct?: number
   current_position_copy?: CurrentPositionCopyResult
 
   atr_profile_patch?: Partial<
@@ -866,6 +867,7 @@ export interface CopyTradeConfig {
   copy_current_positions_selection?: CurrentPositionCopySelection[]
   copy_current_price_filter_enabled?: boolean
   copy_current_min_advantage_pct?: number
+  copy_current_manual_max_disadvantage_pct?: number
   current_position_copy?: CurrentPositionCopyResult
 
   trader_id: string
@@ -1815,6 +1817,8 @@ export interface FollowCoinAccount {
 export interface CurrentPositionCopySelection {
   leader_pos_id: string
   opened_ms: number
+  // 价格未达最低优势、在手选容忍度内且被用户明确勾选
+  accept_unfavorable?: boolean
 }
 
 export interface CurrentPositionCopyRow {
@@ -1833,6 +1837,8 @@ export interface CurrentPositionCopyRow {
   reason: string
   intent_id: number
   filled_quantity: number
+  // 预览：未达最低优势但在手选容忍度内，可勾选、默认不勾
+  price_manual_only?: boolean
 }
 export interface CurrentPositionCopyResult {
   request_id: string
@@ -1842,6 +1848,7 @@ export interface CurrentPositionCopyResult {
   selection_mode?: 'ALL' | 'SELECTED'
   price_filter_enabled?: boolean
   min_advantage_pct?: number
+  manual_max_disadvantage_pct?: number
   selection?: CurrentPositionCopySelection[]
   tasks: CurrentPositionCopyRow[]
 }

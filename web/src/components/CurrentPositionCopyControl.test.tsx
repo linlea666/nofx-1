@@ -75,6 +75,7 @@ describe('one-time current-position copy', () => {
         copy_ratio: 1,
         price_filter_enabled: false,
         min_advantage_pct: 0,
+        manual_max_disadvantage_pct: 0,
       }
     )
     expect(screen.getByText(/保存仅登记请求/)).toBeVisible()
@@ -142,6 +143,70 @@ describe('one-time current-position copy', () => {
         min_advantage_pct: 0.5,
       })
     )
+  })
+  it('lets a slightly worse price be picked by hand but never preselects it', async () => {
+    const mixed: CurrentPositionCopyPreview = {
+      ...preview,
+      positions: [
+        preview.positions[0],
+        {
+          ...preview.positions[0],
+          id: 2,
+          leader_pos_id: 's',
+          symbol: 'SUSDT',
+          side: 'short',
+          leader_entry_price: 100,
+          reference_price: 99.8,
+          price_manual_only: true,
+        },
+      ],
+    }
+    vi.mocked(httpClient.post).mockResolvedValue({ success: true, data: mixed })
+    const onOptionsChange = vi.fn()
+    const { rerender } = render(
+      <CurrentPositionCopyControl
+        {...props}
+        enabled
+        priceFilterEnabled
+        manualMaxDisadvantagePct={1}
+        onOptionsChange={onOptionsChange}
+      />
+    )
+    await waitFor(() =>
+      expect(onOptionsChange).toHaveBeenCalledWith({
+        selection: [{ leader_pos_id: 'p', opened_ms: 1790000000000 }],
+      })
+    )
+    expect(httpClient.post).toHaveBeenCalledWith(
+      '/api/copytrade/current-positions/preview',
+      expect.objectContaining({ manual_max_disadvantage_pct: 1 })
+    )
+    const selection = [{ leader_pos_id: 'p', opened_ms: 1790000000000 }]
+    rerender(
+      <CurrentPositionCopyControl
+        {...props}
+        enabled
+        priceFilterEnabled
+        manualMaxDisadvantagePct={1}
+        selection={selection}
+        onOptionsChange={onOptionsChange}
+      />
+    )
+    expect(await screen.findByText('价格略差，可手动勾选')).toBeVisible()
+    const manual = screen.getByLabelText('复制 SUSDT')
+    expect(manual).toBeEnabled()
+    expect(manual).not.toBeChecked()
+    fireEvent.click(manual)
+    expect(onOptionsChange).toHaveBeenLastCalledWith({
+      selection: [
+        ...selection,
+        {
+          leader_pos_id: 's',
+          opened_ms: 1790000000000,
+          accept_unfavorable: true,
+        },
+      ],
+    })
   })
   it('keeps a saved selection and ticks a whole symbol+side group together', async () => {
     const legs: CurrentPositionCopyPreview = {

@@ -12,6 +12,7 @@ export interface CurrentPositionCopyOptions {
   selection?: CurrentPositionCopySelection[]
   priceFilterEnabled?: boolean
   minAdvantagePct?: number
+  manualMaxDisadvantagePct?: number
 }
 
 const directionKey = (row: CurrentPositionCopyRow) =>
@@ -27,12 +28,15 @@ const isSelected = (
       (!item.opened_ms || item.opened_ms === (row.opened_ms ?? 0))
   )
 
+// A manually picked row below the minimum advantage carries an explicit
+// acceptance; the backend then rechecks it against the manual tolerance.
 const toSelection = (
   rows: CurrentPositionCopyRow[]
 ): CurrentPositionCopySelection[] =>
   rows.map((row) => ({
     leader_pos_id: row.leader_pos_id,
     opened_ms: row.opened_ms ?? 0,
+    ...(row.price_manual_only ? { accept_unfavorable: true } : {}),
   }))
 
 const reasons: Record<string, string> = {
@@ -89,6 +93,7 @@ export function CurrentPositionCopyControl({
   selection,
   priceFilterEnabled = false,
   minAdvantagePct = 0,
+  manualMaxDisadvantagePct = 0,
   onOptionsChange,
 }: {
   enabled: boolean
@@ -103,6 +108,7 @@ export function CurrentPositionCopyControl({
   selection?: CurrentPositionCopySelection[]
   priceFilterEnabled?: boolean
   minAdvantagePct?: number
+  manualMaxDisadvantagePct?: number
   onOptionsChange?: (options: CurrentPositionCopyOptions) => void
 }) {
   const [preview, setPreview] = useState<CurrentPositionCopyPreview>()
@@ -130,6 +136,7 @@ export function CurrentPositionCopyControl({
             copy_ratio: ratio,
             price_filter_enabled: priceFilterEnabled,
             min_advantage_pct: minAdvantagePct,
+            manual_max_disadvantage_pct: manualMaxDisadvantagePct,
           }
         )
         .then((response) => {
@@ -160,14 +167,24 @@ export function CurrentPositionCopyControl({
     providerType,
     priceFilterEnabled,
     minAdvantagePct,
+    manualMaxDisadvantagePct,
   ])
   const rows = preview?.positions ?? []
   const readyRows = rows.filter((row) => row.status === 'READY')
-  // First preview: default to every copyable position. A saved or edited
-  // selection is kept as-is.
+  // Directions with a price-below-minimum leg are only copied when picked by
+  // hand (a direction is copied completely or not at all).
+  const manualDirections = new Set(
+    readyRows.filter((row) => row.price_manual_only).map(directionKey)
+  )
+  // First preview: default to every copyable position whose price meets the
+  // minimum advantage. A saved or edited selection is kept as-is.
   useEffect(() => {
     if (enabled && preview && selection === undefined && onOptionsChange)
-      onOptionsChange({ selection: toSelection(readyRows) })
+      onOptionsChange({
+        selection: toSelection(
+          readyRows.filter((row) => !manualDirections.has(directionKey(row)))
+        ),
+      })
   }, [enabled, preview])
   const chosen = readyRows.filter((row) => isSelected(row, selection))
   const total = chosen.reduce((sum, row) => sum + row.estimated_notional, 0)
@@ -247,8 +264,27 @@ export function CurrentPositionCopyControl({
                 />
                 %
               </label>
+              <label className="flex items-center gap-1">
+                手选最大劣势
+                <input
+                  type="number"
+                  step="0.1"
+                  min={0}
+                  max={20}
+                  value={manualMaxDisadvantagePct}
+                  disabled={disabled || !priceFilterEnabled}
+                  onChange={(event) => {
+                    const value = Number(event.target.value)
+                    if (Number.isFinite(value))
+                      onOptionsChange({ manualMaxDisadvantagePct: value })
+                  }}
+                  className="w-16 px-1 py-0.5 bg-[#1E2329] border border-[#2B3139] rounded text-[#EAECEF] disabled:opacity-50"
+                />
+                %
+              </label>
               <span className="text-[#848E9C]">
-                做多现价低于领航员均价、做空现价高于均价为优势；启动时和下单前各检查一次。
+                做多现价低于领航员均价、做空现价高于均价为优势；启动时和下单前各检查一次。未达最低优势但劣势不超过「手选最大劣势」的仓位默认不勾，可手动勾选（设为
+                0 关闭）。
               </span>
             </div>
           )}
@@ -348,10 +384,12 @@ export function CurrentPositionCopyControl({
                               {row.estimated_notional.toFixed(2)}
                             </td>
                             <td className="p-2">
-                              {reasons[row.reason] ||
-                                statuses[row.status] ||
-                                row.reason ||
-                                row.status}
+                              {row.status === 'READY' && row.price_manual_only
+                                ? '价格略差，可手动勾选'
+                                : reasons[row.reason] ||
+                                  statuses[row.status] ||
+                                  row.reason ||
+                                  row.status}
                             </td>
                           </tr>
                         )

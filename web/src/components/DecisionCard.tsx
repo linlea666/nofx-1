@@ -423,6 +423,14 @@ function ActionCard({
 export function DecisionCard({ decision, language }: DecisionCardProps) {
   const [showInputPrompt, setShowInputPrompt] = useState(false)
   const [showCoT, setShowCoT] = useState(false)
+  // The backend counts a SKIPPED intent as "not failed"; a skip that never
+  // reached the exchange must not read as a green success.
+  const actions = decision.decisions ?? []
+  const skippedWithoutOrder =
+    actions.length > 0 &&
+    actions.every(
+      (action) => action.execution_status === 'SKIPPED' && !action.success
+    )
 
   return (
     <div
@@ -454,20 +462,33 @@ export function DecisionCard({ decision, language }: DecisionCardProps) {
         <div
           className="px-4 py-1.5 rounded-full text-xs font-bold tracking-wider"
           style={
-            decision.success
+            skippedWithoutOrder
               ? {
-                  background: 'rgba(14, 203, 129, 0.15)',
-                  color: '#0ECB81',
-                  border: '1px solid rgba(14, 203, 129, 0.3)',
+                  background: 'rgba(132, 142, 156, 0.15)',
+                  color: '#848E9C',
+                  border: '1px solid rgba(132, 142, 156, 0.3)',
                 }
-              : {
-                  background: 'rgba(246, 70, 93, 0.15)',
-                  color: '#F6465D',
-                  border: '1px solid rgba(246, 70, 93, 0.3)',
-                }
+              : decision.success
+                ? {
+                    background: 'rgba(14, 203, 129, 0.15)',
+                    color: '#0ECB81',
+                    border: '1px solid rgba(14, 203, 129, 0.3)',
+                  }
+                : {
+                    background: 'rgba(246, 70, 93, 0.15)',
+                    color: '#F6465D',
+                    border: '1px solid rgba(246, 70, 93, 0.3)',
+                  }
           }
         >
-          {t(decision.success ? 'success' : 'failed', language)}
+          {t(
+            skippedWithoutOrder
+              ? 'skipped'
+              : decision.success
+                ? 'success'
+                : 'failed',
+            language
+          )}
         </div>
       </div>
 

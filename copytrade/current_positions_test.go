@@ -550,3 +550,46 @@ func TestCurrentPositionCopyHealthySizeChangeRetargetsOnlyProvenUnsentIntent(t *
 		})
 	}
 }
+
+// A serial batch keeps its authorization while it fills; only a stalled batch
+// (no fill within one window) expires. Production: 6 positions at ~11.5s each
+// lost the last three to a window measured from the seal.
+func TestCurrentPositionCopyWindowRestartsOnEachFill(t *testing.T) {
+	for _, progressed := range []bool{true, false} {
+		t.Run(fmt.Sprintf("progressed=%v", progressed), func(t *testing.T) {
+			e, s, _ := currentCopyEngine(t, true)
+			e.config.SyncMarginMode = false
+			if err := e.InitIgnoredPositions(); err != nil {
+				t.Fatal(err)
+			}
+			if err := e.syncLeaderState(); err != nil {
+				t.Fatal(err)
+			}
+			fills := e.detectBinancePositionSnapshotFills()
+			if len(fills) != 2 {
+				t.Fatalf("fills=%d", len(fills))
+			}
+			first := copyDecision(t, e, fills[0])
+			commitCurrentCopyFill(t, e, first)
+			second := copyDecision(t, e, fills[1])
+			filledAt := time.Now().Add(-5 * time.Second)
+			if !progressed {
+				filledAt = time.Now().Add(-90 * time.Second)
+			}
+			if _, err := s.DB().Exec(`UPDATE copy_trade_current_position_requests SET snapshot_at=?`, time.Now().Add(-2*time.Minute).UTC().Format(time.RFC3339Nano)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.DB().Exec(`UPDATE copy_trade_execution_intents SET filled_at=? WHERE id=?`, filledAt.UTC().Format("2006-01-02 15:04:05"), first.ExecutionIntentID); err != nil {
+				t.Fatal(err)
+			}
+			ti := &TraderIntegration{traderID: e.traderID, store: s, engine: e}
+			err := ti.validateCurrentPositionCopy(second)
+			if progressed && err != nil {
+				t.Fatalf("batch in progress was cut off: %v", err)
+			}
+			if !progressed && ReasonCodeOf(err) != "SOURCE_SUPERSEDED" {
+				t.Fatalf("stalled batch must expire, got %v", err)
+			}
+		})
+	}
+}
