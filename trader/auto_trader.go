@@ -1124,6 +1124,9 @@ func (at *AutoTrader) ExecuteDecision(d *decision.Decision) error {
 	if err != nil {
 		if errors.Is(err, ErrPartialCloseSkipped) {
 			logger.Infof("[%s] External decision intentionally skipped without order: %v", at.name, err)
+		} else if errors.Is(err, ErrQuantityBelowMinimum) {
+			// No order was sent; copy trading keeps the difference for a catch-up.
+			logger.Infof("[%s] External decision below exchange minimum, no order placed: %v", at.name, err)
 		} else {
 			logger.Errorf("[%s] External decision execution failed: %v", at.name, err)
 		}

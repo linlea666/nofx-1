@@ -2458,7 +2458,10 @@ func (e *Engine) commitSkippedReservedIntent(dec *decision.Decision, reasonCode 
 		side = "short"
 	}
 	var err error
-	if strings.HasPrefix(dec.Action, "open_") {
+	// Adds also carry an open_* action, but their mapping is already active:
+	// only a brand-new leader position is booked as ignored, an add advances
+	// the active mapping's revision like any other no-fill transition.
+	if strings.HasPrefix(dec.Action, "open_") && dec.CopyTradeAction == string(ActionOpen) {
 		err = e.store.CopyTrade().CommitIgnoredLeaderTransition(store.IgnoredLeaderTransition{
 			IntentID: dec.ExecutionIntentID, TraderID: e.traderID, LeaderID: e.config.LeaderID,
 			LeaderPosID: dec.LeaderPosID, SourceRevision: dec.SourceRevision, Symbol: dec.Symbol,
