@@ -375,6 +375,17 @@ func (e *Engine) SetStore(st *store.Store) {
 	e.store = st
 }
 
+// requiresStartupBaseline reports sources that must not start without a
+// complete baseline of the leader's pre-existing positions. These sources
+// derive opens purely from snapshot diffs, so without the baseline the first
+// healthy snapshot would treat every pre-existing position as a new open and
+// copy it. OKX and Binance keep their historical start-anyway behaviour.
+func (e *Engine) requiresStartupBaseline() bool {
+	return e != nil && e.config != nil &&
+		(e.isSmartMoneyMode() || e.config.ProviderType == ProviderFollowCoin ||
+			e.config.ProviderType == ProviderHyperliquid)
+}
+
 // InitIgnoredPositions 初始化领航员历史仓位（启动跟单时调用）
 // 将领航员当前所有持仓标记为 ignored，后续这些仓位的操作都不跟随
 // 这样可以 100% 准确地区分"新开仓"和"历史仓位操作"
@@ -383,6 +394,7 @@ func (e *Engine) SetStore(st *store.Store) {
 // 重启/配置变更时跳过——否则停机窗口期领航员新开的仓位（本应跟随，只是
 // 错过了开仓信号）会被误标 ignored 而永久失跟。真正的历史仓位在首次启用
 // 时已持久化为 ignored，重启后依然生效，跳过重写不会削弱保护。
+
 func (e *Engine) InitIgnoredPositions() error {
 	if e.store == nil {
 		return fmt.Errorf("store not initialized")
@@ -472,6 +484,9 @@ func (e *Engine) InitIgnoredPositions() error {
 			pos.MarginMode,
 		)
 		if err != nil {
+			if e.requiresStartupBaseline() {
+				return fmt.Errorf("标记历史仓位失败 posId=%s: %w", posID, err)
+			}
 			logger.Warnf("⚠️ [%s] 标记历史仓位失败 posId=%s: %v", e.traderID, posID, err)
 			continue
 		}

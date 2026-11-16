@@ -736,6 +736,9 @@ func (ti *TraderIntegration) StartCopyTrading() error {
 		if engine.isSmartMoneyMode() {
 			return fmt.Errorf("Smart Money 首次基线失败，拒绝启动: %w", err)
 		}
+		if engine.requiresStartupBaseline() {
+			return fmt.Errorf("读取领航员当前持仓失败，拒绝启动（否则已有仓位会被当成新开仓跟单）: %w", err)
+		}
 		logger.Warnf("⚠️ [%s] 初始化历史仓位失败: %v（兼容旧数据源继续启动）", ti.traderID, err)
 	}
 
