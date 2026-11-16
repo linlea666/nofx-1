@@ -99,24 +99,41 @@ func TestRiskIncreasePriceGate(t *testing.T) {
 	e.getFollowerMarketPrice = func(string) (float64, error) { return price, nil }
 	e.observeLeaderPosition(&SignalMatchResult{Action: ActionOpen, PosID: "p", LeaderPosition: &Position{Size: 10, EntryPrice: 100}})
 	add := &SignalMatchResult{Action: ActionAdd, PosID: "p", LeaderPosition: &Position{Size: 20, EntryPrice: 100}} // added at 100
-	dec := &decision.Decision{Action: "open_long", Symbol: "SOLUSDT"}
+	// Venue minimum 10 USDT. This change alone is 50/1000*100 = 5 USDT, so it
+	// only trades as an accumulated amount: the plain tolerance applies.
+	minNotional := func(string) (float64, error) { return 10, nil }
+	e.getFollowerMinNotional = minNotional
+	dec := &decision.Decision{Action: "open_long", Symbol: "SOLUSDT", SourceNotional: 50, CopyLeaderEquity: 1000, CopyFollowerEquity: 100}
 
 	price = 100.4 // 0.4% worse, inside the 0.5% alt tolerance
-	if wait, note := e.riskIncreasePriceGate(&Fill{Symbol: "SOLUSDT", Price: 100}, add, dec, 50); wait || !strings.Contains(note, "补仓") {
+	if wait, note := e.riskIncreasePriceGate(&Fill{Symbol: "SOLUSDT", Price: 100}, add, dec, 50); wait || !strings.Contains(note, "累积差额") {
 		t.Fatalf("inside tolerance must execute: wait=%v note=%q", wait, note)
 	}
 	price = 101 // 1% worse
 	if wait, _ := e.riskIncreasePriceGate(&Fill{Symbol: "SOLUSDT", Price: 100}, add, dec, 50); !wait {
-		t.Fatal("price beyond tolerance must wait at the leader price")
+		t.Fatal("accumulated amount beyond tolerance must wait at the leader price")
 	}
 	price = 99 // better than the leader
 	if wait, _ := e.riskIncreasePriceGate(&Fill{Symbol: "SOLUSDT", Price: 100}, add, dec, 50); wait {
 		t.Fatal("a better price must execute at once")
 	}
 
+	// A change of 1000/1000*100 = 100 USDT trades on its own: it follows
+	// directly, held back only beyond 3x the tolerance (1.5% for alts).
+	single := &decision.Decision{Action: "open_long", Symbol: "SOLUSDT", SourceNotional: 1000, CopyLeaderEquity: 1000, CopyFollowerEquity: 100}
+	price = 101
+	if wait, note := e.riskIncreasePriceGate(&Fill{Symbol: "SOLUSDT", Price: 100}, add, single, 100); wait || !strings.Contains(note, "直接跟随") {
+		t.Fatalf("executable single add must follow directly: wait=%v note=%q", wait, note)
+	}
+	price = 101.6
+	if wait, note := e.riskIncreasePriceGate(&Fill{Symbol: "SOLUSDT", Price: 100}, add, single, 100); !wait || !strings.Contains(note, "倍阈值") {
+		t.Fatalf("a late signal beyond 3x the tolerance must be held: wait=%v note=%q", wait, note)
+	}
+
 	// Cost credit: the follower bought at 95 vs the leader's 100 (5% better),
 	// so an alt add may be up to min(0.5+5, 1.5)% worse than the leader.
 	e2, _ := priceGateEngine(t, 1, 95)
+	e2.getFollowerMinNotional = minNotional
 	addPrice := 101.0
 	e2.getFollowerMarketPrice = func(string) (float64, error) { return addPrice, nil }
 	e2.observeLeaderPosition(&SignalMatchResult{Action: ActionOpen, PosID: "p", LeaderPosition: &Position{Size: 10, EntryPrice: 100}})
@@ -135,9 +152,13 @@ func TestRiskIncreasePriceGate(t *testing.T) {
 		t.Fatal(err)
 	}
 	openDec := &decision.Decision{Action: "open_long", Symbol: "SOLUSDT", ExecutionIntentID: intent.ID}
-	price = 101
+	price = 101 // 1%: an initial open follows directly up to 3x the tolerance
+	if wait, note := e.riskIncreasePriceGate(&Fill{Symbol: "SOLUSDT", Price: 100}, open, openDec, 50); wait || !strings.Contains(note, "首仓直接跟随") {
+		t.Fatalf("initial open must follow directly: wait=%v note=%q", wait, note)
+	}
+	price = 102
 	if wait, _ := e.riskIncreasePriceGate(&Fill{Symbol: "SOLUSDT", Price: 100}, open, openDec, 50); !wait {
-		t.Fatal("fresh initial open beyond tolerance must wait")
+		t.Fatal("initial open beyond 3x the tolerance must wait")
 	}
 	if _, err = st.DB().Exec(`UPDATE copy_trade_execution_intents SET created_at=? WHERE id=?`, time.Now().Add(-3*time.Minute).UTC().Format("2006-01-02 15:04:05"), intent.ID); err != nil {
 		t.Fatal(err)
@@ -158,16 +179,16 @@ func TestRiskIncreasePriceGate(t *testing.T) {
 	e3.getFollowerMarketPrice = func(string) (float64, error) { return price, nil }
 	e3.observeLeaderPosition(&SignalMatchResult{Action: ActionOpen, PosID: "p", LeaderPosition: &Position{Size: 10, EntryPrice: 100}})
 	shortDec := &decision.Decision{Action: "open_short", Symbol: "SOLUSDT"}
-	price = 99
+	price = 98
 	if wait, _ := e3.riskIncreasePriceGate(&Fill{Symbol: "SOLUSDT", Price: 100}, add, shortDec, 50); !wait {
-		t.Fatal("selling 1% below the leader must wait")
+		t.Fatal("selling 2% below the leader must wait")
 	}
 	price = 100.6
 	if wait, _ := e3.riskIncreasePriceGate(&Fill{Symbol: "SOLUSDT", Price: 100}, add, shortDec, 50); wait {
 		t.Fatal("selling above the leader must execute")
 	}
 	e3.config.ProviderType = ProviderBinance
-	price = 99
+	price = 98
 	if wait, _ := e3.riskIncreasePriceGate(&Fill{Symbol: "SOLUSDT", Price: 100}, add, shortDec, 50); wait {
 		t.Fatal("Binance must not be gated")
 	}
@@ -181,7 +202,7 @@ func TestInitialOpenWaitsThenFollowsThroughSignalFlow(t *testing.T) {
 	e.config.MinTradeWarn = 1
 	pos := fcTestPosition("ETHUSDT", SideShort, 1, 2000, 1794694989778)
 	e.provider = &fcPollTestProvider{state: &AccountState{TotalEquity: 1000, Timestamp: time.Now(), Positions: map[string]*Position{pos.PosID: pos}}}
-	price := 1990.0 // a short sold 0.5% below the leader's 2000; ETH allows 0.2%
+	price := 1985.0 // a short sold 0.75% below the leader's 2000; ETH follows directly up to 0.6%
 	e.getFollowerMarketPrice = func(string) (float64, error) { return price, nil }
 
 	e.poll()

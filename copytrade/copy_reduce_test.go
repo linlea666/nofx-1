@@ -81,6 +81,22 @@ func TestReducePriceGateReadsLeaderIntent(t *testing.T) {
 		t.Fatal("close must clear the reduce wait")
 	}
 
+	// An accumulated take-profit (this reduce alone below the venue minimum)
+	// keeps the plain tolerance; an executable one follows up to 3x it.
+	e.config.PriceToleranceAltPct = nil
+	e.getFollowerMinNotional = func(string) (float64, error) { return 500, nil } // 20% of 1000 = 200 < 500
+	accumulated := &SignalMatchResult{Action: ActionReduce, PosID: "p", LeaderPosition: &Position{Side: SideLong, Size: 80, EntryPrice: 100}}
+	price = 109 // 0.9% worse than the leader's 110
+	if wait, note := e.reducePriceGate(&Fill{Symbol: "SOLUSDT", Price: 110, Size: 20}, accumulated); !wait || !strings.Contains(note, "累积差额") {
+		t.Fatalf("accumulated take-profit beyond tolerance must wait: wait=%v note=%q", wait, note)
+	}
+	e.clearReduceWait("p")
+	e.getFollowerMinNotional = func(string) (float64, error) { return 10, nil }
+	if wait, note := e.reducePriceGate(&Fill{Symbol: "SOLUSDT", Price: 110, Size: 20}, accumulated); wait || !strings.Contains(note, "直接执行") {
+		t.Fatalf("executable take-profit must follow directly: wait=%v note=%q", wait, note)
+	}
+	e.getFollowerMinNotional = nil
+
 	// A short take-profit is below its entry and buys back.
 	short := &SignalMatchResult{Action: ActionReduce, PosID: "s", LeaderPosition: &Position{Side: SideShort, Size: 5, EntryPrice: 100}}
 	e.config.PriceToleranceAltPct = nil

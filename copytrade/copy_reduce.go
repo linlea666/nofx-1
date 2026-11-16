@@ -9,9 +9,11 @@ import (
 )
 
 // Leader reductions are read by intent: below the leader's average entry it
-// is a stop (risk control) and follows at once; above it is a take-profit,
-// which may wait for a price no worse than the leader's own reduce price,
-// but never longer than the take-profit wait (default 5 minutes).
+// is a stop (risk control) and follows at once; above it is a take-profit.
+// A take-profit large enough to trade on its own follows at market unless the
+// price is beyond directExecutionGuardMultiple x the tolerance; an amount that
+// had to be accumulated may wait for a price no worse than the leader's own
+// reduce price. Neither waits longer than the take-profit wait (default 5 min).
 const defaultTakeProfitMaxWait = 5 * time.Minute
 
 // reduceWaitState keeps the leader's reduce price from the first time the
@@ -80,16 +82,41 @@ func (e *Engine) reducePriceGate(fill *Fill, match *SignalMatchResult) (wait boo
 
 	// Reducing a long sells (higher is better); reducing a short buys.
 	tol := e.priceTolerancePct(fill.Symbol)
+	kind := "累积差额"
+	if e.singleReduceExecutable(match, fill, symbol) {
+		tol *= directExecutionGuardMultiple
+		kind = "单笔可执行，直接执行"
+	}
 	if copyPriceWithinTolerance(!long, price, ref, tol) {
 		e.clearReduceWait(match.PosID)
-		return false, fmt.Sprintf("止盈减仓 | 领航员减仓价=%.6g 现价=%.6g", ref, price)
+		return false, fmt.Sprintf("止盈减仓（%s）| 领航员减仓价=%.6g 现价=%.6g", kind, ref, price)
 	}
 	maxWait := e.takeProfitMaxWait()
 	if time.Since(since) >= maxWait {
 		e.clearReduceWait(match.PosID)
 		return false, fmt.Sprintf("止盈减仓等待 %.0f 秒后按市价执行 | 领航员减仓价=%.6g 现价=%.6g", maxWait.Seconds(), ref, price)
 	}
-	return true, fmt.Sprintf("止盈减仓价格差于领航员减仓价超过 %.2f%% | 领航员减仓价=%.6g 现价=%.6g，最多等待 %.0f 秒", tol, ref, price, maxWait.Seconds())
+	return true, fmt.Sprintf("止盈减仓（%s）价格差于领航员减仓价超过 %.2f%% | 领航员减仓价=%.6g 现价=%.6g，最多等待 %.0f 秒", kind, tol, ref, price, maxWait.Seconds())
+}
+
+// singleReduceExecutable reports whether the follower's share of this single
+// leader reduction (the leader's reduce ratio applied to the follower's live
+// position) meets the venue minimum on its own. Unknown positions count as
+// executable, so a reduction is never held back for missing data.
+func (e *Engine) singleReduceExecutable(match *SignalMatchResult, fill *Fill, symbol string) bool {
+	if e.store == nil || fill.Size <= 0 || match.LeaderPosition == nil {
+		return true
+	}
+	mapping, err := e.store.CopyTrade().GetActiveMapping(e.traderID, match.PosID)
+	if err != nil || mapping == nil {
+		return true
+	}
+	follower, err := e.readFollowerGroupPosition(mapping.Symbol, mapping.Side, mapping.MarginMode)
+	if err != nil || follower.Notional <= 0 {
+		return true
+	}
+	ratio := fill.Size / (match.LeaderPosition.Size + fill.Size)
+	return e.singleChangeExecutable(symbol, follower.Notional*ratio)
 }
 
 // logReduceWait throttles the per-poll wait log to once a minute per position.
