@@ -306,6 +306,17 @@ function App() {
     )
   }
 
+  // Private deployment: every page except the auth pages requires login.
+  // Visitors who are not signed in see the login page in place.
+  if (
+    (!user || !token) &&
+    route !== '/login' &&
+    route !== '/register' &&
+    route !== '/reset-password'
+  ) {
+    return <LoginPage />
+  }
+
   // Handle specific routes regardless of authentication
   if (route === '/login') {
     return <LoginPage />
