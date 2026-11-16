@@ -10,17 +10,22 @@ import (
 	"nofx/logger"
 )
 
-// Price-aware execution of risk increases. An open or add executes at market
-// when the follower's price is no worse than the leader's own fill price by
-// more than the symbol tolerance; otherwise the source revision is deferred
-// and re-checked every poll (a "soft limit" at the leader's price, with no
-// resting order). An initial open still follows after initialOpenMaxWait.
+// Price-aware execution of risk increases. An initial open, and an add whose
+// single leader change is large enough to trade on its own, follow at market;
+// only a deviation beyond directExecutionGuardMultiple x the tolerance (a
+// signal that arrived late into a moved market) is held back. Amounts that
+// had to be accumulated execute when the follower's price is no worse than
+// the leader's own fill price by more than the tolerance. A held-back change
+// is deferred and re-checked every poll (a "soft limit" at the leader's price,
+// with no resting order); an initial open still follows after
+// initialOpenMaxWait.
 const (
-	majorCopyPriceTolerancePct = 0.2 // BTC / ETH
-	altCopyPriceTolerancePct   = 0.5
-	initialOpenMaxWait         = 2 * time.Minute
-	costCreditMaxMultiple      = 3.0
-	priceWaitLogInterval       = time.Minute
+	majorCopyPriceTolerancePct   = 0.2 // BTC / ETH
+	altCopyPriceTolerancePct     = 0.5
+	initialOpenMaxWait           = 2 * time.Minute
+	directExecutionGuardMultiple = 3.0
+	costCreditMaxMultiple        = 3.0
+	priceWaitLogInterval         = time.Minute
 )
 
 // isMajorCopySymbol reports BTC and ETH perpetuals (any stable quote).
@@ -42,6 +47,24 @@ func copyPriceTolerancePct(symbol string) float64 {
 		return majorCopyPriceTolerancePct
 	}
 	return altCopyPriceTolerancePct
+}
+
+// singleChangeExecutable reports whether the follower's proportional amount
+// for this single leader change meets the venue minimum on its own. An
+// unknown minimum counts as executable (the venue still validates the order);
+// an unknown amount does not, so it keeps the accumulated-amount price rule.
+func (e *Engine) singleChangeExecutable(symbol string, notional float64) bool {
+	if e.getFollowerMinNotional == nil {
+		return true
+	}
+	if !(notional > 0) || math.IsInf(notional, 0) {
+		return false
+	}
+	minimum, err := e.getFollowerMinNotional(symbol)
+	if err != nil || minimum <= 0 {
+		return true
+	}
+	return notional >= minimum
 }
 
 // priceTolerancePct applies the trader's configured tolerance, if any.
@@ -168,12 +191,15 @@ func (e *Engine) riskIncreasePriceGate(fill *Fill, match *SignalMatchResult, dec
 	leader := match.LeaderPosition
 
 	if match.Action == ActionOpen {
+		// The initial open always follows directly; only an extreme deviation
+		// waits, and never longer than initialOpenMaxWait.
+		tol *= directExecutionGuardMultiple
 		ref := leader.EntryPrice
 		if ref <= 0 {
 			ref = fill.Price
 		}
 		if ref <= 0 || copyPriceWithinTolerance(buying, price, ref, tol) {
-			return false, fmt.Sprintf("首仓 | 参照价=%.6g 现价=%.6g", ref, price)
+			return false, fmt.Sprintf("首仓直接跟随 | 参照价=%.6g 现价=%.6g", ref, price)
 		}
 		if e.store != nil && dec.ExecutionIntentID > 0 {
 			if intent, getErr := e.store.CopyTrade().GetExecutionIntentByID(dec.ExecutionIntentID); getErr == nil &&
@@ -200,8 +226,19 @@ func (e *Engine) riskIncreasePriceGate(fill *Fill, match *SignalMatchResult, dec
 	if (buying && ref > leader.EntryPrice) || (!buying && ref < leader.EntryPrice) {
 		scenario = "顺势加仓"
 	}
+	single := 0.0
+	if dec.CopyLeaderEquity > 0 && dec.CopyFollowerEquity > 0 && dec.SourceNotional > 0 {
+		single = proportionalCopyNotional(dec.SourceNotional, dec.CopyLeaderEquity, dec.CopyFollowerEquity, e.config.CopyRatio)
+	}
+	if e.singleChangeExecutable(dec.Symbol, single) {
+		guard := tol * directExecutionGuardMultiple
+		if ref <= 0 || copyPriceWithinTolerance(buying, price, ref, guard) {
+			return false, fmt.Sprintf("%s（单笔可执行，直接跟随）| 参照价=%.6g 现价=%.6g", scenario, ref, price)
+		}
+		return true, fmt.Sprintf("%s单笔价格偏离领航员超过 %.2f%%（%.0f 倍阈值），信号可能已滞后 | 参照价=%.6g 现价=%.6g，等待回到范围内", scenario, guard, directExecutionGuardMultiple, ref, price)
+	}
 	if ref <= 0 || copyPriceWithinTolerance(buying, price, ref, tol) {
-		return false, fmt.Sprintf("%s | 参照价=%.6g 现价=%.6g", scenario, ref, price)
+		return false, fmt.Sprintf("%s（累积差额）| 参照价=%.6g 现价=%.6g", scenario, ref, price)
 	}
 	// Cost credit: when our average entry is better than the leader's, that
 	// advantage may absorb a worse add price, up to costCreditMaxMultiple
