@@ -552,6 +552,11 @@ type CopyConfigReq struct {
 	CopyCatchupMaxAdverseBPS *float64 `json:"copy_catchup_max_adverse_bps,omitempty"`
 	// 复制当前仓位：手选仓位可接受的最大价格劣势（%）
 	CopyCurrentManualMaxDisadvantagePct *float64 `json:"copy_current_manual_max_disadvantage_pct,omitempty"`
+	// 按领航员价格择价执行与超额纠偏（未传则保留原值）
+	CopyPriceToleranceMajorPct   *float64 `json:"copy_price_tolerance_major_pct,omitempty"`
+	CopyPriceToleranceAltPct     *float64 `json:"copy_price_tolerance_alt_pct,omitempty"`
+	CopyTakeProfitMaxWaitSeconds *int     `json:"copy_take_profit_max_wait_seconds,omitempty"`
+	CopyAutoCorrectOverweight    *bool    `json:"copy_auto_correct_overweight,omitempty"`
 
 	// Binance Web 凭证（仅 ProviderType=binance 时使用，明文存储）
 	BinanceP20T        string `json:"binance_p20t,omitempty"`       // 登录 cookie p20t
@@ -908,6 +913,10 @@ func (s *Server) handleCreateTrader(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
+		if err := store.ValidateExecutionPrefs(&store.CopyTradeConfig{CopyPriceToleranceMajorPct: req.CopyConfig.CopyPriceToleranceMajorPct, CopyPriceToleranceAltPct: req.CopyConfig.CopyPriceToleranceAltPct, CopyTakeProfitMaxWaitSeconds: req.CopyConfig.CopyTakeProfitMaxWaitSeconds}); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
 		if err := validateCurrentCopyOptionsRequest(req.CopyConfig.CopyCurrentPositionsOnce, req.CopyConfig.CopyCurrentPositionsSelection, req.CopyConfig.CopyCurrentMinAdvantagePct, req.CopyConfig.CopyCurrentManualMaxDisadvantagePct); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
@@ -1139,6 +1148,10 @@ func (s *Server) handleCreateTrader(c *gin.Context) {
 		copyConfig.CopyCurrentPriceFilterEnabled = req.CopyConfig.CopyCurrentPriceFilterEnabled
 		copyConfig.CopyCurrentMinAdvantagePct = req.CopyConfig.CopyCurrentMinAdvantagePct
 		copyConfig.CopyCurrentManualMaxDisadvantagePct = req.CopyConfig.CopyCurrentManualMaxDisadvantagePct
+		copyConfig.CopyPriceToleranceMajorPct = req.CopyConfig.CopyPriceToleranceMajorPct
+		copyConfig.CopyPriceToleranceAltPct = req.CopyConfig.CopyPriceToleranceAltPct
+		copyConfig.CopyTakeProfitMaxWaitSeconds = req.CopyConfig.CopyTakeProfitMaxWaitSeconds
+		copyConfig.CopyAutoCorrectOverweight = req.CopyConfig.CopyAutoCorrectOverweight
 		copyConfig.SyncLeverage = req.CopyConfig.SyncLeverage
 		copyConfig.SyncMarginMode = syncMarginMode
 		if req.CopyConfig.MinTradeWarn != nil {
@@ -1376,6 +1389,10 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
+		if err := store.ValidateExecutionPrefs(&store.CopyTradeConfig{CopyPriceToleranceMajorPct: req.CopyConfig.CopyPriceToleranceMajorPct, CopyPriceToleranceAltPct: req.CopyConfig.CopyPriceToleranceAltPct, CopyTakeProfitMaxWaitSeconds: req.CopyConfig.CopyTakeProfitMaxWaitSeconds}); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
 		if err := validateCurrentCopyOptionsRequest(req.CopyConfig.CopyCurrentPositionsOnce, req.CopyConfig.CopyCurrentPositionsSelection, req.CopyConfig.CopyCurrentMinAdvantagePct, req.CopyConfig.CopyCurrentManualMaxDisadvantagePct); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
@@ -1485,6 +1502,10 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 		copyConfig.CopyCurrentPriceFilterEnabled = req.CopyConfig.CopyCurrentPriceFilterEnabled
 		copyConfig.CopyCurrentMinAdvantagePct = req.CopyConfig.CopyCurrentMinAdvantagePct
 		copyConfig.CopyCurrentManualMaxDisadvantagePct = req.CopyConfig.CopyCurrentManualMaxDisadvantagePct
+		copyConfig.CopyPriceToleranceMajorPct = req.CopyConfig.CopyPriceToleranceMajorPct
+		copyConfig.CopyPriceToleranceAltPct = req.CopyConfig.CopyPriceToleranceAltPct
+		copyConfig.CopyTakeProfitMaxWaitSeconds = req.CopyConfig.CopyTakeProfitMaxWaitSeconds
+		copyConfig.CopyAutoCorrectOverweight = req.CopyConfig.CopyAutoCorrectOverweight
 		copyConfig.SyncLeverage = req.CopyConfig.SyncLeverage
 		copyConfig.SyncMarginMode = syncMarginMode
 		if req.CopyConfig.MinTradeWarn != nil {

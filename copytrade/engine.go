@@ -97,6 +97,10 @@ type Engine struct {
 	leaderEntries          map[string]leaderEntryObservation
 	leaderAdds             map[string]*leaderAddAccumulator
 	priceWaitLoggedAt      map[int64]time.Time
+	// Take-profit reductions waiting for a leader-relative price (copy_reduce.go).
+	getFollowerMinNotional func(symbol string) (float64, error)
+	reduceWaits            map[string]*reduceWaitState
+	reduceWaitLoggedAt     map[string]time.Time
 	// smartEmptySnapshotCandidateAt is an engine-level confirmation guard that
 	// survives provider-cache uncertainty within a running process. It is used
 	// when persisted follower state exists, including the first poll after a
@@ -1597,6 +1601,11 @@ type SignalMatchResult struct {
 	SourceQuoteAsset     string     // 源合约报价币种
 	ExecutionSettleAsset string     // 执行合约结算币种
 	LeaderReversed       bool       // 同一稳定 posId 已由旧方向反手到新方向
+	// Target-based reduce plan (copy_reduce.go): a ratio that brings the
+	// follower down to its proportional target, or a skip when it already is.
+	ReduceRatioOverride float64
+	ReduceSkip          bool
+	ReduceNote          string
 }
 
 // matchSignalWithMapping 统一信号匹配（核心方法）
@@ -2265,6 +2274,20 @@ func (e *Engine) processSignal(signal *TradeSignal) {
 	}
 	invalidSourceRiskIncrease := migrationRiskBlock != "" || e.blockInvalidSourceRiskIncrease(signal, matchResult)
 
+	if matchResult.Action == ActionReduce {
+		// Waiting happens before any intent exists, so a further reduce or a
+		// close by the leader simply replaces this signal on the next poll.
+		if wait, note := e.reducePriceGate(fill, matchResult); wait {
+			e.unmarkFillSources(fill)
+			e.logReduceWait(matchResult.PosID, note)
+			e.stats.SignalsSkipped++
+			return
+		} else if note != "" {
+			matchResult.ReduceNote = note
+		}
+		e.planTargetReduce(matchResult)
+	}
+
 	// ========================================
 	// Step 3: 计算跟单仓位（基于持仓变化量）
 	// ========================================
@@ -2285,7 +2308,16 @@ func (e *Engine) processSignal(signal *TradeSignal) {
 	// execution filter. This guarantees that every recognized/followed signal
 	// has an auditable terminal intent, including zero/minimum/risk skips.
 	dec := e.buildDecisionV2(signal, matchResult, copySize)
+	if matchResult.ReduceNote != "" {
+		dec.Reasoning += " | " + matchResult.ReduceNote
+	}
 	if !e.reserveExecutionIntent(&dec) {
+		return
+	}
+	if matchResult.Action == ActionReduce && matchResult.ReduceSkip {
+		e.commitSkippedReservedIntent(&dec, "PROPORTIONAL_TARGET_REACHED")
+		logger.Infof("🎯 [%s] ⏭️ 减仓跳过 | %s | %s", e.traderID, fill.Symbol, matchResult.ReduceNote)
+		e.stats.SignalsSkipped++
 		return
 	}
 	e.recordSmartMoneyProcessingDelay()
@@ -2875,6 +2907,9 @@ func (e *Engine) buildDecisionV2(signal *TradeSignal, match *SignalMatchResult, 
 	// ============================================================
 	if match.Action == ActionReduce {
 		ratio := e.calculateReduceRatioV2(signal, match)
+		if match.ReduceRatioOverride > 0 && !SupportsCopyGuard(e.config.ProviderType) {
+			ratio = match.ReduceRatioOverride
+		}
 
 		if SupportsCopyGuard(e.config.ProviderType) {
 			dec.CloseRatio = e.accountLeaderReductionRatio(signal, match)

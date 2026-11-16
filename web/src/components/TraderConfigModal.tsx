@@ -286,6 +286,10 @@ interface FormState {
   copy_max_trade_warn: number // 最大跟单金额预警（USDT），0=不预警
   copy_catchup_window_seconds: number
   copy_catchup_max_adverse_bps: number
+  copy_price_tolerance_major_pct: number
+  copy_price_tolerance_alt_pct: number
+  copy_take_profit_max_wait_seconds: number
+  copy_auto_correct_overweight: boolean
   copy_binance_source_mode: BinanceSourceMode
   copy_binance_top_trader_id: string
   // Binance Web 私有接口凭证（仅 copy_provider_type=binance 时使用）
@@ -398,6 +402,10 @@ export function TraderConfigModal({
     copy_max_trade_warn: 0,
     copy_catchup_window_seconds: 60,
     copy_catchup_max_adverse_bps: 20,
+    copy_price_tolerance_major_pct: 0.2,
+    copy_price_tolerance_alt_pct: 0.5,
+    copy_take_profit_max_wait_seconds: 300,
+    copy_auto_correct_overweight: true,
     copy_binance_source_mode: 'copy_management',
     copy_binance_top_trader_id: '',
     copy_binance_p20t: '',
@@ -650,6 +658,14 @@ export function TraderConfigModal({
             copy_catchup_window_seconds: cfg.copy_catchup_window_seconds ?? 60,
             copy_catchup_max_adverse_bps:
               cfg.copy_catchup_max_adverse_bps ?? 20,
+            copy_price_tolerance_major_pct:
+              cfg.copy_price_tolerance_major_pct ?? 0.2,
+            copy_price_tolerance_alt_pct:
+              cfg.copy_price_tolerance_alt_pct ?? 0.5,
+            copy_take_profit_max_wait_seconds:
+              cfg.copy_take_profit_max_wait_seconds ?? 300,
+            copy_auto_correct_overweight:
+              cfg.copy_auto_correct_overweight ?? true,
             copy_binance_p20t: cfg.binance_p20t ?? '',
             copy_binance_csrf_token: cfg.binance_csrf_token ?? '',
             // 风控字段回填（× 100 转百分比展示，与 store.FillRiskDefaults 保持一致）
@@ -779,6 +795,13 @@ export function TraderConfigModal({
             (cfg.risk_stop_max_account_loss_pct ?? 0) * 100,
           copy_catchup_window_seconds: cfg.copy_catchup_window_seconds ?? 60,
           copy_catchup_max_adverse_bps: cfg.copy_catchup_max_adverse_bps ?? 20,
+          copy_price_tolerance_major_pct:
+            cfg.copy_price_tolerance_major_pct ?? 0.2,
+          copy_price_tolerance_alt_pct: cfg.copy_price_tolerance_alt_pct ?? 0.5,
+          copy_take_profit_max_wait_seconds:
+            cfg.copy_take_profit_max_wait_seconds ?? 300,
+          copy_auto_correct_overweight:
+            cfg.copy_auto_correct_overweight ?? true,
           risk_stop_priority: cfg.risk_stop_priority ?? 'volatility_first',
           risk_account_pct: (cfg.risk_account_pct ?? 0.02) * 100,
           risk_cycle_loss_budget_pct:
@@ -863,6 +886,10 @@ export function TraderConfigModal({
         copy_max_trade_warn: 0,
         copy_catchup_window_seconds: 60,
         copy_catchup_max_adverse_bps: 20,
+        copy_price_tolerance_major_pct: 0.2,
+        copy_price_tolerance_alt_pct: 0.5,
+        copy_take_profit_max_wait_seconds: 300,
+        copy_auto_correct_overweight: true,
         copy_binance_source_mode: 'copy_management',
         copy_binance_top_trader_id: '',
         copy_binance_p20t: '',
@@ -1229,6 +1256,12 @@ export function TraderConfigModal({
           max_trade_warn: formData.copy_max_trade_warn,
           copy_catchup_window_seconds: formData.copy_catchup_window_seconds,
           copy_catchup_max_adverse_bps: formData.copy_catchup_max_adverse_bps,
+          copy_price_tolerance_major_pct:
+            formData.copy_price_tolerance_major_pct,
+          copy_price_tolerance_alt_pct: formData.copy_price_tolerance_alt_pct,
+          copy_take_profit_max_wait_seconds:
+            formData.copy_take_profit_max_wait_seconds,
+          copy_auto_correct_overweight: formData.copy_auto_correct_overweight,
         }
         // 账户保护 v5 风控（Copy Guard）支持 OKX 与 Binance 领航员数据源：
         // 不支持的数据源（Hyperliquid）不携带任何 risk_* 字段（含
@@ -2124,6 +2157,82 @@ export function TraderConfigModal({
                     <p className="col-span-2 text-xs text-[#848E9C]">
                       仅用于保证金暂时不足后的普通比例补齐；不会改变止损或 AI
                       二次入场预算。
+                    </p>
+                  </div>
+
+                  {/* 按领航员价格择价执行与超额纠偏（Hyperliquid / OKX / FollowCoin） */}
+                  <div className="grid grid-cols-2 gap-4">
+                    <label className="text-sm text-[#EAECEF]">
+                      BTC/ETH 价格偏移阈值（%）
+                      <input
+                        type="number"
+                        min="0"
+                        max="5"
+                        step="0.05"
+                        value={formData.copy_price_tolerance_major_pct}
+                        onChange={(e) =>
+                          handleInputChange(
+                            'copy_price_tolerance_major_pct',
+                            Number(e.target.value)
+                          )
+                        }
+                        className="mt-2 w-full px-3 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF]"
+                      />
+                    </label>
+                    <label className="text-sm text-[#EAECEF]">
+                      山寨币价格偏移阈值（%）
+                      <input
+                        type="number"
+                        min="0"
+                        max="5"
+                        step="0.05"
+                        value={formData.copy_price_tolerance_alt_pct}
+                        onChange={(e) =>
+                          handleInputChange(
+                            'copy_price_tolerance_alt_pct',
+                            Number(e.target.value)
+                          )
+                        }
+                        className="mt-2 w-full px-3 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF]"
+                      />
+                    </label>
+                    <label className="text-sm text-[#EAECEF]">
+                      止盈减仓最长等待（秒）
+                      <input
+                        type="number"
+                        min="0"
+                        max="3600"
+                        step="30"
+                        value={formData.copy_take_profit_max_wait_seconds}
+                        onChange={(e) =>
+                          handleInputChange(
+                            'copy_take_profit_max_wait_seconds',
+                            Number(e.target.value)
+                          )
+                        }
+                        className="mt-2 w-full px-3 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF]"
+                      />
+                    </label>
+                    <label className="text-sm text-[#EAECEF] flex items-center gap-2 mt-7 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        className="accent-[#F0B90B]"
+                        checked={formData.copy_auto_correct_overweight}
+                        onChange={(e) =>
+                          handleInputChange(
+                            'copy_auto_correct_overweight',
+                            e.target.checked
+                          )
+                        }
+                      />
+                      超额自动减仓到比例目标
+                    </label>
+                    <p className="col-span-2 text-xs text-[#848E9C]">
+                      开仓、加仓、止盈减仓的价格优于领航员时直接市价成交；比领航员差但在阈值内也直接市价成交；超出阈值时按领航员价等待（首仓最多
+                      2
+                      分钟，止盈减仓最多按上面的等待时长，加仓不追价）。止损减仓和平仓总是立即执行。填
+                      0 表示不接受任何不利价差。仓位持续超过比例目标 1.5
+                      倍时自动减回目标（Hyperliquid / FollowCoin 来源）。
                     </p>
                   </div>
 

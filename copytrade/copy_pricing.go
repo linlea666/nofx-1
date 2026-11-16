@@ -23,9 +23,8 @@ const (
 	priceWaitLogInterval       = time.Minute
 )
 
-// copyPriceTolerancePct is the adverse deviation from the leader's price that
-// may still be taken at market.
-func copyPriceTolerancePct(symbol string) float64 {
+// isMajorCopySymbol reports BTC and ETH perpetuals (any stable quote).
+func isMajorCopySymbol(symbol string) bool {
 	base := strings.ToUpper(strings.TrimSpace(symbol))
 	for _, quote := range []string{"USDT", "USDC", "USD"} {
 		if strings.HasSuffix(base, quote) {
@@ -33,10 +32,32 @@ func copyPriceTolerancePct(symbol string) float64 {
 			break
 		}
 	}
-	if base == "BTC" || base == "ETH" {
+	return base == "BTC" || base == "ETH"
+}
+
+// copyPriceTolerancePct is the default adverse deviation from the leader's
+// price that may still be taken at market.
+func copyPriceTolerancePct(symbol string) float64 {
+	if isMajorCopySymbol(symbol) {
 		return majorCopyPriceTolerancePct
 	}
 	return altCopyPriceTolerancePct
+}
+
+// priceTolerancePct applies the trader's configured tolerance, if any.
+func (e *Engine) priceTolerancePct(symbol string) float64 {
+	tol := copyPriceTolerancePct(symbol)
+	if e.config == nil {
+		return tol
+	}
+	configured := e.config.PriceToleranceAltPct
+	if isMajorCopySymbol(symbol) {
+		configured = e.config.PriceToleranceMajorPct
+	}
+	if configured != nil && *configured >= 0 {
+		return *configured
+	}
+	return tol
 }
 
 // copyPriceWithinTolerance reports whether executing at price is at most
@@ -79,6 +100,7 @@ func (e *Engine) observeLeaderPosition(match *SignalMatchResult) {
 	if match.Action == ActionClose || match.LeaderPosition == nil || match.LeaderPosition.Size <= 0 {
 		delete(e.leaderEntries, match.PosID)
 		delete(e.leaderAdds, match.PosID)
+		delete(e.reduceWaits, match.PosID)
 		return
 	}
 	if match.Action == ActionReduce {
@@ -142,7 +164,7 @@ func (e *Engine) riskIncreasePriceGate(fill *Fill, match *SignalMatchResult, dec
 		return false, "" // the execution preflight re-reads the venue price
 	}
 	buying := strings.HasSuffix(dec.Action, "_long")
-	tol := copyPriceTolerancePct(fill.Symbol)
+	tol := e.priceTolerancePct(fill.Symbol)
 	leader := match.LeaderPosition
 
 	if match.Action == ActionOpen {

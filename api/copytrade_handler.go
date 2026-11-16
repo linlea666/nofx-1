@@ -1371,6 +1371,11 @@ type CopyTradeConfigRequest struct {
 	Enabled                       bool                                 `json:"enabled"`
 	// 复制当前仓位：手选仓位可接受的最大价格劣势（%）
 	CopyCurrentManualMaxDisadvantagePct *float64 `json:"copy_current_manual_max_disadvantage_pct,omitempty"`
+	// 按领航员价格择价执行与超额纠偏（未传则保留原值）
+	CopyPriceToleranceMajorPct   *float64 `json:"copy_price_tolerance_major_pct,omitempty"`
+	CopyPriceToleranceAltPct     *float64 `json:"copy_price_tolerance_alt_pct,omitempty"`
+	CopyTakeProfitMaxWaitSeconds *int     `json:"copy_take_profit_max_wait_seconds,omitempty"`
+	CopyAutoCorrectOverweight    *bool    `json:"copy_auto_correct_overweight,omitempty"`
 
 	// Binance Web 凭证（仅 ProviderType=binance 时使用）
 	BinanceP20T        string `json:"binance_p20t"`
@@ -1668,6 +1673,10 @@ func (h *CopyTradeHandler) SaveConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	if err := store.ValidateExecutionPrefs(&store.CopyTradeConfig{CopyPriceToleranceMajorPct: req.CopyPriceToleranceMajorPct, CopyPriceToleranceAltPct: req.CopyPriceToleranceAltPct, CopyTakeProfitMaxWaitSeconds: req.CopyTakeProfitMaxWaitSeconds}); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 	if err := validateCurrentCopyOptionsRequest(req.CopyCurrentPositionsOnce, req.CopyCurrentPositionsSelection, req.CopyCurrentMinAdvantagePct, req.CopyCurrentManualMaxDisadvantagePct); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -1700,6 +1709,10 @@ func (h *CopyTradeHandler) SaveConfig(c *gin.Context) {
 	config.CopyCurrentPriceFilterEnabled = req.CopyCurrentPriceFilterEnabled
 	config.CopyCurrentMinAdvantagePct = req.CopyCurrentMinAdvantagePct
 	config.CopyCurrentManualMaxDisadvantagePct = req.CopyCurrentManualMaxDisadvantagePct
+	config.CopyPriceToleranceMajorPct = req.CopyPriceToleranceMajorPct
+	config.CopyPriceToleranceAltPct = req.CopyPriceToleranceAltPct
+	config.CopyTakeProfitMaxWaitSeconds = req.CopyTakeProfitMaxWaitSeconds
+	config.CopyAutoCorrectOverweight = req.CopyAutoCorrectOverweight
 	config.SyncLeverage = req.SyncLeverage
 	config.SyncMarginMode = req.SyncMarginMode
 	config.MinTradeWarn = req.MinTradeWarn
