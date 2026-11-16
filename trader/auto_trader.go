@@ -1594,6 +1594,12 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 
 	actualPositionSize := decision.PositionSizeUSD
 	leaderCopy := isCopyTrade && !isAIReentryCopyTrade(decision)
+	if leaderCopy && maxAffordablePositionSize <= 0 {
+		// Nothing is affordable: report it as margin, so the integration defers
+		// the proportional amount to the timed catch-up instead of replaying a
+		// zero-quantity order on every poll.
+		return fmt.Errorf("insufficient available margin for copy open (available=%.4f)", availableBalance)
+	}
 	if actualPositionSize > maxAffordablePositionSize {
 		// Use 98% of max to leave buffer for price fluctuation
 		adjustedSize := maxAffordablePositionSize * 0.98
@@ -1874,6 +1880,12 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 
 	actualPositionSize := decision.PositionSizeUSD
 	leaderCopy := isCopyTrade && !isAIReentryCopyTrade(decision)
+	if leaderCopy && maxAffordablePositionSize <= 0 {
+		// Nothing is affordable: report it as margin, so the integration defers
+		// the proportional amount to the timed catch-up instead of replaying a
+		// zero-quantity order on every poll.
+		return fmt.Errorf("insufficient available margin for copy open (available=%.4f)", availableBalance)
+	}
 	if actualPositionSize > maxAffordablePositionSize {
 		// Use 98% of max to leave buffer for price fluctuation
 		adjustedSize := maxAffordablePositionSize * 0.98

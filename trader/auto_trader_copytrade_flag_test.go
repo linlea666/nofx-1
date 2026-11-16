@@ -6,6 +6,7 @@ package trader
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -198,6 +199,41 @@ func TestCurrentPositionCopyMergeNeedsProvenManagedPeer(t *testing.T) {
 			}
 		} else if err == nil || len(fake.openLongClientIDs) != 0 {
 			t.Fatal("copy request alone bypassed independent position gate")
+		}
+	}
+}
+
+type noMarginCopyTrader struct{ copyFlowFakeTrader }
+
+func (f *noMarginCopyTrader) GetBalance() (map[string]interface{}, error) {
+	return map[string]interface{}{"availableBalance": 0.0, "totalEquity": 294.25}, nil
+}
+
+// Production (滚仓王-466): with no available margin every poll replayed the add
+// and failed with "invalid priced quantity quantization input". It must be a
+// margin error, which the integration defers to the timed catch-up.
+func TestLeaderCopyWithNoAvailableMarginReportsMargin(t *testing.T) {
+	for _, action := range []string{"open_long", "open_short"} {
+		fake := &noMarginCopyTrader{}
+		at := newCopyFlowAutoTrader(&fake.copyFlowFakeTrader)
+		at.trader = fake
+		dec := &decision.Decision{
+			Symbol: "BTCUSDT", Action: action, IsCopyTrade: true,
+			CopyTradeAction: "add", Reasoning: "Copy trading: add following leader", ClientOrderID: "cg44a0",
+			PositionSizeUSD: 2246.37, Leverage: 40, EntryPrice: 64566, MarginMode: "cross",
+		}
+		var err error
+		if action == "open_long" {
+			err = at.executeOpenLongWithRecord(dec, &store.DecisionAction{})
+		} else {
+			err = at.executeOpenShortWithRecord(dec, &store.DecisionAction{})
+		}
+		msg := strings.ToLower(fmt.Sprint(err))
+		if err == nil || !strings.Contains(msg, "insufficient available margin") || strings.Contains(msg, "minimum") {
+			t.Fatalf("%s: want a margin error, got %v", action, err)
+		}
+		if len(fake.openLongClientIDs) != 0 {
+			t.Fatalf("%s: no order may be submitted without margin", action)
 		}
 	}
 }

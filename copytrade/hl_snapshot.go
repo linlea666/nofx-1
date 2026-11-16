@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"nofx/logger"
 )
 
 // ============================================================================
@@ -173,8 +175,94 @@ func (p *HyperliquidProvider) readClearinghouseSnapshot(leaderID string) (*Accou
 		// 有持仓必须有可用权益：它是比例跟单的分母，残缺值会放大跟单金额。
 		return nil, fmt.Errorf("Hyperliquid account equity is invalid (%q)", raw.MarginSummary.AccountValue)
 	}
+	if len(state.Positions) > 0 {
+		state.TotalEquity = p.leaderAccountEquity(leaderID, state.TotalEquity)
+	}
 
 	return state, nil
+}
+
+// Unified-account and portfolio-margin leaders keep their collateral in the
+// spot clearinghouse: the perp marginSummary only holds what was moved into
+// perps and swings while a position is built (seen live: 14k -> 3.3M for a
+// 6.55M account), so it must never be the proportional-copy denominator.
+const (
+	hlAbstractionTTL   = 10 * time.Minute
+	hlSpotEquityMaxAge = 5 * time.Second
+)
+
+type hlLeaderEquityCache struct {
+	mu           sync.Mutex
+	mode         string
+	modeAt       time.Time
+	spotEquity   float64
+	spotEquityAt time.Time
+}
+
+var hlLeaderEquityCaches sync.Map
+
+func hlSpotCollateralMode(mode string) bool {
+	return mode == "unifiedAccount" || mode == "portfolioMargin"
+}
+
+// leaderAccountEquity returns the leader's total account equity. For spot
+// collateral modes it is the spot USDC total (perp holds included). Any
+// unknown mode or failed spot read returns 0: sizing then refuses to add risk
+// while reductions and closes, which never use equity, keep working.
+func (p *HyperliquidProvider) leaderAccountEquity(leader string, perpEquity float64) float64 {
+	key := fmt.Sprintf("%p|%s", p.client.Transport, leader)
+	value, _ := hlLeaderEquityCaches.LoadOrStore(key, &hlLeaderEquityCache{})
+	c := value.(*hlLeaderEquityCache)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.mode == "" || time.Since(c.modeAt) >= hlAbstractionTTL {
+		var mode string
+		if err := p.postWithStatus(map[string]string{"type": "userAbstraction", "user": leader}, &mode); err == nil && mode != "" {
+			if mode != c.mode {
+				logger.Infof("📊 Hyperliquid 领航员 %s 账户模式: %s", leader, mode)
+			}
+			c.mode, c.modeAt = mode, time.Now()
+		} else if c.mode == "" {
+			logger.Warnf("⚠️ Hyperliquid 领航员 %s 账户模式不可用，暂停风险增加: %v", leader, err)
+			return 0
+		}
+	}
+	if !hlSpotCollateralMode(c.mode) {
+		return perpEquity
+	}
+	if c.spotEquity > 0 && time.Since(c.spotEquityAt) < hlSpotEquityMaxAge {
+		return c.spotEquity
+	}
+	spot, err := p.readSpotUSDCTotal(leader)
+	if err != nil {
+		logger.Warnf("⚠️ Hyperliquid 统一账户领航员 %s 现货权益不可用，暂停风险增加: %v", leader, err)
+		return 0
+	}
+	c.spotEquity, c.spotEquityAt = spot, time.Now()
+	return spot
+}
+
+func (p *HyperliquidProvider) readSpotUSDCTotal(leader string) (float64, error) {
+	var raw struct {
+		Balances []struct {
+			Coin  string `json:"coin"`
+			Total string `json:"total"`
+		} `json:"balances"`
+	}
+	if err := p.postWithStatus(map[string]string{"type": "spotClearinghouseState", "user": leader}, &raw); err != nil {
+		return 0, err
+	}
+	for _, b := range raw.Balances {
+		if b.Coin != "USDC" {
+			continue
+		}
+		total, err := strconv.ParseFloat(b.Total, 64)
+		if err != nil || math.IsNaN(total) || math.IsInf(total, 0) || total <= 0 {
+			return 0, fmt.Errorf("invalid spot USDC total %q", b.Total)
+		}
+		return total, nil
+	}
+	return 0, fmt.Errorf("spot USDC balance missing")
 }
 
 // postWithStatus 与 post 行为一致，但非 200 时返回携带状态码与
