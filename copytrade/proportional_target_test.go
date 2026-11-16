@@ -39,36 +39,45 @@ func proportionalTestEngine(t *testing.T, followerValue float64) *Engine {
 	return e
 }
 
-func TestAddIsCappedAtProportionalTargetOfWholePosition(t *testing.T) {
+func TestAddIsSizedToProportionalTargetOfWholePosition(t *testing.T) {
 	target := liveLeaderNotional / liveLeaderEquity * liveFollowerEquity // ≈ 1448.6
 	add := &SignalMatchResult{Action: ActionAdd, PosID: "BTCUSDT_short"}
 
 	// The live follower (≈ 11,466 notional, 8x target) must not add at all.
 	e := proportionalTestEngine(t, 11466.5)
-	size, w := e.capAddToProportionalTarget(add, "BTCUSDT", liveLeaderEquity, liveFollowerEquity, 2246.37)
+	size, w := e.sizeAddByProportionalTarget(add, "BTCUSDT", liveLeaderEquity, liveFollowerEquity, 2246.37)
 	if size != 0 || w == nil || w.Type != WarnProportionalTargetReached {
 		t.Fatalf("overweight follower kept adding: size=%v warning=%+v", size, w)
 	}
 
 	// Below target the add is trimmed to the remaining headroom only.
 	e = proportionalTestEngine(t, 1000)
-	size, w = e.capAddToProportionalTarget(add, "BTCUSDT", liveLeaderEquity, liveFollowerEquity, 2246.37)
+	size, w = e.sizeAddByProportionalTarget(add, "BTCUSDT", liveLeaderEquity, liveFollowerEquity, 2246.37)
 	if w != nil || math.Abs(size-(target-1000)) > 1e-6 {
 		t.Fatalf("add not trimmed to headroom %.4f: size=%v warning=%+v", target-1000, size, w)
 	}
 
-	// A small add inside the headroom is unchanged.
-	size, w = e.capAddToProportionalTarget(add, "BTCUSDT", liveLeaderEquity, liveFollowerEquity, 50)
-	if w != nil || size != 50 {
-		t.Fatalf("small add altered: size=%v warning=%+v", size, w)
+	// A small add tops the follower up to the whole deficit, so earlier
+	// below-minimum adds are not lost.
+	size, w = e.sizeAddByProportionalTarget(add, "BTCUSDT", liveLeaderEquity, liveFollowerEquity, 5)
+	if w != nil || math.Abs(size-(target-1000)) > 1e-6 {
+		t.Fatalf("deficit not carried: size=%v warning=%+v", size, w)
 	}
 
+	// Without a live follower position an add never rebuilds the position.
+	e = proportionalTestEngine(t, 0)
+	size, w = e.sizeAddByProportionalTarget(add, "BTCUSDT", liveLeaderEquity, liveFollowerEquity, 5)
+	if w != nil || size != 5 {
+		t.Fatalf("flat follower add must keep the single-change size: size=%v warning=%+v", size, w)
+	}
+	e = proportionalTestEngine(t, 1000)
+
 	// Opens, other providers and unknown values are left to existing rules.
-	if size, w = e.capAddToProportionalTarget(&SignalMatchResult{Action: ActionOpen, PosID: "BTCUSDT_short"}, "BTCUSDT", liveLeaderEquity, liveFollowerEquity, 9999); size != 9999 || w != nil {
+	if size, w = e.sizeAddByProportionalTarget(&SignalMatchResult{Action: ActionOpen, PosID: "BTCUSDT_short"}, "BTCUSDT", liveLeaderEquity, liveFollowerEquity, 9999); size != 9999 || w != nil {
 		t.Fatalf("initial open must not be capped: %v %+v", size, w)
 	}
 	e.config.ProviderType = ProviderBinance
-	if size, w = e.capAddToProportionalTarget(add, "BTCUSDT", liveLeaderEquity, liveFollowerEquity, 2246.37); size != 2246.37 || w != nil {
+	if size, w = e.sizeAddByProportionalTarget(add, "BTCUSDT", liveLeaderEquity, liveFollowerEquity, 2246.37); size != 2246.37 || w != nil {
 		t.Fatalf("Binance mirrored scale must be excluded: %v %+v", size, w)
 	}
 }
@@ -76,7 +85,7 @@ func TestAddIsCappedAtProportionalTargetOfWholePosition(t *testing.T) {
 func TestAddWaitsWhenFollowerPositionsUnavailable(t *testing.T) {
 	e := proportionalTestEngine(t, 0)
 	e.getFollowerPositionsResult = func() (map[string]*Position, error) { return nil, errTestFollowerDown }
-	size, w := e.capAddToProportionalTarget(&SignalMatchResult{Action: ActionAdd, PosID: "BTCUSDT_short"}, "BTCUSDT", liveLeaderEquity, liveFollowerEquity, 100)
+	size, w := e.sizeAddByProportionalTarget(&SignalMatchResult{Action: ActionAdd, PosID: "BTCUSDT_short"}, "BTCUSDT", liveLeaderEquity, liveFollowerEquity, 100)
 	if size != 0 || w == nil || w.Type != WarnFollowerEquityUnavailable {
 		t.Fatalf("unknown follower position must defer the add: %v %+v", size, w)
 	}

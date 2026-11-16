@@ -73,12 +73,49 @@ func (e *Engine) checkLeaderEquityPlausible(symbol string, leaderEquity float64)
 	return nil
 }
 
-// capAddToProportionalTarget sizes an add against the whole position instead
-// of the single leader change: the follower may only grow up to its
+// followerGroupPosition is the follower's live exposure in one
+// symbol/side/margin-mode group.
+type followerGroupPosition struct {
+	Quantity, Notional, AvgEntry float64
+}
+
+func (e *Engine) readFollowerGroupPosition(symbol, side, marginMode string) (followerGroupPosition, error) {
+	var positions map[string]*Position
+	if e.getFollowerPositionsResult != nil {
+		var err error
+		if positions, err = e.getFollowerPositionsResult(); err != nil {
+			return followerGroupPosition{}, err
+		}
+	} else if e.getFollowerPositions != nil {
+		positions = e.getFollowerPositions()
+	}
+	var g followerGroupPosition
+	entryWeight := 0.0
+	for _, pos := range positions {
+		if pos == nil || pos.Size <= 0 || pos.Symbol != symbol || string(pos.Side) != side ||
+			(marginMode != "" && pos.MarginMode != "" && pos.MarginMode != marginMode) {
+			continue
+		}
+		g.Quantity += pos.Size
+		g.Notional += pos.PositionValue
+		if pos.EntryPrice > 0 {
+			entryWeight += pos.Size
+			g.AvgEntry += pos.EntryPrice * pos.Size
+		}
+	}
+	if entryWeight > 0 {
+		g.AvgEntry /= entryWeight
+	}
+	return g, nil
+}
+
+// sizeAddByProportionalTarget sizes an add against the whole position
+// instead of the single leader change: the follower is topped up to its
 // proportional share of every followed leader position in the same
-// symbol/side/margin-mode group. Per-change sizing alone let rounding and
-// denominator errors compound across many small adds (39x observed live).
-func (e *Engine) capAddToProportionalTarget(match *SignalMatchResult, symbol string, leaderEquity, followerEquity, copySize float64) (float64, *Warning) {
+// symbol/side/margin-mode group. Small leader adds that were below the venue
+// minimum stay in this deficit and are bought once it is executable, while
+// rounding and denominator errors can no longer compound (39x observed live).
+func (e *Engine) sizeAddByProportionalTarget(match *SignalMatchResult, symbol string, leaderEquity, followerEquity, copySize float64) (float64, *Warning) {
 	if !e.proportionalGuardsApply() || match == nil || match.Action != ActionAdd || e.store == nil || copySize <= 0 {
 		return copySize, nil
 	}
@@ -114,24 +151,12 @@ func (e *Engine) capAddToProportionalTarget(match *SignalMatchResult, symbol str
 		return copySize, nil
 	}
 
-	var positions map[string]*Position
-	if e.getFollowerPositionsResult != nil {
-		positions, err = e.getFollowerPositionsResult()
-		if err != nil {
-			return 0, &Warning{Timestamp: time.Now(), Symbol: symbol, Type: WarnFollowerEquityUnavailable,
-				Message: "跟随者持仓暂不可用，无法核对比例目标，等待恢复后重放", Executed: false}
-		}
-	} else if e.getFollowerPositions != nil {
-		positions = e.getFollowerPositions()
+	follower, err := e.readFollowerGroupPosition(mapping.Symbol, mapping.Side, mapping.MarginMode)
+	if err != nil {
+		return 0, &Warning{Timestamp: time.Now(), Symbol: symbol, Type: WarnFollowerEquityUnavailable,
+			Message: "跟随者持仓暂不可用，无法核对比例目标，等待恢复后重放", Executed: false}
 	}
-	actual := 0.0
-	for _, pos := range positions {
-		if pos == nil || pos.Size <= 0 || pos.Symbol != mapping.Symbol || string(pos.Side) != mapping.Side ||
-			(mapping.MarginMode != "" && pos.MarginMode != "" && pos.MarginMode != mapping.MarginMode) {
-			continue
-		}
-		actual += pos.PositionValue
-	}
+	actual := follower.Notional
 
 	target := proportionalCopyNotional(groupNotional, leaderEquity, followerEquity, e.config.CopyRatio)
 	headroom := target - actual
@@ -140,9 +165,13 @@ func (e *Engine) capAddToProportionalTarget(match *SignalMatchResult, symbol str
 		return 0, &Warning{Timestamp: time.Now(), Symbol: symbol, Type: WarnProportionalTargetReached,
 			Message: fmt.Sprintf("跟随仓位已达比例目标（目标 %.2f，实际 %.2f），本次加仓不跟", target, actual), Executed: false}
 	}
-	if copySize > headroom {
-		logger.Infof("📊 [%s] 加仓按比例目标收敛 | %s | 本次=%.2f → %.2f（目标=%.2f 实际=%.2f）", e.traderID, symbol, copySize, headroom, target, actual)
-		return headroom, nil
+	if actual <= 0 {
+		// A followed mapping without a live follower position is reconciled by
+		// the lifecycle checks; an add never rebuilds the whole position.
+		return math.Min(copySize, headroom), nil
 	}
-	return copySize, nil
+	if math.Abs(headroom-copySize) > 1e-9 {
+		logger.Infof("📊 [%s] 加仓按比例目标补差 | %s | 本次变化对应=%.2f → 补差=%.2f（目标=%.2f 实际=%.2f）", e.traderID, symbol, copySize, headroom, target, actual)
+	}
+	return headroom, nil
 }

@@ -660,6 +660,11 @@ func (ti *TraderIntegration) StartCopyTrading() error {
 	// 流式路径断线漏推时没有快照差分兜底，且无法追赶 NOFX 停机期间的仓位变化。
 	var engineOpts []EngineOption
 	engineOpts = append(engineOpts, WithFollowerEquity(ti.getEquityFunc()), WithFollowerPositionsResult(ti.getPositionsResultFunc()))
+	if prices, ok := ti.executor.(interface {
+		GetMarketPrice(string) (float64, error)
+	}); ok {
+		engineOpts = append(engineOpts, WithFollowerMarketPrice(prices.GetMarketPrice))
+	}
 	// Binance 启用全局凭证热加载（store.BinanceCreds 实现了 BinanceCredentialsLoader 接口）
 	// OKX/HL 路径下 NewProviderWithLoader 不会消费 loader，零影响。
 	if engineConfig.ProviderType == ProviderBinance && ti.store != nil {
@@ -1274,8 +1279,8 @@ func (ti *TraderIntegration) executeOrdinaryCatchup(intent *store.CopyTradeExecu
 		anchor = price
 	}
 	maxBPS := ti.engine.config.CopyCatchupMaxAdverseBPS
-	adverse := (strings.EqualFold(intent.Side, "long") && anchor > 0 && price > anchor*(1+maxBPS/10000)) ||
-		(strings.EqualFold(intent.Side, "short") && anchor > 0 && price < anchor*(1-maxBPS/10000))
+	isLong, isShort := strings.EqualFold(intent.Side, "long"), strings.EqualFold(intent.Side, "short")
+	adverse := anchor > 0 && (isLong || isShort) && !copyPriceWithinTolerance(isLong, price, anchor, maxBPS/100)
 	if adverse {
 		ti.terminateOrdinaryCatchup(intent, "CATCHUP_PRICE_LIMIT",
 			fmt.Sprintf("price %.8f exceeded %.2f bps adverse limit from %.8f", price, maxBPS, anchor))
