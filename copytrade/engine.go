@@ -88,6 +88,9 @@ type Engine struct {
 	leaderStateMu     sync.RWMutex
 	lastStateSync     time.Time
 	stateSyncInterval time.Duration
+	// lastSizingLeaderEquity is the denominator of the previous risk
+	// increase; a large jump is confirmed on the next poll before use.
+	lastSizingLeaderEquity float64
 	// smartEmptySnapshotCandidateAt is an engine-level confirmation guard that
 	// survives provider-cache uncertainty within a running process. It is used
 	// when persisted follower state exists, including the first poll after a
@@ -2300,6 +2303,9 @@ func (e *Engine) processSignal(signal *TradeSignal) {
 				reasonCode = "SOURCE_DATA_UNAVAILABLE"
 				break
 			}
+			if w.Type == WarnProportionalTargetReached {
+				reasonCode = "PROPORTIONAL_TARGET_REACHED"
+			}
 		}
 		if reasonCode == "SOURCE_DATA_UNAVAILABLE" {
 			e.deferReservedIntentForSourceData(&dec, reasonCode)
@@ -3118,6 +3124,10 @@ func (e *Engine) calculateCopySizeByPositionChange(signal *TradeSignal, match *S
 	signal.LeaderEquity, signal.SizingFollowerEquity, signal.SizingSourceNotional = leaderEquity, followerEquity, leaderTradeValue
 	leaderTradeRatio := leaderTradeValue / leaderEquity
 
+	if w := e.checkLeaderEquityPlausible(fill.Symbol, leaderEquity); w != nil {
+		return 0, append(warnings, *w)
+	}
+
 	// 计算跟单金额
 	copySize := proportionalCopyNotional(leaderTradeValue, leaderEquity, followerEquity, e.config.CopyRatio)
 
@@ -3125,6 +3135,11 @@ func (e *Engine) calculateCopySizeByPositionChange(signal *TradeSignal, match *S
 		e.traderID, fill.Symbol,
 		leaderTradeValue, leaderEquity, anchorSource, leaderTradeRatio*100,
 		followerEquity, e.config.CopyRatio*100, copySize)
+
+	var targetWarning *Warning
+	if copySize, targetWarning = e.capAddToProportionalTarget(match, fill.Symbol, leaderEquity, followerEquity, copySize); targetWarning != nil {
+		return 0, append(warnings, *targetWarning)
+	}
 
 	// MinTradeWarn is operational observability only. The exact venue minimum
 	// depends on symbol price, minQty/minNotional and native step (OKX ctVal);
