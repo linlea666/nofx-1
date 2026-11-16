@@ -110,8 +110,51 @@ func BuildCurrentPositionPreview(st *store.Store, traderID, leaderID string, rat
 }
 func positiveFinite(n float64) bool { return n > 0 && !math.IsNaN(n) && !math.IsInf(n, 0) }
 
+// currentCopyAdvantagePct is how much better (positive) or worse (negative)
+// the follower's current price is than the leader's average entry:
+// long  = (entry - price) / entry, short = (price - entry) / entry, in percent.
+func currentCopyAdvantagePct(side string, entry, price float64) (float64, bool) {
+	if !positiveFinite(entry) || !positiveFinite(price) {
+		return 0, false
+	}
+	switch side {
+	case string(SideLong):
+		return (entry - price) / entry * 100, true
+	case string(SideShort):
+		return (price - entry) / entry * 100, true
+	default:
+		return 0, false
+	}
+}
+
+// ApplyCurrentCopyPriceFilter skips positions whose current price is not at
+// least minAdvantagePct better than the leader's entry, then re-applies the
+// direction-group rule so a direction is copied completely or not at all.
+// Skipped positions stay ignored and remain selectable next time.
+func ApplyCurrentCopyPriceFilter(st *store.Store, traderID, leaderID string, tasks []store.CurrentPositionCopyTask, enabled bool, minAdvantagePct float64) ([]store.CurrentPositionCopyTask, error) {
+	if !enabled || len(tasks) == 0 {
+		return tasks, nil
+	}
+	for i := range tasks {
+		t := &tasks[i]
+		if t.Reason != "" {
+			continue
+		}
+		advantage, ok := currentCopyAdvantagePct(t.Side, t.EntryPrice, t.ReferencePrice)
+		if !ok {
+			t.Reason = "LEADER_ENTRY_PRICE_UNAVAILABLE"
+		} else if advantage < minAdvantagePct {
+			t.Reason = "PRICE_NOT_FAVORABLE"
+		}
+	}
+	if err := st.CopyTrade().ValidateCurrentCopyCandidates(traderID, leaderID, tasks); err != nil {
+		return nil, err
+	}
+	return tasks, nil
+}
+
 func (e *Engine) prepareCurrentPositionCopy(state *AccountState) error {
-	if e.store == nil || e.config.ProviderType != ProviderOKX {
+	if e.store == nil || !supportsCurrentPositionCopy(e.config.ProviderType) {
 		return nil
 	}
 	request, err := e.store.CopyTrade().ActiveCurrentPositionCopy(e.traderID)
@@ -135,11 +178,18 @@ func (e *Engine) prepareCurrentPositionCopy(state *AccountState) error {
 		if err != nil {
 			return err
 		}
+		positions, err = ApplyCurrentCopyPriceFilter(e.store, e.traderID, e.config.LeaderID, positions, request.PriceFilterEnabled, request.MinAdvantagePct)
+		if err != nil {
+			return err
+		}
 		generation := e.config.SourceGeneration
 		if generation <= 0 {
 			generation = 1
 		}
-		return e.store.CopyTrade().SealCurrentPositionCopy(e.traderID, e.config.LeaderID, generation, positions, state.Timestamp)
+		// The copy window starts when we observed the source. FollowCoin's
+		// snapshot timestamp is the platform's refresh time (minutes old),
+		// which would expire every task immediately.
+		return e.store.CopyTrade().SealCurrentPositionCopy(e.traderID, e.config.LeaderID, generation, positions, time.Now())
 	}
 	if request.Status != "SEALED" {
 		return nil
@@ -232,8 +282,30 @@ func (ti *TraderIntegration) validateCurrentPositionCopy(dec *decision.Decision)
 	}
 	for _, p := range state.Positions {
 		if p != nil && p.PosID == dec.LeaderPosID && p.OpenedMS == dec.SourceOpenedMS && p.MarginMode == task.MarginMode && strings.EqualFold(string(p.Side), strings.TrimPrefix(dec.Action, "open_")) && math.Abs(p.Size-dec.LeaderPosSize) <= math.Max(1e-12, p.Size*1e-8) {
-			return nil
+			return ti.recheckCurrentCopyPrice(dec, task)
 		}
 	}
 	return leaderCopyPreflightError("SOURCE_SUPERSEDED", "领航员仓位已变化，本次复制开仓失效")
+}
+
+// recheckCurrentCopyPrice re-applies the request's price rule with a live
+// follower price right before submission. A miss ends this authorization
+// without a fill; the position stays ignored and can be selected next time.
+func (ti *TraderIntegration) recheckCurrentCopyPrice(dec *decision.Decision, task *store.CurrentPositionCopyTask) error {
+	if !task.PriceFilterEnabled {
+		return nil
+	}
+	prices, ok := ti.executor.(interface{ GetMarketPrice(string) (float64, error) })
+	if !ok {
+		return leaderCopyPreflightError("SOURCE_DATA_UNAVAILABLE", "market query unavailable for current-position price rule")
+	}
+	price, err := prices.GetMarketPrice(dec.Symbol)
+	if err != nil {
+		return leaderCopyPreflightError("SOURCE_DATA_UNAVAILABLE", "current-position price query: %v", err)
+	}
+	advantage, ok := currentCopyAdvantagePct(task.Side, task.EntryPrice, price)
+	if !ok || advantage < task.MinAdvantagePct {
+		return leaderCopyPreflightError("SOURCE_SUPERSEDED", "当前价格不满足价格优势条件（优势 %.3f%% < 要求 %.3f%%），本次复制放弃，下次可重新勾选", advantage, task.MinAdvantagePct)
+	}
+	return nil
 }

@@ -43,6 +43,13 @@ func SupportsCopyGuard(p ProviderType) bool {
 	return p == ProviderOKX || p == ProviderBinance
 }
 
+// supportsCurrentPositionCopy reports sources whose positions carry a stable
+// lifecycle timestamp (OpenedMS), which every one-shot copy authorization
+// re-proves before submission. Keep in sync with store.CurrentPositionCopySupported.
+func supportsCurrentPositionCopy(p ProviderType) bool {
+	return p == ProviderOKX || p == ProviderFollowCoin
+}
+
 // snapshotPolledProvider reports sources whose signals come solely from
 // diffing an authoritative position snapshot that is re-read every poll. A
 // failed read fails the whole round closed instead of diffing a stale cache.

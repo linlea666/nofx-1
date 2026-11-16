@@ -317,6 +317,9 @@ export interface CopyTradeSourceHealth {
 export interface CopyConfigRequest {
   copy_current_positions_once?: boolean
   copy_current_positions_request_id?: string
+  copy_current_positions_selection?: CurrentPositionCopySelection[]
+  copy_current_price_filter_enabled?: boolean
+  copy_current_min_advantage_pct?: number
   current_position_copy?: CurrentPositionCopyResult
 
   atr_profile_patch?: Partial<
@@ -860,6 +863,9 @@ export interface DebatePersonalityInfo {
 export interface CopyTradeConfig {
   copy_current_positions_once?: boolean
   copy_current_positions_request_id?: string
+  copy_current_positions_selection?: CurrentPositionCopySelection[]
+  copy_current_price_filter_enabled?: boolean
+  copy_current_min_advantage_pct?: number
   current_position_copy?: CurrentPositionCopyResult
 
   trader_id: string
@@ -1805,12 +1811,20 @@ export interface FollowCoinAccount {
   status: number
 }
 
+// 一次性复制时用户勾选的领航员仓位（按开仓时间锁定同一轮持仓）
+export interface CurrentPositionCopySelection {
+  leader_pos_id: string
+  opened_ms: number
+}
+
 export interface CurrentPositionCopyRow {
   id: number
   leader_pos_id: string
   symbol: string
   side: string
   margin_mode: string
+  opened_ms?: number
+  source_size?: number
   leader_entry_price: number
   reference_price: number
   estimated_notional: number
@@ -1825,6 +1839,10 @@ export interface CurrentPositionCopyResult {
   status: string
   reason: string
   snapshot_at: string
+  selection_mode?: 'ALL' | 'SELECTED'
+  price_filter_enabled?: boolean
+  min_advantage_pct?: number
+  selection?: CurrentPositionCopySelection[]
   tasks: CurrentPositionCopyRow[]
 }
 export interface CurrentPositionCopyPreview {

@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -13,13 +14,38 @@ import (
 // fill transaction may replace it with an active mapping and acquire custody.
 const MappingStatusCopyPending = "copy_pending"
 
+// Current-position copy supports only sources whose positions carry a stable
+// lifecycle timestamp (OpenedMS): every authorization re-proves it before
+// submission. Keep in sync with copytrade.supportsCurrentPositionCopy.
+func CurrentPositionCopySupported(provider string) bool {
+	return provider == "okx" || provider == "followcoin"
+}
+
+const (
+	CurrentCopySelectionAll      = "ALL"
+	CurrentCopySelectionSelected = "SELECTED"
+
+	currentCopyMinAdvantagePctFloor   = -20.0
+	currentCopyMinAdvantagePctCeiling = 50.0
+)
+
+// CurrentPositionCopySelection is one operator-chosen leader lifecycle.
+type CurrentPositionCopySelection struct {
+	LeaderPosID string `json:"leader_pos_id"`
+	OpenedMS    int64  `json:"opened_ms"`
+}
+
 type CurrentPositionCopy struct {
-	RequestID  string                    `json:"request_id"`
-	Status     string                    `json:"status"`
-	Reason     string                    `json:"reason"`
-	CreatedAt  string                    `json:"created_at"`
-	SnapshotAt string                    `json:"snapshot_at"`
-	Tasks      []CurrentPositionCopyTask `json:"tasks"`
+	RequestID          string                         `json:"request_id"`
+	Status             string                         `json:"status"`
+	Reason             string                         `json:"reason"`
+	CreatedAt          string                         `json:"created_at"`
+	SnapshotAt         string                         `json:"snapshot_at"`
+	SelectionMode      string                         `json:"selection_mode"`
+	PriceFilterEnabled bool                           `json:"price_filter_enabled"`
+	MinAdvantagePct    float64                        `json:"min_advantage_pct"`
+	Selection          []CurrentPositionCopySelection `json:"selection"`
+	Tasks              []CurrentPositionCopyTask      `json:"tasks"`
 }
 type CurrentPositionCopyTask struct {
 	SnapshotAt     string  `json:"-"`
@@ -38,6 +64,9 @@ type CurrentPositionCopyTask struct {
 	Reason         string  `json:"reason"`
 	IntentID       int64   `json:"intent_id"`
 	FilledQuantity float64 `json:"filled_quantity"`
+	// Request-level price rule, carried for the pre-submission recheck.
+	PriceFilterEnabled bool    `json:"-"`
+	MinAdvantagePct    float64 `json:"-"`
 }
 
 func (s *CopyTradeStore) initCurrentPositionCopyTables() error {
@@ -54,8 +83,82 @@ func (s *CopyTradeStore) initCurrentPositionCopyTables() error {
  status TEXT NOT NULL,reason TEXT NOT NULL DEFAULT '',intent_id INTEGER NOT NULL DEFAULT 0,
  UNIQUE(request_id,leader_pos_id));
  CREATE INDEX IF NOT EXISTS idx_current_copy_intent ON copy_trade_current_position_tasks(intent_id);
- CREATE INDEX IF NOT EXISTS idx_current_copy_source ON copy_trade_current_position_tasks(trader_id,leader_pos_id);`)
-	return err
+ CREATE INDEX IF NOT EXISTS idx_current_copy_source ON copy_trade_current_position_tasks(trader_id,leader_pos_id);
+ CREATE TABLE IF NOT EXISTS copy_trade_current_position_selections (
+ request_id TEXT NOT NULL,leader_pos_id TEXT NOT NULL,opened_ms INTEGER NOT NULL DEFAULT 0,
+ PRIMARY KEY(request_id,leader_pos_id));`)
+	if err != nil {
+		return err
+	}
+	// Requests registered before selection existed keep copying every eligible
+	// position without a price rule.
+	for _, m := range []struct{ column, definition string }{
+		{"selection_mode", "TEXT NOT NULL DEFAULT 'ALL'"},
+		{"price_filter_enabled", "INTEGER NOT NULL DEFAULT 0"},
+		{"min_advantage_pct", "REAL NOT NULL DEFAULT 0"},
+	} {
+		if err = ensureSQLiteColumn(s.db, "copy_trade_current_position_requests", m.column, m.definition); err != nil {
+			return fmt.Errorf("migrate copy_trade_current_position_requests.%s: %w", m.column, err)
+		}
+	}
+	return nil
+}
+
+// ValidateCurrentCopyOptions lets API handlers reject a bad selection or price
+// rule before anything is persisted; the config transaction checks it again.
+func ValidateCurrentCopyOptions(c *CopyTradeConfig) error { return validateCurrentCopyOptions(c) }
+
+func validateCurrentCopyOptions(c *CopyTradeConfig) error {
+	if c.CopyCurrentMinAdvantagePct != nil {
+		v := *c.CopyCurrentMinAdvantagePct
+		if math.IsNaN(v) || math.IsInf(v, 0) || v < currentCopyMinAdvantagePctFloor || v > currentCopyMinAdvantagePctCeiling {
+			return fmt.Errorf("复制仓位的最低价格优势需在 %.0f%% 到 %.0f%% 之间", currentCopyMinAdvantagePctFloor, currentCopyMinAdvantagePctCeiling)
+		}
+	}
+	if c.CopyCurrentPositionsSelection != nil {
+		if len(c.CopyCurrentPositionsSelection) == 0 {
+			return fmt.Errorf("请至少勾选一个要复制的仓位")
+		}
+		seen := map[string]bool{}
+		for _, sel := range c.CopyCurrentPositionsSelection {
+			id := strings.TrimSpace(sel.LeaderPosID)
+			if id == "" || seen[id] || sel.OpenedMS < 0 {
+				return fmt.Errorf("复制仓位的勾选列表无效")
+			}
+			seen[id] = true
+		}
+	}
+	return nil
+}
+
+// writeCurrentCopyOptionsTx stores the operator's selection and price rule.
+// Omitted (nil) values from older clients leave the stored values untouched.
+func writeCurrentCopyOptionsTx(tx *sql.Tx, requestID string, c *CopyTradeConfig) error {
+	if c.CopyCurrentPriceFilterEnabled != nil {
+		if _, err := tx.Exec(`UPDATE copy_trade_current_position_requests SET price_filter_enabled=? WHERE request_id=?`, *c.CopyCurrentPriceFilterEnabled, requestID); err != nil {
+			return err
+		}
+	}
+	if c.CopyCurrentMinAdvantagePct != nil {
+		if _, err := tx.Exec(`UPDATE copy_trade_current_position_requests SET min_advantage_pct=? WHERE request_id=?`, *c.CopyCurrentMinAdvantagePct, requestID); err != nil {
+			return err
+		}
+	}
+	if c.CopyCurrentPositionsSelection == nil {
+		return nil
+	}
+	if _, err := tx.Exec(`UPDATE copy_trade_current_position_requests SET selection_mode=? WHERE request_id=?`, CurrentCopySelectionSelected, requestID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM copy_trade_current_position_selections WHERE request_id=?`, requestID); err != nil {
+		return err
+	}
+	for _, sel := range c.CopyCurrentPositionsSelection {
+		if _, err := tx.Exec(`INSERT INTO copy_trade_current_position_selections(request_id,leader_pos_id,opened_ms) VALUES(?,?,?)`, requestID, strings.TrimSpace(sel.LeaderPosID), sel.OpenedMS); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Registration and configuration commit together. An omitted flag from an old
@@ -81,19 +184,27 @@ func saveCurrentPositionCopyTx(tx *sql.Tx, c *CopyTradeConfig) error {
 		_, err = tx.Exec(`UPDATE copy_trade_current_position_requests SET status='CANCELLED',reason='OPERATOR_CANCELLED' WHERE trader_id=? AND status='PENDING'`, c.TraderID)
 		return err
 	}
-	if c.ProviderType != "okx" {
-		return fmt.Errorf("复制当前仓位首版仅支持 OKX 领航员")
+	if !CurrentPositionCopySupported(c.ProviderType) {
+		return fmt.Errorf("复制当前仓位目前仅支持 OKX 和 FollowCoin 领航员")
+	}
+	if err = validateCurrentCopyOptions(c); err != nil {
+		return err
 	}
 	if _, err = uuid.Parse(c.CopyCurrentPositionsRequestID); err != nil {
 		return fmt.Errorf("复制当前仓位需要有效的请求幂等编号")
 	}
 	// A response lost after saving or after execution cannot register another batch.
-	var owner, provider, leader, previousAccount string
+	var owner, provider, leader, previousAccount, requestStatus string
 	var source int
-	err = tx.QueryRow(`SELECT trader_id,provider,leader_id,source_generation,exchange_id FROM copy_trade_current_position_requests WHERE request_id=?`, c.CopyCurrentPositionsRequestID).Scan(&owner, &provider, &leader, &source, &previousAccount)
+	err = tx.QueryRow(`SELECT trader_id,provider,leader_id,source_generation,exchange_id,status FROM copy_trade_current_position_requests WHERE request_id=?`, c.CopyCurrentPositionsRequestID).Scan(&owner, &provider, &leader, &source, &previousAccount, &requestStatus)
 	if err == nil {
 		if owner != c.TraderID || provider != c.ProviderType || leader != c.LeaderID || source != c.SourceGeneration || previousAccount != account {
 			return fmt.Errorf("复制请求配置身份已改变，请重新开启复制开关")
+		}
+		// Re-saving a still-pending request may adjust its selection and price
+		// rule; a sealed or finished request is immutable.
+		if requestStatus == "PENDING" {
+			return writeCurrentCopyOptionsTx(tx, c.CopyCurrentPositionsRequestID, c)
 		}
 		return nil
 	}
@@ -106,8 +217,10 @@ func saveCurrentPositionCopyTx(tx *sql.Tx, c *CopyTradeConfig) error {
 	if _, err = tx.Exec(`UPDATE copy_trade_current_position_requests SET status='CANCELLED',reason='OPERATOR_REPLACED' WHERE trader_id=? AND status='PENDING'`, c.TraderID); err != nil {
 		return err
 	}
-	_, err = tx.Exec(`INSERT INTO copy_trade_current_position_requests(request_id,trader_id,provider,leader_id,source_generation,exchange_id,saved_generation) VALUES(?,?,?,?,?,?,?)`, c.CopyCurrentPositionsRequestID, c.TraderID, c.ProviderType, c.LeaderID, c.SourceGeneration, account, generation)
-	return err
+	if _, err = tx.Exec(`INSERT INTO copy_trade_current_position_requests(request_id,trader_id,provider,leader_id,source_generation,exchange_id,saved_generation) VALUES(?,?,?,?,?,?,?)`, c.CopyCurrentPositionsRequestID, c.TraderID, c.ProviderType, c.LeaderID, c.SourceGeneration, account, generation); err != nil {
+		return err
+	}
+	return writeCurrentCopyOptionsTx(tx, c.CopyCurrentPositionsRequestID, c)
 }
 
 func (s *CopyTradeStore) CurrentPositionCopy(traderID string) (*CurrentPositionCopy, error) {
@@ -118,16 +231,19 @@ func (s *CopyTradeStore) ActiveCurrentPositionCopy(traderID string) (*CurrentPos
 }
 func (s *CopyTradeStore) currentPositionCopy(traderID string, activeOnly bool) (*CurrentPositionCopy, error) {
 	r := &CurrentPositionCopy{Tasks: []CurrentPositionCopyTask{}}
-	query := `SELECT request_id,status,reason,created_at,snapshot_at FROM copy_trade_current_position_requests WHERE trader_id=?`
+	query := `SELECT request_id,status,reason,created_at,snapshot_at,selection_mode,price_filter_enabled,min_advantage_pct FROM copy_trade_current_position_requests WHERE trader_id=?`
 	if activeOnly {
 		query += ` AND status IN ('PENDING','SEALED')`
 	}
 	query += ` ORDER BY rowid DESC LIMIT 1`
-	err := s.db.QueryRow(query, traderID).Scan(&r.RequestID, &r.Status, &r.Reason, &r.CreatedAt, &r.SnapshotAt)
+	err := s.db.QueryRow(query, traderID).Scan(&r.RequestID, &r.Status, &r.Reason, &r.CreatedAt, &r.SnapshotAt, &r.SelectionMode, &r.PriceFilterEnabled, &r.MinAdvantagePct)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
+		return nil, err
+	}
+	if r.Selection, err = currentCopySelection(s.db, r.RequestID); err != nil {
 		return nil, err
 	}
 	rows, err := s.db.Query(`SELECT t.id,t.leader_pos_id,t.symbol,t.side,t.margin_mode,t.opened_ms,t.source_size,t.entry_price,t.reference_price,t.notional,t.leverage,
@@ -181,7 +297,9 @@ func currentCopyEligibility(q interface {
 		if leader != leaderID || symbol != p.Symbol || side != p.Side || margin != p.MarginMode {
 			return "SOURCE_IDENTITY_CHANGED", nil
 		}
-		if reason != "" && reason != "ROLLOUT_NO_CHASE" && reason != "STOPPED_SOURCE_BASELINE" {
+		// A one-shot copy that ended without any fill left no exposure; the
+		// operator may explicitly select it again in a later request.
+		if reason != "" && reason != "ROLLOUT_NO_CHASE" && reason != "STOPPED_SOURCE_BASELINE" && reason != "CURRENT_POSITION_COPY_NO_FILL" {
 			return "SOURCE_PREVIOUSLY_SKIPPED", nil
 		}
 	}
@@ -275,18 +393,37 @@ func (s *CopyTradeStore) SealCurrentPositionCopy(traderID, leaderID string, sour
 		return err
 	}
 	defer tx.Rollback()
-	var request, account string
+	var request, account, selectionMode string
 	var generation int64
-	err = tx.QueryRow(`SELECT r.request_id,t.exchange_id,t.lifecycle_generation FROM copy_trade_current_position_requests r JOIN traders t ON t.id=r.trader_id
- JOIN copy_trade_configs c ON c.trader_id=t.id WHERE r.trader_id=? AND r.status='PENDING' AND r.provider='okx' AND r.leader_id=? AND r.source_generation=?
+	err = tx.QueryRow(`SELECT r.request_id,t.exchange_id,t.lifecycle_generation,r.selection_mode FROM copy_trade_current_position_requests r JOIN traders t ON t.id=r.trader_id
+ JOIN copy_trade_configs c ON c.trader_id=t.id WHERE r.trader_id=? AND r.status='PENDING' AND r.provider IN ('okx','followcoin') AND r.leader_id=? AND r.source_generation=?
  AND r.exchange_id=t.exchange_id AND c.provider_type=r.provider AND c.leader_id=r.leader_id AND c.source_generation=r.source_generation
  AND t.lifecycle_status='RUNNING' AND t.is_running=1 AND t.decision_mode='copy_trade' AND t.lifecycle_generation>r.saved_generation
- AND EXISTS(SELECT 1 FROM trader_lifecycle_events e WHERE e.trader_id=t.id AND e.generation=t.lifecycle_generation AND e.reason_code='OPERATOR_START')`, traderID, leaderID, sourceGeneration).Scan(&request, &account, &generation)
+ AND EXISTS(SELECT 1 FROM trader_lifecycle_events e WHERE e.trader_id=t.id AND e.generation=t.lifecycle_generation AND e.reason_code='OPERATOR_START')`, traderID, leaderID, sourceGeneration).Scan(&request, &account, &generation, &selectionMode)
 	if err == sql.ErrNoRows {
 		return nil
 	}
 	if err != nil {
 		return err
+	}
+	selected := selectionMode == CurrentCopySelectionSelected
+	if selected {
+		chosen, err := currentCopySelection(tx, request)
+		if err != nil {
+			return err
+		}
+		byID := map[string]int64{}
+		for _, sel := range chosen {
+			byID[sel.LeaderPosID] = sel.OpenedMS
+		}
+		for i := range positions {
+			p := &positions[i]
+			opened, ok := byID[p.LeaderPosID]
+			// A selection names one lifecycle; a reopened position is a new choice.
+			if p.Reason == "" && (!ok || (opened > 0 && opened != p.OpenedMS)) {
+				p.Reason = "NOT_SELECTED"
+			}
+		}
 	}
 	if err = validateCurrentCopyCandidatesTx(tx, traderID, leaderID, positions); err != nil {
 		return err
@@ -300,6 +437,16 @@ func (s *CopyTradeStore) SealCurrentPositionCopy(traderID, leaderID string, sour
 			return err
 		}
 		if status != "READY" {
+			// The operator's decision covers every position in the snapshot: a
+			// position they did not copy must not be followed automatically as
+			// a "new open" merely because it has no mapping yet (e.g. opened
+			// while the trader was stopped). It stays selectable next time.
+			if selected && !strings.HasPrefix(p.LeaderPosID, "unknown:") {
+				if _, err = tx.Exec(`INSERT INTO copy_trade_position_mappings(trader_id,leader_pos_id,leader_id,symbol,side,margin_mode,status,opened_at,open_price,open_size_usd,add_count,reduce_count,updated_at)
+ VALUES(?,?,?,?,?,?,'ignored',CURRENT_TIMESTAMP,0,0,0,0,CURRENT_TIMESTAMP) ON CONFLICT(trader_id,leader_pos_id) DO NOTHING`, traderID, p.LeaderPosID, leaderID, p.Symbol, p.Side, p.MarginMode); err != nil {
+					return err
+				}
+			}
 			continue
 		}
 		if _, err = tx.Exec(`INSERT INTO copy_trade_position_mappings(trader_id,leader_pos_id,leader_id,symbol,side,margin_mode,status,source_revision,last_known_size,opened_at)
@@ -343,9 +490,9 @@ func bindCurrentPositionCopyTx(tx *sql.Tx, intent *CopyTradeExecutionIntent, id 
 }
 func (s *CopyTradeStore) CurrentPositionCopyTask(traderID, posID string) (*CurrentPositionCopyTask, error) {
 	t := &CurrentPositionCopyTask{}
-	err := s.db.QueryRow(`SELECT t.id,t.opened_ms,t.side,t.margin_mode,t.source_size,t.intent_id,r.snapshot_at FROM copy_trade_current_position_tasks t
+	err := s.db.QueryRow(`SELECT t.id,t.opened_ms,t.side,t.margin_mode,t.source_size,t.intent_id,r.snapshot_at,t.entry_price,r.price_filter_enabled,r.min_advantage_pct FROM copy_trade_current_position_tasks t
  JOIN copy_trade_current_position_requests r ON r.request_id=t.request_id JOIN traders owner ON owner.id=t.trader_id JOIN copy_trade_configs cfg ON cfg.trader_id=owner.id
- WHERE t.trader_id=? AND t.leader_pos_id=? AND t.status='READY' AND r.status='SEALED' AND r.start_generation=owner.lifecycle_generation AND owner.lifecycle_status='RUNNING' AND owner.exchange_id=r.exchange_id AND owner.decision_mode='copy_trade' AND cfg.provider_type=r.provider AND cfg.leader_id=r.leader_id AND cfg.source_generation=r.source_generation ORDER BY t.id DESC LIMIT 1`, traderID, posID).Scan(&t.ID, &t.OpenedMS, &t.Side, &t.MarginMode, &t.Size, &t.IntentID, &t.SnapshotAt)
+ WHERE t.trader_id=? AND t.leader_pos_id=? AND t.status='READY' AND r.status='SEALED' AND r.start_generation=owner.lifecycle_generation AND owner.lifecycle_status='RUNNING' AND owner.exchange_id=r.exchange_id AND owner.decision_mode='copy_trade' AND cfg.provider_type=r.provider AND cfg.leader_id=r.leader_id AND cfg.source_generation=r.source_generation ORDER BY t.id DESC LIMIT 1`, traderID, posID).Scan(&t.ID, &t.OpenedMS, &t.Side, &t.MarginMode, &t.Size, &t.IntentID, &t.SnapshotAt, &t.EntryPrice, &t.PriceFilterEnabled, &t.MinAdvantagePct)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -526,4 +673,23 @@ func (s *CopyTradeStore) RefreshUnsubmittedCurrentCopyTarget(taskID, intentID in
 		return err
 	}
 	return tx.Commit()
+}
+
+func currentCopySelection(q interface {
+	Query(string, ...interface{}) (*sql.Rows, error)
+}, requestID string) ([]CurrentPositionCopySelection, error) {
+	rows, err := q.Query(`SELECT leader_pos_id,opened_ms FROM copy_trade_current_position_selections WHERE request_id=? ORDER BY leader_pos_id`, requestID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []CurrentPositionCopySelection{}
+	for rows.Next() {
+		var sel CurrentPositionCopySelection
+		if err = rows.Scan(&sel.LeaderPosID, &sel.OpenedMS); err != nil {
+			return nil, err
+		}
+		out = append(out, sel)
+	}
+	return out, rows.Err()
 }

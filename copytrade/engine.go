@@ -2729,7 +2729,11 @@ func (e *Engine) blockInvalidSourceRiskIncrease(signal *TradeSignal, match *Sign
 	fill := signal.Fill
 	requiresValidatedValue := e.isSmartMoneyMode() ||
 		(e.config != nil && snapshotPolledProvider(e.config.ProviderType) &&
-			strings.HasPrefix(fill.ID, snapshotFillIDPrefix(e.config.ProviderType)+"|"))
+			strings.HasPrefix(fill.ID, snapshotFillIDPrefix(e.config.ProviderType)+"|")) ||
+		// One-shot current-position copies carry the same snapshot value; without
+		// this they bypassed the check and relied on the preview alone.
+		(e.config != nil && supportsCurrentPositionCopy(e.config.ProviderType) &&
+			strings.HasPrefix(fill.ID, "current-position-copy|"))
 	if !requiresValidatedValue {
 		return false
 	}

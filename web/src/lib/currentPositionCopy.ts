@@ -1,3 +1,9 @@
+import type {
+  CopyTradeConfig,
+  CopyTradeProvider,
+  CurrentPositionCopySelection,
+} from '../types'
+
 // getRandomValues also works on the HTTP self-hosted deployments supported by
 // this project; randomUUID is only available in a secure browser context.
 export function newCurrentPositionCopyRequestId(): string {
@@ -8,4 +14,40 @@ export function newCurrentPositionCopyRequestId(): string {
     byte.toString(16).padStart(2, '0')
   ).join('')
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
+}
+
+// Keep in sync with store.CurrentPositionCopySupported on the backend.
+export function currentPositionCopySupported(
+  provider: CopyTradeProvider
+): boolean {
+  return provider === 'okx' || provider === 'followcoin'
+}
+
+// Restores the selection/price options of a request that has not run yet, so
+// re-saving the trader keeps what the operator chose. Finished or cancelled
+// requests fall back to the defaults (filter on, not worse than leader entry).
+export function pendingCurrentCopyOptions(cfg: CopyTradeConfig): {
+  copy_current_positions_selection?: CurrentPositionCopySelection[]
+  copy_current_price_filter_enabled: boolean
+  copy_current_min_advantage_pct: number
+} {
+  const pending = cfg.current_position_copy
+  if (
+    !cfg.copy_current_positions_once ||
+    !pending ||
+    pending.status !== 'PENDING' ||
+    pending.request_id !== cfg.copy_current_positions_request_id
+  ) {
+    return {
+      copy_current_positions_selection: undefined,
+      copy_current_price_filter_enabled: true,
+      copy_current_min_advantage_pct: 0,
+    }
+  }
+  return {
+    copy_current_positions_selection:
+      pending.selection_mode === 'SELECTED' ? pending.selection : undefined,
+    copy_current_price_filter_enabled: pending.price_filter_enabled ?? false,
+    copy_current_min_advantage_pct: pending.min_advantage_pct ?? 0,
+  }
 }

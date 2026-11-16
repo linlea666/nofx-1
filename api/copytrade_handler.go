@@ -1353,19 +1353,22 @@ func (h *CopyTradeHandler) DismissManualSignal(c *gin.Context) {
 
 // CopyTradeConfigRequest 跟单配置请求
 type CopyTradeConfigRequest struct {
-	CopyCurrentPositionsOnce      *bool                           `json:"copy_current_positions_once,omitempty"`
-	CopyCurrentPositionsRequestID string                          `json:"copy_current_positions_request_id,omitempty"`
-	ATRProfilePatch               *store.CopyGuardATRProfilePatch `json:"atr_profile_patch,omitempty"`
-	ProviderType                  string                          `json:"provider_type" binding:"required,oneof=hyperliquid okx binance followcoin"`
-	LeaderID                      string                          `json:"leader_id"`
-	CopyRatio                     float64                         `json:"copy_ratio" binding:"required,gt=0"`
-	SyncLeverage                  bool                            `json:"sync_leverage"`
-	SyncMarginMode                bool                            `json:"sync_margin_mode"`
-	MinTradeWarn                  float64                         `json:"min_trade_warn"`
-	MaxTradeWarn                  float64                         `json:"max_trade_warn"`
-	CopyCatchupWindowSeconds      *int                            `json:"copy_catchup_window_seconds,omitempty"`
-	CopyCatchupMaxAdverseBPS      *float64                        `json:"copy_catchup_max_adverse_bps,omitempty"`
-	Enabled                       bool                            `json:"enabled"`
+	CopyCurrentPositionsOnce      *bool                                `json:"copy_current_positions_once,omitempty"`
+	CopyCurrentPositionsRequestID string                               `json:"copy_current_positions_request_id,omitempty"`
+	CopyCurrentPositionsSelection []store.CurrentPositionCopySelection `json:"copy_current_positions_selection,omitempty"`
+	CopyCurrentPriceFilterEnabled *bool                                `json:"copy_current_price_filter_enabled,omitempty"`
+	CopyCurrentMinAdvantagePct    *float64                             `json:"copy_current_min_advantage_pct,omitempty"`
+	ATRProfilePatch               *store.CopyGuardATRProfilePatch      `json:"atr_profile_patch,omitempty"`
+	ProviderType                  string                               `json:"provider_type" binding:"required,oneof=hyperliquid okx binance followcoin"`
+	LeaderID                      string                               `json:"leader_id"`
+	CopyRatio                     float64                              `json:"copy_ratio" binding:"required,gt=0"`
+	SyncLeverage                  bool                                 `json:"sync_leverage"`
+	SyncMarginMode                bool                                 `json:"sync_margin_mode"`
+	MinTradeWarn                  float64                              `json:"min_trade_warn"`
+	MaxTradeWarn                  float64                              `json:"max_trade_warn"`
+	CopyCatchupWindowSeconds      *int                                 `json:"copy_catchup_window_seconds,omitempty"`
+	CopyCatchupMaxAdverseBPS      *float64                             `json:"copy_catchup_max_adverse_bps,omitempty"`
+	Enabled                       bool                                 `json:"enabled"`
 
 	// Binance Web 凭证（仅 ProviderType=binance 时使用）
 	BinanceP20T        string `json:"binance_p20t"`
@@ -1663,6 +1666,10 @@ func (h *CopyTradeHandler) SaveConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	if err := validateCurrentCopyOptionsRequest(req.CopyCurrentPositionsOnce, req.CopyCurrentPositionsSelection, req.CopyCurrentMinAdvantagePct); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 	// 跟单系数上限校验（与前端滑杆上限 3 保持数量级一致，留出直连 API 余量）：
 	// 无上限时误传 100 会以百倍杠杆化仓位跟单，属于资金安全隐患
 	if req.CopyRatio > maxCopyRatio {
@@ -1687,6 +1694,9 @@ func (h *CopyTradeHandler) SaveConfig(c *gin.Context) {
 	config.CopyRatio = req.CopyRatio
 	config.CopyCurrentPositionsOnce = req.CopyCurrentPositionsOnce
 	config.CopyCurrentPositionsRequestID = req.CopyCurrentPositionsRequestID
+	config.CopyCurrentPositionsSelection = req.CopyCurrentPositionsSelection
+	config.CopyCurrentPriceFilterEnabled = req.CopyCurrentPriceFilterEnabled
+	config.CopyCurrentMinAdvantagePct = req.CopyCurrentMinAdvantagePct
 	config.SyncLeverage = req.SyncLeverage
 	config.SyncMarginMode = req.SyncMarginMode
 	config.MinTradeWarn = req.MinTradeWarn

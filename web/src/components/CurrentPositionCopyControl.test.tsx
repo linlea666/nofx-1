@@ -73,6 +73,8 @@ describe('one-time current-position copy', () => {
         provider_type: 'okx',
         leader_id: 'leader',
         copy_ratio: 1,
+        price_filter_enabled: false,
+        min_advantage_pct: 0,
       }
     )
     expect(screen.getByText(/保存仅登记请求/)).toBeVisible()
@@ -114,6 +116,71 @@ describe('one-time current-position copy', () => {
   it('disables registration while the trader is running', () => {
     render(<CurrentPositionCopyControl {...props} disabled />)
     expect(screen.getByRole('checkbox')).toBeDisabled()
+  })
+  it('previews FollowCoin with the price rule and defaults to every ready position', async () => {
+    const onOptionsChange = vi.fn()
+    render(
+      <CurrentPositionCopyControl
+        {...props}
+        enabled
+        providerType="followcoin"
+        priceFilterEnabled
+        minAdvantagePct={0.5}
+        onOptionsChange={onOptionsChange}
+      />
+    )
+    await waitFor(() =>
+      expect(onOptionsChange).toHaveBeenCalledWith({
+        selection: [{ leader_pos_id: 'p', opened_ms: 1790000000000 }],
+      })
+    )
+    expect(httpClient.post).toHaveBeenCalledWith(
+      '/api/copytrade/current-positions/preview',
+      expect.objectContaining({
+        provider_type: 'followcoin',
+        price_filter_enabled: true,
+        min_advantage_pct: 0.5,
+      })
+    )
+  })
+  it('keeps a saved selection and ticks a whole symbol+side group together', async () => {
+    const legs: CurrentPositionCopyPreview = {
+      ...preview,
+      positions: [
+        preview.positions[0],
+        { ...preview.positions[0], id: 2, leader_pos_id: 'q' },
+        {
+          ...preview.positions[0],
+          id: 3,
+          leader_pos_id: 'r',
+          symbol: 'BTCUSDT',
+          status: 'SKIPPED',
+          reason: 'PRICE_NOT_FAVORABLE',
+        },
+      ],
+    }
+    vi.mocked(httpClient.post).mockResolvedValue({ success: true, data: legs })
+    const onOptionsChange = vi.fn()
+    render(
+      <CurrentPositionCopyControl
+        {...props}
+        enabled
+        selection={[]}
+        onOptionsChange={onOptionsChange}
+      />
+    )
+    expect(
+      await screen.findByText('价格无优势，本次不复制（下次可再选）')
+    ).toBeVisible()
+    expect(onOptionsChange).not.toHaveBeenCalled()
+    expect(screen.getByLabelText('复制 BTCUSDT')).toBeDisabled()
+    fireEvent.click(screen.getAllByLabelText('复制 ETHUSDT')[0])
+    expect(onOptionsChange).toHaveBeenCalledWith({
+      selection: [
+        { leader_pos_id: 'p', opened_ms: 1790000000000 },
+        { leader_pos_id: 'q', opened_ms: 1790000000000 },
+      ],
+    })
   })
   it('generates distinct UUID v4 request identities without secure-context randomUUID', () => {
     const a = newCurrentPositionCopyRequestId(),

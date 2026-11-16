@@ -15,22 +15,51 @@ import (
 	"nofx/trader"
 )
 
+// newCurrentCopySource builds the read-only leader source for a preview.
+// Replaceable in tests; production never mutates anything through it.
+var newCurrentCopySource = func(st *store.Store, provider, leaderID string) (copytrade.LeaderProvider, error) {
+	switch provider {
+	case string(copytrade.ProviderOKX):
+		return copytrade.NewOKXProvider(), nil
+	case string(copytrade.ProviderFollowCoin):
+		if _, err := copytrade.ParseFollowCoinAPIID(leaderID); err != nil {
+			return nil, err
+		}
+		token, err := st.FollowCoinCreds().LoadFollowCoinToken(store.FollowCoinCredsLabelDefault)
+		if err != nil {
+			return nil, err
+		}
+		if token == "" {
+			return nil, fmt.Errorf("请先在「FollowCoin 凭证」中配置 token")
+		}
+		return copytrade.NewFollowCoinProviderWithLoader(st.FollowCoinCreds()), nil
+	default:
+		return nil, fmt.Errorf("复制当前仓位目前仅支持 OKX 和 FollowCoin 领航员")
+	}
+}
+
 // PreviewCurrentPositions accepts draft settings, and never saves configuration,
 // initializes a trading runtime, or sends any exchange mutation.
 func (h *CopyTradeHandler) PreviewCurrentPositions(c *gin.Context) {
 	var req struct {
-		TraderID   string  `json:"trader_id"`
-		ExchangeID string  `json:"exchange_id"`
-		Provider   string  `json:"provider_type"`
-		LeaderID   string  `json:"leader_id"`
-		Ratio      float64 `json:"copy_ratio"`
+		TraderID           string  `json:"trader_id"`
+		ExchangeID         string  `json:"exchange_id"`
+		Provider           string  `json:"provider_type"`
+		LeaderID           string  `json:"leader_id"`
+		Ratio              float64 `json:"copy_ratio"`
+		PriceFilterEnabled bool    `json:"price_filter_enabled"`
+		MinAdvantagePct    float64 `json:"min_advantage_pct"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if req.Provider != "okx" || strings.TrimSpace(req.LeaderID) == "" || req.Ratio <= 0 || req.Ratio > maxCopyRatio || math.IsNaN(req.Ratio) || math.IsInf(req.Ratio, 0) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "需要 OKX 领航员、执行账户及有效跟单系数"})
+	if !store.CurrentPositionCopySupported(req.Provider) || strings.TrimSpace(req.LeaderID) == "" || req.Ratio <= 0 || req.Ratio > maxCopyRatio || math.IsNaN(req.Ratio) || math.IsInf(req.Ratio, 0) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "需要 OKX 或 FollowCoin 领航员、执行账户及有效跟单系数"})
+		return
+	}
+	if math.IsNaN(req.MinAdvantagePct) || math.IsInf(req.MinAdvantagePct, 0) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "价格优势阈值无效"})
 		return
 	}
 	userID := c.GetString("user_id")
@@ -55,7 +84,10 @@ func (h *CopyTradeHandler) PreviewCurrentPositions(c *gin.Context) {
 		return
 	}
 	result, err := func() (gin.H, error) {
-		source := copytrade.NewOKXProvider()
+		source, err := newCurrentCopySource(h.store, req.Provider, req.LeaderID)
+		if err != nil {
+			return nil, err
+		}
 		state, err := source.GetAccountState(req.LeaderID)
 		if err != nil {
 			return nil, err
@@ -83,6 +115,9 @@ func (h *CopyTradeHandler) PreviewCurrentPositions(c *gin.Context) {
 		if err != nil {
 			return nil, err
 		}
+		if tasks, err = copytrade.ApplyCurrentCopyPriceFilter(h.store, req.TraderID, req.LeaderID, tasks, req.PriceFilterEnabled, req.MinAdvantagePct); err != nil {
+			return nil, err
+		}
 		return gin.H{"positions": tasks, "snapshot_at": state.Timestamp, "leader_equity": state.TotalEquity, "follower_equity": equity}, nil
 	}()
 	if err != nil {
@@ -92,14 +127,23 @@ func (h *CopyTradeHandler) PreviewCurrentPositions(c *gin.Context) {
 	c.JSON(http.StatusOK, result)
 }
 
+// validateCurrentCopyOptionsRequest checks the selection and price rule of an
+// enabled registration before the trader endpoint persists anything.
+func validateCurrentCopyOptionsRequest(enabled *bool, selection []store.CurrentPositionCopySelection, minPct *float64) error {
+	if enabled == nil || !*enabled {
+		return nil
+	}
+	return store.ValidateCurrentCopyOptions(&store.CopyTradeConfig{CopyCurrentPositionsSelection: selection, CopyCurrentMinAdvantagePct: minPct})
+}
+
 // Validate before the general trader endpoint saves unrelated trader fields.
 // The config transaction repeats the authoritative generation/identity check.
 func validateCurrentCopyRegistration(st *store.Store, traderID, accountID, mode, provider, leader, requestID string, enabled *bool) error {
 	if enabled == nil || !*enabled {
 		return nil
 	}
-	if mode != "copy_trade" || provider != "okx" || strings.TrimSpace(leader) == "" {
-		return fmt.Errorf("复制当前仓位需要 OKX 领航员及跟单模式")
+	if mode != "copy_trade" || !store.CurrentPositionCopySupported(provider) || strings.TrimSpace(leader) == "" {
+		return fmt.Errorf("复制当前仓位目前仅支持 OKX 和 FollowCoin 领航员（跟单模式）")
 	}
 	if _, err := uuid.Parse(requestID); err != nil {
 		return fmt.Errorf("复制当前仓位需要有效的请求幂等编号")

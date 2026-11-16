@@ -1,17 +1,51 @@
 import { useEffect, useState } from 'react'
 import { httpClient } from '../lib/httpClient'
 import type {
+  CopyTradeProvider,
   CurrentPositionCopyPreview,
   CurrentPositionCopyResult,
+  CurrentPositionCopyRow,
+  CurrentPositionCopySelection,
 } from '../types'
+
+export interface CurrentPositionCopyOptions {
+  selection?: CurrentPositionCopySelection[]
+  priceFilterEnabled?: boolean
+  minAdvantagePct?: number
+}
+
+const directionKey = (row: CurrentPositionCopyRow) =>
+  `${row.symbol}|${row.side}`
+
+const isSelected = (
+  row: CurrentPositionCopyRow,
+  selection: CurrentPositionCopySelection[] | undefined
+) =>
+  !!selection?.some(
+    (item) =>
+      item.leader_pos_id === row.leader_pos_id &&
+      (!item.opened_ms || item.opened_ms === (row.opened_ms ?? 0))
+  )
+
+const toSelection = (
+  rows: CurrentPositionCopyRow[]
+): CurrentPositionCopySelection[] =>
+  rows.map((row) => ({
+    leader_pos_id: row.leader_pos_id,
+    opened_ms: row.opened_ms ?? 0,
+  }))
 
 const reasons: Record<string, string> = {
   SOURCE_IDENTITY_UNAVAILABLE: '源仓身份不完整',
   SOURCE_IDENTITY_CHANGED: '源仓周期或保证金模式已改变',
   SOURCE_VALUE_UNAVAILABLE: '源仓名义金额不可核实',
-  ALREADY_PARTICIPATED_OR_UNSETTLED: '已参与过本轮，或存在待对账订单',
-  SOURCE_NOT_INITIAL_BASELINE: '已跟随、停跟或退出，本次不复制',
+  ALREADY_PARTICIPATED_OR_UNSETTLED:
+    '曾跟随过本仓位或存在待对账订单，不支持重新复制',
+  SOURCE_NOT_INITIAL_BASELINE: '曾跟随过（已停跟或已结束），不支持重新复制',
   SOURCE_PREVIOUSLY_SKIPPED: '本轮已有跳过记录',
+  NOT_SELECTED: '未勾选，本次不复制（下次可再选）',
+  PRICE_NOT_FAVORABLE: '价格无优势，本次不复制（下次可再选）',
+  LEADER_ENTRY_PRICE_UNAVAILABLE: '领航员均价不可用，无法判断价格优势',
   GROUP_ENTRY_BLOCKED: '该方向处于暂停或风险退出状态',
   GROUP_PARTICIPATION_CONFLICT: '同方向源仓参与状态不一致',
   INDEPENDENT_SAME_SIDE_POSITION: '账户已有独立同向仓位',
@@ -51,6 +85,11 @@ export function CurrentPositionCopyControl({
   ratio,
   result,
   onChange,
+  providerType = 'okx',
+  selection,
+  priceFilterEnabled = false,
+  minAdvantagePct = 0,
+  onOptionsChange,
 }: {
   enabled: boolean
   disabled: boolean
@@ -60,6 +99,11 @@ export function CurrentPositionCopyControl({
   ratio: number
   result?: CurrentPositionCopyResult
   onChange: (enabled: boolean) => void
+  providerType?: CopyTradeProvider
+  selection?: CurrentPositionCopySelection[]
+  priceFilterEnabled?: boolean
+  minAdvantagePct?: number
+  onOptionsChange?: (options: CurrentPositionCopyOptions) => void
 }) {
   const [preview, setPreview] = useState<CurrentPositionCopyPreview>()
   const [error, setError] = useState('')
@@ -81,9 +125,11 @@ export function CurrentPositionCopyControl({
           {
             trader_id: traderId,
             exchange_id: exchangeId,
-            provider_type: 'okx',
+            provider_type: providerType,
             leader_id: leaderId,
             copy_ratio: ratio,
+            price_filter_enabled: priceFilterEnabled,
+            min_advantage_pct: minAdvantagePct,
           }
         )
         .then((response) => {
@@ -104,11 +150,40 @@ export function CurrentPositionCopyControl({
       cancelled = true
       clearTimeout(timer)
     }
-  }, [enabled, traderId, exchangeId, leaderId, ratio, refresh])
+  }, [
+    enabled,
+    traderId,
+    exchangeId,
+    leaderId,
+    ratio,
+    refresh,
+    providerType,
+    priceFilterEnabled,
+    minAdvantagePct,
+  ])
   const rows = preview?.positions ?? []
-  const total = rows
-    .filter((row) => row.status === 'READY')
-    .reduce((sum, row) => sum + row.estimated_notional, 0)
+  const readyRows = rows.filter((row) => row.status === 'READY')
+  // First preview: default to every copyable position. A saved or edited
+  // selection is kept as-is.
+  useEffect(() => {
+    if (enabled && preview && selection === undefined && onOptionsChange)
+      onOptionsChange({ selection: toSelection(readyRows) })
+  }, [enabled, preview])
+  const chosen = readyRows.filter((row) => isSelected(row, selection))
+  const total = chosen.reduce((sum, row) => sum + row.estimated_notional, 0)
+  // Same symbol+side legs must be copied together (direction-group rule).
+  const toggleDirection = (row: CurrentPositionCopyRow, checked: boolean) => {
+    if (!onOptionsChange) return
+    const group = readyRows.filter(
+      (other) => directionKey(other) === directionKey(row)
+    )
+    const rest = (selection ?? []).filter(
+      (item) => !group.some((g) => g.leader_pos_id === item.leader_pos_id)
+    )
+    onOptionsChange({
+      selection: checked ? [...rest, ...toSelection(group)] : rest,
+    })
+  }
   return (
     <div className="p-4 bg-[#0B0E11] border border-[#F0B90B33] rounded-lg space-y-3">
       <label className="flex items-start gap-3 cursor-pointer">
@@ -136,8 +211,47 @@ export function CurrentPositionCopyControl({
       {enabled && (
         <>
           <p className="text-xs text-[#848E9C]">
-            自动复制所有符合条件的当前仓位。价格对比仅供参考，不限制入场；实际执行仍受余额、合约规则及补齐窗口约束。
+            勾选要复制的仓位，未勾选的本次不复制、下次可再选。实际执行仍受余额、合约规则及补齐窗口约束。
           </p>
+          {onOptionsChange && (
+            <div className="flex flex-wrap items-center gap-3 text-xs text-[#EAECEF]">
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  className="accent-[#F0B90B]"
+                  checked={priceFilterEnabled}
+                  disabled={disabled}
+                  onChange={(event) =>
+                    onOptionsChange({
+                      priceFilterEnabled: event.target.checked,
+                    })
+                  }
+                />
+                只复制价格有优势的仓位
+              </label>
+              <label className="flex items-center gap-1">
+                最低优势
+                <input
+                  type="number"
+                  step="0.1"
+                  min={-20}
+                  max={50}
+                  value={minAdvantagePct}
+                  disabled={disabled || !priceFilterEnabled}
+                  onChange={(event) => {
+                    const value = Number(event.target.value)
+                    if (Number.isFinite(value))
+                      onOptionsChange({ minAdvantagePct: value })
+                  }}
+                  className="w-16 px-1 py-0.5 bg-[#1E2329] border border-[#2B3139] rounded text-[#EAECEF] disabled:opacity-50"
+                />
+                %
+              </label>
+              <span className="text-[#848E9C]">
+                做多现价低于领航员均价、做空现价高于均价为优势；启动时和下单前各检查一次。
+              </span>
+            </div>
+          )}
           <button
             type="button"
             disabled={loading || !leaderId || !exchangeId}
@@ -160,8 +274,8 @@ export function CurrentPositionCopyControl({
             <>
               <p className="text-xs text-[#848E9C]">
                 快照：{new Date(preview.snapshot_at).toLocaleString()} ·
-                符合条件 {rows.filter((row) => row.status === 'READY').length}{' '}
-                仓 · 预计名义金额 {total.toFixed(2)}{' '}
+                符合条件 {readyRows.length} 仓 · 已勾选 {chosen.length} 仓 ·
+                预计名义金额 {total.toFixed(2)}{' '}
                 USDT（非保证金，执行时按真实合约最小量取整）
               </p>
               {rows.length === 0 ? (
@@ -173,6 +287,7 @@ export function CurrentPositionCopyControl({
                   <table className="w-full text-xs text-left text-[#EAECEF]">
                     <thead className="text-[#848E9C]">
                       <tr>
+                        {onOptionsChange && <th className="p-2">复制</th>}
                         <th className="p-2">仓位</th>
                         <th className="p-2">领航员均价</th>
                         <th className="p-2">当前参考价 / 优势</th>
@@ -196,6 +311,23 @@ export function CurrentPositionCopyControl({
                             key={row.leader_pos_id}
                             className="border-t border-[#2B3139]"
                           >
+                            {onOptionsChange && (
+                              <td className="p-2">
+                                <input
+                                  type="checkbox"
+                                  aria-label={`复制 ${row.symbol}`}
+                                  className="accent-[#F0B90B]"
+                                  disabled={disabled || row.status !== 'READY'}
+                                  checked={
+                                    row.status === 'READY' &&
+                                    isSelected(row, selection)
+                                  }
+                                  onChange={(event) =>
+                                    toggleDirection(row, event.target.checked)
+                                  }
+                                />
+                              </td>
+                            )}
                             <td className="p-2">
                               {row.symbol} {row.side === 'long' ? '多' : '空'}
                               <br />

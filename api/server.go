@@ -532,14 +532,17 @@ type CreateTraderRequest struct {
 
 // CopyConfigReq Copy trading configuration request
 type CopyConfigReq struct {
-	CopyCurrentPositionsOnce      *bool                           `json:"copy_current_positions_once,omitempty"`
-	CopyCurrentPositionsRequestID string                          `json:"copy_current_positions_request_id,omitempty"`
-	ATRProfilePatch               *store.CopyGuardATRProfilePatch `json:"atr_profile_patch,omitempty"`
-	ProviderType                  string                          `json:"provider_type"`    // "hyperliquid" | "okx" | "binance"
-	LeaderID                      string                          `json:"leader_id"`        // Leader wallet address or uniqueName / portfolioId (Binance)
-	CopyRatio                     float64                         `json:"copy_ratio"`       // Copy ratio (1.0 = 100%)
-	SyncLeverage                  bool                            `json:"sync_leverage"`    // Whether to sync leverage
-	SyncMarginMode                *bool                           `json:"sync_margin_mode"` // Whether to sync margin mode (OKX: cross/isolated)
+	CopyCurrentPositionsOnce      *bool                                `json:"copy_current_positions_once,omitempty"`
+	CopyCurrentPositionsRequestID string                               `json:"copy_current_positions_request_id,omitempty"`
+	CopyCurrentPositionsSelection []store.CurrentPositionCopySelection `json:"copy_current_positions_selection,omitempty"`
+	CopyCurrentPriceFilterEnabled *bool                                `json:"copy_current_price_filter_enabled,omitempty"`
+	CopyCurrentMinAdvantagePct    *float64                             `json:"copy_current_min_advantage_pct,omitempty"`
+	ATRProfilePatch               *store.CopyGuardATRProfilePatch      `json:"atr_profile_patch,omitempty"`
+	ProviderType                  string                               `json:"provider_type"`    // "hyperliquid" | "okx" | "binance"
+	LeaderID                      string                               `json:"leader_id"`        // Leader wallet address or uniqueName / portfolioId (Binance)
+	CopyRatio                     float64                              `json:"copy_ratio"`       // Copy ratio (1.0 = 100%)
+	SyncLeverage                  bool                                 `json:"sync_leverage"`    // Whether to sync leverage
+	SyncMarginMode                *bool                                `json:"sync_margin_mode"` // Whether to sync margin mode (OKX: cross/isolated)
 	// 最小/最大跟单金额阈值（USDT）。指针区分"未传"（保留存量/默认值）与
 	// 显式 0（max=0 表示不预警）。此前请求结构缺这两个字段，前端传值被
 	// JSON unmarshal 静默丢弃，配置形同虚设（M18）。
@@ -903,6 +906,10 @@ func (s *Server) handleCreateTrader(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
+		if err := validateCurrentCopyOptionsRequest(req.CopyConfig.CopyCurrentPositionsOnce, req.CopyConfig.CopyCurrentPositionsSelection, req.CopyConfig.CopyCurrentMinAdvantagePct); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
 	}
 
 	// Validate leverage values
@@ -1126,6 +1133,9 @@ func (s *Server) handleCreateTrader(c *gin.Context) {
 		copyConfig.CopyRatio = req.CopyConfig.CopyRatio
 		copyConfig.CopyCurrentPositionsOnce = req.CopyConfig.CopyCurrentPositionsOnce
 		copyConfig.CopyCurrentPositionsRequestID = req.CopyConfig.CopyCurrentPositionsRequestID
+		copyConfig.CopyCurrentPositionsSelection = req.CopyConfig.CopyCurrentPositionsSelection
+		copyConfig.CopyCurrentPriceFilterEnabled = req.CopyConfig.CopyCurrentPriceFilterEnabled
+		copyConfig.CopyCurrentMinAdvantagePct = req.CopyConfig.CopyCurrentMinAdvantagePct
 		copyConfig.SyncLeverage = req.CopyConfig.SyncLeverage
 		copyConfig.SyncMarginMode = syncMarginMode
 		if req.CopyConfig.MinTradeWarn != nil {
@@ -1363,6 +1373,10 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
+		if err := validateCurrentCopyOptionsRequest(req.CopyConfig.CopyCurrentPositionsOnce, req.CopyConfig.CopyCurrentPositionsSelection, req.CopyConfig.CopyCurrentMinAdvantagePct); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
 	}
 
 	// Set default values
@@ -1464,6 +1478,9 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 		copyConfig.CopyRatio = req.CopyConfig.CopyRatio
 		copyConfig.CopyCurrentPositionsOnce = req.CopyConfig.CopyCurrentPositionsOnce
 		copyConfig.CopyCurrentPositionsRequestID = req.CopyConfig.CopyCurrentPositionsRequestID
+		copyConfig.CopyCurrentPositionsSelection = req.CopyConfig.CopyCurrentPositionsSelection
+		copyConfig.CopyCurrentPriceFilterEnabled = req.CopyConfig.CopyCurrentPriceFilterEnabled
+		copyConfig.CopyCurrentMinAdvantagePct = req.CopyConfig.CopyCurrentMinAdvantagePct
 		copyConfig.SyncLeverage = req.CopyConfig.SyncLeverage
 		copyConfig.SyncMarginMode = syncMarginMode
 		if req.CopyConfig.MinTradeWarn != nil {
