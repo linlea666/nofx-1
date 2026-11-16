@@ -12,6 +12,11 @@ nofx-auto
 *.exe
 nofx
 nofx_test
+/nofx-1
+
+# 本地运行日志与临时截图（不入库）
+/项目日志.txt
+/img*.png
 
 # Go 相关
 *.test
