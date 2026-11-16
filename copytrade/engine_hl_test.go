@@ -272,3 +272,104 @@ func TestHyperliquidSnapshotMissingValueFailsClosedForRiskIncrease(t *testing.T)
 		t.Fatal("risk-reducing Hyperliquid transitions must never be blocked by value checks")
 	}
 }
+
+func hlState(positions ...*Position) *AccountState {
+	m := map[string]*Position{}
+	for _, p := range positions {
+		m[p.PosID] = p
+	}
+	return &AccountState{TotalEquity: 1000, Timestamp: time.Now(), Positions: m}
+}
+
+func drainHLDecisions(e *Engine) []string {
+	var out []string
+	for {
+		select {
+		case full := <-e.decisionCh:
+			for _, d := range full.Decisions {
+				out = append(out, d.CopyTradeAction+":"+d.Action+":"+d.LeaderPosID)
+			}
+		default:
+			return out
+		}
+	}
+}
+
+// 只跟启动后新开的仓位：启动时已有仓位及其后续加减仓一律跳过。
+func TestHyperliquidOnlyFollowsPositionsOpenedAfterStart(t *testing.T) {
+	e, st := newTestCopyTradeEngine(t, ProviderHyperliquid)
+	e.config.MinTradeWarn = 1
+	provider := &hlPollTestProvider{state: hlState(hlTestPosition("BTCUSDT", SideLong, 1, 60000))}
+	e.provider = provider
+
+	if err := e.InitIgnoredPositions(); err != nil {
+		t.Fatal(err)
+	}
+	if m, _ := st.CopyTrade().GetMapping(e.traderID, "BTCUSDT_long"); m == nil || m.Status != "ignored" {
+		t.Fatalf("pre-existing position must be baselined as ignored: %+v", m)
+	}
+	for _, size := range []float64{1.5, 0.5} {
+		provider.state = hlState(hlTestPosition("BTCUSDT", SideLong, size, 60000))
+		e.poll()
+		if got := drainHLDecisions(e); len(got) != 0 {
+			t.Fatalf("add/reduce on a historical position must be skipped (size=%v): %v", size, got)
+		}
+	}
+
+	eth := hlTestPosition("ETHUSDT", SideShort, 2, 2000)
+	provider.state = hlState(hlTestPosition("BTCUSDT", SideLong, 0.5, 60000), eth)
+	e.poll()
+	if got := drainHLDecisions(e); len(got) != 1 || got[0] != "open:open_short:ETHUSDT_short" {
+		t.Fatalf("new position must be followed as an open: %v", got)
+	}
+
+	provider.state = hlState(eth)
+	e.poll()
+	if got := drainHLDecisions(e); len(got) != 0 {
+		t.Fatalf("closing a never-followed position must not trade: %v", got)
+	}
+	provider.state = hlState(eth, hlTestPosition("BTCUSDT", SideLong, 0.2, 60000))
+	e.poll()
+	if got := drainHLDecisions(e); len(got) != 1 || got[0] != "open:open_long:BTCUSDT_long" {
+		t.Fatalf("re-opened position after a full close is a new open: %v", got)
+	}
+}
+
+// 已跟随仓位加仓必须是 add，且只按增量计价。
+func TestHyperliquidAddToFollowedPositionIsAddNotOpen(t *testing.T) {
+	e, st := newTestCopyTradeEngine(t, ProviderHyperliquid)
+	e.config.MinTradeWarn = 1
+	if err := st.CopyTrade().SavePositionMapping(&store.CopyTradePositionMapping{
+		TraderID: e.traderID, LeaderPosID: "ETHUSDT_short", LeaderID: e.config.LeaderID, Symbol: "ETHUSDT",
+		Side: string(SideShort), MarginMode: "cross", OpenedAt: time.Now(), OpenPrice: 2000,
+		OpenSizeUSD: 4000, LastKnownSize: 2,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	e.provider = &hlPollTestProvider{state: hlState(hlTestPosition("ETHUSDT", SideShort, 3, 2000))}
+	e.poll()
+	select {
+	case full := <-e.decisionCh:
+		d := full.Decisions[0]
+		if d.CopyTradeAction != "add" || d.LeaderPosID != "ETHUSDT_short" || d.LeaderPosSize != 3 {
+			t.Fatalf("size growth on a followed position must be an add: %+v", d)
+		}
+		// 增量 1 × 2000 / 1000 × 跟随者权益 100 = 200（整仓会是 600）
+		if math.Abs(d.PositionSizeUSD-200) > 1e-9 {
+			t.Fatalf("add must size the delta only, got %.4f", d.PositionSizeUSD)
+		}
+	default:
+		t.Fatal("expected an add decision")
+	}
+}
+
+func TestHyperliquidStartupBaselineFailureRefusesStart(t *testing.T) {
+	e, _ := newTestCopyTradeEngine(t, ProviderHyperliquid)
+	e.provider = &hlPollTestProvider{stateErr: errors.New("HTTP 502")}
+	if err := e.InitIgnoredPositions(); err == nil {
+		t.Fatal("baseline read failure must be reported")
+	}
+	if !e.requiresStartupBaseline() {
+		t.Fatal("Hyperliquid must refuse to start without a startup baseline")
+	}
+}

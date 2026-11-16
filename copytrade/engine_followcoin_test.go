@@ -227,3 +227,124 @@ func TestFollowCoinCredentialMonitorWarnsBeforeJWTExpiry(t *testing.T) {
 func encodeTestJWTPayload(payload string) string {
 	return strings.TrimRight(base64.URLEncoding.EncodeToString([]byte(payload)), "=")
 }
+
+func fcState(positions ...*Position) *AccountState {
+	m := map[string]*Position{}
+	for _, p := range positions {
+		m[p.PosID] = p
+	}
+	return &AccountState{TotalEquity: 1000, Timestamp: time.Now(), Positions: m}
+}
+
+func drainDecisions(e *Engine) []string {
+	var out []string
+	for {
+		select {
+		case full := <-e.decisionCh:
+			for _, d := range full.Decisions {
+				out = append(out, fmt.Sprintf("%s:%s:%s", d.CopyTradeAction, d.Action, d.LeaderPosID))
+			}
+		default:
+			return out
+		}
+	}
+}
+
+// 用户要求：启动时已有的仓位（以及它们之后的加仓/减仓）一律不跟，只跟新开仓。
+func TestFollowCoinOnlyFollowsPositionsOpenedAfterStart(t *testing.T) {
+	e, st := newTestCopyTradeEngine(t, ProviderFollowCoin)
+	e.config.LeaderID = "57"
+	e.config.MinTradeWarn = 1
+	const openedAt = 1794694989778
+	btc := fcTestPosition("BTCUSDT", SideLong, 1, 60000, openedAt)
+	provider := &fcPollTestProvider{state: fcState(btc)}
+	e.provider = provider
+
+	if err := e.InitIgnoredPositions(); err != nil {
+		t.Fatal(err)
+	}
+	if m, _ := st.CopyTrade().GetMapping(e.traderID, btc.PosID); m == nil || m.Status != "ignored" {
+		t.Fatalf("pre-existing position must be baselined as ignored: %+v", m)
+	}
+
+	// Leader adds to and then reduces the historical position (ctime unchanged).
+	for _, size := range []float64{1.5, 0.5} {
+		provider.state = fcState(fcTestPosition("BTCUSDT", SideLong, size, 60000, openedAt))
+		e.poll()
+		if got := drainDecisions(e); len(got) != 0 {
+			t.Fatalf("add/reduce on a historical position must be skipped (size=%v): %v", size, got)
+		}
+	}
+
+	// A genuinely new position is followed as an open.
+	eth := fcTestPosition("ETHUSDT", SideShort, 2, 2000, openedAt+3600_000)
+	provider.state = fcState(fcTestPosition("BTCUSDT", SideLong, 0.5, 60000, openedAt), eth)
+	e.poll()
+	if got := drainDecisions(e); len(got) != 1 || got[0] != "open:open_short:"+eth.PosID {
+		t.Fatalf("new position must be followed as an open: %v", got)
+	}
+
+	// The historical position closes, then the leader opens it again: a new lifecycle.
+	provider.state = fcState(eth)
+	e.poll()
+	if got := drainDecisions(e); len(got) != 0 {
+		t.Fatalf("closing a never-followed position must not trade: %v", got)
+	}
+	reopened := fcTestPosition("BTCUSDT", SideLong, 0.2, 60000, openedAt+7200_000)
+	provider.state = fcState(eth, reopened)
+	e.poll()
+	got := drainDecisions(e)
+	if len(got) != 1 || got[0] != "open:open_long:"+reopened.PosID {
+		t.Fatalf("re-opened position after a full close is a new open: %v", got)
+	}
+}
+
+// 已跟随的仓位加仓必须是 add（按增量下单），绝不能当成新开仓按整仓再开一次。
+func TestFollowCoinAddToFollowedPositionIsAddNotOpen(t *testing.T) {
+	e, st := newTestCopyTradeEngine(t, ProviderFollowCoin)
+	e.config.LeaderID = "57"
+	e.config.MinTradeWarn = 1
+	const openedAt = 1794694989778
+	eth := fcTestPosition("ETHUSDT", SideShort, 3, 2000, openedAt)
+	if err := st.CopyTrade().SavePositionMapping(&store.CopyTradePositionMapping{
+		TraderID: e.traderID, LeaderPosID: eth.PosID, LeaderID: "57", Symbol: "ETHUSDT",
+		Side: string(SideShort), MarginMode: "cross", OpenedAt: time.Now(), OpenPrice: 2000,
+		OpenSizeUSD: 4000, LastKnownSize: 2,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	e.provider = &fcPollTestProvider{state: fcState(eth)}
+	e.poll()
+	select {
+	case full := <-e.decisionCh:
+		d := full.Decisions[0]
+		if d.CopyTradeAction != "add" || d.LeaderPosID != eth.PosID || d.LeaderPosSize != 3 {
+			t.Fatalf("size growth on a followed position must be an add: %+v", d)
+		}
+		// 只按增量 1 × 2000 = 2000 计价：2000/1000 × 跟随者权益 100 = 200，而不是整仓 6000 → 600。
+		if math.Abs(d.PositionSizeUSD-200) > 1e-9 {
+			t.Fatalf("add must size the delta only, got %.4f", d.PositionSizeUSD)
+		}
+	default:
+		t.Fatal("expected an add decision")
+	}
+}
+
+// 启动时拿不到领航员持仓（token 失效/网络故障）不能放行：否则已有仓位会在
+// 第一次成功读取时被当成新开仓跟进。FollowCoin 必须拒绝启动。
+func TestFollowCoinStartupBaselineFailureRefusesStart(t *testing.T) {
+	e, _ := newTestCopyTradeEngine(t, ProviderFollowCoin)
+	e.provider = &fcPollTestProvider{stateErr: ErrFollowCoinTokenInvalid}
+	if err := e.InitIgnoredPositions(); err == nil {
+		t.Fatal("baseline read failure must be reported")
+	}
+	if !e.requiresStartupBaseline() {
+		t.Fatal("FollowCoin must refuse to start without a startup baseline")
+	}
+	for _, p := range []ProviderType{ProviderOKX, ProviderBinance} {
+		other, _ := newTestCopyTradeEngine(t, p)
+		if other.requiresStartupBaseline() {
+			t.Fatalf("%s startup behaviour must stay unchanged", p)
+		}
+	}
+}
