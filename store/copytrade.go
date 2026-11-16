@@ -26,17 +26,23 @@ type CopyTradeConfig struct {
 	CopyCurrentPositionsOnce      *bool                `json:"copy_current_positions_once,omitempty"`
 	CopyCurrentPositionsRequestID string               `json:"copy_current_positions_request_id,omitempty"`
 	CurrentPositionCopy           *CurrentPositionCopy `json:"current_position_copy,omitempty"`
-	TraderID                      string               `json:"trader_id"`
-	ProviderType                  string               `json:"provider_type"`    // "hyperliquid" | "okx" | "binance"
-	LeaderID                      string               `json:"leader_id"`        // 领航员地址/uniqueName，Binance 模式下复用为 portfolioId
-	CopyRatio                     float64              `json:"copy_ratio"`       // 跟单系数 (1.0 = 100%)
-	SyncLeverage                  bool                 `json:"sync_leverage"`    // 同步杠杆
-	SyncMarginMode                bool                 `json:"sync_margin_mode"` // 同步保证金模式
-	MinTradeWarn                  float64              `json:"min_trade_warn"`   // 纯运营小额预警，不参与交易所可执行性判断
-	MaxTradeWarn                  float64              `json:"max_trade_warn"`   // 大额预警阈值 (0=不预警)
-	CopyCatchupWindowSeconds      int                  `json:"copy_catchup_window_seconds"`
-	CopyCatchupMaxAdverseBPS      float64              `json:"copy_catchup_max_adverse_bps"`
-	Enabled                       bool                 `json:"enabled"` // 是否启用
+	// 当前仓位复制的逐仓选择与价格过滤。nil 表示客户端未提供（旧客户端），
+	// 保存时保留已登记请求的原值；新登记的请求在 nil 时沿用旧行为（复制全部、
+	// 不做价格过滤）。
+	CopyCurrentPositionsSelection []CurrentPositionCopySelection `json:"copy_current_positions_selection,omitempty"`
+	CopyCurrentPriceFilterEnabled *bool                          `json:"copy_current_price_filter_enabled,omitempty"`
+	CopyCurrentMinAdvantagePct    *float64                       `json:"copy_current_min_advantage_pct,omitempty"`
+	TraderID                      string                         `json:"trader_id"`
+	ProviderType                  string                         `json:"provider_type"`    // "hyperliquid" | "okx" | "binance"
+	LeaderID                      string                         `json:"leader_id"`        // 领航员地址/uniqueName，Binance 模式下复用为 portfolioId
+	CopyRatio                     float64                        `json:"copy_ratio"`       // 跟单系数 (1.0 = 100%)
+	SyncLeverage                  bool                           `json:"sync_leverage"`    // 同步杠杆
+	SyncMarginMode                bool                           `json:"sync_margin_mode"` // 同步保证金模式
+	MinTradeWarn                  float64                        `json:"min_trade_warn"`   // 纯运营小额预警，不参与交易所可执行性判断
+	MaxTradeWarn                  float64                        `json:"max_trade_warn"`   // 大额预警阈值 (0=不预警)
+	CopyCatchupWindowSeconds      int                            `json:"copy_catchup_window_seconds"`
+	CopyCatchupMaxAdverseBPS      float64                        `json:"copy_catchup_max_adverse_bps"`
+	Enabled                       bool                           `json:"enabled"` // 是否启用
 
 	// Binance Web 私有接口凭证（仅 ProviderType=binance 时使用，明文存储）
 	BinanceP20T        string `json:"binance_p20t,omitempty"`       // 登录 cookie p20t

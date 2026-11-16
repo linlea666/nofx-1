@@ -15,6 +15,13 @@ import (
 
 func currentCopyEngine(t *testing.T, enabled bool) (*Engine, *store.Store, *okxPollTestProvider) {
 	t.Helper()
+	return currentCopyEngineWith(t, enabled, nil)
+}
+
+// currentCopyEngineWith lets a test adjust the registration (selection, price
+// rule) before the operator start that seals it.
+func currentCopyEngineWith(t *testing.T, enabled bool, register func(*store.CopyTradeConfig)) (*Engine, *store.Store, *okxPollTestProvider) {
+	t.Helper()
 	e, s := newTestCopyTradeEngine(t, ProviderOKX)
 	e.config.SourceGeneration = 1
 	e.config.FollowExitPolicyVersion = 2
@@ -27,6 +34,9 @@ func currentCopyEngine(t *testing.T, enabled bool) (*Engine, *store.Store, *okxP
 	if enabled {
 		cfg.CopyCurrentPositionsOnce = &enabled
 		cfg.CopyCurrentPositionsRequestID = uuid.NewString()
+		if register != nil {
+			register(cfg)
+		}
 	}
 	if err := s.CopyTrade().Create(cfg); err != nil {
 		t.Fatal(err)

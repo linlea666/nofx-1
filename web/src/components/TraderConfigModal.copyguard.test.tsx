@@ -196,17 +196,55 @@ describe('Copy Guard trader configuration', () => {
 })
 
 it('registers one idempotent current-position request on save without starting a trader', async () => {
+  vi.mocked(httpClient.post).mockResolvedValue({
+    success: true,
+    data: {
+      snapshot_at: '2026-09-29T10:00:00Z',
+      leader_equity: 1000,
+      follower_equity: 100,
+      positions: [
+        {
+          id: 1,
+          leader_pos_id: 'p',
+          symbol: 'ETHUSDT',
+          side: 'long',
+          margin_mode: 'cross',
+          opened_ms: 1790000000000,
+          leader_entry_price: 100,
+          reference_price: 99,
+          estimated_notional: 10,
+          leverage: 10,
+          status: 'READY',
+          reason: '',
+          intent_id: 0,
+          filled_quantity: 0,
+        },
+      ],
+    },
+  })
   const onSave = mount()
   const toggle = await screen.findByRole('checkbox', {
     name: /下次启动时复制领航员当前仓位/,
   })
   expect(toggle).not.toBeChecked()
   fireEvent.click(toggle)
+  // Saving before the preview has produced a selection is refused.
+  fireEvent.click(screen.getByRole('button', { name: '保存修改' }))
+  expect(window.alert).toHaveBeenCalledWith(
+    expect.stringContaining('至少勾选一个要复制的仓位')
+  )
+  expect(onSave).not.toHaveBeenCalled()
+  expect(await screen.findByLabelText('复制 ETHUSDT')).toBeChecked()
   fireEvent.click(screen.getByRole('button', { name: '保存修改' }))
   await waitFor(() => expect(onSave).toHaveBeenCalledOnce())
   const request = onSave.mock.calls[0][0].copy_config
   expect(request.copy_current_positions_once).toBe(true)
   expect(request.copy_current_positions_request_id).toMatch(/^[a-f\d-]{36}$/)
+  expect(request.copy_current_positions_selection).toEqual([
+    { leader_pos_id: 'p', opened_ms: 1790000000000 },
+  ])
+  expect(request.copy_current_price_filter_enabled).toBe(true)
+  expect(request.copy_current_min_advantage_pct).toBe(0)
   fireEvent.click(screen.getByRole('button', { name: '保存修改' }))
   await waitFor(() => expect(onSave).toHaveBeenCalledTimes(2))
   expect(

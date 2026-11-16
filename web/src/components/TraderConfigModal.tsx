@@ -1,5 +1,9 @@
 import { CurrentPositionCopyControl } from './CurrentPositionCopyControl'
-import { newCurrentPositionCopyRequestId } from '../lib/currentPositionCopy'
+import {
+  currentPositionCopySupported,
+  newCurrentPositionCopyRequestId,
+  pendingCurrentCopyOptions,
+} from '../lib/currentPositionCopy'
 import { useState, useEffect } from 'react'
 import type {
   AIModel,
@@ -10,6 +14,7 @@ import type {
   CopyTradeProvider,
   CopyTradeConfig,
   CopyTradeConfigResponse,
+  CurrentPositionCopySelection,
   CopyTradeSourceHealth,
   CopyTradeSourceHealthStatus,
   BinanceSourceMode,
@@ -268,6 +273,9 @@ interface FormState {
   copy_leader_id: string
   copy_current_positions_once: boolean
   copy_current_positions_request_id: string
+  copy_current_positions_selection?: CurrentPositionCopySelection[]
+  copy_current_price_filter_enabled: boolean
+  copy_current_min_advantage_pct: number
   current_position_copy?: CopyTradeConfig['current_position_copy']
   copy_ratio: number
   copy_sync_leverage: boolean
@@ -376,6 +384,9 @@ export function TraderConfigModal({
     copy_ratio: 1.0,
     copy_current_positions_once: false,
     copy_current_positions_request_id: '',
+    copy_current_positions_selection: undefined,
+    copy_current_price_filter_enabled: true,
+    copy_current_min_advantage_pct: 0,
     current_position_copy: undefined,
     copy_sync_leverage: true,
     copy_sync_margin_mode: true, // 默认同步保证金模式
@@ -626,6 +637,7 @@ export function TraderConfigModal({
               cfg.copy_current_positions_once ?? false,
             copy_current_positions_request_id:
               cfg.copy_current_positions_request_id ?? '',
+            ...pendingCurrentCopyOptions(cfg),
             current_position_copy: cfg.current_position_copy,
             copy_sync_leverage: cfg.sync_leverage,
             copy_sync_margin_mode: cfg.sync_margin_mode ?? true, // 默认 true
@@ -835,6 +847,9 @@ export function TraderConfigModal({
         copy_ratio: 1.0,
         copy_current_positions_once: false,
         copy_current_positions_request_id: '',
+        copy_current_positions_selection: undefined,
+        copy_current_price_filter_enabled: true,
+        copy_current_min_advantage_pct: 0,
         current_position_copy: undefined,
         copy_sync_leverage: true,
         copy_sync_margin_mode: true, // 默认同步保证金模式
@@ -919,6 +934,7 @@ export function TraderConfigModal({
         ? {
             copy_current_positions_once: false,
             copy_current_positions_request_id: '',
+            copy_current_positions_selection: undefined,
           }
         : {}),
     }))
@@ -1111,6 +1127,22 @@ export function TraderConfigModal({
         )
         return
       }
+      if (
+        currentPositionCopySupported(formData.copy_provider_type) &&
+        formData.copy_current_positions_once
+      ) {
+        if (!formData.copy_current_positions_selection?.length) {
+          window.alert(
+            '已开启「复制领航员当前仓位」：请等待仓位预览加载，并至少勾选一个要复制的仓位（或关闭该选项）'
+          )
+          return
+        }
+        const pct = formData.copy_current_min_advantage_pct
+        if (!Number.isFinite(pct) || pct < -20 || pct > 50) {
+          window.alert('最低价格优势须在 -20% 到 50% 之间')
+          return
+        }
+      }
       // M18：跟单金额阈值合法性（max=0 表示不预警，允许）
       if (
         formData.copy_min_trade_warn < 0 ||
@@ -1158,15 +1190,26 @@ export function TraderConfigModal({
         const leaderID = isSmartMoney
           ? normalizedTopTraderID!
           : formData.copy_leader_id.trim()
+        const currentCopyOnce =
+          currentPositionCopySupported(formData.copy_provider_type) &&
+          formData.copy_current_positions_once
         saveData.copy_config = {
           provider_type: formData.copy_provider_type,
           leader_id: leaderID,
           copy_ratio: formData.copy_ratio,
-          copy_current_positions_once:
-            formData.copy_provider_type === 'okx' &&
-            formData.copy_current_positions_once,
+          copy_current_positions_once: currentCopyOnce,
           copy_current_positions_request_id:
             formData.copy_current_positions_request_id,
+          ...(currentCopyOnce
+            ? {
+                copy_current_positions_selection:
+                  formData.copy_current_positions_selection,
+                copy_current_price_filter_enabled:
+                  formData.copy_current_price_filter_enabled,
+                copy_current_min_advantage_pct:
+                  formData.copy_current_min_advantage_pct,
+              }
+            : {}),
           sync_leverage: formData.copy_sync_leverage,
           sync_margin_mode: formData.copy_sync_margin_mode, // 同步保证金模式（仅 OKX 生效）
           min_trade_warn: formData.copy_min_trade_warn,
@@ -2190,8 +2233,37 @@ export function TraderConfigModal({
                     </div>
                   )}
 
-                  {formData.copy_provider_type === 'okx' && (
+                  {currentPositionCopySupported(
+                    formData.copy_provider_type
+                  ) && (
                     <CurrentPositionCopyControl
+                      providerType={formData.copy_provider_type}
+                      selection={formData.copy_current_positions_selection}
+                      priceFilterEnabled={
+                        formData.copy_current_price_filter_enabled
+                      }
+                      minAdvantagePct={formData.copy_current_min_advantage_pct}
+                      onOptionsChange={(options) =>
+                        setFormData((prev) => {
+                          const priceChanged =
+                            options.priceFilterEnabled !== undefined ||
+                            options.minAdvantagePct !== undefined
+                          return {
+                            ...prev,
+                            copy_current_price_filter_enabled:
+                              options.priceFilterEnabled ??
+                              prev.copy_current_price_filter_enabled,
+                            copy_current_min_advantage_pct:
+                              options.minAdvantagePct ??
+                              prev.copy_current_min_advantage_pct,
+                            // A price-rule change re-defaults the ticks to the
+                            // positions that qualify under the new rule.
+                            copy_current_positions_selection: priceChanged
+                              ? undefined
+                              : options.selection,
+                          }
+                        })
+                      }
                       enabled={formData.copy_current_positions_once}
                       disabled={sourceSwitchLocked}
                       traderId={isEditMode ? traderData?.trader_id : undefined}
@@ -2206,6 +2278,7 @@ export function TraderConfigModal({
                           copy_current_positions_request_id: enabled
                             ? newCurrentPositionCopyRequestId()
                             : prev.copy_current_positions_request_id,
+                          copy_current_positions_selection: undefined,
                         }))
                       }
                     />
@@ -2227,7 +2300,7 @@ export function TraderConfigModal({
                     </svg>
                     <span className="text-xs text-[#848E9C]">
                       {formData.copy_current_positions_once
-                        ? '下次手动启动将复制符合条件的当前仓位，之后监听领航员操作。'
+                        ? '下次手动启动将复制已勾选且符合条件的当前仓位，未勾选的仓位不跟随，之后监听领航员操作。'
                         : '跟单模式只跟随新开仓；未开启一次性复制时不追历史仓位。'}
                       跟单金额 = 跟单系数 × (领航员交易名义金额÷领航员总权益) ×
                       你的账户总权益
