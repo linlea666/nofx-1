@@ -931,12 +931,14 @@ func (s *CopyTradeStore) SettleOrdinaryCatchupTransition(c OrdinaryCatchupSettle
 			SET source_revision=?,last_known_size=?,updated_at=CURRENT_TIMESTAMP
 			WHERE trader_id=? AND leader_pos_id=? AND status='active' AND COALESCE(source_revision,0)=?`,
 			sourceRevision, leaderTargetSize, c.TraderID, leaderPosID, sourceRevision-1)
-	case mappingErr == nil && currentRevision == sourceRevision &&
+	case mappingErr == nil && currentRevision >= sourceRevision &&
 		(mappingStatus == MappingStatusActive || mappingStatus == MappingStatusIgnored || mappingStatus == MappingStatusCopyPending ||
 			mappingStatus == MappingStatusStoppedByRisk || mappingStatus == MappingStatusDetached ||
 			mappingStatus == MappingStatusManualStopped):
-		// A confirmed partial fill already advanced the mapping. Only the
-		// residual catch-up lifecycle remains to be terminalized.
+		// A confirmed partial fill already advanced the mapping, possibly
+		// followed by later no-fill acknowledgements (revisions advance one at
+		// a time, so this revision was booked). Only the residual catch-up
+		// lifecycle remains to be terminalized; never rewind the mapping.
 	case mappingErr == nil && mappingStatus == MappingStatusClosed &&
 		currentRevision == sourceRevision-1 && filledQuantity <= tolerance:
 		// The authoritative close retired the mapping before this zero-fill
