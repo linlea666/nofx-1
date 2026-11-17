@@ -189,6 +189,9 @@ type TraderIntegration struct {
 	// Overweight correction state (overweight_correction.go); monitor goroutine only.
 	lastOverweightCheck time.Time
 	overweightStrikes   map[string]int
+	// Leader exit watchdog state (leader_exit_watchdog.go); monitor goroutine only.
+	lastLeaderExitWatch   time.Time
+	leaderExitAbsentSince map[string]time.Time
 	// Last decision record of each blocked (custody-pending) intent.
 	pendingRecordMu sync.Mutex
 	pendingRecordAt map[int64]time.Time
@@ -1867,6 +1870,7 @@ func (ti *TraderIntegration) monitorExecutionIntents() {
 			ti.reconcileMappingOwnershipGaps(false)
 			ti.reconcileExecutionIntents(false)
 			ti.correctProportionalOverweight()
+			ti.enforceLeaderExits()
 		}
 	}
 }
@@ -5494,11 +5498,23 @@ func (ti *TraderIntegration) supersedeOlderOrdinaryCatchup(dec *decision.Decisio
 			_ = ti.store.CopyTrade().MarkOrdinaryCatchupReconciliationPending(
 				prior.ID, ti.traderID, pendingReason, detail)
 		}
+		if err != nil && !errors.Is(err, store.ErrOrdinaryCatchupUnsettled) && reducesFollowerRisk(dec) {
+			// Only local bookkeeping failed (no live catch-up order): a close or
+			// reduction must never wait on it. A live order still blocks, so a
+			// late fill cannot outlive the exit; the watchdog backs that case.
+			logger.Warnf("⚠️ [%s] 旧补仓结算失败，平仓/减仓优先继续执行 | intent=%d posId=%s next=%s: %v",
+				ti.traderID, prior.ID, dec.LeaderPosID, dec.Action, err)
+			continue
+		}
 		if err != nil {
 			return leaderCopyPreflightError("PRECHECK_PERSISTENCE_FAILED", "retire prior proportional gap: %v", err)
 		}
 	}
 	return nil
+}
+
+func reducesFollowerRisk(dec *decision.Decision) bool {
+	return strings.HasPrefix(dec.Action, "close_") || strings.HasPrefix(dec.Action, "reduce_")
 }
 
 func (ti *TraderIntegration) deferSourceTransitionRevalidation(dec *decision.Decision, originalReason string, cause error) {
