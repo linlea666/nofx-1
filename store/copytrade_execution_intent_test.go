@@ -1995,3 +1995,60 @@ func TestCopyGuardBackfillBaselineUsesCurrentReopenedLifecycle(t *testing.T) {
 		t.Fatalf("current reopened lifecycle baseline must use revision 4 open, not old open/add: size=%v available=%v err=%v", size, available, err)
 	}
 }
+
+// Live incident: a partially filled catch-up stayed open while later no-fill
+// transitions advanced the active mapping; every leader close then failed
+// its precheck trying to retire the catch-up.
+func TestSettleOrdinaryCatchupAfterLaterRevisionsOnActiveMapping(t *testing.T) {
+	st, err := New(filepath.Join(t.TempDir(), "settle-later-revision.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cs := st.CopyTrade()
+	if err = cs.SavePositionMapping(&CopyTradePositionMapping{
+		TraderID: "trader-1", LeaderID: "leader-1", LeaderPosID: "btc-long",
+		Symbol: "BTCUSDT", Side: "long", MarginMode: "cross",
+		Status: MappingStatusActive, SourceRevision: 4, LastKnownSize: 700,
+		OpenedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	intent, claimed, err := cs.ReserveExecutionIntent(&CopyTradeExecutionIntent{
+		TraderID: "trader-1", LeaderPosID: "btc-long", SourceRevision: 5,
+		CanonicalKey: "leader|trader-1|btc-long|5", Action: "open_long",
+		Symbol: "BTCUSDT", Side: "long", LeaderTargetSize: 727,
+		ClientOrderID: "later-revision-catchup",
+	})
+	if err != nil || !claimed {
+		t.Fatalf("reserve claimed=%v err=%v", claimed, err)
+	}
+	if _, err = cs.PrepareExecutionOrderAttempt(intent.ID, "later-revision-catchup", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err = cs.CompleteExecutionOrderAttempt(intent.ID, "later-revision-catchup",
+		ExecutionOrderAttemptFilled, "ord-1", "FILLED", "", 0.0003); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = st.DB().Exec(`UPDATE copy_trade_execution_intents SET status='PARTIALLY_FILLED',reason_code='CATCHUP_PENDING',filled_quantity=0.0003 WHERE id=?`, intent.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = st.DB().Exec(`UPDATE copy_trade_position_mappings SET source_revision=9,last_known_size=731 WHERE trader_id='trader-1' AND leader_pos_id='btc-long'`); err != nil {
+		t.Fatal(err)
+	}
+	status, err := cs.SettleOrdinaryCatchupTransition(OrdinaryCatchupSettlement{
+		IntentID: intent.ID, TraderID: "trader-1", LeaderID: "leader-1",
+		ReasonCode: "CATCHUP_RESIDUAL_SUPERSEDED", Detail: "leader source revision advanced from 5 to 10",
+	})
+	if err != nil || status != ExecutionIntentCompletedPartial {
+		t.Fatalf("settle after later revisions status=%s err=%v", status, err)
+	}
+	var mappingStatus string
+	var sourceRevision int64
+	var size float64
+	err = st.DB().QueryRow(`SELECT status,source_revision,last_known_size FROM copy_trade_position_mappings
+		WHERE trader_id=? AND leader_pos_id=?`, "trader-1", "btc-long").Scan(&mappingStatus, &sourceRevision, &size)
+	if err != nil || mappingStatus != MappingStatusActive || sourceRevision != 9 || size != 731 {
+		t.Fatalf("active mapping was mutated: status=%s revision=%d size=%v err=%v", mappingStatus, sourceRevision, size, err)
+	}
+}
