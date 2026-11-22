@@ -341,10 +341,14 @@ func TestFollowCoinStartupBaselineFailureRefusesStart(t *testing.T) {
 	if !e.requiresStartupBaseline() {
 		t.Fatal("FollowCoin must refuse to start without a startup baseline")
 	}
-	for _, p := range []ProviderType{ProviderOKX, ProviderBinance} {
-		other, _ := newTestCopyTradeEngine(t, p)
-		if other.requiresStartupBaseline() {
-			t.Fatalf("%s startup behaviour must stay unchanged", p)
-		}
+	okx, _ := newTestCopyTradeEngine(t, ProviderOKX)
+	if okx.requiresStartupBaseline() {
+		t.Fatal("OKX startup behaviour must stay unchanged")
+	}
+	// Binance copy management is rate limited: a throttled first read must
+	// not let pre-existing positions be copied as new opens later.
+	binance, _ := newTestCopyTradeEngine(t, ProviderBinance)
+	if !binance.requiresStartupBaseline() {
+		t.Fatal("Binance copy management must refuse to start without a startup baseline")
 	}
 }

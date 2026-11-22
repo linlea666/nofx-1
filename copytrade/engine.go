@@ -394,10 +394,12 @@ func (e *Engine) SetStore(st *store.Store) {
 // complete baseline of the leader's pre-existing positions. These sources
 // derive opens purely from snapshot diffs, so without the baseline the first
 // healthy snapshot would treat every pre-existing position as a new open and
-// copy it. OKX and Binance keep their historical start-anyway behaviour.
+// copy it. Binance copy management is snapshot-diffed too and its source is
+// rate limited, so a throttled first read must refuse to start. OKX keeps its
+// historical start-anyway behaviour.
 func (e *Engine) requiresStartupBaseline() bool {
 	return e != nil && e.config != nil &&
-		(e.isSmartMoneyMode() || e.config.ProviderType == ProviderFollowCoin ||
+		(e.config.ProviderType == ProviderBinance || e.config.ProviderType == ProviderFollowCoin ||
 			e.config.ProviderType == ProviderHyperliquid)
 }
 

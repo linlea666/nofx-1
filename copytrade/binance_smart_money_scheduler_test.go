@@ -96,6 +96,53 @@ func TestClassicBinanceSourceRequestsUseCredentialScoped429Gate(t *testing.T) {
 	}
 }
 
+// Binance web throttles copy-management positions with HTTP 200 and business
+// code 90801003. It must enter the same backoff as an HTTP 429, otherwise the
+// 3-second poll keeps the limiter tripped and every leader signal is skipped.
+func TestClassicBinanceBusinessRateLimitCodeBacksOff(t *testing.T) {
+	const credential = "classic-business-rate-limit-p20t"
+	key := smartMoneyCredentialKey(credential)
+	smartMoneyCredentialGates.Delete(key)
+	t.Cleanup(func() { smartMoneyCredentialGates.Delete(key) })
+	p := NewBinanceProvider(credential, "csrf")
+	calls := 0
+	p.client.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls++
+		return smartHTTPResponse(http.StatusOK, `{"code":"90801003","message":"Too many requests. Please use WebSocket for updates.","data":null,"success":false}`), nil
+	})
+	_, status, firstErr := p.sourceWebRequest(http.MethodPost, "https://example.invalid/positions", map[string]interface{}{})
+	var httpErr *BinanceHTTPError
+	if !errors.As(firstErr, &httpErr) || httpErr.StatusCode != http.StatusTooManyRequests || status != http.StatusTooManyRequests || calls != 1 {
+		t.Fatalf("business rate-limit code must surface as 429: status=%d calls=%d err=%v", status, calls, firstErr)
+	}
+	until, total := smartMoneyGateForCredential(credential).snapshot()
+	if total != 1 || time.Until(until) < 14*time.Second {
+		t.Fatalf("business rate-limit code must start the fallback backoff: until=%s total=%d", until, total)
+	}
+	_, _, secondErr := p.sourceWebRequest(http.MethodPost, "https://example.invalid/positions", map[string]interface{}{})
+	var backoffErr *SmartMoneyBackoffError
+	if !errors.As(secondErr, &backoffErr) || calls != 1 {
+		t.Fatalf("backoff must suppress the next request: calls=%d err=%v", calls, secondErr)
+	}
+	if delay := p.SuggestedSourcePollDelay(true); delay < 14*time.Second {
+		t.Fatalf("poll cadence must honour the backoff, got %s", delay)
+	}
+}
+
+func TestBinanceWebRateLimitCodeDetection(t *testing.T) {
+	for body, want := range map[string]bool{
+		`{"code":"90801003","message":"Too many requests."}`: true,
+		`{"code":90801003}`:           true,
+		`{"code":"000000","data":[]}`: false,
+		`{"code":"100001005"}`:        false,
+		`not json`:                    false,
+	} {
+		if got := isBinanceWebRateLimited([]byte(body)); got != want {
+			t.Fatalf("isBinanceWebRateLimited(%s)=%v want %v", body, got, want)
+		}
+	}
+}
+
 // A credential lease covers the complete paginated snapshot, not one HTTP
 // page. Otherwise two leaders sharing the global credential can interleave
 // dozens of pages and recreate the production 429 storm even though each page

@@ -85,5 +85,29 @@ func binanceWebRequest(client *http.Client, p20t, csrf, method, url string, body
 			RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()),
 		}
 	}
+	// Binance web also throttles with HTTP 200 and a business code. Surface it
+	// as a 429 so the credential gate backs off instead of re-polling a tripped
+	// limiter every few seconds.
+	if isBinanceWebRateLimited(raw) {
+		return raw, http.StatusTooManyRequests, &BinanceHTTPError{
+			StatusCode: http.StatusTooManyRequests,
+			Body:       truncate(string(raw), 200),
+		}
+	}
 	return raw, resp.StatusCode, nil
+}
+
+// binanceWebRateLimitCodes are business codes Binance web returns with HTTP
+// 200 when the caller is throttled, e.g. 90801003 "Too many requests. Please
+// use WebSocket for updates."
+var binanceWebRateLimitCodes = map[string]bool{"90801003": true}
+
+func isBinanceWebRateLimited(raw []byte) bool {
+	var envelope struct {
+		Code json.RawMessage `json:"code"`
+	}
+	if json.Unmarshal(raw, &envelope) != nil {
+		return false
+	}
+	return binanceWebRateLimitCodes[strings.Trim(string(envelope.Code), `"`)]
 }
