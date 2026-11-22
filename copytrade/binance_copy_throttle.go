@@ -8,22 +8,25 @@ import (
 	"time"
 )
 
-// Binance web now throttles the copy-management position endpoint
-// (user-position) far below its former 3-second polling budget: a second read
-// within the same second answers 90801003, and every request during the
-// following ~5-6 minutes renews the block. This throttle is the single choke
-// point for that endpoint and applies to Binance copy-management sources only;
-// Smart Money and every other source keep their own cadence.
+// Binance web throttles the copy-management position endpoint (user-position)
+// per account: a probe on 2026-11-22 passed 10 reads in a minute and was
+// rejected with 90801003 on the 11th; a rejected account stays blocked for
+// several minutes and retries inside the block renew it. Every program using
+// the same Binance login shares this budget. This throttle is the single
+// choke point for that endpoint and applies to Binance copy-management
+// sources only; Smart Money and every other source keep their own cadence.
 const (
-	binanceCopyActivePollInterval = 15 * time.Second
-	binanceCopyIdlePollInterval   = 30 * time.Second
+	// 6 reads/minute while the leader holds positions leaves headroom under
+	// the ~10/minute budget.
+	binanceCopyActivePollInterval = 10 * time.Second
+	binanceCopyIdlePollInterval   = 20 * time.Second
 	// Reads closer together than this reuse the last complete snapshot (the
 	// startup baseline followed by the first sync, pre-submit revalidation,
-	// operator actions and previews), so they never burst the endpoint.
+	// operator actions and previews), so they never exceed the poll budget.
 	binanceCopyMinRequestInterval = 10 * time.Second
 	// Longer than the observed block window, so the first retry is not itself
 	// rejected and renews the block.
-	binanceCopyRateLimitCooldown = 7 * time.Minute
+	binanceCopyRateLimitCooldown = 10 * time.Minute
 )
 
 // BinanceCopyRateLimitError reports that the copy-management position endpoint
