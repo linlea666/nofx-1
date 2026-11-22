@@ -15,6 +15,9 @@ func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 }
 
 func newBinanceProviderWithTransport(fn roundTripFunc) *BinanceProvider {
+	// The copy-management throttle is process-global per credential; each
+	// fixture starts without another test's cached snapshot or cooldown.
+	binanceCopyThrottles.Delete(smartMoneyCredentialKey("p20t"))
 	p := NewBinanceProvider("p20t", "csrf")
 	p.client.Transport = fn
 	return p

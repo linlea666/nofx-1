@@ -261,11 +261,26 @@ func (p *BinanceProvider) UseAuthoritativeSnapshotHotPath() bool { return true }
 // GetAccountState 获取领航员账户状态（持仓）
 // leadPortfolioID: 领航员主页 portfolioId（用户在前端配置）
 // Provider 内部会先调 lead-portfolio/detail 反查 copyPortfolioId 再拉持仓
+//
+// Every read goes through the credential's copy-management throttle: reads
+// within binanceCopyMinRequestInterval share one snapshot, and a rate limit
+// stops all requests for binanceCopyRateLimitCooldown.
 func (p *BinanceProvider) GetAccountState(leadPortfolioID string) (*AccountState, error) {
 	leadPortfolioID = strings.TrimSpace(leadPortfolioID)
 	if leadPortfolioID == "" {
 		return nil, errors.New("binance: leadPortfolioId is required")
 	}
+	p20t, _, err := p.credentials()
+	if err != nil {
+		return nil, err
+	}
+	return binanceCopyThrottleFor(p20t).read(leadPortfolioID, func() (*AccountState, error) {
+		return p.fetchAccountState(leadPortfolioID)
+	})
+}
+
+// fetchAccountState performs one copy-management snapshot read.
+func (p *BinanceProvider) fetchAccountState(leadPortfolioID string) (*AccountState, error) {
 
 	// 先确保拿到 copyPortfolioId（首次调用会刷新 detail 同时填充 marginBalance 缓存）
 	copyPID, err := p.resolveCopyPortfolioID(leadPortfolioID)
@@ -390,9 +405,9 @@ func (p *BinanceProvider) GetAccountState(leadPortfolioID string) (*AccountState
 }
 
 func (p *BinanceProvider) SuggestedSourcePollDelay(activeLeaderPosition bool) time.Duration {
-	delay := smartMoneyIdlePollInterval
+	delay := binanceCopyIdlePollInterval
 	if activeLeaderPosition {
-		delay = smartMoneyActivePollInterval
+		delay = binanceCopyActivePollInterval
 	}
 	p.mu.Lock()
 	until := p.notFollowingUntil
@@ -400,6 +415,11 @@ func (p *BinanceProvider) SuggestedSourcePollDelay(activeLeaderPosition bool) ti
 	p.mu.Unlock()
 	if remaining := time.Until(until); remaining > delay {
 		delay = remaining
+	}
+	if p20t, _, err := p.credentials(); err == nil {
+		if remaining := binanceCopyThrottleFor(p20t).cooldownRemaining(time.Now()); remaining > delay {
+			delay = remaining
+		}
 	}
 	if gate != nil {
 		if remaining := gate.remaining(time.Now()); remaining > delay {
