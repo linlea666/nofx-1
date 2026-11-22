@@ -1,5 +1,9 @@
 import { useEffect, useState } from 'react'
 import { httpClient } from '../lib/httpClient'
+import {
+  MANUAL_MAX_DISADVANTAGE_CEILING_PCT,
+  priceSkipNote,
+} from '../lib/currentPositionCopy'
 import type {
   CopyTradeProvider,
   CurrentPositionCopyPreview,
@@ -270,7 +274,7 @@ export function CurrentPositionCopyControl({
                   type="number"
                   step="0.1"
                   min={0}
-                  max={20}
+                  max={MANUAL_MAX_DISADVANTAGE_CEILING_PCT}
                   value={manualMaxDisadvantagePct}
                   disabled={disabled || !priceFilterEnabled}
                   onChange={(event) => {
@@ -386,10 +390,17 @@ export function CurrentPositionCopyControl({
                             <td className="p-2">
                               {row.status === 'READY' && row.price_manual_only
                                 ? '价格略差，可手动勾选'
-                                : reasons[row.reason] ||
-                                  statuses[row.status] ||
-                                  row.reason ||
-                                  row.status}
+                                : row.reason === 'PRICE_NOT_FAVORABLE' &&
+                                    advantage !== undefined
+                                  ? priceSkipNote(
+                                      advantage,
+                                      minAdvantagePct,
+                                      manualMaxDisadvantagePct
+                                    )
+                                  : reasons[row.reason] ||
+                                    statuses[row.status] ||
+                                    row.reason ||
+                                    row.status}
                             </td>
                           </tr>
                         )

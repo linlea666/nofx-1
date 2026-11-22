@@ -59,3 +59,24 @@ export function pendingCurrentCopyOptions(cfg: CopyTradeConfig): {
       pending.manual_max_disadvantage_pct ?? 0,
   }
 }
+
+// Spells out why a row missed the price rule, so the operator sees the gap and
+// which setting to change instead of a bare "价格无优势".
+// Keep in sync with store currentCopyManualMaxDisadvantagePctCeiling.
+export const MANUAL_MAX_DISADVANTAGE_CEILING_PCT = 20
+export function priceSkipNote(
+  advantage: number,
+  minAdvantagePct: number,
+  manualMaxDisadvantagePct: number
+): string {
+  const adv = `${advantage >= 0 ? '+' : ''}${advantage.toFixed(2)}%`
+  if (manualMaxDisadvantagePct <= 0)
+    return `优势 ${adv} 低于最低优势 ${minAdvantagePct}%（手选已关闭：「手选最大劣势」设为大于 0 可放宽，或关闭价格过滤）`
+  const gap = -advantage
+  if (gap <= 0)
+    return `优势 ${adv} 低于最低优势 ${minAdvantagePct}%，本次不复制（下次可再选）`
+  const needed = Math.ceil(gap * 10) / 10
+  if (needed > MANUAL_MAX_DISADVANTAGE_CEILING_PCT)
+    return `劣势 ${gap.toFixed(2)}% 超过手选上限可设的最大值 ${MANUAL_MAX_DISADVANTAGE_CEILING_PCT}%，本次不复制（可关闭价格过滤）`
+  return `劣势 ${gap.toFixed(2)}% 超过手选上限 ${manualMaxDisadvantagePct}%：将「手选最大劣势」调到 ≥${needed}% 后可手动勾选，或关闭价格过滤`
+}

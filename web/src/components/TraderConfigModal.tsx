@@ -1395,6 +1395,8 @@ export function TraderConfigModal({
   // 持有 seenFills、仓位映射与 Copy Guard 周期，热切换来源身份会产生孤儿映射
   // 与误信号；必须先停止跟单再改。
   const sourceSwitchLocked = isEditMode && !!traderData?.is_running
+  // Backend proportionalGuardsApply excludes Binance: these settings are no-ops there.
+  const binanceGuardsNotApplicable = formData.copy_provider_type === 'binance'
   const showAtrStructureRiskControls =
     formData.risk_policy_version >= 4 &&
     formData.risk_protection_mode === 'atr_structure'
@@ -2176,7 +2178,8 @@ export function TraderConfigModal({
                             Number(e.target.value)
                           )
                         }
-                        className="mt-2 w-full px-3 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF]"
+                        disabled={binanceGuardsNotApplicable}
+                        className="mt-2 w-full px-3 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF] disabled:opacity-50"
                       />
                     </label>
                     <label className="text-sm text-[#EAECEF]">
@@ -2193,7 +2196,8 @@ export function TraderConfigModal({
                             Number(e.target.value)
                           )
                         }
-                        className="mt-2 w-full px-3 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF]"
+                        disabled={binanceGuardsNotApplicable}
+                        className="mt-2 w-full px-3 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF] disabled:opacity-50"
                       />
                     </label>
                     <label className="text-sm text-[#EAECEF]">
@@ -2210,7 +2214,8 @@ export function TraderConfigModal({
                             Number(e.target.value)
                           )
                         }
-                        className="mt-2 w-full px-3 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF]"
+                        disabled={binanceGuardsNotApplicable}
+                        className="mt-2 w-full px-3 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF] disabled:opacity-50"
                       />
                     </label>
                     <label className="text-sm text-[#EAECEF] flex items-center gap-2 mt-7 cursor-pointer">
@@ -2218,6 +2223,7 @@ export function TraderConfigModal({
                         type="checkbox"
                         className="accent-[#F0B90B]"
                         checked={formData.copy_auto_correct_overweight}
+                        disabled={binanceGuardsNotApplicable}
                         onChange={(e) =>
                           handleInputChange(
                             'copy_auto_correct_overweight',
@@ -2234,6 +2240,14 @@ export function TraderConfigModal({
                       0 表示不接受任何不利价差。仓位持续超过比例目标 1.5
                       倍时自动减回目标（Hyperliquid / FollowCoin 来源）。
                     </p>
+                    {binanceGuardsNotApplicable && (
+                      <p className="col-span-2 text-xs text-[#F0B90B]">
+                        Binance
+                        数据源不适用：以上价格偏移阈值、止盈减仓等待与超额自动减仓仅对
+                        Hyperliquid / OKX / FollowCoin 生效，Binance
+                        跟单按领航员动作直接执行。
+                      </p>
+                    )}
                   </div>
 
                   {/* 跟单运营预警阈值（不参与交易所可执行性判断） */}

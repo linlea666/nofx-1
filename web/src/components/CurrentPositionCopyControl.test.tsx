@@ -8,7 +8,10 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { CurrentPositionCopyControl } from './CurrentPositionCopyControl'
 import { httpClient } from '../lib/httpClient'
-import { newCurrentPositionCopyRequestId } from '../lib/currentPositionCopy'
+import {
+  newCurrentPositionCopyRequestId,
+  priceSkipNote,
+} from '../lib/currentPositionCopy'
 import type { CurrentPositionCopyPreview } from '../types'
 
 vi.mock('../lib/httpClient', () => ({ httpClient: { post: vi.fn() } }))
@@ -208,6 +211,49 @@ describe('one-time current-position copy', () => {
       ],
     })
   })
+  it('explains a price skip with the gap and the setting to change', async () => {
+    vi.mocked(httpClient.post).mockResolvedValue({
+      success: true,
+      data: {
+        ...preview,
+        positions: [
+          {
+            ...preview.positions[0],
+            symbol: 'STRCUSDT',
+            side: 'short',
+            leader_entry_price: 99.29449643140364,
+            reference_price: 93.9,
+            status: 'SKIPPED',
+            reason: 'PRICE_NOT_FAVORABLE',
+          },
+        ],
+      },
+    })
+    render(
+      <CurrentPositionCopyControl
+        {...props}
+        enabled
+        priceFilterEnabled
+        minAdvantagePct={0}
+        manualMaxDisadvantagePct={1}
+        selection={[]}
+        onOptionsChange={vi.fn()}
+      />
+    )
+    expect(
+      await screen.findByText(
+        '劣势 5.43% 超过手选上限 1%：将「手选最大劣势」调到 ≥5.5% 后可手动勾选，或关闭价格过滤'
+      )
+    ).toBeVisible()
+    expect(
+      screen.getByRole('checkbox', { name: '复制 STRCUSDT' })
+    ).toBeDisabled()
+  })
+  it('names the manual-pick switch and the settable ceiling in price skips', () => {
+    expect(priceSkipNote(-0.4, 0, 0)).toContain('手选已关闭')
+    expect(priceSkipNote(-25, 0, 1)).toContain('最大值 20%')
+    expect(priceSkipNote(0.2, 0.5, 1)).toContain('低于最低优势 0.5%')
+  })
   it('keeps a saved selection and ticks a whole symbol+side group together', async () => {
     const legs: CurrentPositionCopyPreview = {
       ...preview,
@@ -235,7 +281,9 @@ describe('one-time current-position copy', () => {
       />
     )
     expect(
-      await screen.findByText('价格无优势，本次不复制（下次可再选）')
+      await screen.findByText(
+        '优势 -10.00% 低于最低优势 0%（手选已关闭：「手选最大劣势」设为大于 0 可放宽，或关闭价格过滤）'
+      )
     ).toBeVisible()
     expect(onOptionsChange).not.toHaveBeenCalled()
     expect(screen.getByLabelText('复制 BTCUSDT')).toBeDisabled()
