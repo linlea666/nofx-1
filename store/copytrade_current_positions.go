@@ -14,10 +14,26 @@ import (
 // fill transaction may replace it with an active mapping and acquire custody.
 const MappingStatusCopyPending = "copy_pending"
 
-// Current-position copy supports only sources whose positions carry a stable
-// lifecycle timestamp (OpenedMS): every authorization re-proves it before
-// submission. Keep in sync with copytrade.supportsCurrentPositionCopy.
+// currentPositionCopyProviders are the sources the one-shot copy can run on.
+// Every authorization re-proves the source lifecycle before submission: OKX
+// and FollowCoin by the venue's open time, Binance and Hyperliquid by a
+// seal-time anchor. Keep in sync with copytrade.supportsCurrentPositionCopy.
+var currentPositionCopyProviders = []string{"okx", "followcoin", "binance", "hyperliquid"}
+
 func CurrentPositionCopySupported(provider string) bool {
+	for _, p := range currentPositionCopyProviders {
+		if provider == p {
+			return true
+		}
+	}
+	return false
+}
+
+// currentCopyNativeLifecycle reports sources whose positions carry the venue's
+// open time. A seal-time anchor of any other source identifies only its
+// one-shot authorization and is never stored as a source lifecycle.
+// Keep in sync with copytrade.nativeSourceLifecycle.
+func currentCopyNativeLifecycle(provider string) bool {
 	return provider == "okx" || provider == "followcoin"
 }
 
@@ -217,7 +233,7 @@ func saveCurrentPositionCopyTx(tx *sql.Tx, c *CopyTradeConfig) error {
 		return err
 	}
 	if !CurrentPositionCopySupported(c.ProviderType) {
-		return fmt.Errorf("复制当前仓位目前仅支持 OKX 和 FollowCoin 领航员")
+		return fmt.Errorf("复制当前仓位不支持该数据源：%s", c.ProviderType)
 	}
 	if err = validateCurrentCopyOptions(c); err != nil {
 		return err
@@ -431,7 +447,7 @@ func (s *CopyTradeStore) SealCurrentPositionCopy(traderID, leaderID string, sour
 	var request, account, selectionMode string
 	var generation int64
 	err = tx.QueryRow(`SELECT r.request_id,t.exchange_id,t.lifecycle_generation,r.selection_mode FROM copy_trade_current_position_requests r JOIN traders t ON t.id=r.trader_id
- JOIN copy_trade_configs c ON c.trader_id=t.id WHERE r.trader_id=? AND r.status='PENDING' AND r.provider IN ('okx','followcoin') AND r.leader_id=? AND r.source_generation=?
+ JOIN copy_trade_configs c ON c.trader_id=t.id WHERE r.trader_id=? AND r.status='PENDING' AND r.provider IN ('okx','followcoin','binance','hyperliquid') AND r.leader_id=? AND r.source_generation=?
  AND r.exchange_id=t.exchange_id AND c.provider_type=r.provider AND c.leader_id=r.leader_id AND c.source_generation=r.source_generation
  AND t.lifecycle_status='RUNNING' AND t.is_running=1 AND t.decision_mode='copy_trade' AND t.lifecycle_generation>r.saved_generation
  AND EXISTS(SELECT 1 FROM trader_lifecycle_events e WHERE e.trader_id=t.id AND e.generation=t.lifecycle_generation AND e.reason_code='OPERATOR_START')`, traderID, leaderID, sourceGeneration).Scan(&request, &account, &generation, &selectionMode)

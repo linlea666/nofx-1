@@ -20,7 +20,12 @@ export function newCurrentPositionCopyRequestId(): string {
 export function currentPositionCopySupported(
   provider: CopyTradeProvider
 ): boolean {
-  return provider === 'okx' || provider === 'followcoin'
+  return (
+    provider === 'okx' ||
+    provider === 'followcoin' ||
+    provider === 'binance' ||
+    provider === 'hyperliquid'
+  )
 }
 
 // Restores the selection/price options of a request that has not run yet, so

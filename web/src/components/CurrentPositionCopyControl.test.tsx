@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { CurrentPositionCopyControl } from './CurrentPositionCopyControl'
 import { httpClient } from '../lib/httpClient'
 import {
+  currentPositionCopySupported,
   newCurrentPositionCopyRequestId,
   priceSkipNote,
 } from '../lib/currentPositionCopy'
@@ -210,6 +211,40 @@ describe('one-time current-position copy', () => {
         },
       ],
     })
+  })
+  it('previews Binance and Hyperliquid leaders with the source mode', async () => {
+    render(
+      <CurrentPositionCopyControl
+        {...props}
+        enabled
+        providerType="binance"
+        binanceSourceMode="smart_money"
+      />
+    )
+    await waitFor(() =>
+      expect(httpClient.post).toHaveBeenCalledWith(
+        '/api/copytrade/current-positions/preview',
+        expect.objectContaining({
+          provider_type: 'binance',
+          binance_source_mode: 'smart_money',
+        })
+      )
+    )
+    cleanup()
+    vi.mocked(httpClient.post).mockClear()
+    render(
+      <CurrentPositionCopyControl
+        {...props}
+        enabled
+        providerType="hyperliquid"
+      />
+    )
+    await waitFor(() => expect(httpClient.post).toHaveBeenCalledOnce())
+    expect(vi.mocked(httpClient.post).mock.calls[0][1]).not.toHaveProperty(
+      'binance_source_mode'
+    )
+    expect(currentPositionCopySupported('binance')).toBe(true)
+    expect(currentPositionCopySupported('hyperliquid')).toBe(true)
   })
   it('explains a price skip with the gap and the setting to change', async () => {
     vi.mocked(httpClient.post).mockResolvedValue({

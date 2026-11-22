@@ -43,10 +43,19 @@ func SupportsCopyGuard(p ProviderType) bool {
 	return p == ProviderOKX || p == ProviderBinance
 }
 
-// supportsCurrentPositionCopy reports sources whose positions carry a stable
-// lifecycle timestamp (OpenedMS), which every one-shot copy authorization
-// re-proves before submission. Keep in sync with store.CurrentPositionCopySupported.
+// supportsCurrentPositionCopy reports sources the one-shot current-position
+// copy can run on. Every authorization re-proves the source lifecycle before
+// submission: natively (see nativeSourceLifecycle) or through a seal-time
+// anchor. Keep in sync with store.CurrentPositionCopySupported.
 func supportsCurrentPositionCopy(p ProviderType) bool {
+	return p == ProviderOKX || p == ProviderFollowCoin || p == ProviderBinance || p == ProviderHyperliquid
+}
+
+// nativeSourceLifecycle reports sources whose positions carry the venue's own
+// open time (OpenedMS). Binance and Hyperliquid positions do not; their
+// current-position copies use a seal-time anchor that must never be recorded
+// as a real source lifecycle. Keep in sync with store.currentCopyNativeLifecycle.
+func nativeSourceLifecycle(p ProviderType) bool {
 	return p == ProviderOKX || p == ProviderFollowCoin
 }
 

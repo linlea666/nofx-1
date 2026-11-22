@@ -110,6 +110,173 @@ func BuildCurrentPositionPreview(st *store.Store, traderID, leaderID string, rat
 }
 func positiveFinite(n float64) bool { return n > 0 && !math.IsNaN(n) && !math.IsInf(n, 0) }
 
+// currentCopyAnchor fingerprints a position sealed for a one-shot copy from a
+// source without venue open times. OpenedMS is the seal-time anchor written to
+// the task; it identifies the position only while it is unchanged.
+type currentCopyAnchor struct {
+	OpenedMS   int64
+	Side       string
+	MarginMode string
+	Size       float64
+	EntryPrice float64
+}
+
+func sameSourceAmount(a, b float64) bool {
+	return math.Abs(a-b) <= math.Max(1e-12, math.Abs(b)*1e-8)
+}
+
+// anchorCurrentCopyLifecycle returns a copy of state in which every position
+// without a venue open time carries anchorMS, so a one-shot copy can name its
+// lifecycle. Sources with native open times are returned unchanged.
+func anchorCurrentCopyLifecycle(provider ProviderType, state *AccountState, anchorMS int64) *AccountState {
+	if state == nil || state.Positions == nil || nativeSourceLifecycle(provider) {
+		return state
+	}
+	anchored := *state
+	anchored.Positions = make(map[string]*Position, len(state.Positions))
+	for id, p := range state.Positions {
+		if p != nil && p.OpenedMS <= 0 {
+			copied := *p
+			copied.OpenedMS = anchorMS
+			p = &copied
+		}
+		anchored.Positions[id] = p
+	}
+	return &anchored
+}
+
+// currentCopySizingEquity is the leader-side equity a current-position copy
+// sizes against, matching live execution: Binance copy management sizes its
+// mirrored positions against the follower copy portfolio's margin balance,
+// OKX against the sampled leader equity, other sources the snapshot equity.
+func currentCopySizingEquity(source LeaderProvider, leaderID string, state *AccountState) (float64, error) {
+	if state == nil {
+		return 0, fmt.Errorf("完整领航员仓位快照不可用")
+	}
+	if len(state.Positions) == 0 {
+		return state.TotalEquity, nil
+	}
+	if bp, ok := source.(*BinanceProvider); ok {
+		detail, err := binanceCopyAnchorDetail(bp, leaderID)
+		if err != nil {
+			return 0, fmt.Errorf("Binance 跟单组合权益不可用: %w", err)
+		}
+		return detail.MarginBalance, nil
+	}
+	if equity, ok := source.(interface{ GetLeaderEquity(string) (float64, error) }); ok {
+		return equity.GetLeaderEquity(leaderID)
+	}
+	return state.TotalEquity, nil
+}
+
+// CurrentCopyPreviewRequest is a read-only preview of the one-shot copy.
+type CurrentCopyPreviewRequest struct {
+	Provider                 ProviderType
+	Source                   LeaderProvider
+	TraderID, LeaderID       string
+	Ratio                    float64
+	State                    *AccountState
+	FollowerEquity           float64
+	FollowerPositions        []map[string]interface{}
+	Price                    func(string) (float64, error)
+	Resolver                 trader.ExecutionInstrumentResolver
+	PriceFilterEnabled       bool
+	MinAdvantagePct          float64
+	ManualMaxDisadvantagePct float64
+}
+
+// PreviewCurrentPositionCopy applies the sizing equity, identity rules and
+// price rule used when the request is sealed. It returns the tasks and the
+// leader-side sizing equity. Anchors of sources without venue open times are
+// cleared from the result: the operator's selection names the position and
+// the seal anchors and re-proves its lifecycle.
+func PreviewCurrentPositionCopy(st *store.Store, r CurrentCopyPreviewRequest) ([]store.CurrentPositionCopyTask, float64, error) {
+	equity, err := currentCopySizingEquity(r.Source, r.LeaderID, r.State)
+	if err != nil {
+		return nil, 0, err
+	}
+	snapshot := *r.State
+	snapshot.TotalEquity = equity
+	anchorMS := snapshot.Timestamp.UnixMilli()
+	if anchorMS <= 0 {
+		anchorMS = time.Now().UnixMilli()
+	}
+	tasks, err := BuildCurrentPositionPreview(st, r.TraderID, r.LeaderID, r.Ratio, anchorCurrentCopyLifecycle(r.Provider, &snapshot, anchorMS), r.FollowerEquity, r.FollowerPositions, r.Price, r.Resolver)
+	if err != nil {
+		return nil, 0, err
+	}
+	if tasks, err = ApplyCurrentCopyPriceFilter(st, r.TraderID, r.LeaderID, tasks, r.PriceFilterEnabled, r.MinAdvantagePct, r.ManualMaxDisadvantagePct, nil); err != nil {
+		return nil, 0, err
+	}
+	if !nativeSourceLifecycle(r.Provider) {
+		for i := range tasks {
+			tasks[i].OpenedMS = 0
+		}
+	}
+	return tasks, equity, nil
+}
+
+// currentCopyOpenedMS is the lifecycle identity a one-shot copy re-proves.
+// Native sources use the venue's open time. Other sources use the seal-time
+// anchor while the position still matches the sealed fingerprint; any change,
+// or an anchor lost to a restart, reads as 0 so the authorization ends
+// without a fill and the position stays selectable next time.
+func (e *Engine) currentCopyOpenedMS(pos *Position) int64 {
+	if pos == nil {
+		return 0
+	}
+	if e.config == nil || nativeSourceLifecycle(e.config.ProviderType) {
+		return pos.OpenedMS
+	}
+	e.currentCopyAnchorMu.Lock()
+	anchor, ok := e.currentCopyAnchors[pos.PosID]
+	e.currentCopyAnchorMu.Unlock()
+	if !ok || string(pos.Side) != anchor.Side || pos.MarginMode != anchor.MarginMode ||
+		!sameSourceAmount(pos.Size, anchor.Size) || !sameSourceAmount(pos.EntryPrice, anchor.EntryPrice) {
+		return 0
+	}
+	return anchor.OpenedMS
+}
+
+// anchorSealedCurrentCopy records the fingerprints of the positions just
+// sealed as READY. It replaces any earlier request's anchors.
+func (e *Engine) anchorSealedCurrentCopy(state *AccountState, tasks []store.CurrentPositionCopyTask) {
+	if e.config == nil || nativeSourceLifecycle(e.config.ProviderType) {
+		return
+	}
+	byID := map[string]*Position{}
+	for _, p := range state.Positions {
+		if p != nil {
+			byID[p.PosID] = p
+		}
+	}
+	anchors := map[string]currentCopyAnchor{}
+	for _, t := range tasks {
+		p := byID[t.LeaderPosID]
+		if t.Reason != "" || p == nil || t.OpenedMS <= 0 {
+			continue
+		}
+		anchors[t.LeaderPosID] = currentCopyAnchor{OpenedMS: t.OpenedMS, Side: string(p.Side), MarginMode: p.MarginMode, Size: p.Size, EntryPrice: p.EntryPrice}
+	}
+	e.setCurrentCopyAnchors(anchors)
+}
+
+func (e *Engine) setCurrentCopyAnchors(anchors map[string]currentCopyAnchor) {
+	e.currentCopyAnchorMu.Lock()
+	e.currentCopyAnchors = anchors
+	e.currentCopyAnchorMu.Unlock()
+}
+
+// sourceLifecycleMS is the decision's real source open time. The seal-time
+// anchor of a current-position copy from a source without venue open times
+// is not one and must not be bound as a source lifecycle.
+func (e *Engine) sourceLifecycleMS(openedMS int64) int64 {
+	if e.config == nil || nativeSourceLifecycle(e.config.ProviderType) {
+		return openedMS
+	}
+	return 0
+}
+
 // currentCopyAdvantagePct is how much better (positive) or worse (negative)
 // the follower's current price is than the leader's average entry:
 // long  = (entry - price) / entry, short = (price - entry) / entry, in percent.
@@ -170,8 +337,12 @@ func (e *Engine) prepareCurrentPositionCopy(state *AccountState) error {
 		return nil
 	}
 	request, err := e.store.CopyTrade().ActiveCurrentPositionCopy(e.traderID)
-	if err != nil || request == nil {
+	if err != nil {
 		return err
+	}
+	if request == nil {
+		e.setCurrentCopyAnchors(nil)
+		return nil
 	}
 	if request.Status == "SEALED" {
 		if err = e.store.CopyTrade().RefreshCurrentPositionCopy(e.traderID); err != nil {
@@ -209,7 +380,11 @@ func (e *Engine) prepareCurrentPositionCopy(state *AccountState) error {
 		// The copy window starts when we observed the source. FollowCoin's
 		// snapshot timestamp is the platform's refresh time (minutes old),
 		// which would expire every task immediately.
-		return e.store.CopyTrade().SealCurrentPositionCopy(e.traderID, e.config.LeaderID, generation, positions, time.Now())
+		if err = e.store.CopyTrade().SealCurrentPositionCopy(e.traderID, e.config.LeaderID, generation, positions, time.Now()); err != nil {
+			return err
+		}
+		e.anchorSealedCurrentCopy(state, positions)
+		return nil
 	}
 	if request.Status != "SEALED" {
 		return nil
@@ -223,7 +398,7 @@ func (e *Engine) prepareCurrentPositionCopy(state *AccountState) error {
 	expired := !request.WindowAnchorAt.IsZero() && currentCopyWindowExpired(request.WindowAnchorAt, e.config.CopyCatchupWindowSeconds)
 	for _, task := range request.Tasks {
 		p := positions[task.LeaderPosID]
-		changed := p == nil || !positiveFinite(p.Size) || p.OpenedMS != task.OpenedMS || string(p.Side) != task.Side || p.MarginMode != task.MarginMode
+		changed := p == nil || !positiveFinite(p.Size) || e.currentCopyOpenedMS(p) != task.OpenedMS || string(p.Side) != task.Side || p.MarginMode != task.MarginMode
 		if task.IntentID > 0 {
 			intent, err := e.store.CopyTrade().GetExecutionIntentByID(task.IntentID)
 			if err != nil {
@@ -267,7 +442,7 @@ func currentCopyWindowExpired(anchor time.Time, windowSeconds int) bool {
 
 func (e *Engine) currentPositionCopyFill(pos *Position, m *store.CopyTradePositionMapping) *Fill {
 	task, err := e.store.CopyTrade().CurrentPositionCopyTask(e.traderID, m.LeaderPosID)
-	if err != nil || task == nil || pos.PosID != m.LeaderPosID || pos.OpenedMS != task.OpenedMS || string(pos.Side) != task.Side || pos.MarginMode != task.MarginMode {
+	if err != nil || task == nil || pos.PosID != m.LeaderPosID || e.currentCopyOpenedMS(pos) != task.OpenedMS || string(pos.Side) != task.Side || pos.MarginMode != task.MarginMode {
 		return nil
 	}
 	fill := e.buildBinanceSnapshotFillForPosition(pos, m.LeaderPosID, ActionOpen, pos.Size, 0, pos.Size, m.SourceRevision)
@@ -307,7 +482,7 @@ func (ti *TraderIntegration) validateCurrentPositionCopy(dec *decision.Decision)
 		return leaderCopyPreflightError("SOURCE_DATA_UNAVAILABLE", "current-position copy source query: %v", err)
 	}
 	for _, p := range state.Positions {
-		if p != nil && p.PosID == dec.LeaderPosID && p.OpenedMS == dec.SourceOpenedMS && p.MarginMode == task.MarginMode && strings.EqualFold(string(p.Side), strings.TrimPrefix(dec.Action, "open_")) && math.Abs(p.Size-dec.LeaderPosSize) <= math.Max(1e-12, p.Size*1e-8) {
+		if p != nil && p.PosID == dec.LeaderPosID && dec.SourceOpenedMS > 0 && ti.engine.currentCopyOpenedMS(p) == dec.SourceOpenedMS && p.MarginMode == task.MarginMode && strings.EqualFold(string(p.Side), strings.TrimPrefix(dec.Action, "open_")) && math.Abs(p.Size-dec.LeaderPosSize) <= math.Max(1e-12, p.Size*1e-8) {
 			return ti.recheckCurrentCopyPrice(dec, task)
 		}
 	}

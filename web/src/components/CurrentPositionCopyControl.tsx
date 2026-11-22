@@ -94,6 +94,7 @@ export function CurrentPositionCopyControl({
   result,
   onChange,
   providerType = 'okx',
+  binanceSourceMode,
   selection,
   priceFilterEnabled = false,
   minAdvantagePct = 0,
@@ -109,6 +110,7 @@ export function CurrentPositionCopyControl({
   result?: CurrentPositionCopyResult
   onChange: (enabled: boolean) => void
   providerType?: CopyTradeProvider
+  binanceSourceMode?: string
   selection?: CurrentPositionCopySelection[]
   priceFilterEnabled?: boolean
   minAdvantagePct?: number
@@ -141,6 +143,9 @@ export function CurrentPositionCopyControl({
             price_filter_enabled: priceFilterEnabled,
             min_advantage_pct: minAdvantagePct,
             manual_max_disadvantage_pct: manualMaxDisadvantagePct,
+            ...(providerType === 'binance'
+              ? { binance_source_mode: binanceSourceMode || 'copy_management' }
+              : {}),
           }
         )
         .then((response) => {
@@ -169,6 +174,7 @@ export function CurrentPositionCopyControl({
     ratio,
     refresh,
     providerType,
+    binanceSourceMode,
     priceFilterEnabled,
     minAdvantagePct,
     manualMaxDisadvantagePct,

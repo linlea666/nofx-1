@@ -70,16 +70,21 @@ func TestCurrentPositionCopyOptionsArePersistedAndEditableWhilePending(t *testin
 }
 
 func TestCurrentPositionCopyProviderScope(t *testing.T) {
-	for provider, ok := range map[string]bool{"okx": true, "followcoin": true, "hyperliquid": false, "binance": false} {
+	for provider, ok := range map[string]bool{"okx": true, "followcoin": true, "hyperliquid": true, "binance": true, "lighter": false} {
 		if CurrentPositionCopySupported(provider) != ok {
 			t.Fatalf("%s supported=%v", provider, !ok)
 		}
 	}
+	for provider, native := range map[string]bool{"okx": true, "followcoin": true, "hyperliquid": false, "binance": false} {
+		if currentCopyNativeLifecycle(provider) != native {
+			t.Fatalf("%s native lifecycle=%v", provider, !native)
+		}
+	}
 	s, c := currentCopyFixture(t)
-	c.ProviderType = "hyperliquid"
+	c.ProviderType = "lighter"
 	c.CopyCurrentPositionsRequestID = uuid.NewString()
 	if err := s.CopyTrade().Update(c); err == nil {
-		t.Fatal("hyperliquid registration accepted")
+		t.Fatal("unsupported provider registration accepted")
 	}
 	c.ProviderType = "followcoin"
 	c.LeaderID = "31535"

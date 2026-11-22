@@ -10,31 +10,39 @@ import (
 	"nofx/store"
 )
 
-func TestCurrentCopyPreviewSourceCoversOKXAndFollowCoinOnly(t *testing.T) {
+func TestCurrentCopyPreviewSourceCoversEverySupportedProvider(t *testing.T) {
 	st, err := store.New(filepath.Join(t.TempDir(), "copy-source.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	if _, err = newCurrentCopySource(st, "okx", "leader"); err != nil {
+	if _, err = newCurrentCopySource(st, "okx", "", "leader"); err != nil {
 		t.Fatalf("okx source: %v", err)
 	}
-	if _, err = newCurrentCopySource(st, "followcoin", "31535"); err == nil || !strings.Contains(err.Error(), "token") {
+	if _, err = newCurrentCopySource(st, "followcoin", "", "31535"); err == nil || !strings.Contains(err.Error(), "token") {
 		t.Fatalf("followcoin without token must explain the missing credential: %v", err)
 	}
 	if err = st.FollowCoinCreds().Set(store.FollowCoinCredsLabelDefault, "test-token"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = newCurrentCopySource(st, "followcoin", "not-a-number"); err == nil {
+	if _, err = newCurrentCopySource(st, "followcoin", "", "not-a-number"); err == nil {
 		t.Fatal("invalid followcoin apiId accepted")
 	}
-	if p, err := newCurrentCopySource(st, "followcoin", "31535"); err != nil || p == nil {
+	if p, err := newCurrentCopySource(st, "followcoin", "", "31535"); err != nil || p == nil {
 		t.Fatalf("followcoin source: %v %v", p, err)
 	}
-	for _, provider := range []string{"hyperliquid", "binance"} {
-		if _, err = newCurrentCopySource(st, provider, "leader"); err == nil {
-			t.Fatalf("%s preview source built", provider)
+	for _, tc := range []struct{ provider, mode string }{
+		{"hyperliquid", ""}, {"binance", "copy_management"}, {"binance", "smart_money"},
+	} {
+		if p, err := newCurrentCopySource(st, tc.provider, tc.mode, "leader"); err != nil || p == nil {
+			t.Fatalf("%s/%s preview source: %v %v", tc.provider, tc.mode, p, err)
 		}
+	}
+	if _, err = newCurrentCopySource(st, "binance", "bogus", "leader"); err == nil {
+		t.Fatal("unknown Binance source mode built a preview source")
+	}
+	if _, err = newCurrentCopySource(st, "lighter", "", "leader"); err == nil {
+		t.Fatal("unsupported provider built a preview source")
 	}
 	// Unsupported providers are refused before any account or venue query.
 	if _, err = st.DB().Exec(`INSERT INTO traders(id,user_id,name,ai_model_id,exchange_id,initial_balance) VALUES('t','owner','trader','','exchange',1000)`); err != nil {
@@ -42,8 +50,8 @@ func TestCurrentCopyPreviewSourceCoversOKXAndFollowCoinOnly(t *testing.T) {
 	}
 	h := &CopyTradeHandler{store: st}
 	for _, body := range []string{
-		`{"provider_type":"hyperliquid","leader_id":"0xabc","copy_ratio":1}`,
-		`{"provider_type":"binance","leader_id":"leader","copy_ratio":1}`,
+		`{"provider_type":"lighter","leader_id":"0xabc","copy_ratio":1}`,
+		`{"provider_type":"binance","binance_source_mode":"smart_money","leader_id":"not-a-top-trader","copy_ratio":1}`,
 	} {
 		w := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(w)

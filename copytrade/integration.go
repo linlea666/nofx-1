@@ -729,18 +729,18 @@ func (ti *TraderIntegration) StartCopyTrading() error {
 			return nil, err
 		}
 		snapshot := *state
-		if source, ok := engine.provider.(interface{ GetLeaderEquity(string) (float64, error) }); ok && len(state.Positions) > 0 {
-			snapshot.TotalEquity, err = source.GetLeaderEquity(engineConfig.LeaderID)
-			if err != nil {
-				return nil, err
-			}
+		if snapshot.TotalEquity, err = currentCopySizingEquity(engine.provider, engineConfig.LeaderID, state); err != nil {
+			return nil, err
 		}
 		prices, ok := ti.executor.(interface{ GetMarketPrice(string) (float64, error) })
 		if !ok {
 			return nil, fmt.Errorf("market query unavailable")
 		}
 		resolver, _ := ti.executor.(trader.ExecutionInstrumentResolver)
-		return BuildCurrentPositionPreview(ti.store, ti.traderID, engineConfig.LeaderID, engineConfig.CopyRatio, &snapshot, ti.getEquityFunc()(), positions, prices.GetMarketPrice, resolver)
+		// Sources without venue open times are anchored at seal time; the
+		// engine records their fingerprints once the request is sealed.
+		anchored := anchorCurrentCopyLifecycle(engineConfig.ProviderType, &snapshot, time.Now().UnixMilli())
+		return BuildCurrentPositionPreview(ti.store, ti.traderID, engineConfig.LeaderID, engineConfig.CopyRatio, anchored, ti.getEquityFunc()(), positions, prices.GetMarketPrice, resolver)
 	}
 	ti.engine = engine
 	engine.SetCopyGuardRiskExitBegin(ti.establishRiskExitGate)

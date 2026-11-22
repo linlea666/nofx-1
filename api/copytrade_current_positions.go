@@ -17,10 +17,15 @@ import (
 
 // newCurrentCopySource builds the read-only leader source for a preview.
 // Replaceable in tests; production never mutates anything through it.
-var newCurrentCopySource = func(st *store.Store, provider, leaderID string) (copytrade.LeaderProvider, error) {
+var newCurrentCopySource = func(st *store.Store, provider, binanceMode, leaderID string) (copytrade.LeaderProvider, error) {
 	switch provider {
 	case string(copytrade.ProviderOKX):
 		return copytrade.NewOKXProvider(), nil
+	case string(copytrade.ProviderHyperliquid):
+		return copytrade.NewHyperliquidProvider(), nil
+	case string(copytrade.ProviderBinance):
+		// Same construction and global credentials as the running engine.
+		return copytrade.NewProviderWithLoader(&copytrade.CopyConfig{ProviderType: copytrade.ProviderBinance, BinanceSourceMode: copytrade.BinanceSourceMode(binanceMode)}, st.BinanceCreds())
 	case string(copytrade.ProviderFollowCoin):
 		if _, err := copytrade.ParseFollowCoinAPIID(leaderID); err != nil {
 			return nil, err
@@ -34,7 +39,7 @@ var newCurrentCopySource = func(st *store.Store, provider, leaderID string) (cop
 		}
 		return copytrade.NewFollowCoinProviderWithLoader(st.FollowCoinCreds()), nil
 	default:
-		return nil, fmt.Errorf("复制当前仓位目前仅支持 OKX 和 FollowCoin 领航员")
+		return nil, fmt.Errorf("复制当前仓位不支持该数据源：%s", provider)
 	}
 }
 
@@ -45,6 +50,7 @@ func (h *CopyTradeHandler) PreviewCurrentPositions(c *gin.Context) {
 		TraderID           string  `json:"trader_id"`
 		ExchangeID         string  `json:"exchange_id"`
 		Provider           string  `json:"provider_type"`
+		BinanceSourceMode  string  `json:"binance_source_mode"`
 		LeaderID           string  `json:"leader_id"`
 		Ratio              float64 `json:"copy_ratio"`
 		PriceFilterEnabled bool    `json:"price_filter_enabled"`
@@ -57,8 +63,23 @@ func (h *CopyTradeHandler) PreviewCurrentPositions(c *gin.Context) {
 		return
 	}
 	if !store.CurrentPositionCopySupported(req.Provider) || strings.TrimSpace(req.LeaderID) == "" || req.Ratio <= 0 || req.Ratio > maxCopyRatio || math.IsNaN(req.Ratio) || math.IsInf(req.Ratio, 0) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "需要 OKX 或 FollowCoin 领航员、执行账户及有效跟单系数"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "需要受支持的领航员数据源、执行账户及有效跟单系数"})
 		return
+	}
+	if req.Provider == string(copytrade.ProviderBinance) {
+		if req.BinanceSourceMode == "" {
+			req.BinanceSourceMode = string(copytrade.BinanceSourceCopyManagement)
+		}
+		// The saved Smart Money leader is the normalized topTraderId; the
+		// preview must check eligibility against the same identity.
+		if req.BinanceSourceMode == string(copytrade.BinanceSourceSmartMoney) {
+			id, err := copytrade.NormalizeTopTraderID(req.LeaderID)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+			req.LeaderID = id
+		}
 	}
 	if math.IsNaN(req.MinAdvantagePct) || math.IsInf(req.MinAdvantagePct, 0) || math.IsNaN(req.ManualMaxDisadvantagePct) || math.IsInf(req.ManualMaxDisadvantagePct, 0) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "价格优势阈值无效"})
@@ -86,7 +107,7 @@ func (h *CopyTradeHandler) PreviewCurrentPositions(c *gin.Context) {
 		return
 	}
 	result, err := func() (gin.H, error) {
-		source, err := newCurrentCopySource(h.store, req.Provider, req.LeaderID)
+		source, err := newCurrentCopySource(h.store, req.Provider, req.BinanceSourceMode, req.LeaderID)
 		if err != nil {
 			return nil, err
 		}
@@ -113,14 +134,17 @@ func (h *CopyTradeHandler) PreviewCurrentPositions(c *gin.Context) {
 			return nil, err
 		}
 		resolver, _ := executor.(trader.ExecutionInstrumentResolver)
-		tasks, err := copytrade.BuildCurrentPositionPreview(h.store, req.TraderID, req.LeaderID, req.Ratio, state, equity, positions, executor.GetMarketPrice, resolver)
+		tasks, leaderEquity, err := copytrade.PreviewCurrentPositionCopy(h.store, copytrade.CurrentCopyPreviewRequest{
+			Provider: copytrade.ProviderType(req.Provider), Source: source,
+			TraderID: req.TraderID, LeaderID: req.LeaderID, Ratio: req.Ratio,
+			State: state, FollowerEquity: equity, FollowerPositions: positions,
+			Price: executor.GetMarketPrice, Resolver: resolver,
+			PriceFilterEnabled: req.PriceFilterEnabled, MinAdvantagePct: req.MinAdvantagePct, ManualMaxDisadvantagePct: req.ManualMaxDisadvantagePct,
+		})
 		if err != nil {
 			return nil, err
 		}
-		if tasks, err = copytrade.ApplyCurrentCopyPriceFilter(h.store, req.TraderID, req.LeaderID, tasks, req.PriceFilterEnabled, req.MinAdvantagePct, req.ManualMaxDisadvantagePct, nil); err != nil {
-			return nil, err
-		}
-		return gin.H{"positions": tasks, "snapshot_at": state.Timestamp, "leader_equity": state.TotalEquity, "follower_equity": equity}, nil
+		return gin.H{"positions": tasks, "snapshot_at": state.Timestamp, "leader_equity": leaderEquity, "follower_equity": equity}, nil
 	}()
 	if err != nil {
 		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "复制仓位预览失败: " + err.Error()})
@@ -145,7 +169,7 @@ func validateCurrentCopyRegistration(st *store.Store, traderID, accountID, mode,
 		return nil
 	}
 	if mode != "copy_trade" || !store.CurrentPositionCopySupported(provider) || strings.TrimSpace(leader) == "" {
-		return fmt.Errorf("复制当前仓位目前仅支持 OKX 和 FollowCoin 领航员（跟单模式）")
+		return fmt.Errorf("复制当前仓位需要跟单模式及受支持的领航员数据源")
 	}
 	if _, err := uuid.Parse(requestID); err != nil {
 		return fmt.Errorf("复制当前仓位需要有效的请求幂等编号")

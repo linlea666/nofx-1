@@ -28,7 +28,7 @@ func TestCurrentPositionPreviewRequiresOwnershipBeforeAnyVenueQuery(t *testing.T
 		{"", `{"provider_type":"okx","leader_id":"leader","copy_ratio":1}`, 401},
 		{"other", `{"trader_id":"t","exchange_id":"exchange","provider_type":"okx","leader_id":"leader","copy_ratio":1}`, 404},
 		{"owner", `{"trader_id":"t","exchange_id":"someone-else","provider_type":"okx","leader_id":"leader","copy_ratio":1}`, 404},
-		{"owner", `{"provider_type":"binance","leader_id":"leader","copy_ratio":1}`, 400},
+		{"owner", `{"provider_type":"lighter","leader_id":"leader","copy_ratio":1}`, 400},
 		{"owner", `{"provider_type":"okx","leader_id":"leader","copy_ratio":100}`, 400},
 	} {
 		w := httptest.NewRecorder()
@@ -69,7 +69,9 @@ func TestCurrentCopyRegistrationFailsBeforeTraderChanges(t *testing.T) {
 		{"t", "copy_trade", "okx", id, &on, false},
 		{"", "copy_trade", "okx", "bad-id", &on, false},
 		{"", "ai", "okx", id, &on, false},
-		{"", "copy_trade", "binance", id, &on, false},
+		{"", "copy_trade", "lighter", id, &on, false},
+		{"", "copy_trade", "binance", id, &on, true},
+		{"", "copy_trade", "hyperliquid", id, &on, true},
 		{"", "copy_trade", "okx", id, &on, true},
 	} {
 		err := validateCurrentCopyRegistration(st, tc.trader, "exchange", tc.mode, tc.provider, "leader", tc.request, tc.flag)

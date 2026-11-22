@@ -2411,7 +2411,15 @@ export function TraderConfigModal({
                       disabled={sourceSwitchLocked}
                       traderId={isEditMode ? traderData?.trader_id : undefined}
                       exchangeId={formData.exchange_id}
-                      leaderId={formData.copy_leader_id}
+                      leaderId={
+                        formData.copy_provider_type === 'binance' &&
+                        formData.copy_binance_source_mode === 'smart_money'
+                          ? (normalizeTopTraderID(
+                              formData.copy_binance_top_trader_id
+                            ) ?? '')
+                          : formData.copy_leader_id
+                      }
+                      binanceSourceMode={formData.copy_binance_source_mode}
                       ratio={formData.copy_ratio}
                       result={formData.current_position_copy}
                       onChange={(enabled) =>

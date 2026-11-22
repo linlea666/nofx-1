@@ -25,6 +25,11 @@ func TestSupportedCurrentCopyProvidersMatchStore(t *testing.T) {
 			t.Fatalf("engine and store disagree on %s", p)
 		}
 	}
+	for p, native := range map[ProviderType]bool{ProviderOKX: true, ProviderFollowCoin: true, ProviderHyperliquid: false, ProviderBinance: false} {
+		if nativeSourceLifecycle(p) != native || !supportsCurrentPositionCopy(p) {
+			t.Fatalf("%s native lifecycle=%v supported=%v", p, nativeSourceLifecycle(p), supportsCurrentPositionCopy(p))
+		}
+	}
 }
 
 func TestCurrentCopyAdvantageDirection(t *testing.T) {

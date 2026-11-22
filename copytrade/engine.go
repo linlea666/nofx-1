@@ -46,6 +46,10 @@ type unqueuedReservationFailure struct {
 // Engine 跟单引擎
 type Engine struct {
 	currentCopyPreview func(*AccountState) ([]store.CurrentPositionCopyTask, error)
+	// currentCopyAnchors fingerprints the positions a one-shot copy sealed for
+	// a source without venue open times (see currentCopyOpenedMS).
+	currentCopyAnchorMu sync.Mutex
+	currentCopyAnchors  map[string]currentCopyAnchor
 	// Only reservations that this Engine failed BEFORE decision-channel handoff
 	// enter this set. Ordinary RESERVED work remains owned by its queued consumer.
 	reservationFailureMu        sync.Mutex
@@ -1748,7 +1752,7 @@ func (e *Engine) matchOpenAddSignal(signal *TradeSignal, leaderPosMap map[string
 	if fill.CurrentPositionTaskID > 0 {
 		pos := leaderPosMap[fill.LeaderPosID]
 		task, err := e.store.CopyTrade().CurrentPositionCopyTask(e.traderID, fill.LeaderPosID)
-		if err != nil || task == nil || task.ID != fill.CurrentPositionTaskID || pos == nil || pos.OpenedMS != task.OpenedMS || string(pos.Side) != task.Side || pos.MarginMode != task.MarginMode {
+		if err != nil || task == nil || task.ID != fill.CurrentPositionTaskID || pos == nil || e.currentCopyOpenedMS(pos) != task.OpenedMS || string(pos.Side) != task.Side || pos.MarginMode != task.MarginMode {
 			return &SignalMatchResult{Reason: "当前仓位复制授权或源周期已改变"}
 		}
 		return &SignalMatchResult{ShouldFollow: true, Reason: "当前仓位复制（一次性授权）", Action: ActionOpen, PosID: fill.LeaderPosID, MarginMode: pos.MarginMode, LeaderPosition: pos}
@@ -2496,7 +2500,7 @@ func (e *Engine) reserveExecutionIntent(dec *decision.Decision) bool {
 	}
 	if e.usesFollowGroups() && dec.CopyTradeAction == "open" {
 		side := strings.TrimPrefix(dec.Action, "open_")
-		if _, err := e.store.CopyTrade().EnsureFollowGroupMember(e.traderID, string(e.config.ProviderType), e.config.LeaderID, dec.Symbol, side, dec.LeaderPosID, dec.SourceOpenedMS, ""); err != nil {
+		if _, err := e.store.CopyTrade().EnsureFollowGroupMember(e.traderID, string(e.config.ProviderType), e.config.LeaderID, dec.Symbol, side, dec.LeaderPosID, e.sourceLifecycleMS(dec.SourceOpenedMS), ""); err != nil {
 			e.UnmarkDecisionSources(dec)
 			return false
 		}
@@ -2717,7 +2721,7 @@ func (e *Engine) completeReservedExecutionIntent(dec *decision.Decision, intent 
 			}
 		}
 	}
-	if dec.SourceOpenedMS > 0 && dec.CopyTradeAction == "open" {
+	if e.sourceLifecycleMS(dec.SourceOpenedMS) > 0 && dec.CopyTradeAction == "open" {
 		if err := e.store.CopyTrade().BindSourceLifecycle(e.traderID, dec.LeaderPosID, dec.SourceOpenedMS); err != nil {
 			return deferPending(fmt.Errorf("bind source lifecycle: %w", err))
 		}
@@ -2797,8 +2801,9 @@ func (e *Engine) blockInvalidSourceRiskIncrease(signal *TradeSignal, match *Sign
 		(e.config != nil && snapshotPolledProvider(e.config.ProviderType) &&
 			strings.HasPrefix(fill.ID, snapshotFillIDPrefix(e.config.ProviderType)+"|")) ||
 		// One-shot current-position copies carry the same snapshot value; without
-		// this they bypassed the check and relied on the preview alone.
-		(e.config != nil && supportsCurrentPositionCopy(e.config.ProviderType) &&
+		// this they bypassed the check and relied on the preview alone. Binance
+		// copy management opens are not USD-validated on either path.
+		(e.config != nil && snapshotPolledProvider(e.config.ProviderType) &&
 			strings.HasPrefix(fill.ID, "current-position-copy|"))
 	if !requiresValidatedValue {
 		return false
@@ -2873,6 +2878,10 @@ func (e *Engine) buildDecisionV2(signal *TradeSignal, match *SignalMatchResult, 
 	}
 	if match.LeaderPosition != nil {
 		dec.SourceOpenedMS = match.LeaderPosition.OpenedMS
+		if fill.CurrentPositionTaskID > 0 {
+			// The one-shot authorization is bound to its sealed lifecycle identity.
+			dec.SourceOpenedMS = e.currentCopyOpenedMS(match.LeaderPosition)
+		}
 	}
 	if SupportsCopyGuard(e.config.ProviderType) && (match.Action == ActionClose || match.Action == ActionReduce) {
 		dec.LeaderExitScope = leaderAccountExitScope
@@ -3265,12 +3274,9 @@ func (e *Engine) resolveBinanceAnchorEquity() (float64, string, error) {
 		return 0, "", fmt.Errorf("provider is not *BinanceProvider")
 	}
 
-	detail, err := bp.GetCopyPortfolioDetail(e.config.LeaderID)
+	detail, err := binanceCopyAnchorDetail(bp, e.config.LeaderID)
 	if err != nil {
 		return 0, "", err
-	}
-	if detail == nil || detail.MarginBalance <= 0 {
-		return 0, "", fmt.Errorf("follower marginBalance non-positive")
 	}
 
 	// 非 FIXED_RATIO 模式下两侧 ratio 不严格相等，但跟随者权益仍是更合适的锚定
@@ -3284,6 +3290,20 @@ func (e *Engine) resolveBinanceAnchorEquity() (float64, string, error) {
 	}
 
 	return detail.MarginBalance, "follower_margin", nil
+}
+
+// binanceCopyAnchorDetail reads the follower copy portfolio whose margin
+// balance is on the same scale as Binance copy-management positions. Shared by
+// live sizing and the current-position copy so both size identically.
+func binanceCopyAnchorDetail(bp *BinanceProvider, leaderID string) (*BinanceCopyPortfolioDetail, error) {
+	detail, err := bp.GetCopyPortfolioDetail(leaderID)
+	if err != nil {
+		return nil, err
+	}
+	if detail == nil || detail.MarginBalance <= 0 {
+		return nil, fmt.Errorf("follower marginBalance non-positive")
+	}
+	return detail, nil
 }
 
 // getLeaderLeverage 获取领航员杠杆

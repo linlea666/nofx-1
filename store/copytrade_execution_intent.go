@@ -1657,7 +1657,19 @@ func (s *CopyTradeStore) ReserveExecutionIntent(intent *CopyTradeExecutionIntent
 				return nil, false, err
 			}
 		}
-		if intent.SourceOpenedMS > 0 && (intent.Action == "open_long" || intent.Action == "open_short") {
+		nativeLifecycle := true
+		if intent.SourceOpenedMS > 0 && intent.CurrentPositionTaskID > 0 {
+			// A one-shot copy of a source without venue open times carries a
+			// seal-time anchor, not a source lifecycle.
+			var provider string
+			err = tx.QueryRow(`SELECT provider_type FROM copy_trade_configs WHERE trader_id=?`, intent.TraderID).Scan(&provider)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return nil, false, err
+			}
+			nativeLifecycle = err != nil || currentCopyNativeLifecycle(provider)
+			err = nil
+		}
+		if nativeLifecycle && intent.SourceOpenedMS > 0 && (intent.Action == "open_long" || intent.Action == "open_short") {
 			if _, err = tx.Exec(`INSERT INTO copy_trade_source_lifecycles(trader_id,leader_pos_id,opened_ms) VALUES(?,?,?) ON CONFLICT(trader_id,leader_pos_id) DO UPDATE SET opened_ms=excluded.opened_ms`, intent.TraderID, intent.LeaderPosID, intent.SourceOpenedMS); err != nil {
 				return nil, false, err
 			}
