@@ -18,6 +18,22 @@ import (
 
 var errCopyPositionEnded = errors.New("immutable fills prove the original position ended")
 
+// separatesMarginModePositions reports execution venues that keep cross and
+// isolated positions of one symbol/side as separate venue positions (OKX). On
+// Binance a symbol has a single margin type, so both modes share one position.
+func (ti *TraderIntegration) separatesMarginModePositions() bool {
+	venue, ok := ti.executor.(interface{ GetExchange() string })
+	return ok && strings.EqualFold(venue.GetExchange(), "okx")
+}
+
+// otherMarginModePosition reports a live position that is a separate venue
+// position from one in marginMode: it can neither merge with a copy in
+// marginMode nor belong to that copy's exits. Unknown modes are never separate.
+func (ti *TraderIntegration) otherMarginModePosition(pos map[string]interface{}, marginMode string) bool {
+	mode := getStringField(pos, "mgnMode", "marginMode")
+	return marginMode != "" && mode != "" && !strings.EqualFold(mode, marginMode) && ti.separatesMarginModePositions()
+}
+
 // Protect independent manual positions before a new copy can merge into the
 // same venue position, and verify lifetime before mutating an existing copy.
 // This does not inspect protection health and never waits on protectionMu.
@@ -73,7 +89,8 @@ func (ti *TraderIntegration) preflightCopyPositionOwnership(dec *decision.Decisi
 	if dec.CurrentPositionTaskID > 0 {
 		dec.AllowManagedPositionMerge = false
 		for _, actual := range positions {
-			if getStringField(actual, "symbol") != dec.Symbol || !strings.EqualFold(getStringField(actual, "side"), side) || absFloat(getFloatField(actual, "positionAmt", "quantity")) <= 0 {
+			if getStringField(actual, "symbol") != dec.Symbol || !strings.EqualFold(getStringField(actual, "side"), side) || absFloat(getFloatField(actual, "positionAmt", "quantity")) <= 0 ||
+				ti.otherMarginModePosition(actual, dec.MarginMode) {
 				continue
 			}
 			mode := getStringField(actual, "marginMode", "mgnMode")
@@ -102,7 +119,8 @@ func (ti *TraderIntegration) preflightCopyPositionOwnership(dec *decision.Decisi
 		}
 	}
 	for _, p := range positions {
-		if getStringField(p, "symbol") == dec.Symbol && strings.EqualFold(getStringField(p, "side"), side) && absFloat(getFloatField(p, "positionAmt", "quantity")) > 0 {
+		if getStringField(p, "symbol") == dec.Symbol && strings.EqualFold(getStringField(p, "side"), side) && absFloat(getFloatField(p, "positionAmt", "quantity")) > 0 &&
+			!ti.otherMarginModePosition(p, dec.MarginMode) {
 			if managedPeer {
 				return nil
 			}

@@ -50,6 +50,38 @@ func (ti *TraderIntegration) leaderExitPositions(symbol, side string) (map[strin
 	return result, nil
 }
 
+// scopeLeaderExitTargets keeps only positions in modes on venues that keep
+// cross and isolated positions separate (OKX), so an independent position in
+// the other margin mode is never planned, drained or counted as a residual.
+// With fallbackToAll, a plan that sees no position in modes keeps the whole
+// symbol/side so a leader exit is never skipped on a stale margin-mode record.
+func (ti *TraderIntegration) scopeLeaderExitTargets(positions map[string]store.LeaderExitTarget, modes map[string]bool, fallbackToAll bool) map[string]store.LeaderExitTarget {
+	if len(modes) == 0 || !ti.separatesMarginModePositions() {
+		return positions
+	}
+	scoped := make(map[string]store.LeaderExitTarget, len(positions))
+	for key, t := range positions {
+		if modes[strings.ToLower(t.MarginMode)] {
+			scoped[key] = t
+		}
+	}
+	if len(scoped) == 0 && fallbackToAll {
+		return positions
+	}
+	return scoped
+}
+
+// leaderExitPlanModes are the margin modes a prepared plan targets.
+func leaderExitPlanModes(plan *store.LeaderExitPlan) map[string]bool {
+	modes := make(map[string]bool)
+	for _, t := range plan.Targets {
+		if t.MarginMode != "" {
+			modes[strings.ToLower(t.MarginMode)] = true
+		}
+	}
+	return modes
+}
+
 func (ti *TraderIntegration) prepareLeaderExit(dec *decision.Decision) (*store.LeaderExitPlan, error) {
 	if plan, err := ti.store.CopyTrade().GetLeaderExitPlan(dec.ExecutionIntentID); err == nil {
 		return plan, nil
@@ -66,6 +98,9 @@ func (ti *TraderIntegration) prepareLeaderExit(dec *decision.Decision) (*store.L
 	positions, err := ti.leaderExitPositions(dec.Symbol, side)
 	if err != nil {
 		return nil, err
+	}
+	if dec.MarginMode != "" {
+		positions = ti.scopeLeaderExitTargets(positions, map[string]bool{strings.ToLower(dec.MarginMode): true}, true)
 	}
 	plan := store.LeaderExitPlan{IntentID: dec.ExecutionIntentID, TraderID: ti.traderID, LeaderPosID: dec.LeaderPosID, Symbol: dec.Symbol, Side: side, Ratio: dec.CloseRatio, SourceClosed: dec.CopyTradeAction == "close"}
 	if c, cycleErr := ti.store.CopyTrade().GetOpenCopyGuardCycle(ti.traderID, dec.LeaderPosID); cycleErr == nil {
@@ -151,6 +186,7 @@ func (ti *TraderIntegration) runLeaderExitOrders(dec *decision.Decision, plan *s
 	if err != nil {
 		return err
 	}
+	positions = ti.scopeLeaderExitTargets(positions, leaderExitPlanModes(plan), false)
 	// A full exit also drains newly visible scopes from in-flight entries. A
 	// partial exit never expands its frozen target set after preparation.
 	if fullDrain {
@@ -262,6 +298,7 @@ func (ti *TraderIntegration) runLeaderExitOrders(dec *decision.Decision, plan *s
 	if err != nil {
 		return err
 	}
+	positions = ti.scopeLeaderExitTargets(positions, leaderExitPlanModes(plan), false)
 	if fullDrain {
 		pending, err := cs.HasUnsettledScopeEntries(ti.traderID, plan.Symbol, plan.Side)
 		if err != nil {
